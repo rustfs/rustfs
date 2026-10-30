@@ -528,7 +528,7 @@ impl NodeService {
             Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
             None => self
                 .find_disk(&request.disk)
-                .await
+                .await?
                 .ok_or_else(|| DiskError::other("cannot find disk")),
         };
         let result = match disk {
@@ -550,7 +550,7 @@ impl NodeService {
         let request = request.into_inner();
         let token =
             SnapshotLeaseToken::from_slice(&request.token).map_err(|_| Status::invalid_argument("invalid lease token"))?;
-        let result = match self.find_disk(&request.disk).await {
+        let result = match self.find_disk(&request.disk).await? {
             Some(disk) => disk.renew_snapshot_lease(&request.volume, &request.path, token).await,
             None => Err(DiskError::other("cannot find disk")),
         };
@@ -583,7 +583,7 @@ impl NodeService {
             Some(store) => store.quota_mutation_fence_disk(&request.disk).await,
             None => self
                 .find_disk(&request.disk)
-                .await
+                .await?
                 .ok_or_else(|| DiskError::other("cannot find disk")),
         };
         let result = match disk {
@@ -604,7 +604,7 @@ impl NodeService {
 
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let opts = match serde_json::from_str::<DiskInfoOptions>(&request.opts) {
                 Ok(opts) => opts,
                 Err(err) => {
@@ -653,7 +653,7 @@ impl NodeService {
             "delete_volume",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.delete_volume(&request.volume, request.force).await {
                 Ok(_) => Ok(Response::new(DeleteVolumeResponse {
                     success: true,
@@ -677,7 +677,7 @@ impl NodeService {
         request: Request<ReadMultipleRequest>,
     ) -> Result<Response<ReadMultipleResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let read_multiple_req = match decode_msgpack_or_json::<ReadMultipleReq>(
                 &request.read_multiple_req_bin,
                 &request.read_multiple_req,
@@ -754,7 +754,7 @@ impl NodeService {
                     .saturating_add(request.batch_read_version_req_bin.len()),
             );
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let decode_started = internode_stage_timer(attribution_enabled);
             let decoded_batch_read_version_req: DecodedRpcPayload<BatchReadVersionReq> = match decode_msgpack_or_json_with_source(
                 &request.batch_read_version_req_bin,
@@ -846,7 +846,7 @@ impl NodeService {
         let request = request.into_inner();
         let disk = self
             .find_disk(&request.disk)
-            .await
+            .await?
             .ok_or_else(|| Status::not_found("cannot find disk"))?;
         if request.probe_only {
             if !request.payload.is_empty() || !request.volume.is_empty() {
@@ -894,7 +894,7 @@ impl NodeService {
             "delete_versions",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let mut versions = Vec::with_capacity(request.versions.len());
             for (index, version) in request.versions.iter().enumerate() {
                 let version_bin = request.versions_bin.get(index).map(|b| b.as_ref()).unwrap_or(&[]);
@@ -1072,7 +1072,7 @@ impl NodeService {
                     .undo_local_write(&request.disk, &request.volume, &request.path, file_info, opts)
                     .await
             }
-        } else if let Some(disk) = self.find_disk(&request.disk).await {
+        } else if let Some(disk) = self.find_disk(&request.disk).await? {
             disk.delete_version(&request.volume, &request.path, file_info, request.force_del_marker, opts)
                 .await
         } else {
@@ -1101,7 +1101,7 @@ impl NodeService {
 
     pub(super) async fn handle_read_xl(&self, request: Request<ReadXlRequest>) -> Result<Response<ReadXlResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.read_xl(&request.volume, &request.path, request.read_data).await {
                 Ok(raw_file_info) => {
                     let raw_file_info_json = compat_response_json(&raw_file_info, false);
@@ -1171,7 +1171,7 @@ impl NodeService {
                     .saturating_add(request.opts_bin.len()),
             );
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let request_had_msgpack_payload = !request.opts_bin.is_empty();
             let decode_started = internode_stage_timer(read_version_attribution_enabled);
             let opts = match decode_msgpack_or_json::<ReadOptions>(&request.opts_bin, &request.opts, "ReadOptions") {
@@ -1332,7 +1332,7 @@ impl NodeService {
                 error: result.err().map(Into::into),
             }));
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -1378,7 +1378,7 @@ impl NodeService {
             "update_metadata",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let file_info = match decode_msgpack_or_json::<FileInfo>(&request.file_info_bin, &request.file_info, "FileInfo") {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -1504,7 +1504,7 @@ impl NodeService {
         let request = request.into_inner();
         let operation: NativeRecoveryRequest = rustfs_protos::decode_pool_meta_native_recovery_payload(&request.payload)
             .map_err(|_| Status::invalid_argument("invalid native pool metadata recovery payload"))?;
-        let result = match self.find_disk(&request.disk).await {
+        let result = match self.find_disk(&request.disk).await? {
             Some(disk) => {
                 crate::storage::storage_api::ecstore_disk::DiskAPI::pool_meta_native_recovery(disk.as_ref(), operation).await
             }
@@ -1536,7 +1536,7 @@ impl NodeService {
         request: Request<ReadMetadataRequest>,
     ) -> Result<Response<ReadMetadataResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.read_metadata(&request.volume, &request.path).await {
                 Ok(data) => Ok(Response::new(ReadMetadataResponse {
                     success: true,
@@ -1568,7 +1568,7 @@ impl NodeService {
             "delete_paths",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.delete_paths(&request.volume, &request.paths).await {
                 Ok(_) => Ok(Response::new(DeletePathsResponse {
                     success: true,
@@ -1592,7 +1592,7 @@ impl NodeService {
         request: Request<StatVolumeRequest>,
     ) -> Result<Response<StatVolumeResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.stat_volume(&request.volume).await {
                 Ok(volume_info) => match serde_json::to_string(&volume_info) {
                     Ok(volume_info) => Ok(Response::new(StatVolumeResponse {
@@ -1626,7 +1626,7 @@ impl NodeService {
         request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.list_volumes().await {
                 Ok(volume_infos) => {
                     let volume_infos = volume_infos
@@ -1675,7 +1675,7 @@ impl NodeService {
             "make_volume",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.make_volume(&request.volume).await {
                 Ok(_) => Ok(Response::new(MakeVolumeResponse {
                     success: true,
@@ -1704,7 +1704,7 @@ impl NodeService {
             "make_volumes",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.make_volumes(request.volumes.iter().map(|s| &**s).collect()).await {
                 Ok(_) => Ok(Response::new(MakeVolumesResponse {
                     success: true,
@@ -2018,7 +2018,7 @@ impl NodeService {
 
     pub(super) async fn handle_list_dir(&self, request: Request<ListDirRequest>) -> Result<Response<ListDirResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.list_dir("", &request.volume, &request.dir_path, request.count).await {
                 Ok(volumes) => Ok(Response::new(ListDirResponse {
                     success: true,
@@ -2054,7 +2054,7 @@ impl NodeService {
             "rename_file",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let result = if request.durable {
                 disk.rename_file_durable(&request.src_volume, &request.src_path, &request.dst_volume, &request.dst_path)
                     .await
@@ -2095,7 +2095,7 @@ impl NodeService {
         #[cfg(feature = "e2e-test-hooks")]
         let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             #[cfg(feature = "e2e-test-hooks")]
             super::e2e_rpc_delay::disk(
                 super::e2e_rpc_delay::Method::RenamePart,
@@ -2141,7 +2141,7 @@ impl NodeService {
             "prepare_part_transaction",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk
                 .prepare_part_transaction(
                     &request.src_volume,
@@ -2234,7 +2234,7 @@ impl NodeService {
             }
             _ => {}
         }
-        let result = if let Some(disk) = self.find_disk(&request.disk).await {
+        let result = if let Some(disk) = self.find_disk(&request.disk).await? {
             match operation {
                 DeleteRecoveryRpcOperation::Exists { object } => disk
                     .has_delete_transaction_evidence(&request.volume, &object)
@@ -2313,7 +2313,7 @@ impl NodeService {
             "settle_part_transaction",
         )?;
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let action = if request.rollback {
                 PartTransactionAction::Rollback
             } else {
@@ -2342,7 +2342,7 @@ impl NodeService {
         request: Request<CheckPartsRequest>,
     ) -> Result<Response<CheckPartsResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -2391,7 +2391,7 @@ impl NodeService {
         request: Request<ReadPartsRequest>,
     ) -> Result<Response<ReadPartsResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.read_parts(&request.bucket, &request.paths).await {
                 Ok(data) => {
                     let data = match rmp_serde::to_vec(&data) {
@@ -2431,7 +2431,7 @@ impl NodeService {
         request: Request<VerifyFileRequest>,
     ) -> Result<Response<VerifyFileResponse>, Status> {
         let request = request.into_inner();
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let file_info = match serde_json::from_str::<FileInfo>(&request.file_info) {
                 Ok(file_info) => file_info,
                 Err(err) => {
@@ -2519,7 +2519,7 @@ impl NodeService {
                 error: result.err().map(Into::into),
             }));
         }
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let options = match serde_json::from_str::<DeleteOptions>(&request.options) {
                 Ok(options) => options,
                 Err(err) => {
@@ -2611,7 +2611,7 @@ impl NodeService {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             data_len,
         );
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.write_all(&request.volume, &request.path, request.data).await {
                 Ok(_) => Ok(Response::new(WriteAllResponse {
                     success: true,
@@ -2662,7 +2662,7 @@ impl NodeService {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             data_len,
         );
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk
                 .compare_and_update_file(&request.volume, &request.path, request.expected, request.replacement)
                 .await
@@ -2710,7 +2710,7 @@ impl NodeService {
             INTERNODE_OPERATION_GRPC_READ_ALL,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
         );
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             match disk.read_all(&request.volume, &request.path).await {
                 Ok(data) => {
                     metrics.record_sent_bytes_for_operation_and_backend(

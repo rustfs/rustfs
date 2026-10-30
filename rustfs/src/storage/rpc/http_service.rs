@@ -15,11 +15,13 @@
 use crate::server::RPC_PREFIX;
 use crate::storage::request_context::spawn_traced;
 use crate::storage::storage_api::rpc_consumer::http_service::{
-    DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore, NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse,
-    PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1, PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, StorageDiskRpcExt as _,
-    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, check_and_record_signed_rpc_nonce, find_local_disk_by_ref,
-    sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, verify_put_file_auth_trailer,
-    verify_rpc_signature,
+    BackgroundPipeWriter, BackgroundReaderStream, DEFAULT_READ_BUFFER_SIZE, DeleteOptions, DiskStore,
+    NS_SCANNER_PROTOCOL_VERSION, NsScannerCapabilityResponse, PUT_FILE_AUTH_TRAILER_LEN, PUT_FILE_AUTH_V1,
+    PUT_FILE_CAPABILITY_VERSION, PutFileCapabilityResponse, RemoteBackgroundIo, StorageDiskRpcExt as _,
+    WALK_DIR_STREAM_COMPLETION_V1, WalkDirOptions, background_pipe, check_and_record_signed_rpc_nonce,
+    find_local_disk_by_ref_for_rpc, rpc_background_admission, sign_ns_scanner_capability_with_checkpoint_coverage,
+    sign_put_file_capability, verify_put_file_auth_trailer, verify_rpc_signature, with_remote_background_io,
+    with_rpc_background_request,
 };
 #[cfg(test)]
 use crate::storage::storage_api::rpc_consumer::http_service::{
@@ -55,7 +57,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
 use tokio::sync::{Mutex, oneshot};
-use tokio_util::{io::ReaderStream, sync::CancellationToken};
+use tokio_util::sync::CancellationToken;
 use tower::Service;
 use tracing::{error, warn};
 
@@ -424,38 +426,64 @@ async fn handle_internode_rpc(req: Request<Incoming>) -> Response<Body> {
         return response;
     }
 
-    let method = req.method().clone();
-    let path = req.uri().path();
-
-    let response = match (method, path) {
-        (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
-        (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
-        (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
-            Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
-                Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
-                    challenge,
-                    query.ns_scanner_tier_registry_generation == Some(true),
-                    query.ns_scanner_checkpoint_coverage == Some(true),
-                ),
-                Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
+    let wire_background = match rpc_background_admission(req.headers()) {
+        Ok(background) => background,
+        Err(_) => {
+            return response_with_status(StatusCode::FORBIDDEN, "invalid background admission request");
+        }
+    };
+    let local_admission = if wire_background || (req.method() == Method::POST && req.uri().path() == NS_SCANNER_PATH) {
+        crate::startup_background::background_node_admission()
+    } else {
+        None
+    };
+    if wire_background && local_admission.is_none() {
+        return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background resource admission is not enabled");
+    }
+    let inferred_background = !wire_background && local_admission.is_some();
+    let response_future = with_remote_background_io(local_admission.map(RemoteBackgroundIo::new), async move {
+        let method = req.method().clone();
+        let path = req.uri().path();
+        let response = match (method, path) {
+            (Method::GET, READ_FILE_STREAM_PATH) | (Method::HEAD, READ_FILE_STREAM_PATH) => handle_read_file(req).await,
+            (Method::GET, WALK_DIR_PATH) | (Method::HEAD, WALK_DIR_PATH) => handle_walk_dir(req).await,
+            (Method::GET, NS_SCANNER_PATH) => match parse_query::<NsScannerCapabilityQuery>(&req) {
+                Ok(query) if query.ns_scanner_protocol == Some(NS_SCANNER_PROTOCOL_VERSION) => match query.ns_scanner_challenge {
+                    Some(challenge) if !challenge.is_nil() => ns_scanner_capability_response(
+                        challenge,
+                        query.ns_scanner_tier_registry_generation == Some(true),
+                        query.ns_scanner_checkpoint_coverage == Some(true),
+                    ),
+                    Some(_) | None => response_with_status(StatusCode::BAD_REQUEST, "namespace scanner challenge is invalid"),
+                },
+                Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
+                Err(response) => *response,
             },
-            Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "namespace scanner protocol is unsupported"),
-            Err(response) => *response,
-        },
-        (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
-        (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
-            Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
-                match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
-                    Some(challenge) => put_file_capability_response(challenge),
-                    None => response_with_status(StatusCode::BAD_REQUEST, "put_file capability challenge is invalid"),
+            (Method::POST, NS_SCANNER_PATH) => handle_ns_scanner(req).await,
+            (Method::GET, PUT_FILE_CAPABILITY_PATH) => match parse_query::<PutFileCapabilityQuery>(&req) {
+                Ok(query) if query.put_file_capability == Some(PUT_FILE_CAPABILITY_VERSION) => {
+                    match query.put_file_challenge.filter(|challenge| !challenge.is_nil()) {
+                        Some(challenge) => put_file_capability_response(challenge),
+                        None => response_with_status(StatusCode::BAD_REQUEST, "put_file capability challenge is invalid"),
+                    }
                 }
-            }
-            Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
-            Err(response) => *response,
-        },
-        (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
-        (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
-        _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+                Ok(_) => response_with_status(StatusCode::UPGRADE_REQUIRED, "put_file capability is unsupported"),
+                Err(response) => *response,
+            },
+            (Method::PUT, PUT_FILE_STREAM_PATH) => handle_put_file(req, false).await,
+            (Method::PUT, PUT_FILE_AUTH_STREAM_PATH) => handle_put_file(req, true).await,
+            _ => response_with_status(StatusCode::NOT_FOUND, "internode rpc route not found"),
+        };
+        if !response.status().is_success() {
+            RemoteBackgroundIo::discard_current_progress();
+        }
+        response
+    });
+    let response = if inferred_background {
+        // Local admission must not change the wire class of nested RPC signatures.
+        with_rpc_background_request(wire_background, response_future).await
+    } else {
+        response_future.await
     };
 
     if !response.status().is_success() {
@@ -638,7 +666,11 @@ async fn handle_read_file(req: Request<Incoming>) -> Response<Body> {
         Err(response) => return *response,
     };
 
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -725,9 +757,32 @@ where
     } else {
         u64::try_from(length).unwrap_or(u64::MAX)
     };
-    ReaderStream::with_capacity(reader.take(read_limit), read_buffer_size).map_ok(move |bytes| {
-        metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
-        bytes
+    let mut reader = BackgroundReaderStream::with_capacity(reader.take(read_limit), read_buffer_size);
+    let mut completion = RemoteBackgroundIo::take_current_completion();
+    let mut remaining = (length != 0).then_some(length);
+    stream::poll_fn(move |cx| {
+        let chunk = std::task::ready!(Pin::new(&mut reader).poll_next(cx));
+        match &chunk {
+            Some(Ok(bytes)) => {
+                metrics.record_sent_bytes_for_operation_and_backend(operation, INTERNODE_TRANSPORT_BACKEND_TCP_HTTP, bytes.len());
+                if let Some(remaining) = &mut remaining {
+                    *remaining -= bytes.len();
+                    // A Content-Length response may never poll the source EOF.
+                    if *remaining == 0
+                        && let Some(completion) = completion.take()
+                    {
+                        completion.complete();
+                    }
+                }
+            }
+            None if remaining.is_none() => {
+                if let Some(completion) = completion.take() {
+                    completion.complete();
+                }
+            }
+            Some(Err(_)) | None => drop(completion.take()),
+        }
+        Poll::Ready(chunk)
     })
 }
 
@@ -748,7 +803,11 @@ async fn handle_walk_dir(req: Request<Incoming>) -> Response<Body> {
         Ok(query) => query,
         Err(response) => return *response,
     };
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -950,7 +1009,11 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
         );
         return response_with_status(StatusCode::CONFLICT, "namespace scanner server epoch is stale");
     }
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         warn!(
             event = EVENT_RPC_REQUEST_REJECTED,
             component = LOG_COMPONENT_INTERNODE_RPC,
@@ -1186,7 +1249,8 @@ async fn handle_ns_scanner(req: Request<Incoming>) -> Response<Body> {
     let log_disk = query.disk;
     let response_body = ns_scanner_response_body(move |writer, disconnect| async move {
         let _admission = admission;
-        rustfs_scanner::serve_remote_scanner_request(disk, request, writer, disconnect)
+        let memory = writer.memory_budget();
+        rustfs_scanner::serve_remote_scanner_request_with_memory(disk, request, writer, disconnect, memory)
             .await
             .map_err(|err| {
                 error!(
@@ -1234,23 +1298,28 @@ async fn walk_dir_response_body<F, Fut>(
     producer: F,
 ) -> Result<Body, DiskError>
 where
-    F: FnOnce(tokio::io::DuplexStream) -> Fut + Send + 'static,
+    F: FnOnce(BackgroundPipeWriter) -> Fut + Send + 'static,
     Fut: Future<Output = Result<(), DiskError>> + Send + 'static,
 {
-    let (reader, writer) = tokio::io::duplex(DEFAULT_READ_BUFFER_SIZE);
+    let (reader, writer) = background_pipe(DEFAULT_READ_BUFFER_SIZE);
+    let reader = BackgroundReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
-    spawn_traced(async move {
+    let resource_context = RemoteBackgroundIo::take_current();
+    spawn_traced(with_remote_background_io(resource_context, async move {
         tokio::select! {
             biased;
             result = producer(writer) => {
+                if result.is_err() {
+                    RemoteBackgroundIo::discard_current_progress();
+                }
                 let _ = completion_tx.send(result);
             }
-            _ = completion_tx.closed() => {}
+            _ = completion_tx.closed() => RemoteBackgroundIo::discard_current_progress(),
         }
-    });
+    }));
 
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(reader, DEFAULT_READ_BUFFER_SIZE).map_ok(move |bytes| {
+    let stream = reader.map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_WALK_DIR,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
@@ -1319,12 +1388,16 @@ where
 
 fn ns_scanner_response_body<F, Fut>(producer: F) -> Body
 where
-    F: FnOnce(tokio::io::DuplexStream, CancellationToken) -> Fut + Send + 'static,
+    F: FnOnce(BackgroundPipeWriter, CancellationToken) -> Fut + Send + 'static,
     Fut: Future<Output = io::Result<()>> + Send + 'static,
 {
-    let (reader, writer) = tokio::io::duplex(NS_SCANNER_STREAM_BUFFER_SIZE);
+    let (reader, writer) = background_pipe(NS_SCANNER_STREAM_BUFFER_SIZE);
+    let reader = BackgroundReaderStream::with_capacity(reader, NS_SCANNER_STREAM_BUFFER_SIZE);
     let (mut completion_tx, completion_rx) = oneshot::channel();
     let disconnect = CancellationToken::new();
+    // Scanner reacquires each operation outside its cache lease. Carrying the
+    // preflight node unit into that scheduler would deadlock at capacity one.
+    drop(RemoteBackgroundIo::take_current());
     spawn_traced(async move {
         let producer = producer(writer, disconnect.clone());
         tokio::pin!(producer);
@@ -1341,7 +1414,7 @@ where
     });
 
     let metrics = runtime_sources::current_internode_metrics();
-    let stream = ReaderStream::with_capacity(reader, NS_SCANNER_STREAM_BUFFER_SIZE).map_ok(move |bytes| {
+    let stream = reader.map_ok(move |bytes| {
         metrics.record_sent_bytes_for_operation_and_backend(
             INTERNODE_OPERATION_NS_SCANNER,
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
@@ -1514,7 +1587,11 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
         return response_with_status(StatusCode::FORBIDDEN, format!("invalid put_file auth: {e}"));
     }
 
-    let Some(disk) = find_local_disk_by_ref(&query.disk).await else {
+    let disk = match find_local_disk_by_ref_for_rpc(&query.disk).await {
+        Ok(disk) => disk,
+        Err(_) => return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "background storage admission deferred"),
+    };
+    let Some(disk) = disk else {
         log_internode_rpc_response_failure!(
             StatusCode::BAD_REQUEST,
             &path,
@@ -1823,6 +1900,9 @@ fn put_file_stage_error_message(stage: &str, query: &PutFileQuery, err: &dyn std
 }
 
 #[cfg(test)]
+mod namespace_memory_tests;
+
+#[cfg(test)]
 mod tests {
     use super::{
         DEFAULT_READ_BUFFER_SIZE, DiskError, InternodeRpcService, LOG_SUBSYSTEM_DIRECTORY_WALK, LOG_SUBSYSTEM_FILE_TRANSFER,
@@ -1918,6 +1998,148 @@ mod tests {
         assert_eq!(success.operation, rustfs_common::trace_bus::TelemetryTraceOperation::InternalRpc);
         assert_eq!(success.status, rustfs_common::trace_bus::TelemetryTraceStatus::Ok);
         assert!(success.duration > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn local_admission_scope_keeps_unmarked_nested_rpc_signatures() {
+        let _ = rustfs_credentials::set_global_rpc_secret("namespace-classification-test-secret".to_string());
+        let node = rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN);
+        super::with_rpc_background_request(
+            false,
+            super::with_remote_background_io(Some(super::RemoteBackgroundIo::new(node)), async {
+                let headers = gen_signature_headers("/rustfs/rpc/read_file_stream?disk=peer", &Method::GET)
+                    .expect("nested signature should build");
+                assert!(!super::rpc_background_admission(&headers).expect("nested wire class"));
+                super::verify_rpc_signature("/rustfs/rpc/read_file_stream?disk=peer", &Method::GET, &headers)
+                    .expect("unmarked nested signature should verify");
+            }),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn namespace_post_infers_only_enabled_local_admission() {
+        const CHILD: &str = "RUSTFS_NAMESPACE_CLASSIFICATION_TEST_CHILD";
+        const TEST: &str = "storage::rpc::http_service::tests::namespace_post_infers_only_enabled_local_admission";
+        let mode = match std::env::var(CHILD) {
+            Ok(mode) => mode,
+            Err(_) => {
+                for mode in ["enabled", "disabled"] {
+                    let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                        .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                        .env(CHILD, mode)
+                        .output()
+                        .expect("isolated namespace classification test");
+                    assert!(
+                        output.status.success(),
+                        "namespace classification {mode}: {}{}",
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    assert!(String::from_utf8_lossy(&output.stdout).contains("NAMESPACE_CLASSIFICATION_OK"));
+                }
+                return;
+            }
+        };
+        let enabled = mode == "enabled";
+        let _ = rustfs_credentials::set_global_rpc_secret("namespace-classification-test-secret".to_string());
+        if enabled {
+            crate::startup_background::install_background_node_admission_for_test(
+                rustfs_concurrency::adaptive::NodeAdmission::new(std::num::NonZeroU16::MIN),
+            );
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("test listener");
+        let address = listener.local_addr().expect("test listener address");
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.expect("accept namespace classification connection");
+            let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+            server_http1::Builder::new()
+                .serve_connection(TokioIo::new(socket), TowerToHyperService::new(InternodeRpcService::new(fallback)))
+                .await
+                .expect("namespace classification connection");
+        });
+        let (mut sender, connection) =
+            client_http1::handshake(TokioIo::new(TcpStream::connect(address).await.expect("test client connection")))
+                .await
+                .expect("HTTP handshake");
+        let client = tokio::spawn(async move { connection.await.expect("client connection") });
+        let missing_disk = uuid::Uuid::new_v4();
+        let namespace_uri = format!(
+            "{NS_SCANNER_PATH}?disk={missing_disk}&ns_scanner_request_id={}&ns_scanner_server_epoch={}&ns_scanner_session_id={}&ns_scanner_session_sequence=0&ns_scanner_cycle=0&ns_scanner_leader_epoch=0",
+            uuid::Uuid::new_v4(),
+            *super::NS_SCANNER_SERVER_EPOCH,
+            uuid::Uuid::new_v4()
+        );
+        let capability_uri = format!(
+            "{NS_SCANNER_PATH}?ns_scanner_protocol={}&ns_scanner_challenge={}",
+            super::NS_SCANNER_PROTOCOL_VERSION,
+            uuid::Uuid::new_v4()
+        );
+        for (method, uri, wire_background, tamper, expected) in [
+            (
+                Method::POST,
+                namespace_uri.clone(),
+                false,
+                false,
+                if enabled {
+                    StatusCode::SERVICE_UNAVAILABLE
+                } else {
+                    StatusCode::BAD_REQUEST
+                },
+            ),
+            (Method::POST, namespace_uri.clone(), true, false, StatusCode::SERVICE_UNAVAILABLE),
+            (Method::POST, namespace_uri.clone(), true, true, StatusCode::FORBIDDEN),
+            (Method::GET, capability_uri, false, false, StatusCode::OK),
+            (
+                Method::GET,
+                format!("{WALK_DIR_PATH}?disk={missing_disk}"),
+                false,
+                false,
+                StatusCode::BAD_REQUEST,
+            ),
+        ] {
+            let mut headers = super::with_rpc_background_request(wire_background, async {
+                gen_signature_headers(&uri, &method).expect("request signature")
+            })
+            .await;
+            assert_eq!(super::rpc_background_admission(&headers).expect("original wire class"), wire_background);
+            if tamper {
+                headers.insert("x-rustfs-signature", HeaderValue::from_static("00"));
+            }
+            let mut request = Request::builder()
+                .method(method)
+                .uri(&uri)
+                .header(http::header::HOST, address.to_string())
+                .body(Empty::<Bytes>::new())
+                .expect("classification request");
+            request.headers_mut().extend(headers);
+            let response = sender.send_request(request).await.expect("classification response");
+            assert_eq!(
+                response.status(),
+                expected,
+                "mode={mode}, wire_background={wire_background}, tamper={tamper}, uri={uri}"
+            );
+            let body = response
+                .into_body()
+                .collect()
+                .await
+                .expect("drain classification response")
+                .to_bytes();
+            if uri == namespace_uri && !tamper {
+                let expected_body = if !enabled && wire_background {
+                    "background resource admission is not enabled"
+                } else if enabled {
+                    "background storage admission deferred"
+                } else {
+                    "disk not found"
+                };
+                assert_eq!(body.as_ref(), expected_body.as_bytes());
+            }
+        }
+        drop(sender);
+        client.await.expect("client task");
+        server.await.expect("server task");
+        println!("NAMESPACE_CLASSIFICATION_OK");
     }
 
     #[tokio::test]
@@ -3032,6 +3254,150 @@ mod tests {
                 .expect("final data should be readable"),
             Bytes::from_static(b"old-datalegacyauthenticated")
         );
+    }
+
+    #[tokio::test]
+    async fn background_pipe_memory_denial_fails_walk_and_namespace_bodies() {
+        const CHILD: &str = "RUSTFS_PIPE_MEMORY_TEST_CHILD";
+        const TEST: &str = "storage::rpc::http_service::tests::background_pipe_memory_denial_fails_walk_and_namespace_bodies";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated process memory owner test");
+            assert!(
+                output.status.success(),
+                "background pipe memory: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("BACKGROUND_PIPE_MEMORY_OK"));
+            return;
+        }
+
+        use crate::storage::storage_api::ecstore_disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        let memory = crate::storage_api::startup::background::BackgroundMemoryBudget::new();
+        assert!(memory.install(), "install the isolated process memory owner");
+        let physical = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        for mode in ["legacy", "capable", "namespace"] {
+            let capacity = if mode == "namespace" {
+                super::NS_SCANNER_STREAM_BUFFER_SIZE
+            } else {
+                DEFAULT_READ_BUFFER_SIZE
+            };
+            memory.set_sampled_limit(u64::try_from(capacity).expect("capacity fits u64"), Duration::from_secs(30));
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let body = with_background_resource_unit(physical.try_acquire().expect("physical admission"), async {
+                if mode == "namespace" {
+                    ns_scanner_response_body(move |mut writer, _| async move {
+                        release_rx.await.expect("release namespace producer");
+                        writer.write_all(b"namespace").await
+                    })
+                } else {
+                    walk_dir_response_body(mode == "capable", false, move |mut writer| async move {
+                        release_rx.await.expect("release directory producer");
+                        writer.write_all(b"directory").await?;
+                        Ok(())
+                    })
+                    .await
+                    .expect("prepare directory stream")
+                }
+            })
+            .await;
+            assert_eq!(physical.snapshot().active, 0, "the escaped pipe must not retain disk capacity");
+            let collected = BodyExt::collect(body);
+            tokio::pin!(collected);
+            assert!(futures_util::poll!(&mut collected).is_pending());
+            assert_eq!(memory.snapshot().used, u64::try_from(capacity).expect("capacity fits u64"));
+            release_tx
+                .send(())
+                .expect("release the producer after output staging reserves the budget");
+            tokio::time::timeout(Duration::from_secs(2), &mut collected)
+                .await
+                .expect("bounded failed body")
+                .expect_err("pipe admission denial must not turn into successful empty EOF");
+            assert_eq!(memory.snapshot().used, 0, "failed body must release its output allocation");
+        }
+        println!("BACKGROUND_PIPE_MEMORY_OK");
+    }
+
+    #[tokio::test]
+    async fn namespace_encode_allocation_failure_terminates_http_body() {
+        const CHILD: &str = "RUSTFS_NAMESPACE_ENCODE_MEMORY_TEST_CHILD";
+        const TEST: &str = "storage::rpc::http_service::tests::namespace_encode_allocation_failure_terminates_http_body";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("isolated namespace encoding memory owner");
+            assert!(
+                output.status.success(),
+                "namespace encoding memory: {}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(String::from_utf8_lossy(&output.stdout).contains("NAMESPACE_ENCODE_MEMORY_OK"));
+            return;
+        }
+
+        use crate::storage::storage_api::ecstore_disk::with_background_resource_unit;
+        use crate::storage::storage_api::rpc_consumer::http_service::BackgroundEncodeBuffer;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+        use std::sync::Arc;
+        let memory = crate::storage_api::startup::background::BackgroundMemoryBudget::new();
+        assert!(memory.install(), "install the isolated process memory owner");
+        let physical = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let capacity = super::NS_SCANNER_STREAM_BUFFER_SIZE;
+        for phase in ["payload", "envelope"] {
+            memory.set_sampled_limit(u64::try_from(2 * capacity).expect("budget fits u64"), Duration::from_secs(30));
+            let source = vec![0_u8; if phase == "payload" { capacity + 1 } else { capacity / 2 }];
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+            let producer_memory = memory.clone();
+            let body = with_background_resource_unit(physical.try_acquire().expect("physical admission"), async {
+                ns_scanner_response_body(move |writer, _| async move {
+                    release_rx.await.expect("release namespace encoding producer");
+                    let captured = writer.memory_budget().expect("pipe retains the admitted memory owner");
+                    assert!(Arc::ptr_eq(&captured, &producer_memory));
+                    let mut payload = BackgroundEncodeBuffer::new(captured.clone(), 2 * capacity);
+                    let mut envelope = BackgroundEncodeBuffer::new(captured.clone(), 2 * capacity);
+                    let result = if phase == "payload" {
+                        std::io::Write::write_all(&mut payload, &source)
+                    } else {
+                        std::io::Write::write_all(&mut payload, &source).expect("inner payload fits");
+                        std::io::Write::write_all(&mut envelope, &source).expect("initial envelope storage fits");
+                        std::io::Write::write_all(&mut envelope, &[1])
+                    };
+                    let error = result.expect_err("encoding must fail before attempting a pipe write");
+                    failure_tx
+                        .send((error.kind(), captured.snapshot().used))
+                        .expect("record the actual encoding failure");
+                    Err(error)
+                })
+            })
+            .await;
+            assert_eq!(physical.snapshot().active, 0, "encoding does not retain physical admission");
+            let collected = BodyExt::collect(body);
+            tokio::pin!(collected);
+            assert!(futures_util::poll!(&mut collected).is_pending());
+            assert_eq!(memory.snapshot().used, u64::try_from(capacity).expect("reader storage fits u64"));
+            release_tx.send(()).expect("release the encoding producer");
+            tokio::time::timeout(Duration::from_secs(2), &mut collected)
+                .await
+                .expect("bounded encoding failure")
+                .expect_err("encoding denial must not become successful empty EOF");
+            let (kind, retained) = failure_rx.await.expect("the producer reached encoding admission");
+            assert_eq!(kind, io::ErrorKind::WouldBlock);
+            let expected = if phase == "payload" { capacity } else { 2 * capacity };
+            assert_eq!(retained, u64::try_from(expected).expect("retained storage fits u64"));
+            assert_eq!(memory.snapshot().used, 0, "failed encoding and body release every allocation");
+        }
+        println!("NAMESPACE_ENCODE_MEMORY_OK");
     }
 
     #[tokio::test]

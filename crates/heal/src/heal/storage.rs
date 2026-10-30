@@ -17,17 +17,22 @@ use async_trait::async_trait;
 use base64_simd::URL_SAFE_NO_PAD;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_concurrency::adaptive::NodeAdmission;
+use rustfs_concurrency::adaptive::permit_set::NodeResourcePermit;
 use rustfs_heal_contracts::heal_channel::{DriveState, HealOpts, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
 use serde::{Deserialize, Serialize};
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, warn};
 use uuid::Uuid;
 
 use super::outcome::{HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectReceipt};
 use super::progress::stable_generation;
 pub use super::replacement_execution::ReplacementExecution;
-use super::storage_api::owner::{EcstoreHealLifecycleExpiryContext, ecstore_load_admin_data_usage_from_backend_cached};
+use super::storage_api::owner::{
+    EcstoreHealLifecycleExpiryContext, PhysicalResourcePlan, ecstore_load_admin_data_usage_from_backend_cached,
+    ecstore_with_background_resource_set,
+};
 use super::storage_api::storage::{
     BucketInfo, BucketOperations, DiskSetSelector, EcstoreHealObjectStorageResult, HealOperations as _, ListOperations as _,
     ObjectIO as _, ObjectOperations as _, StorageAdminApi,
@@ -135,6 +140,10 @@ fn verified_object_receipt(
     } else {
         Some(resolved_version.to_string())
     };
+    let quorum_selected_data_dir = item
+        .quorum_selected_data_dir
+        .map(Uuid::from_bytes)
+        .filter(|generation| !generation.is_nil());
     Some(HealObjectReceipt {
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
@@ -154,6 +163,8 @@ fn verified_object_receipt(
         } else {
             return None;
         },
+        quorum_selected_data_dir,
+        deep_check_observed: item.integrity_verified && quorum_selected_data_dir.is_some(),
     })
 }
 
@@ -423,6 +434,11 @@ pub struct HealListItem {
 /// Heal storage layer interface
 #[async_trait]
 pub trait HealStorageAPI: Send + Sync {
+    /// Existing process scheduling capability; snapshots alone do not admit I/O.
+    fn background_node_admission(&self) -> Option<Arc<NodeAdmission>> {
+        None
+    }
+
     /// Delete one exact marker from every member of its original erasure set.
     async fn purge_delete_marker(
         &self,
@@ -566,6 +582,22 @@ pub trait HealStorageAPI: Send + Sync {
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)>;
 
+    /// Preserve an issued replacement mutation while yielding its task's node
+    /// scheduling unit on logical cancellation. New objects remain fenced.
+    async fn heal_object_with_task_cancel(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        task_cancel: &CancellationToken,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        if task_cancel.is_cancelled() {
+            return Err(Error::TaskCancelled);
+        }
+        self.heal_object(bucket, object, version_id, opts).await
+    }
+
     async fn heal_object_with_receipt(
         &self,
         bucket: &str,
@@ -702,7 +734,13 @@ pub trait HealStorageAPI: Send + Sync {
     /// Return every formatted disk that may durably host or expose a
     /// replacement intent. Implementations should order local disks first so
     /// discovery remains deterministic and preserves the local preference.
-    async fn replacement_intent_disks(&self, _set_disk_id: &str) -> Result<Vec<DiskStore>> {
+    /// A supplied token uses attached admission for known-local probes; None
+    /// keeps startup discovery on its original direct path.
+    async fn replacement_intent_disks(
+        &self,
+        _set_disk_id: &str,
+        _cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<DiskStore>> {
         Ok(Vec::new())
     }
 
@@ -749,30 +787,160 @@ pub trait HealStorageAPI: Send + Sync {
     }
 }
 
+// One bounded local metadata operation owns only its selected disk. Permanent
+// tickers retain the controller capability, never a permit between operations.
+pub(super) async fn run_local_metadata<T>(
+    disk: &super::DiskStore,
+    admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    cancellation: &CancellationToken,
+    operation: impl Future<Output = T>,
+) -> Result<T> {
+    let Some(admission) = admission else {
+        return Ok(operation.await);
+    };
+    let plan = disk
+        .physical_admission()
+        .and_then(|binding| binding.plan())
+        .ok_or_else(|| Error::transient_skip("local metadata physical resource discovery unavailable"))?;
+    let permit = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => return Err(Error::transient_skip("local metadata admission cancelled")),
+        result = tokio::time::timeout(Duration::from_millis(250), plan.acquire(admission)) => {
+            result.ok().flatten()
+                .ok_or_else(|| Error::transient_skip("local metadata node or physical resource admission deferred"))?
+        }
+    };
+    if !plan.is_current() {
+        return Err(Error::transient_skip("local metadata physical resource discovery expired"));
+    }
+    use super::storage_api::owner::{
+        ecstore_with_background_disk_io, ecstore_with_background_resource_set, ecstore_with_rpc_background_request,
+    };
+    let mut operation = std::pin::pin!(ecstore_with_rpc_background_request(
+        false,
+        ecstore_with_background_disk_io(
+            cancellation.clone(),
+            ecstore_with_background_resource_set(permit.resources().clone(), operation),
+        ),
+    ));
+    let mut started = false;
+    let selected = tokio::select! {
+        biased;
+        _ = cancellation.cancelled() => None,
+        result = std::future::poll_fn(|cx| {
+            started = true;
+            std::future::Future::poll(operation.as_mut(), cx)
+        }) => Some(result),
+    };
+    // Cancellation yields only the node unit; the same started operation owns
+    // its physical/native resources until it finishes. Never credit diagnostics.
+    drop(permit);
+    match selected {
+        Some(result) => Ok(result),
+        None if started => Ok(operation.await),
+        None => Err(Error::transient_skip("local metadata cancelled before first poll")),
+    }
+}
+
+// An object heal future is hundreds of KiB and unoptimized builds copy it into
+// every awaiting frame. Create it here, where the temporary leaves the stack as
+// soon as it is boxed, so the admission layers carry only a pointer.
+fn boxed_object_operation<F, Fut>(operation: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+{
+    Box::pin(operation())
+}
+
 // Scheduling precedes the operation's first poll and therefore its namespace
 // locks. No-lock callers may already own a namespace lock: never park them.
 async fn run_background_object<T>(
     admission: Option<&Arc<NodeAdmission>>,
+    physical_plan: impl FnOnce() -> Result<Option<PhysicalResourcePlan>>,
     opts: &HealOpts,
     completed: impl FnOnce(&T) -> bool,
     operation: impl std::future::Future<Output = Result<T>>,
 ) -> Result<T> {
+    run_background_object_inner(admission, physical_plan, opts, None, completed, operation).await
+}
+
+async fn run_background_object_inner<T>(
+    admission: Option<&Arc<NodeAdmission>>,
+    physical_plan: impl FnOnce() -> Result<Option<PhysicalResourcePlan>>,
+    opts: &HealOpts,
+    task_cancel: Option<&CancellationToken>,
+    completed: impl FnOnce(&T) -> bool,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    if task_cancel.is_some_and(CancellationToken::is_cancelled) {
+        return Err(Error::TaskCancelled);
+    }
     let Some(admission) = admission else {
         return operation.await;
     };
-    let permit = if opts.no_lock {
-        admission.try_acquire()
-    } else {
-        tokio::time::timeout(std::time::Duration::from_millis(250), admission.acquire())
-            .await
-            .ok()
+    let plan = physical_plan()?.ok_or_else(|| Error::transient_skip("physical resource discovery unavailable"))?;
+    let acquire = async {
+        if opts.no_lock {
+            plan.try_acquire(admission)
+        } else {
+            tokio::time::timeout(std::time::Duration::from_millis(250), plan.acquire(admission))
+                .await
+                .ok()
+                .flatten()
+        }
+    };
+    let permit = match task_cancel {
+        Some(cancel) => tokio::select! {
+            biased;
+            _ = cancel.cancelled() => return Err(Error::TaskCancelled),
+            permit = acquire => permit,
+        },
+        None => acquire.await,
     }
-    .ok_or_else(|| Error::transient_skip("node resource admission deferred"))?;
-    let result = operation.await;
+    .ok_or_else(|| Error::transient_skip("node or physical resource admission deferred"))?;
+    if let Some(cancel) = task_cancel {
+        return await_admitted_object(permit, opts, cancel, completed, operation).await;
+    }
+    let result = ecstore_with_background_resource_set(permit.resources().clone(), operation).await;
     if !opts.dry_run && result.as_ref().is_ok_and(completed) {
         permit.complete();
     }
     result
+}
+
+// The permit accounts for one logical object, not each shard/native dispatch.
+// Physical units live in the pinned operation scope after scheduling is yielded.
+async fn await_admitted_object<T>(
+    permit: NodeResourcePermit,
+    opts: &HealOpts,
+    task_cancel: &CancellationToken,
+    completed: impl FnOnce(&T) -> bool,
+    operation: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    let mut operation = std::pin::pin!(ecstore_with_background_resource_set(permit.resources().clone(), operation));
+    let mut started = false;
+    let selected = {
+        tokio::select! {
+            biased;
+            _ = task_cancel.cancelled() => None,
+            result = std::future::poll_fn(|cx| {
+                started = true;
+                std::future::Future::poll(operation.as_mut(), cx)
+            }) => Some(result),
+        }
+    };
+    match selected {
+        None => {
+            drop(permit);
+            if started { operation.await } else { Err(Error::TaskCancelled) }
+        }
+        Some(result) => {
+            if !task_cancel.is_cancelled() && !opts.dry_run && result.as_ref().is_ok_and(completed) {
+                permit.complete();
+            }
+            result
+        }
+    }
 }
 
 /// ECStore Heal storage layer implementation
@@ -794,6 +962,50 @@ impl ECStoreHealStorage {
     pub fn with_admission(mut self, admission: Option<Arc<NodeAdmission>>) -> Self {
         self.admission = admission;
         self
+    }
+
+    async fn heal_object_admitted(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        task_cancel: Option<&CancellationToken>,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        run_background_object_inner(
+            self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
+            opts,
+            task_cancel,
+            |result: &(HealResultItem, Option<Error>)| result.1.is_none(),
+            boxed_object_operation(|| async {
+                debug!(
+                    target: "rustfs::heal::storage",
+                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_STORAGE,
+                    operation = "heal_object",
+                    bucket,
+                    object,
+                    version_id = ?version_id,
+                    scan_mode = %opts.scan_mode.as_str(),
+                    dry_run = opts.dry_run,
+                    state = "started",
+                    "Heal storage repair started"
+                );
+
+                let version_id_str = version_id.unwrap_or("");
+
+                Self::adapt_object_heal_result(
+                    bucket,
+                    object,
+                    version_id,
+                    opts,
+                    self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
+                )
+            }),
+        )
+        .await
     }
 
     fn adapt_object_heal_result(
@@ -880,6 +1092,8 @@ impl ECStoreHealStorage {
                 })
             {
                 Some(HealObjectReceipt {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Object,
                         bucket: proof.bucket,
@@ -1016,6 +1230,10 @@ fn is_transient_object_exists_error(err: &StorageError) -> bool {
 
 #[async_trait]
 impl HealStorageAPI for ECStoreHealStorage {
+    fn background_node_admission(&self) -> Option<Arc<NodeAdmission>> {
+        self.admission.clone()
+    }
+
     async fn purge_delete_marker(
         &self,
         bucket: &str,
@@ -1033,6 +1251,8 @@ impl HealStorageAPI for ECStoreHealStorage {
             item: HealResultItem::default(),
             error: None,
             receipt: Some(HealObjectReceipt {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity: HealObjectIdentity {
                     kind: HealObjectKind::DeleteMarkerPurge,
                     bucket: bucket.to_owned(),
@@ -1079,9 +1299,10 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
@@ -1090,7 +1311,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
                     .await)
-            },
+            }),
         )
         .await
     }
@@ -1105,9 +1326,10 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
@@ -1116,7 +1338,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
                     .await)
-            },
+            }),
         )
         .await
     }
@@ -1547,38 +1769,19 @@ impl HealStorageAPI for ECStoreHealStorage {
         version_id: Option<&str>,
         opts: &HealOpts,
     ) -> Result<(HealResultItem, Option<Error>)> {
-        run_background_object(
-            self.admission.as_ref(),
-            opts,
-            |result: &(HealResultItem, Option<Error>)| result.1.is_none(),
-            async {
-                debug!(
-                    target: "rustfs::heal::storage",
-                    event = EVENT_HEAL_STORAGE_REPAIR_OP,
-                    component = LOG_COMPONENT_HEAL,
-                    subsystem = LOG_SUBSYSTEM_STORAGE,
-                    operation = "heal_object",
-                    bucket,
-                    object,
-                    version_id = ?version_id,
-                    scan_mode = %opts.scan_mode.as_str(),
-                    dry_run = opts.dry_run,
-                    state = "started",
-                    "Heal storage repair started"
-                );
+        self.heal_object_admitted(bucket, object, version_id, opts, None).await
+    }
 
-                let version_id_str = version_id.unwrap_or("");
-
-                Self::adapt_object_heal_result(
-                    bucket,
-                    object,
-                    version_id,
-                    opts,
-                    self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
-                )
-            },
-        )
-        .await
+    async fn heal_object_with_task_cancel(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        opts: &HealOpts,
+        task_cancel: &CancellationToken,
+    ) -> Result<(HealResultItem, Option<Error>)> {
+        self.heal_object_admitted(bucket, object, version_id, opts, Some(task_cancel))
+            .await
     }
 
     async fn heal_object_with_receipt(
@@ -1590,9 +1793,10 @@ impl HealStorageAPI for ECStoreHealStorage {
     ) -> Result<HealStorageObjectResult> {
         run_background_object(
             self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
@@ -1601,7 +1805,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, None)
                     .await)
-            },
+            }),
         )
         .await
     }
@@ -2045,15 +2249,35 @@ impl HealStorageAPI for ECStoreHealStorage {
         })
     }
 
-    async fn replacement_intent_disks(&self, set_disk_id: &str) -> Result<Vec<DiskStore>> {
+    async fn replacement_intent_disks(
+        &self,
+        set_disk_id: &str,
+        cancellation: Option<&CancellationToken>,
+    ) -> Result<Vec<DiskStore>> {
         let disks = self.resume_disk_inventory(set_disk_id).await?;
         let mut formatted = Vec::with_capacity(disks.len());
+        let admitted_scan = self.admission.as_ref().zip(cancellation);
         for prefer_local in [true, false] {
             for disk in &disks {
                 if disk.endpoint().is_local != prefer_local {
                     continue;
                 }
-                match disk.get_disk_id().await {
+                if admitted_scan.is_some_and(|(_, cancellation)| cancellation.is_cancelled()) {
+                    return Err(Error::transient_skip("replacement inventory admission cancelled"));
+                }
+                let disk_id = if prefer_local && let Some((admission, cancellation)) = admitted_scan {
+                    let result = run_local_metadata(disk, Some(admission), cancellation, disk.get_disk_id()).await?;
+                    if cancellation.is_cancelled() {
+                        return Err(Error::transient_skip("replacement inventory admission cancelled"));
+                    }
+                    if matches!(&result, Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock) {
+                        return Err(Error::transient_skip("replacement inventory native resources unavailable"));
+                    }
+                    result
+                } else {
+                    disk.get_disk_id().await
+                };
+                match disk_id {
                     Ok(Some(id)) if !id.is_nil() => formatted.push(disk.clone()),
                     Ok(_) | Err(DiskError::UnformattedDisk) => {}
                     Err(error) => {
@@ -2228,6 +2452,79 @@ mod tests {
         gate
     }
 
+    fn physical_plan() -> crate::Result<Option<super::PhysicalResourcePlan>> {
+        let binding = super::super::storage_api::owner::PhysicalDiskBinding::default();
+        binding
+            .set_test_capacity(vec![rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1)])
+            .expect("synthetic physical capacity");
+        Ok(Some(binding.plan().expect("live physical binding").resource_plan()))
+    }
+
+    #[tokio::test]
+    async fn object_admission_releases_node_and_retains_only_a_running_native_disk() {
+        use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+        let node = admission(true);
+        let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![disk.clone()]).expect("physical binding");
+        let plan = binding.plan().expect("physical plan").resource_plan();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let handle = tokio::spawn({
+            let node = node.clone();
+            async move {
+                super::run_background_object(Some(&node), || Ok(Some(plan)), &super::HealOpts::default(), |_: &()| true, async {
+                    ecstore_spawn_blocking_with_resource_ownership(move || {
+                        started_tx.send(()).expect("native started");
+                        release_rx.recv().expect("release native");
+                    })
+                    .await
+                    .expect("native job");
+                    Ok(())
+                })
+                .await
+            }
+        });
+        started_rx.await.expect("native dispatched");
+        assert_eq!((node.snapshot().active, disk.snapshot().active), (1, 1));
+        handle.abort();
+        assert!(handle.await.expect_err("waiter aborted").is_cancelled());
+        assert_eq!((node.snapshot().active, disk.snapshot().active), (0, 1));
+        assert_eq!((node.completed(), disk.completed()), (Some(0), Some(0)));
+        release_tx.send(()).expect("release native");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while disk.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native releases physical resource");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn object_admission_closed_physical_capacity_defers_before_storage_locks() {
+        use super::super::storage_api::owner::PhysicalDiskBinding;
+        let node = admission(true);
+        let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 0);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![disk.clone()]).expect("physical binding");
+        let plan = binding.plan().expect("physical plan").resource_plan();
+        for no_lock in [false, true] {
+            let began = tokio::time::Instant::now();
+            let opts = super::HealOpts {
+                no_lock,
+                ..Default::default()
+            };
+            let result = super::run_background_object(Some(&node), || Ok(Some(plan.clone())), &opts, |_: &()| true, async {
+                panic!("closed disk must prevent storage polling");
+            })
+            .await;
+            assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
+            assert_eq!(began.elapsed(), if no_lock { Duration::ZERO } else { Duration::from_millis(250) });
+            assert_eq!((node.snapshot().active, disk.snapshot().active), (0, 0));
+        }
+    }
+
     #[tokio::test]
     async fn object_admission_is_wired_to_all_four_real_storage_entry_points() {
         use super::{ECStoreHealStorage, Error, HealOpts, HealStorageAPI};
@@ -2236,7 +2533,7 @@ mod tests {
             .base_dir(root.path())
             .build()
             .await;
-        let gate = admission(false);
+        let gate = admission(true);
         let storage = ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone()));
         let opts = HealOpts {
             no_lock: true,
@@ -2261,7 +2558,7 @@ mod tests {
         for result in results {
             assert!(
                 matches!(result, Err(Error::TransientSkip { .. })),
-                "closed admission precedes even bucket validation: {result:?}"
+                "unknown physical ownership precedes even bucket validation: {result:?}"
             );
         }
         assert_eq!(gate.completed(), Some(0));
@@ -2285,11 +2582,12 @@ mod tests {
         let gate = admission(false);
         let polled = std::cell::Cell::new(false);
         let began = tokio::time::Instant::now();
-        let result = super::run_background_object(Some(&gate), &super::HealOpts::default(), |_: &()| true, async {
-            polled.set(true);
-            Ok(())
-        })
-        .await;
+        let result =
+            super::run_background_object(Some(&gate), physical_plan, &super::HealOpts::default(), |_: &()| true, async {
+                polled.set(true);
+                Ok(())
+            })
+            .await;
         assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
         assert!(!polled.get(), "no locks or storage mutation before admission");
         assert_eq!(began.elapsed(), Duration::from_millis(250));
@@ -2304,9 +2602,10 @@ mod tests {
             ..Default::default()
         };
         let began = tokio::time::Instant::now();
-        let result =
-            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { panic!("storage must remain unpolled") })
-                .await;
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
+            panic!("storage must remain unpolled")
+        })
+        .await;
         assert!(matches!(result, Err(super::Error::TransientSkip { .. })));
         assert_eq!(began.elapsed(), Duration::ZERO);
     }
@@ -2316,15 +2615,17 @@ mod tests {
         use std::task::{Context, Poll, Waker};
         let gate = admission(true);
         let opts = super::HealOpts::default();
-        let future = super::run_background_object(Some(&gate), &opts, |_: &()| true, std::future::pending());
+        let future = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, std::future::pending());
         let mut future = Box::pin(future);
         assert!(matches!(future.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
         assert_eq!(gate.snapshot().active, 1);
         drop(future);
         assert_eq!(gate.snapshot().active, 0);
         assert_eq!(gate.completed(), Some(0));
-        let result =
-            super::run_background_object(Some(&gate), &opts, |_: &()| true, async { Err(super::Error::TaskCancelled) }).await;
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
+            Err(super::Error::TaskCancelled)
+        })
+        .await;
         assert!(matches!(result, Err(super::Error::TaskCancelled)));
         assert_eq!(gate.completed(), Some(0));
         assert_eq!(gate.snapshot().active, 0);
@@ -2337,7 +2638,7 @@ mod tests {
             read_repair: true,
             ..Default::default()
         };
-        let result = super::run_background_object(Some(&gate), &opts, |_: &()| true, async {
+        let result = super::run_background_object(Some(&gate), physical_plan, &opts, |_: &()| true, async {
             panic!("queued read repair must not bypass the closed node gate");
         })
         .await;
@@ -2355,7 +2656,7 @@ mod tests {
                 ..Default::default()
             };
             assert_eq!(
-                super::run_background_object(Some(&gate), &opts, |ok: &bool| *ok, async { Ok(successful) })
+                super::run_background_object(Some(&gate), physical_plan, &opts, |ok: &bool| *ok, async { Ok(successful) })
                     .await
                     .expect("operation"),
                 successful
@@ -2365,9 +2666,15 @@ mod tests {
         }
         gate.update(&mut FeedbackController::new(), None);
         assert_eq!(gate.completed(), Some(1));
-        super::run_background_object(None, &super::HealOpts::default(), |_: &()| true, async { Ok(()) })
-            .await
-            .expect("default path stays available");
+        super::run_background_object(
+            None,
+            || panic!("disabled admission must not read discovery"),
+            &super::HealOpts::default(),
+            |_: &()| true,
+            async { Ok(()) },
+        )
+        .await
+        .expect("default path stays available");
     }
 
     #[test]
@@ -2508,6 +2815,42 @@ mod tests {
     }
 
     #[test]
+    fn receipt_retains_only_the_storage_selected_generation() {
+        use super::{HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let generation = Uuid::new_v4();
+        let mut item = HealResultItem {
+            integrity_verified: true,
+            resolved_version_id: Some([0; 16]),
+            quorum_selected_data_dir: Some(*generation.as_bytes()),
+            ..Default::default()
+        };
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+        let incarnation = Uuid::new_v4();
+        let options = HealOpts::default();
+        let receipt =
+            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).expect("healthy storage result");
+        assert_eq!(receipt.quorum_selected_data_dir, Some(generation));
+
+        for unresolved in [None, Some([0; 16])] {
+            item.quorum_selected_data_dir = unresolved;
+            let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+                .expect("missing generation must not alter repair authorization");
+            assert_eq!(receipt.quorum_selected_data_dir, None);
+            assert!(
+                !receipt.deep_check_observed,
+                "a missing or nil selection cannot carry the Deep observation"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_health_and_marker_repair_have_distinct_receipts() {
         use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
         use rustfs_madmin::heal_commands::HealDriveInfo;
@@ -2523,6 +2866,7 @@ mod tests {
             metadata_verified: true,
             version_id: version.clone(),
             resolved_version_id: Some(*Uuid::parse_str(&version).expect("version UUID").as_bytes()),
+            quorum_selected_data_dir: Some(*Uuid::new_v4().as_bytes()),
             ..Default::default()
         };
         item.before.drives.push(healthy.clone());
@@ -2531,11 +2875,13 @@ mod tests {
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("metadata quorum should certify metadata health");
         assert_eq!(receipt.disposition, HealObjectDisposition::MetadataHealthy);
+        assert!(!receipt.deep_check_observed);
 
         item.integrity_verified = true;
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("stronger integrity proof should remain available");
         assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+        assert!(receipt.deep_check_observed);
 
         item.integrity_verified = false;
         item.metadata_verified = false;
@@ -2544,11 +2890,59 @@ mod tests {
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("a committed metadata repair should certify the marker/version");
         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+        assert!(!receipt.deep_check_observed);
 
         item.before.drives[0].state = "ok".to_string();
         assert!(
             verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation).is_none(),
             "repair proof without a repaired drive must fail closed"
+        );
+    }
+
+    #[test]
+    fn repaired_disposition_does_not_imply_a_deep_check_observation() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let mut item = HealResultItem {
+            repair_verified: true,
+            resolved_version_id: Some([0; 16]),
+            quorum_selected_data_dir: Some(*Uuid::new_v4().as_bytes()),
+            ..Default::default()
+        };
+        item.before.drives.push(HealDriveInfo {
+            state: "missing".to_string(),
+            ..Default::default()
+        });
+        item.after.drives.push(HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        });
+        let options = HealOpts::default();
+        let incarnation = Uuid::new_v4();
+        let normal = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("repair without a Deep observation still has a receipt");
+        assert_eq!(normal.disposition, HealObjectDisposition::Repaired);
+        assert!(!normal.deep_check_observed);
+
+        item.integrity_verified = true;
+        let deep =
+            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).expect("storage Deep observation");
+        assert_eq!(deep.disposition, HealObjectDisposition::Repaired);
+        assert!(deep.deep_check_observed);
+        assert!(
+            verified_object_receipt(
+                "bucket",
+                "object",
+                None,
+                &HealOpts {
+                    dry_run: true,
+                    ..options
+                },
+                &item,
+                incarnation,
+            )
+            .is_none()
         );
     }
 
@@ -2685,5 +3079,388 @@ mod tests {
                 .expect("an unmatched durable owner must produce a conflict");
         assert!(matches!(error, crate::Error::ReplacementGenerationConflict { .. }));
         assert!(replacement_resume_conflict_for_other_tasks("task", &HashSet::new(), "pool_0_set_0").is_none());
+    }
+    // Owner/resource composition only: this does not traverse an erasure page or namespace lock.
+    #[test]
+    fn replacement_outside_waiter_drop_keeps_cancelled_native_mutation_and_manager_drain_owned() {
+        const FLAG: &str = "RUSTFS_TEST_REPLACEMENT_OUTSIDE_WAITER_CHILD";
+        const NAME: &str =
+            "heal::storage::tests::replacement_outside_waiter_drop_keeps_cancelled_native_mutation_and_manager_drain_owned";
+        if std::env::var(FLAG).ok().as_deref() != Some("1") {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([NAME, "--exact", "--nocapture", "--test-threads=1"])
+                .env(FLAG, "1")
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                output.status.success() && stdout.contains("1 passed; 0 failed; 0 ignored;"),
+                "child failed: {stdout}\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            println!("OUTSIDE_WAITER_COMPOSITION_CHILD_OK");
+            return;
+        }
+        use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+        use crate::heal::storage_api::{
+            EcstoreBackgroundEncodeBuffer as BackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget,
+        };
+        use std::io::Write as _;
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let root = tempfile::tempdir().unwrap();
+            let env = rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(root.path().join("store"))
+                .build()
+                .await;
+            let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(
+                Arc::new(super::ECStoreHealStorage::new(env.ecstore.clone())),
+                None,
+            ));
+            let parent = manager.test_work_parent();
+            let execution = super::ReplacementExecution::for_test(Vec::new(), Vec::new());
+            let ownership = Arc::downgrade(&execution);
+            let node = admission(true);
+            let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+            let binding = PhysicalDiskBinding::default();
+            binding.set_test_capacity(vec![disk.clone()]).unwrap();
+            let plan = binding.plan().unwrap().resource_plan();
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(128 * 1024, Duration::from_secs(60));
+            let mut encoded = BackgroundEncodeBuffer::new(memory.clone(), 64 * 1024);
+            encoded.write_all(b"same outside waiter mutation").unwrap();
+            let bytes = encoded.into_bytes();
+            let charged = memory.snapshot().used;
+            let path = root.path().join("mutated-object");
+            let native_path = path.clone();
+            let task_cancel = tokio_util::sync::CancellationToken::new();
+            let cancel = task_cancel.clone();
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let (continued_tx, continued_rx) = tokio::sync::oneshot::channel();
+            let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+            let (result_tx, result_rx) = tokio::sync::oneshot::channel();
+            let worker_node = node.clone();
+            let waiter = tokio::spawn(async move {
+                execution
+                    .run_owned(&parent, async move {
+                        let result = super::run_background_object_inner(
+                            Some(&worker_node),
+                            || Ok(Some(plan)),
+                            &super::HealOpts::default(),
+                            Some(&cancel),
+                            |_: &bool| true,
+                            async {
+                                ecstore_spawn_blocking_with_resource_ownership(move || -> std::io::Result<()> {
+                                    let _ = entered_tx.send(());
+                                    let _ = release_rx.recv();
+                                    std::fs::write(native_path, &bytes)
+                                })
+                                .await
+                                .map_err(|error| super::Error::other(error.to_string()))??;
+                                let _ = continued_tx.send(());
+                                let _ = finish_rx.await;
+                                Ok(true)
+                            },
+                        )
+                        .await;
+                        let _ = result_tx.send(result.as_ref().is_ok_and(|ok| *ok));
+                        result
+                    })
+                    .await
+            });
+            let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+                .await
+                .is_ok_and(|result| result.is_ok());
+            let admitted = (node.snapshot().active, disk.snapshot().active);
+            waiter.abort();
+            let waiter_cancelled = waiter.await.is_err_and(|error| error.is_cancelled());
+            // Observer Drop alone is not logical cancellation of the accepted object.
+            task_cancel.cancel();
+            let yielded = tokio::time::timeout(Duration::from_secs(2), async {
+                while node.snapshot().active != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let retained = (disk.snapshot().active, memory.snapshot().used, ownership.upgrade().is_some());
+            let credit = (node.completed(), disk.completed());
+            let stopping = manager.clone();
+            let mut stop = tokio::spawn(async move { stopping.stop().await });
+            let stop_entered = tokio::time::timeout(Duration::from_secs(5), async {
+                while !manager.stop_handoff_completed() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .is_ok();
+            let first_stop = tokio::time::timeout(Duration::from_millis(30), &mut stop).await;
+            let stop_pending_while_native_held = first_stop.is_err();
+
+            // Always release native work and its continuation before asserting or removing roots.
+            let _ = release_tx.send(());
+            let continued = tokio::time::timeout(Duration::from_secs(5), continued_rx)
+                .await
+                .is_ok_and(|result| result.is_ok());
+            let stop_pending_through_continuation = !stop.is_finished();
+            let _ = finish_tx.send(());
+            let mutation_completed = tokio::time::timeout(Duration::from_secs(5), result_rx)
+                .await
+                .is_ok_and(|result| result.is_ok_and(|completed| completed));
+            let drained = match first_stop {
+                Ok(result) => Ok(result),
+                Err(_) => tokio::time::timeout(Duration::from_secs(5), &mut stop).await,
+            };
+            if drained.is_err() {
+                stop.abort();
+                let _ = stop.await;
+            }
+            if !mutation_completed || drained.is_err() {
+                // Unknown native retirement must preserve its task-owned filesystem root.
+                let _ = root.keep();
+            }
+            assert!(entered && waiter_cancelled && yielded);
+            assert_eq!(admitted, (1, 1));
+            assert!(charged > 0);
+            assert_eq!(retained, (1, charged, true));
+            assert_eq!(credit, (Some(0), Some(0)));
+            assert!(stop_entered && stop_pending_while_native_held && continued && stop_pending_through_continuation);
+            assert!(mutation_completed, "the original owned operation must complete its actual continuation");
+            drained.unwrap().unwrap().unwrap();
+            assert!(ownership.upgrade().is_none());
+            assert_eq!(std::fs::read(path).unwrap(), b"same outside waiter mutation");
+            assert_eq!((node.snapshot().active, disk.snapshot().active, memory.snapshot().used), (0, 0, 0));
+            assert_eq!((node.completed(), disk.completed()), (Some(0), Some(0)));
+            manager.stop().await.unwrap();
+        });
+        drop(runtime);
+    }
+
+    #[tokio::test]
+    async fn logical_cancel_yields_node_without_dropping_native_buffer_or_result_continuation() {
+        use super::super::storage_api::owner::{PhysicalDiskBinding, ecstore_spawn_blocking_with_resource_ownership};
+        use crate::heal::storage_api::{
+            EcstoreBackgroundEncodeBuffer as BackgroundEncodeBuffer, EcstoreBackgroundMemoryBudget as BackgroundMemoryBudget,
+        };
+        use std::io::Write as _;
+        let node = admission(true);
+        let disk = rustfs_concurrency::adaptive::AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let binding = PhysicalDiskBinding::default();
+        binding.set_test_capacity(vec![disk.clone()]).unwrap();
+        let plan = binding.plan().unwrap().resource_plan();
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(128 * 1024, Duration::from_secs(60));
+        let mut encoded = BackgroundEncodeBuffer::new(memory.clone(), 64 * 1024);
+        encoded.write_all(b"same accepted object mutation").unwrap();
+        let bytes = encoded.into_bytes();
+        let charged = memory.snapshot().used;
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("mutated-object");
+        let native_path = path.clone();
+        let task_cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = task_cancel.clone();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (continued_tx, continued_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let worker_node = node.clone();
+        let task = tokio::spawn(async move {
+            super::run_background_object_inner(
+                Some(&worker_node),
+                || Ok(Some(plan)),
+                &super::HealOpts::default(),
+                Some(&cancel),
+                |_: &bool| true,
+                async {
+                    ecstore_spawn_blocking_with_resource_ownership(move || -> std::io::Result<()> {
+                        let _ = entered_tx.send(());
+                        let _ = release_rx.recv();
+                        std::fs::write(native_path, &bytes)
+                    })
+                    .await
+                    .map_err(|error| super::Error::other(error.to_string()))??;
+                    let _ = continued_tx.send(());
+                    let _ = finish_rx.await;
+                    Ok(true)
+                },
+            )
+            .await
+        });
+        entered_rx.await.unwrap();
+        let admitted = (node.snapshot().active, disk.snapshot().active);
+        task_cancel.cancel();
+        let yielded = tokio::time::timeout(Duration::from_secs(2), async {
+            while node.snapshot().active != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let retained = (disk.snapshot().active, memory.snapshot().used, !task.is_finished());
+        let credit = (node.completed(), disk.completed());
+        let new_object_polled = std::sync::atomic::AtomicBool::new(false);
+        let rejected = super::run_background_object_inner(
+            Some(&node),
+            physical_plan,
+            &super::HealOpts::default(),
+            Some(&task_cancel),
+            |_: &()| true,
+            async {
+                new_object_polled.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+        // Unconditionally release issued native work and its same-operation
+        // continuation before inspecting the observations, including red probes.
+        let _ = release_tx.send(());
+        let continued = tokio::time::timeout(Duration::from_secs(2), continued_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        let still_owned = !task.is_finished();
+        let _ = finish_tx.send(());
+        let result = tokio::time::timeout(Duration::from_secs(5), task).await;
+        assert_eq!(admitted, (1, 1));
+        assert!(yielded, "logical cancellation must return only the node scheduling unit");
+        assert!(charged > 0, "the buffer must have an actual reservation");
+        assert_eq!(retained, (1, charged, true));
+        assert_eq!(credit, (Some(0), Some(0)));
+        assert!(matches!(rejected, Err(super::Error::TaskCancelled)));
+        assert!(!new_object_polled.load(std::sync::atomic::Ordering::Acquire));
+        assert!(
+            continued && still_owned,
+            "the same issued operation cannot return before its continuation"
+        );
+        assert!(result.unwrap().unwrap().unwrap());
+        assert_eq!(std::fs::read(path).unwrap(), b"same accepted object mutation");
+        assert_eq!((node.snapshot().active, disk.snapshot().active, memory.snapshot().used), (0, 0, 0));
+        assert_eq!((node.completed(), disk.completed()), (Some(0), Some(0)));
+    }
+
+    #[tokio::test]
+    async fn logical_cancel_rejects_entry_and_unpolled_admitted_object() {
+        let node = admission(true);
+        let task_cancel = tokio_util::sync::CancellationToken::new();
+        task_cancel.cancel();
+        let planned = std::sync::atomic::AtomicBool::new(false);
+        let polled = std::sync::atomic::AtomicBool::new(false);
+        let result = super::run_background_object_inner(
+            Some(&node),
+            || {
+                planned.store(true, std::sync::atomic::Ordering::Release);
+                physical_plan()
+            },
+            &super::HealOpts::default(),
+            Some(&task_cancel),
+            |_: &()| true,
+            async {
+                polled.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            },
+        )
+        .await;
+        assert!(matches!(result, Err(super::Error::TaskCancelled)));
+        assert!(!planned.load(std::sync::atomic::Ordering::Acquire));
+        let plan = physical_plan().unwrap().unwrap();
+        let permit = plan.try_acquire(&node).unwrap();
+        let result = super::await_admitted_object(permit, &super::HealOpts::default(), &task_cancel, |_: &()| true, async {
+            polled.store(true, std::sync::atomic::Ordering::Release);
+            Ok(())
+        })
+        .await;
+        assert!(matches!(result, Err(super::Error::TaskCancelled)));
+        assert!(
+            !polled.load(std::sync::atomic::Ordering::Acquire),
+            "do not start an unpaid object in cancellation's branch"
+        );
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn logical_cancel_interrupts_admission_without_polling_new_object() {
+        let node = admission(false);
+        let task_cancel = tokio_util::sync::CancellationToken::new();
+        let cancel = task_cancel.clone();
+        let polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = polled.clone();
+        let (planned_tx, planned_rx) = tokio::sync::oneshot::channel();
+        let worker_node = node.clone();
+        let task = tokio::spawn(async move {
+            super::run_background_object_inner(
+                Some(&worker_node),
+                || {
+                    let _ = planned_tx.send(());
+                    physical_plan()
+                },
+                &super::HealOpts::default(),
+                Some(&cancel),
+                |_: &()| true,
+                async {
+                    observed.store(true, std::sync::atomic::Ordering::Release);
+                    Ok(())
+                },
+            )
+            .await
+        });
+        planned_rx.await.unwrap();
+        task_cancel.cancel();
+        let result = tokio::time::timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+        assert!(matches!(result, Err(super::Error::TaskCancelled)));
+        assert!(!polled.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(node.snapshot().active, 0);
+        assert_eq!(node.completed(), Some(0));
+    }
+
+    #[tokio::test]
+    async fn logical_cancel_entry_preserves_normal_dry_run_and_legacy_credit() {
+        for (logical, dry_run) in [(true, false), (true, true), (false, false)] {
+            let node = admission(true);
+            let task_cancel = tokio_util::sync::CancellationToken::new();
+            let opts = super::HealOpts {
+                dry_run,
+                ..Default::default()
+            };
+            let result = super::run_background_object_inner(
+                Some(&node),
+                physical_plan,
+                &opts,
+                logical.then_some(&task_cancel),
+                |ok: &bool| *ok,
+                async { Ok(true) },
+            )
+            .await;
+            assert!(result.unwrap());
+            assert_eq!(node.snapshot().active, 0);
+            assert_eq!(node.completed(), Some(u64::from(!dry_run)));
+        }
+    }
+
+    #[tokio::test]
+    async fn actual_storage_logical_cancel_entry_refuses_an_already_cancelled_object() {
+        let env = rustfs_test_utils::TestECStoreEnv::builder()
+            .prefix("task_cancel_entry")
+            .build()
+            .await;
+        let node = admission(true);
+        let storage = super::ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(node.clone()));
+        let task_cancel = tokio_util::sync::CancellationToken::new();
+        task_cancel.cancel();
+        let result = super::HealStorageAPI::heal_object_with_task_cancel(
+            &storage,
+            "bucket",
+            "object",
+            None,
+            &super::HealOpts::default(),
+            &task_cancel,
+        )
+        .await;
+        assert!(matches!(result, Err(super::Error::TaskCancelled)));
+        assert_eq!((node.snapshot().active, node.completed()), (0, Some(0)));
     }
 }

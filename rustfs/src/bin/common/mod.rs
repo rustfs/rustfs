@@ -71,9 +71,7 @@ pub fn run() -> ExitCode {
         };
     }
 
-    rustfs::startup_entrypoint::run_process();
-
-    ExitCode::SUCCESS
+    rustfs::startup_entrypoint::run_process()
 }
 
 fn run_offline(arguments: &[String]) -> Result<(), String> {

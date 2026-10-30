@@ -240,7 +240,7 @@ impl HealManager {
             }
 
             for set_disk_id in &set_disk_ids {
-                match self.storage.replacement_intent_disks(set_disk_id).await {
+                match self.storage.replacement_intent_disks(set_disk_id, None).await {
                     Ok(disks) => recovery_disks.extend(disks),
                     Err(error) => {
                         conflicted_replacement_sets.insert(set_disk_id.clone());

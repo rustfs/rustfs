@@ -80,7 +80,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
 use crate::object_api::object_api_utils::get_raw_etag;
@@ -4537,6 +4537,7 @@ fn resolve_tiered_decommission_write_quorum_result(
 pub struct SetDisks {
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
+    pub(crate) physical_heal_admission: Arc<crate::disk::PhysicalHealBinding>,
     pub set_endpoints: Vec<Endpoint>,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -5479,6 +5480,7 @@ impl SetDisks {
         Arc::new(SetDisks {
             locker_owner,
             disks,
+            physical_heal_admission: Arc::default(),
             set_drive_count,
             default_parity_count,
             set_index,
@@ -14807,7 +14809,7 @@ mod tests {
             file.erasure.index = files.len() + 1;
             file.erasure.block_size = erasure.block_size;
             file.uses_legacy_checksum = uses_legacy;
-            file.data = Some(Bytes::from(data));
+            file.data = Some(data);
             files.push(file);
         }
 
@@ -15268,7 +15270,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15352,7 +15354,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15465,7 +15467,7 @@ mod tests {
             }
 
             let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-            disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+            disk.write_all(bucket, &shard_path, encoded)
                 .await
                 .expect("encoded shard should be stored");
         }

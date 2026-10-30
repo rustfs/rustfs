@@ -75,6 +75,7 @@ async fn run_cycle(
                 service_cohort: None,
                 resolved_scope_observer: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )

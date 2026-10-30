@@ -256,6 +256,12 @@ reported separately, not renamed as a combined p95 or p99. Ledger reduction
 uses a size-limited scratch database and samples free space; those checks do not
 reserve disk space or prevent concurrent writers from crossing the floor.
 
+The live telemetry collector starts its HTTP captures concurrently and records
+their actual transport intervals. These receipts explicitly report
+`synchronized_source_window=false`: concurrent collection does not establish
+that the servers measured the same source window. The adapter must separately
+prove alignment with the client window before claiming same-window acceptance.
+
 For usage-cache saves, `encode_bytes` uses the window delta of
 `rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of
 `rustfs_scanner_cache_save_payload_bytes_total` deltas for `cache="main"` and

@@ -16,7 +16,7 @@ fn request() -> HealChannelRequest {
 }
 
 fn candidate() -> Candidate {
-    Candidate::from_request(&request()).expect("bounded candidate")
+    Candidate::from_request(&request(), Some(Uuid::from_u128(33))).expect("bounded candidate")
 }
 
 fn completion(task: &str, disposition: HealObjectDisposition) -> Arc<HealCompletion> {
@@ -28,8 +28,36 @@ fn completion(task: &str, disposition: HealObjectDisposition) -> Arc<HealComplet
         object: Some(HealObjectReceipt {
             identity: candidate().identity.expect("exact object identity"),
             disposition,
+            quorum_selected_data_dir: Some(Uuid::from_u128(33)),
+            deep_check_observed: false,
         }),
     })
+}
+
+#[test]
+fn weak_observation_does_not_upgrade_normal_completion_to_deep() {
+    let mut terminal = (*completion("normal", HealObjectDisposition::Repaired)).clone();
+    terminal.scan_mode = HealScanMode::Normal;
+    terminal.object.as_mut().expect("object receipt").deep_check_observed = true;
+    let mut recent = Recent {
+        completion: Arc::new(terminal),
+        counted: false,
+    };
+    let settled = Settlement::new(candidate(), &mut recent);
+    assert_eq!(settled.scope, "insufficient_scan");
+}
+
+#[test]
+fn weak_observation_of_different_data_dirs_is_not_identity_mismatch() {
+    let mut terminal = (*completion("different", HealObjectDisposition::VerifiedHealthy)).clone();
+    terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    let mut recent = Recent {
+        completion: Arc::new(terminal),
+        counted: false,
+    };
+    let settled = Settlement::new(candidate(), &mut recent);
+    assert!(settled.data_dir_observation_mismatch);
+    assert_eq!(settled.scope, "content_and_leader_unknown");
 }
 
 #[test]
@@ -96,6 +124,382 @@ fn replacement_bucket_version_or_location_cannot_match_an_old_result() {
         };
         assert_eq!(Settlement::new(observed, &mut recent).scope, "identity_mismatch");
     }
+}
+
+#[test]
+fn candidate_captures_only_non_nil_object_data_dir() {
+    let generation = Uuid::from_u128(33);
+    for (data_dir, expected) in [(Some(generation), Some(generation)), (Some(Uuid::nil()), None), (None, None)] {
+        let object = crate::ScannerObjectInfo {
+            data_dir,
+            ..Default::default()
+        };
+        let observed = Candidate::from_request(&request(), object.data_dir).expect("bounded object candidate");
+        assert_eq!(observed.data_dir, expected);
+    }
+}
+
+#[test]
+fn data_dir_observations_do_not_determine_identity_scope() {
+    let generation = Uuid::from_u128(33);
+    let replacement = Uuid::from_u128(34);
+    for (expected, resolved, mismatch) in [
+        (Some(generation), Some(generation), false),
+        (Some(generation), Some(replacement), true),
+        (None, Some(generation), false),
+        (Some(generation), None, false),
+        (None, None, false),
+        (Some(Uuid::nil()), Some(generation), false),
+        (Some(generation), Some(Uuid::nil()), false),
+    ] {
+        let mut observed = candidate();
+        observed.data_dir = expected;
+        let mut terminal = (*completion("generation", HealObjectDisposition::VerifiedHealthy)).clone();
+        terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = resolved;
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        let settled = Settlement::new(observed, &mut recent);
+        assert_eq!(settled.scope, "content_and_leader_unknown", "{expected:?}, {resolved:?}");
+        assert_eq!(settled.data_dir_observation_mismatch, mismatch, "{expected:?}, {resolved:?}");
+    }
+}
+
+#[test]
+fn data_dir_difference_does_not_replace_missing_location() {
+    let mut observed = candidate();
+    observed.identity.as_mut().expect("candidate identity").pool_index = None;
+    let mut terminal = (*completion("generation", HealObjectDisposition::VerifiedHealthy)).clone();
+    let receipt = terminal.object.as_mut().expect("object receipt");
+    receipt.identity.set_index = None;
+    receipt.quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    let mut recent = Recent {
+        completion: Arc::new(terminal),
+        counted: false,
+    };
+    let settled = Settlement::new(observed, &mut recent);
+    assert_eq!(settled.scope, "identity_unknown");
+    assert!(settled.data_dir_observation_mismatch);
+}
+
+#[test]
+fn merged_generations_settle_independently_in_any_arrival_order() {
+    for terminal_first in [false, true] {
+        for reversed in [false, true] {
+            let recorder = CompletionRecorder::default();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let mut observations = Observations::default();
+            let terminal = completion("owner", HealObjectDisposition::VerifiedHealthy);
+            if terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_none());
+            }
+            let mut generations = [Some(Uuid::from_u128(33)), Some(Uuid::from_u128(34)), None];
+            if reversed {
+                generations.reverse();
+            }
+            for generation in generations {
+                let mut observed = candidate();
+                observed.data_dir = generation;
+                assert_eq!(observations.admit("owner".into(), observed).is_some(), terminal_first);
+            }
+            if !terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_some());
+            }
+            assert!(observations.complete(terminal, Instant::now()).is_none(), "duplicate terminal ignored");
+            assert_eq!(observations.pending_groups, 0);
+            assert_eq!(observations.terminal_tasks, 1);
+            assert_eq!(observations.unknown_counts.get("content_and_leader_unknown"), Some(&3));
+            assert_eq!(observations.unknown_counts.get("identity_mismatch"), None);
+            assert_eq!(observations.unknown_counts.get("identity_unknown"), None);
+            assert_eq!(observations.terminal_counts.values().sum::<u64>(), 3);
+            assert_eq!(
+                recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+                1
+            );
+        }
+    }
+}
+
+#[test]
+fn pending_group_limit_is_global_and_overflow_stays_unknown() {
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let mut observations = Observations::default();
+    for index in 1..=MAX_PENDING_GROUPS {
+        let mut observed = candidate();
+        observed.data_dir = Some(Uuid::from_u128(u128::try_from(index).expect("group index")));
+        assert!(observations.admit("owner".into(), observed).is_none());
+    }
+    assert_eq!(observations.pending_groups, MAX_PENDING_GROUPS);
+    assert_eq!(observations.pending.len(), 1);
+    let mut overflow = candidate();
+    overflow.data_dir = Some(Uuid::from_u128(2000));
+    assert!(observations.admit("owner".into(), overflow).is_none());
+    assert!(observations.admit("another-owner".into(), candidate()).is_none());
+    assert_eq!(observations.unknown_counts.get("pending_groups_full"), Some(&2));
+    assert!(observations.admit("owner".into(), candidate()).is_none());
+    assert_eq!(observations.pending_groups, MAX_PENDING_GROUPS);
+
+    assert!(
+        observations
+            .complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_some()
+    );
+    assert_eq!(observations.pending_groups, 0);
+    assert_eq!(observations.terminal_tasks, 1);
+    assert_eq!(
+        observations.unknown_counts.get("content_and_leader_unknown"),
+        Some(&(u64::try_from(MAX_PENDING_GROUPS).expect("bounded group count") + 1))
+    );
+    assert_eq!(observations.unknown_counts.get("identity_mismatch"), None);
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        u64::try_from(MAX_PENDING_GROUPS).expect("bounded group count") - 1
+    );
+}
+
+#[test]
+fn insufficient_scan_and_data_dir_observation_mismatch_are_both_counted() {
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let mut observations = Observations::default();
+    observations.admit("owner".into(), candidate());
+    observations.admit("owner".into(), candidate());
+    let mut terminal = (*completion("owner", HealObjectDisposition::MetadataHealthy)).clone();
+    terminal.scan_mode = HealScanMode::Normal;
+    terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    let terminal = Arc::new(terminal);
+    let settled = observations
+        .complete(terminal.clone(), Instant::now())
+        .expect("canonical terminal observed");
+    assert_eq!(settled.scope, "insufficient_scan");
+    assert!(settled.data_dir_observation_mismatch);
+    assert_eq!(observations.unknown_counts.get("insufficient_scan"), Some(&2));
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        2
+    );
+    assert!(observations.complete(terminal, Instant::now()).is_none());
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        2
+    );
+
+    let mut matching = candidate();
+    matching.data_dir = Some(Uuid::from_u128(34));
+    let settled = observations.admit("owner".into(), matching).expect("late merged admission");
+    assert_eq!(settled.scope, "insufficient_scan");
+    assert!(!settled.data_dir_observation_mismatch);
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        2
+    );
+    assert_eq!(observations.terminal_tasks, 1);
+}
+
+#[test]
+fn deep_check_task_observation_is_counted_once_for_either_terminal_order() {
+    for terminal_first in [false, true] {
+        for requested_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+            let recorder = CompletionRecorder::default();
+            let _recorder = metrics::set_default_local_recorder(&recorder);
+            let mut observations = Observations::default();
+            let mut terminal = (*completion("owner", HealObjectDisposition::VerifiedHealthy)).clone();
+            terminal.scan_mode = requested_mode;
+            terminal.object.as_mut().expect("object receipt").deep_check_observed = true;
+            let terminal = Arc::new(terminal);
+            if terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_none());
+            }
+            observations.admit("owner".into(), candidate());
+            observations.admit("owner".into(), candidate());
+            if !terminal_first {
+                assert!(observations.complete(terminal.clone(), Instant::now()).is_some());
+            }
+            assert!(observations.complete(terminal, Instant::now()).is_none(), "duplicate terminal ignored");
+            assert_eq!(observations.terminal_tasks, 1);
+            let scope = if requested_mode == HealScanMode::Deep {
+                "content_and_leader_unknown"
+            } else {
+                "insufficient_scan"
+            };
+            assert_eq!(observations.unknown_counts.get(scope), Some(&2));
+            assert_eq!(recorder.total("rustfs_scanner_heal_task_deep_check_observations_total"), 1);
+        }
+    }
+}
+
+#[test]
+fn deep_check_counter_requires_completed_nondry_observation() {
+    for change in 0..6 {
+        let recorder = CompletionRecorder::default();
+        let _recorder = metrics::set_default_local_recorder(&recorder);
+        let mut observations = Observations::default();
+        observations.admit("owner".into(), candidate());
+        let mut terminal = (*completion("owner", HealObjectDisposition::VerifiedHealthy)).clone();
+        terminal.object.as_mut().expect("object receipt").deep_check_observed = true;
+        match change {
+            0 => terminal.object.as_mut().expect("object receipt").deep_check_observed = false,
+            1 => terminal.object = None,
+            2 => terminal.dry_run = true,
+            3 => terminal.execution = None,
+            4 => terminal.execution = Some(HealExecutionOutcome::CompletedWithErrors),
+            _ => terminal.execution = Some(HealExecutionOutcome::Aborted(HealAbortReason::Cancelled)),
+        }
+        let settled = observations
+            .complete(Arc::new(terminal), Instant::now())
+            .expect("terminal observed");
+        assert!(!settled.deep_check_observed_task, "case {change}");
+        assert_eq!(
+            recorder.total("rustfs_scanner_heal_task_deep_check_observations_total"),
+            0,
+            "case {change}"
+        );
+    }
+}
+
+#[test]
+fn normal_completion_never_satisfies_a_deep_candidate_from_weak_observations() {
+    for change in 0..7 {
+        let mut observed = candidate();
+        let mut terminal = (*completion("owner", HealObjectDisposition::VerifiedHealthy)).clone();
+        terminal.scan_mode = HealScanMode::Normal;
+        let receipt = terminal.object.as_mut().expect("object receipt");
+        receipt.deep_check_observed = true;
+        match change {
+            0 => {}
+            1 => observed.identity.as_mut().expect("candidate identity").version_id = None,
+            2 => observed.data_dir = None,
+            3 => receipt.quorum_selected_data_dir = None,
+            4 => receipt.quorum_selected_data_dir = Some(Uuid::from_u128(34)),
+            5 => receipt.identity.object = "another-object".into(),
+            _ => receipt.deep_check_observed = false,
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        let settled = Settlement::new(observed, &mut recent);
+        assert_eq!(settled.scope, "insufficient_scan", "case {change}");
+        assert_eq!(settled.data_dir_observation_mismatch, change == 4, "case {change}");
+        assert_eq!(settled.deep_check_observed_task, change != 6, "case {change}");
+    }
+}
+
+#[test]
+fn merged_candidates_keep_scan_mode_and_dry_run_scopes_separate() {
+    let recorder = CompletionRecorder::default();
+    let _recorder = metrics::set_default_local_recorder(&recorder);
+    let mut observations = Observations::default();
+    let mut normal = candidate();
+    normal.mode = HealScanMode::Normal;
+    let mut dry = candidate();
+    dry.dry_run = true;
+    observations.admit("owner".into(), candidate());
+    observations.admit("owner".into(), normal);
+    observations.admit("owner".into(), dry);
+    assert_eq!(observations.pending_groups, 3);
+    let mut terminal = (*completion("owner", HealObjectDisposition::MetadataHealthy)).clone();
+    terminal.scan_mode = HealScanMode::Normal;
+    terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    observations.complete(Arc::new(terminal), Instant::now());
+    assert_eq!(observations.unknown_counts.get("insufficient_scan"), Some(&1));
+    assert_eq!(observations.unknown_counts.get("content_and_leader_unknown"), Some(&1));
+    assert_eq!(observations.unknown_counts.get("dry_run"), Some(&1));
+    assert_eq!(
+        recorder.total("rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total"),
+        3
+    );
+    assert_eq!(observations.terminal_tasks, 1);
+}
+
+#[test]
+fn data_dir_observation_mismatch_counter_requires_matching_object_identity_and_known_data_dirs() {
+    for change in 0..6 {
+        let mut observed = candidate();
+        let mut terminal = (*completion("unrelated", HealObjectDisposition::VerifiedHealthy)).clone();
+        let receipt = terminal.object.as_mut().expect("object receipt");
+        receipt.quorum_selected_data_dir = Some(Uuid::from_u128(34));
+        match change {
+            0 => receipt.identity.bucket = "another-bucket".into(),
+            1 => receipt.identity.object = "another-object".into(),
+            2 => receipt.identity.kind = HealObjectKind::Metadata,
+            3 => observed.data_dir = None,
+            4 => observed.data_dir = Some(Uuid::nil()),
+            _ => receipt.quorum_selected_data_dir = Some(Uuid::nil()),
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        assert!(!Settlement::new(observed, &mut recent).data_dir_observation_mismatch, "case {change}");
+    }
+}
+
+#[test]
+fn group_expiry_and_lag_release_capacity_without_settling_candidates() {
+    let mut observations = Observations::default();
+    let now = Instant::now();
+    let mut old = candidate();
+    old.first_seen = now;
+    let mut newer = candidate();
+    newer.data_dir = Some(Uuid::from_u128(34));
+    newer.first_seen = now + Duration::from_secs(1);
+    observations.admit("owner".into(), old);
+    observations.admit("owner".into(), newer);
+    observations.maintain(now + PENDING_TTL);
+    assert_eq!(observations.pending_groups, 1);
+    assert_eq!(observations.pending["owner"].first.data_dir, Some(Uuid::from_u128(34)));
+    assert_eq!(observations.unknown_counts.get("expired"), Some(&1));
+
+    observations.lagged(1);
+    assert_eq!(observations.pending_groups, 0);
+    assert_eq!(observations.unknown_counts.get("completion_lost"), Some(&1));
+    assert!(
+        observations
+            .complete(completion("owner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+            .is_none()
+    );
+    assert_eq!(observations.terminal_tasks, 0);
+    assert!(observations.admit("new-owner".into(), candidate()).is_none());
+    assert_eq!(observations.pending_groups, 1);
+}
+
+#[test]
+fn merged_candidates_record_data_dir_difference_without_claiming_identity_mismatch() {
+    let mut observations = Observations::default();
+    assert!(observations.admit("owner".into(), candidate()).is_none());
+    assert!(observations.admit("owner".into(), candidate()).is_none());
+    let mut terminal = (*completion("owner", HealObjectDisposition::VerifiedHealthy)).clone();
+    terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    let settled = observations
+        .complete(Arc::new(terminal), Instant::now())
+        .expect("canonical terminal observed");
+    assert_eq!(settled.candidates, 2);
+    assert_eq!(settled.scope, "content_and_leader_unknown");
+    assert!(settled.data_dir_observation_mismatch);
+    assert_eq!(observations.unknown_counts.get("content_and_leader_unknown"), Some(&2));
+}
+
+#[test]
+fn early_terminal_compares_each_late_admission_generation() {
+    let mut observations = Observations::default();
+    let terminal = completion("fast", HealObjectDisposition::VerifiedHealthy);
+    assert!(observations.complete(terminal.clone(), Instant::now()).is_none());
+    let mut replaced = candidate();
+    replaced.data_dir = Some(Uuid::from_u128(34));
+    let first = observations.admit("fast".into(), replaced).expect("early terminal retained");
+    assert_eq!(first.scope, "content_and_leader_unknown");
+    assert!(first.data_dir_observation_mismatch);
+    assert!(first.first_task_observation);
+    assert!(observations.complete(terminal, Instant::now()).is_none(), "duplicate terminal ignored");
+    let second = observations
+        .admit("fast".into(), candidate())
+        .expect("merged admission observed");
+    assert_eq!(second.scope, "content_and_leader_unknown");
+    assert!(!second.first_task_observation);
+    assert_eq!(observations.terminal_tasks, 1);
 }
 
 #[test]
@@ -171,7 +575,7 @@ fn scanner_candidate_without_location_records_identity_unknown() {
         observations
             .admit(
                 "scanner".into(),
-                Candidate::from_request(&scanner_request).expect("bounded scanner candidate"),
+                Candidate::from_request(&scanner_request, Some(Uuid::from_u128(33))).expect("bounded scanner candidate"),
             )
             .is_none()
     );
@@ -313,7 +717,7 @@ fn terminal_history_eviction_loses_evidence_without_inventing_a_completion() {
 fn identity_size_is_bounded_before_cloning() {
     let mut large = request();
     large.object_prefix = Some("x".repeat(MAX_COMPLETION_IDENTITY_BYTES));
-    assert!(Candidate::from_request(&large).is_none());
+    assert!(Candidate::from_request(&large, Some(Uuid::from_u128(33))).is_none());
 }
 
 #[test]
@@ -429,6 +833,57 @@ fn observer_status_preserves_loss_expiry_and_rejected_admissions() {
     assert_eq!(unknown["missing_task_id"], 1);
     assert_eq!(unknown["not_admitted"], 1);
     assert_eq!(unknown["observer_full_or_closed"], 2);
+}
+
+#[tokio::test]
+async fn broadcast_terminal_reports_data_dir_difference_for_merged_candidates() {
+    use rustfs_heal_contracts::{completion::publish_heal_completion, heal_channel::HealAdmissionResult};
+
+    let registry = Mutex::new(None);
+    let observer = observer_from(&registry);
+    let canonical = Uuid::new_v4().to_string();
+    let object = crate::ScannerObjectInfo {
+        data_dir: Some(Uuid::from_u128(33)),
+        ..Default::default()
+    };
+    for result in [HealAdmissionResult::Accepted, HealAdmissionResult::Merged] {
+        observe_on(
+            &observer,
+            Candidate::from_request(&request(), object.data_dir),
+            Ok(&HealAdmissionReceipt {
+                result,
+                task_id: canonical.clone(),
+            }),
+        );
+    }
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while observation_status_from(&registry).retained_pending_candidates != Some(2) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both admissions must reach the observer before the terminal");
+
+    let mut terminal = (*completion(&canonical, HealObjectDisposition::VerifiedHealthy)).clone();
+    terminal.object.as_mut().expect("object receipt").quorum_selected_data_dir = Some(Uuid::from_u128(34));
+    publish_heal_completion(terminal);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while observation_status_from(&registry).terminal_task_observations_total != Some(1) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("broadcast terminal must reach the observer");
+
+    let status = observation_status_from(&registry);
+    assert_eq!(status.retained_pending_candidates, Some(0));
+    assert_eq!(status.integrity_state, "unknown");
+    assert_eq!(status.terminal_candidates.len(), 1);
+    assert_eq!(status.terminal_candidates[0].scope, "content_and_leader_unknown");
+    assert_eq!(status.terminal_candidates[0].count, 2);
+    assert_eq!(status.unknown_candidates.len(), 1);
+    assert_eq!(status.unknown_candidates[0].reason, "content_and_leader_unknown");
+    assert_eq!(status.unknown_candidates[0].count, 2);
 }
 
 #[tokio::test]
@@ -576,9 +1031,9 @@ async fn live_observer_associates_early_completion_with_canonical_merged_receipt
         result: HealAdmissionResult::Merged,
         task_id: canonical_id,
     };
-    observe_on(&sender, Candidate::from_request(&source_request), Ok(&merged));
+    observe_on(&sender, Candidate::from_request(&source_request, Some(Uuid::from_u128(33))), Ok(&merged));
     recorder.wait_for_terminals(2).await;
-    observe_on(&sender, Candidate::from_request(&source_request), Ok(&merged));
+    observe_on(&sender, Candidate::from_request(&source_request, Some(Uuid::from_u128(33))), Ok(&merged));
     recorder.wait_for_terminals(3).await;
 
     assert_eq!(recorder.total("rustfs_scanner_heal_candidate_terminal_total"), 3);

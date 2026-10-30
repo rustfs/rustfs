@@ -32,6 +32,21 @@ cat >"$BIN_DIR/awscurl" <<'STUB'
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -n "${SCANNER_CAPTURE_CHILD_MODE:-}" && "$*" == */scanner/status* ]]; then
+  exec "${SCANNER_TEST_PYTHON:?}" - <<'PY'
+import json, os, pathlib, signal, subprocess, sys, time
+root = pathlib.Path(os.environ["SCANNER_CAPTURE_CHILD_DIR"])
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+child = subprocess.Popen([sys.executable, "-c", "import pathlib,signal,sys,time; signal.signal(signal.SIGTERM,signal.SIG_IGN); pathlib.Path(sys.argv[1]).touch(); time.sleep(120)", str(root / "ready")])
+while not (root / "ready").exists():
+    time.sleep(0.01)
+(root / "pids.json").write_text(json.dumps({"owner": os.getppid(), "leader": os.getpid(), "child": child.pid}))
+if os.environ["SCANNER_CAPTURE_CHILD_MODE"] == "failure":
+    raise SystemExit(74)
+time.sleep(120)
+PY
+fi
+
 if [[ "${SCANNER_STATUS_EXIT_CODE:-0}" != "0" && "$*" == */scanner/status* ]]; then
   for attempt in {1..100}; do
     [[ -s "${IOSTAT_PID_FILE:?}" ]] && break
@@ -89,6 +104,25 @@ JSON
 fi
 
 if [[ "$url" == *"/rustfs/admin/v3/realtime?types=1&by-host=true&n=1" ]]; then
+  if [[ -n "${SCANNER_CAPTURE_BARRIER:-}" ]]; then
+    case "$url" in
+      *node-a*) touch "$SCANNER_CAPTURE_BARRIER/node-a" ;;
+      *node-b*) touch "$SCANNER_CAPTURE_BARRIER/node-b" ;;
+    esac
+    for attempt in {1..100}; do
+      [[ -f "$SCANNER_CAPTURE_BARRIER/node-a" && -f "$SCANNER_CAPTURE_BARRIER/node-b" ]] && break
+      sleep 0.05
+    done
+    if [[ ! -f "$SCANNER_CAPTURE_BARRIER/node-a" || ! -f "$SCANNER_CAPTURE_BARRIER/node-b" ]]; then
+      echo "distributed requests were serialized" >&2
+      exit 73
+    fi
+    if [[ "${SCANNER_CAPTURE_FAIL:-}" == true ]]; then
+      if [[ "$url" == *node-a* ]]; then exit 74; fi
+      sleep 0.1
+      touch "$SCANNER_CAPTURE_BARRIER/node-b-finished"
+    fi
+  fi
   cat <<'JSON'
 {"node":"node-a","metrics":{"scanner":{"maintenanceControl":{"primaryControl":"active"}}}}
 JSON
@@ -281,6 +315,139 @@ grep -q -- 'http://node-a:9000/rustfs/admin/v3/background-heal/status' "$awscurl
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/background-heal/status' "$awscurl_log"
 grep -q -- 'http://node-a:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
 grep -q -- 'http://node-b:9000/rustfs/admin/v3/realtime?types=1&by-host=true&n=1' "$awscurl_log"
+
+parallel_out="$TMP_DIR/parallel-out"
+parallel_barrier="$TMP_DIR/parallel-barrier"
+mkdir "$parallel_barrier"
+SCANNER_CAPTURE_BARRIER="$parallel_barrier" RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" \
+  AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \
+  --alias rustfs-local --endpoint http://127.0.0.1:9000 --access-key rustfsadmin \
+  --metrics-endpoints http://node-a:9000,http://node-b:9000 \
+  --samples 1 --interval-secs 0 --out-dir "$parallel_out" --skip-host-telemetry
+"$ROOT_DIR/scripts/python_bin.sh" - "$parallel_out" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+records = [(path, json.loads(path.read_text())) for path in (root / "requests").glob("*.timing.json")]
+assert len(records) == 5, records
+assert len({row["clock_id"] for _, row in records}) == 1
+assert len({row["start_ns"] for _, row in records}) == 5
+for _, row in records:
+    assert 0 < row["start_ns"] < row["end_ns"]
+    assert row["start_unix_ns"] > 0 and row["end_unix_ns"] > 0
+    assert row["exit_status"] == 0
+    assert row["synchronized_source_window"] is False
+metrics = [row for path, row in records if path.name.startswith("admin-metrics.")]
+assert len(metrics) == 2
+assert max(row["start_ns"] for row in metrics) < min(row["end_ns"] for row in metrics)
+PY
+
+failed_parallel_out="$TMP_DIR/failed-parallel-out"
+failed_parallel_barrier="$TMP_DIR/failed-parallel-barrier"
+mkdir "$failed_parallel_barrier"
+parallel_status=0
+SCANNER_CAPTURE_BARRIER="$failed_parallel_barrier" SCANNER_CAPTURE_FAIL=true \
+  RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" \
+  "$SCRIPT" --alias rustfs-local --endpoint http://127.0.0.1:9000 --access-key rustfsadmin \
+  --metrics-endpoints http://node-a:9000,http://node-b:9000 --samples 1 --interval-secs 0 \
+  --out-dir "$failed_parallel_out" --skip-host-telemetry >"$TMP_DIR/failed-parallel.log" 2>&1 || parallel_status=$?
+if [[ "$parallel_status" != 74 ]]; then
+  cat "$TMP_DIR/failed-parallel.log" >&2
+  echo "Expected failed parallel request status 74, got $parallel_status" >&2
+  exit 1
+fi
+test -f "$failed_parallel_barrier/node-b-finished"
+"$ROOT_DIR/scripts/python_bin.sh" - "$failed_parallel_out" <<'PY'
+import json
+from pathlib import Path
+import sys
+
+records = [json.loads(path.read_text()) for path in (Path(sys.argv[1]) / "requests").glob("*.timing.json")]
+assert len(records) == 5, records
+assert sorted(row["exit_status"] for row in records) == [0, 0, 0, 0, 74]
+PY
+
+RUSTFS_ACCESS_KEY=rustfsadmin RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" \
+  SCANNER_TEST_PYTHON="$ROOT_DIR/scripts/python_bin.sh" PATH="$BIN_DIR:$PATH" \
+  "$ROOT_DIR/scripts/python_bin.sh" - "$ROOT_DIR" "$TMP_DIR" <<'PY'
+import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+import time
+from unittest.mock import patch
+
+root, temporary = map(Path, sys.argv[1:])
+sys.path.insert(0, str(root / "scripts"))
+import scanner_abba as harness
+
+def running(pid):
+    result = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True)
+    return result.returncode == 0 and result.stdout.strip() and not result.stdout.lstrip().startswith("Z")
+
+failures = []
+for mode in ("failure", "cancel"):
+    folder = temporary / ("http-child-" + mode)
+    folder.mkdir()
+    os.environ.update(SCANNER_CAPTURE_CHILD_MODE=mode, SCANNER_CAPTURE_CHILD_DIR=str(folder))
+    pids = {}
+    resumers = []
+    try:
+        if mode == "failure":
+            with (folder / "collector.log").open("w") as log:
+                result = subprocess.run([str(root / "scripts/run_scanner_validation_harness.sh"),
+                    "--alias", "rustfs-local", "--endpoint", "http://127.0.0.1:9000", "--samples", "1",
+                    "--interval-secs", "0", "--out-dir", str(folder / "telemetry"), "--skip-host-telemetry"],
+                    stdout=log, stderr=log, timeout=30)
+            assert result.returncode == 74, result.returncode
+        else:
+            def cancel_measurement(*_args):
+                deadline = time.monotonic() + 20
+                while not (folder / "pids.json").exists():
+                    assert time.monotonic() < deadline, "HTTP fixture did not become ready"
+                    time.sleep(0.01)
+                # Control scheduling so the outer cancellation deadline starts
+                # before this request owner can begin its nested cleanup.
+                owner = json.loads((folder / "pids.json").read_text())["owner"]
+                os.kill(owner, signal.SIGSTOP)
+                resumers.append(subprocess.Popen([sys.executable, "-c",
+                    "import os,signal,sys,time; time.sleep(0.25); os.kill(int(sys.argv[1]),signal.SIGCONT)", str(owner)]))
+                raise RuntimeError("cancel measurement fixture")
+            prepared = {"collector": {"alias": "rustfs-local", "endpoint": "http://127.0.0.1:9000",
+                                      "metrics_endpoints": "http://node-a:9000,http://node-b:9000"}}
+            with patch.object(harness, "invoke", side_effect=cancel_measurement):
+                try:
+                    harness.collect_live(prepared, {"duration_seconds": 0}, folder / "request.json", Path("unused"))
+                except RuntimeError as error:
+                    assert str(error) == "cancel measurement fixture"
+                else:
+                    raise AssertionError("expected outer collect_live cancellation")
+        pids = json.loads((folder / "pids.json").read_text())
+        receipts = list((folder / "telemetry/requests").glob("scanner-status.*.timing.json"))
+        receipt = json.loads(receipts[0].read_text()) if len(receipts) == 1 else None
+        alive = {name: bool(running(pid)) for name, pid in pids.items()}
+        evidence = {"mode": mode, "alive_after_cleanup": alive, "receipt": receipt}
+        print(json.dumps(evidence), flush=True)
+        if any(alive.values()) or receipt is None or receipt["exit_status"] != (74 if mode == "failure" else 143):
+            failures.append(evidence)
+    finally:
+        for resumer in resumers:
+            resumer.wait(timeout=2)
+        if not pids and (folder / "pids.json").exists():
+            pids = json.loads((folder / "pids.json").read_text())
+        if pids:
+            try:
+                os.killpg(pids["leader"], signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        os.environ.pop("SCANNER_CAPTURE_CHILD_MODE", None)
+        os.environ.pop("SCANNER_CAPTURE_CHILD_DIR", None)
+assert not failures, failures
+PY
 
 missing_pid_out="$TMP_DIR/out-missing-pid"
 RUSTFS_SECRET_KEY=rustfsadmin MC_LOG="$mc_log" AWSCURL_LOG="$awscurl_log" PATH="$BIN_DIR:$PATH" "$SCRIPT" \

@@ -4743,7 +4743,7 @@ impl SetDisks {
                                 .ok_or_else(|| Error::other(format!("inline encoder omitted disk shard {i}")))?,
                         );
                     } else if let Some(writer) = writers[i].take() {
-                        pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                        pfi.data = Some(writer.into_inline_data().unwrap_or_default());
                     }
 
                     pfi.set_inline_data();

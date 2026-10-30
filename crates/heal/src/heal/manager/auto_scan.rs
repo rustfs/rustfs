@@ -36,6 +36,7 @@ impl HealManager {
         let displaced_terminals = self.displaced_terminals.clone();
         let mrf_repair_notice_targets = self.mrf_repair_notice_targets.clone();
         let storage = self.storage.clone();
+        let admission = storage.background_node_admission();
         let replacement_recovery_anchors = self.replacement_recovery_anchors.clone();
         let blocks = self.replacement_recovery_blocks.clone();
         let cancel_token = self.cancel_token.clone();
@@ -57,7 +58,7 @@ impl HealManager {
             "Heal auto disk scanner started"
         );
 
-        tokio::spawn(async move {
+        self.workers.spawn_fixed(1, move |_parent| async move {
             let mut interval = interval(duration);
 
             loop {
@@ -88,6 +89,10 @@ impl HealManager {
                         let mut conflicted_recovery_tasks = HashSet::<String>::new();
                         let mut conflicted_recovery_sets = HashSet::<String>::new();
                         let mut deferred_recovery_sets = HashSet::<String>::new();
+                        // This tick lacks local evidence for these sets/endpoints;
+                        // later inventory must not turn the deferral into absence.
+                        let mut metadata_deferred_sets = HashSet::<String>::new();
+                        let mut metadata_deferred_endpoints = HashSet::<String>::new();
                         let mut deferred_replacement_endpoints = HashSet::<String>::new();
                         let local_disks = {
                             let local_disk_map = local_disk_map_read().await;
@@ -133,8 +138,32 @@ impl HealManager {
                                 continue;
                             }
 
-                            // detect unformatted disk via get_disk_id()
-                            match disk.get_disk_id().await {
+                            // Preserve backend format results separately from admission deferral.
+                            let probe = run_local_metadata(
+                                disk, admission.as_ref(), &cancel_token, disk.get_disk_id(),
+                            ).await;
+                            // Native capability projection can defer after the outer plan was acquired.
+                            let resource_deferred = admission.is_some()
+                                && matches!(&probe, Ok(Err(DiskError::Io(error))) if error.kind() == std::io::ErrorKind::WouldBlock);
+                            let disk_id = match probe {
+                                Ok(result) if !resource_deferred => result,
+                                _ => {
+                                    if cancel_token.is_cancelled() {
+                                        return;
+                                    }
+                                    metadata_deferred_endpoints.insert(endpoint.to_string());
+                                    if let Some(set) = &set_disk_id {
+                                        metadata_deferred_sets.insert(set.clone());
+                                        deferred_recovery_sets.insert(set.clone());
+                                    }
+                                    skipped_invalid_count += 1;
+                                    continue;
+                                }
+                            };
+                            if admission.is_some() && cancel_token.is_cancelled() {
+                                return;
+                            }
+                            match disk_id {
                                 Err(DiskError::UnformattedDisk) => {
                                     if !super::super::replacement_readiness::auto_replacement_target_ready(disk, &local_disks)
                                         .await
@@ -203,8 +232,18 @@ impl HealManager {
                         let mut recovery_disks = BTreeMap::new();
                         extend_replacement_recovery_disks(&mut recovery_disks, local_disks.iter().cloned());
                         for set_disk_id in &recovery_sets {
-                            match storage.replacement_intent_disks(set_disk_id).await {
+                            if metadata_deferred_sets.contains(set_disk_id) {
+                                continue;
+                            }
+                            match storage.replacement_intent_disks(set_disk_id, Some(&cancel_token)).await {
                                 Ok(disks) => extend_replacement_recovery_disks(&mut recovery_disks, disks),
+                                Err(Error::TransientSkip { .. }) => {
+                                    if cancel_token.is_cancelled() {
+                                        return;
+                                    }
+                                    metadata_deferred_sets.insert(set_disk_id.clone());
+                                    deferred_recovery_sets.insert(set_disk_id.clone());
+                                }
                                 Err(error) => {
                                     conflicted_recovery_sets.insert(set_disk_id.clone());
                                     warn!(
@@ -230,6 +269,11 @@ impl HealManager {
                             let endpoint = disk.endpoint();
                             let disk_set_disk_id =
                                 crate::heal::utils::format_set_disk_id_from_i32(endpoint.pool_idx, endpoint.set_idx);
+                            if metadata_deferred_endpoints.contains(anchor)
+                                || disk_set_disk_id.as_ref().is_some_and(|set| metadata_deferred_sets.contains(set))
+                            {
+                                continue;
+                            }
                             let replacement_task_ids = match ResumeUtils::get_replacement_intent_tasks(disk).await {
                                 Ok(task_ids) => task_ids,
                                 Err(error) => {
@@ -795,7 +839,7 @@ impl HealManager {
                     }
                 }
             }
-        });
+        })?;
         Ok(())
     }
 }

@@ -32,6 +32,7 @@ workspace = true
 [features]
 default = []
 diagnostic-prefix-attribution = []
+e2e-test-hooks = []
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller"]
 hotpath = [
     "hotpath/hotpath",

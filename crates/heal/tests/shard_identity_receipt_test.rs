@@ -30,6 +30,88 @@ use storage_api::integration::{
     WriteCommitGuard, WriteCompletion,
 };
 
+#[test]
+fn disabled_lock_reports_only_quorum_selection_and_deep_check_observations() {
+    const CHILD_ENV: &str = "RUSTFS_TEST_DISABLED_LOCK_HEAL_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("--exact")
+            .arg("disabled_lock_reports_only_quorum_selection_and_deep_check_observations")
+            .arg("--nocapture")
+            .env(CHILD_ENV, "1")
+            .env("RUSTFS_LOCK_ENABLED", "false")
+            .output()
+            .expect("run disabled-lock test in an isolated process");
+        assert!(
+            output.status.success(),
+            "disabled-lock child failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("disabled-lock test runtime")
+        .block_on(async {
+            let root = tempfile::tempdir().expect("disabled-lock fixture");
+            let env = TestECStoreEnv::builder().base_dir(root.path()).build().await;
+            let bucket = "disabled-lock-heal";
+            let object = "object";
+            env.make_bucket(bucket, false).await;
+            let lock = env.ecstore.new_ns_lock(bucket, object).await.expect("fixture namespace lock");
+            let guard = lock.get_write_lock(Duration::from_secs(30)).await.expect("disabled guard");
+            assert!(
+                matches!(guard, rustfs_lock::NamespaceLockGuard::Fast(ref guard) if guard.is_disabled()),
+                "the fixture must use the real disabled lock manager"
+            );
+            drop(guard);
+
+            let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(30))
+                .await
+                .expect("fixture write owner");
+            let mut opts = ObjectOptions {
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            };
+            opts.add_write_commit_guard(&guard);
+            let written = env
+                .ecstore
+                .put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x42; 1024 * 1024 + 123]), &opts)
+                .await
+                .expect("write protected object");
+            drop(opts);
+            drop(guard);
+            let selected = written.data_dir.expect("fixture data directory");
+
+            let storage = ECStoreHealStorage::new(env.ecstore.clone());
+            for no_lock in [false, true] {
+                let result = storage
+                    .heal_object_with_receipt(
+                        bucket,
+                        object,
+                        None,
+                        &HealOpts {
+                            no_lock,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("Deep scan with disabled locking");
+                assert!(result.error.is_none(), "{:?}", result.error);
+                assert!(result.item.integrity_verified, "the Deep check path must complete");
+                assert_eq!(result.item.quorum_selected_data_dir, Some(*selected.as_bytes()));
+                let receipt = result.receipt.expect("Deep scan result receipt");
+                assert_eq!(receipt.quorum_selected_data_dir, Some(selected));
+                assert!(receipt.deep_check_observed);
+            }
+        });
+}
+
 #[tokio::test]
 #[serial]
 async fn legacy_repair_reports_execution_without_strong_receipt() {
@@ -196,7 +278,6 @@ async fn receipt_requires_independent_deep_verification() {
                 &object,
                 None,
                 &HealOpts {
-                    no_lock: true,
                     scan_mode: HealScanMode::Normal,
                     ..Default::default()
                 },
@@ -209,13 +290,19 @@ async fn receipt_requires_independent_deep_verification() {
             HealObjectDisposition::MetadataHealthy,
             "a presence scan must not be promoted to payload VerifiedHealthy"
         );
+        assert!(
+            normal_receipt
+                .quorum_selected_data_dir
+                .is_some_and(|generation| !generation.is_nil()),
+            "the Normal scan must report the quorum-selected data directory"
+        );
+        assert!(!normal_receipt.deep_check_observed);
         let result = storage
             .heal_object_with_receipt(
                 bucket,
                 &object,
                 None,
                 &HealOpts {
-                    no_lock: true,
                     scan_mode: HealScanMode::Deep,
                     ..Default::default()
                 },
@@ -224,11 +311,32 @@ async fn receipt_requires_independent_deep_verification() {
         if corrupt_count == 1 {
             let result = result.expect("recoverable repair");
             assert!(result.error.is_none());
+            let receipt = result.receipt.expect("verified repair receipt");
             assert_eq!(
-                result.receipt.expect("verified repair receipt").disposition,
+                receipt.disposition,
                 HealObjectDisposition::Repaired,
                 "presence alone must not produce VerifiedHealthy"
             );
+            assert!(receipt.deep_check_observed, "Deep repair completed the protected-shard check path");
+            let selected = receipt.quorum_selected_data_dir.expect("quorum-selected data directory");
+            let unowned = storage
+                .heal_object_with_receipt(
+                    bucket,
+                    &object,
+                    None,
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("unowned Deep inspection");
+            assert!(unowned.item.integrity_verified, "the storage scan completed its Deep check path");
+            assert_eq!(unowned.item.quorum_selected_data_dir, Some(*selected.as_bytes()));
+            let unowned_receipt = unowned.receipt.expect("unowned result receipt");
+            assert_eq!(unowned_receipt.quorum_selected_data_dir, Some(selected));
+            assert!(unowned_receipt.deep_check_observed);
         } else if let Ok(result) = result {
             assert!(result.error.is_some(), "below quorum cannot be a success");
             assert!(result.receipt.is_none(), "no completion receipt without authoritative sources");
@@ -357,6 +465,10 @@ fn admin_pool_set_repairs_five_shards_and_retains_exact_terminal_after_restart()
                             .find(|receipt| receipt.identity.bucket == *bucket && receipt.identity.object == *object)
                             .expect("one receipt per exact fault");
                         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+                        assert!(
+                            !receipt.deep_check_observed,
+                            "erasure-set checkpoint outcomes do not retain the local Deep observation"
+                        );
                         assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
                         assert!(receipt.identity.version_id.is_some());
                         assert_eq!(
@@ -528,6 +640,7 @@ fn admin_normal_protected_repairs_report_repaired_for_data_and_parity() {
                             .find(|receipt| receipt.identity.bucket == bucket && receipt.identity.object == *object)
                             .expect("one receipt per repaired object");
                         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+                        assert!(!receipt.deep_check_observed, "Normal repair has no Deep check observation");
                         assert_eq!((receipt.identity.pool_index, receipt.identity.set_index), (Some(0), Some(0)));
                         assert!(receipt.identity.version_id.is_some());
                         assert_eq!(
