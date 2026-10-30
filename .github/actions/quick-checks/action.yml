@@ -13,7 +13,7 @@
 # limitations under the License.
 
 name: Quick Checks
-description: Run the shared compile-free RustFS quality checks.
+description: Run the shared RustFS quality checks.
 
 runs:
   using: composite
@@ -24,6 +24,7 @@ runs:
         tool: |
           ripgrep@15.2.0
           shellcheck@0.11.0
+          cargo-nextest@0.9.138
 
     - name: Install actionlint
       shell: bash
@@ -36,6 +37,15 @@ runs:
         tar -xzf "$actionlint_dir/actionlint.tar.gz" -C "$actionlint_dir" actionlint
         rm "$actionlint_dir/actionlint.tar.gz"
         echo "$actionlint_dir" >> "$GITHUB_PATH"
+
+    - name: Install Python
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: "3.12"
+
+    - name: Install workflow parser
+      shell: bash
+      run: python3 -m pip install --disable-pip-version-check PyYAML==6.0.3
 
     - name: Install Rust toolchain
       uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -104,7 +114,10 @@ runs:
 
     - name: Check test wiring
       shell: bash
-      run: python3 ./scripts/check_test_wiring.py
+      run: |
+        python3 ./scripts/check_test_wiring.py
+        python3 ./scripts/ci_gate.py --check-workflow
+        python3 ./scripts/validation_registry.py check
 
     - name: Check no planning docs committed
       shell: bash

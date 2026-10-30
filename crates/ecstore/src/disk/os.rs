@@ -286,6 +286,11 @@ mod dir_fsync_failures {
 
     static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn has_any() -> bool {
+        !FAILURES.lock().is_empty()
+    }
+
     pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
         FAILURES.lock().insert(dir.to_path_buf(), kind);
     }
@@ -323,6 +328,11 @@ pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path:
     Ok(())
 }
 
+#[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
+pub(crate) fn has_dir_fsync_test_failures() -> bool {
+    dir_fsync_failures::has_any()
+}
+
 /// Pause a real namespace mutation inside its physical executor.
 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
 pub(crate) mod prepared_publication_test_hooks {
@@ -333,6 +343,8 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        MetadataReadAfterOpen,
+        MetadataReadAfterRead,
         #[cfg(test)]
         Rollback,
         #[cfg(test)]
@@ -368,6 +380,17 @@ pub(crate) mod prepared_publication_test_hooks {
             let _pause = super::enter_blocking_test_hook();
             hook();
         }
+    }
+
+    pub(crate) fn has_any_hooks() -> bool {
+        if !BEFORE_PUBLICATION.lock().is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -457,6 +480,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    MetadataReadAfterOpen,
+    MetadataReadAfterRead,
 }
 
 #[cfg(all(feature = "test-util", not(windows)))]
@@ -469,6 +494,8 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
+            LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
         let (entered_tx, entered) = oneshot::channel();
         let (release, release_rx) = std::sync::mpsc::channel::<()>();
@@ -752,7 +779,7 @@ fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
     file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
 }
 
-fn file_fdatasync_group_commit_enabled() -> bool {
+pub(crate) fn file_fdatasync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = file_fdatasync_group_commit_override::get() {
         return enabled;
@@ -2386,6 +2413,10 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
+    pub(crate) fn is_active() -> bool {
+        !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
+    }
+
     pub(super) fn set_failing(root: &Path) -> ProbeGuard {
         configure(root, Some(1), false)
     }
@@ -2547,18 +2578,25 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
-#[allow(
-    dead_code,
-    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+    )
 )]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir.as_ref())? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            sync_file(&entry.path())?;
-        }
-    }
-    fsync_dir_std(dir)
+    let dir = dir.as_ref();
+    let files = regular_files(dir)?;
+    rustfs_io_metrics::record_put_rename_fdatasync_batch(rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, files.len());
+    sync_files(&files)?;
+    let fsync_started = rustfs_io_metrics::put_stage_timer();
+    let result = fsync_dir_std(dir);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+        fsync_started,
+    );
+    result
 }
 
 /// Async wrapper around [`sync_dir_files_std`]. Large directories flush files
@@ -3047,17 +3085,6 @@ pub(crate) async fn rename_all_with_lease(
 
 /// A source admission must run before destination preparation can mkdir and
 /// again before the consuming rename, inside the actual owned callback.
-pub(crate) async fn rename_all_with_precondition(
-    source: &Path,
-    destination: &Path,
-    base: &Path,
-    publication_root: &PublicationRoot,
-    owner: Option<Arc<dyn Send + Sync>>,
-    precondition: Option<Arc<dyn Fn() -> io::Result<()> + Send + Sync>>,
-) -> Result<()> {
-    rename_all_with_precondition_and_parent_sync(source, destination, base, publication_root, owner, precondition, false).await
-}
-
 pub(crate) async fn rename_all_with_precondition_and_parent_sync(
     source: &Path,
     destination: &Path,
@@ -3075,43 +3102,61 @@ pub(crate) async fn rename_all_with_precondition_and_parent_sync(
     let base = base.to_path_buf();
     let root = publication_root.clone();
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
-    run_blocking_namespace_operation(lease, move || {
-        if let Some(check) = precondition.as_ref() {
-            check()?;
-        }
-        let preparation = prepare_rename_with_retry(&source, &destination, &base, &root)?;
-        #[cfg(all(test, not(windows)))]
-        prepared_publication_test_hooks::run_rename_destination(&source, &destination);
-        #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-        {
-            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &source);
-            prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
-        }
-        if let Some(check) = precondition.as_ref() {
-            check()?;
-        }
-        rename_prepared(&source, &destination, &preparation)?;
-        if sync_parent {
-            let parent = destination
-                .parent()
-                .ok_or_else(|| io::Error::other("source metadata parent is missing"))?;
-            #[cfg(unix)]
-            {
-                let pinned = preparation
-                    .parent_guard
-                    .as_ref()
-                    .and_then(|guard| guard.last())
-                    .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
-                let opened = std::fs::File::from(pinned.try_clone()?);
-                fsync_directory_handle_std(parent, Some(&opened))?;
-            }
-            #[cfg(not(unix))]
-            fsync_dir_std(parent)?;
-        }
-        Ok(())
+    run_blocking_namespace_operation_with_sync(lease, sync_parent, move || {
+        rename_all_with_precondition_and_parent_sync_std(
+            &source,
+            &destination,
+            &base,
+            &root,
+            precondition.as_deref(),
+            sync_parent,
+        )
     })
     .await
     .map_err(|error| to_file_error(error).into())
+}
+
+pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
+    source: &Path,
+    destination: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    precondition: Option<&(dyn Fn() -> io::Result<()> + Send + Sync)>,
+    sync_parent: bool,
+) -> io::Result<()> {
+    if let Some(check) = precondition {
+        check()?;
+    }
+    let preparation = prepare_rename_with_retry(source, destination, base, publication_root)?;
+    #[cfg(all(test, not(windows)))]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+        if let Some(check) = precondition {
+            check()?;
+        }
+    }
+    rename_prepared(source, destination, &preparation)?;
+    if sync_parent {
+        let parent = destination
+            .parent()
+            .ok_or_else(|| io::Error::other("source metadata parent is missing"))?;
+        #[cfg(unix)]
+        {
+            let pinned = preparation
+                .parent_guard
+                .as_ref()
+                .and_then(|guard| guard.last())
+                .ok_or_else(|| io::Error::other("source metadata parent was not pinned"))?;
+            let opened = std::fs::File::from(pinned.try_clone()?);
+            fsync_directory_handle_std(parent, Some(&opened))?;
+        }
+        #[cfg(not(unix))]
+        fsync_dir_std(parent)?;
+    }
+    Ok(())
 }
 
 /// Publish a conditional repair and sync its directory in one owned executor.
@@ -3186,26 +3231,32 @@ pub(crate) struct DurableFileReceipt {
 
 #[cfg(unix)]
 fn open_anchored_metadata(path: &Path, publication_root: &PublicationRoot) -> io::Result<std::fs::File> {
-    use rustix::fs::{Mode, OFlags, openat};
     #[cfg(target_os = "linux")]
-    let logical_path = publication_root.path().join(publication_root.relative_path(path)?);
-    #[cfg(target_os = "linux")]
-    let path = logical_path.as_path();
-    let parents = open_existing_directory_below_base_std(
-        path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
-        publication_root.path(),
-        publication_root,
-    )?;
-    let directory = parents
-        .last()
-        .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
-    Ok(openat(
-        directory,
-        path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
-        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?
-    .into())
+    {
+        let parent = path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?;
+        existing_base_directory_suffix(parent, publication_root.path())
+            .or_else(|_| existing_base_directory_suffix(parent, publication_root.io_path()))?;
+        publication_root.open_readonly(path)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let parents = open_existing_directory_below_base_std(
+            path.parent().ok_or_else(|| io::Error::other("metadata has no parent"))?,
+            publication_root.path(),
+            publication_root,
+        )?;
+        let directory = parents
+            .last()
+            .ok_or_else(|| io::Error::other("missing metadata directory guard"))?;
+        Ok(openat(
+            directory,
+            path.file_name().ok_or_else(|| io::Error::other("metadata has no name"))?,
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        )?
+        .into())
+    }
 }
 
 #[cfg(unix)]
@@ -3681,8 +3732,10 @@ pub(crate) fn read_destination_file_with_commit_guard(
         };
         match open_linux_relative(&parent.file, Path::new(name), OFlags::RDONLY, Mode::empty()) {
             Ok(mut file) => {
-                let mut data = Vec::new();
-                std::io::Read::read_to_end(&mut file, &mut data)?;
+                let len = file.metadata()?.len();
+                let cap = usize::try_from(len).map_or(0, |len| len.saturating_add(1));
+                let mut data = Vec::with_capacity(cap);
+                std::io::Read::read_to_end(&mut std::io::Read::take(&mut file, len), &mut data)?;
                 Ok(Some(data))
             }
             Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(None),
@@ -3784,6 +3837,23 @@ pub(crate) async fn rename_all_with_prepared_source(
     })
     .await
     .map_err(to_file_error)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
+    guard.directories.prepare_destination().map_err(to_file_error)?;
+    #[cfg(test)]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+    }
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, destination)
+        .map_err(to_file_error)?;
+    guard.directories.rename(source, destination, None).map_err(to_file_error)?;
     Ok(())
 }
 
@@ -4688,6 +4758,27 @@ impl PublicationRoot {
         return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
         #[cfg(not(target_os = "linux"))]
         std::fs::File::open(path)
+    }
+
+    pub(crate) fn check_writable(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let directory = self.open_directory(path)?;
+        #[cfg(target_os = "linux")]
+        let probe_directory = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe_directory = path;
+
+        // Keep the Linux parent handle pinned through deletion, including when
+        // a startup timeout detaches the blocking task.
+        let mut probe = tempfile::Builder::new()
+            .prefix(".rustfs-write-check-")
+            .tempfile_in(probe_directory)?;
+        let write_result = std::io::Write::write_all(probe.as_file_mut(), b"rustfs");
+        let delete_result = probe.close();
+        write_result.and(delete_result)
     }
 
     pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {
@@ -6259,6 +6350,7 @@ pub(crate) fn replace_multipart_source_metadata(
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
+    #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
     let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
@@ -6440,6 +6532,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {
@@ -6474,6 +6567,7 @@ pub(crate) fn install_multipart_prepared_head(
     if original_path.parent() != Some(parent) || original_path == canonical_head {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
+    #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
     let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
@@ -6640,13 +6734,69 @@ fn read_multipart_metadata_in_pinned(
     }
 }
 
+pub(crate) fn read_and_sync_multipart_target_metadata(
+    directory: &Path,
+    name: &std::ffi::OsStr,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    validate: impl FnOnce(&[u8]) -> io::Result<()>,
+) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use rustix::fs::{Mode, OFlags, openat};
+        let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        let dir_fd = pinned
+            .last()
+            .ok_or_else(|| io::Error::other("missing multipart target directory"))?;
+        let mut file =
+            std::fs::File::from(openat(dir_fd, name, OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?);
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        let bytes = read_multipart_metadata_bytes(&mut file, Some(metadata.len()), None)?;
+        validate(&bytes)?;
+        file.sync_data()?;
+        let opened = std::fs::File::from(pinned.pop().ok_or_else(|| io::Error::other("empty target directory guard"))?);
+        fsync_directory_handle_std(directory, Some(&opened))
+    }
+    #[cfg(not(unix))]
+    {
+        let _pinned = pin_multipart_source_directory(directory, base, publication_root)?;
+        let file = directory.join(name);
+        let bytes = read_multipart_metadata(&file, base, publication_root, None)?;
+        validate(&bytes)?;
+        sync_file(&file)?;
+        fsync_dir_std(directory)
+    }
+}
+
 fn read_multipart_metadata(
     path: &Path,
     base: &Path,
     publication_root: &PublicationRoot,
     maximum: Option<u64>,
 ) -> io::Result<Vec<u8>> {
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
+    {
+        let parent = path
+            .parent()
+            .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
+        let name = path
+            .file_name()
+            .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
+        if name.is_empty() {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "multipart metadata has no name"));
+        }
+        existing_base_directory_suffix(parent, base)?;
+        let mut file = publication_root.open_readonly(path)?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart metadata is not a regular file"));
+        }
+        read_multipart_metadata_bytes(&mut file, Some(metadata.len()), maximum)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
     {
         let parent = path
             .parent()

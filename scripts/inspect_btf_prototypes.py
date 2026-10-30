@@ -7,6 +7,7 @@ import array
 import hashlib
 import json
 import os
+import re
 import stat
 import struct
 import sys
@@ -14,6 +15,7 @@ from pathlib import Path
 
 MAX_BTF_BYTES = 32 * 1024 * 1024
 MAX_FUNCTIONS = 16
+MAX_FIELDS = 16
 MAX_JSON_BYTES = 1024 * 1024
 
 
@@ -118,6 +120,48 @@ class _BTF:
         result, chain = self.unwrap(p['size_or_type'], allow_void=True)
         return {'function': fn, 'prototype': p, 'args': args, 'return': result, 'return_chain': chain}
 
+    def scalar_field(self, root, path):
+        """Resolve a declared, byte-aligned integer span without dereferencing pointers."""
+        container, absolute, steps, seen = root, 0, [], set()
+        parts = path.split('.')
+        for index, name in enumerate(parts):
+            need(container['kind'] == 4 and container['ID'] not in seen,
+                 'acyclic_struct_member_path')
+            seen.add(container['ID'])
+            members = []
+            for member in range(container['count']):
+                nm, ty, bits = struct.unpack_from('<III', self.raw, container['offset'] + 12 + member * 12)
+                if self.string(nm) == name:
+                    members.append((ty, bits))
+            need(len(members) == 1, 'unique_actual_named_struct_member')
+            ident, encoded_offset = members[0]
+            bitfield = encoded_offset >> 24 if container['kflag'] else 0
+            offset = encoded_offset & 0xffffff if container['kflag'] else encoded_offset
+            need(not bitfield and offset % 8 == 0, 'non_bitfield_byte_aligned_member')
+            leaf, chain = self.unwrap(ident)
+            if index + 1 < len(parts):
+                need(leaf['kind'] == 4, 'member_path_cannot_cross_pointer_or_non_struct')
+                width = leaf['size_or_type']
+            else:
+                need(leaf['kind'] == 1 and leaf['count'] == 0 and not leaf['kflag'],
+                     'actual_scalar_integer_header')
+                encoding = struct.unpack_from('<I', self.raw, leaf['offset'] + 12)[0]
+                flags, integer_offset, integer_bits = (encoding >> 24) & 15, (encoding >> 16) & 255, encoding & 255
+                width = leaf['size_or_type']
+                need(encoding & 0xf000ff00 == 0 and flags in (0, 1, 2, 4),
+                     'supported_integer_encoding')
+                need(width in (1, 2, 4, 8) and integer_offset == 0 and integer_bits == width * 8,
+                     'complete_byte_scalar_integer')
+            need(width > 0 and offset + width * 8 <= container['size_or_type'] * 8,
+                 'member_span_within_declared_container')
+            absolute += offset
+            steps.append({'container_ID': container['ID'], 'member': name, 'member_type_ID': ident,
+                          'member_bit_offset': offset, 'qualifiers': chain})
+            container = leaf
+        return {'path': path, 'byte_offset': absolute // 8, 'bytes': width, 'leaf': leaf,
+                'integer': {'encoding_flags': flags, 'bit_offset': integer_offset, 'bits': integer_bits},
+                'steps': steps}
+
 
 def inspect_prototypes(path, names):
     """Read bounded source bytes and report declared prototypes, never runtime ABI."""
@@ -126,6 +170,30 @@ def inspect_prototypes(path, names):
                    or len(name.encode("utf-8")) > 4096 for name in names)
             or len(set(names)) != len(names)):
         raise ValueError("one_to_sixteen_unique_function_names_required")
+    btf, source = _read_btf(path)
+    return {"schema": 1, "source": source, "prototypes": [btf.prototype(name) for name in names]}
+
+
+def inspect_scalar_fields(path, struct_name, fields):
+    """Report selected declared integer layouts, never runtime memory or ABI."""
+    if (not isinstance(struct_name, str) or not struct_name or "\0" in struct_name
+            or len(struct_name.encode("utf-8")) > 4096):
+        raise ValueError("one_exact_struct_name_required")
+    if (not isinstance(fields, (list, tuple)) or not fields or len(fields) > MAX_FIELDS
+            or any(not isinstance(field, str) or len(field.encode("utf-8")) > 4096
+                   or not 1 <= len(field.split('.')) <= 32
+                   or any(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', part) is None for part in field.split('.'))
+                   for field in fields)
+            or len(set(fields)) != len(fields)):
+        raise ValueError("one_to_sixteen_unique_scalar_member_paths_required")
+    btf, source = _read_btf(path)
+    root = btf.find(struct_name, 4)
+    return {"schema": 1, "source": source, "struct": root, "runtime_ABI_verified": False,
+            "scalar_fields": [btf.scalar_field(root, field) for field in fields]}
+
+
+def _read_btf(path):
+    """Share the same bounded regular-file contract across inspection modes."""
     path = Path(path)
     if not stat.S_ISREG(path.lstat().st_mode):
         raise ValueError("BTF_input_must_be_a_regular_non_symlink_file")
@@ -139,11 +207,8 @@ def inspect_prototypes(path, names):
         raw = source.read(MAX_BTF_BYTES + 1)
     if len(raw) > MAX_BTF_BYTES:
         raise ValueError("BTF_source_exceeds_32_MiB")
-    btf = _BTF(raw)
-    return {"schema": 1,
-            "source": {"format": "BTF-v1-little-endian", "bytes": len(raw),
-                       "sha256": hashlib.sha256(raw).hexdigest()},
-            "prototypes": [btf.prototype(name) for name in names]}
+    return _BTF(raw), {"format": "BTF-v1-little-endian", "bytes": len(raw),
+                       "sha256": hashlib.sha256(raw).hexdigest()}
 
 
 def encode_document(document):
@@ -160,13 +225,21 @@ def encode_document(document):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="Read-only inspection of declared BTF function prototypes; no probe loading or runtime ABI claims.")
+        description="Read-only BTF prototypes or scalar member layouts; no probe loading or runtime ABI claims.")
     parser.add_argument("--btf", required=True, type=Path, help="raw BTF v1 little-endian file (at most 32 MiB)")
-    parser.add_argument("--function", required=True, action="append", dest="functions",
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--function", action="append", dest="functions",
                         help="exact, unique function name; repeat at most 16 times")
+    selection.add_argument("--struct", dest="struct_name", help="exact, unique struct name for scalar fields")
+    parser.add_argument("--field", action="append", dest="fields",
+                        help="named integer member path within --struct; repeat at most 16 times")
     args = parser.parse_args(argv)
+    if (args.struct_name is not None) != (args.fields is not None):
+        parser.error("--struct and --field must be supplied together")
     try:
-        output = encode_document(inspect_prototypes(args.btf, args.functions))
+        document = (inspect_scalar_fields(args.btf, args.struct_name, args.fields) if args.struct_name is not None
+                    else inspect_prototypes(args.btf, args.functions))
+        output = encode_document(document)
     except OSError:
         parser.exit(2, "BTF input could not be read\n")
     except (ValueError, UnicodeError) as error:

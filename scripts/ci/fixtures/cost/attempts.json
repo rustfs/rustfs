@@ -1,0 +1,29 @@
+{
+  "schema": 1,
+  "repository": "owner/repo",
+  "complete": true,
+  "created_since": "2026-10-01T00:00:00Z",
+  "created_until": "2026-10-02T00:00:00Z",
+  "issues": [],
+  "pull_requests": {
+    "11": {"number": 11, "created_at": "2026-10-01T00:00:00Z", "merged_at": "2026-10-01T01:00:00Z", "merge_commit_sha": "cccccccccccccccccccccccccccccccccccccccc"},
+    "12": {"number": 12, "created_at": "2026-10-01T00:00:00Z", "merged_at": "2026-10-01T01:00:00Z"}
+  },
+  "attributions": {
+    "102": {"run_id": 102, "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "pull_requests": [11, 12], "evidence": "https://github.com/owner/repo/actions/runs/102"}
+  },
+  "runs": [
+    {"id": 101, "run_attempt": 1, "path": ".github/workflows/ci.yml", "event": "pull_request", "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "status": "completed", "conclusion": "failure", "created_at": "2026-10-01T00:00:00Z", "run_started_at": "2026-10-01T00:00:00Z", "pull_requests": [{"number": 11, "url": "https://api.github.com/repos/owner/repo/pulls/11"}], "complete": true,
+      "jobs": [{"id": 1001, "run_id": 101, "run_attempt": 1, "name": "Workspace Test and Lint", "status": "completed", "conclusion": "failure", "labels": ["sm-standard-4"], "created_at": "2026-10-01T00:00:00Z", "started_at": "2026-10-01T00:02:00Z", "completed_at": "2026-10-01T00:12:00Z", "steps": []}]},
+    {"id": 101, "run_attempt": 2, "path": ".github/workflows/ci.yml", "event": "pull_request", "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "status": "completed", "conclusion": "success", "created_at": "2026-10-01T00:00:00Z", "run_started_at": "2026-10-01T00:20:00Z", "pull_requests": [{"number": 11, "url": "https://api.github.com/repos/owner/repo/pulls/11"}], "complete": true,
+      "jobs": [{"id": 1002, "run_id": 101, "run_attempt": 2, "name": "Workspace Test and Lint", "status": "completed", "conclusion": "success", "labels": ["sm-standard-4"], "created_at": "2026-10-01T00:20:00Z", "started_at": "2026-10-01T00:21:00Z", "completed_at": "2026-10-01T00:31:00Z", "steps": [{"name": "Run nextest tests", "status": "completed", "conclusion": "success", "started_at": "2026-10-01T00:22:00Z", "completed_at": "2026-10-01T00:30:00Z"}]}]},
+    {"id": 102, "run_attempt": 1, "path": ".github/workflows/build.yml", "event": "merge_group", "head_sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "status": "completed", "conclusion": "cancelled", "complete": true,
+      "jobs": [{"id": 1003, "run_id": 102, "run_attempt": 1, "name": "Build", "status": "completed", "conclusion": "cancelled", "labels": ["ubicloud-standard-16-arm"], "created_at": "2026-10-01T00:30:00Z", "started_at": "2026-10-01T00:34:00Z", "completed_at": "2026-10-01T00:40:00Z", "steps": []}]},
+    {"id": 103, "run_attempt": 1, "path": ".github/workflows/nightly.yml", "event": "schedule", "head_sha": "cccccccccccccccccccccccccccccccccccccccc", "status": "completed", "conclusion": "success", "complete": true,
+      "jobs": [{"id": 1004, "name": "Nightly", "status": "completed", "conclusion": "success", "labels": ["sm-standard-4"], "created_at": null, "started_at": "2026-10-01T00:40:00Z", "completed_at": "2026-10-01T00:45:00Z", "steps": []}]},
+    {"id": 104, "run_attempt": 1, "path": ".github/workflows/downstream.yml", "event": "workflow_run", "head_sha": "cccccccccccccccccccccccccccccccccccccccc", "status": "completed", "conclusion": "cancelled", "complete": true,
+      "jobs": [{"id": 1005, "name": "Expired details", "status": "completed", "conclusion": "cancelled", "labels": ["custom-pool"], "created_at": null, "started_at": null, "completed_at": null, "steps": null}]},
+    {"id": 105, "run_attempt": 1, "path": ".github/workflows/post-merge.yml", "event": "push", "head_sha": "cccccccccccccccccccccccccccccccccccccccc", "status": "completed", "conclusion": "success", "complete": true,
+      "jobs": [{"id": 1006, "name": "Post merge", "status": "completed", "conclusion": "success", "labels": ["ubuntu-latest"], "created_at": "2026-10-01T01:00:00Z", "started_at": "2026-10-01T01:01:00Z", "completed_at": "2026-10-01T01:03:00Z", "steps": []}]}
+  ]
+}

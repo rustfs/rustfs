@@ -130,6 +130,10 @@ curl -O https://rustfs.com/install_rustfs.sh && bash install_rustfs.sh
 
 The RustFS container runs as a non-root user `rustfs` (UID/GID `10001:10001`). If you bind-mount host directories with Docker or Compose, every mounted path must be writable by that user, otherwise startup may fail with permission denied errors. This applies to data directories, log directories, and TLS certificate directories when `RUSTFS_TLS_PATH` is enabled.
 
+**Upgrading an existing data volume:** some older images ran as root. Replacing the image does not change ownership of mounted files. Before upgrading to a non-root image, stop the instances using the volume, confirm the actual host mount paths and runtime UID/GID, and grant that identity access to all existing data and log directories. For ordinary Docker bind mounts using the default identity, run `sudo chown -R 10001:10001 /actual/data /actual/logs` on the host. Repeat for each data mount; do not apply this recursively to unrelated shared directories. Kubernetes, NFS, ACLs, and rootless UID mappings may require a different ownership or access-control adjustment.
+
+RustFS checks creation, writing, and deletion of a small temporary file in each data root and fixed internal metadata directories when opening a local disk. A failed check rejects that disk through the existing startup/quorum rules and logs the filesystem error; permission diagnostics include the runtime UID/GID and path owner on Unix. This is not a recursive scan of existing buckets or objects: permissions must also allow access to their contents. RustFS does not change ownership automatically. After migration, verify upload, download, and deletion rather than relying only on a green health endpoint.
+
 ```bash
 # Create data and logs directories
 mkdir -p data logs

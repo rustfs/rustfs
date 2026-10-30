@@ -29,11 +29,6 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  repository_dispatch:
-    # Chain handoff: dispatched when the storage suite finishes. Heal runs
-    # exactly once per chain; the pool expansion workflow no longer embeds
-    # its own heal pass.
-    types: [rustfs-chain-heal]
 
 permissions:
   contents: read
@@ -60,10 +55,11 @@ env:
 jobs:
   heal-test:
     runs-on: smoke-testing
-    timeout-minutes: 60
+    # 90-minute heal run (see the step below) plus setup, report and cleanup.
+    timeout-minutes: 120
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
-    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout chain tooling
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -109,6 +105,13 @@ jobs:
           warp --version || true
           df -h /data | tail -1
 
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-heal.json
+        run: python3 scripts/functional_environment.py enter --suite heal
+
       - name: Cleanup environment (before)
         timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' }}
@@ -152,10 +155,9 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
-        timeout-minutes: 45
+        timeout-minutes: 90
         id: test
-        # Case failures keep the run green: the report and the backlog
-        # issue manager carry the product signal.
+        # Collect reports and backlog evidence before the final suite verdict.
         continue-on-error: true
         run: |
           ./auto-testing/rustfs_heal_test.sh \
@@ -241,9 +243,8 @@ jobs:
             RESULT=success
           fi
 
-          # Product gate: failing steps keep the run green — they are reported
-          # below and tracked in rustfs/backlog. Only harness/environment
-          # breakdowns turn the workflow red.
+          # Preserve harness completion separately; the final verdict checks
+          # every case after retaining reports and cleanup evidence.
           STEPS_TOTAL="$(grep -cE '^\[HEAL-STEP\]' "${LOG_FILE}" 2>/dev/null || true)"
           STEPS_FAIL="$(grep -cE '^\[HEAL-STEP\].* FAIL$' "${LOG_FILE}" 2>/dev/null || true)"
           STEPS_TOTAL=$(( ${STEPS_TOTAL:-0} + 0 )); STEPS_FAIL=$(( ${STEPS_FAIL:-0} + 0 ))
@@ -281,7 +282,7 @@ jobs:
             fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
-          # Red only for harness/environment breakdowns; step failures stay green.
+          # Preserve the harness verdict separately from the final case verdict.
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
@@ -377,8 +378,9 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        if: ${{ always() && inputs.cleanup_after != 'false' && steps.environment.outcome == 'success' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -396,54 +398,21 @@ jobs:
             '
           done
 
-      - name: "Continue functional chain (next: Pool expansion)"
-        # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup. A failed
-        # handoff must never pass silently: it retries, then files an alert
-        # issue in rustfs/backlog so a stalled chain is visible.
-        if: ${{ always() && github.event_name == 'repository_dispatch' }}
-        continue-on-error: true
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          DISPATCHED=0
-          for attempt in 1 2 3; do
-            if gh api --method POST repos/rustfs/rustfs/dispatches \
-              -f event_type='rustfs-chain-pool' \
-              -F 'client_payload[from_suite]=heal'; then
-              echo "dispatched next suite Pool expansion (attempt ${attempt})"
-              DISPATCHED=1
-              break
-            fi
-            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
-            sleep "${attempt}0"
-          done
-          if [ "${DISPATCHED:-0}" -ne 1 ]; then
-            echo "ERROR: functional chain stalled: could not dispatch Pool expansion after 3 attempts" >&2
-            TITLE="[functional][chain] stalled after heal (run ${GITHUB_RUN_ID})"
-            BODY_FILE="$(mktemp)"
-            {
-              echo "The functional chain could not hand off from **heal** to **Pool expansion** after 3 attempts."
-              echo ""
-              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-              echo "- Expected next event: 'rustfs-chain-pool'"
-              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
-              echo "- Recovery: re-dispatch manually with"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-pool'"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-            } > "${BODY_FILE}"
-            gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test \
-              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
-              || echo "could not file the stall alert issue either; check the token" >&2
-            exit 1
-          fi
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-heal.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 scripts/functional_environment.py finish --suite heal --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-heal-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-heal.json
+          if-no-files-found: error
 
       - name: Notify on failure
         if: failure()
@@ -472,3 +441,13 @@ jobs:
           name: functional-chain-heal-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-heal-${{ github.run_id }}-${{ github.run_attempt }}/heal.json
           if-no-files-found: error
+
+      - name: Enforce suite and report result
+        if: ${{ always() }}
+        env:
+          SUITE_OUTCOME: ${{ steps.test.outcome }}
+          REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: |
+          test "$SUITE_OUTCOME" = success
+          test "$REPORT_OUTCOME" = success
+          python3 scripts/functional_chain_evidence.py verify-report --suite heal --report "${FUNCTIONAL_ARTIFACTS_DIR}/steps.md"

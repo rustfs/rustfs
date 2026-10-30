@@ -16,7 +16,7 @@ Every other label in this repository is capacity RustFS pays for. ARC pods and l
 | `sm-standard-2` | RustFS | ARC pod, Ubuntu 24.04, minimal image: no `gh`, no C toolchain; Docker only on the `dind-` label | only a job that a hosted runner cannot run (see the placement rule) |
 | `sm-standard-4` | RustFS | ARC pod, Ubuntu 24.04, 14 CPUs and 28 GB (the label is not the core count), large disk | workspace-scale Cargo builds |
 | `ubicloud-standard-16-arm` | RustFS | Ubicloud VM, alias of `ubicloud-standard-16-arm-ubuntu-2404`: Ubuntu 24.04 arm64, 16 vCPU, 48 GB, 300 GB disk. Reached through the `build.yml` matrix, so `actionlint.yaml` does not list it | native aarch64 release builds (`linux-aarch64-musl`, `linux-aarch64-gnu`) |
-| `dind-sm-standard-2` | RustFS | ARC pod with Docker-in-Docker | image builds that need `buildx` and a registry push |
+| `dind-sm-standard-2` | RustFS | ARC pod with Docker-in-Docker | Docker workloads with a measured resource or environment requirement beyond the hosted runner |
 | `smoke-testing`, `pf-testing` | RustFS | long-lived lab machines | the packaged functional chain and performance suites |
 
 The self-hosted pods and the hosted image are both Ubuntu 24.04, so a binary built on one runs on the other; `ci.yml` builds the debug binary on `sm-standard-4` and runs it on both pools.
@@ -27,10 +27,14 @@ A job runs on `ubuntu-latest` unless it has one of these reasons, and the reason
 
 1. **Disk.** It restores or produces the workspace `target/`: `cargo build` or `cargo test` with `--all-targets`, `cargo nextest run --all`, or any reader of the `ci-dev` / `ci-feat-*` caches. The workspace test build leaves about 64 GB in `target/`; a hosted runner has about 14 GB.
 2. **Critical-path CPU.** It is a build that several downstream lanes wait on and would blow its timeout at 4 vCPU (`build-rustfs-debug-binary` gates the e2e and s3-tests lanes).
-3. **Hardware.** Native aarch64, Docker-in-Docker, or the lab machines.
+3. **Hardware or environment.** Native aarch64 or access to the lab machines. Docker alone is not a reason: hosted Ubuntu ships Docker and supports the QEMU and Buildx setup actions.
 4. **Cache ownership.** It reads a `rust-cache` key that a self-hosted job writes (see the cache rule below).
 
 Jobs that do only the following have no reason to be self-hosted: shell or Python scripts, `cargo fmt`, `cargo deny`, typos, actionlint, API calls (`gh`, dependency review, issue and stale bots, CLA checks), downloading an artifact and running a prebuilt binary, or a `cargo build -p rustfs` with its own cache key. `e2e-distributed.yml` and `e2e-upgrade.yml` build the server and the `e2e_test` harness on `ubuntu-latest` inside their budgets, so "it compiles something" alone is not a reason.
+
+The functional chain's `prepare` and `complete-chain` jobs, the performance runner availability check, and runner hygiene use `ubuntu-latest`: they inspect APIs or artifacts, not the lab hosts. The actual functional and performance suites remain on their lab runners. Functional-chain health collection uses `ubuntu-latest` so a lab outage cannot also stop its independent monitor. Docker image packaging also uses `ubuntu-latest` for both musl and glibc variants; it downloads release binaries rather than compiling the workspace, and still sets up QEMU and Buildx explicitly.
+
+Moving these jobs off AKS reduces capacity demand, not necessarily the Azure bill immediately. VM costs fall only when nodes scale down or smaller capacity replaces them.
 
 A hosted runner is also the only choice for a few things the pods cannot do: `mount -o loop` and `mount -t tmpfs` fail inside the ARC pods, and a container runtime cannot guarantee that `io_uring_setup` is allowed. `uring-integration` and `e2e-distributed` are on `ubuntu-latest` for that reason, not for cost.
 

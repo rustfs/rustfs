@@ -2169,8 +2169,12 @@ pub fn init_metrics_runtime(token: CancellationToken) {
     let token_clone = token.clone();
     tokio::spawn(async move {
         let process_attribute_labels = current_process_attribute_labels();
-        let mut host_system = System::new_all();
-        let mut host_networks = Networks::new();
+        let mut host_system = System::new_all().inspect_err(|error| {
+            warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, result = "system_info_unavailable", collector = "system_monitoring", error = %error, "metrics source unavailable");
+        }).ok();
+        let mut host_networks = Networks::new().inspect_err(|error| {
+            warn!(event = EVENT_METRICS_RUNTIME_STATE, component = LOG_COMPONENT_OBS, subsystem = LOG_SUBSYSTEM_METRICS_RUNTIME, result = "network_info_unavailable", collector = "system_monitoring", error = %error, "metrics source unavailable");
+        }).ok();
         let mut process_sampler = ProcessSampler::new();
         let process_interval = config.process_interval;
         let mut interval = metrics_interval(process_interval, Duration::ZERO);
@@ -2178,9 +2182,11 @@ pub fn init_metrics_runtime(token: CancellationToken) {
         let mut next_resource_run = now;
         let mut next_system_run = now;
 
-        host_system.refresh_cpu_all();
-        tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
-        host_system.refresh_cpu_all();
+        if let Some(system) = host_system.as_mut() {
+            system.refresh_cpu_all();
+            tokio::time::sleep(sysinfo::MINIMUM_CPU_UPDATE_INTERVAL).await;
+            system.refresh_cpu_all();
+        }
 
         #[cfg(feature = "gpu")]
         let current_pid = match sysinfo::get_current_pid() {
@@ -2376,8 +2382,8 @@ fn current_process_metric_labels(
 fn collect_system_monitoring_metrics(
     bundle: &ProcessMetricBundle,
     labels: &[(&'static str, Cow<'static, str>)],
-    host_system: &mut System,
-    host_networks: &mut Networks,
+    host_system: &mut Option<System>,
+    host_networks: &mut Option<Networks>,
 ) -> Vec<PrometheusMetric> {
     let cpu_stats = ProcessCpuStats {
         usage: bundle.resource.cpu_percent,
@@ -2391,17 +2397,20 @@ fn collect_system_monitoring_metrics(
         read_bytes: bundle.disk_read_bytes,
         written_bytes: bundle.disk_write_bytes,
     };
-    let network_stats = collect_host_network_stats(host_networks);
-    let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(host_system);
-
     let mut metrics = Vec::new();
-    metrics.extend(collect_cpu_metrics(&system_cpu_stats));
-    metrics.extend(collect_memory_metrics(&system_memory_stats));
+    if let Some(system) = host_system.as_mut() {
+        let (system_cpu_stats, system_memory_stats) = collect_system_cpu_and_memory_stats_with(system);
+        metrics.extend(collect_cpu_metrics(&system_cpu_stats));
+        metrics.extend(collect_memory_metrics(&system_memory_stats));
+    }
     metrics.extend(collect_process_cpu_metrics(&cpu_stats, Some(labels)));
     metrics.extend(collect_process_memory_metrics(&memory_stats, Some(labels)));
     metrics.extend(collect_process_disk_metrics(&disk_stats, Some(labels)));
     // Interface counters are host-wide, so keep these metrics free of process labels.
-    metrics.extend(collect_host_network_metrics(&network_stats, None));
+    if let Some(networks) = host_networks.as_mut() {
+        let network_stats = collect_host_network_stats(networks);
+        metrics.extend(collect_host_network_metrics(&network_stats, None));
+    }
     metrics
 }
 
@@ -2412,6 +2421,20 @@ mod tests {
     use std::collections::{HashMap, HashSet};
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[test]
+    fn unavailable_host_sources_preserve_process_metrics() {
+        let bundle = ProcessMetricBundle::default();
+        let metrics = collect_system_monitoring_metrics(&bundle, &[], &mut None, &mut None);
+        let names = metrics.iter().map(|metric| metric.name.as_ref()).collect::<HashSet<_>>();
+        assert!(names.iter().any(|name| name.contains("process_cpu")));
+        assert!(names.iter().any(|name| name.contains("process_resident_memory")));
+        assert!(
+            names
+                .iter()
+                .all(|name| !name.contains("network_host") && !name.contains("system_cpu"))
+        );
+    }
 
     fn fixed_metrics_runtime_config() -> MetricsRuntimeConfig {
         MetricsRuntimeConfig {

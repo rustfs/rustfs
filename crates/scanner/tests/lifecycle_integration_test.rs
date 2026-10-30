@@ -40,6 +40,9 @@ use uuid::Uuid;
 mod heal_generation_observation;
 mod storage_api;
 
+#[path = "lifecycle/scanner_heal_scope.rs"]
+mod scanner_heal_scope;
+
 use storage_api::lifecycle::{
     BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketOperations, BucketOptions, BucketVersioningSys, CompletePart,
     DeleteAfterObjectLockSnapshotBarrier, DiskOption, ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints,
@@ -468,6 +471,7 @@ async fn scan_object_with_lifecycle(disk_path: &Path, bucket: &str, object: &str
         lifecycle,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -505,6 +509,7 @@ async fn scan_object_metadata(disk_path: &Path, bucket: &str, object: &str) {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,

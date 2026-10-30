@@ -238,6 +238,71 @@ pub enum ScannerDurableDirtyUsageReplayScope {
     TopLevelEntries { entries: BTreeSet<String> },
 }
 
+impl ScannerDurableDirtyUsageReplayRecord {
+    /// Replays decoded producer hints with the canonical byte limit and semantic checks.
+    ///
+    /// Callers must retain their framing and owner checks. This performs the same
+    /// state update as [`replay_durable_dirty_usage_producer_record`]; it does not
+    /// establish storage-verified source authority.
+    pub fn replay(self) -> std::result::Result<ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayError> {
+        check_durable_dirty_usage_replay_bytes(&self)?;
+        replay_decoded_dirty_usage_record(&self)
+    }
+}
+
+struct ReplayByteLimit {
+    remaining: usize,
+}
+
+impl std::io::Write for ReplayByteLimit {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes.len())
+            .ok_or_else(|| std::io::Error::other("dirty replay byte limit"))?;
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn check_durable_dirty_usage_replay_bytes(
+    record: &ScannerDurableDirtyUsageReplayRecord,
+) -> std::result::Result<(), ScannerDurableDirtyUsageReplayError> {
+    // Bound structure traversal and string scanning before counting escaped JSON.
+    // Each entry or prefix contributes at least one additional serialized byte.
+    let mut remaining = SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES;
+    let mut charge = |size: usize| -> std::result::Result<(), ScannerDurableDirtyUsageReplayError> {
+        remaining = remaining
+            .checked_sub(size)
+            .ok_or(ScannerDurableDirtyUsageReplayError::ByteLimit)?;
+        Ok(())
+    };
+    charge(record.writer_epoch.len())?;
+    charge(record.entries.len())?;
+    for entry in &record.entries {
+        charge(entry.bucket.len())?;
+        if let ScannerDurableDirtyUsageReplayScope::TopLevelEntries { entries } = &entry.scope {
+            charge(entries.len())?;
+            for entry in entries {
+                charge(entry.len())?;
+            }
+        }
+    }
+    let mut limit = ReplayByteLimit {
+        remaining: SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES,
+    };
+    serde_json::to_writer(&mut limit, record).map_err(|error| {
+        if error.is_io() {
+            ScannerDurableDirtyUsageReplayError::ByteLimit
+        } else {
+            ScannerDurableDirtyUsageReplayError::InvalidJson
+        }
+    })
+}
+
 pub fn encode_durable_dirty_usage_producer_replay_record(
     entries: Vec<ScannerDurableDirtyUsageReplayEntry>,
 ) -> std::result::Result<Vec<u8>, ScannerDurableDirtyUsageReplayError> {
@@ -263,7 +328,13 @@ pub fn replay_durable_dirty_usage_producer_record(
     }
     let record: ScannerDurableDirtyUsageReplayRecord =
         serde_json::from_slice(bytes).map_err(|_| ScannerDurableDirtyUsageReplayError::InvalidJson)?;
-    let replay = validate_durable_dirty_usage_replay_record(&record)?;
+    replay_decoded_dirty_usage_record(&record)
+}
+
+fn replay_decoded_dirty_usage_record(
+    record: &ScannerDurableDirtyUsageReplayRecord,
+) -> std::result::Result<ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayError> {
+    let replay = validate_durable_dirty_usage_replay_record(record)?;
     let max_generation = replay.iter().map(|entry| entry.generation).max().unwrap_or(0);
     set_dirty_usage_generation_floor(max_generation)?;
     let pending = {
@@ -772,6 +843,109 @@ mod scoped_dirty_usage_tests {
         );
     }
 
+    fn decoded_replay_fixture() -> ScannerDurableDirtyUsageReplayRecord {
+        ScannerDurableDirtyUsageReplayRecord {
+            schema: SCANNER_DURABLE_DIRTY_USAGE_REPLAY_SCHEMA,
+            cache_key_format: crate::DATA_USAGE_CACHE_KEY_FORMAT,
+            writer_epoch: "writer".to_string(),
+            entries: vec![ScannerDurableDirtyUsageReplayEntry {
+                bucket: "photos".to_string(),
+                generation: 7,
+                scope: ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                    entries: BTreeSet::from(["2026".to_string(), "archive".to_string()]),
+                },
+                producers: SegmentInvalidationProducerIdentity::REQUIRED_PRODUCTION.into_iter().collect(),
+            }],
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_matches_byte_replay_at_size_boundary() {
+        let record = decoded_replay_fixture();
+        let fixed_bytes = serde_json::to_vec(&record).expect("fixture encoding").len() - record.writer_epoch.len();
+        for size in [
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES - 1,
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES,
+            SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES + 1,
+        ] {
+            clear_dirty_usage_buckets_for_tests();
+            let mut record = record.clone();
+            record.writer_epoch = "x".repeat(size - fixed_bytes);
+            let bytes = serde_json::to_vec(&record).expect("bounded fixture encoding");
+            assert_eq!(bytes.len(), size);
+            let expected = replay_durable_dirty_usage_producer_record(&bytes);
+            let buckets = dirty_usage_buckets_for_tests();
+            let scopes = dirty_usage_bucket_scopes_for_tests();
+            let identities = dirty_usage_producer_identities().clone();
+            let coverage = DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire);
+
+            clear_dirty_usage_buckets_for_tests();
+            assert_eq!(record.replay(), expected, "canonical size {size}");
+            assert_eq!(dirty_usage_buckets_for_tests(), buckets);
+            assert_eq!(dirty_usage_bucket_scopes_for_tests(), scopes);
+            assert_eq!(*dirty_usage_producer_identities(), identities);
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), coverage);
+        }
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    fn durable_dirty_usage_decoded_size_counts_escaped_utf8() {
+        for repeats in [6000, 8000] {
+            let mut record = decoded_replay_fixture();
+            record.writer_epoch = "\"\n雪\\".repeat(repeats);
+            let bytes = serde_json::to_vec(&record).expect("escaped fixture encoding");
+            let expected = if bytes.len() > SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
+                Err(ScannerDurableDirtyUsageReplayError::ByteLimit)
+            } else {
+                Ok(())
+            };
+            assert_eq!(check_durable_dirty_usage_replay_bytes(&record), expected);
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_rejects_large_values_before_state_changes() {
+        for field in ["epoch", "prefix", "entries"] {
+            clear_dirty_usage_buckets_for_tests();
+            let before = scanner_dirty_usage_state();
+            let mut record = decoded_replay_fixture();
+            match field {
+                "epoch" => record.writer_epoch = "x".repeat(1024 * 1024),
+                "prefix" => {
+                    record.entries[0].scope = ScannerDurableDirtyUsageReplayScope::TopLevelEntries {
+                        entries: BTreeSet::from(["x".repeat(1024 * 1024)]),
+                    };
+                }
+                _ => record.entries = vec![record.entries[0].clone(); SCANNER_DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES + 1],
+            }
+            assert_eq!(record.replay(), Err(ScannerDurableDirtyUsageReplayError::ByteLimit), "{field}");
+            assert_eq!(scanner_dirty_usage_state(), before);
+            assert!(dirty_usage_buckets_for_tests().is_empty());
+            assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            assert!(dirty_usage_producer_identities().is_empty());
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
+        }
+        clear_dirty_usage_buckets_for_tests();
+    }
+
+    #[test]
+    #[serial]
+    fn durable_dirty_usage_decoded_replay_preserves_generation_exhaustion() {
+        clear_dirty_usage_buckets_for_tests();
+        let generation = DIRTY_USAGE_BUCKET_GENERATION.swap(u64::MAX, Ordering::AcqRel);
+        let result = decoded_replay_fixture().replay();
+        DIRTY_USAGE_BUCKET_GENERATION.store(generation, Ordering::Release);
+        assert_eq!(result, Err(ScannerDurableDirtyUsageReplayError::InvalidGeneration));
+        assert!(dirty_usage_buckets_for_tests().is_empty());
+        assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+        assert!(dirty_usage_producer_identities().is_empty());
+        assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
+        clear_dirty_usage_buckets_for_tests();
+    }
+
     #[test]
     #[serial]
     fn durable_dirty_usage_replay_rejects_invalid_records_without_partial_state() {
@@ -843,9 +1017,17 @@ mod scoped_dirty_usage_tests {
 
         for (bytes, expected_error) in invalid_cases {
             clear_dirty_usage_buckets_for_tests();
-            assert_eq!(replay_durable_dirty_usage_producer_record(&bytes), Err(expected_error));
+            let before = scanner_dirty_usage_state();
+            assert_eq!(replay_durable_dirty_usage_producer_record(&bytes), Err(expected_error.clone()));
             assert!(dirty_usage_buckets_for_tests().is_empty());
             assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            let record: ScannerDurableDirtyUsageReplayRecord = serde_json::from_slice(&bytes).expect("typed invalid record");
+            assert_eq!(record.replay(), Err(expected_error));
+            assert_eq!(scanner_dirty_usage_state(), before);
+            assert!(dirty_usage_buckets_for_tests().is_empty());
+            assert!(dirty_usage_bucket_scopes_for_tests().is_empty());
+            assert!(dirty_usage_producer_identities().is_empty());
+            assert_eq!(DIRTY_USAGE_PRODUCER_COVERAGE.load(Ordering::Acquire), 0);
         }
 
         clear_dirty_usage_buckets_for_tests();

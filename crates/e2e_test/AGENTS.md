@@ -2,10 +2,7 @@
 
 Applies to `crates/e2e_test/`.
 
-Contributor guide (how to run suites, add a test, the harness/fixture
-inventory, `#[ignore]` classes, and the CI map) lives in
-[`README.md`](README.md). This file holds the crate rules that agents must
-follow.
+Contributor guide (how to run suites, add a test, the harness/fixture inventory, `#[ignore]` classes, and the CI map) lives in [`README.md`](README.md). This file holds the crate rules that agents must follow.
 
 ## Test Reliability
 
@@ -27,4 +24,4 @@ follow.
 
 ## Suggested Validation
 
-- `python3 scripts/e2e_binary.py build --features e2e-test-hooks`, then `python3 scripts/e2e_binary.py run --features e2e-test-hooks -- cargo test --package e2e_test` (running `cargo test -p e2e_test` directly fails with a missing E2E run receipt; see [`README.md`](README.md#how-to-run))
+- Use the build/run provenance wrapper and select the affected tests or matching nextest profile from [`README.md`](README.md#how-to-run). Keep build/run features aligned and add `--no-tests fail` to focused nextest commands; running the tests directly fails with a missing E2E run receipt.

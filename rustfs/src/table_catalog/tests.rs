@@ -21682,7 +21682,6 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
 
     for expected in [
         "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
-        "validate_object_key(&key, \"COPY (dest)\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
         "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
         "validate_table_catalog_object_mutation(&bucket, &object).await?;",
         "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
@@ -21690,6 +21689,24 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     ] {
         assert!(source.contains(expected), "missing object mutation guard: {expected}");
     }
+    let copy_object = include_str!("../app/object/copy.rs")
+        .split_once("async fn execute_copy_object_body(")
+        .map(|(_, body)| body.split_once("\n#[cfg(test)]").map_or(body, |(entrypoint, _)| entrypoint))
+        .expect("copy object entrypoint should remain in app/object/copy.rs");
+    let copy_key = copy_object
+        .find("validate_object_key(&key, \"COPY (dest)\")?;")
+        .expect("copy destination key validation");
+    let copy_guard = copy_object
+        .find("validate_table_catalog_object_mutation(&bucket, &key).await?;")
+        .expect("copy destination catalog guard");
+    let copy_store = copy_object
+        .find("let Some(store) = self.object_store()")
+        .expect("copy object store resolution");
+    assert!(
+        copy_key < copy_guard && copy_guard < copy_store,
+        "copy must guard the destination before store access"
+    );
+
     assert!(
         delete_object.contains("validate_object_key(&key, \"DELETE\")?;")
             && delete_object.contains("validate_table_catalog_object_mutation(&bucket, &key).await?;"),

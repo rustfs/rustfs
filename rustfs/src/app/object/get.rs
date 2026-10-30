@@ -14,6 +14,7 @@
 
 //! GetObject / GetObjectAttributes read path: cold fill, resume, stream tuning.
 
+use super::veeam_sosapi;
 use super::*;
 use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
@@ -3141,7 +3142,10 @@ impl DefaultObjectUsecase {
             // resolver; only the response headers, authorization and audit
             // summary are derived here, without a second KMS unwrap.
             Some(headers) => (
-                Some(headers.server_side_encryption),
+                headers
+                    .sse_customer_algorithm
+                    .is_none()
+                    .then_some(headers.server_side_encryption),
                 headers.sse_customer_algorithm,
                 headers.sse_customer_key_md5,
                 headers.ssekms_key_id,
@@ -4145,6 +4149,37 @@ impl DefaultObjectUsecase {
         result
     }
 
+    async fn serve_veeam_sosapi_get(
+        &self,
+        req: &S3Request<GetObjectInput>,
+        store: &Arc<ECStore>,
+        kind: veeam_sosapi::SosapiKind,
+        part_number: Option<usize>,
+        range: Option<&HTTPRangeSpec>,
+    ) -> S3Result<S3Response<GetObjectOutput>> {
+        let representation =
+            veeam_sosapi::read_representation(store, &req.input.bucket, kind, &req.headers, part_number, range).await?;
+        let content_type = ContentType::from_str(veeam_sosapi::CONTENT_TYPE)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid SOSAPI content type"))?;
+        let ranged = representation.content_range.is_some();
+        let output = GetObjectOutput {
+            body: Some(StreamingBlob::from(s3s::Body::from(representation.body))),
+            content_length: Some(representation.content_length),
+            content_type: Some(content_type),
+            content_range: representation.content_range,
+            e_tag: Some(to_s3s_etag(&representation.etag_hex)),
+            last_modified: Some(Timestamp::from(representation.last_modified)),
+            accept_ranges: Some(ACCEPT_RANGES_BYTES.to_string()),
+            ..Default::default()
+        };
+        let mut response = wrap_response_with_cors(&req.input.bucket, &req.method, &req.headers, output).await;
+        inject_accept_ranges_header(&mut response.headers);
+        if ranged {
+            response.status = Some(StatusCode::PARTIAL_CONTENT);
+        }
+        Ok(response)
+    }
+
     async fn execute_get_object_inner(&self, mut req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
         let helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject).suppress_event();
 
@@ -4222,6 +4257,26 @@ impl DefaultObjectUsecase {
             return Self::complete_get_object_error(helper, err);
         }
         record_get_object_s3_handler_stage_duration(GET_OBJECT_STAGE_BUCKET_VALIDATION, bucket_validation_start);
+
+        if validated.version_id.is_none()
+            && let Some(kind) = veeam_sosapi::handled_kind(&validated.key)
+        {
+            let served = self
+                .serve_veeam_sosapi_get(&req, &store, kind, validated.part_number, validated.rs.as_ref())
+                .await;
+            match served {
+                Ok(response) => {
+                    lifecycle.finish_ok();
+                    let result = Ok(response);
+                    let _ = helper.complete(&result);
+                    return result;
+                }
+                Err(err) => {
+                    lifecycle.finish_err();
+                    return Self::complete_get_object_error(helper, err);
+                }
+            }
+        }
 
         let request_context_start = stage_metrics_enabled.then(std::time::Instant::now);
         let request_context = match Self::prepare_get_object_request_context(validated, &req.headers).await {

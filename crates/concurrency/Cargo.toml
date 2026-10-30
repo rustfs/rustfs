@@ -26,7 +26,7 @@ rustfs-io-core = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 
 # Async runtime
-tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread"] }
+tokio = { workspace = true, features = ["sync", "fs", "rt-multi-thread", "time"] }
 
 # Logging
 tracing = { workspace = true }

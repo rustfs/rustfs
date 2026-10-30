@@ -48,10 +48,11 @@ pub async fn capture_top_net(
     let Some(_permit) = request.acquire(cancel).await? else {
         return request.cancelled(TOOL_ID);
     };
-    if !sysinfo::IS_SUPPORTED_SYSTEM {
-        return request.failed(TOOL_ID, 0, TopReasonCode::SourceUnavailable);
-    }
-    let mut networks = Networks::new();
+    let mut networks = match Networks::new() {
+        Ok(networks) => networks,
+        Err(sysinfo::Error::Unsupported) => return request.failed(TOOL_ID, 0, TopReasonCode::SourceUnavailable),
+        Err(_) => return request.failed(TOOL_ID, 0, TopReasonCode::CollectionFailed),
+    };
     networks.refresh(true);
     if networks.is_empty() {
         return request.failed(TOOL_ID, 0, TopReasonCode::SourceUnavailable);
