@@ -5331,6 +5331,9 @@ impl LocalIoBackend for StdBackend {
                 }
 
                 if let Some(resources) = current_resource_unit() {
+                    if let Some(parent) = file_path.parent() {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                     return self.open_resource_writer(file_path, mode, resources).await;
                 }
 
