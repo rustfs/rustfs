@@ -219,7 +219,8 @@ jobs:
       - name: Upload workspace test binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: workspace-test-binaries-${{ github.run_attempt }}
+          name: workspace-test-binaries
+          overwrite: true
           path: ${{ runner.temp }}/workspace-tests.tar.zst*
           compression-level: 0
           if-no-files-found: error
@@ -278,7 +279,7 @@ jobs:
         run: chmod go-w "$(realpath "$HOME")"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: workspace-test-binaries-${{ github.run_attempt }}
+          name: workspace-test-binaries
           path: ${{ runner.temp }}
       - name: Verify workspace archive identity
         run: python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
@@ -615,7 +616,8 @@ jobs:
       - name: Upload debug binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
+          overwrite: true
           path: |
             target/debug/rustfs
             target/debug/rustfs.e2e.json
@@ -634,7 +636,8 @@ jobs:
       - name: Upload E2E test binaries
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: e2e-test-binaries-${{ github.run_attempt }}
+          name: e2e-test-binaries
+          overwrite: true
           path: ${{ runner.temp }}/e2e-tests.tar.zst*
           compression-level: 0
           if-no-files-found: error
@@ -673,7 +676,8 @@ jobs:
       - name: Upload debug binary
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: rustfs-debug-binary-rio-v2-${{ github.run_attempt }}
+          name: rustfs-debug-binary-rio-v2
+          overwrite: true
           path: |
             target/debug/rustfs
             target/debug/rustfs.e2e.json
@@ -769,11 +773,11 @@ jobs:
       - uses: ./.github/actions/test-runtime
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: e2e-test-binaries-${{ github.run_attempt }}
+          name: e2e-test-binaries
           path: ${{ runner.temp }}
       - name: Run core storage and authorization contract
         env:
@@ -816,7 +820,7 @@ jobs:
       - name: Download E2E test binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: e2e-test-binaries-${{ github.run_attempt }}
+          name: e2e-test-binaries
           path: ${{ runner.temp }}
 
       - name: Verify E2E archive identity
@@ -840,7 +844,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
 
       - name: Make binary executable
@@ -949,7 +953,7 @@ jobs:
       - name: Download E2E test binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: e2e-test-binaries-${{ github.run_attempt }}
+          name: e2e-test-binaries
           path: ${{ runner.temp }}
 
       - name: Verify E2E archive identity
@@ -973,7 +977,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
 
       - name: Make binary executable
@@ -1056,7 +1060,7 @@ jobs:
       - name: Download E2E test binaries
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: e2e-test-binaries-${{ github.run_attempt }}
+          name: e2e-test-binaries
           path: ${{ runner.temp }}
 
       - name: Verify E2E archive identity
@@ -1118,7 +1122,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
 
       - name: Make binary executable
@@ -1230,7 +1234,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-rio-v2-${{ github.run_attempt }}
+          name: rustfs-debug-binary-rio-v2
           path: target/debug
 
       - name: Make binary executable
@@ -1281,7 +1285,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
 
       - name: Make binary executable
@@ -1355,7 +1359,7 @@ jobs:
       - name: Download debug binary
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
-          name: rustfs-debug-binary-${{ github.run_attempt }}
+          name: rustfs-debug-binary
           path: target/debug
 
       - name: Make binary executable

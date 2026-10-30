@@ -79,7 +79,7 @@ Architecture migration rules run once in the required Quick Checks job. Migratio
 
 Scanner usage and heal rebuild coverage are intentionally split by risk and cost. `data_usage_test` runs in the PR `e2e-smoke` lane so changes that affect authoritative scanner usage publication, quota-visible usage, or admin usage snapshots get an end-to-end signal before merge review. `heal_erasure_disk_rebuild_test` runs in `e2e-full` so core erasure heal rebuild regressions are caught no later than the merge queue or `main` push lane; it also remains in `e2e-nightly` with the serialized cluster fault-domain suites for scheduled soak signal.
 
-The E2E producer builds the hooks binary and harness archive once. Smoke, full and core consumers verify their identity and execution membership. The two S3 lanes depend directly on that producer and run alongside E2E. Runtime consumers retain the producer checkout path because existing fixtures embed compile-time paths.
+The E2E producer builds the hooks binary and harness archive once. Smoke, full and core consumers verify their identity and execution membership. The two S3 lanes depend directly on that producer and run alongside E2E. Runtime consumers retain the producer checkout path because existing fixtures embed compile-time paths. Shared test archives and debug binaries keep one name per run and the archive identity binds the run, not the attempt: "Re-run failed jobs" reuses the earlier attempt's producer output, and a full rerun overwrites it before any consumer starts.
 
 ## Scheduled validation
 
