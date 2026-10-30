@@ -832,6 +832,10 @@ pub struct FolderScanner {
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
     #[cfg(test)]
     defer_abandoned_entries_until_finished: bool,
+    #[cfg(test)]
+    partial_heal_candidate_limit: Option<usize>,
+    #[cfg(test)]
+    partial_heal_discovery_observer: Option<mpsc::UnboundedSender<(usize, usize)>>,
 }
 
 struct RawEnumerationProgress {
@@ -2902,7 +2906,15 @@ impl FolderScanner {
                                 break;
                             }
 
-                            let discovery = entries.discover_heal_candidates(&bucket, MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(test)]
+                            let candidate_limit = self.partial_heal_candidate_limit.unwrap_or(MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(not(test))]
+                            let candidate_limit = MAX_META_CACHE_HEAL_CANDIDATES;
+                            let discovery = entries.discover_heal_candidates(&bucket, candidate_limit);
+                            #[cfg(test)]
+                            if let Some(observer) = &self.partial_heal_discovery_observer {
+                                let _ = observer.send((discovery.candidates.len(), discovery.truncated_candidates.len()));
+                            }
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL)
                                 .increment(u64::try_from(discovery.candidates.len()).unwrap_or(u64::MAX));
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL).increment(
@@ -2988,13 +3000,22 @@ impl FolderScanner {
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
-                                let request = build_object_heal_request(
-                                    bucket.clone(),
-                                    candidate.object.clone(),
-                                    version_id.clone(),
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                );
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
                                 (self.update_current_path)(&candidate.object).await;
                                 let admission = self
                                     .send_required_scanner_heal_request(
@@ -3286,6 +3307,10 @@ pub(crate) async fn scan_data_folder_scoped(
         list_path_raw_options_observer: None,
         #[cfg(test)]
         defer_abandoned_entries_until_finished: false,
+        #[cfg(test)]
+        partial_heal_candidate_limit: None,
+        #[cfg(test)]
+        partial_heal_discovery_observer: None,
     };
 
     let now = FolderScanner::now_secs();

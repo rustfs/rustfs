@@ -401,6 +401,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
         defer_abandoned_entries_until_finished: false,
+        partial_heal_candidate_limit: None,
+        partial_heal_discovery_observer: None,
     };
 
     (scanner, temp_dir)
