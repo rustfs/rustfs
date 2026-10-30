@@ -47,6 +47,7 @@ enum TestPausePoint {
     BeforeFastWrite,
     FastWriteExisting,
     SlowLookup,
+    ForceAfterTailRelease,
 }
 
 #[cfg(test)]
@@ -70,7 +71,7 @@ fn test_pause(point: TestPausePoint, key: &ObjectKey) {
 
 /// Lock shard to reduce global contention.
 ///
-/// When both are needed, lock `objects` before a state's owner metadata.
+/// When combined, lock `active_guards`, then `objects`, then a state's owner metadata.
 #[derive(Debug)]
 pub struct LockShard {
     /// Object lock states - using parking_lot for better performance
@@ -762,32 +763,52 @@ impl LockShard {
     /// Returns the number of owners that were released. Used by the admin
     /// force-unlock path to clear a stuck resource.
     pub fn force_release_all(&self, key: &ObjectKey) -> usize {
-        let tail = {
-            let guards = self.active_guards.lock();
-            guards.iter().find_map(|(&id, info)| {
-                info.as_ref()
-                    .filter(|info| info.committed_tail && info.key == *key)
-                    .map(|info| (id, info.owner.clone()))
-            })
-        };
-        let mut released = usize::from(tail.is_some_and(|(id, owner)| self.release_committed_tail_with_guard(key, &owner, id)));
-        let owners_modes: Vec<(Arc<str>, LockMode)> = {
-            let objects = self.objects.read();
-            let Some(state) = objects.get(key) else { return released };
-            let mut pairs = Vec::new();
-            if let Some(info) = state.current_owner.read().clone() {
-                pairs.push((info.owner, LockMode::Exclusive));
+        // Serialize tail conversion and prevent new acquisitions while taking
+        // and releasing the owner snapshot. A new tail must never be mistaken
+        // for an ordinary shared owner by force unlock.
+        let mut guards = self.active_guards.lock();
+        let objects = self.objects.write();
+        let Some(state) = objects.get(key) else { return 0 };
+        let tail = guards.iter().find_map(|(&id, info)| {
+            info.as_ref()
+                .filter(|info| info.committed_tail && info.key == *key)
+                .map(|info| (id, info.owner.clone()))
+        });
+        let mut released = 0;
+        if let Some((id, owner)) = tail
+            && state.release_committed_tail(&owner)
+        {
+            guards.remove(&id);
+            self.metrics.record_release();
+            released += 1;
+        }
+        #[cfg(test)]
+        test_pause(TestPausePoint::ForceAfterTailRelease, key);
+        let mut owners_modes = Vec::new();
+        if let Some(info) = state.current_owner.read().clone() {
+            owners_modes.push((info.owner, LockMode::Exclusive, 1));
+        }
+        for entry in state.shared_owners.read().iter() {
+            owners_modes.push((entry.owner.clone(), LockMode::Shared, entry.count));
+        }
+        for (owner, mode, count) in owners_modes {
+            let mut owner_released = false;
+            for _ in 0..count {
+                let success = match mode {
+                    LockMode::Shared => state.release_shared(&owner),
+                    LockMode::Exclusive => state.release_exclusive(&owner),
+                };
+                if success {
+                    self.metrics.record_release();
+                    owner_released = true;
+                }
             }
-            for entry in state.shared_owners.read().iter() {
-                pairs.push((entry.owner.clone(), LockMode::Shared));
-            }
-            pairs
-        };
-        for (owner, mode) in owners_modes {
-            if self.release_lock(key, &owner, mode) {
+            if owner_released {
                 released += 1;
             }
         }
+        // Old guard drops must not release a later holder with the same owner.
+        guards.retain(|_, info| info.as_ref().is_none_or(|info| info.key != *key));
         released
     }
 
@@ -1025,6 +1046,65 @@ mod tests {
             .join()
             .expect("manager construction"),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_unlock_does_not_capture_a_new_committed_tail() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "force-tail-race");
+        let mut old = manager.acquire_write_lock(key.clone(), "old").await.expect("old writer");
+        assert!(old.downgrade_committed_tail());
+        let (entered, resume) = install_pause(TestPausePoint::ForceAfterTailRelease, &key);
+        let force = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::task::spawn_blocking(move || manager.force_unlock(&key))
+        };
+        entered.recv_timeout(Duration::from_secs(5)).expect("force unlock paused");
+        let mut next = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move { manager.acquire_write_lock(key, "new").await })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut next).await.is_err());
+        resume.send(()).expect("resume force unlock");
+        assert_eq!(force.await.expect("force unlock task"), 1);
+        let mut new = next.await.expect("new writer task").expect("new writer");
+        assert!(new.downgrade_committed_tail());
+        drop(old);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, "competitor"))
+                .await
+                .is_err(),
+            "the new committed tail must still exclude writers"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_unlock_old_readers_cannot_release_a_new_tail() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "force-old-readers");
+        let old1 = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("first reader");
+        let old2 = manager
+            .acquire_read_lock(key.clone(), "same-owner")
+            .await
+            .expect("second reader");
+        assert_eq!(manager.force_unlock(&key), 1);
+        let mut tail = manager
+            .acquire_write_lock(key.clone(), "same-owner")
+            .await
+            .expect("new writer");
+        assert!(tail.downgrade_committed_tail());
+        drop((old1, old2));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, "competitor"))
+                .await
+                .is_err(),
+            "old reader drops must not release the new tail"
+        );
     }
 
     fn start_acquisition(
