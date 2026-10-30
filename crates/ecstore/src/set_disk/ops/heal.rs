@@ -3684,22 +3684,9 @@ impl SetDisks {
             }
         }
         let _write_lock_guard = if !opts.no_lock {
-            let ns_lock = self
-                .new_ns_lock(bucket, object)
-                .await
-                .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
             Some(Arc::new(
-                measure_heal_object_lock(
-                    "heal_object",
-                    HealObjectLockKind::Write,
-                    ns_lock.get_write_lock(get_lock_acquire_timeout()),
-                )
-                .await
-                .map_err(|e| {
-                    self.map_namespace_lock_error(bucket, object, "write", e)
-                        .narrow_to_disk()
-                        .unwrap_or_else(DiskError::other)
-                })?,
+                self.acquire_heal_object_lock(bucket, object, version_id, HealObjectLockKind::Write, "heal_object")
+                    .await?,
             ))
         } else {
             None
