@@ -3121,6 +3121,8 @@ async fn local_automatic_query_preserves_source_path_token_and_state() {
                 },
                 disposition: HealObjectDisposition::VerifiedHealthy,
                 detail: None,
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
             });
             snapshot.outcome = Some(Arc::new(outcome));
             snapshot.seqed_items = vec![(
