@@ -2364,7 +2364,7 @@ mod tests {
             .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
             .expect("test bucket");
         let input = PutObjectInput::builder()
-            .bucket(bucket.clone())
+            .bucket(bucket)
             .key("test-object".to_string())
             .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"payload"))))
             .content_length(Some(7))
