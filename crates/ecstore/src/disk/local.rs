@@ -13145,6 +13145,7 @@ impl DiskAPI for LocalDisk {
         let probe_active = false;
         let sync_on_close = cfg!(target_os = "linux")
             && volume == RUSTFS_META_TMP_BUCKET
+            && !origvolume.is_empty()
             && path.ends_with("/part.1")
             && effective_durability(origvolume).syncs_data_shards()
             && !os::file_fdatasync_group_commit_enabled()
@@ -20148,6 +20149,61 @@ mod test {
                 .exists(),
             "the rollback backup itself must still be written"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_unknown_destination_defers_shard_sync() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        for destination_mode in [DurabilityMode::None, DurabilityMode::Strict] {
+            let bucket = "unknown-destination-shard-bucket";
+            let _bucket_mode = BucketOverrideGuard::set(bucket, destination_mode);
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            let object = "dir/object";
+            let tmp_object = "tmp-unknown-destination";
+            let data_dir = Uuid::new_v4();
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let shard_path = format!("{tmp_object}/{data_dir}/part.1");
+            let mut writer = disk
+                .create_file("", RUSTFS_META_TMP_BUCKET, &shard_path, 8)
+                .await
+                .expect("open staged shard writer without a destination");
+            writer.write_all(b"new-data").await.expect("write staged shard");
+            writer.shutdown().await.expect("close staged shard");
+            let staged_dir = disk
+                .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
+                .expect("staged shard directory should resolve");
+            assert!(
+                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                "an unknown destination must defer payload sync until commit"
+            );
+
+            let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            fi.size = 8;
+            fi.parts[0].size = 8;
+            fi.parts[0].actual_size = 8;
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+                .await
+                .expect("rename_data should apply the destination policy");
+            assert_eq!(
+                os::fsync_dir_recorder::was_fsynced(&staged_dir),
+                destination_mode.syncs_data_shards(),
+                "the commit must apply the destination durability override"
+            );
+            let shard = disk
+                .get_object_path(bucket, &format!("{object}/{data_dir}/part.1"))
+                .expect("committed shard should resolve");
+            assert_eq!(fs::read(shard).await.expect("committed shard should be readable"), b"new-data");
+        }
     }
 
     #[cfg(target_os = "linux")]
