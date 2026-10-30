@@ -100,6 +100,16 @@ async fn observe_disk_operation<F: std::future::Future>(
     }
 }
 
+// The health, admission and timeout layers above a disk operation each embed its
+// future, and unoptimized builds copy it into every awaiting frame. Box it where
+// it is created so those layers carry only a pointer: one allocation per operation.
+fn boxed_disk_operation<F, Fut>(operation: F, io_permit: Option<crate::disk::io_admission::DiskIoPermit>) -> Pin<Box<Fut>>
+where
+    F: FnOnce(Option<crate::disk::io_admission::DiskIoPermit>) -> Fut,
+{
+    Box::pin(operation(io_permit))
+}
+
 struct SlowDiskWriter {
     inner: crate::disk::FileWriter,
     endpoint: Endpoint,
@@ -2566,7 +2576,7 @@ impl LocalDiskWrapper {
         let _waiting_guard = self.health.waiting_guard();
         let _metric_waiting_guard = self.metrics.waiting_guard();
         let started = Instant::now();
-        let operation = observe_disk_operation(|| self.endpoint(), op, operation(io_permit));
+        let operation = observe_disk_operation(|| self.endpoint(), op, boxed_disk_operation(operation, io_permit));
 
         if timeout_duration == Duration::ZERO {
             let result = operation.await;
