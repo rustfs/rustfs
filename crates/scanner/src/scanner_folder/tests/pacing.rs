@@ -40,7 +40,6 @@ async fn pacing_preserves_real_folder_versions_bytes_checkpoints_and_maintenance
         let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
         scanner.old_cache.info.name = "bucket".to_string();
         scanner.new_cache.info.name = "bucket".to_string();
-        scanner.update_cache.info.name = "bucket".to_string();
         scanner.new_cache.info.pending_heals.push(pending.clone());
         scanner.is_erasure_mode = true;
         scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Default).for_disk_with_budget_for_tests(
@@ -115,7 +114,6 @@ async fn pacing_settles_failed_metadata_work_at_bucket_completion() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Default);
     scanner
         .sleeper
