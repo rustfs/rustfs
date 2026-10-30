@@ -975,3 +975,17 @@ test-group = 'e2e-vault'
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
 threads-required = "num-test-threads"
+
+# Fixed, small contract for every executable server change. These existing
+# scenarios exercise write/read, anonymous denial and retained bytes on restart.
+[profile.core-contract]
+default-filter = '''
+    package(e2e_test) & test(/^(anonymous_access_test::test_anonymous_access_denied_when_restrict_public_buckets_enabled|head_object_consistency_test::head_object_consistency_after_write_and_multipart_and_presigned_head|storage_class_capability_test::tests::historical_label_only_metadata_is_standard_without_hiding_a_real_transition_tier)$/)
+'''
+retries = 0
+fail-fast = false
+test-threads = 1
+slow-timeout = { period = "60s", terminate-after = 3 }
+
+[profile.core-contract.junit]
+path = "junit.xml"
