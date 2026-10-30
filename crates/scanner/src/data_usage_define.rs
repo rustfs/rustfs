@@ -615,6 +615,11 @@ pub struct DataUsageCacheInfo {
     pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    /// Indexes of the other directories on the active walk path. A restart
+    /// must replay every wide ancestor before it reaches the selected one, and
+    /// recharging those replays would stop a fixed budget from ever advancing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_raw_enumeration_path_page_indexes: Vec<RawEnumerationPageIndex>,
     #[serde(default)]
     pub scan_identity: Option<DataUsageScanIdentity>,
     #[serde(default)]
@@ -686,6 +691,7 @@ impl Serialize for DataUsageCacheInfo {
         let field_count = 16
             + usize::from(self.scan_raw_enumeration_cursor.is_some())
             + usize::from(self.scan_raw_enumeration_page_index.is_some())
+            + usize::from(!self.scan_raw_enumeration_path_page_indexes.is_empty())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
@@ -716,6 +722,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(index) = &self.scan_raw_enumeration_page_index {
             state.serialize_entry("scan_raw_enumeration_page_index", index)?;
+        }
+        if !self.scan_raw_enumeration_path_page_indexes.is_empty() {
+            state.serialize_entry("scan_raw_enumeration_path_page_indexes", &self.scan_raw_enumeration_path_page_indexes)?;
         }
         if let Some(identity) = self.scan_identity {
             state.serialize_entry("scan_identity", &identity)?;
@@ -1044,7 +1053,14 @@ impl DataUsageCache {
         }
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
         }
+        let path_indexes = std::mem::take(&mut self.info.scan_raw_enumeration_path_page_indexes);
+        self.info.scan_raw_enumeration_path_page_indexes = path_indexes
+            .into_iter()
+            .take(MAX_DATA_USAGE_CACHE_DEPTH)
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+            .collect();
         let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
@@ -1087,6 +1103,7 @@ impl DataUsageCache {
             self.info.scan_checkpoint = None;
             self.info.scan_raw_enumeration_cursor = None;
             self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
             self.info.scan_coverage_receipt = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
@@ -1230,22 +1247,37 @@ impl DataUsageCache {
     }
 
     pub(crate) fn validated_raw_enumeration_page_index(&self) -> Option<&RawEnumerationPageIndex> {
-        let index = self.info.scan_raw_enumeration_page_index.as_ref()?;
+        self.info
+            .scan_raw_enumeration_page_index
+            .as_ref()
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    /// The durable index of one directory on the saved walk path.
+    pub(crate) fn validated_raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+        self.info
+            .scan_raw_enumeration_page_index
+            .iter()
+            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+            .find(|index| index.parent() == Some(parent))
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    fn raw_enumeration_page_index_is_valid(&self, index: &RawEnumerationPageIndex) -> bool {
         if self.info.scan_progress.is_none()
             || !self.info.scan_identity.is_some_and(|identity| identity.is_valid())
             || self.info.source.is_none()
             || index.committed_entries().is_err()
             || index.indexed_entries().is_err()
         {
-            return None;
+            return false;
         }
-        let parent = match index.status() {
-            RawEnumerationPageOwnerStatus::Unsupported => return None,
+        match index.status() {
+            RawEnumerationPageOwnerStatus::Unsupported => false,
             RawEnumerationPageOwnerStatus::Building { parent, .. } | RawEnumerationPageOwnerStatus::Ready { parent, .. } => {
-                parent
+                path_is_in_bucket_scope(&self.info.name, &parent)
             }
-        };
-        path_is_in_bucket_scope(&self.info.name, &parent).then_some(index)
+        }
     }
 
     /// Seal only the frontier supplied by completed traversal, never a restored cursor.
