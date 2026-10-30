@@ -1148,18 +1148,18 @@ mod tests {
         let b = gate(1);
         let node = node(2);
         let ab = AdaptivePermitSetOwner::new(maximum(1), vec![a.clone(), b.clone()]).expect("ab");
-        let ba = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone(), a.clone()]).expect("ba");
-        for (ab_index, ba_index) in ab.turn_order.iter().zip(ba.turn_order.iter()) {
-            assert!(Arc::ptr_eq(&ab.owners[*ab_index], &ba.owners[*ba_index]));
+        let reversed = AdaptivePermitSetOwner::new(maximum(1), vec![b.clone(), a.clone()]).expect("reversed");
+        for (ab_index, reversed_index) in ab.turn_order.iter().zip(reversed.turn_order.iter()) {
+            assert!(Arc::ptr_eq(&ab.owners[*ab_index], &reversed.owners[*reversed_index]));
         }
         let held = b.try_acquire().expect("prior native unit");
         let mut first = Box::pin(ab.acquire_with_node(&node));
-        let mut second = Box::pin(ba.acquire_with_node(&node));
+        let mut second = Box::pin(reversed.acquire_with_node(&node));
         assert_pending(first.as_mut());
         assert_pending(second.as_mut());
         for _ in 0..1_000 {
             assert!(a.try_acquire().is_none(), "fast path cannot steal a queued group's leaf");
-            assert!(ba.try_acquire_with_node(&node).is_none());
+            assert!(reversed.try_acquire_with_node(&node).is_none());
         }
         drop(held);
         let first = tokio::time::timeout(Duration::from_secs(1), first)
@@ -1228,11 +1228,11 @@ mod tests {
         let b = gate(2);
         let node = node(2);
         let ab = AdaptivePermitSetOwner::new(maximum(8), vec![a.clone(), b.clone()]).expect("ab");
-        let ba = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone(), a.clone()]).expect("ba");
+        let reversed = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone(), a.clone()]).expect("reversed");
         let native = AdaptivePermitSetOwner::new(maximum(8), vec![b.clone()]).expect("native leaf");
         let mut jobs = tokio::task::JoinSet::new();
         for worker in 0..8 {
-            let group = if worker % 2 == 0 { ab.clone() } else { ba.clone() };
+            let group = if worker % 2 == 0 { ab.clone() } else { reversed.clone() };
             let node = node.clone();
             let native = native.clone();
             jobs.spawn(async move {
@@ -1272,7 +1272,7 @@ mod tests {
             assert_eq!(owner.queued.load(Ordering::Acquire), 0);
             assert_eq!(owner.turn.available_permits(), 1);
         }
-        for group in [&ab, &ba, &native] {
+        for group in [&ab, &reversed, &native] {
             assert_eq!(group.capacity.snapshot().active, 0);
         }
     }
