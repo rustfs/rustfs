@@ -10,7 +10,7 @@
 # intentionally removed. Regenerate with:
 #   scripts/check_test_count_ratchet.sh --update
 e2e_test	993	20
-rustfs	6083	64
+rustfs	6085	64
 rustfs-audit	70	0
 rustfs-checksums	26	0
 rustfs-common	36	0

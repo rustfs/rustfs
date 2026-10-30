@@ -64,18 +64,35 @@ fn lock_resource_class(resource: Option<&str>) -> &'static str {
     }
 }
 
+fn lock_failure_reason(error: &LockError) -> &'static str {
+    match error {
+        LockError::Timeout { .. } => "timeout",
+        LockError::AlreadyLocked { .. } => "contention",
+        LockError::QuorumNotReached { .. } => "quorum",
+        LockError::InsufficientNodes { .. } => "insufficient_nodes",
+        LockError::Network { .. } => "network",
+        LockError::Internal { .. } => "internal",
+        _ => "other",
+    }
+}
+
 fn record_s3_lock_failure(err: &StorageError) {
     let record = |resource: Option<&str>, mode: &'static str, reason: &'static str| {
         rustfs_io_metrics::s3_http_metrics::record_s3_http_lock_failure(lock_resource_class(resource), mode, reason);
     };
     match err {
-        StorageError::Lock(lock_error) => match lock_error {
-            LockError::Timeout { resource, .. } => record(Some(resource), "unknown", "timeout"),
-            LockError::AlreadyLocked { resource, .. } => record(Some(resource), "unknown", "contention"),
-            LockError::QuorumNotReached { .. } | LockError::InsufficientNodes { .. } => record(None, "unknown", "quorum"),
-            LockError::Network { .. } | LockError::Internal { .. } => record(None, "unknown", "transport"),
-            _ => record(None, "unknown", "other"),
-        },
+        StorageError::Lock(lock_error) => {
+            let resource = match lock_error {
+                LockError::Timeout { resource, .. } | LockError::AlreadyLocked { resource, .. } => Some(resource.as_str()),
+                _ => None,
+            };
+            let reason = match lock_failure_reason(lock_error) {
+                "insufficient_nodes" => "quorum",
+                "network" | "internal" => "transport",
+                reason => reason,
+            };
+            record(resource, "unknown", reason);
+        }
         StorageError::NamespaceLockQuorumUnavailable {
             mode, bucket, object, ..
         } => {
@@ -309,6 +326,7 @@ impl std::error::Error for ApiError {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct ApiErrorDiagnostic {
     pub storage_code: Option<StorageErrorCode>,
+    pub lock_reason: Option<&'static str>,
     pub io_kind: Option<std::io::ErrorKind>,
     pub io_os_error: Option<i32>,
     pub rpc_code: Option<tonic::Code>,
@@ -350,6 +368,18 @@ impl ApiErrorDiagnostic {
             };
             if let Some(storage) = error.downcast_ref::<StorageError>() {
                 diagnostic.storage_code = Some(storage.code());
+                match storage {
+                    StorageError::Lock(lock_error) => {
+                        diagnostic.lock_reason = Some(lock_failure_reason(lock_error));
+                    }
+                    StorageError::NamespaceLockQuorumUnavailable { .. } => {
+                        diagnostic.lock_reason = Some("quorum");
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(lock_error) = error.downcast_ref::<LockError>() {
+                diagnostic.lock_reason = Some(lock_failure_reason(lock_error));
             }
             if let Some(status) = error.downcast_ref::<tonic::Status>() {
                 diagnostic.rpc_code = Some(status.code());
@@ -1271,6 +1301,91 @@ mod tests {
         let error = ApiError::from(StorageError::from(status));
         assert_eq!(error.diagnostic().rpc_code, Some(tonic::Code::Unavailable));
         assert!(!format!("{:?}", error.diagnostic()).contains("secret"));
+    }
+
+    #[test]
+    fn api_error_diagnostic_classifies_lock_failures_without_exposing_resources() {
+        let cases = [
+            (
+                LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5)),
+                "timeout",
+            ),
+            (
+                LockError::AlreadyLocked {
+                    resource: "private-bucket/private-key".into(),
+                    owner: "private-owner".into(),
+                },
+                "contention",
+            ),
+            (
+                LockError::QuorumNotReached {
+                    required: 3,
+                    achieved: 2,
+                },
+                "quorum",
+            ),
+            (
+                LockError::InsufficientNodes {
+                    required: 3,
+                    available: 2,
+                },
+                "insufficient_nodes",
+            ),
+            (LockError::internal("private-transport-detail"), "internal"),
+            (LockError::network("private-network-detail", IoError::other("private-source")), "network"),
+            (
+                LockError::QueueFull {
+                    message: "private-queue-detail".into(),
+                },
+                "other",
+            ),
+        ];
+        for (failure, expected) in cases {
+            let api = ApiError::from(StorageError::Lock(failure));
+            assert_eq!(api.code, S3ErrorCode::ServiceUnavailable);
+            let diagnostic = api.diagnostic();
+            assert_eq!(diagnostic.storage_code, Some(StorageErrorCode::Lock));
+            assert_eq!(diagnostic.lock_reason, Some(expected));
+            assert!(!format!("{diagnostic:?}").contains("private"));
+            let s3: S3Error = api.into();
+            assert_eq!(s3.code(), &S3ErrorCode::ServiceUnavailable);
+            assert_eq!(super::ApiErrorDiagnostic::from_error(&s3).lock_reason, Some(expected));
+        }
+
+        let nested = ApiError::from(StorageError::Io(IoError::other(StorageError::Lock(LockError::timeout(
+            "private-bucket/private-key",
+            std::time::Duration::from_secs(5),
+        )))));
+        assert_eq!(nested.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested.diagnostic()).contains("private"));
+
+        let nested_lock = ApiError::from(StorageError::Lock(LockError::network(
+            "private-transport",
+            StorageError::Lock(LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5))),
+        )));
+        assert_eq!(nested_lock.diagnostic().storage_code, Some(StorageErrorCode::Lock));
+        assert_eq!(nested_lock.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested_lock.diagnostic()).contains("private"));
+
+        let nested_direct = ApiError::from(StorageError::Lock(LockError::network(
+            "private-transport",
+            LockError::timeout("private-bucket/private-key", std::time::Duration::from_secs(5)),
+        )));
+        assert_eq!(nested_direct.diagnostic().lock_reason, Some("timeout"));
+        assert!(!format!("{:?}", nested_direct.diagnostic()).contains("private"));
+
+        let unavailable = ApiError::from(StorageError::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket: "private-bucket".into(),
+            object: "private-key".into(),
+            required: 3,
+            achieved: 2,
+        });
+        assert_eq!(unavailable.diagnostic().lock_reason, Some("quorum"));
+        assert!(!format!("{:?}", unavailable.diagnostic()).contains("private"));
+
+        let other = ApiError::from(StorageError::ErasureWriteQuorum);
+        assert_eq!(other.diagnostic().lock_reason, None);
     }
 
     #[test]
