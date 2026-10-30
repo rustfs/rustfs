@@ -1186,6 +1186,7 @@ mod tests {
             EventName::ObjectCreatedCreateMultipartUpload,
             EventName::ObjectRemovedAbortMultipartUpload,
             EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
         ] {
             let body = br#"{"ok":true}"#.to_vec();
             let meta = QueuedPayloadMeta::new(event, "bucket-a".to_string(), "obj".to_string(), "application/json", body.len());
