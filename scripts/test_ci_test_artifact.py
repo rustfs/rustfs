@@ -184,6 +184,28 @@ class ArtifactIdentityTests(unittest.TestCase):
             self.assertEqual(artifact.main(), 0)
         self.assertEqual(run.call_args.args[0], ["cargo", "test", "--locked", "--workspace", "--exclude", "e2e_test", "--doc"])
 
+    def test_real_lint_rejects_a_warning_even_when_archive_tests_pass(self):
+        (self.root / 'rust-toolchain.toml').write_text((artifact.ROOT / 'rust-toolchain.toml').read_text())
+        (self.root / 'Cargo.toml').write_text('[workspace]\nmembers = ["probe", "e2e_test"]\n')
+        for name in ('probe', 'e2e_test'):
+            package = self.root / name
+            (package / 'src').mkdir(parents=True)
+            (package / 'Cargo.toml').write_text(f'[package]\nname="{name}"\nversion="0.1.0"\nedition="2021"\n')
+            (package / 'src/lib.rs').write_text('')
+        source = self.root / 'probe/src/lib.rs'
+        source.write_text('pub fn answer() -> u8 { let unused = 1; 2 }\n#[test] fn value() { assert_eq!(answer(), 2); }\n')
+        archive = self.root / 'lint-probe.tar.zst'
+        for arguments in (['archive', '--offline', '--archive-file', str(archive)],
+                          ['run', '--archive-file', str(archive)]):
+            result = subprocess.run(['cargo', 'nextest', *arguments], cwd=self.root, text=True, capture_output=True)
+            self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('1 passed', result.stderr)
+        with patch.object(artifact, 'ROOT', self.root), patch.dict(os.environ, {'CI_PACKAGES': '["probe"]'}), \
+                patch.object(sys, 'argv', ['ci_test_artifact.py', 'cargo', 'lint', '--configuration', 'workspace']):
+            self.assertEqual(artifact.main(), 1)
+            source.write_text(source.read_text().replace('let unused = 1; ', ''))
+            self.assertEqual(artifact.main(), 0)
+
 
 class ExecutionEvidenceTests(unittest.TestCase):
     def setUp(self):

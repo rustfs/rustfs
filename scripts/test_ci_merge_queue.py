@@ -1,8 +1,14 @@
 #!/usr/bin/env python3
 import copy
+import json
+from pathlib import Path
+import subprocess
+import tempfile
 import unittest
 
 from ci_merge_queue import REQUIRED_CHECKS, compare, prepare
+import ci_gate
+from test_ci_plan import Repository
 
 
 class QueueTests(unittest.TestCase):
@@ -47,6 +53,41 @@ class QueueTests(unittest.TestCase):
         record = prepare(self.snapshot())
         with self.assertRaises(ValueError):
             prepare(dict(record["after"], id=12))
+
+    def test_individually_passing_changes_fail_on_the_actual_combined_git_candidate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            repo = Repository(Path(directory))
+            repo.write('rust-toolchain.toml', (ci_gate.ROOT / 'rust-toolchain.toml').read_text())
+            repo.write('core/src/lib.rs', 'mod a; mod b; #[test] fn combined_contract() { assert!(a::VALUE + b::VALUE <= 3); }\n')
+            repo.write('core/src/a.rs', 'pub const VALUE: u8 = 1;\n')
+            repo.write('core/src/b.rs', 'pub const VALUE: u8 = 1;\n')
+            baseline = repo.commit()
+            def check():
+                return subprocess.run(['cargo', 'nextest', 'run', '--offline', '-p', 'core'],
+                                      cwd=repo.root, capture_output=True, text=True)
+            repo.git('checkout', '-b', 'first')
+            repo.write('core/src/a.rs', 'pub const VALUE: u8 = 2;\n')
+            first = repo.commit()
+            self.assertEqual(check().returncode, 0)
+            repo.git('checkout', '-b', 'second', baseline)
+            repo.write('core/src/b.rs', 'pub const VALUE: u8 = 2;\n')
+            second = repo.commit()
+            self.assertEqual(check().returncode, 0)
+            repo.git('checkout', '-b', 'combined', first)
+            repo.git('merge', '--no-ff', '-m', 'combined candidate', second)
+            head = repo.git('rev-parse', 'HEAD')
+            plan = ci_gate.select_plan('merge_group', baseline, head, 'refs/heads/main', repo.root)
+            self.assertEqual(plan['head'], head)
+            self.assertEqual(plan['tree'], repo.git('rev-parse', head + '^{tree}'))
+            self.assertTrue(plan['full_validation'])
+            result = check()
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn('combined_contract', result.stderr)
+            self.assertIn('1 failed', result.stderr)
+            needs = {job: {'result': value} for job, value in plan['jobs'].items()}
+            needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': json.dumps(plan)}
+            needs['workspace-tests']['result'] = 'failure'
+            self.assertTrue(ci_gate.verify_results(needs, 'merge_group', plan['ref'], head, plan['tree']))
 
 
 if __name__ == "__main__":

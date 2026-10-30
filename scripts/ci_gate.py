@@ -38,7 +38,8 @@ E2E_SELECTION_FILES = {
         "e2e-distributed", "e2e-protocols", "e2e-odm-interop",
     )
 }
-OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full")
+SHARD_JOBS = ("workspace-shards", "workspace-shard-evidence")
+OPTIONAL_JOBS = ("build-rustfs-debug-binary-rio-v2", "e2e-tests-rio-v2", "e2e-full", *SHARD_JOBS)
 NON_VALIDATION_JOBS = {"required-checks", "cancel-closed-pr-runs", "alert-on-failure"}
 
 
@@ -157,11 +158,13 @@ def closure(seeds: set[str], graph: dict[str, set[str]], reverse: bool = False) 
         reached = expanded
 
 
-def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "") -> dict[str, str]:
+def expected_results(mode: str, event: str, ref: str, connect: bool = True, action: str = "", rehearse_shards: bool = False) -> dict[str, str]:
     if event not in EVENTS:
         raise ValueError(f"unsupported CI event: {event!r}")
     if mode not in ("docs", "e2e", "full") or (mode != "full" and event != "pull_request"):
         raise ValueError(f"invalid CI selection: {mode!r} for {event!r}")
+    if type(rehearse_shards) is not bool or (rehearse_shards and event != "workflow_dispatch"):
+        raise ValueError("shard rehearsal requires an explicit manual event")
     expected = {job: "success" for job in ALWAYS_JOBS}
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
     expected["connect-feature-boundaries"] = "success" if mode == "full" and connect else "skipped"
@@ -171,6 +174,7 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
     expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
     full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
     expected["e2e-full"] = "success" if full else "skipped"
+    expected.update({job: "success" if rehearse_shards else "skipped" for job in SHARD_JOBS})
     if event == "pull_request" and action == "closed":
         return {job: "skipped" for job in expected}
     return expected
@@ -212,7 +216,7 @@ def configurations(jobs: dict[str, str]) -> list[dict]:
              "default_features": True, "features": features} for identity, job, profile, features in values if jobs[job] == "success"]
 
 
-def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "") -> dict:
+def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: str = "", rehearse_shards: bool = False) -> dict:
     if event not in EVENTS or not SHA.fullmatch(head):
         raise ValueError("unsupported event or missing candidate SHA")
     tree = git(root, "rev-parse", f"{head}^{{tree}}").strip()
@@ -250,7 +254,12 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             if path in E2E_SELECTION_FILES:
                 affected.add("e2e_test")
                 continue
-            if any(fnmatch.fnmatchcase(path, pattern) for pattern in policy["full_paths"]):
+            # Cargo's graph cannot describe include_bytes!, fixture readers or
+            # build-script inputs shared across packages. Narrow only Rust
+            # sources; all other package-owned inputs retain the full gate.
+            if (not path.endswith(".rs") or PurePosixPath(path).name == "build.rs"
+                    or "fixtures" in PurePosixPath(path).parts
+                    or any(fnmatch.fnmatchcase(path, pattern) for pattern in policy["full_paths"])):
                 full = True
                 reasons.append(f"shared build or policy input: {path}")
                 continue
@@ -292,15 +301,16 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
     reasons.append("selected changed packages, reverse dependencies and fixed core contracts")
     reasons.append("Connect boundary or a shared input changed" if connect else "Connect has no changed credential/configuration dependency")
     proposed = {"packages": sorted(selected), "connect": connect, "full_validation": full, "reasons": reasons,
-                "jobs": expected_results(mode, event, ref, connect, action)}
+                "jobs": expected_results(mode, event, ref, connect, action, rehearse_shards)}
     shadow = policy is None or policy["rollout"] == "shadow"
     effective_packages = all_packages if shadow and mode != "docs" else sorted(selected)
     effective_connect = mode == "full" if shadow else connect
     effective_full = mode == "full" if shadow else full
-    jobs = expected_results(mode, event, ref, effective_connect, action)
+    jobs = expected_results(mode, event, ref, effective_connect, action, rehearse_shards)
     plan = {"schema_version": 1, "event": event, "action": action, "ref": ref, "base": base if SHA.fullmatch(base) else "",
             "head": head, "tree": tree, "policy": {"revision": policy_revision, "rollout": "shadow" if shadow else "enforced"},
             "mode": mode, "packages": effective_packages, "full_validation": effective_full, "connect": effective_connect,
+            "rehearse_shards": rehearse_shards,
             "configurations": configurations(jobs), "jobs": jobs, "proposed": proposed,
             "reasons": ["shadow rollout preserves current validation responsibility"] + reasons if shadow else reasons,
             "not_applicable": {job: f"not required for {mode}/{event}" for job, result in jobs.items() if result == "skipped"}}
@@ -323,7 +333,7 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
             raise ValueError(f"invalid plan {field}")
     if (head and plan["head"] != head) or (tree and plan["tree"] != tree):
         raise ValueError("plan candidate identity does not match this run")
-    if type(plan.get("connect")) is not bool or type(plan.get("full_validation")) is not bool:
+    if any(type(plan.get(name)) is not bool for name in ("connect", "full_validation", "rehearse_shards")):
         raise ValueError("invalid plan selection flags")
     policy = plan.get("policy")
     if not isinstance(policy, dict) or policy.get("rollout") not in ("shadow", "enforced") or not isinstance(policy.get("revision"), str) or not SHA.fullmatch(policy["revision"]):
@@ -335,7 +345,7 @@ def validate_plan(plan: object, event: str, ref: str, head: str = "", tree: str 
         raise ValueError("invalid plan packages")
     if plan.get("mode") != "docs" and not packages:
         raise ValueError("code validation plan must not be empty")
-    expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""))
+    expected = expected_results(plan.get("mode"), event, ref, plan["connect"], plan.get("action", ""), plan["rehearse_shards"])
     if plan.get("jobs") != expected:
         raise ValueError("plan job contract differs from selected responsibilities")
     if plan.get("configurations") != configurations(expected):
@@ -360,7 +370,7 @@ def verify_results(needs: object, event: str, ref: str, head: str = "", tree: st
             expected = validate_plan(plan, event, ref, head, tree, base, action)
             if outputs.get("mode") != plan["mode"]:
                 raise ValueError("plan mode differs from scheduling output")
-            for name in ("connect", "full_validation"):
+            for name in ("connect", "full_validation", "rehearse_shards"):
                 if name in outputs and outputs[name] != str(plan[name]).lower():
                     raise ValueError(f"plan {name} differs from scheduling output")
             if outputs.get("packages") and json.loads(outputs["packages"]) != plan["packages"]:
@@ -545,14 +555,16 @@ def check_workflow(root: Path) -> list[str]:
     if (root / ".github/workflows/ci-docs-only.yml").exists():
         errors.append("the duplicate required-status companion must be removed")
     # Truth tables protect behavior while allowing equivalent expression and YAML formatting.
-    for event in EVENTS:
+    for event, rehearse_shards in [(event, rehearsal) for event in EVENTS
+                                   for rehearsal in ((False, True) if event == "workflow_dispatch" else (False,))]:
         for mode in (("docs", "e2e", "full") if event == "pull_request" else ("full",)):
             for ref in ("refs/heads/main", "refs/heads/release"):
                 for connect in (True, False) if event == "pull_request" and mode == "full" else (mode == "full",):
                     for action in ("opened", "closed") if event == "pull_request" else ("",):
-                        expected = expected_results(mode, event, ref, connect, action)
+                        expected = expected_results(mode, event, ref, connect, action, rehearse_shards)
                         context = {"github.event_name": event, "github.ref": ref, "github.event.action": action,
                                    "needs.classify-changes.outputs.mode": mode, "needs.classify-changes.outputs.connect": str(connect).lower(),
+                                   "needs.classify-changes.outputs.rehearse_shards": str(rehearse_shards).lower(),
                                    "success": True}
                         evaluated, evaluating = {}, set()
 
@@ -603,11 +615,12 @@ def main() -> int:
         try:
             plan = select_plan(os.environ.get("GITHUB_EVENT_NAME", ""), os.environ.get("CI_BASE_SHA", ""),
                                os.environ.get("GITHUB_SHA", ""), os.environ.get("GITHUB_REF", ""),
-                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""))
+                               Path.cwd(), os.environ.get("CI_EVENT_ACTION", ""), os.environ.get("CI_REHEARSE_SHARDS", "false") == "true")
             with open(os.environ["GITHUB_OUTPUT"], "a") as output:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
-                                    ("full_validation", str(plan["full_validation"]).lower())):
+                                    ("full_validation", str(plan["full_validation"]).lower()),
+                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower())):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))
             if os.environ.get("GITHUB_STEP_SUMMARY"):

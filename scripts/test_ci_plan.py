@@ -17,6 +17,7 @@ class Repository:
     def __init__(self, root):
         self.root = root
         self.git('init', '-q')
+        self.write('.gitignore', '/target/\n')
         self.write('Cargo.toml', '[workspace]\nmembers = ["rustfs", "core", "leaf", "consumer", "macro", "crates/e2e_test"]\n[workspace.dependencies]\nrenamed = { package="leaf", path="leaf" }\n')
         for name, directory in [('rustfs', 'rustfs'), ('core', 'core'), ('leaf', 'leaf'), ('consumer', 'consumer'), ('macro', 'macro'), ('e2e_test', 'crates/e2e_test')]:
             self.write(f'{directory}/Cargo.toml', f'[package]\nname = "{name}"\nversion = "0.1.0"\n')
@@ -96,6 +97,47 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(plan['full_validation'])
         self.assertTrue(plan['connect'])
 
+    def test_enforced_selection_keeps_shared_package_inputs_full(self):
+        self.repo.write(gate.POLICY_PATH, json.dumps(dict(self.repo.policy, rollout='enforced')))
+        baseline = self.repo.commit()
+        for path in ('leaf/build.rs', 'leaf/tests/fixtures/data.json', 'leaf/tests/fixtures/shared.rs',
+                     'leaf/src/template.html', 'leaf/native/include.h'):
+            with self.subTest(path=path):
+                self.repo.write(path, 'changed\n')
+                plan = self.repo.plan(self.repo.commit(), base=baseline)
+                self.assertTrue(plan['full_validation'])
+                self.assertTrue(plan['connect'])
+                self.assertEqual(set(plan['packages']), {'rustfs', 'core', 'leaf', 'consumer', 'macro'})
+
+    def test_enforced_unrelated_source_omits_connect_but_keeps_its_dependents_and_core(self):
+        self.repo.write(gate.POLICY_PATH, json.dumps(dict(self.repo.policy, rollout='enforced')))
+        baseline = self.repo.commit()
+        self.repo.write('leaf/src/lib.rs', '// changed\n')
+        plan = self.repo.plan(self.repo.commit(), base=baseline)
+        self.assertEqual(plan['packages'], ['consumer', 'core', 'leaf', 'rustfs'])
+        self.assertEqual(plan['jobs']['connect-feature-boundaries'], 'skipped')
+        for job in ('test-and-lint', 'workspace-tests', 'core-contract', 'e2e-tests',
+                    's3-implemented-tests', 's3-lifecycle-behavior-tests'):
+            self.assertEqual(plan['jobs'][job], 'success')
+
+    def test_enforced_plan_runs_a_real_failing_reverse_dependency_test(self):
+        self.repo.write('rust-toolchain.toml', (gate.ROOT / 'rust-toolchain.toml').read_text())
+        self.repo.write(gate.POLICY_PATH, json.dumps(dict(self.repo.policy, rollout='enforced')))
+        self.repo.write('leaf/src/lib.rs', 'pub fn answer() -> u8 { 1 }\n')
+        self.repo.write('core/src/lib.rs', '#[test] fn core_contract() { assert_eq!(1, 1); }\n')
+        self.repo.write('consumer/src/lib.rs', '#[cfg(test)] mod tests { extern crate renamed; #[test] fn reverse_dependency_contract() { assert_eq!(renamed::answer(), 1); } }\n')
+        baseline = self.repo.commit()
+        self.repo.write('leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n')
+        plan = self.repo.plan(self.repo.commit(), base=baseline)
+        arguments = ['cargo', 'nextest', 'run', '--offline']
+        for package in plan['packages']:
+            arguments.extend(['-p', package])
+        result = subprocess.run(arguments, cwd=self.repo.root, capture_output=True, text=True)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('reverse_dependency_contract', result.stderr)
+        self.assertIn('1 failed', result.stderr)
+        self.assertIn('1 passed', result.stderr)
+
     def test_docs_and_e2e_shortcuts_do_not_hide_production_or_fixture_inputs(self):
         self.repo.write('README.md', '# docs\n')
         docs = self.repo.plan(self.repo.commit())
@@ -155,7 +197,7 @@ class PlannerTests(unittest.TestCase):
     def test_actual_workflow_bootstrap_never_executes_pr_policy_and_upgrades_legacy_output(self):
         workflow = gate.workflow_document((Path(gate.__file__).resolve().parent.parent / '.github/workflows/ci.yml').read_text())
         body = next(step['run'] for step in workflow['jobs']['classify-changes']['steps'] if step.get('id') == 'scope')
-        self.repo.write('scripts/ci_gate.py', "import os\nwith open(os.environ['GITHUB_OUTPUT'], 'a') as output: output.write('mode=docs\\n')\n")
+        self.repo.write('scripts/ci_gate.py', "import os\nwith open(os.environ['GITHUB_OUTPUT'], 'a') as output: output.write('mode=docs\\npackages=[\"core\"]\\nplan={}\\n')\n")
         base = self.repo.commit()
         self.repo.write('scripts/ci_gate.py', 'raise SystemExit(71)\n')
         head = self.repo.commit()
@@ -170,6 +212,8 @@ class PlannerTests(unittest.TestCase):
             values = dict(line.split('=', 1) for line in output.read_text().splitlines())
             self.assertEqual(values['mode'], 'full')
             self.assertEqual(values['connect'], 'true')
+            self.assertEqual(values['packages'], '')
+            self.assertEqual(values['plan'], '')
         self.repo.write('scripts/ci_gate.py', 'raise SystemExit(29)\n')
         broken = self.repo.commit()
         env['CI_BASE_SHA'] = broken
@@ -189,7 +233,7 @@ class PlannerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', str(script), 'select'], cwd=self.repo.root, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation'})
+        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards'})
         plan = json.loads(values['plan'])
         self.assertEqual(plan['policy']['revision'], self.repo.base)
         self.assertEqual(plan['policy']['rollout'], 'shadow')
@@ -201,6 +245,7 @@ class GateTests(unittest.TestCase):
         jobs = gate.expected_results(mode, event, 'refs/heads/main', connect)
         return {'schema_version': 1, 'event': event, 'ref': 'refs/heads/main', 'head': 'a' * 40, 'tree': 'b' * 40,
                 'base': 'c' * 40, 'action': '', 'mode': mode, 'connect': connect, 'full_validation': mode == 'full', 'packages': ['rustfs'] if mode != 'docs' else [],
+                'rehearse_shards': False,
                 'policy': {'revision': 'c' * 40, 'rollout': 'enforced'}, 'jobs': jobs, 'configurations': gate.configurations(jobs),
                 'reasons': ['fixture'], 'not_applicable': {job: 'fixture' for job, state in jobs.items() if state == 'skipped'}}
 
@@ -262,6 +307,8 @@ class GateTests(unittest.TestCase):
                 expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
                 expression = "github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')"
+            elif job in gate.SHARD_JOBS:
+                expression = "needs.classify-changes.outputs.rehearse_shards == 'true'"
             elif job == 'connect-feature-boundaries':
                 expression = "needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect == 'true'"
             elif job in gate.E2E_JOBS:
@@ -318,6 +365,20 @@ class GateTests(unittest.TestCase):
                 self.assertEqual(arguments[arguments.index('--binaries-metadata') + 1], 'target/nextest/binaries-metadata.json')
                 self.assertEqual(arguments[arguments.index('--target-dir-remap') + 1], str(root / 'target'))
                 self.assertIn(f'exit_status={status}', (root / 'artifacts/ilm-integration/diagnostics.txt').read_text())
+
+    def test_requested_shards_and_union_proof_are_required_and_cannot_be_skipped(self):
+        plan = self.plan('workflow_dispatch')
+        plan['rehearse_shards'] = True
+        plan['jobs'] = gate.expected_results('full', 'workflow_dispatch', plan['ref'], rehearse_shards=True)
+        plan['not_applicable'] = {job: 'not selected' for job, state in plan['jobs'].items() if state == 'skipped'}
+        self.assertEqual(gate.verify_results(self.needs(plan), plan['event'], plan['ref']), [])
+        for job in gate.SHARD_JOBS:
+            for state in ('failure', 'cancelled', 'skipped', None):
+                needs = self.needs(plan)
+                needs[job]['result'] = state
+                self.assertTrue(gate.verify_results(needs, plan['event'], plan['ref']))
+        with self.assertRaises(ValueError):
+            gate.expected_results('full', 'pull_request', plan['ref'], rehearse_shards=True)
 
     def test_semantic_yaml_equivalence_and_wiring_boundaries(self):
         workflow = self.workflow()
