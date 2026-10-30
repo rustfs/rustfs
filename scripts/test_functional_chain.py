@@ -817,12 +817,13 @@ class EnvelopeTests(unittest.TestCase):
         previous = None
         for suite in evidence.SUITES:
             job = "\n".join(yaml_block(lines, suite, 2))
-            self.assertIn("needs: [prepare" + (", " + previous if previous else "") + "]", job)
+            self.assertIn("needs: [prepare" + (", " + previous if previous and suite != "performance" else "") + "]", job)
+            selected = " && contains(fromJSON(needs.prepare.outputs.suites || '[]'), '" + suite + "')"
             if suite == "performance":
                 # gated on the preflight probe: runs only when its fleet is online
-                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}", job)
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success'" + selected + " && needs.prepare.outputs.performance_ready == 'online' }}", job)
             else:
-                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success'" + selected + " }}", job)
             self.assertIn("chain_manifest: ${{ needs.prepare.outputs.manifest }}", job)
             previous = suite
         complete = "\n".join(yaml_block(lines, "complete-chain", 2))
@@ -918,7 +919,10 @@ class WorkflowTimeoutTests(unittest.TestCase):
             with self.subTest(suite=suite):
                 source = (candidate.ROOT / f".github/workflows/rustfs-{suite}-test.yml").read_text()
                 job = yaml_block(source.splitlines(), job_id, 2)
-                job_timeout = 360 if suite == "pool-expand" else 60
+                # heal: a progressing heal outran the shared 45-minute step
+                # cap (chain 40796474356), so it gets a 90-minute run budget
+                # and a 120-minute job budget for setup, report and cleanup.
+                job_timeout = 360 if suite == "pool-expand" else 120 if suite == "heal" else 60
                 self.assertIn(f"    timeout-minutes: {job_timeout}", job)
                 steps = named_steps(job)
                 primary = [step for step in steps.values() if any(
@@ -932,6 +936,8 @@ class WorkflowTimeoutTests(unittest.TestCase):
                         self.assertIsNotNone(timeout_input, event)
                         self.assertIn("        default: '240'", timeout_input)
                         self.assertIn("        required: false", timeout_input)
+                elif suite == "heal":
+                    self.assertIn("        timeout-minutes: 90", primary[0])
                 else:
                     self.assertIn("        timeout-minutes: 45", primary[0])
                 cleanup = "Cleanup environment"
@@ -952,7 +958,8 @@ class WorkflowTimeoutTests(unittest.TestCase):
         source = (candidate.ROOT / ".github/workflows/rustfs-performance-test.yml").read_text()
         job = "\n".join(yaml_block(source.splitlines(), "performance-test", 2))
         self.assertIn("    timeout-minutes: 900", job)
-        self.assertNotIn("        timeout-minutes:", job)
+        benchmark = job.split("id: benchmark", 1)[1].split("      - name:", 1)[0]
+        self.assertNotIn("        timeout-minutes:", benchmark)
         self.assertIn("RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '5m' }}", job)
         self.assertNotIn("RUSTFS_WARP_SLEEP:", job)
         self.assertIn("RUSTFS_WARP_METHODS: ${{ inputs.test_method }}", job)
