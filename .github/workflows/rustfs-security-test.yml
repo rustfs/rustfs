@@ -52,9 +52,6 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  repository_dispatch:
-    # Chain handoff: dispatched when the pool expansion suite finishes.
-    types: [rustfs-chain-security]
 
 permissions:
   contents: read
@@ -81,7 +78,7 @@ jobs:
   security-test:
     runs-on: smoke-testing
     timeout-minutes: 60
-    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' }}
     steps:
       # Checkout the repository into its own subdirectory. Checking out at
       # the workspace root would wipe the auto-testing clone above (that is
@@ -126,6 +123,13 @@ jobs:
           docker --version || true
           df -h /data | tail -1
 
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-security.json
+        run: python3 rustfs-repo/scripts/functional_environment.py enter --suite security
+
       - name: Cleanup environment (before)
         timeout-minutes: 5
         if: ${{ inputs.cleanup_before != 'false' || github.event_name != 'workflow_dispatch' }}
@@ -149,8 +153,7 @@ jobs:
       - name: Run security suite
         id: test
         timeout-minutes: 45
-        # Case failures keep the run green: the report and the backlog
-        # issue manager carry the product signal.
+        # Collect reports and backlog evidence before the final suite verdict.
         continue-on-error: true
         env:
           REPORT_FILE: ${{ env.SECURITY_ARTIFACTS_DIR }}/suite-report.md
@@ -194,9 +197,8 @@ jobs:
             RESULT=success
           fi
 
-          # Product gate: failing cases keep the run green — they are reported
-          # below and tracked in rustfs/backlog. Only harness/environment
-          # breakdowns turn the workflow red. The suite log lines carry ANSI
+          # The final verdict checks cases after diagnostics and cleanup.
+          # The suite log lines carry ANSI
           # color escapes both before and after the verdict tag
           # (e.g. "\e[1;31m[FAIL]\e[0m STS-105 ..."), so the pattern allows
           # any number of escapes on each side of it.
@@ -236,7 +238,7 @@ jobs:
             fi
           } > "${SECURITY_ARTIFACTS_DIR}/report.md"
           cat "${SECURITY_ARTIFACTS_DIR}/report.md" >> "${GITHUB_STEP_SUMMARY}"
-          # Red only for harness/environment breakdowns; case failures stay green.
+          # Preserve the harness verdict separately from the final case verdict.
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
@@ -336,8 +338,9 @@ jobs:
           retention-days: 3
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') }}
+        if: ${{ always() && (inputs.cleanup_after != 'false' || github.event_name != 'workflow_dispatch') && steps.environment.outcome == 'success' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -355,23 +358,21 @@ jobs:
             '
           done
 
-      - name: "Continue functional chain (next: Replication)"
-        # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup.
-        if: ${{ always() && github.event_name == 'repository_dispatch' }}
-        continue-on-error: true
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          echo "Dispatching next functional suite: Replication"
-          gh api --method POST repos/rustfs/rustfs/dispatches \
-            -f event_type='rustfs-chain-replication' \
-            -F 'client_payload[from_suite]=security'
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-security.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 rustfs-repo/scripts/functional_environment.py finish --suite security --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-security-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-security.json
+          if-no-files-found: error
 
       - name: Notify on failure
         if: failure()
@@ -400,3 +401,13 @@ jobs:
           name: functional-chain-security-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-security-${{ github.run_id }}-${{ github.run_attempt }}/security.json
           if-no-files-found: error
+
+      - name: Enforce suite and report result
+        if: ${{ always() }}
+        env:
+          SUITE_OUTCOME: ${{ steps.test.outcome }}
+          REPORT_OUTCOME: ${{ steps.report.outcome }}
+        run: |
+          test "$SUITE_OUTCOME" = success
+          test "$REPORT_OUTCOME" = success
+          python3 rustfs-repo/scripts/functional_chain_evidence.py verify-report --suite security --report "${SECURITY_ARTIFACTS_DIR}/suite-report.md"

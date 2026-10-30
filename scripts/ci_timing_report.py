@@ -35,6 +35,25 @@ def distribution(values):
             "median_minutes": statistics.median(known) if known else None}
 
 
+def successful_code_run(run):
+    """Recognize both the historical combined lane and the archive consumers."""
+    jobs = run["jobs"]
+    if not (run.get("event", "pull_request") == "pull_request"
+            and run.get("status") == "completed" and run.get("conclusion") == "success"
+            and jobs and all(job.get("status") == "completed" for job in jobs)):
+        return False
+    consumers = [job for job in jobs if job["name"].startswith(("Workspace tests", "Core contract"))]
+    if consumers:
+        return (any(job["name"] == "Workspace Lint and Build" and job.get("conclusion") == "success" for job in jobs)
+                and all(job.get("conclusion") == "success" for job in consumers)
+                and all(any(job["name"].startswith(prefix) for job in consumers)
+                        for prefix in ("Workspace tests", "Core contract")))
+    return any(job["name"] in ("Workspace Test and Lint", "Test and Lint")
+               and job.get("conclusion") == "success"
+               and any(step.get("name") == "Run nextest tests" and step.get("conclusion") == "success"
+                       for step in (job.get("steps") or [])) for job in jobs)
+
+
 def summarize(runs):
     statuses = Counter()
     jobs_by_name = defaultdict(list)
@@ -46,10 +65,7 @@ def summarize(runs):
             if job.get("conclusion") != "skipped":
                 jobs_by_name[job["name"]].append(job)
         # Exclude docs-only and pull_request.closed cancellation-handler greens.
-        if (run.get("status") == "completed" and run.get("conclusion") == "success" and jobs
-                and any(job["name"] in ("Workspace Test and Lint", "Test and Lint") and job.get("conclusion") == "success"
-                        and any(step.get("name") == "Run nextest tests" and step.get("conclusion") == "success" for step in (job.get("steps") or [])) for job in jobs)
-                and all(job.get("status") == "completed" for job in jobs)):
+        if successful_code_run(run):
             successful_code_runs.append(run)
 
     wall, job_time = [], []
@@ -82,7 +98,7 @@ def summarize(runs):
             "successful_code_wall": distribution(wall), "successful_code_job_sum": distribution(job_time),
             "jobs": job_summary,
             "limits": ["Live collection samples completed runs; ongoing queue depth is not measured.",
-                       "Job creation-to-start is scheduler wait; dependency delay is not included.",
+                       "Job creation-to-start wait does not separately identify scheduler and dependency delays.",
                        "Step times can combine setup, compilation and tests; they do not isolate compiler time.",
                        "Job sums are unweighted runner minutes, not billing or wall time.",
                        "Actions timing does not establish functional completeness, escaped regressions or quarantine health."]}

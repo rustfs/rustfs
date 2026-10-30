@@ -34,7 +34,7 @@ jobs:
     # self-hosted sm-standard-* pool is down, which is exactly when the
     # scheduled validations it watches stall.
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     permissions:
       actions: read
       contents: read
@@ -47,6 +47,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           RUSTFS_DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          NIGHTLY_SOURCE_REF: ${{ vars.NIGHTLY_BRANCH || 'main' }}
         run: |
           set +e
           python3 scripts/check_scheduled_validation_freshness.py \

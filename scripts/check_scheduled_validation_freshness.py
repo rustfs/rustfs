@@ -17,14 +17,14 @@ from unittest import mock
 from urllib.parse import parse_qs, quote, urlencode, urlsplit
 from urllib.request import Request, urlopen
 
+from validation_registry import load_registry, monitored_workflows
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_validations(path: Path) -> list[tuple[str, int, datetime | None]]:
-    data = json.loads(path.read_text())
-    if not isinstance(data, list) or not data:
-        raise ValueError("scheduled validation config must be a non-empty list")
+    data = [item for item in monitored_workflows(load_registry(path)) if item["monitor"] == "workflow"]
 
     validations: list[tuple[str, int, datetime | None]] = []
     seen: set[str] = set()
@@ -161,7 +161,8 @@ def write_report(path: Path, rows: list[tuple[str, int, str, str, str]], default
         "",
         f"Default branch: `{default_branch}`. Ages use scheduled-run creation time; rerunning an old commit does not refresh its evidence.",
         "Attempt outcomes are shown independently of successful-run freshness.",
-        "Success is the GitHub workflow run conclusion; suite completeness remains the responsibility of each workflow.",
+        "Ordinary duties use workflow conclusions; the functional chain reuses its complete candidate and attempt evidence verifier.",
+        "Disabled and paused responsibilities remain visible and are never enabled by monitoring.",
         "",
         "| Workflow | Limit | Freshness | Last attempt | Last completed success |",
         "| --- | ---: | --- | --- | --- |",
@@ -172,13 +173,38 @@ def write_report(path: Path, rows: list[tuple[str, int, str, str, str]], default
     path.write_text("\n".join(lines) + "\n")
 
 
+def workflow_state(repository, workflow, token, api_url):
+    endpoint = f"{api_url.rstrip('/')}/repos/{repository}/actions/workflows/{Path(workflow).name}"
+    request = Request(endpoint, headers={"Accept": "application/vnd.github+json", "Authorization": f"Bearer {token}"})
+    with urlopen(request, timeout=15) as response:
+        value = json.load(response)
+    state = value.get("state")
+    if state not in ("active", "disabled_manually", "disabled_inactivity", "disabled_fork", "deleted"):
+        raise ValueError("unknown workflow execution state")
+    return state
+
+
 def check_freshness(
     config: Path, report: Path, repository: str, token: str, api_url: str, default_branch: str
 ) -> int:
     now = datetime.now(timezone.utc)
+    registry = load_registry(config)
+    definitions = {item["workflow"]: item for item in monitored_workflows(registry)}
     rows: list[tuple[str, int, str, str, str]] = []
     failed = False
     for workflow, max_age_hours, never_ran_grace_until in load_validations(config):
+        definition = definitions[workflow]
+        try:
+            state = workflow_state(repository, workflow, token, api_url)
+        except Exception as error:
+            failed = True
+            rows.append((workflow, max_age_hours, f"Observation incomplete: {error}", "Inspection failed", "Inspection failed"))
+            continue
+        if definition["policy"] != "active" or state != "active":
+            failed |= definition["policy"] == "active"
+            rows.append((workflow, max_age_hours, f"Policy: {definition['policy']}; runtime: {state}; no health claim",
+                         "Not scheduled by this monitor", "Historical successes do not override execution policy"))
+            continue
         runs: dict[str, dict[str, object] | None] = {}
         reasons: list[str] = []
         for label, successful in (("Last attempt", False), ("Last completed success", True)):
@@ -188,7 +214,6 @@ def check_freshness(
                 )
             except Exception as error:
                 reasons.append(f"{label}: inspection failed: {error}")
-        # A failed inspection or any recorded attempt ends first-run grace.
         initial_grace = (
             len(runs) == 2
             and all(run is None for run in runs.values())
@@ -200,8 +225,13 @@ def check_freshness(
                 reason = stale_reason(run, now, max_age_hours)
                 if reason is not None:
                     reasons.append(f"{label}: {reason}")
+        attempt = runs.get("Last attempt") or {}
+        if attempt.get("status") == "completed" and attempt.get("conclusion") != "success":
+            reasons.append("Latest attempt: " + str(attempt.get("conclusion")))
         failed |= bool(reasons)
         result = "; ".join(reasons) if reasons else "Fresh"
+        if attempt.get("status") in ("queued", "in_progress", "waiting", "pending"):
+            result += "; latest attempt " + str(attempt["status"]) + ", completion pending"
         if initial_grace:
             result = f"Initial grace until {never_ran_grace_until.isoformat()}"
         evidence = [
@@ -209,6 +239,24 @@ def check_freshness(
             for label in ("Last attempt", "Last completed success")
         ]
         rows.append((workflow, max_age_hours, result, *evidence))
+    for definition in definitions.values():
+        if definition["monitor"] != "complete-chain":
+            continue
+        try:
+            # Use the existing candidate/attempt/evidence verifier. A green
+            # GitHub conclusion alone never satisfies this responsibility.
+            from functional_chain_health import collect
+            health = collect(source_ref=os.environ.get("NIGHTLY_SOURCE_REF") or default_branch)
+            latest = health["latest_attempt"] or {}
+            success = health["last_complete_success"].get(health.get("expected_source_ref"), {})
+            verdict = "Verified complete and current" if health["healthy"] else "Incomplete, stale, disabled or wrong candidate"
+            failed |= not health["healthy"] and definition["policy"] == "active"
+            rows.append((definition["workflow"], definition["max_age_hours"], verdict,
+                         json.dumps(latest, sort_keys=True), json.dumps(success, sort_keys=True)))
+        except Exception as error:
+            failed = True
+            rows.append((definition["workflow"], definition["max_age_hours"], f"Observation incomplete: {error}",
+                         "Inspection failed", "No complete-evidence claim"))
     write_report(report, rows, default_branch)
     return 1 if failed else 0
 
@@ -226,58 +274,16 @@ class SelfTests(unittest.TestCase):
     def test_config_rejects_duplicate_and_invalid_entries(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "validations.json"
-            path.write_text(
-                json.dumps(
-                    [
-                        {"workflow": ".github/workflows/ci.yml", "max_age_hours": 36},
-                        {"workflow": ".github/workflows/ci.yml", "max_age_hours": 0},
-                    ]
-                )
-            )
-            with self.assertRaises(ValueError):
-                load_validations(path)
-            path.write_text(
-                json.dumps(
-                    [{"workflow": ".github/workflows/ci.yml", "max_age_hours": 0}]
-                )
-            )
-            with self.assertRaises(ValueError):
-                load_validations(path)
-            for bad_grace in (36, "not-a-timestamp", "2026-09-01T00:00:00"):
-                path.write_text(
-                    json.dumps(
-                        [
-                            {
-                                "workflow": ".github/workflows/ci.yml",
-                                "max_age_hours": 36,
-                                "never_ran_grace_until": bad_grace,
-                            }
-                        ]
-                    )
-                )
+            original = load_registry()
+            for mutate in (lambda value: value["workflows"].append(value["workflows"][0]),
+                           lambda value: value["workflows"][0].update(max_age_hours=0),
+                           lambda value: value.update(schema=2)):
+                value = json.loads(json.dumps(original))
+                mutate(value)
+                path.write_text(json.dumps(value))
                 with self.assertRaises(ValueError):
                     load_validations(path)
-            path.write_text(
-                json.dumps(
-                    [
-                        {
-                            "workflow": ".github/workflows/ci.yml",
-                            "max_age_hours": 36,
-                            "never_ran_grace_until": "2026-09-02T06:37:00Z",
-                        }
-                    ]
-                )
-            )
-            self.assertEqual(
-                load_validations(path),
-                [
-                    (
-                        ".github/workflows/ci.yml",
-                        36,
-                        datetime(2026, 9, 2, 6, 37, tzinfo=timezone.utc),
-                    )
-                ],
-            )
+            self.assertTrue(load_validations(ROOT / ".github/scheduled-validations.json"))
 
     @staticmethod
     def run_fixture(**overrides: object) -> dict[str, object]:
@@ -299,7 +305,7 @@ class SelfTests(unittest.TestCase):
             config = root / "validations.json"
             report = root / "report.md"
             entries = [
-                {"workflow": f".github/workflows/check-{index}.yml", "max_age_hours": 36}
+                {"workflow": f".github/workflows/check-{index}.yml", "max_age_hours": 36, "monitor": "workflow", "policy": "active"}
                 for index in range(workflows)
             ]
             if grace is not None:
@@ -311,6 +317,8 @@ class SelfTests(unittest.TestCase):
                     payload = {"total_count": len(payload["workflow_runs"]), **payload}
                 responses.append(payload if isinstance(payload, Exception) else io.StringIO(json.dumps(payload)))
             with (
+                mock.patch(__name__ + ".load_registry", return_value={"workflows": entries}),
+                mock.patch(__name__ + ".workflow_state", return_value="active"),
                 mock.patch(__name__ + ".urlopen", side_effect=responses) as request,
                 mock.patch(__name__ + ".datetime", wraps=datetime) as clock,
             ):
@@ -372,9 +380,9 @@ class SelfTests(unittest.TestCase):
                     {"workflow_runs": [self.run_fixture(status=state, conclusion=conclusion)]},
                     {"workflow_runs": [success]},
                 ])
-                self.assertEqual(status, 0)
+                self.assertEqual(status, int(state == "completed" and conclusion != "success"))
                 self.assertIn(f"[{state}" + (f"/{conclusion}" if conclusion else "") + "]", report)
-                self.assertIn("Fresh", report)
+                self.assertIn("Fresh" if status == 0 else "Latest attempt:", report)
                 self.assertNotIn("All critical scheduled validations", report)
 
     def test_grace_requires_two_successful_queries_with_no_history(self) -> None:
@@ -456,6 +464,21 @@ class SelfTests(unittest.TestCase):
             self.assertEqual(report.count(f"`.github/workflows/check-{index}.yml`"), 1)
         self.assertIn("No recorded run", report)
         self.assertIn("Inspection failed", report)
+
+    def test_disabled_policy_and_runtime_state_remain_visible_without_enable_calls(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            report = Path(tmp) / "report.md"
+            entry = {"workflow": ".github/workflows/check.yml", "max_age_hours": 36,
+                     "monitor": "workflow", "policy": "disabled"}
+            for policy, expected in (("disabled", 0), ("paused", 0), ("active", 1)):
+                entry["policy"] = policy
+                with mock.patch(__name__ + ".load_registry", return_value={"workflows": [entry]}), \
+                     mock.patch(__name__ + ".workflow_state", return_value="disabled_manually"), \
+                     mock.patch(__name__ + ".urlopen") as request:
+                    status = check_freshness(Path("unused"), report, "rustfs/rustfs", "token", "https://api.github.test", "main")
+                self.assertEqual(status, expected)
+                self.assertIn("runtime: disabled_manually; no health claim", report.read_text())
+                request.assert_not_called()
 
     def test_cli_requires_the_repository_default_branch(self) -> None:
         from check_test_wiring import yaml_block

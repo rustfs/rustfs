@@ -45,6 +45,20 @@ class TimingTests(unittest.TestCase):
         self.job["steps"] = []
         self.assertEqual(summarize([self.run])["successful_code_runs"], 0)
 
+    def test_archive_pipeline_requires_workspace_and_core_consumers(self):
+        self.run["jobs"] = [{**self.job, "id": 5, "name": "Workspace Lint and Build"},
+                            {**self.job, "name": "Workspace tests (0)"},
+                            {**self.job, "id": 3, "name": "Workspace tests (1)"},
+                            {**self.job, "id": 4, "name": "Core contract"}]
+        self.assertEqual(summarize([self.run])["successful_code_runs"], 1)
+        self.run["jobs"][0]["conclusion"] = "skipped"
+        self.assertEqual(summarize([self.run])["successful_code_runs"], 0)
+        self.run["jobs"][0]["conclusion"] = "success"
+        self.run["jobs"][-1]["conclusion"] = "skipped"
+        self.assertEqual(summarize([self.run])["successful_code_runs"], 0)
+        self.run["jobs"].pop()
+        self.assertEqual(summarize([self.run])["successful_code_runs"], 0)
+
     def test_collection_rejects_out_of_range_api_results(self):
         with mock.patch("ci_timing_report.api", return_value={"workflow_runs": [self.run]}):
             with self.assertRaisesRegex(ValueError, "outside the requested date range"):

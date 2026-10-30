@@ -39,9 +39,6 @@ on:
           - bucket
           - site
         default: all
-  repository_dispatch:
-    # Chain handoff: dispatched when the security suite finishes.
-    types: [rustfs-chain-replication]
 
 permissions:
   contents: read
@@ -68,7 +65,7 @@ jobs:
   replication-test:
     runs-on: smoke-testing
     timeout-minutes: 60
-    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -113,6 +110,13 @@ jobs:
           aws --version
           df -h /data | tail -1 || true
 
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-replication.json
+        run: python3 scripts/functional_environment.py enter --suite replication
+
       - name: Cleanup environment (before)
         timeout-minutes: 5
         run: |
@@ -135,8 +139,7 @@ jobs:
       - name: Run replication suite
         id: test
         timeout-minutes: 45
-        # Case failures keep the run green: the report and the backlog
-        # issue manager carry the product signal.
+        # Collect reports and backlog evidence before the final suite verdict.
         continue-on-error: true
         run: |
           set -euo pipefail
@@ -192,10 +195,8 @@ jobs:
             RESULT=success
           fi
 
-          # Product gate: failing cases keep the run green — they are reported
-          # below and tracked in rustfs/backlog. Only harness/environment
-          # breakdowns (the suite never reached case level, or a wholesale
-          # failure with zero passes) turn the workflow red.
+          # Report harness completion here; the final verdict checks every
+          # case result after diagnostics and cleanup have been retained.
           CASES_TOTAL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| (PASS|FAIL|UNSUPPORTED|RUNNING) \|' "${CASE_TABLE}" 2>/dev/null || true)"
           CASES_FAIL="$(grep -cE '^\| [A-Z][A-Z0-9]*-[0-9]+ .*\| FAIL \|' "${CASE_TABLE}" 2>/dev/null || true)"
           CASES_TOTAL=$(( ${CASES_TOTAL:-0} + 0 )); CASES_FAIL=$(( ${CASES_FAIL:-0} + 0 ))
@@ -234,7 +235,7 @@ jobs:
             fi
           } | tee "${REPORT_FILE}"
           cat "${REPORT_FILE}" >> "${GITHUB_STEP_SUMMARY}"
-          # Red only for harness/environment breakdowns; case failures stay green.
+          # Preserve the harness verdict separately from the final case verdict.
           [ "${HARNESS_OK}" = "1" ]
 
       - name: Upload functional report to dashboard
@@ -333,8 +334,9 @@ jobs:
           if-no-files-found: error
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: always()
+        if: ${{ always() && steps.environment.outcome == 'success' }}
         run: |
           set -euo pipefail
           read -r -a NODES <<< "${RUSTFS_NODES:-vm000 vm001 vm002}"
@@ -352,50 +354,21 @@ jobs:
             '
           done
 
-      - name: "Continue functional chain (next: Fault tolerance)"
-        if: ${{ always() && github.event_name == 'repository_dispatch' }}
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          DISPATCHED=0
-          for attempt in 1 2 3; do
-            if gh api --method POST repos/rustfs/rustfs/dispatches \
-              -f event_type='rustfs-chain-fault-tolerance' \
-              -F 'client_payload[from_suite]=replication'; then
-              echo "dispatched next suite Fault tolerance (attempt ${attempt})"
-              DISPATCHED=1
-              break
-            fi
-            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
-            sleep "${attempt}0"
-          done
-          if [ "${DISPATCHED:-0}" -ne 1 ]; then
-            echo "ERROR: functional chain stalled: could not dispatch Fault tolerance after 3 attempts" >&2
-            TITLE="[functional][chain] stalled after replication (run ${GITHUB_RUN_ID})"
-            BODY_FILE="$(mktemp)"
-            trap 'rm -f "${BODY_FILE}"' EXIT
-            {
-              echo "The functional chain could not hand off from **replication** to **Fault tolerance** after 3 attempts."
-              echo ""
-              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-              echo "- Expected next event: 'rustfs-chain-fault-tolerance'"
-              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
-              echo "- Recovery: re-dispatch manually with"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-fault-tolerance'"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-            } > "${BODY_FILE}"
-            gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test \
-              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
-              || echo "could not file the stall alert issue either; check the token" >&2
-            exit 1
-          fi
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-replication.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 scripts/functional_environment.py finish --suite replication --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-replication-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-replication.json
+          if-no-files-found: error
 
       - name: Notify on failure
         if: failure()
@@ -424,3 +397,13 @@ jobs:
           name: functional-chain-replication-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-replication-${{ github.run_id }}-${{ github.run_attempt }}/replication.json
           if-no-files-found: error
+
+      - name: Enforce suite and report result
+        if: ${{ always() }}
+        env:
+          SUITE_OUTCOME: ${{ steps.test.outcome }}
+          REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: |
+          test "$SUITE_OUTCOME" = success
+          test "$REPORT_OUTCOME" = success
+          python3 scripts/functional_chain_evidence.py verify-report --suite replication --report "${FUNCTIONAL_ARTIFACTS_DIR}/cases.md"

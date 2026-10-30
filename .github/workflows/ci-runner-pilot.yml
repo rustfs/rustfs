@@ -1,0 +1,92 @@
+name: CI Runner Pilot
+
+on:
+  workflow_dispatch:
+    inputs:
+      pool:
+        description: "Existing runner pool; no infrastructure is created"
+        required: true
+        type: choice
+        options: [hosted, arc]
+        default: hosted
+      workload:
+        description: "Probe only, or perform cold/warm fixed-source builds"
+        required: true
+        type: choice
+        options: [probe, server, workspace-tests]
+        default: probe
+      source_sha:
+        description: "Exact 40-character merged main SHA; required for builds"
+        type: string
+      toolchain:
+        description: "Exact Rust version such as 1.92.0; required for builds"
+        type: string
+      scratch_root:
+        description: "Existing absolute scratch directory; empty uses runner.temp"
+        type: string
+      build_jobs:
+        description: "Fixed Cargo concurrency for both comparisons (1-16)"
+        type: string
+        default: "2"
+      local_ssd:
+        description: "Require operator /etc/rustfs-runner/storage.json attestation"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-runner-pilot
+  cancel-in-progress: false
+
+jobs:
+  hosted:
+    if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main' && inputs.pool == 'hosted'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/runner-pilot
+        with:
+          workload: ${{ inputs.workload }}
+          source-sha: ${{ inputs.source_sha }}
+          toolchain: ${{ inputs.toolchain }}
+          scratch-root: ${{ inputs.scratch_root }}
+          build-jobs: ${{ inputs.build_jobs }}
+          local-ssd: ${{ inputs.local_ssd }}
+      - name: Retain hosted pilot evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runner-pilot-hosted-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-pilot-evidence
+          if-no-files-found: error
+          retention-days: 30
+  arc:
+    if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main' && inputs.pool == 'arc'
+    # Disk and hardware: measure the existing workspace build pool's storage.
+    runs-on: sm-standard-4
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/runner-pilot
+        with:
+          workload: ${{ inputs.workload }}
+          source-sha: ${{ inputs.source_sha }}
+          toolchain: ${{ inputs.toolchain }}
+          scratch-root: ${{ inputs.scratch_root }}
+          build-jobs: ${{ inputs.build_jobs }}
+          local-ssd: ${{ inputs.local_ssd }}
+      - name: Retain ARC pilot evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runner-pilot-arc-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/runner-pilot-evidence
+          if-no-files-found: error
+          retention-days: 30

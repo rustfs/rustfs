@@ -817,12 +817,13 @@ class EnvelopeTests(unittest.TestCase):
         previous = None
         for suite in evidence.SUITES:
             job = "\n".join(yaml_block(lines, suite, 2))
-            self.assertIn("needs: [prepare" + (", " + previous if previous else "") + "]", job)
+            self.assertIn("needs: [prepare" + (", " + previous if previous and suite != "performance" else "") + "]", job)
+            selected = " && contains(fromJSON(needs.prepare.outputs.suites || '[]'), '" + suite + "')"
             if suite == "performance":
                 # gated on the preflight probe: runs only when its fleet is online
-                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}", job)
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success'" + selected + " && needs.prepare.outputs.performance_ready == 'online' }}", job)
             else:
-                self.assertIn("if: ${{ always() && needs.prepare.result == 'success' }}", job)
+                self.assertIn("if: ${{ always() && needs.prepare.result == 'success'" + selected + " }}", job)
             self.assertIn("chain_manifest: ${{ needs.prepare.outputs.manifest }}", job)
             previous = suite
         complete = "\n".join(yaml_block(lines, "complete-chain", 2))
@@ -952,7 +953,8 @@ class WorkflowTimeoutTests(unittest.TestCase):
         source = (candidate.ROOT / ".github/workflows/rustfs-performance-test.yml").read_text()
         job = "\n".join(yaml_block(source.splitlines(), "performance-test", 2))
         self.assertIn("    timeout-minutes: 900", job)
-        self.assertNotIn("        timeout-minutes:", job)
+        benchmark = job.split("id: benchmark", 1)[1].split("      - name:", 1)[0]
+        self.assertNotIn("        timeout-minutes:", benchmark)
         self.assertIn("RUSTFS_WARP_DURATION: ${{ inputs.warp_duration || '5m' }}", job)
         self.assertNotIn("RUSTFS_WARP_SLEEP:", job)
         self.assertIn("RUSTFS_WARP_METHODS: ${{ inputs.test_method }}", job)

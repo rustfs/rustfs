@@ -52,8 +52,7 @@ trap 'exit 130' HUP INT TERM
 # response and key files are task-local.
 target_dir="${CARGO_TARGET_DIR:-${repo_root}/target}"
 feature=offline-enrollment-e2e-root
-cargo build --locked -p rustfs --bin rustfs-cli-e2e --features "${feature}"
-cargo build --locked -p rustfs --bin rustfs-cli --features "${feature}"
+cargo build --locked -p rustfs --bin rustfs-cli-e2e --bin rustfs-cli --features "${feature}"
 cargo test --locked -p rustfs --test connect_offline_enrollment --features "${feature}" e2e_
 
 "${target_dir}/debug/rustfs-cli-e2e" connect offline enroll \

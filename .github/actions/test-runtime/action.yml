@@ -1,0 +1,16 @@
+name: Verification runtime
+description: Install the runtime for prebuilt test archives without a target cache
+runs:
+  using: composite
+  steps:
+    - name: Install runtime tools
+      shell: bash
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y libssl-dev ripgrep
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@96c7780c1d8a2b8723e12031def873a434d39d8d # nextest
+      with:
+        tool: cargo-nextest@0.9.138

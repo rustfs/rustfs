@@ -1,0 +1,60 @@
+name: CI Resource Accounting
+
+on:
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Inclusive run creation timestamp, for example 2026-10-01T00:00:00Z"
+        required: true
+        type: string
+      until:
+        description: "Inclusive end timestamp; keep the window below 1000 runs"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+  pull-requests: read
+
+concurrency:
+  group: ci-resource-accounting
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - name: Collect all workflow attempts in the window
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ACCOUNTING_SINCE: ${{ inputs.since }}
+          ACCOUNTING_UNTIL: ${{ inputs.until }}
+          ACCOUNTING_REPOSITORY: ${{ github.repository }}
+        run: |
+          python3 scripts/ci/actions_cost_report.py \
+            --repository "$ACCOUNTING_REPOSITORY" \
+            --since "$ACCOUNTING_SINCE" --until "$ACCOUNTING_UNTIL" \
+            --output "$RUNNER_TEMP/ci-accounting.json" \
+            --summary "$RUNNER_TEMP/ci-accounting.md"
+      - name: Show available accounting summary
+        if: always()
+        run: |
+          if [[ -f "$RUNNER_TEMP/ci-accounting.md" ]]; then
+            cat "$RUNNER_TEMP/ci-accounting.md" >> "$GITHUB_STEP_SUMMARY"
+          fi
+      - name: Retain recomputable accounting evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-accounting-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/ci-accounting.json
+            ${{ runner.temp }}/ci-accounting.md
+          if-no-files-found: error
+          retention-days: 30
