@@ -281,12 +281,20 @@ jobs:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
           PERFORMANCE_OPTIONAL: ${{ contains(fromJSON(steps.selection.outputs.optional_suites), 'performance') }}
         run: |
-          if python3 scripts/check_functional_runners.py pf-testing; then
-            echo "performance_ready=online" >> "$GITHUB_OUTPUT"
-          else
-            echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
-            test "$PERFORMANCE_OPTIONAL" = true
-          fi
+          # TEMPORARY: the pf-testing environment is broken, so the
+          # performance lane is disabled until it is repaired. Forcing
+          # offline keeps the chain on its designed skip path: the lane job
+          # is skipped, aggregate receives --allow-skipped performance
+          # (required=false in scheduled-validations.json), and the report
+          # records the optional-lane skip with its reason.
+          # Restore the probe below once the environment is healthy again.
+          # if python3 scripts/check_functional_runners.py pf-testing; then
+          #   echo "performance_ready=online" >> "$GITHUB_OUTPUT"
+          # else
+          #   echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
+          #   test "$PERFORMANCE_OPTIONAL" = true
+          # fi
+          echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
 
   validation:
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '' || inputs.validation_cleanup_retained_evidence) }}
