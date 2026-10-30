@@ -13,6 +13,7 @@ cleanup() {
 trap cleanup EXIT
 
 "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" --self-test
+"${RUSTFS_PYTHON_BIN:-python3}" "$PROJECT_ROOT/scripts/test_scanner_heal_linux_evidence_plan.py"
 
 "${RUSTFS_PYTHON_BIN:-python3}" "$RUNNER" --phase preflight >"$TMP_DIR/preflight.out"
 rg -q "stage=preflight" "$TMP_DIR/preflight.out"
