@@ -3472,23 +3472,47 @@ mod tests {
         (port, handle)
     }
 
-    fn spawn_http_status_server(status: u16) -> (u16, std::thread::JoinHandle<()>) {
-        use std::io::{Read, Write};
+    fn spawn_http_status_server(status: u16) -> (u16, std::sync::mpsc::Sender<()>, std::thread::JoinHandle<usize>) {
+        use std::io::{ErrorKind, Read, Write};
 
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("test HTTP listener should bind");
+        listener
+            .set_nonblocking(true)
+            .expect("test HTTP listener should be nonblocking");
         let port = listener
             .local_addr()
             .expect("test HTTP listener should have an address")
             .port();
+        let (stop, stopped) = std::sync::mpsc::channel();
         let handle = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("test HTTP client should connect");
-            let mut request = [0_u8; 8192];
-            let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
-            assert!(bytes_read > 0, "test HTTP request should not be empty");
-            write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .expect("test HTTP response should be written");
+            let mut requests = 0;
+            loop {
+                match stopped.try_recv() {
+                    Ok(()) | Err(std::sync::mpsc::TryRecvError::Disconnected) => break,
+                    Err(std::sync::mpsc::TryRecvError::Empty) => {}
+                }
+                let (mut stream, _) = match listener.accept() {
+                    Ok(connection) => connection,
+                    Err(err) if err.kind() == ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(5));
+                        continue;
+                    }
+                    Err(err) => panic!("test HTTP listener failed: {err}"),
+                };
+                stream.set_nonblocking(false).expect("test HTTP stream should be blocking");
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(3)))
+                    .expect("test HTTP read timeout should configure");
+                let mut request = [0_u8; 8192];
+                let bytes_read = stream.read(&mut request).expect("test HTTP request should be read");
+                assert!(bytes_read > 0, "test HTTP request should not be empty");
+                requests += 1;
+                write!(stream, "HTTP/1.1 {status} Test\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .expect("test HTTP response should be written");
+            }
+            requests
         });
-        (port, handle)
+        (port, stop, handle)
     }
 
     fn spawn_delayed_http_server() -> (
@@ -4492,16 +4516,26 @@ mod tests {
     #[tokio::test]
     async fn target_health_check_treats_client_errors_as_online_and_server_errors_as_offline() {
         for (status, expected_online) in [(403, true), (500, false)] {
-            let (port, server) = spawn_http_status_server(status);
+            let (port, stop, server) = spawn_http_status_server(status);
             let endpoint = format!("http://127.0.0.1:{port}");
-            let target = target_client_for_test(
-                &format!("arn:http-{status}"),
-                endpoint.clone(),
-                s3_client_for_endpoint_test(endpoint, None),
-            );
+            let client = s3_client_for_endpoint_test(endpoint.clone(), None);
+            let config = client
+                .config()
+                .to_builder()
+                .retry_config(
+                    aws_sdk_s3::config::retry::RetryConfig::standard()
+                        .with_max_attempts(2)
+                        .with_initial_backoff(Duration::from_millis(1))
+                        .with_max_backoff(Duration::from_millis(1)),
+                )
+                .build();
+            let target = target_client_for_test(&format!("arn:http-{status}"), endpoint, S3Client::from_conf(config));
 
-            assert_eq!(BucketTargetSys::check_endpoint_health(&target).await, expected_online);
-            server.join().expect("test HTTP server should stop");
+            let online = BucketTargetSys::check_endpoint_health(&target).await;
+            stop.send(()).expect("test HTTP server should be running");
+            let requests = server.join().expect("test HTTP server should stop");
+            assert_eq!(requests, if status == 500 { 2 } else { 1 }, "unexpected probe count for HTTP {status}");
+            assert_eq!(online, expected_online, "unexpected health for HTTP {status}");
         }
     }
 

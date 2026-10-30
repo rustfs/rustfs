@@ -448,6 +448,14 @@ impl ECStore {
         await_orphan_bucket_recovery(bucket, &publication_guard, &lifecycle_guard, &metadata_guard, &ns_guard, recover).await
     }
 
+    /// Read quota and bucket identity from one authoritative metadata snapshot.
+    pub async fn bucket_quota_and_incarnation_from_disk(
+        &self,
+        bucket: &str,
+    ) -> Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime)> {
+        metadata_sys::get_quota_config_and_incarnation_from_disk_in(&self.ctx, bucket).await
+    }
+
     pub async fn get_bucket_metadata(&self, bucket: &str) -> Result<Arc<BucketMetadata>> {
         let sys = metadata_sys::require_bucket_metadata_sys_in(&self.ctx)?;
         sys.read().await.get(bucket).await
@@ -564,13 +572,83 @@ impl ECStore {
             .await
     }
 
-    pub(super) async fn acquire_bucket_incarnation_fence_with_options(
+    pub(crate) async fn acquire_bucket_incarnation_fence_with_options(
         &self,
         bucket: &str,
         expected: Uuid,
         opts: Option<&ObjectOptions>,
     ) -> Result<super::BucketIncarnationFenceGuard> {
+        Ok(self
+            .acquire_bucket_incarnation_fence_for_options(bucket, Some(expected), opts)
+            .await?
+            .0)
+    }
+
+    pub(crate) async fn acquire_bucket_incarnation_fence_for_options(
+        &self,
+        bucket: &str,
+        expected: Option<Uuid>,
+        opts: Option<&ObjectOptions>,
+    ) -> Result<(super::BucketIncarnationFenceGuard, Uuid)> {
         let inner = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        self.validate_bucket_incarnation_fence_guard_with_options(bucket, inner, expected, opts)
+            .await
+    }
+
+    /// Acquire lexicographically ordered bucket lifecycle read locks for a copy
+    /// operation and validate both bucket incarnations through [`super::BucketFenceRegistry`].
+    pub async fn acquire_copy_bucket_incarnation_fences(
+        &self,
+        source_bucket: &str,
+        expected_source: Option<Uuid>,
+        destination_bucket: &str,
+        expected_destination: Option<Uuid>,
+    ) -> Result<(super::BucketIncarnationFenceGuard, Uuid, Option<super::BucketIncarnationFenceGuard>, Uuid)> {
+        let (source_guard, destination_guard) = if source_bucket == destination_bucket {
+            (self.acquire_bucket_lifecycle_read_lock(source_bucket).await?, None)
+        } else if source_bucket < destination_bucket {
+            let source_guard = self.acquire_bucket_lifecycle_read_lock(source_bucket).await?;
+            let destination_guard = self.acquire_bucket_lifecycle_read_lock(destination_bucket).await?;
+            (source_guard, Some(destination_guard))
+        } else {
+            let destination_guard = self.acquire_bucket_lifecycle_read_lock(destination_bucket).await?;
+            let source_guard = self.acquire_bucket_lifecycle_read_lock(source_bucket).await?;
+            (source_guard, Some(destination_guard))
+        };
+        let (source_guard, current_source_incarnation_id) = self
+            .validate_bucket_incarnation_fence_guard_with_options(source_bucket, source_guard, expected_source, None)
+            .await?;
+        let (destination_guard, current_destination_incarnation_id) = if let Some(destination_guard) = destination_guard {
+            let (destination_guard, destination_incarnation_id) = self
+                .validate_bucket_incarnation_fence_guard_with_options(
+                    destination_bucket,
+                    destination_guard,
+                    expected_destination,
+                    None,
+                )
+                .await?;
+            (Some(destination_guard), destination_incarnation_id)
+        } else {
+            if expected_destination.is_some_and(|expected| expected != current_source_incarnation_id) {
+                return Err(StorageError::BucketNotFound(destination_bucket.to_owned()));
+            }
+            (None, current_source_incarnation_id)
+        };
+        Ok((
+            source_guard,
+            current_source_incarnation_id,
+            destination_guard,
+            current_destination_incarnation_id,
+        ))
+    }
+
+    async fn validate_bucket_incarnation_fence_guard_with_options(
+        &self,
+        bucket: &str,
+        inner: rustfs_lock::NamespaceLockGuard,
+        expected: Option<Uuid>,
+        opts: Option<&ObjectOptions>,
+    ) -> Result<(super::BucketIncarnationFenceGuard, Uuid)> {
         let mut guard = super::BucketIncarnationFenceGuard::new(
             Arc::clone(&self.bucket_fence_registry),
             bucket,
@@ -586,10 +664,10 @@ impl ECStore {
                 }
             })
             .await?;
-        if current != expected {
+        if expected.is_some_and(|expected| current != expected) {
             return Err(StorageError::BucketNotFound(bucket.to_owned()));
         }
-        Ok(guard)
+        Ok((guard, current))
     }
 
     /// Hold this guard through recursive-delete authorization and mutation so

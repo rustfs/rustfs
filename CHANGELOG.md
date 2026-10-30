@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Deployment
+
+- Existing volumes created by older root-running container images must be writable by the non-root runtime identity before upgrading. The default container UID/GID is `10001:10001`; stop the affected instances, verify host mount paths, and for ordinary bind mounts run `sudo chown -R 10001:10001 /actual/data /actual/logs` on each RustFS data/log mount. Account for ACLs, NFS, Kubernetes, and rootless UID mappings. Image-build ownership changes do not migrate mounted data. See the Docker Quick Start in [README.md](README.md).
+- Local disk initialization now checks file creation, writing, and deletion in the data root and fixed internal metadata directories. Unwritable disks are rejected using existing startup/quorum rules, with filesystem errors and Unix runtime/owner IDs logged for permission failures, instead of admitting those disks and discovering the mismatch on a later write. Existing object trees are not scanned and volume ownership is never changed automatically.
+
 ### Security
 
 - **Header-signed SigV4 requests honour only signed headers** (GHSA-xm99-m3gq-83g8): a request authenticated with a SigV4 `Authorization` header that carries an `x-amz-*` request header not listed in its `SignedHeaders` is now rejected with `403 AccessDenied` ("There were headers present in the request which were not signed"), matching AWS S3 and the presigned rule from GHSA-g8w9-qw9q-fghr. Previously anyone holding one header-signed `PutObject` request could add an unsigned `x-amz-copy-source` and turn it into a `CopyObject` that ran with the signer's permissions, copying any object the signer could read into the target. An `Authorization` header whose algorithm token is not `AWS4-HMAC-SHA256` is now rejected instead of being verified as SigV4. The request-envelope headers `x-amz-content-sha256`, `x-amz-decoded-content-length`, `x-amz-trailer` and `x-amz-checksum-algorithm` (the same set the upstream `s3s` fix exempts) and `x-amz-cf-id` (CloudFront) remain tolerated unsigned; AWS SDKs and RustFS's own signers already sign every other `x-amz-*` header. SigV2, JWT and anonymous requests are unchanged.

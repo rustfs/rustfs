@@ -391,14 +391,22 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
     // The token was built by this server around the internal cursor, which is
     // the last raw key the walker scanned: on a delimiter page that folded into
     // fewer prefixes than max-keys it lies past the last visible entry.
-    if let Some(marker) = v2
+    if let Some(mut marker) = v2
         .next_continuation_token
         .as_deref()
         .and_then(|token| decode_list_objects_v2_continuation_token(token).ok())
     {
-        // Only cache-shaped literal keys carry this server-generated escape.
-        let marker = marker.strip_suffix("[rustfs_cache:v2,return:]").unwrap_or(&marker);
-        return Some(encode_list_output_value(marker.to_owned(), v2.encoding_type.as_ref()));
+        // V2 cursors protect literal cache-shaped keys with an outer tag. V1
+        // exposes the key itself, which is sent back as a literal StartAfter.
+        // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): Remove after supported upgrade sources stop issuing tagged V2 cursors.
+        let unescaped_len = marker
+            .strip_suffix("[rustfs_cache:v2,return:]")
+            .filter(|key| key.rfind("[rustfs_cache:").is_some_and(|start| key[start..].contains(']')))
+            .map(str::len);
+        if let Some(len) = unescaped_len {
+            marker.truncate(len);
+        }
+        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
     }
 
     let last_key = v2
@@ -584,15 +592,34 @@ mod tests {
     }
 
     #[test]
-    fn test_list_objects_next_marker_unwraps_only_the_literal_key_escape() {
+    fn test_list_objects_next_marker_returns_the_literal_key() {
+        for key in [
+            "key[rustfs_cache:v2,return:]",
+            "key[rustfs_cache:v1,id:x]suffix",
+            "key[rustfs_cache:v1,id:x][rustfs_cache:v2,return:]",
+        ] {
+            let cursor = format!("{key}[rustfs_cache:v2,return:]");
+            for encoding in [None, Some(EncodingType::from_static(EncodingType::URL))] {
+                let v2 = ListObjectsV2Output {
+                    is_truncated: Some(true),
+                    encoding_type: encoding.clone(),
+                    next_continuation_token: Some(encode_list_objects_v2_continuation_token(&cursor)),
+                    ..Default::default()
+                };
+                let expected = super::encode_list_output_value(key.to_owned(), encoding.as_ref());
+                assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(expected.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_preserves_an_unescaped_literal_return_tag() {
         let key = "key[rustfs_cache:v2,return:]";
-        let cursor = format!("{key}[rustfs_cache:v2,return:]");
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
-            next_continuation_token: Some(encode_list_objects_v2_continuation_token(&cursor)),
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token(key)),
             ..Default::default()
         };
-
         assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(key));
     }
 

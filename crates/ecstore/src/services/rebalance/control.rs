@@ -1,8 +1,8 @@
 use super::meta::{
-    RebalanceMetaMergeOutcome, clone_first_arc, clone_rebalance_pool_stats, defer_bucket_in_rebalance_queue,
-    ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error, is_rebalance_actively_running,
-    is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done, merge_rebalance_meta, percent_free_ratio,
-    rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
+    RebalanceMetaMergeOutcome, RebalanceMetadataLoadError, clone_first_arc, clone_rebalance_pool_stats,
+    defer_bucket_in_rebalance_queue, ensure_valid_rebalance_pool_index, invalid_rebalance_pool_index_error,
+    is_rebalance_actively_running, is_rebalance_conflicting_with_decommission, mark_rebalance_bucket_done, merge_rebalance_meta,
+    percent_free_ratio, rebalance_metadata_not_initialized_error, record_rebalance_cleanup_warning_in_meta,
     record_rebalance_stop_propagation_snapshot, resolve_next_rebalance_bucket, rollback_rebalance_start_meta_snapshot_for_id,
     should_accept_rebalance_stats_update, should_pool_participate, stop_rebalance_meta_snapshot_for_id,
     validate_init_rebalance_state,
@@ -853,6 +853,26 @@ impl ECStore {
         Ok(snapshot)
     }
 
+    /// Admin-only rebalance status snapshot. Diagnostic reads may use the last
+    /// published state when the persisted record is temporarily unavailable;
+    /// mutation paths continue to use the authoritative loaders above.
+    pub async fn rebalance_admin_diagnostic_snapshot(&self) -> (Option<RebalanceMeta>, &'static str) {
+        let fallback = self.rebalance_meta.read().await.clone();
+        match self.rebalance_status_meta_snapshot().await {
+            Ok(snapshot) => (snapshot, "fresh"),
+            Err(err) => {
+                let status = if error_chain_has_rebalance_metadata_load_error(&err) {
+                    "recovery_required"
+                } else if fallback.is_some() {
+                    "stale"
+                } else {
+                    "unknown"
+                };
+                (fallback, status)
+            }
+        }
+    }
+
     /// Persisted rebalance metadata, or `None` when no rebalance was recorded.
     async fn load_rebalance_status_meta(&self) -> Result<Option<RebalanceMeta>> {
         let pool = clone_first_arc(&self.pools, "refresh_rebalance_status_meta: no pools available")?;
@@ -860,7 +880,7 @@ impl ECStore {
         match persisted.load(pool).await {
             Ok(()) => Ok(Some(persisted)),
             Err(Error::ConfigNotFound) => Ok(None),
-            Err(err) => Err(Error::other(format!("rebalance metadata refresh failed during pool status: {err}"))),
+            Err(err) => Err(Error::other_with_context("rebalance metadata refresh failed during pool status", err)),
         }
     }
 
@@ -1445,6 +1465,21 @@ impl ECStore {
 
         Ok(())
     }
+}
+
+fn error_chain_has_rebalance_metadata_load_error(err: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(err);
+    while let Some(error) = current {
+        if error.downcast_ref::<RebalanceMetadataLoadError>().is_some() {
+            return true;
+        }
+        current = if let Some(io) = error.downcast_ref::<std::io::Error>() {
+            io.get_ref().map(|source| source as &(dyn std::error::Error + 'static))
+        } else {
+            error.source()
+        };
+    }
+    false
 }
 
 #[cfg(test)]

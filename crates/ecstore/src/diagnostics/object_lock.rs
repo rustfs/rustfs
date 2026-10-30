@@ -19,6 +19,7 @@ use tracing::Span;
 use uuid::Uuid;
 
 const EVENT_OBJECT_NAMESPACE_LOCK: &str = "object_namespace_lock";
+const EVENT_OBJECT_NAMESPACE_LOCK_PEER: &str = "object_namespace_lock_peer";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_OBJECT_LOCK: &str = "object_lock";
 
@@ -56,6 +57,7 @@ struct AttemptContext {
     requested_version_id: Option<String>,
     namespace: String,
     owner: String,
+    lock_id: Option<String>,
     mode: &'static str,
     timeout: Duration,
     started_at: Instant,
@@ -85,6 +87,7 @@ impl ObjectLockAttempt {
             requested_version_id: requested_version_id.map(str::to_owned),
             namespace: lock.namespace().to_owned(),
             owner: lock.owner().to_owned(),
+            lock_id: None,
             mode,
             timeout,
             started_at: Instant::now(),
@@ -105,9 +108,29 @@ impl ObjectLockAttempt {
                 context.finished = true;
                 context.trace("disabled");
             }
-            Ok(_) => {
+            Ok(guard) => {
+                context.lock_id = guard.lock_id().map(ToString::to_string);
                 context.acquired_at = Some(Instant::now());
                 context.trace("acquired");
+                if let NamespaceLockGuard::Standard(guard) = guard {
+                    for (peer_index, peer_lock_id) in guard.granted_lock_ids().enumerate() {
+                        context.parent.in_scope(|| {
+                            tracing::trace!(
+                                target: "rustfs_ecstore::object_lock_diag",
+                                parent: &context.parent,
+                                event = EVENT_OBJECT_NAMESPACE_LOCK_PEER,
+                                component = LOG_COMPONENT_ECSTORE,
+                                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                                state = "granted",
+                                lock_attempt_id = %context.id,
+                                lock_id = context.lock_id.as_deref(),
+                                peer_lock_id = %peer_lock_id,
+                                peer_index,
+                                "Object namespace peer owner granted"
+                            );
+                        });
+                    }
+                }
             }
             Err(error) => {
                 context.finished = true;
@@ -171,6 +194,7 @@ impl AttemptContext {
                 mode = self.mode,
                 owner = %self.owner,
                 lock_attempt_id = %self.id,
+                lock_id = self.lock_id.as_deref(),
                 acquire_ms = duration_ms(acquired_at.duration_since(self.started_at)),
                 hold_ms = duration_ms(now.duration_since(acquired_at)),
                 timeout_ms = duration_ms(self.timeout),
@@ -235,13 +259,236 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn rows(&self) -> Vec<serde_json::Value> {
+            self.all_rows()
+                .into_iter()
+                .filter(|row| row["fields"]["event"] == EVENT_OBJECT_NAMESPACE_LOCK)
+                .collect()
+        }
+
+        fn all_rows(&self) -> Vec<serde_json::Value> {
             let bytes = self.0.lock().expect("lock diagnostic capture mutex");
             let text = std::str::from_utf8(&bytes).expect("UTF-8 diagnostic events");
             text.lines()
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("JSON diagnostic event"))
-                .filter(|row| row["fields"]["event"] == EVENT_OBJECT_NAMESPACE_LOCK)
                 .collect()
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn object_lock_diagnostics_join_guard_identity_to_physical_release() {
+        use rustfs_lock::{
+            DisabledLockManager, FastObjectLockManager, GlobalLockManager, LocalClient, LockClient, LockRequest, LockType,
+            NamespaceLock, ObjectKey,
+        };
+
+        temp_env::with_vars([(rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true"))], || {
+            let capture = CapturedLockEvents::default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("diagnostic release runtime");
+            tracing::subscriber::with_default(capture.subscriber(), || {
+                runtime.block_on(async {
+                    let clients = (0..4)
+                        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn LockClient>)
+                        .collect::<Vec<_>>();
+                    let lock = NamespaceLockWrapper::new(
+                        NamespaceLock::with_clients_and_quorum("diagnostics".to_owned(), clients.clone(), 4),
+                        ObjectKey::new("bucket", "object"),
+                        "coordinator".to_owned(),
+                    );
+                    let request = tracing::info_span!("request", request_id = "original-multipart-request");
+                    let mut attempt = request.in_scope(|| {
+                        ObjectLockAttempt::start(
+                            "abort_multipart_upload",
+                            "bucket",
+                            "object",
+                            None,
+                            &lock,
+                            "write",
+                            Duration::from_secs(5),
+                        )
+                    });
+                    let result = lock.get_write_lock(Duration::from_secs(5)).await;
+                    attempt.observe(&result);
+                    let guard = result.expect("four real namespace owners");
+                    let id = guard.lock_id().expect("distributed guard identity").clone();
+                    let peer_ids = match &guard {
+                        NamespaceLockGuard::Standard(guard) => {
+                            assert_eq!(guard.granted_lock_ids().count(), 4);
+                            guard.granted_lock_ids().cloned().collect::<std::collections::HashSet<_>>()
+                        }
+                        NamespaceLockGuard::Fast(_) => panic!("real distributed namespace required"),
+                    };
+                    let rows = capture.rows();
+                    assert_eq!(rows.last().expect("acquired event")["fields"]["lock_id"], id.to_string());
+                    let rows = capture.all_rows();
+                    let mappings = rows
+                        .iter()
+                        .filter(|row| row["fields"]["event"] == EVENT_OBJECT_NAMESPACE_LOCK_PEER)
+                        .collect::<Vec<_>>();
+                    assert_eq!(mappings.len(), 4, "every granted peer must map to its logical guard");
+                    assert!(mappings.iter().all(|row| {
+                        row["fields"]["lock_id"] == id.to_string()
+                            && peer_ids
+                                .iter()
+                                .any(|peer_id| row["fields"]["peer_lock_id"] == peer_id.to_string())
+                    }));
+                    for client in &clients {
+                        let mut owned = 0;
+                        for peer_id in &peer_ids {
+                            owned += usize::from(
+                                client
+                                    .check_status(peer_id)
+                                    .await
+                                    .expect("actual peer owner status")
+                                    .is_some(),
+                            );
+                        }
+                        assert_eq!(owned, 1, "each client must hold exactly one actual granted identity");
+                    }
+                    drop((guard, attempt));
+                    assert!(
+                        capture.all_rows().iter().all(|row| row["fields"]["state"] != "released"),
+                        "enqueue is not release acknowledgement"
+                    );
+                    tokio::time::timeout(Duration::from_secs(5), async {
+                        while capture
+                            .all_rows()
+                            .iter()
+                            .filter(|row| {
+                                row["fields"]["event"] == "namespace_lock_release" && row["fields"]["state"] == "released"
+                            })
+                            .count()
+                            < 4
+                        {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .expect("all physical release callbacks finish");
+                    for client in &clients {
+                        for peer_id in &peer_ids {
+                            assert!(
+                                client
+                                    .check_status(peer_id)
+                                    .await
+                                    .expect("released peer owner status")
+                                    .is_none()
+                            );
+                            assert!(!client.release(peer_id).await.expect("duplicate release is absent"));
+                        }
+                    }
+                    let disabled = LocalClient::with_manager(Arc::new(GlobalLockManager::Disabled(DisabledLockManager::new())));
+                    let disabled_request =
+                        LockRequest::new(ObjectKey::new("bucket", "disabled"), LockType::Exclusive, "disabled-owner".to_owned());
+                    assert!(
+                        disabled
+                            .acquire_lock(&disabled_request)
+                            .await
+                            .expect("disabled acquire bypass")
+                            .success
+                    );
+                    assert!(
+                        disabled
+                            .release(&disabled_request.lock_id)
+                            .await
+                            .expect("disabled release bypass")
+                    );
+                    let rows = capture.all_rows();
+                    let releases = rows
+                        .iter()
+                        .filter(|row| row["fields"]["event"] == "namespace_lock_release" && row["fields"]["state"] == "released")
+                        .collect::<Vec<_>>();
+                    assert_eq!(
+                        releases.len(),
+                        4,
+                        "duplicates and disabled guards cannot acknowledge another physical release"
+                    );
+                    let physical_mappings = rows
+                        .iter()
+                        .filter(|row| row["fields"]["event"] == "namespace_lock_release" && row["fields"]["state"] == "mapped")
+                        .collect::<Vec<_>>();
+                    assert_eq!(physical_mappings.len(), 4);
+                    assert!(releases.iter().all(|row| physical_mappings.iter().any(|mapped| {
+                        mapped["fields"]["physical_guard_id"] == row["fields"]["physical_guard_id"]
+                            && mapped["fields"]["process_id"] == row["fields"]["process_id"]
+                            && peer_ids
+                                .iter()
+                                .any(|peer_id| mapped["fields"]["lock_id"] == peer_id.to_string())
+                    })));
+                    let dropped = capture.rows().pop().expect("guard drop event");
+                    assert_eq!(dropped["fields"]["lock_id"], id.to_string());
+                    assert!(
+                        dropped["spans"]
+                            .as_array()
+                            .expect("retained request span")
+                            .iter()
+                            .any(|span| span["request_id"] == "original-multipart-request")
+                    );
+                    let manager = Arc::new(FastObjectLockManager::new());
+                    let stale_client = LocalClient::with_manager(Arc::new(GlobalLockManager::Enabled(manager.clone())));
+                    let stale_request = LockRequest::new(
+                        ObjectKey::new("bucket", "externally-released"),
+                        LockType::Exclusive,
+                        "stale-owner".to_owned(),
+                    );
+                    assert!(
+                        stale_client
+                            .acquire_lock(&stale_request)
+                            .await
+                            .expect("real stale owner")
+                            .success
+                    );
+                    assert_eq!(manager.force_unlock(&stale_request.resource), 1);
+                    let mut successor = manager
+                        .acquire_write_lock(stale_request.resource.clone(), "successor-owner")
+                        .await
+                        .expect("real successor guard");
+                    assert!(
+                        stale_client
+                            .release(&stale_request.lock_id)
+                            .await
+                            .expect("retire stale client record")
+                    );
+                    assert_eq!(
+                        manager
+                            .get_lock_info(&stale_request.resource)
+                            .expect("successor remains locked")
+                            .owner
+                            .as_ref(),
+                        "successor-owner"
+                    );
+                    assert_eq!(
+                        capture
+                            .all_rows()
+                            .iter()
+                            .filter(
+                                |row| row["fields"]["event"] == "namespace_lock_release" && row["fields"]["state"] == "released"
+                            )
+                            .count(),
+                        4,
+                        "a stale guard's failed physical release must not produce an ACK"
+                    );
+                    let successor_id = successor.guard_id();
+                    assert!(successor.release(), "the actual successor release succeeds");
+                    assert!(!successor.release(), "a duplicate explicit release cannot complete again");
+                    drop(successor);
+                    assert_eq!(
+                        capture
+                            .all_rows()
+                            .iter()
+                            .filter(|row| row["fields"]["event"] == "namespace_lock_release"
+                                && row["fields"]["state"] == "released"
+                                && row["fields"]["physical_guard_id"] == successor_id)
+                            .count(),
+                        1,
+                        "explicit release followed by Drop records one physical completion"
+                    );
+                });
+            });
+        });
     }
 
     fn namespace() -> NamespaceLockWrapper {

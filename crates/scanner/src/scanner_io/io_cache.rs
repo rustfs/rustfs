@@ -21,15 +21,41 @@ pub(super) async fn collect_completed_bucket_results(
 ) -> (DataUsageCache, HashSet<String>) {
     let mut cancelled = false;
     let mut completed = HashSet::new();
+    let mut received_roots = 0usize;
+    let mut duplicate_applied_roots = 0usize;
+    let mut rejected_roots = 0usize;
     loop {
         tokio::select! {
             _ = ctx.cancelled(), if !cancelled => cancelled = true,
             result = results.recv() => {
                 let Some(result) = result else {
+                    debug!(
+                        target: "rustfs::scanner::io",
+                        event = EVENT_SCANNER_SET_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_IO,
+                        state = "bucket_root_collector_drained",
+                        collector_cache_pool = cache.info.source.map(|source| source.pool_index),
+                        collector_cache_set = cache.info.source.map(|source| source.set_index),
+                        collector_cache_cycle = cache.info.next_cycle,
+                        collector_cache_leader_epoch = cache.info.leader_epoch,
+                        received_roots,
+                        distinct_applied_roots = completed.len(),
+                        duplicate_applied_roots,
+                        rejected_roots,
+                        cancellation_observed = cancelled,
+                        cancelled_at_drain = ctx.is_cancelled(),
+                        "Scanner bucket root collector drained"
+                    );
                     return (cache, completed);
                 };
+                received_roots = received_roots.saturating_add(1);
                 if let Some(bucket) = apply_bucket_result_to_cache(&mut cache, result, SystemTime::now()) {
-                    completed.insert(bucket);
+                    if !completed.insert(bucket) {
+                        duplicate_applied_roots = duplicate_applied_roots.saturating_add(1);
+                    }
+                } else {
+                    rejected_roots = rejected_roots.saturating_add(1);
                 }
             }
         }
@@ -1072,7 +1098,7 @@ impl ScannerIOCache for SetDisks {
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
-                    let cache_guard = match acquire_scanner_cache_locks(store_clone_clone.as_ref(), &cache_name, source).await {
+                    let mut cache_guard = match acquire_scanner_cache_locks(store_clone_clone.as_ref(), &cache_name, source).await {
                         Ok(guard) => guard,
                         Err(e) => {
                             if e.is_contention() {
@@ -1302,6 +1328,7 @@ impl ScannerIOCache for SetDisks {
                     );
 
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
+                    let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
 
                     let scan_ctx = ctx_clone.child_token();
                     #[cfg(feature = "e2e-test-hooks")]
@@ -1321,7 +1348,7 @@ impl ScannerIOCache for SetDisks {
                             "bucket_incarnation": worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)),
                         })).await;
                     }
-                    let scan = disk.clone().nsscanner_disk(
+                    let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
@@ -1332,7 +1359,7 @@ impl ScannerIOCache for SetDisks {
                             prefix_scan_scope,
                             checkpoint_tx: Some(checkpoint_tx),
                         },
-                    );
+                    ));
                     tokio::pin!(scan);
                     let mut lock_watch = tokio::time::interval(SCANNER_CACHE_LOCK_POLL_INTERVAL);
                     lock_watch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -1340,6 +1367,24 @@ impl ScannerIOCache for SetDisks {
                     let scan_result = loop {
                         tokio::select! {
                             result = &mut scan => break result,
+                            request = async {
+                                match node_rx.as_mut() {
+                                    Some(receiver) => receiver.recv().await,
+                                    None => std::future::pending().await,
+                                }
+                            } => {
+                                let Some(request) = request else {
+                                    node_rx = None;
+                                    continue;
+                                };
+                                if let Err(error) = cache_guard.resume_node_operation(
+                                    store_clone_clone.clone(), &cache_name, source, &revisions, request,
+                                ).await {
+                                    scan_ctx.cancel();
+                                    await_scanner_disk_shutdown(scan.as_mut()).await;
+                                    break Err(error);
+                                }
+                            }
                             _ = lock_watch.tick() => {
                                 if cache_guard.is_lock_lost() {
                                     scan_ctx.cancel();
@@ -1848,6 +1893,7 @@ impl ScannerIOCache for SetDisks {
                 pool = source.pool_index,
                 set = source.set_index,
                 cycle = want_cycle,
+                leader_epoch,
                 completed_buckets = completed_count,
                 carried_buckets = carried_buckets.len(),
                 total_buckets = buckets.len(),

@@ -27,8 +27,9 @@ use hyper_util::{
 };
 use prost::Message as _;
 use rustfs_protos::proto_gen::node_service::{
-    BatchGenerallyLockRequest, DeleteRequest, GenerallyLockRequest, ReadVersionRequest, RecoverMultipartSourceRequest,
-    RenameDataResponse, ScannerScopedDirtyUsageAckRequest,
+    BatchGenerallyLockRequest, DeleteRequest, GenerallyLockRequest, PreparePartTransactionResponse, ReadVersionRequest,
+    RecoverMultipartSourceRequest, RenameDataResponse, ScannerScopedDirtyUsageAckRequest, SettlePartTransactionRequest,
+    SettlePartTransactionResponse,
 };
 use std::{
     collections::HashSet,
@@ -59,6 +60,35 @@ enum Disposition {
     Discard,
 }
 
+#[derive(Clone, Copy)]
+enum MutationReply {
+    None,
+    Rename,
+    PreparePart,
+    SettlePart,
+}
+
+impl MutationReply {
+    fn outcome(self, bytes: &[u8]) -> io::Result<Option<(bool, bool)>> {
+        let result = match self {
+            Self::None => return Ok(None),
+            Self::Rename => {
+                let reply = RenameDataResponse::decode(unary_payload(bytes)?).map_err(io::Error::other)?;
+                (reply.success, reply.error.is_some())
+            }
+            Self::PreparePart => {
+                let reply = PreparePartTransactionResponse::decode(unary_payload(bytes)?).map_err(io::Error::other)?;
+                (reply.success, reply.error.is_some())
+            }
+            Self::SettlePart => {
+                let reply = SettlePartTransactionResponse::decode(unary_payload(bytes)?).map_err(io::Error::other)?;
+                (reply.success, reply.error.is_some())
+            }
+        };
+        Ok(Some(result))
+    }
+}
+
 struct PauseState {
     methods: Vec<&'static str>,
     scope: Option<Vec<u8>>,
@@ -67,6 +97,9 @@ struct PauseState {
     limit: usize,
     retain_after_disconnect: bool,
     refused_mutations: AtomicUsize,
+    successful_mutation_replies: AtomicUsize,
+    settle_commits: AtomicUsize,
+    settle_rollbacks: AtomicUsize,
     responses: AtomicUsize,
     matched: AtomicUsize,
     blocked: AtomicUsize,
@@ -124,6 +157,17 @@ impl RpcPause {
 
     pub(crate) fn refused_mutations(&self) -> usize {
         self.state.refused_mutations.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn successful_mutation_replies(&self) -> usize {
+        self.state.successful_mutation_replies.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn retained_settle_actions(&self) -> (usize, usize) {
+        (
+            self.state.settle_commits.load(Ordering::SeqCst),
+            self.state.settle_rollbacks.load(Ordering::SeqCst),
+        )
     }
 
     pub(crate) fn unsupported_source_inspection_routes(&self) -> HashSet<String> {
@@ -409,6 +453,9 @@ impl RpcFaultProxy {
             limit,
             retain_after_disconnect,
             refused_mutations: AtomicUsize::new(0),
+            successful_mutation_replies: AtomicUsize::new(0),
+            settle_commits: AtomicUsize::new(0),
+            settle_rollbacks: AtomicUsize::new(0),
             responses: AtomicUsize::new(0),
             matched: AtomicUsize::new(0),
             blocked: AtomicUsize::new(0),
@@ -550,6 +597,7 @@ async fn forward_request(
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
             let mut route = None;
             let mut lock_owners = Vec::new();
+            let mut settle_action = None;
             let matches = if let Some(scope) = pause.scope.as_deref() {
                 // Inspect bounded control routing while preserving the exact
                 // signed bytes and trailers forwarded to the backend.
@@ -563,12 +611,19 @@ async fn forward_request(
                     inspection = Some((pause.clone(), disk));
                 }
                 let mut matches = scope_matches(method, &bytes, scope)?;
+                if matches && method == "SettlePartTransaction" {
+                    settle_action = Some(
+                        SettlePartTransactionRequest::decode(unary_payload(&bytes)?)
+                            .map_err(io::Error::other)?
+                            .rollback,
+                    );
+                }
                 if matches && (pause.record_lock_owners || pause.lock_owner.is_some()) {
                     lock_owners = scoped_lock_owners(method, &bytes, scope)?;
                     if let Some(owner) = &pause.lock_owner {
                         matches = lock_owners.iter().any(|candidate| candidate == owner);
                         if !matches && pause.record_lock_owners {
-                            observed = Some((pause.clone(), None, std::mem::take(&mut lock_owners), false));
+                            observed = Some((pause.clone(), None, std::mem::take(&mut lock_owners), MutationReply::None));
                         }
                     }
                 }
@@ -600,6 +655,14 @@ async fn forward_request(
                 true
             };
             if matches && pause.matched.fetch_add(1, Ordering::SeqCst) < pause.limit {
+                if let Some(rollback) = settle_action {
+                    let counter = if rollback {
+                        &pause.settle_rollbacks
+                    } else {
+                        &pause.settle_commits
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
                 let mut released = pause.release.subscribe();
                 pause.blocked.fetch_add(1, Ordering::SeqCst);
                 pause.reached.notify_one();
@@ -619,10 +682,14 @@ async fn forward_request(
                     pause,
                     route,
                     lock_owners,
-                    matches!(
-                        method,
-                        "RenameData" | "RenameMultipartData" | "RenameDataAtIncarnation" | "RenameDataWithQuotaFence"
-                    ),
+                    match method {
+                        "RenameData" | "RenameMultipartData" | "RenameDataAtIncarnation" | "RenameDataWithQuotaFence" => {
+                            MutationReply::Rename
+                        }
+                        "PreparePartTransaction" => MutationReply::PreparePart,
+                        "SettlePartTransaction" => MutationReply::SettlePart,
+                        _ => MutationReply::None,
+                    },
                 ));
             }
         }
@@ -638,7 +705,7 @@ async fn forward_request(
             .expect("inspection response routes")
             .insert(disk);
     }
-    if let Some((pause, route, lock_owners, rename)) = observed {
+    if let Some((pause, route, lock_owners, mutation_reply)) = observed {
         pause.responses.fetch_add(1, Ordering::SeqCst);
         if response.status().is_success() && response.headers().get("grpc-status").is_none_or(|status| status == "0") {
             pause.forwarded.fetch_add(1, Ordering::SeqCst);
@@ -660,10 +727,14 @@ async fn forward_request(
                 .headers
                 .get("grpc-status")
                 .or_else(|| trailers.as_ref()?.get("grpc-status"));
-            if rename && parts.status.is_success() && status.is_none_or(|status| status == "0") {
-                let result = RenameDataResponse::decode(unary_payload(&bytes)?).map_err(io::Error::other)?;
-                if !result.success && result.error.is_some() {
+            if parts.status.is_success()
+                && status.is_some_and(|status| status == "0")
+                && let Some((success, has_error)) = mutation_reply.outcome(&bytes)?
+            {
+                if !success && has_error {
                     pause.refused_mutations.fetch_add(1, Ordering::SeqCst);
+                } else if success && !has_error {
+                    pause.successful_mutation_replies.fetch_add(1, Ordering::SeqCst);
                 }
             }
             let body = Full::new(bytes)
@@ -737,6 +808,10 @@ mod tests {
     }
 
     async fn backend_with_status(status: Option<&'static str>) -> io::Result<Backend> {
+        backend_with_reply(status, None).await
+    }
+
+    async fn backend_with_reply(status: Option<&'static str>, reply: Option<Bytes>) -> io::Result<Backend> {
         let listener = TcpListener::bind("127.0.0.1:0").await?;
         let address = listener.local_addr()?;
         let received = Arc::new(AtomicUsize::new(0));
@@ -751,10 +826,12 @@ mod tests {
                         let Ok((socket, _)) = accepted else { break };
                         let received = received_task.clone();
                         let backend_auth = backend_auth.clone();
+                        let reply = reply.clone();
                         children.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let received = received.clone();
                                 let backend_auth = backend_auth.clone();
+                                let reply = reply.clone();
                                 async move {
                                 received.fetch_add(1, Ordering::SeqCst);
                                 let authority = request.headers().get(http::header::HOST).cloned().or_else(|| {
@@ -767,6 +844,7 @@ mod tests {
                                         nonce.to_str().expect("test nonce").to_string(), signature.to_str().expect("test signature").to_string()));
                                 }
                                 let body = request.into_body().collect().await?.to_bytes();
+                                let body = reply.unwrap_or(body);
                                 let mut trailers = http::HeaderMap::new();
                                 trailers.insert("grpc-status", http::HeaderValue::from_static(status.unwrap_or("0")));
                                 trailers.insert("x-proof", http::HeaderValue::from_static("unchanged-proof"));
@@ -1860,6 +1938,93 @@ mod tests {
         .await
         .expect("scoped discard deadline");
         assert_late_packet_ownership().await;
+        assert_late_part_reply_refusal().await;
+    }
+
+    async fn assert_late_part_reply_refusal() {
+        use rustfs_protos::proto_gen::node_service::{Error, PreparePartTransactionRequest};
+        tokio::time::timeout(Duration::from_secs(10), async {
+            // method, success, error, gRPC status, rollback, expected successes/refusals
+            for (method, success, has_error, status, rollback, expected) in [
+                ("PreparePartTransaction", false, true, None, false, (0, 1)),
+                ("PreparePartTransaction", true, false, None, false, (1, 0)),
+                ("PreparePartTransaction", false, false, None, false, (0, 0)),
+                ("SettlePartTransaction", true, false, None, false, (1, 0)),
+                ("SettlePartTransaction", false, true, None, true, (0, 1)),
+                ("SettlePartTransaction", true, true, None, false, (0, 0)),
+                ("SettlePartTransaction", false, true, Some("16"), false, (0, 0)),
+                ("PreparePartTransaction", false, true, Some("16"), false, (0, 0)),
+                ("RenameMultipartData", false, true, None, false, (0, 1)),
+            ] {
+                let error = has_error.then(|| Error {
+                    code: 1,
+                    error_info: "retired source".to_owned(),
+                });
+                let reply = match method {
+                    "PreparePartTransaction" => unary_frame(&PreparePartTransactionResponse { success, error }),
+                    "SettlePartTransaction" => unary_frame(&SettlePartTransactionResponse { success, error }),
+                    _ => unary_frame(&RenameDataResponse {
+                        success,
+                        error,
+                        ..Default::default()
+                    }),
+                };
+                // An unknown field must survive typed inspection byte-for-byte.
+                let mut framed = reply.to_vec();
+                framed.extend_from_slice(&[0xfa, 0x03, 0x03, b'x', b'y', b'z']);
+                let payload_len = u32::try_from(framed.len() - 5).expect("small reply");
+                framed[1..5].copy_from_slice(&payload_len.to_be_bytes());
+                let reply = Bytes::from(framed);
+                let backend = backend_with_reply(status, Some(reply.clone()))
+                    .await
+                    .expect("typed reply backend");
+                let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                    .await
+                    .expect("proxy");
+                let pause = proxy.pause_late(&[method], 1, "late-upload").expect("part gate");
+                let request = match method {
+                    "PreparePartTransaction" => unary_frame(&PreparePartTransactionRequest {
+                        disk: "disk".to_owned(),
+                        dst_path: "late-upload/part.1".to_owned(),
+                        ..Default::default()
+                    }),
+                    "SettlePartTransaction" => unary_frame(&SettlePartTransactionRequest {
+                        disk: "disk".to_owned(),
+                        path: "late-upload/part.1".to_owned(),
+                        rollback,
+                        ..Default::default()
+                    }),
+                    _ => Bytes::from_static(b"late-upload"),
+                };
+                let address = proxy.local_addr();
+                let caller = tokio::spawn(async move {
+                    let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+                    let response = call_body(&client, address, method, request).await.expect("retained reply");
+                    response.into_body().collect().await.expect("typed response frames")
+                });
+                pause.wait_for_hits(1).await.expect("actual retained request");
+                pause.release();
+                let response = caller.await.expect("caller task");
+                let trailers = response.trailers().expect("reply trailers");
+                assert_eq!(trailers["x-proof"], "unchanged-proof");
+                assert_eq!(trailers["grpc-status"], status.unwrap_or("0"));
+                assert_eq!(response.to_bytes(), reply);
+                assert_eq!(pause.responses(), 1);
+                assert_eq!(
+                    (pause.successful_mutation_replies(), pause.refused_mutations()),
+                    expected,
+                    "typed {method} outcome"
+                );
+                let actions = if method == "SettlePartTransaction" {
+                    if rollback { (0, 1) } else { (1, 0) }
+                } else {
+                    (0, 0)
+                };
+                assert_eq!(pause.retained_settle_actions(), actions);
+            }
+        })
+        .await
+        .expect("part reply deadline");
     }
     async fn assert_late_packet_ownership() {
         tokio::time::timeout(Duration::from_secs(10), async {

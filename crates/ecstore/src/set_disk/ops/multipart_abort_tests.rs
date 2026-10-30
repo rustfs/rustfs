@@ -364,6 +364,202 @@ mod native_abort_closure_tests {
     }
 
     #[tokio::test]
+    async fn stale_cleanup_reclaims_certified_one_and_two_disk_residuals_after_reopen() {
+        for survivors in [1, 2] {
+            let (dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "native-stale-certified";
+            let object = format!("survivors-{survivors}");
+            make_bucket_on_all(&disks, bucket).await;
+            let opts = ObjectOptions {
+                max_parity: true,
+                ..Default::default()
+            };
+            let (upload, _) = stage_upload_with_create_opts(&set, bucket, &object, &[0x61; 4096], &opts).await;
+            let path = SetDisks::get_upload_id_dir(bucket, &object, &upload);
+            let before = originals(&disks, &path).await;
+            {
+                let physical = disks.iter().cloned().map(Some).collect::<Vec<_>>();
+                let SourceCleanupAuthority::Native { certificate, snapshots } =
+                    prepare_source_cleanup(&physical, bucket, &object, &path, true, &set.multipart_proof_verification_context())
+                        .await
+                        .expect("close every original and persist the certificate")
+                else {
+                    panic!("native upload must retain a native certificate")
+                };
+                for slot in 0..(4 - survivors) {
+                    let response = operation(
+                        &disks[slot],
+                        &path,
+                        MultipartSourceOperation::DeleteAborted {
+                            expected: snapshots[slot].clone().expect("actual certified source"),
+                            certificate: certificate.as_ref().clone(),
+                        },
+                    )
+                    .await;
+                    assert!(matches!(response, MultipartSourceResponse::AbortDeleted(_)));
+                }
+            }
+            let (reopened, cold) = cold_reopen(disks, set).await;
+            for slot in (4 - survivors)..4 {
+                assert_eq!(
+                    retained_native_multipart_original(&reopened[slot], slot, bucket, &object, &path).await,
+                    before[slot]
+                );
+            }
+            cold.lock_stale_multipart_cleanup(&path)
+                .await
+                .expect("complete certificate authorizes the background retry")
+                .delete(&cold)
+                .await
+                .expect("background retry removes certified survivors");
+            for dir in &dirs {
+                assert!(!dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists());
+            }
+            assert!(
+                cold.lock_stale_multipart_cleanup(&path).await.is_err(),
+                "a repeated pass must not recreate the retired upload"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn stale_certified_residual_survives_lock_loss_then_converges() {
+        let target = Arc::new(std::sync::RwLock::new(None));
+        let refresh_calls = Arc::new(AtomicUsize::new(0));
+        let lockers: Vec<Arc<dyn LockClient>> = (0..4)
+            .map(|_| {
+                Arc::new(SelectiveLockLossClient::new(Arc::clone(&target), Arc::clone(&refresh_calls))) as Arc<dyn LockClient>
+            })
+            .collect();
+        let (dirs, disks, set) = hermetic_set_disks_with_lockers(4, 0, 2, lockers).await;
+        let bucket = "stale-certified-lock-loss";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let opts = ObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        };
+        let (upload, _) = stage_upload_with_create_opts(&set, bucket, object, &[0x63; 4096], &opts).await;
+        let path = SetDisks::get_upload_id_dir(bucket, object, &upload);
+        let (fi, _) = set
+            .check_upload_id_exists(bucket, object, &upload, false)
+            .await
+            .expect("source metadata before closure");
+        let part_path = format!("{path}/{}/part.1", fi.data_dir.expect("source data directory"));
+        let original = originals(&disks, &path).await;
+        let surviving_part = disks[3]
+            .read_all(RUSTFS_META_MULTIPART_BUCKET, &part_path)
+            .await
+            .expect("snapshot surviving shard");
+        {
+            let physical = disks.iter().cloned().map(Some).collect::<Vec<_>>();
+            let SourceCleanupAuthority::Native { certificate, snapshots } =
+                prepare_source_cleanup(&physical, bucket, object, &path, true, &set.multipart_proof_verification_context())
+                    .await
+                    .expect("all original participants close and persist the certificate")
+            else {
+                panic!("native certificate required")
+            };
+            let authority = set.multipart_proof_verification_context();
+            let mut ids = certificate.disk_ids.iter().copied().map(Some).collect::<Vec<_>>();
+            ids[0] = None;
+            assert_eq!(
+                crate::set_disk::core::multipart_source::abort_certificate_cohort(&certificate, &ids, &authority),
+                Err(DiskError::ErasureWriteQuorum),
+                "an unavailable participant is a retryable proof gap"
+            );
+            ids[1] = Some(Uuid::new_v4());
+            assert_eq!(
+                crate::set_disk::core::multipart_source::abort_certificate_cohort(&certificate, &ids, &authority),
+                Err(DiskError::FileCorrupt),
+                "a missing participant cannot hide a known identity conflict"
+            );
+            ids[0] = Some(Uuid::new_v4());
+            ids[1] = Some(certificate.disk_ids[1]);
+            assert_eq!(
+                crate::set_disk::core::multipart_source::abort_certificate_cohort(&certificate, &ids, &authority),
+                Err(DiskError::FileCorrupt),
+                "a known different identity remains a certificate conflict"
+            );
+            for slot in 0..3 {
+                let response = operation(
+                    &disks[slot],
+                    &path,
+                    MultipartSourceOperation::DeleteAborted {
+                        expected: snapshots[slot].clone().expect("certified source"),
+                        certificate: certificate.as_ref().clone(),
+                    },
+                )
+                .await;
+                assert!(matches!(response, MultipartSourceResponse::AbortDeleted(_)));
+            }
+        }
+        assert!(dirs[3].path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists());
+        let offline = set.disks.write().await[0]
+            .take()
+            .expect("take an original participant offline");
+        let rejected = set.lock_stale_multipart_cleanup(&path).await;
+        set.disks.write().await[0] = Some(offline);
+        let err = rejected
+            .err()
+            .expect("a certificate must not substitute for an unavailable participant");
+        assert!(
+            matches!(err, StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(..)),
+            "the missing participant must be reported as a quorum failure: {err:?}"
+        );
+        assert_eq!(retained_native_multipart_original(&disks[3], 3, bucket, object, &path).await, original[3]);
+        assert_eq!(
+            disks[3]
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &part_path)
+                .await
+                .expect("surviving shard while a participant was offline"),
+            surviving_part
+        );
+        tokio::time::pause();
+        *target.write().expect("lock-loss target") =
+            Some(rustfs_lock::ObjectKey::new(RUSTFS_META_MULTIPART_BUCKET, path.clone()));
+        let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
+        let guard = set
+            .lock_stale_multipart_cleanup(&path)
+            .await
+            .expect("certificate admits the one-disk residual");
+        tokio::time::advance(Duration::from_secs(11)).await;
+        for _ in 0..20 {
+            if guard.is_lock_lost() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(refresh_calls.load(Ordering::Acquire) > 0, "the real lock refresh must fail");
+        assert!(guard.is_lock_lost(), "the cleanup guard must observe lock loss");
+        // Real disk I/O must not run under Tokio's auto-advancing paused clock:
+        // a pending blocking operation could otherwise exhaust its timeout.
+        tokio::time::resume();
+        let err = guard.delete(&set).await.expect_err("lock loss must fence physical deletion");
+        assert!(matches!(err, StorageError::NamespaceLockQuorumUnavailable { .. }), "{err:?}");
+        assert_eq!(retained_native_multipart_original(&disks[3], 3, bucket, object, &path).await, original[3]);
+        assert_eq!(
+            disks[3]
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &part_path)
+                .await
+                .expect("surviving shard after loss"),
+            surviving_part
+        );
+
+        *target.write().expect("restore lock service") = None;
+        set.lock_stale_multipart_cleanup(&path)
+            .await
+            .expect("reacquire the cleanup lock")
+            .delete(&set)
+            .await
+            .expect("the certified residual converges after lock recovery");
+        for dir in &dirs {
+            assert!(!dir.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&path).exists());
+        }
+    }
+
+    #[tokio::test]
     async fn native_abort_partial_delete_surviving_producer_confirms_current_and_historical_exact_target() {
         use crate::set_disk::core::io_primitives::{rename_fault_injection, rollback_fault_injection};
         for historical in [false, true] {
@@ -507,7 +703,7 @@ mod native_abort_closure_tests {
         let path = SetDisks::get_upload_id_dir(bucket, object, &upload);
         pin_historical_unmarked_upload(&disks, bucket, &path).await;
         let before = originals(&disks, &path).await;
-        set.check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+        set.check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await
             .expect("readonly legacy cleanup identity lookup");
         assert_eq!(
@@ -786,7 +982,7 @@ mod native_abort_closure_tests {
             "known orphan native evidence remains unknown: {inspected:?}"
         );
         let readonly = set
-            .check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await;
         assert!(
             matches!(

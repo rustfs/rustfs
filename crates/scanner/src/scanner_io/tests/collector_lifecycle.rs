@@ -355,3 +355,202 @@ async fn collector_worker_panic_waits_for_admitted_resume_and_preserves_checkpoi
 async fn collector_parent_cancel_drains_accepted_root_and_preserves_checkpoint() {
     run_collector_lifecycle(Stop::ParentCancellation).await;
 }
+
+#[derive(Clone)]
+struct CollectorLogWriter(Arc<StdMutex<Vec<u8>>>);
+
+impl std::io::Write for CollectorLogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().expect("collector log buffer").extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+async fn capture_collector_logs<F: std::future::Future>(future: F) -> (F::Output, Vec<serde_json::Value>) {
+    use tracing::instrument::WithSubscriber as _;
+
+    let buffer = Arc::new(StdMutex::new(Vec::new()));
+    let writer = Arc::clone(&buffer);
+    let subscriber = tracing_subscriber::fmt()
+        .json()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || CollectorLogWriter(Arc::clone(&writer)))
+        .finish();
+    let _interest_guard = tracing::Dispatch::new(tracing::subscriber::NoSubscriber::default());
+    let result = future.with_subscriber(subscriber).await;
+    let logs = buffer.lock().expect("collector log buffer");
+    let events = std::str::from_utf8(&logs)
+        .expect("collector logs should be UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("collector event should be JSON"))
+        .collect();
+    (result, events)
+}
+
+fn bucket_root(name: &str, generation: u64, size: usize) -> DataUsageEntryInfo {
+    DataUsageEntryInfo {
+        name: name.to_string(),
+        parent: DATA_USAGE_ROOT.to_string(),
+        entry: DataUsageEntry {
+            size,
+            ..Default::default()
+        },
+        bucket_incarnation: None,
+        tier_registry_generation: Some(generation),
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn collector_reports_distinct_duplicate_and_rejected_roots_after_drain() {
+    for (cancel, recover_missing) in [(false, false), (false, true), (true, false), (true, true)] {
+        let ctx = CancellationToken::new();
+        let mut cache = DataUsageCache {
+            info: DataUsageCacheInfo {
+                name: DATA_USAGE_ROOT.to_string(),
+                source: Some(DataUsageCacheSource::new(2, 3)),
+                next_cycle: 17,
+                leader_epoch: 23,
+                tier_registry_generation: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        cache.replace(
+            "bucket-b",
+            DATA_USAGE_ROOT,
+            DataUsageEntry {
+                size: 19,
+                ..Default::default()
+            },
+        );
+        let (tx, rx) = mpsc::channel(4);
+        if cancel {
+            ctx.cancel();
+        }
+        let run = async {
+            let collector = super::super::io_cache::collect_completed_bucket_results(ctx.clone(), cache, rx);
+            tokio::pin!(collector);
+            if cancel {
+                tokio::select! {
+                    biased;
+                    _ = &mut collector => panic!("collector cannot close while the sender is open"),
+                    _ = tokio::task::yield_now() => {}
+                }
+            }
+            tx.send(bucket_root("bucket-a", 7, 1)).await.expect("first root send");
+            tx.send(bucket_root("bucket-a", 7, 2)).await.expect("duplicate root send");
+            tx.send(bucket_root("bucket-b", 8, 3)).await.expect("wrong-tier root send");
+            if recover_missing {
+                tx.send(bucket_root("bucket-b", 7, 4)).await.expect("current root send");
+            }
+            drop(tx);
+            collector.await
+        };
+        let ((cache, completed), events) = capture_collector_logs(run).await;
+        assert_eq!(completed.len(), if recover_missing { 2 } else { 1 });
+        assert_eq!(cache.find("bucket-a").expect("applied duplicate root").size, 2);
+        assert_eq!(
+            cache.find("bucket-b").expect("retained or recovered root").size,
+            if recover_missing { 4 } else { 19 }
+        );
+        assert_eq!(should_publish_completed_snapshot(completed.len(), 2, false, false), recover_missing);
+        assert!(!should_publish_completed_snapshot(completed.len(), 2, false, true));
+
+        let events = events
+            .iter()
+            .filter(|event| event["fields"]["state"] == "bucket_root_collector_drained")
+            .collect::<Vec<_>>();
+        assert_eq!(events.len(), 1, "each collector drain should report one bounded summary");
+        let fields = &events[0]["fields"];
+        assert_eq!(fields["collector_cache_pool"], 2);
+        assert_eq!(fields["collector_cache_set"], 3);
+        assert_eq!(fields["collector_cache_cycle"], 17);
+        assert_eq!(fields["collector_cache_leader_epoch"], 23);
+        assert_eq!(fields["received_roots"], if recover_missing { 4 } else { 3 });
+        assert_eq!(fields["distinct_applied_roots"], if recover_missing { 2 } else { 1 });
+        assert_eq!(fields["duplicate_applied_roots"], 1);
+        assert_eq!(fields["rejected_roots"], 1);
+        assert_eq!(fields["cancellation_observed"], cancel);
+        assert_eq!(fields["cancelled_at_drain"], cancel);
+        assert!(fields.get("bucket").is_none());
+        assert!(fields.get("object").is_none());
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn collector_reports_cancellation_when_close_and_cancel_are_both_ready() {
+    let ctx = CancellationToken::new();
+    ctx.cancel();
+    let (tx, rx) = mpsc::channel(1);
+    drop(tx);
+    let ((_, completed), events) = capture_collector_logs(super::super::io_cache::collect_completed_bucket_results(
+        ctx,
+        DataUsageCache::default(),
+        rx,
+    ))
+    .await;
+    assert!(completed.is_empty());
+    let events = events
+        .iter()
+        .filter(|event| event["fields"]["state"] == "bucket_root_collector_drained")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["cancelled_at_drain"], true);
+    assert!(fields["cancellation_observed"].is_boolean(), "either ready branch may be selected first");
+    assert_eq!(fields["received_roots"], 0);
+    assert_eq!(fields["distinct_applied_roots"], 0);
+}
+
+#[tokio::test]
+#[serial]
+async fn incomplete_set_event_reports_requested_cycle_and_epoch() {
+    let ((), events) = capture_collector_logs(async {
+        let (_dir, store) = setup_local_scanner_store(1, 1).await;
+        clear_dirty_usage_buckets_for_tests();
+        create_bucket(&store, PARTIAL_BUCKET, 4).await;
+        let set = Arc::clone(&store.pools[0].disk_set[0]);
+        let parent = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &parent,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(1),
+                ..Default::default()
+            },
+        );
+        let (updates, mut results) = mpsc::channel(1);
+        set.clone()
+            .nsscanner_cache(
+                budget.token(),
+                Arc::clone(&budget),
+                scan_plan(&set, &[PARTIAL_BUCKET], 1).await,
+                updates,
+                1,
+                HealScanMode::Normal,
+            )
+            .await
+            .expect("budgeted fixture should return partial progress");
+        assert!(budget.budget_elapsed());
+        assert!(!results.recv().await.expect("incomplete set result").info.snapshot_complete);
+        clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+    let events = events
+        .iter()
+        .filter(|event| event["fields"]["state"] == "set_cache_publish_skipped")
+        .collect::<Vec<_>>();
+    assert_eq!(events.len(), 1);
+    let fields = &events[0]["fields"];
+    assert_eq!(fields["pool"], 0);
+    assert_eq!(fields["set"], 0);
+    assert_eq!(fields["cycle"], 1);
+    assert_eq!(fields["leader_epoch"], 11);
+}

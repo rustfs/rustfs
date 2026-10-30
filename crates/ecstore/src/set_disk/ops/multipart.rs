@@ -43,8 +43,9 @@ use super::super::{
     complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, contains_key_str,
     create_bitrot_writer, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5, get_header_map,
     get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
-    log_multipart_write_quorum_failure, parts_after_marker, path_join_buf, prepare_complete_multipart_parts,
-    record_compression_total_memory, reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
+    log_multipart_write_quorum_failure, multipart_part_logical_size, parts_after_marker, path_join_buf,
+    prepare_complete_multipart_parts, record_compression_total_memory, record_multipart_write_quorum_failure,
+    reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
     restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
     to_object_err, warn,
 };
@@ -233,6 +234,19 @@ fn admitted_multipart_size(current: u64, candidate: u64, limit: u64) -> Result<u
     Ok(total)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum MultipartMetadataQuorum {
+    Read,
+    Write,
+    Cleanup,
+}
+
+impl From<bool> for MultipartMetadataQuorum {
+    fn from(write: bool) -> Self {
+        if write { Self::Write } else { Self::Read }
+    }
+}
+
 pub(crate) struct StaleMultipartCleanupGuard {
     file_info: FileInfo,
     upload_path: String,
@@ -410,6 +424,8 @@ impl StaleMultipartCleanupGuard {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MultipartCommitPause {
     NewUploadBeforeLockLost,
+    #[cfg(test)]
+    ListPartsAfterMetadata,
     PutPartBeforeLockAcquire,
     PutPartBeforeLockLost,
     PutPartAfterCapacityAdmission,
@@ -824,7 +840,8 @@ where
     }
 
     if successful_responses < read_quorum {
-        if empty_upload_fallback_possible(successful_responses, &errs) {
+        // A single missing directory cannot speak for unavailable disks.
+        if !errs.is_empty() && errs.iter().all(|err| matches!(err, Some(DiskError::FileNotFound))) {
             return Err(DiskError::FileNotFound);
         }
 
@@ -832,6 +849,51 @@ where
     }
 
     Ok((errs, object_parts))
+}
+
+// Size-dependent decisions must not discard a part merely because only a
+// minority of its files was observed. All participants must answer, and each
+// observed part must have a complete file/metadata pair on a read quorum.
+fn validate_part_size_observations(
+    errs: &[Option<DiskError>],
+    object_parts: &[Vec<String>],
+    read_quorum: usize,
+) -> disk::error::Result<Vec<usize>> {
+    if errs.iter().any(Option::is_some) {
+        return Err(DiskError::ErasureReadQuorum);
+    }
+    let mut counts: HashMap<usize, usize> = HashMap::new();
+    for entries in object_parts {
+        let mut observed: HashMap<usize, u8> = HashMap::new();
+        for entry in entries {
+            let Some(name) = entry.strip_prefix("part.") else {
+                continue;
+            };
+            let (number, flag) = match name.strip_suffix(".meta") {
+                Some(number) => (number, 2),
+                None => (name, 1),
+            };
+            let parsed = number.parse::<usize>().map_err(|_| DiskError::FileCorrupt)?;
+            if !(1..=MAX_PARTS_COUNT).contains(&parsed)
+                || !number.as_bytes().first().is_some_and(|digit| (b'1'..=b'9').contains(digit))
+            {
+                return Err(DiskError::FileCorrupt);
+            }
+            *observed.entry(parsed).or_default() |= flag;
+        }
+        for (number, flags) in observed {
+            if flags != 3 {
+                return Err(DiskError::FileCorrupt);
+            }
+            *counts.entry(number).or_default() += 1;
+        }
+    }
+    if counts.values().any(|&count| count < read_quorum) {
+        return Err(DiskError::ErasureReadQuorum);
+    }
+    let mut part_numbers: Vec<_> = counts.into_keys().collect();
+    part_numbers.sort_unstable();
+    Ok(part_numbers)
 }
 
 fn reduce_quorum_part_numbers(object_parts: Vec<Vec<String>>, read_quorum: usize) -> Vec<usize> {
@@ -1004,7 +1066,7 @@ impl SetDisks {
             ]),
             SLASH_SEPARATOR
         );
-        let part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
+        let part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum, true).await {
             Ok(parts) => parts,
             Err(DiskError::FileNotFound) => return Ok(0),
             Err(err) => return Err(to_object_err(err.into(), vec![bucket, object, upload_id])),
@@ -1016,28 +1078,45 @@ impl SetDisks {
             .iter()
             .map(|number| format!("{part_path}part.{number}.meta"))
             .collect::<Vec<_>>();
-        let existing_parts =
-            Self::read_parts(&online_disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
-                .await
-                .map_err(|err| to_object_err(err.into(), vec![bucket, object, upload_id]))?;
+        let existing_parts = Self::read_parts(
+            &online_disks,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &part_meta_paths,
+            &part_numbers,
+            fi.write_quorum(self.default_write_quorum()),
+        )
+        .await
+        .map_err(|err| to_object_err(err.into(), vec![bucket, object, upload_id]))?;
 
-        existing_parts.into_iter().try_fold(0_u64, |total, part| {
-            if part.error.is_some() || part.number == replacing_part {
-                return if part.error.is_some() {
-                    Err(Error::PartMissingOrCorrupt)
-                } else {
-                    Ok(total)
-                };
-            }
-            let part_size = u64::try_from(part.actual_size).map_err(|_| Error::PartMissingOrCorrupt)?;
-            total.checked_add(part_size).ok_or_else(|| {
-                Error::InvalidArgument(
-                    "multipart upload".to_string(),
-                    SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
-                    "logical size overflow".to_string(),
-                )
+        if existing_parts.len() != part_numbers.len() {
+            return Err(Error::PartMissingOrCorrupt);
+        }
+        let transformed = fi.is_compressed() || should_persist_encryption_original_size(&fi.metadata);
+        existing_parts
+            .into_iter()
+            .zip(part_numbers)
+            .try_fold(0_u64, |total, (part, number)| {
+                if part.number != number {
+                    return Err(Error::PartMissingOrCorrupt);
+                }
+                if part.error.is_some() || part.number == replacing_part {
+                    return if part.error.is_some() {
+                        Err(Error::PartMissingOrCorrupt)
+                    } else {
+                        Ok(total)
+                    };
+                }
+                let part_size = multipart_part_logical_size(part.size, part.actual_size, transformed)
+                    .and_then(|size| u64::try_from(size).ok())
+                    .ok_or(Error::PartMissingOrCorrupt)?;
+                total.checked_add(part_size).ok_or_else(|| {
+                    Error::InvalidArgument(
+                        "multipart upload".to_string(),
+                        SUFFIX_MAX_TOTAL_OBJECT_SIZE.to_string(),
+                        "logical size overflow".to_string(),
+                    )
+                })
             })
-        })
     }
 
     async fn discover_multipart_upload_paths(
@@ -1139,7 +1218,7 @@ impl SetDisks {
             }
             let upload_id = runtime_sources::deployment_upload_id(raw_upload_id);
             let file_info = match self
-                .check_multipart_upload_path_exists(bucket, object, &upload_id, &upload_path, false, true)
+                .check_multipart_upload_path_exists(bucket, object, &upload_id, &upload_path, MultipartMetadataQuorum::Read, true)
                 .await
             {
                 Ok((file_info, _)) => file_info,
@@ -1226,7 +1305,7 @@ impl SetDisks {
             .acquire_write_lock_diag("abort_data_movement_multipart", RUSTFS_META_MULTIPART_BUCKET, &upload_path)
             .await?;
         let file_info = match self
-            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_path, true, true)
+            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_path, MultipartMetadataQuorum::Write, true)
             .await
         {
             Ok((file_info, _)) => file_info,
@@ -1269,6 +1348,7 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         part_path: &str,
         read_quorum: usize,
+        strict_size: bool,
     ) -> disk::error::Result<Vec<usize>> {
         let mut futures = Vec::with_capacity(disks.len());
         let part_path = part_path.to_string();
@@ -1277,21 +1357,24 @@ impl SetDisks {
             let part_path = part_path.clone();
             futures.push(async move {
                 if let Some(disk) = disk {
-                    disk.list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path.as_str(), -1)
+                    match disk
+                        .list_dir(RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_MULTIPART_BUCKET, part_path.as_str(), -1)
                         .await
+                    {
+                        Err(DiskError::FileNotFound) if strict_size => Ok(Vec::new()),
+                        result => result,
+                    }
                 } else {
                     Err(DiskError::DiskNotFound)
                 }
             });
         }
 
-        let mut errs = Vec::with_capacity(disks.len());
-        let mut object_parts = Vec::with_capacity(disks.len());
+        let (errs, object_parts) = collect_list_parts_results(futures, read_quorum).await?;
 
-        let (collected_errs, collected_parts) = collect_list_parts_results(futures, read_quorum).await?;
-        errs.extend(collected_errs);
-        object_parts.extend(collected_parts);
-
+        if strict_size {
+            return validate_part_size_observations(&errs, &object_parts, read_quorum);
+        }
         if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, read_quorum) {
             return Err(err);
         }
@@ -1333,7 +1416,7 @@ impl SetDisks {
         data_movement: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, data_movement)?;
-        self.check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, write, false)
+        self.check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, write.into(), false)
             .await
     }
 
@@ -1373,7 +1456,7 @@ impl SetDisks {
         object: &str,
         upload_id: &str,
         upload_id_path: &str,
-        write: bool,
+        quorum_mode: MultipartMetadataQuorum,
         include_recovery: bool,
     ) -> Result<(FileInfo, Vec<FileInfo>)> {
         // Slow metadata I/O must not hold the topology registry's read lock.
@@ -1489,22 +1572,26 @@ impl SetDisks {
         }
 
         let mut quorum = read_quorum as usize;
-        if write {
+        if quorum_mode != MultipartMetadataQuorum::Read {
             quorum = write_quorum as usize;
 
             if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
-                log_multipart_write_quorum_failure(
-                    MultipartWriteQuorumContext {
-                        stage: MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
-                        bucket,
-                        object,
-                        upload_id,
-                        part_number: None,
-                    },
-                    &errs,
-                    quorum,
-                    &err,
-                );
+                if quorum_mode == MultipartMetadataQuorum::Write {
+                    log_multipart_write_quorum_failure(
+                        MultipartWriteQuorumContext {
+                            stage: MULTIPART_WRITE_QUORUM_UPLOAD_METADATA,
+                            bucket,
+                            object,
+                            upload_id,
+                            part_number: None,
+                        },
+                        &errs,
+                        quorum,
+                        &err,
+                    );
+                } else {
+                    record_multipart_write_quorum_failure(MULTIPART_WRITE_QUORUM_UPLOAD_METADATA, &errs, quorum);
+                }
                 return Err(map_error(err));
             }
         } else if let Some(err) = reduce_read_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, quorum) {
@@ -1523,7 +1610,7 @@ impl SetDisks {
             .acquire_write_lock_diag("stale_multipart_cleanup", RUSTFS_META_MULTIPART_BUCKET, upload_path)
             .await?;
         let (file_info, _) = self
-            .check_multipart_upload_path_exists("", "", "", upload_path, true, true)
+            .check_multipart_upload_path_exists("", "", "", upload_path, MultipartMetadataQuorum::Cleanup, true)
             .await?;
         let write_quorum = file_info.write_quorum(self.default_write_quorum());
         Ok(StaleMultipartCleanupGuard {
@@ -2634,6 +2721,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
             .await?;
+        #[cfg(test)]
+        pause_multipart_commit(bucket, object, MultipartCommitPause::ListPartsAfterMetadata).await;
 
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, opts.data_movement)?;
 
@@ -2682,16 +2771,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             SLASH_SEPARATOR
         );
 
-        let mut part_numbers = match Self::list_parts(&online_disks, &part_path, read_quorum).await {
-            Ok(parts) => parts,
-            Err(err) => {
-                if err == DiskError::FileNotFound {
-                    return Ok(ret);
-                }
+        let mut part_numbers =
+            match Self::list_parts(&online_disks, &part_path, read_quorum, opts.strict_multipart_part_sizes).await {
+                Ok(parts) => parts,
+                Err(err) => {
+                    if err == DiskError::FileNotFound {
+                        return Ok(ret);
+                    }
 
-                return Err(to_object_err(err.into(), vec![bucket, object]));
-            }
-        };
+                    return Err(to_object_err(err.into(), vec![bucket, object]));
+                }
+            };
 
         if part_numbers.is_empty() {
             return Ok(ret);
@@ -2708,11 +2798,29 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             .map(|v| format!("{part_path}part.{v}.meta"))
             .collect::<Vec<String>>();
 
-        let object_parts =
-            Self::read_parts(&online_disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
-                .await
-                .map_err(|e| to_object_err(e.into(), vec![bucket, object, upload_id]))?;
+        let object_parts = Self::read_parts(
+            &online_disks,
+            RUSTFS_META_MULTIPART_BUCKET,
+            &part_meta_paths,
+            &part_numbers,
+            if opts.strict_multipart_part_sizes {
+                fi.write_quorum(self.default_write_quorum())
+            } else {
+                read_quorum
+            },
+        )
+        .await
+        .map_err(|e| to_object_err(e.into(), vec![bucket, object, upload_id]))?;
 
+        if opts.strict_multipart_part_sizes
+            && (object_parts.len() != part_numbers.len()
+                || object_parts
+                    .iter()
+                    .zip(&part_numbers)
+                    .any(|(part, number)| part.number != *number || part.error.is_some() || part.etag.is_empty()))
+        {
+            return Err(Error::PartMissingOrCorrupt);
+        }
         let mut count = max_parts;
 
         for part in object_parts.iter() {
@@ -3032,7 +3140,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         // its full write quorum and the upload's incarnation/lifecycle fences.
         let upload_id_path = Self::validated_multipart_upload_path(bucket, object, upload_id, opts.data_movement)?;
         let (fi, _) = self
-            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, MultipartMetadataQuorum::Read, true)
             .await?;
         ensure_data_movement_upload_access(&fi, bucket, object, upload_id, opts)?;
         ensure_multipart_bucket_incarnation(&self.ctx, &fi, bucket, object, upload_id, opts.expected_bucket_incarnation_id)
@@ -3192,7 +3300,14 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     }
                     SourceRecovery::Missing => {
                         return match self
-                            .check_multipart_upload_path_exists(bucket, object, upload_id, &upload_id_path, false, true)
+                            .check_multipart_upload_path_exists(
+                                bucket,
+                                object,
+                                upload_id,
+                                &upload_id_path,
+                                MultipartMetadataQuorum::Read,
+                                true,
+                            )
                             .await
                         {
                             Ok(_) => Err(Error::ErasureWriteQuorum),
@@ -7492,7 +7607,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn collect_list_parts_results_returns_file_not_found_for_empty_upload_dirs() {
+    async fn collect_list_parts_results_rejects_unavailable_empty_upload_dirs() {
         let tasks: Vec<_> = vec![
             (5_u64, Err(DiskError::FileNotFound)),
             (10, Err(DiskError::DiskNotFound)),
@@ -7507,9 +7622,370 @@ mod tests {
 
         let err = collect_list_parts_results(tasks, 2)
             .await
-            .expect_err("missing multipart directories should be treated as empty uploads");
+            .expect_err("an unavailable disk cannot prove an empty upload");
 
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[serial]
+    async fn list_parts_rejects_disk_loss_after_upload_metadata_was_read() {
+        let (dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "multipart-list-loss-after-metadata";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let opts = ObjectOptions {
+            max_parity: true,
+            ..Default::default()
+        };
+        let (upload_id, _) = stage_upload_with_create_opts(&set, bucket, object, &[1; 32], &opts).await;
+        let (fi, _) = set
+            .check_upload_id_exists(bucket, object, &upload_id, false)
+            .await
+            .expect("read initial metadata");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, object, &upload_id);
+        let part_dir = dirs[0]
+            .path()
+            .join(RUSTFS_META_MULTIPART_BUCKET)
+            .join(upload_path)
+            .join(fi.data_dir.expect("upload data directory").to_string());
+        let held_dir = part_dir.with_extension("held-for-test");
+        let barrier = MultipartCommitBarrier::install(bucket, object, MultipartCommitPause::ListPartsAfterMetadata);
+        let query_set = Arc::clone(&set);
+        let query_id = upload_id.clone();
+        let query = tokio::spawn(async move {
+            query_set
+                .list_object_parts(bucket, object, &query_id, None, 100, &ObjectOptions::default())
+                .await
+        });
+        barrier.wait_until_paused().await;
+        tokio::fs::rename(&part_dir, &held_dir)
+            .await
+            .expect("simulate the surviving disk missing the part directory");
+        {
+            let mut live = set.disks.write().await;
+            for slot in 1..4 {
+                live[slot] = None;
+            }
+        }
+        barrier.release();
+        let result = query.await.expect("list task must finish");
+        drop(barrier);
+        tokio::fs::rename(&held_dir, &part_dir)
+            .await
+            .expect("restore the original directory");
+        {
+            let mut live = set.disks.write().await;
+            for slot in 1..4 {
+                live[slot] = Some(disks[slot].clone());
+            }
+        }
+        assert!(
+            matches!(result, Err(StorageError::InsufficientReadQuorum(..))),
+            "disk loss must fail rather than return an empty part list: {result:?}"
+        );
+        let recovered = set
+            .list_object_parts(bucket, object, &upload_id, None, 100, &ObjectOptions::default())
+            .await
+            .expect("listing resumes after the original disks return");
+        assert_eq!(recovered.parts.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn collect_list_parts_results_proves_all_directories_missing() {
+        let tasks = (0..4)
+            .map(|_| async { Err::<Vec<String>, _>(DiskError::FileNotFound) })
+            .collect();
+        let err = collect_list_parts_results(tasks, 2)
+            .await
+            .expect_err("all missing directories are empty");
         assert_eq!(err, DiskError::FileNotFound);
+    }
+
+    #[test]
+    fn strict_multipart_part_sizes_reject_incomplete_observations() {
+        let pair = || vec!["part.1".to_string(), "part.1.meta".to_string()];
+        let all_online = vec![None; 4];
+        assert!(validate_part_size_observations(&all_online, &[vec![], vec![], vec![], vec![]], 2).is_ok());
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[pair(), pair(), vec![], vec![]], 2),
+            Ok(vec![1])
+        );
+        let unordered = vec!["part.9.meta", "part.1", "part.9", "part.1.meta", "part.1"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[unordered.clone(), unordered, vec![], vec![]], 2),
+            Ok(vec![1, 9])
+        );
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[pair(), vec![], vec![], vec![]], 2),
+            Err(DiskError::ErasureReadQuorum)
+        );
+        assert_eq!(
+            validate_part_size_observations(&all_online, &[vec!["part.1.meta".to_string()], pair(), pair(), vec![]], 2),
+            Err(DiskError::FileCorrupt)
+        );
+        for invalid in ["part.0", "part.10001", "part.01", "part.+1", "part.1x"] {
+            let entries = vec![invalid.to_string(), format!("{invalid}.meta")];
+            assert_eq!(
+                validate_part_size_observations(&all_online, &[entries.clone(), entries.clone(), entries.clone(), entries], 2),
+                Err(DiskError::FileCorrupt),
+                "noncanonical part names are not valid size evidence even on every disk"
+            );
+        }
+        assert_eq!(
+            validate_part_size_observations(
+                &[None, None, None, Some(DiskError::DiskNotFound)],
+                &[pair(), pair(), pair(), vec![]],
+                2
+            ),
+            Err(DiskError::ErasureReadQuorum)
+        );
+    }
+
+    #[tokio::test]
+    async fn strict_multipart_capped_upload_rejects_unavailable_participant_and_recovers() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "strict-multipart-size-bucket";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "10".to_string());
+        let opts = ObjectOptions {
+            max_parity: true,
+            user_defined: metadata,
+            ..Default::default()
+        };
+        let (upload_id, _) = stage_upload_with_create_opts(&set, bucket, object, &[1; 6], &opts).await;
+
+        set.disks.write().await[3] = None;
+        let mut part = PutObjReader::from_vec(vec![2; 4]);
+        let err = set
+            .put_object_part(bucket, object, &upload_id, 2, &mut part, &ObjectOptions::default())
+            .await;
+        assert!(err.is_err(), "an unavailable disk must not produce a size admission: {err:?}");
+        set.disks.write().await[3] = Some(disks[3].clone());
+
+        // Two distinct part identities at read quorum cannot prove which size
+        // belongs to the acknowledged write; require the write quorum instead.
+        let (other_id, _) = stage_upload_with_create_opts(&set, bucket, "other", &[9; 2], &ObjectOptions::default()).await;
+        let (fi, _) = set
+            .check_upload_id_exists(bucket, object, &upload_id, false)
+            .await
+            .expect("read capped upload metadata");
+        let (other_fi, _) = set
+            .check_upload_id_exists(bucket, "other", &other_id, false)
+            .await
+            .expect("read other upload metadata");
+        let path = format!(
+            "{}/{}/part.1.meta",
+            SetDisks::get_upload_id_dir(bucket, object, &upload_id),
+            fi.data_dir.expect("data dir")
+        );
+        let other_path = format!(
+            "{}/{}/part.1.meta",
+            SetDisks::get_upload_id_dir(bucket, "other", &other_id),
+            other_fi.data_dir.expect("data dir")
+        );
+        let mut originals = Vec::new();
+        for disk in disks.iter().take(2) {
+            originals.push(
+                disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &path)
+                    .await
+                    .expect("save original part metadata"),
+            );
+            let conflicting = disk
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &other_path)
+                .await
+                .expect("read conflicting part metadata");
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &path, conflicting)
+                .await
+                .expect("install split part metadata");
+        }
+        let mut split = PutObjReader::from_vec(vec![5; 4]);
+        let split_result = set
+            .put_object_part(bucket, object, &upload_id, 2, &mut split, &ObjectOptions::default())
+            .await;
+        for (disk, original) in disks.iter().zip(originals) {
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &path, original)
+                .await
+                .expect("restore original part metadata");
+        }
+        assert!(
+            split_result.is_err(),
+            "split part identities must not authorize a size decision: {split_result:?}"
+        );
+
+        let mut originals = Vec::new();
+        for disk in disks.iter().take(3) {
+            let original = disk
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &path)
+                .await
+                .expect("save original part metadata");
+            let mut stale = ObjectPartInfo::unmarshal(&original).expect("decode original part metadata");
+            stale.actual_size = 1;
+            disk.write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &path,
+                Bytes::from(stale.marshal_msg().expect("encode stale part")),
+            )
+            .await
+            .expect("install stale size on write quorum");
+            originals.push(original);
+        }
+        let mut undercounted = PutObjReader::from_vec(vec![6; 4]);
+        let result = set
+            .put_object_part(bucket, object, &upload_id, 2, &mut undercounted, &ObjectOptions::default())
+            .await;
+        for (disk, original) in disks.iter().zip(originals) {
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &path, original)
+                .await
+                .expect("restore original part metadata");
+        }
+        assert!(
+            matches!(result, Err(StorageError::PartMissingOrCorrupt)),
+            "smaller logical size must fail closed: {result:?}"
+        );
+
+        let mut originals = Vec::new();
+        for disk in disks.iter().take(3) {
+            let original = disk
+                .read_all(RUSTFS_META_MULTIPART_BUCKET, &path)
+                .await
+                .expect("save original part metadata");
+            let mut wrong_identity = ObjectPartInfo::unmarshal(&original).expect("decode original part metadata");
+            wrong_identity.number = 2;
+            disk.write_all(
+                RUSTFS_META_MULTIPART_BUCKET,
+                &path,
+                Bytes::from(wrong_identity.marshal_msg().expect("encode wrong identity")),
+            )
+            .await
+            .expect("install mismatched part identity on write quorum");
+            originals.push(original);
+        }
+        let list_result = set
+            .list_object_parts(
+                bucket,
+                object,
+                &upload_id,
+                None,
+                100,
+                &ObjectOptions {
+                    strict_multipart_part_sizes: true,
+                    ..Default::default()
+                },
+            )
+            .await;
+        let mut replacement = PutObjReader::from_vec(vec![7; 4]);
+        let result = set
+            .put_object_part(bucket, object, &upload_id, 2, &mut replacement, &ObjectOptions::default())
+            .await;
+        for (disk, original) in disks.iter().zip(originals) {
+            disk.write_all(RUSTFS_META_MULTIPART_BUCKET, &path, original)
+                .await
+                .expect("restore original part metadata");
+        }
+        assert!(
+            matches!(list_result, Err(StorageError::PartMissingOrCorrupt)),
+            "strict listing must reject mismatched part identity: {list_result:?}"
+        );
+        assert!(
+            matches!(result, Err(StorageError::PartMissingOrCorrupt)),
+            "mismatched part identity must not bypass the cap: {result:?}"
+        );
+
+        let mut too_large = PutObjReader::from_vec(vec![3; 5]);
+        let err = set
+            .put_object_part(bucket, object, &upload_id, 2, &mut too_large, &ObjectOptions::default())
+            .await;
+        assert!(
+            matches!(err, Err(StorageError::EntityTooLarge(11, 10))),
+            "existing part must count: {err:?}"
+        );
+        let mut fits = PutObjReader::from_vec(vec![4; 4]);
+        set.put_object_part(bucket, object, &upload_id, 2, &mut fits, &ObjectOptions::default())
+            .await
+            .expect("the upload should resume at the exact limit after all disks recover");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn capped_multipart_concurrent_parts_cannot_exceed_logical_limit() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "concurrent-capped-multipart";
+        let object = "object";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut metadata = HashMap::new();
+        insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "10".to_owned());
+        let opts = ObjectOptions {
+            max_parity: true,
+            user_defined: metadata,
+            ..Default::default()
+        };
+        let upload = set
+            .new_multipart_upload(bucket, object, &opts)
+            .await
+            .expect("create capped upload");
+        let barrier = Arc::new(tokio::sync::Barrier::new(3));
+        let mut tasks = Vec::new();
+        for (number, byte) in [(1_usize, 0x41_u8), (2, 0x42)] {
+            let set = Arc::clone(&set);
+            let barrier = Arc::clone(&barrier);
+            let upload_id = upload.upload_id.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut body = PutObjReader::from_vec(vec![byte; 6]);
+                barrier.wait().await;
+                set.put_object_part(bucket, object, &upload_id, number, &mut body, &ObjectOptions::default())
+                    .await
+            }));
+        }
+        barrier.wait().await;
+        let mut accepted = Vec::new();
+        let mut rejected = 0;
+        for task in tasks {
+            match tokio::time::timeout(Duration::from_secs(30), task)
+                .await
+                .expect("concurrent part deadline")
+                .expect("part task")
+            {
+                Ok(part) => accepted.push(part),
+                Err(StorageError::EntityTooLarge(12, 10)) => rejected += 1,
+                Err(other) => panic!("unexpected concurrent admission result: {other:?}"),
+            }
+        }
+        assert_eq!(accepted.len(), 1, "only one six-byte part fits the ten-byte limit");
+        assert_eq!(rejected, 1);
+        let listed = set
+            .list_object_parts(bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+            .await
+            .expect("read final part listing");
+        assert_eq!(listed.parts.len(), 1);
+        assert_eq!(listed.parts[0].part_num, accepted[0].part_num);
+        let winner = accepted.remove(0);
+        let part_number = winner.part_num;
+        set.clone()
+            .complete_multipart_upload(
+                bucket,
+                object,
+                &upload.upload_id,
+                vec![CompletePart {
+                    part_num: part_number,
+                    etag: winner.etag,
+                    ..Default::default()
+                }],
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("complete the admitted part");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read completed object");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read whole object");
+        assert_eq!(actual, vec![if part_number == 1 { 0x41 } else { 0x42 }; 6]);
     }
 
     #[tokio::test]
@@ -8131,9 +8607,7 @@ mod tests {
         assert!(listed.parts.is_empty(), "part lock loss before rename must not publish the part");
     }
 
-    #[tokio::test]
-    #[serial]
-    async fn put_object_part_fences_upload_lock_loss_before_rename() {
+    async fn put_object_part_fences_upload_lock_loss_before_rename_case(capped: bool) {
         let target = Arc::new(std::sync::RwLock::new(None));
         let refresh_calls = Arc::new(AtomicUsize::new(0));
         let lockers: Vec<Arc<dyn LockClient>> = (0..4)
@@ -8145,10 +8619,12 @@ mod tests {
         let bucket = "multipart-put-part-lock-loss-bucket";
         let object = "object";
         make_bucket_on_all(&disk_stores, bucket).await;
+        let mut create_opts = ObjectOptions::default();
+        if capped {
+            insert_str(&mut create_opts.user_defined, SUFFIX_MAX_TOTAL_OBJECT_SIZE, "8192".to_owned());
+        }
         let upload = temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
-            set_disks
-                .new_multipart_upload(bucket, object, &ObjectOptions::default())
-                .await
+            set_disks.new_multipart_upload(bucket, object, &create_opts).await
         })
         .await
         .expect("multipart upload should be created");
@@ -8197,6 +8673,18 @@ mod tests {
             .await
             .expect("lock loss before rename must leave the upload readable");
         assert!(listed.parts.is_empty(), "lock loss before rename must not publish the part");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn put_object_part_fences_upload_lock_loss_before_rename() {
+        put_object_part_fences_upload_lock_loss_before_rename_case(false).await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn capped_multipart_part_fences_upload_lock_loss_before_rename() {
+        put_object_part_fences_upload_lock_loss_before_rename_case(true).await;
     }
 
     #[tokio::test]
@@ -11133,7 +11621,7 @@ mod tests {
             *disk = None;
         }
         let (info, _) = set
-            .check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            .check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
             .await
             .expect("four primary plus four recovery copies reach metadata read quorum");
         assert_eq!(info.name, path);
@@ -11154,7 +11642,7 @@ mod tests {
             *disk = None;
         }
         assert!(
-            set.check_multipart_upload_path_exists(bucket, object, &upload, &path, false, true)
+            set.check_multipart_upload_path_exists(bucket, object, &upload, &path, MultipartMetadataQuorum::Read, true)
                 .await
                 .is_err(),
             "two files on each of four disks must not count as eight voters"
@@ -14471,7 +14959,7 @@ mod tests {
                     object,
                     &u_new,
                     &SetDisks::get_upload_id_dir(bucket, object, &u_new),
-                    true,
+                    MultipartMetadataQuorum::Write,
                     true,
                 )
                 .await
@@ -14516,7 +15004,7 @@ mod tests {
                 object,
                 &upload,
                 &SetDisks::get_upload_id_dir(bucket, object, &upload),
-                true,
+                MultipartMetadataQuorum::Write,
                 true,
             )
             .await
@@ -14599,7 +15087,7 @@ mod tests {
                     assert_completion_files_preserved(&disk_stores, RUSTFS_META_MULTIPART_BUCKET, &source_files).await;
                     set_disks
                         .check_multipart_upload_path_exists(
-                            bucket, object, &u_new, &SetDisks::get_upload_id_dir(bucket, object, &u_new), true, true,
+                            bucket, object, &u_new, &SetDisks::get_upload_id_dir(bucket, object, &u_new), MultipartMetadataQuorum::Write, true,
                         )
                         .await
                         .expect("upload authority must survive the post-commit crash");

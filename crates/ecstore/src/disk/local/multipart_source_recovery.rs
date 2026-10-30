@@ -170,7 +170,7 @@ impl LocalDisk {
             recovery: loaded.state.as_ref().and_then(|state| state.recovery.clone()),
             negative_certificate,
             ready_certificate,
-            root_missing: store.root_missing().await?,
+            root_missing: loaded.root_missing,
             abort_round: loaded
                 .state
                 .as_ref()
@@ -552,25 +552,33 @@ impl LocalDisk {
         let target = self.get_object_path(&publication.lineage.bucket, &publication.lineage.object)?;
         let _target_owner = os::acquire_metadata_mutation_lease(&target, store.owner.clone()).await;
         if require_target {
-            let raw = store
-                .read_target(publication)
-                .await?
-                .ok_or(DiskError::ConditionalDeleteConflict)?;
-            if !store.target_matches(publication, &raw)? {
-                return Err(DiskError::ConditionalDeleteConflict);
-            }
-            store.sync_target(publication).await?;
+            let expected_publication = publication.clone();
+            let physical_slot = store.physical_slot;
+            let disk_count = store.disk_ids.len();
+            store
+                .read_and_sync_target(publication, move |raw| {
+                    if !super::multipart_source_state::SourceStore::target_matches_for_slot(
+                        &expected_publication,
+                        raw,
+                        physical_slot,
+                        disk_count,
+                    )? {
+                        return Err(DiskError::ConditionalDeleteConflict);
+                    }
+                    Ok(())
+                })
+                .await?;
         }
-        if !matches!(
+        let snapshot = if !matches!(
             state.phase,
             MultipartSourcePhase::LocalTerminalSeal | MultipartSourcePhase::GlobalTerminalCertified
         ) {
             state.capability_sha256 = None;
             state.advance(MultipartSourcePhase::LocalTerminalSeal)?;
-            store.persist(&state).await?;
-        }
-        let current = store.load().await?;
-        let snapshot = current.snapshot.ok_or(DiskError::ConditionalDeleteConflict)?;
+            store.persist_with_source_sync(&state, false).await?
+        } else {
+            loaded.snapshot.ok_or(DiskError::ConditionalDeleteConflict)?
+        };
         if snapshot.head_sha256.is_some()
             || snapshot.capability_sha256.is_some()
             || snapshot.publication.as_ref() != Some(publication)

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -504,7 +505,8 @@ SCANNER_HEAL_RELEASE_PRESSURE_METRICS = (
 )
 SCHEDULED_ALERT_WORKFLOWS = tuple(
     item["workflow"]
-    for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())
+    for item in json.loads((ROOT / ".github/scheduled-validations.json").read_text())["workflows"]
+    if item.get("alert_contract") == "scheduled-validation"
 )
 # Each migrated scheduled-alert workflow requires the new pin; this is not a list of pins that
 # every workflow may choose between during the staged checkout update.
@@ -520,7 +522,6 @@ SCHEDULED_ALERT_CHECKOUT_OVERRIDES = {
     ".github/workflows/ci.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/fuzz.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/nightly-gnu.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
-    ".github/workflows/performance-ab.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/runner-hygiene.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/scheduled-validation-watchdog.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
     ".github/workflows/scheduled-validation-freshness.yml": "actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a",
@@ -679,46 +680,66 @@ def check_vault_test_groups(root: Path) -> list[str]:
 
 
 def check_ilm_build_budget(root: Path) -> list[str]:
-    workflow_path = root / ".github/workflows/ci.yml"
-    if not workflow_path.is_file():
-        return [".github/workflows/ci.yml: missing workflow"]
-    workflow = workflow_path.read_text()
-    job = re.search(
-        r"^  test-and-lint:\n(?P<body>.*?)(?=^  [a-z0-9-]+:\n)",
-        workflow,
-        re.MULTILINE | re.DOTALL,
-    )
-    if job is None:
-        return [".github/workflows/ci.yml: ILM integration must share the workspace test job"]
-
-    step = re.search(
-        r"^      - name: Run ignored ILM integration tests serially\n(?P<body>.*?)(?=^      - name:|\Z)",
-        job.group("body"),
-        re.MULTILINE | re.DOTALL,
-    )
-    if step is None:
-        return [".github/workflows/ci.yml: missing ignored ILM integration step"]
-
-    # Measured budget: 3 build jobs on main pushes and dispatches, 2 on pull
-    # requests. A pull-request run at 3 (39193827281) spent 70 minutes with the
-    # pod's io.pressure "full" at 86-88% and timed out before any test started;
-    # the shared pod storage, not CPU, bounds the PR lane.
-    budget = (
-        "CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || "
-        "github.event_name == 'workflow_dispatch') && '3' || '2' }}"
-    )
-    if budget not in step.group("body"):
-        return [".github/workflows/ci.yml: ILM integration must keep the measured 3/2 Cargo build budget"]
-    for required in (
-        "        if: needs.classify-changes.outputs.mode == 'full'",
-        "cargo nextest run --profile default -j1 --run-ignored ignored-only",
-        "--all --exclude e2e_test",
-        "-E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'",
-        'status=${PIPESTATUS[0]}',
-        'exit "${status}"',
-    ):
-        if required not in step.group("body"):
-            return [f".github/workflows/ci.yml: ILM integration is missing {required.strip()}"]
+    """Preserve the serial ignored-test contract while allowing archive reuse."""
+    from ci_gate import condition, workflow_document
+    try:
+        jobs = workflow_document((root / ".github/workflows/ci.yml").read_text())["jobs"]
+        matches = [(name, job, step) for name, job in jobs.items() for step in job.get("steps", [])
+                   if "--run-ignored" in step.get("run", "")]
+        if len(matches) != 1:
+            return ["CI must have exactly one ignored ILM execution"]
+        name, job, step = matches[0]
+        command = step.get("run", "").replace("\\\n", " ")
+        tokens = shlex.split(command)
+        for mode in ("docs", "e2e", "full"):
+            if condition(step.get("if", "true"), {"needs.classify-changes.outputs.mode": mode}) != (mode == "full"):
+                return ["ILM integration must run for full validation only"]
+        for required in ("cargo", "nextest", "run", "--profile", "default", "-j1", "--run-ignored", "ignored-only",
+                         "-E", "binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))"):
+            if required not in tokens:
+                return [f"ILM integration is missing {required}"]
+        reuse_options = {
+            "--cargo-metadata": "target/nextest/cargo-metadata.json",
+            "--binaries-metadata": "target/nextest/binaries-metadata.json",
+            "--workspace-remap": "$GITHUB_WORKSPACE",
+            "--target-dir-remap": "$GITHUB_WORKSPACE/target",
+        }
+        if ("test-and-lint" not in job.get("needs", []) or "--archive-file" in tokens
+                or any(tokens.count(flag) != 1 or tokens[tokens.index(flag) + 1:tokens.index(flag) + 2] != [value]
+                       for flag, value in reuse_options.items())):
+            return ["ILM integration must consume the workspace producer archive"]
+        preceding = job["steps"][:job["steps"].index(step)]
+        listings = [(index, item) for index, item in enumerate(preceding) if "cargo nextest list" in item.get("run", "")]
+        if len(listings) != 1:
+            return ["workspace tests must extract and list their archive exactly once"]
+        index, listing_step = listings[0]
+        listed = shlex.split(listing_step["run"].replace("\\\n", " "))
+        for flag, value in {"--archive-file": "$RUNNER_TEMP/workspace-tests.tar.zst", "--extract-to": "$GITHUB_WORKSPACE"}.items():
+            if listed.count(flag) != 1 or listed[listed.index(flag) + 1:listed.index(flag) + 2] != [value]:
+                return ["workspace listing must extract the producer archive into the checkout"]
+        verification = shell_command_contract(
+            'python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"'
+        )
+        verified = [item for item in preceding[:index] if shell_command_contract(item.get("run", "")) == verification]
+        if (len(verified) != 1 or any("if" in item or item.get("continue-on-error", "false") != "false"
+                                    for item in [listing_step, *verified])):
+            return ["workspace archive must be verified before extraction"]
+        if any(item.get("continue-on-error", "false") != "false" for item in (job, step)):
+            return ["ILM integration must propagate failures"]
+        if 'status=${PIPESTATUS[0]}' not in command or 'exit "${status}"' not in command or "|| true" in command.split('status=${PIPESTATUS[0]}')[0]:
+            return ["ILM integration must retain the actual test exit status"]
+        producer_steps = jobs.get("test-and-lint", {}).get("steps", [])
+        builds = [item for item in producer_steps if "ci_test_artifact.py build --configuration workspace" in item.get("run", "")]
+        if len(builds) != 1:
+            return ["ILM integration requires one workspace archive producer"]
+        budget = builds[0].get("env", {}).get("CARGO_BUILD_JOBS", "")
+        # This remains the measured build budget; execution has no Cargo build.
+        compact = re.sub(r"\s+", "", budget)
+        expected = "${{(github.event_name=='push'||github.event_name=='workflow_dispatch')&&'3'||'2'}}"
+        if compact != expected:
+            return ["workspace archive must keep the measured 3/2 Cargo build budget"]
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        return [f"invalid ILM workflow contract: {error}"]
     return []
 
 
@@ -1047,63 +1068,52 @@ def yaml_scalar_continues(lines: list[str], index: int, indent: int) -> bool:
     return following is not None and len(following) - len(following.lstrip()) > indent
 
 
-def check_quick_checks(root: Path) -> list[str]:
-    errors: list[str] = []
-    bypass_key = r'''(?:if|continue-on-error|needs|"if"|"continue-on-error"|"needs"|'if'|'continue-on-error'|'needs')\s*:'''
-    for name in ("ci.yml",):
-        relative = f".github/workflows/{name}"
-        path = root / relative
-        job = yaml_block(path.read_text().splitlines(), "quick-checks", 2) if path.is_file() else None
-        if job is None:
-            errors.append(f"{relative}: missing Quick Checks job")
-            continue
-        conditions = [index for index, line in enumerate(job) if re.match(rf"^    {bypass_key}", line)]
-        expected = ["if: github.event_name != 'pull_request' || github.event.action != 'closed'"] if name == "ci.yml" else []
-        if [job[index].strip() for index in conditions] != expected or any(
-            yaml_scalar_continues(job, index, 4) for index in conditions
-        ):
-            errors.append(f"{relative}: Quick Checks job must not add dependencies, bypass failures, or change its event condition")
-        checkout_ref = SCHEDULED_ALERT_CHECKOUT_OVERRIDES.get(
-            relative, "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0"
-        )
-        checkout = workflow_step_block(job, checkout_ref)
-        action = workflow_step_block(job, "./.github/actions/quick-checks")
-        if checkout is None or action is None:
-            errors.append(f"{relative}: Quick Checks requires checkout and the shared quick-checks action")
-            continue
-        if checkout[0] >= action[0]:
-            errors.append(f"{relative}: checkout must run before shared Quick Checks")
-        if "          persist-credentials: false" not in checkout[1]:
-            errors.append(f"{relative}: Quick Checks checkout must disable persisted credentials")
-        for step in (checkout, action):
-            if any(re.match(rf"^\s+(?:- )?{bypass_key}", line) for line in step[1]):
-                errors.append(f"{relative}: Quick Checks checkout and shared action must run without bypasses")
+def shell_command_contract(source: str) -> list[str]:
+    """Normalize harmless multiline shell spelling; never accept extra commands."""
+    source = source.replace("\\\n", " ")
+    lines = [line.strip() for line in source.splitlines() if line.strip() and not line.lstrip().startswith("#")]
+    if lines and lines[0] == "set -euo pipefail":
+        lines.pop(0)
+    tokens = shlex.split(" ; ".join(lines), comments=True)
+    return [";" if token == "&&" else token for token in tokens]
 
-    relative = ".github/actions/quick-checks/action.yml"
-    path = root / relative
-    runs = yaml_block(path.read_text().splitlines(), "runs", 0) if path.is_file() else None
-    if runs is None or "  using: composite" not in runs:
-        errors.append(f"{relative}: missing composite action")
-        return errors
-    steps = yaml_block(runs, "steps", 2) or []
-    for command in (
-        "shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
-        "python3 ./scripts/test_object_generation_protocol_model.py",
-    ):
-        step = workflow_step_block(steps, command, key="run", indent=4)
-        if step is None:
-            errors.append(f"{relative}: missing direct execution of {command}")
-            continue
-        if "      shell: bash" not in step[1] or any(
-            re.match(rf"^\s+(?:- )?{bypass_key}", line) for line in step[1]
-        ):
-            errors.append(f"{relative}: {command} must use bash without a condition or continue-on-error")
-        run_index = next(
-            index for index, line in enumerate(step[1])
-            if line.split("#", 1)[0].rstrip() in (f"      run: {command}", f"    - run: {command}")
-        )
-        if yaml_scalar_continues(step[1], run_index, 6):
-            errors.append(f"{relative}: {command} must remain a single-line run scalar")
+
+def check_quick_checks(root: Path) -> list[str]:
+    from ci_gate import condition, workflow_document
+    errors: list[str] = []
+    try:
+        caller = workflow_document((root / ".github/workflows/ci.yml").read_text())
+        job = caller["jobs"]["quick-checks"]
+        if job.get("needs") or job.get("continue-on-error", "false") != "false":
+            errors.append("Quick Checks must not depend on other jobs or bypass failures")
+        for event in ("pull_request", "push", "merge_group", "schedule", "workflow_dispatch"):
+            for action in ("opened", "closed", "synchronize"):
+                context = {"github.event_name": event, "github.event.action": action}
+                if condition(job.get("if", "true"), context) != (event != "pull_request" or action != "closed"):
+                    errors.append("Quick Checks event condition changes required responsibility")
+        steps = job.get("steps", [])
+        checkout = [(index, step) for index, step in enumerate(steps) if step.get("uses", "").startswith("actions/checkout@")]
+        actions = [(index, step) for index, step in enumerate(steps) if step.get("uses") == "./.github/actions/quick-checks"]
+        if len(checkout) != 1 or len(actions) != 1 or checkout[0][0] >= actions[0][0]:
+            errors.append("Quick Checks requires checkout before its shared action")
+        else:
+            if checkout[0][1].get("with", {}).get("persist-credentials") != "false":
+                errors.append("Quick Checks checkout must disable persisted credentials")
+            for _, step in checkout + actions:
+                if "if" in step or step.get("continue-on-error", "false") != "false":
+                    errors.append("Quick Checks steps must not bypass execution or failure")
+        action = workflow_document((root / ".github/actions/quick-checks/action.yml").read_text())["runs"]
+        if action.get("using") != "composite":
+            errors.append("Quick Checks must use the shared composite action")
+        for command in ("shellcheck --version && actionlint", "./scripts/check_error_other_format_ratchet.sh", "make script-tests",
+                        "python3 ./scripts/test_object_generation_protocol_model.py"):
+            matching = [step for step in action.get("steps", []) if shell_command_contract(step.get("run", "")) == shell_command_contract(command)]
+            if len(matching) != 1:
+                errors.append(f"Quick Checks must execute {command} exactly once with failure propagation")
+            elif matching[0].get("shell") != "bash" or "if" in matching[0] or matching[0].get("continue-on-error", "false") != "false":
+                errors.append(f"Quick Checks must execute {command} in fail-fast bash without bypasses")
+    except (OSError, KeyError, TypeError, ValueError) as error:
+        errors.append(f"invalid Quick Checks contract: {error}")
     return errors
 
 
@@ -1239,21 +1249,9 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         return errors
     watchdog_on = yaml_block(watchdog_lines, "on", 0)
     watchdog_run = yaml_block(watchdog_on or [], "workflow_run", 2)
-    watchdog_workflows = yaml_block(watchdog_run or [], "workflows", 4)
-    if watchdog_workflows is None:
-        errors.append(".github/workflows/scheduled-validation-watchdog.yml: missing workflow_run workflows")
-        return errors
-    watchdog_sources = "\n".join(line.split("#", 1)[0] for line in watchdog_workflows)
-    for relative in SCHEDULED_ALERT_WORKFLOWS:
-        path = root / relative
-        if not path.is_file():
-            continue
-        source = path.read_text()
-        match = re.search(r"^name:\s*[\"']?([^\"'\n]+)", source, re.MULTILINE)
-        if not match:
-            errors.append(f"{relative}: missing workflow name")
-        elif f'- "{match.group(1).strip()}"' not in watchdog_sources:
-            errors.append(f"{relative}: missing from scheduled completion watchdog")
+    watchdog_sources = "\n".join(line.split("#", 1)[0] for line in watchdog_run or [])
+    if not re.search(r'^    workflows:\s*\["\*"\]\s*$', watchdog_sources, re.MULTILINE):
+        errors.append(".github/workflows/scheduled-validation-watchdog.yml: missing registry-wide completion subscription")
     watchdog_job_lines = yaml_block(watchdog_lines, "alert-on-incomplete-run", 2)
     if watchdog_job_lines is None:
         errors.append(".github/workflows/scheduled-validation-watchdog.yml: missing alert-on-incomplete-run job")
@@ -1264,9 +1262,9 @@ def check_scheduled_alerts(root: Path) -> list[str]:
         "actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0",
     )
     required = (
-        "github.event.workflow_run.event == 'schedule'",
-        "github.event.workflow_run.conclusion != 'success'",
-        "github.event.workflow_run.conclusion != 'failure'",
+        "python3 scripts/validation_registry.py watchdog",
+        "id: registry",
+        "if: steps.registry.outputs.selected == 'true'",
         "actions: read",
         "issues: write",
         f"uses: {watchdog_checkout_ref}",
@@ -1289,7 +1287,7 @@ def check_scheduled_alerts(root: Path) -> list[str]:
             ".github/workflows/scheduled-validation-watchdog.yml: " + error
             for error in alert_step_errors(
                 watchdog_job_lines,
-                None,
+                "if: steps.registry.outputs.selected == 'true'",
                 ("actions: read", "issues: write"),
                 (
                     "github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}",
@@ -3548,6 +3546,11 @@ class SelfTests(unittest.TestCase):
                 path.parent.mkdir(parents=True, exist_ok=True)
                 path.write_text(source)
             self.assertEqual(check_quick_checks(root), [])
+            for command in ("shellcheck --version && actionlint", "make script-tests"):
+                formatted = action.replace(f"run: {command}", f"run: |\n        {command}")
+                (root / ".github/actions/quick-checks/action.yml").write_text(formatted)
+                self.assertEqual(check_quick_checks(root), [])
+            (root / ".github/actions/quick-checks/action.yml").write_text(action)
             for relative in (".github/workflows/ci.yml",):
                 source = sources[relative]
                 mutations = {
@@ -5573,46 +5576,35 @@ class SelfTests(unittest.TestCase):
             listing.write_text("not json")
             self.assertIn("cannot read", check_core_listing(root, listing)[0])
 
-    def test_ilm_lane_keeps_the_measured_cargo_build_budget(self) -> None:
+    def test_ilm_lane_keeps_archive_reuse_and_serial_execution(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             workflow = root / ".github/workflows/ci.yml"
             workflow.parent.mkdir(parents=True)
-            valid = (
-                "jobs:\n"
-                "  test-and-lint:\n"
-                "    steps:\n"
-                "      - name: Run ignored ILM integration tests serially\n"
-                "        if: needs.classify-changes.outputs.mode == 'full'\n"
-                "        env:\n"
-                "          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}\n"
-                "        run: |\n"
-                "          cargo nextest run --profile default -j1 --run-ignored ignored-only --all --exclude e2e_test \\\n"
-                "            -E 'binary(lifecycle_integration_test) or (package(rustfs) and test(lifecycle_transition_api_test))'\n"
-                "          status=${PIPESTATUS[0]}\n"
-                '          exit "${status}"\n'
-                "  next-job:\n"
-                "    steps: []\n"
-            )
+            valid = (ROOT / ".github/workflows/ci.yml").read_text()
             workflow.write_text(valid)
             self.assertEqual(check_ilm_build_budget(root), [])
-
-            workflow.write_text(valid.replace("          CARGO_BUILD_JOBS:", "          BUILD_JOBS:"))
-            self.assertEqual(len(check_ilm_build_budget(root)), 1)
             for old, new in (
                 ("&& '3' || '2' }}", "&& '3' || '3' }}"),
-                ("&& '3' || '2' }}", "&& '2' || '2' }}"),
-                ("test-and-lint:", "test-ilm-integration-serial:"),
                 ("outputs.mode == 'full'", "outputs.mode == 'docs'"),
-                ("--profile default", "--profile ci"),
-                ("-j1", "-j2"),
+                ("--profile default -j1", "--profile ci -j1"),
+                ("-j1 --run-ignored", "-j2 --run-ignored"),
                 ("ignored-only", "default"),
-                ("--all --exclude e2e_test", "-p rustfs-scanner -p rustfs"),
                 ("binary(lifecycle_integration_test)", "none()"),
                 ('exit "${status}"', "exit 0"),
+                ("--archive-file", "--not-an-archive"),
+                ("--cargo-metadata", "--not-cargo-metadata"),
+                ("--binaries-metadata", "--not-binaries-metadata"),
+                ("target/nextest/binaries-metadata.json", "target/unrelated.json"),
+                ('--extract-to "$GITHUB_WORKSPACE"', '--extract-to "$RUNNER_TEMP"'),
+                ("verify --configuration workspace", "verify --configuration e2e"),
+                ("build --configuration workspace", "build --configuration e2e"),
             ):
                 workflow.write_text(valid.replace(old, new))
                 self.assertTrue(check_ilm_build_budget(root), (old, new))
+            # Formatting and the consumer job ID are not execution contracts.
+            workflow.write_text(valid.replace("  workspace-tests:", "  renamed-workspace-tests:"))
+            self.assertEqual(check_ilm_build_budget(root), [])
 
     def test_vault_tests_require_cross_process_serialization(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -5953,7 +5945,6 @@ class SelfTests(unittest.TestCase):
             ".github/workflows/ci.yml",
             ".github/workflows/fuzz.yml",
             ".github/workflows/nightly-gnu.yml",
-            ".github/workflows/performance-ab.yml",
             ".github/workflows/runner-hygiene.yml",
         )
         with tempfile.TemporaryDirectory() as tmp:
@@ -5986,19 +5977,19 @@ class SelfTests(unittest.TestCase):
             freshness_checkout = new_checkout
             watchdog = root / ".github/workflows/scheduled-validation-watchdog.yml"
             watchdog.write_text(
-                "on:\n  workflow_run:\n    workflows:\n"
-                + "\n".join(f'      - "{name}"' for name in names)
-                + "\njobs:\n"
+                'on:\n  workflow_run:\n    workflows: ["*"]\n'
+                + "jobs:\n"
                 + "  alert-on-incomplete-run:\n"
-                + "    github.event.workflow_run.event == 'schedule'\n"
-                + "    github.event.workflow_run.conclusion != 'success'\n"
-                + "    github.event.workflow_run.conclusion != 'failure'\n"
+
                 + "    permissions:\n"
                 + "      actions: read\n"
                 + "      issues: write\n"
                 + "    steps:\n"
                 + f"      - uses: {watchdog_checkout}\n"
+                + "      - run: python3 scripts/validation_registry.py watchdog\n"
+                + "        id: registry\n"
                 + "      - uses: ./.github/actions/schedule-failure-issue\n"
+                + "        if: steps.registry.outputs.selected == 'true'\n"
                 + "        with:\n"
                 + "          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}\n"
                 + "          workflow-name: ${{ github.event.workflow_run.name }}\n"
@@ -6173,14 +6164,14 @@ class SelfTests(unittest.TestCase):
             first.write_text(first_original)
 
             watchdog.write_text(
-                watchdog_original.replace(f'      - "{names[0]}"\n', "")
+                watchdog_original.replace('    workflows: ["*"]\n', '    workflows: ["unrelated"]\n')
                 + f'  decoy:\n    strategy:\n      matrix:\n        workflow:\n          - "{names[0]}"\n'
                 + '    runs-on: ubuntu-latest\n    steps:\n      - run: true\n'
             )
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             watchdog.write_text(watchdog_original)
 
-            watchdog.write_text(watchdog_original.replace(f'      - "{names[0]}"\n', ""))
+            watchdog.write_text(watchdog_original.replace('    workflows: ["*"]\n', '    workflows: ["unrelated"]\n'))
             self.assertEqual(len(check_scheduled_alerts(root)), 1)
             watchdog.write_text(watchdog_original)
             original = first.read_text()

@@ -8750,6 +8750,89 @@ mod tests {
 
     #[tokio::test]
     #[serial(remote_disk_recovery_probe)]
+    async fn endpoint_reconnect_admits_ready_drive_while_another_format_probe_is_blocked() {
+        runtime_sources::ensure_test_rpc_secret();
+        let reference = crate::layout::format::FormatV3::new(1, 2);
+        let mut peers = Vec::new();
+        let mut endpoints = Vec::new();
+        for index in 0..2 {
+            let mut format = reference.clone();
+            format.erasure.this = reference.erasure.sets[0][index];
+            let peer = TestGrpcPeer::spawn(
+                Bytes::from(format.to_json().expect("format should serialize")),
+                Bytes::from_static(b"recovered-peer-data"),
+            )
+            .await
+            .expect("authenticated regression peer is required");
+            endpoints.push(Endpoint {
+                url: url::Url::parse(&format!("{}/data/rustfs{index}", peer.addr)).expect("endpoint should parse"),
+                is_local: false,
+                pool_idx: 0,
+                set_idx: 0,
+                disk_idx: i32::try_from(index).expect("fixture index fits"),
+            });
+            peers.push(peer);
+        }
+        let set = crate::set_disk::SetDisks::new(
+            "independent-reconnect-test".to_owned(),
+            Arc::new(tokio::sync::RwLock::new(vec![None; 2])),
+            2,
+            1,
+            0,
+            0,
+            endpoints,
+            reference.clone(),
+            Vec::new(),
+        )
+        .await;
+        let gate = peers[0].peer.pause_next_format_read();
+        let pending_set = Arc::clone(&set);
+        let pending = tokio::spawn(async move { pending_set.connect_disks().await });
+        time::timeout(Duration::from_secs(10), gate.entered.notified())
+            .await
+            .expect("the first endpoint must reach the format barrier");
+
+        let ready = time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(disk) = set.disks.read().await[1].clone() {
+                    return disk;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if let Ok(disk) = &ready {
+            assert!(set.disks.read().await[0].is_none(), "the blocked endpoint must remain unpublished");
+            assert!(!pending.is_finished(), "the sweep still owns its blocked endpoint probe");
+            assert_eq!(
+                disk.read_all("bucket", "object")
+                    .await
+                    .expect("the ready endpoint must serve real I/O"),
+                Bytes::from_static(b"recovered-peer-data")
+            );
+            assert_eq!(
+                peers[1].peer.object_read_all_disks(),
+                vec![reference.erasure.sets[0][1].to_string()],
+                "the usable handle must carry its validated slot identity"
+            );
+        }
+        gate.release.cancel();
+        pending.await.expect("all endpoint probes must finish after release");
+        for disk in set.disks.read().await.iter().flatten() {
+            disk.close().await.expect("stop each published handle's monitoring");
+        }
+        for peer in peers {
+            peer.stop().await;
+        }
+        ready.expect("a blocked earlier endpoint must not delay a ready drive in the same set");
+        assert!(
+            set.disks.read().await.iter().all(Option::is_some),
+            "both endpoints must eventually be admitted"
+        );
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
     async fn missing_read_disks_preserve_concurrently_published_handles() {
         runtime_sources::ensure_test_rpc_secret();
         let mut reference = crate::layout::format::FormatV3::new(1, 1);

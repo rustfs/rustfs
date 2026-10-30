@@ -44,7 +44,7 @@ shown. The manifest contains their complete module paths.
 | MPU delete quorum | `abort_enforces_delete_write_quorum_boundary` | Abort requires the existing delete write quorum. |
 | MPU physical publication | `complete_multipart_timeout_keeps_namespace_owner_until_physical_publication` | Timeout cannot retire an active physical publication. |
 | Restore failures | `multipart_restore_aborts_every_post_create_failure` | Every injected post-create failure aborts the remote upload. |
-| Partial LIST metadata | `rustfs-filemeta`: `resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge` | A partial newer version remains hidden. |
+| Partial LIST metadata | `rustfs-filemeta`: `resolve_merge_keeps_the_newest_version_at_listing_quorum` | A newer version below the listing quorum remains hidden behind the committed version. |
 | Metadata observations | `metadata_observation_all_four_slot_states_and_arrival_orders_preserve_reduction` and its companion tests | Pending, absent, corrupt, offline and successful disk slots retain the existing quorum decisions across all four-slot arrival orders. |
 | Metadata cache bodies | `metadata_cache_real_get_and_range_preserve_body_across_read_modes` | Real cache misses and hits return identical full-body and non-zero Range bytes for verified inline/non-inline objects, with early-stop enabled/disabled and one offline disk. Hits share a complete four-slot snapshot containing all available disks and issue no new metadata reads. |
 | Late metadata identity | `late_metadata_refresh_rejects_changed_generation_and_mapped_shards` | Metadata from a real four-disk PUT still reaches selection quorum, but changed generation or incorrect per-slot shard mapping fails the disk-backed late-refresh boundary with an object-scoped read-quorum error. |
@@ -100,10 +100,13 @@ Removing only the two old #7049 limit guards still passes because the recursive
 child's stop result provides another protection. Removing those guards and
 ignoring that result in the same stack-draining loop makes raw limit 1 return
 `a/first` and `a0` instead of only `a/first`. This tests the historical invariant,
-not a literal revert of #7049. Setting the current offline write-quorum
-allowance to zero makes the #7010 corpus return `InsufficientReadQuorum` where
+not a literal revert of #7049. At that main, setting the offline write-quorum
+allowance to zero made the #7010 corpus return `InsufficientReadQuorum` where
 the independent oracle requires visible objects. Restoring both production
-files passes both tests. These local controls do not establish a concurrent
+files passes both tests. The listing now takes its quorum as `ceil(asked/2)`
+of the online drives it asked (MinIO's rule), so the #7010 boundary needs two
+copies among three online drives; a write-quorum requirement of three would
+hide those objects again. These local controls do not establish a concurrent
 cross-page snapshot or process-crash safety.
 
 ## Write owner and completion routes

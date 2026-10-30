@@ -42,5 +42,6 @@ mod scanner_heal_topology_tier_test;
 mod scanner_peer_bucket_fixture;
 mod scanner_peer_bucket_test;
 mod site_replication_test;
+mod table_catalog_test;
 mod upgrade_test;
 mod versioning_test;

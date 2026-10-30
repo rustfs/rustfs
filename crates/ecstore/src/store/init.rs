@@ -5090,8 +5090,8 @@ mod tests {
             assert!(Arc::ptr_eq(disk, expected), "endpoint monitor must not replace an offline test handle");
             assert_eq!(disk.runtime_state(), crate::disk::health_state::RuntimeDriveHealthState::Offline);
             assert!(
-                disk.is_online().await,
-                "the valid disk identity must prevent endpoint renewal while the IO health gate remains offline"
+                !disk.is_online().await,
+                "the explicit drive fault must survive renewal despite a valid disk identity"
             );
         }
         OfflineTestDisks { disks }
@@ -11991,6 +11991,7 @@ mod tests {
             ..Default::default()
         });
 
+        let mut stage_started = std::time::Instant::now();
         futures::stream::iter(0..RECEIPT_COUNT)
             .map(|index| {
                 let store = store.clone();
@@ -12024,15 +12025,21 @@ mod tests {
             .try_collect::<Vec<_>>()
             .await
             .expect("more than one receipt page should persist");
+        eprintln!("receipt fixture: seed {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         store
             .persist_decommission_durable_ilm_manifest_for_test(0)
             .await
             .expect("paginated source receipts should produce a manifest");
+        eprintln!("receipt fixture: manifest {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
 
         let target_receipts = store
             .decommission_durable_ilm_receipt_paths_for_test(0)
             .await
             .expect("paginated target receipts should list");
+        eprintln!("receipt fixture: list {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         assert_eq!(target_receipts.len(), RECEIPT_COUNT);
         let (target_pool_idx, second_page_path) = target_receipts
             .get(1000)
@@ -12050,6 +12057,8 @@ mod tests {
             .await
             .expect_err("a missing second page receipt must block completion")
             .to_string();
+        eprintln!("receipt fixture: missing {:.3}s", stage_started.elapsed().as_secs_f64());
+        stage_started = std::time::Instant::now();
         assert!(missing.contains(&second_page_path));
         assert!(
             !store.pool_meta.read().await.pools[0]
@@ -12076,6 +12085,7 @@ mod tests {
             .await
             .expect_err("a corrupt second page receipt must block completion")
             .to_string();
+        eprintln!("receipt fixture: corrupt {:.3}s", stage_started.elapsed().as_secs_f64());
         assert!(corrupt.contains(&second_page_path));
         assert!(corrupt.contains("invalid"));
         assert!(
@@ -21386,6 +21396,141 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
+    async fn put_object_metadata_and_copy_object_reuse_overlapping_incarnation_fence() {
+        let temp = tempfile::tempdir().expect("create metadata/copy fence store");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "metadata-copy-fence-reuse", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("metadata-copy-fence-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let mut seed_reader = PutObjReader::from_vec(b"seed payload".to_vec());
+        let versioned_opts = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        let mut src_info = store
+            .put_object(&bucket, "src.bin", &mut seed_reader, &versioned_opts)
+            .await
+            .expect("seed source object");
+        let src_version_id = src_info
+            .version_id
+            .expect("versioned PUT should return a version ID")
+            .to_string();
+        let expected = store.bucket_incarnation_id(&bucket).await.expect("read incarnation");
+        let coverage = store
+            .acquire_bucket_incarnation_fence(&bucket, expected)
+            .await
+            .expect("validate continuous coverage");
+        let metadata_writer = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_lock_in(&store.ctx, &bucket)
+            .await
+            .expect("hold metadata writer during covered metadata and copy operations");
+
+        let updated = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.put_object_metadata(
+                &bucket,
+                "src.bin",
+                &ObjectOptions {
+                    version_id: Some(src_version_id.clone()),
+                    versioned: true,
+                    eval_metadata: Some(HashMap::from([("x-amz-meta-fenced".to_string(), "true".to_string())])),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("covered put_object_metadata must not reacquire the metadata transaction lock")
+        .expect("update object metadata using authoritative memo");
+        assert_eq!(updated.user_defined.get("x-amz-meta-fenced").map(String::as_str), Some("true"));
+
+        Arc::make_mut(&mut src_info.user_defined).insert("x-amz-meta-copied".to_string(), "true".to_string());
+        let src_copy_opts = ObjectOptions {
+            version_id: Some(src_version_id),
+            versioned: true,
+            ..Default::default()
+        };
+        let copied = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.copy_object(&bucket, "src.bin", &bucket, "src.bin", &mut src_info, &src_copy_opts, &versioned_opts),
+        )
+        .await
+        .expect("covered versioned copy_object must not reacquire the metadata transaction lock")
+        .expect("versioned copy using authoritative memo");
+        assert_eq!(copied.user_defined.get("x-amz-meta-copied").map(String::as_str), Some("true"));
+
+        let (src_guard, src_incarnation, dst_guard, dst_incarnation) = tokio::time::timeout(
+            Duration::from_secs(10),
+            store.acquire_copy_bucket_incarnation_fences(&bucket, Some(expected), &bucket, Some(expected)),
+        )
+        .await
+        .expect("covered acquire_copy_bucket_incarnation_fences must not reacquire the metadata transaction lock")
+        .expect("validate same-bucket copy fences using authoritative memo");
+        assert!(dst_guard.is_none());
+        assert_eq!(src_incarnation, expected);
+        assert_eq!(dst_incarnation, expected);
+        let mut borrowed_fence_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(expected),
+            ..Default::default()
+        };
+        src_guard.attach_to_object_options(&mut borrowed_fence_opts);
+        let fenced_incarnation = tokio::time::timeout(
+            Duration::from_secs(10),
+            crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&store.ctx, &bucket, &borrowed_fence_opts),
+        )
+        .await
+        .expect("borrowed fence under active coverage must not reacquire the metadata transaction lock")
+        .expect("resolve incarnation under borrowed fence");
+        assert_eq!(fenced_incarnation, expected);
+        assert!(
+            matches!(
+                store
+                    .acquire_copy_bucket_incarnation_fences(&bucket, Some(expected), &bucket, Some(Uuid::new_v4()))
+                    .await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "same-bucket copy fence must reject a mismatched destination incarnation"
+        );
+        drop(src_guard);
+
+        let stale_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(Uuid::new_v4()),
+            versioned: true,
+            ..Default::default()
+        };
+        assert!(
+            matches!(
+                store.put_object_metadata(&bucket, "src.bin", &stale_opts).await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "put_object_metadata must reject a stale expected incarnation even under warm coverage"
+        );
+        assert!(
+            matches!(
+                store
+                    .copy_object(
+                        &bucket,
+                        "src.bin",
+                        &bucket,
+                        "src.bin",
+                        &mut src_info,
+                        &ObjectOptions::default(),
+                        &stale_opts,
+                    )
+                    .await,
+                Err(StorageError::BucketNotFound(_))
+            ),
+            "copy_object must reject a stale expected incarnation even under warm coverage"
+        );
+        drop(metadata_writer);
+        drop(coverage);
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
     async fn multipart_snapshot_bypasses_initializer_queued_behind_metadata_writer() {
         let temp = tempfile::tempdir().expect("create snapshot validation store");
         let (_ctx, store, shutdown) =
@@ -21469,10 +21614,25 @@ mod tests {
             .acquire_bucket_incarnation_fence(&bucket, old)
             .await
             .expect("validate with no-op lock");
+        let snapshot = store
+            .object_lock_config_snapshot_under_lifecycle_fence(&bucket, &crate::object_api::NamespaceLockFence::new())
+            .await
+            .expect("capture snapshot under no-op lock");
         let current = Uuid::new_v4();
         crate::bucket::metadata::save_bucket_incarnation(store.clone(), &bucket, current)
             .await
             .expect("replace authority while no-op guard provides no exclusion");
+        let snapshot_opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(old),
+            object_lock_config_snapshot: Some(snapshot),
+            ..Default::default()
+        };
+        assert_eq!(
+            crate::bucket::metadata_sys::get_bucket_incarnation_id_for_options_in(&store.ctx, &bucket, &snapshot_opts)
+                .await
+                .expect("disabled lock manager must re-read incarnation from disk instead of trusting snapshot"),
+            current
+        );
         assert!(
             matches!(
                 store.acquire_bucket_incarnation_fence(&bucket, old).await,

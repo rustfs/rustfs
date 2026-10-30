@@ -357,6 +357,7 @@ where
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QueuedPayloadMeta {
+    #[serde(deserialize_with = "rustfs_s3_types::deserialize_persisted_event_name")]
     pub event_name: EventName,
     pub bucket_name: String,
     pub object_name: String,
@@ -1175,6 +1176,24 @@ mod tests {
         assert!(json.contains("dedup_id"));
         let decoded: QueuedPayloadMeta = serde_json::from_str(&json).unwrap();
         assert_eq!(decoded.dedup_id, "minted-id");
+    }
+
+    /// Regression: the internal multipart events were dropped on replay because their
+    /// persisted name did not parse back.
+    #[test]
+    fn queued_payload_round_trips_internal_event_names() {
+        for event in [
+            EventName::ObjectCreatedCreateMultipartUpload,
+            EventName::ObjectRemovedAbortMultipartUpload,
+            EventName::ObjectRemovedDeleteObjects,
+            EventName::AuditS3Operation,
+        ] {
+            let body = br#"{"ok":true}"#.to_vec();
+            let meta = QueuedPayloadMeta::new(event, "bucket-a".to_string(), "obj".to_string(), "application/json", body.len());
+            let encoded = QueuedPayload::new(meta, body).encode().unwrap();
+            let decoded = QueuedPayload::decode(&encoded).unwrap_or_else(|err| panic!("{event:?} dropped on replay: {err}"));
+            assert_eq!(decoded.meta.event_name, event);
+        }
     }
 
     #[test]
