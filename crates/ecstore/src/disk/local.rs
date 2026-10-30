@@ -17755,6 +17755,54 @@ mod test {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit)]
+    #[allow(clippy::await_holding_lock)]
+    async fn rename_data_inline_new_version_fsync_failure_preserves_previous_metadata() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temp dir should be created");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+        let bucket = "inline-version-fsync-failure";
+        let object = "dir/object";
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        let old_version = Uuid::new_v4();
+        let old_fi = test_file_info(object, old_version, None, Some(Bytes::from_static(b"previous-inline-version")));
+        disk.rename_data(RUSTFS_META_TMP_BUCKET, "old-inline-stage", old_fi, bucket, object)
+            .await
+            .expect("previous inline version should commit");
+        let dst_meta = disk
+            .get_object_path(bucket, &format!("{object}/{STORAGE_FORMAT_FILE}"))
+            .expect("metadata path should resolve");
+        let previous = fs::read(&dst_meta).await.expect("previous metadata should be readable");
+        let destination_dir = dst_meta.parent().expect("metadata should have a parent").to_path_buf();
+        // Arm the failure after the fused-path selection so the test exercises
+        // its normal admission path instead of the failpoint fallback.
+        set_inline_before_file_sync_admission(object, move || {
+            os::fsync_dir_recorder::set_failure(&destination_dir, io::ErrorKind::PermissionDenied);
+        });
+
+        let new_version = Uuid::new_v4();
+        let new_fi = test_file_info(object, new_version, None, Some(Bytes::from_static(b"incoming-inline-version")));
+        let err = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "new-inline-stage", new_fi, bucket, object)
+            .await
+            .expect_err("directory fsync failure must reject the new version");
+        assert!(matches!(err, DiskError::Io(ref err) if err.kind() == io::ErrorKind::PermissionDenied));
+        let restored = fs::read(&dst_meta)
+            .await
+            .expect("previous metadata must survive the failed commit");
+        assert_eq!(restored, previous, "rollback must restore all previously committed inline versions");
+        let metadata = FileMeta::load(&restored).expect("restored metadata must be valid");
+        assert!(metadata.find_version(Some(old_version)).is_ok());
+        assert!(metadata.find_version(Some(new_version)).is_err());
+    }
+
     // Seed a first PUT of `object` (no prior version) through the non-inline
     // rename_data path and return (disk, tempdir). The object dir and any prefix
     // dirs are created during the commit.

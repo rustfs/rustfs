@@ -785,7 +785,10 @@ impl LocalDisk {
                     &dst_volume_dir_owned,
                     &publication_root_owned,
                 )?;
-                if is_cancelled() {
+                // A new inline version can share xl.meta with older versions
+                // without having a rollback_data_dir. Keep the backup-aware
+                // path when a failed metadata sync must restore that file.
+                if is_cancelled() || (!no_inline && sync_commit_metadata && has_dst_buf.is_some()) {
                     return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
                 }
                 let mut xlmeta = FileMeta::new();
