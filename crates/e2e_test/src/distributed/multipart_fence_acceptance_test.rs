@@ -18,7 +18,7 @@ use super::harness::{
 };
 use crate::common::{ClusterTopology, RustFSTestClusterEnvironment};
 use crate::rpc_fault_proxy::{RpcFaultProxy, RpcPause};
-use crate::storage_api::multipart_fence_acceptance::RUSTFS_META_MULTIPART_BUCKET;
+use crate::storage_api::multipart_fence_acceptance::{LOCK_DIAGNOSTICS_FILTER, RUSTFS_META_MULTIPART_BUCKET};
 use aws_sdk_s3::{
     Client,
     config::retry::RetryConfig,
@@ -93,10 +93,7 @@ async fn fixture_from_binary(
         cluster.set_env(name, value);
     }
     if lock_diagnostics {
-        cluster.set_env(
-            "RUST_LOG",
-            "warn,rustfs_lock::distributed_lock=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_ecstore::cluster::rpc::remote_locker=info",
-        );
+        cluster.set_env("RUST_LOG", LOCK_DIAGNOSTICS_FILTER);
         cluster.set_env("RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "true");
     }
     let mut proxies = Vec::new();

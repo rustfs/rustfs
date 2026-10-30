@@ -15,7 +15,7 @@
 //! Full namespace POST coverage. The response tap retains an actual server-side
 //! output owner; a network client's Bytes would not own that reservation.
 
-use super::{InternodeRpcService, NS_SCANNER_PATH, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_SERVER_EPOCH};
+use super::{Body, InternodeRpcService, NS_SCANNER_PATH, NS_SCANNER_PROTOCOL_VERSION, NS_SCANNER_SERVER_EPOCH, StreamingBlob};
 use crate::storage::storage_api::ecstore_config::com::{read_config, save_config};
 use crate::storage::storage_api::ecstore_rpc::gen_signature_headers;
 use crate::storage::storage_api::rpc_consumer::http_service::DiskAPI as _;
@@ -194,7 +194,7 @@ async fn run_namespace_case(mode: &str) {
             let retained = server_retained.clone();
             let status = server_status.clone();
             async move {
-                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) });
+                let fallback = tower::service_fn(|_| async { Ok::<_, Infallible>(Response::new(Body::empty())) });
                 let mut receiver = InternodeRpcService::new(fallback);
                 let response = receiver.call(request).await?;
                 status.store(response.status().as_u16(), Ordering::Release);
@@ -206,7 +206,7 @@ async fn run_namespace_case(mode: &str) {
                 });
                 Ok::<_, Infallible>(Response::from_parts(
                     parts,
-                    s3s::Body::from(s3s::dto::StreamingBlob::wrap(tapped.map_err(std::io::Error::other))),
+                    Body::from(StreamingBlob::wrap(tapped.map_err(std::io::Error::other))),
                 ))
             }
         });

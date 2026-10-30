@@ -496,19 +496,18 @@ impl ReedSolomonEncoder {
         }
 
         if let Some(ref rs) = self.encoder {
-            if let Some(memory) = current_resource_unit().and_then(|resources| resources.memory_budget())
+            let result = if let Some(memory) = current_resource_unit().and_then(|resources| resources.memory_budget())
                 && let Some(shard_len) = shards.first().map(|shard| shard.len()).filter(|len| *len != 0)
             {
                 let scratch_len = shard_len.checked_mul(self.parity_shards).ok_or(io::ErrorKind::OutOfMemory)?;
                 let mut scratch = BackgroundBuffer::new(Some(memory));
                 scratch.ensure_len(scratch_len)?;
                 let mut buffers: SmallVec<[&mut [u8]; 16]> = scratch.as_mut_slice().chunks_mut(shard_len).collect();
-                return rs
-                    .verify_with_buffer(shards, &mut buffers)
-                    .map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")));
-            }
-            rs.verify(shards)
-                .map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")))
+                rs.verify_with_buffer(shards, &mut buffers)
+            } else {
+                rs.verify(shards)
+            };
+            result.map_err(|e| io::Error::other(format!("Reed-Solomon verify failed: {e:?}")))
         } else {
             Ok(true)
         }
