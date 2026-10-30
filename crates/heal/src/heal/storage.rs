@@ -836,6 +836,16 @@ pub(super) async fn run_local_metadata<T>(
     }
 }
 
+// An object heal future is hundreds of KiB and unoptimized builds copy it into
+// every awaiting frame. Create it here, where the temporary leaves the stack as
+// soon as it is boxed, so the admission layers carry only a pointer.
+fn boxed_object_operation<F, Fut>(operation: F) -> std::pin::Pin<Box<Fut>>
+where
+    F: FnOnce() -> Fut,
+{
+    Box::pin(operation())
+}
+
 // Scheduling precedes the operation's first poll and therefore its namespace
 // locks. No-lock callers may already own a namespace lock: never park them.
 async fn run_background_object<T>(
@@ -962,7 +972,7 @@ impl ECStoreHealStorage {
             opts,
             task_cancel,
             |result: &(HealResultItem, Option<Error>)| result.1.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 debug!(
                     target: "rustfs::heal::storage",
                     event = EVENT_HEAL_STORAGE_REPAIR_OP,
@@ -987,7 +997,7 @@ impl ECStoreHealStorage {
                     opts,
                     self.ecstore.heal_object(bucket, object, version_id_str, opts).await,
                 )
-            },
+            }),
         )
         .await
     }
@@ -1282,7 +1292,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
@@ -1291,7 +1301,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
                     .await)
-            },
+            }),
         )
         .await
     }
@@ -1309,7 +1319,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_mrf_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
@@ -1318,7 +1328,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
                     .await)
-            },
+            }),
         )
         .await
     }
@@ -1776,7 +1786,7 @@ impl HealStorageAPI for ECStoreHealStorage {
             || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
             opts,
             |result: &HealStorageObjectResult| result.error.is_none(),
-            async {
+            boxed_object_operation(|| async {
                 let result = self
                     .ecstore
                     .heal_object_with_proof(bucket, object, version_id.unwrap_or(""), opts)
@@ -1785,7 +1795,7 @@ impl HealStorageAPI for ECStoreHealStorage {
                 Ok(self
                     .object_result_with_receipt(bucket, object, version_id, opts, result, None)
                     .await)
-            },
+            }),
         )
         .await
     }
