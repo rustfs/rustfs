@@ -43,6 +43,60 @@ mod tests {
             .map(|value| value.to_str().expect("allow-origin header must be valid UTF-8").to_string())
     }
 
+    /// Runs a request through a router that returns a brotli-encoded response without
+    /// `Content-Length` and returns the response's `content-length` header value, if any.
+    async fn brotli_response_content_length(has_content_length: bool) -> Option<String> {
+        use crate::admin::console::buffer_brotli_responses;
+        use axum::middleware;
+        use axum::{Router, body::Body, routing::get};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || async move {
+                    let mut builder = http::Response::builder().header(http::header::CONTENT_ENCODING, "br");
+                    if has_content_length {
+                        builder = builder.header(http::header::CONTENT_LENGTH, "4");
+                    }
+                    builder.body(Body::from("data")).expect("response must build")
+                }),
+            )
+            .layer(middleware::from_fn(buffer_brotli_responses));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("request must not fail");
+
+        response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .map(|value| value.to_str().expect("content-length header must be valid UTF-8").to_string())
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_buffer_brotli_responses() {
+        // Brotli response without Content-Length must have Content-Length added.
+        assert!(
+            brotli_response_content_length(false).await.is_some(),
+            "brotli response without Content-Length must have Content-Length added"
+        );
+
+        // Brotli response that already carries Content-Length must pass through unchanged.
+        assert_eq!(
+            brotli_response_content_length(true).await.as_deref(),
+            Some("4"),
+            "brotli response that already has Content-Length must not be re-buffered"
+        );
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_console_cors_configuration() {

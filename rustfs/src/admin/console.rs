@@ -433,6 +433,40 @@ async fn config_handler(uri: Uri, headers: HeaderMap) -> impl IntoResponse {
         .unwrap()
 }
 
+/// Buffers brotli-encoded responses to add a `Content-Length` header.
+///
+/// `tower_http`'s `CompressionLayer` streams brotli via `Transfer-Encoding: chunked`
+/// without a `Content-Length`. Firefox's incremental brotli decoder aborts on this
+/// combination (`NS_BINDING_ERROR`). Chrome and Safari buffer the full chunked body
+/// before decompressing and are unaffected.
+///
+/// This middleware collects the complete body for any brotli response that lacks a
+/// `Content-Length`, then re-emits it with the correct length so Firefox can decode it.
+pub(crate) async fn buffer_brotli_responses(request: Request, next: middleware::Next) -> Response {
+    let response = next.run(request).await;
+
+    let is_brotli = response
+        .headers()
+        .get(http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v == "br");
+
+    if !is_brotli || response.headers().contains_key(http::header::CONTENT_LENGTH) {
+        return response;
+    }
+
+    let (mut parts, body) = response.into_parts();
+    match axum::body::to_bytes(body, 32 * 1024 * 1024).await {
+        Ok(bytes) => {
+            if let Ok(value) = HeaderValue::from_str(&bytes.len().to_string()) {
+                parts.headers.insert(http::header::CONTENT_LENGTH, value);
+            }
+            Response::from_parts(parts, Body::from(bytes))
+        }
+        Err(_) => Response::from_parts(parts, Body::empty()),
+    }
+}
+
 /// Console access logging middleware
 /// Logs each console access with method, URI, status code, and duration.
 ///
@@ -605,6 +639,8 @@ fn setup_console_middleware_stack(
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))
         // Compress responses
         .layer(CompressionLayer::new())
+        // Buffer brotli responses to add Content-Length
+        .layer(middleware::from_fn(buffer_brotli_responses))
         .layer(middleware::from_fn(console_logging_middleware))
         .layer(cors_layer)
         // Add timeout layer - convert auth_timeout from seconds to Duration
