@@ -640,6 +640,19 @@ impl ECStore {
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
         }
 
+        if self.single_pool() && !self.is_suspended(0).await && !self.is_pool_rebalancing(0).await {
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
+                .await;
+            let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+            let lock_object = encode_dir_object(object);
+            let res = self
+                .run_external_decommission_capacity_object_mutation(0, bucket, &lock_object, object, opts, |opts| async move {
+                    self.pools[0].new_multipart_upload(bucket, object, &opts).await
+                })
+                .await?;
+            return Ok((res, 0, expected_bucket_incarnation_id));
+        }
+
         for (idx, pool) in self.pools.iter().enumerate() {
             if self.is_suspended(idx).await || self.is_pool_rebalancing(idx).await {
                 continue;

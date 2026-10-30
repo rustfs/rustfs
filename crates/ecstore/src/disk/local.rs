@@ -3686,6 +3686,26 @@ fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_s
 #[cfg(not(target_os = "linux"))]
 fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
 
+static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
+    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+
+fn mark_presynced_tmp_data_dir(dir: PathBuf) {
+    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
+    if set.len() >= 4096 {
+        set.clear();
+    }
+    set.insert(dir);
+}
+
+fn unmark_presynced_tmp_data_dir(dir: &Path) {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir);
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
 fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
     if let Some(parent) = file_path.parent()
         && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
@@ -3712,6 +3732,7 @@ struct LazyLocalFileWriter {
     volume_dir: PathBuf,
     reclaim_len: usize,
     reclaim_on_shutdown: bool,
+    sync_on_close: bool,
     bytes_written: usize,
     state: LazyLocalFileWriterState,
 }
@@ -3725,12 +3746,13 @@ enum LazyLocalFileWriterState {
 }
 
 impl LazyLocalFileWriter {
-    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
+    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool, sync_on_close: bool) -> Self {
         Self {
             file_path,
             volume_dir,
             reclaim_len,
             reclaim_on_shutdown,
+            sync_on_close,
             bytes_written: 0,
             state: LazyLocalFileWriterState::Unopened,
         }
@@ -3741,6 +3763,7 @@ impl LazyLocalFileWriter {
         let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(len) >= self.reclaim_len;
         let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
+        let sync_on_close = self.sync_on_close;
         match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
             LazyLocalFileWriterState::Unopened => {
                 let file_path = self.file_path.clone();
@@ -3749,8 +3772,14 @@ impl LazyLocalFileWriter {
                     let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown)?;
                     std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
                     if close_after {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
                         Ok((None, len))
                     } else {
                         Ok((Some(file), len))
@@ -4033,6 +4062,7 @@ fn should_reclaim_file_cache_after_read(length: usize) -> bool {
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum WriteMode {
     Truncate { size_hint: i64 },
+    TruncateSync { size_hint: i64 },
     Append,
 }
 
@@ -4800,12 +4830,16 @@ impl LocalIoBackend for StdBackend {
     async fn open_write(&self, volume: &str, path: &str, mode: WriteMode) -> Result<FileWriter> {
         self.invalidate_cached_fd(volume, path).await;
         match mode {
-            WriteMode::Truncate { size_hint } => {
+            WriteMode::Truncate { size_hint } | WriteMode::TruncateSync { size_hint } => {
+                let sync_on_close = matches!(mode, WriteMode::TruncateSync { .. });
                 let volume_dir = local_disk_bucket_path(self.io_root(), volume)?;
                 let file_path = local_disk_object_path(self.io_root(), volume, path)?;
                 check_path_length(file_path.to_string_lossy().as_ref())?;
                 if let Some(parent) = file_path.parent() {
                     check_path_length(parent.to_string_lossy().as_ref())?;
+                    if volume == RUSTFS_META_TMP_BUCKET {
+                        unmark_presynced_tmp_data_dir(parent);
+                    }
                 }
 
                 // O_DIRECT streaming write (Linux, opt-in): shard bytes stream
@@ -4835,6 +4869,7 @@ impl LocalIoBackend for StdBackend {
                     volume_dir,
                     size_hint.max(0) as usize,
                     reclaim_on_shutdown,
+                    sync_on_close,
                 )))
             }
             WriteMode::Append => {
@@ -13079,9 +13114,22 @@ impl DiskAPI for LocalDisk {
             }
         }
 
-        self.io_backend
-            .open_write(volume, path, WriteMode::Truncate { size_hint: _file_size })
-            .await
+        #[cfg(test)]
+        let probe_active = os::file_sync_probe::is_active();
+        #[cfg(not(test))]
+        let probe_active = false;
+        let sync_on_close = volume == RUSTFS_META_TMP_BUCKET
+            && !origvolume.is_empty()
+            && path.ends_with("/part.1")
+            && effective_durability(origvolume).syncs_data_shards()
+            && !os::file_fdatasync_group_commit_enabled()
+            && !probe_active;
+        let mode = if sync_on_close {
+            WriteMode::TruncateSync { size_hint: _file_size }
+        } else {
+            WriteMode::Truncate { size_hint: _file_size }
+        };
+        self.io_backend.open_write(volume, path, mode).await
     }
 
     async fn rename_file_durable(&self, src_volume: &str, src_path: &str, dst_volume: &str, dst_path: &str) -> Result<()> {
@@ -13646,16 +13694,70 @@ impl DiskAPI for LocalDisk {
 
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
-            let buf = self
-                .read_all(volume, format!("{}/{}", path, STORAGE_FORMAT_FILE).as_str())
-                .await
-                .map_err(|e| {
-                    if e == DiskError::FileNotFound && fi.version_id.is_some() {
-                        DiskError::FileVersionNotFound
-                    } else {
-                        e
+            let xl_rel_path = format!("{path}/{STORAGE_FORMAT_FILE}");
+            if self.multipart_source_admission(volume, &xl_rel_path, true, false)?.is_none()
+                && !crash_inject::should_crash_at(CrashPoint::MetaWriteAfterTmpBeforeRename, &xl_rel_path)
+                && !has_delete_version_test_failpoints()
+                && !has_rename_data_test_failpoints(&xl_rel_path)
+            {
+                multipart_staging::reject_reserved_anchor(&xl_rel_path)?;
+                let volume_dir = self.io_get_bucket_path(volume)?;
+                let xl_file_path = self.io_get_object_path(volume, &xl_rel_path)?;
+                check_path_length(xl_file_path.to_string_lossy().as_ref())?;
+                let tmp_file_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, Uuid::new_v4().to_string().as_str())?;
+                let sync = !opts.no_persistence && effective_durability(volume).syncs_commit_metadata();
+                let replace_user_metadata = opts.replace_user_metadata;
+                let has_version_id = fi.version_id.is_some();
+                let publication_root = self.publication_root.clone();
+                let lease = os::acquire_namespace_mutation_lease_with_owner(&xl_file_path, namespace_owner).await;
+                return os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<Result<()>> {
+                    let buf = match std::fs::read(&xl_file_path) {
+                        Ok(buf) => buf,
+                        Err(err) if err.kind() == ErrorKind::NotFound && has_version_id => {
+                            return Ok(Err(DiskError::FileVersionNotFound));
+                        }
+                        Err(err) => return Err(err),
+                    };
+                    if !FileMeta::is_xl2_v1_format(&buf) {
+                        return Ok(Err(DiskError::FileVersionNotFound));
                     }
-                })?;
+                    let wbuf = match FileMeta::load(&buf).and_then(|mut xl_meta| {
+                        xl_meta.update_object_version_with_opts(fi, replace_user_metadata)?;
+                        xl_meta.marshal_msg()
+                    }) {
+                        Ok(wbuf) => wbuf,
+                        Err(err) => return Ok(Err(err.into())),
+                    };
+                    if let Some(parent) = tmp_file_path.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    let mut tmp_file = std::fs::File::create(&tmp_file_path)?;
+                    std::io::Write::write_all(&mut tmp_file, &wbuf)?;
+                    if sync && !wbuf.is_empty() {
+                        tmp_file.sync_data()?;
+                    }
+                    drop(tmp_file);
+                    os::rename_all_with_precondition_and_parent_sync_std(
+                        &tmp_file_path,
+                        &xl_file_path,
+                        &volume_dir,
+                        &publication_root,
+                        None,
+                        sync,
+                    )?;
+                    Ok(Ok(()))
+                })
+                .await
+                .map_err(to_file_error)?;
+            }
+
+            let buf = self.read_all(volume, xl_rel_path.as_str()).await.map_err(|e| {
+                if e == DiskError::FileNotFound && fi.version_id.is_some() {
+                    DiskError::FileVersionNotFound
+                } else {
+                    e
+                }
+            })?;
 
             if !FileMeta::is_xl2_v1_format(buf.as_ref()) {
                 return Err(DiskError::FileVersionNotFound);
@@ -13668,13 +13770,7 @@ impl DiskAPI for LocalDisk {
             let wbuf = xl_meta.marshal_msg()?;
 
             return self
-                .write_all_meta_with_namespace_owner(
-                    volume,
-                    format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
-                    &wbuf,
-                    !opts.no_persistence,
-                    namespace_owner,
-                )
+                .write_all_meta_with_namespace_owner(volume, xl_rel_path.as_str(), &wbuf, !opts.no_persistence, namespace_owner)
                 .await;
         }
 

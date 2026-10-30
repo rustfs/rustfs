@@ -1418,6 +1418,30 @@ impl ECStore {
         }
         result
     }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object_with_old_current_size(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        let (oi, old_current_size) = box_copy_object_handler(move || {
+            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+        })
+        .await?;
+        let result = enqueue_transition_after_write(self, Ok(oi), LcEventSrc::S3CopyObject, dst_opts)
+            .await
+            .map(|oi| (oi, old_current_size));
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
+        }
+        result
+    }
 }
 
 lazy_static! {
@@ -1495,20 +1519,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self,
-            box_copy_object_handler(move || {
-                self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-            })
-            .await,
-            LcEventSrc::S3CopyObject,
-            dst_opts,
-        )
-        .await;
-        if result.is_ok() {
-            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
-        }
-        result
+        self.copy_object_with_old_current_size(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            .await
+            .map(|(oi, _)| oi)
     }
 
     #[instrument(skip(self))]

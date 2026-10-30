@@ -4890,7 +4890,7 @@ impl ECStore {
         src_info: &mut ObjectInfo,
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         check_copy_obj_args(src_bucket, src_object)?;
         if src_bucket == dst_bucket && src_object == dst_object {
             // In-place copies (metadata replace, restore) rewrite a key that
@@ -4969,9 +4969,17 @@ impl ECStore {
         };
 
         if cp_src_dst_same {
-            let (_, pool_idx) = self
-                .get_latest_accessible_object_info_with_idx(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
-                .await?;
+            let pool_idx = if self.single_pool() {
+                0
+            } else {
+                self.get_latest_accessible_object_info_with_idx(
+                    src_bucket,
+                    &src_object,
+                    &version_aware_lookup_opts(src_opts, true),
+                )
+                .await?
+                .1
+            };
             let source_pool_writable = !self.is_suspended(pool_idx).await && !self.is_pool_rebalancing(pool_idx).await;
 
             if source_pool_writable
@@ -4992,7 +5000,8 @@ impl ECStore {
                                 .await
                         },
                     )
-                    .await;
+                    .await
+                    .map(|oi| (oi, None));
             }
 
             if source_pool_writable && !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -5020,7 +5029,8 @@ impl ECStore {
                                     .await
                             },
                         )
-                        .await;
+                        .await
+                        .map(|oi| (oi, None));
                 }
                 // Transitioned object self-copy: restore from tier into the same pool.
                 let mut put_opts = ObjectOptions {
@@ -5048,7 +5058,7 @@ impl ECStore {
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
                     let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
                     let result = self.pools[pool_idx]
-                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .put_object_with_old_current_size(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
                     enqueue_recorded_tier_free_versions(self, receipt_sink).await;
                     result
@@ -5092,7 +5102,7 @@ impl ECStore {
                     }
                     let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
                     let result = self.pools[pool_idx]
-                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .put_object_with_old_current_size(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
                     enqueue_recorded_tier_free_versions(self, receipt_sink).await;
                     return result;
@@ -5112,11 +5122,14 @@ impl ECStore {
                                 .await
                         },
                     )
-                    .await;
+                    .await
+                    .map(|oi| (oi, None));
             }
         }
 
-        let pool_idx = if dst_opts.no_lock {
+        let pool_idx = if self.single_pool() && !self.is_suspended(0).await && !self.is_pool_rebalancing(0).await {
+            0
+        } else if dst_opts.no_lock {
             self.get_pool_idx_no_lock(dst_bucket, &dst_object, src_info.size).await?
         } else {
             self.get_pool_idx(dst_bucket, &dst_object, src_info.size).await?
@@ -5149,7 +5162,7 @@ impl ECStore {
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
             let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
             let result = self.pools[pool_idx]
-                .put_object(dst_bucket, dst_object_name, put_object_reader, &put_opts)
+                .put_object_with_old_current_size(dst_bucket, dst_object_name, put_object_reader, &put_opts)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             return result;
@@ -9971,6 +9984,7 @@ mod tests {
                 copy_store
                     .handle_copy_object(bucket, source, bucket, target, &mut source_info, &ObjectOptions::default(), &options)
                     .await
+                    .map(|(oi, _)| oi)
             });
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             tokio::time::timeout_at(deadline, barrier.wait_until_paused())
