@@ -24,7 +24,7 @@ use super::{
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::{ApiError, ApiErrorDiagnostic};
 use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
-use crate::storage::helper::OperationHelper;
+use crate::storage::helper::{OperationHelper, audit_only_operation};
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
 use crate::storage::storage_api::ecfs_consumer::contract::{
@@ -536,6 +536,190 @@ pub(crate) fn validate_object_lock_configuration_input(input_cfg: &ObjectLockCon
     Ok(())
 }
 
+/// Handler bodies that [`S3`] runs through `audit_only_operation`.
+impl FS {
+    async fn delete_bucket_replication_inner(
+        &self,
+        req: S3Request<DeleteBucketReplicationInput>,
+    ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
+        deny_replication_config_edit_for_non_owner(&req).await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
+        let usecase = s3_api::bucket_usecase_for(self);
+        usecase.execute_delete_bucket_replication(req, site_peers, contract).await
+    }
+
+    async fn put_bucket_replication_inner(
+        &self,
+        req: S3Request<PutBucketReplicationInput>,
+    ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        deny_replication_config_edit_for_non_owner(&req).await?;
+        let (site_peers, contract) = site_replication_edit_context().await?;
+        let usecase = s3_api::bucket_usecase_for(self);
+        usecase.execute_put_bucket_replication(req, site_peers, contract).await
+    }
+
+    async fn put_bucket_acl_inner(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
+        let PutBucketAclInput {
+            bucket,
+            access_control_policy,
+            ..
+        } = req.input;
+        record_s3_op(S3Operation::PutBucketAcl);
+
+        let Some(store) = self.server_ctx.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        if access_control_policy.is_some() {
+            return Err(s3_error!(
+                NotImplemented,
+                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
+            ));
+        }
+
+        Ok(S3Response::new(PutBucketAclOutput::default()))
+    }
+
+    async fn put_bucket_logging_inner(
+        &self,
+        req: S3Request<PutBucketLoggingInput>,
+    ) -> S3Result<S3Response<PutBucketLoggingOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
+        record_s3_op(S3Operation::PutBucketLogging);
+        let Some(store) = self.server_ctx.object_store() else {
+            return Err(s3_error!(InternalError, "Not init"));
+        };
+        store
+            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
+            .await
+            .map_err(crate::error::ApiError::from)?;
+
+        let logging_config = serialize(&req.input.bucket_logging_status)
+            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
+        update_bucket_metadata_config_if_incarnation(
+            &req.input.bucket,
+            BUCKET_LOGGING_CONFIG,
+            logging_config,
+            expected_incarnation_id,
+        )
+        .await
+        .map_err(crate::error::ApiError::from)?;
+
+        Ok(S3Response::new(PutBucketLoggingOutput::default()))
+    }
+
+    async fn put_object_lock_configuration_inner(
+        &self,
+        req: S3Request<PutObjectLockConfigurationInput>,
+    ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
+        let PutObjectLockConfigurationInput {
+            bucket,
+            object_lock_configuration,
+            ..
+        } = req.input;
+
+        let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
+
+        let Some(store) = self.server_ctx.object_store() else {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
+        };
+
+        store
+            .get_bucket_info(&bucket, &BucketOptions::default())
+            .await
+            .map_err(ApiError::from)?;
+
+        validate_object_lock_configuration_input(&input_cfg)?;
+
+        match get_bucket_object_lock_config(&bucket).await {
+            Ok(_) => {}
+            Err(err) => {
+                if err == StorageError::ConfigNotFound {
+                    if !BucketVersioningSys::enabled(&bucket).await {
+                        return Err(S3Error::with_message(
+                            S3ErrorCode::InvalidBucketState,
+                            "Object Lock configuration cannot be enabled on existing buckets".to_string(),
+                        ));
+                    }
+                } else {
+                    warn!("get_object_lock_config err {:?}", err);
+                    return Err(S3Error::with_message(
+                        S3ErrorCode::InternalError,
+                        "Failed to get bucket ObjectLockConfiguration".to_string(),
+                    ));
+                }
+            }
+        };
+
+        let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+        let object_lock_config =
+            String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+
+        let updated_at = update_bucket_metadata_config_if_incarnation(&bucket, OBJECT_LOCK_CONFIG, data, expected_incarnation_id)
+            .await
+            .map_err(ApiError::from)?;
+
+        // When Object Lock is enabled, automatically enable versioning if not already enabled.
+        // This matches S3-compatible behavior.
+        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
+        if !versioning_config.enabled() {
+            let enable_versioning_config = VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                ..Default::default()
+            };
+            let versioning_data = serialize(&enable_versioning_config)
+                .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
+            update_bucket_metadata_config_if_incarnation(
+                &bucket,
+                BUCKET_VERSIONING_CONFIG,
+                versioning_data,
+                expected_incarnation_id,
+            )
+            .await
+            .map_err(ApiError::from)?;
+        }
+
+        if let Some(notification_sys) =
+            runtime_sources::current_notification_system_for_context(self.server_ctx.app_context().as_deref())
+        {
+            propagate_object_lock_peer_reload(notification_sys.load_bucket_metadata(&bucket).await)?;
+        }
+
+        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
+            bucket: bucket.clone(),
+            r#type: "object-lock-config".to_string(),
+            object_lock_config: Some(object_lock_config),
+            updated_at: Some(updated_at),
+            api_version: Some(SITE_REPL_API_VERSION.to_string()),
+            ..Default::default()
+        })
+        .await
+        {
+            warn!(
+                component = LOG_COMPONENT_STORAGE,
+                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
+                event = "put_object_lock_configuration",
+                bucket = %bucket,
+                result = "site_replication_hook_failed",
+                error = ?err,
+                "storage object lock state"
+            );
+        }
+
+        rustfs_scanner::record_dirty_usage_bucket_from_producer(
+            &bucket,
+            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
+        );
+        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
+    }
+}
+
 #[async_trait::async_trait]
 impl S3 for FS {
     #[instrument(level = "debug", skip(self))]
@@ -544,7 +728,7 @@ impl S3 for FS {
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_abort_multipart_upload(req).await
+        audit_only_operation(req, S3Operation::AbortMultipartUpload, |req| usecase.execute_abort_multipart_upload(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
@@ -594,7 +778,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self))]
     async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_cors(req).await
+        audit_only_operation(req, S3Operation::DeleteBucketCors, |req| usecase.execute_delete_bucket_cors(req)).await
     }
 
     async fn delete_bucket_encryption(
@@ -602,7 +786,10 @@ impl S3 for FS {
         req: S3Request<DeleteBucketEncryptionInput>,
     ) -> S3Result<S3Response<DeleteBucketEncryptionOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_encryption(req).await
+        audit_only_operation(req, S3Operation::DeleteBucketEncryption, |req| {
+            usecase.execute_delete_bucket_encryption(req)
+        })
+        .await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -611,7 +798,10 @@ impl S3 for FS {
         req: S3Request<DeleteBucketLifecycleInput>,
     ) -> S3Result<S3Response<DeleteBucketLifecycleOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_lifecycle(req).await
+        audit_only_operation(req, S3Operation::DeleteBucketLifecycle, |req| {
+            usecase.execute_delete_bucket_lifecycle(req)
+        })
+        .await
     }
 
     async fn delete_bucket_policy(
@@ -619,17 +809,14 @@ impl S3 for FS {
         req: S3Request<DeleteBucketPolicyInput>,
     ) -> S3Result<S3Response<DeleteBucketPolicyOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_policy(req).await
+        audit_only_operation(req, S3Operation::DeleteBucketPolicy, |req| usecase.execute_delete_bucket_policy(req)).await
     }
 
     async fn delete_bucket_replication(
         &self,
         req: S3Request<DeleteBucketReplicationInput>,
     ) -> S3Result<S3Response<DeleteBucketReplicationOutput>> {
-        deny_replication_config_edit_for_non_owner(&req).await?;
-        let (site_peers, contract) = site_replication_edit_context().await?;
-        let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_replication(req, site_peers, contract).await
+        audit_only_operation(req, S3Operation::DeleteBucketReplication, |req| self.delete_bucket_replication_inner(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -638,7 +825,7 @@ impl S3 for FS {
         req: S3Request<DeleteBucketTaggingInput>,
     ) -> S3Result<S3Response<DeleteBucketTaggingOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_bucket_tagging(req).await
+        audit_only_operation(req, S3Operation::DeleteBucketTagging, |req| usecase.execute_delete_bucket_tagging(req)).await
     }
 
     async fn delete_bucket_website(
@@ -668,7 +855,10 @@ impl S3 for FS {
         req: S3Request<DeletePublicAccessBlockInput>,
     ) -> S3Result<S3Response<DeletePublicAccessBlockOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_delete_public_access_block(req).await
+        audit_only_operation(req, S3Operation::DeletePublicAccessBlock, |req| {
+            usecase.execute_delete_public_access_block(req)
+        })
+        .await
     }
 
     /// Delete an object
@@ -1384,30 +1574,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_acl(&self, req: S3Request<PutBucketAclInput>) -> S3Result<S3Response<PutBucketAclOutput>> {
-        let PutBucketAclInput {
-            bucket,
-            access_control_policy,
-            ..
-        } = req.input;
-        record_s3_op(S3Operation::PutBucketAcl);
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        if access_control_policy.is_some() {
-            return Err(s3_error!(
-                NotImplemented,
-                "ACL XML grants are not supported; use canned ACL headers or omit ACL"
-            ));
-        }
-
-        Ok(S3Response::new(PutBucketAclOutput::default()))
+        audit_only_operation(req, S3Operation::PutBucketAcl, |req| self.put_bucket_acl_inner(req)).await
     }
 
     async fn put_bucket_accelerate_configuration(
@@ -1440,7 +1607,7 @@ impl S3 for FS {
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_cors(req).await
+        audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req)).await
     }
 
     async fn get_bucket_logging(&self, req: S3Request<GetBucketLoggingInput>) -> S3Result<S3Response<GetBucketLoggingOutput>> {
@@ -1463,28 +1630,7 @@ impl S3 for FS {
     }
 
     async fn put_bucket_logging(&self, req: S3Request<PutBucketLoggingInput>) -> S3Result<S3Response<PutBucketLoggingOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        record_s3_op(S3Operation::PutBucketLogging);
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(s3_error!(InternalError, "Not init"));
-        };
-        store
-            .get_bucket_info(&req.input.bucket, &BucketOptions::default())
-            .await
-            .map_err(crate::error::ApiError::from)?;
-
-        let logging_config = serialize(&req.input.bucket_logging_status)
-            .map_err(|err| S3Error::with_message(S3ErrorCode::MalformedXML, format!("{err}")))?;
-        update_bucket_metadata_config_if_incarnation(
-            &req.input.bucket,
-            BUCKET_LOGGING_CONFIG,
-            logging_config,
-            expected_incarnation_id,
-        )
-        .await
-        .map_err(crate::error::ApiError::from)?;
-
-        Ok(S3Response::new(PutBucketLoggingOutput::default()))
+        audit_only_operation(req, S3Operation::PutBucketLogging, |req| self.put_bucket_logging_inner(req)).await
     }
 
     async fn put_bucket_encryption(
@@ -1492,7 +1638,7 @@ impl S3 for FS {
         req: S3Request<PutBucketEncryptionInput>,
     ) -> S3Result<S3Response<PutBucketEncryptionOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_encryption(req).await
+        audit_only_operation(req, S3Operation::PutBucketEncryption, |req| usecase.execute_put_bucket_encryption(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1501,7 +1647,10 @@ impl S3 for FS {
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_lifecycle_configuration(req).await
+        audit_only_operation(req, S3Operation::PutBucketLifecycleConfiguration, |req| {
+            usecase.execute_put_bucket_lifecycle_configuration(req)
+        })
+        .await
     }
 
     async fn put_bucket_notification_configuration(
@@ -1509,22 +1658,22 @@ impl S3 for FS {
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_notification_configuration(req).await
+        audit_only_operation(req, S3Operation::PutBucketNotificationConfiguration, |req| {
+            usecase.execute_put_bucket_notification_configuration(req)
+        })
+        .await
     }
 
     async fn put_bucket_policy(&self, req: S3Request<PutBucketPolicyInput>) -> S3Result<S3Response<PutBucketPolicyOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_policy(req).await
+        audit_only_operation(req, S3Operation::PutBucketPolicy, |req| usecase.execute_put_bucket_policy(req)).await
     }
 
     async fn put_bucket_replication(
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
-        deny_replication_config_edit_for_non_owner(&req).await?;
-        let (site_peers, contract) = site_replication_edit_context().await?;
-        let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_replication(req, site_peers, contract).await
+        audit_only_operation(req, S3Operation::PutBucketReplication, |req| self.put_bucket_replication_inner(req)).await
     }
 
     async fn put_bucket_request_payment(
@@ -1560,13 +1709,13 @@ impl S3 for FS {
         req: S3Request<PutPublicAccessBlockInput>,
     ) -> S3Result<S3Response<PutPublicAccessBlockOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_public_access_block(req).await
+        audit_only_operation(req, S3Operation::PutPublicAccessBlock, |req| usecase.execute_put_public_access_block(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_tagging(req).await
+        audit_only_operation(req, S3Operation::PutBucketTagging, |req| usecase.execute_put_bucket_tagging(req)).await
     }
 
     #[instrument(level = "debug", skip(self))]
@@ -1575,7 +1724,7 @@ impl S3 for FS {
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
-        usecase.execute_put_bucket_versioning(req).await
+        audit_only_operation(req, S3Operation::PutBucketVersioning, |req| usecase.execute_put_bucket_versioning(req)).await
     }
 
     async fn put_bucket_website(&self, req: S3Request<PutBucketWebsiteInput>) -> S3Result<S3Response<PutBucketWebsiteOutput>> {
@@ -1666,12 +1815,13 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let _ = store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        validate_bucket_object_lock_enabled(&bucket).await?;
+        if let Err(err) = validate_bucket_object_lock_enabled(&bucket).await {
+            let _ = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
+            return Err(err);
+        }
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -1692,19 +1842,22 @@ impl S3 for FS {
         // once BEFORE the commit and persist the pending marker with it, so a restart between
         // the commit and the worker write-back leaves a Pending status on disk for the scanner
         // to re-drive. Scheduling without that marker would lose the task silently.
-        let dsc = match store.get_object_info(&bucket, &key, &opts).await.ok() {
-            Some(info) => {
-                must_replicate_metadata(
-                    &bucket,
-                    &key,
-                    &info.user_defined,
-                    info.user_tags.as_ref().clone(),
-                    popts.delete_marker_replication_status(),
-                    popts.clone(),
-                )
-                .await
-            }
-            None => ReplicateDecision::new(),
+        let dsc = if crate::app::storage_api::bucket::metadata_sys::get_replication_config(&bucket)
+            .await
+            .is_ok()
+            && let Ok(info) = store.get_object_info(&bucket, &key, &opts).await
+        {
+            must_replicate_metadata(
+                &bucket,
+                &key,
+                &info.user_defined,
+                info.user_tags.as_ref().clone(),
+                popts.delete_marker_replication_status(),
+                popts.clone(),
+            )
+            .await
+        } else {
+            ReplicateDecision::new()
         };
 
         let mut eval_metadata = parse_object_lock_legal_hold(legal_hold)?;
@@ -1746,106 +1899,10 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
-        let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
-        let PutObjectLockConfigurationInput {
-            bucket,
-            object_lock_configuration,
-            ..
-        } = req.input;
-
-        let Some(input_cfg) = object_lock_configuration else { return Err(s3_error!(InvalidArgument)) };
-
-        let Some(store) = self.server_ctx.object_store() else {
-            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
-        };
-
-        store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        validate_object_lock_configuration_input(&input_cfg)?;
-
-        match get_bucket_object_lock_config(&bucket).await {
-            Ok(_) => {}
-            Err(err) => {
-                if err == StorageError::ConfigNotFound {
-                    if !BucketVersioningSys::enabled(&bucket).await {
-                        return Err(S3Error::with_message(
-                            S3ErrorCode::InvalidBucketState,
-                            "Object Lock configuration cannot be enabled on existing buckets".to_string(),
-                        ));
-                    }
-                } else {
-                    warn!("get_object_lock_config err {:?}", err);
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InternalError,
-                        "Failed to get bucket ObjectLockConfiguration".to_string(),
-                    ));
-                }
-            }
-        };
-
-        let data = serialize(&input_cfg).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-        let object_lock_config =
-            String::from_utf8(data.clone()).map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-
-        let updated_at = update_bucket_metadata_config_if_incarnation(&bucket, OBJECT_LOCK_CONFIG, data, expected_incarnation_id)
-            .await
-            .map_err(ApiError::from)?;
-
-        // When Object Lock is enabled, automatically enable versioning if not already enabled.
-        // This matches S3-compatible behavior.
-        let versioning_config = BucketVersioningSys::get(&bucket).await.map_err(ApiError::from)?;
-        if !versioning_config.enabled() {
-            let enable_versioning_config = VersioningConfiguration {
-                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
-                ..Default::default()
-            };
-            let versioning_data = serialize(&enable_versioning_config)
-                .map_err(|err| S3Error::with_message(S3ErrorCode::InternalError, format!("{err}")))?;
-            update_bucket_metadata_config_if_incarnation(
-                &bucket,
-                BUCKET_VERSIONING_CONFIG,
-                versioning_data,
-                expected_incarnation_id,
-            )
-            .await
-            .map_err(ApiError::from)?;
-        }
-
-        if let Some(notification_sys) =
-            runtime_sources::current_notification_system_for_context(self.server_ctx.app_context().as_deref())
-        {
-            propagate_object_lock_peer_reload(notification_sys.load_bucket_metadata(&bucket).await)?;
-        }
-
-        if let Err(err) = site_replication_bucket_meta_hook(SRBucketMeta {
-            bucket: bucket.clone(),
-            r#type: "object-lock-config".to_string(),
-            object_lock_config: Some(object_lock_config),
-            updated_at: Some(updated_at),
-            api_version: Some(SITE_REPL_API_VERSION.to_string()),
-            ..Default::default()
+        audit_only_operation(req, S3Operation::PutObjectLockConfiguration, |req| {
+            self.put_object_lock_configuration_inner(req)
         })
         .await
-        {
-            warn!(
-                component = LOG_COMPONENT_STORAGE,
-                subsystem = LOG_SUBSYSTEM_OBJECT_LOCK,
-                event = "put_object_lock_configuration",
-                bucket = %bucket,
-                result = "site_replication_hook_failed",
-                error = ?err,
-                "storage object lock state"
-            );
-        }
-
-        rustfs_scanner::record_dirty_usage_bucket_from_producer(
-            &bucket,
-            rustfs_scanner::SegmentInvalidationProducerIdentity::BucketMetadata,
-        );
-        Ok(S3Response::new(PutObjectLockConfigurationOutput::default()))
     }
 
     async fn put_object_retention(
@@ -2104,14 +2161,47 @@ impl S3 for FS {
         crate::hp_guard!("S3::upload_part");
         record_s3_op(S3Operation::UploadPart);
         let usecase = s3_api::multipart_usecase_for(self);
-        usecase.execute_upload_part(req).await
+        audit_only_operation(req, S3Operation::UploadPart, |req| usecase.execute_upload_part(req)).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
         record_s3_op(S3Operation::UploadPartCopy);
         let usecase = s3_api::multipart_usecase_for(self);
-        Box::pin(usecase.execute_upload_part_copy(req)).await
+        audit_only_operation(req, S3Operation::UploadPartCopy, |req| Box::pin(usecase.execute_upload_part_copy(req))).await
+    }
+}
+
+/// Every mutating S3 operation that has no bucket notification event reaches the audit
+/// stream only through `audit_only_operation`; a new such operation, or a dropped
+/// wrapper, must fail here rather than silently go unaudited.
+#[cfg(test)]
+mod audit_coverage_tests {
+    use rustfs_s3_ops::S3Operation;
+
+    const SOURCE: &str = include_str!("ecfs.rs");
+
+    fn is_read_only(op: S3Operation) -> bool {
+        let name = op.as_str().trim_start_matches("s3:");
+        ["Get", "Head", "List", "Select"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }
+
+    #[test]
+    fn mutating_operations_without_a_notification_event_are_wrapped_for_audit() {
+        let mut expected: Vec<S3Operation> = S3Operation::ALL
+            .into_iter()
+            .filter(|op| !is_read_only(*op) && op.to_event_name().is_none())
+            .collect();
+        // AbortMultipartUpload has an internal event but no handler-built helper.
+        expected.push(S3Operation::AbortMultipartUpload);
+        assert_eq!(expected.len(), 22, "an operation was added or removed: {expected:?}");
+
+        for op in expected {
+            let wrapper = format!("audit_only_operation(req, S3Operation::{op:?},");
+            assert!(SOURCE.contains(&wrapper), "{} is not run through audit_only_operation", op.as_str());
+        }
     }
 }
 

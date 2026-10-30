@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import retain_validation_evidence as retain
 import prepare_retained_validation_recovery as recovery_input
-from check_test_wiring import yaml_block
+from ci_gate import workflow_document
 
 
 class RetainEvidenceTests(unittest.TestCase):
@@ -38,12 +38,13 @@ class RetainEvidenceTests(unittest.TestCase):
 
     def test_workflow_default_allows_evidence_retention(self):
         workflow = Path(__file__).resolve().parents[1] / ".github/workflows/rustfs-functional-chain.yml"
-        block = yaml_block(workflow.read_text().splitlines(), "i05_diagnostic_branch", 6)
-        default = next(line.split(":", 1)[1].strip() for line in block if line.strip().startswith("default:"))
+        definitions = workflow_document(workflow.read_text())['on']['workflow_dispatch']['inputs']
+        defaults = {key: value['default'] == 'true' if value.get('type') == 'boolean' else value['default']
+                    for key, value in definitions.items() if 'default' in value}
         with tempfile.TemporaryDirectory() as directory:
             env, root, run, jobs = self.fixture(directory)
             inputs = json.loads(env["EVIDENCE_RETAIN_INPUTS"])
-            env["EVIDENCE_RETAIN_INPUTS"] = json.dumps({**inputs, "i05_diagnostic_branch": default})
+            env["EVIDENCE_RETAIN_INPUTS"] = json.dumps({**defaults, **inputs})
             with patch.object(retain, "api", side_effect=[run, jobs]):
                 self.assertEqual(retain.prepare(env, {}), root)
 
@@ -71,6 +72,7 @@ class RetainEvidenceTests(unittest.TestCase):
                                  ("build_run_id", "1"), ("validation_retain_evidence_run_id", "../77"),
                                  ("i05_diagnostic_branch", "timeout"),
                                  ("i05_diagnostic_branch", "queued-successor"),
+                                 ("validation_plan", "weekly"), ("suites", "s3"),
                                  ("validation_retain_evidence_run_id", "88")]:
                 with self.subTest(field=field, value=value), patch.object(retain, "api") as api:
                     altered = {**env, "EVIDENCE_RETAIN_INPUTS": json.dumps({**inputs, field: value})}

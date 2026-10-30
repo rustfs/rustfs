@@ -13,12 +13,23 @@
 # limitations under the License.
 
 # Reusable workflows run from this driver's commit in one Actions run. Each
-# suite still runs after an earlier suite fails; the final job requires all twelve.
+# selected suite still runs after an earlier failure; the final job checks its plan.
 name: RustFS Functional Chain
 
 on:
   workflow_dispatch:
     inputs:
+      validation_plan:
+        description: Registered cadence plan (existing suite frequencies are preserved)
+        type: choice
+        options: [nightly, weekly, monthly]
+        required: false
+        default: nightly
+      suites:
+        description: Comma-separated suite IDs, or empty for the complete registered plan
+        type: string
+        required: false
+        default: ''
       build_run_id:
         description: Successful nightly or validation package run; empty for package-only build
         type: string
@@ -216,10 +227,25 @@ jobs:
     outputs:
       manifest: ${{ steps.candidate.outputs.manifest }}
       performance_ready: ${{ steps.perf_probe.outputs.performance_ready }}
+      plan: ${{ steps.selection.outputs.plan }}
+      suites: ${{ steps.selection.outputs.suites }}
+      optional_suites: ${{ steps.selection.outputs.optional_suites }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+      - name: Select registered suites
+        id: selection
+        env:
+          VALIDATION_PLAN: ${{ inputs.validation_plan || 'nightly' }}
+          VALIDATION_SUITES: ${{ inputs.suites }}
+        run: python3 scripts/validation_registry.py select --output "${RUNNER_TEMP}/suite-plan.json"
+      - name: Retain selected responsibilities
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/suite-plan.json
+          if-no-files-found: error
       - name: Resolve published candidate
         id: candidate
         env:
@@ -239,6 +265,7 @@ jobs:
           if-no-files-found: error
 
       - name: Check shared functional fleet runner before scheduling suites
+        if: ${{ contains(fromJSON(steps.selection.outputs.environments), 'functional-fleet') }}
         # The eleven functional suites run on the smoke-testing fleet; a hard
         # requirement. The performance lane runs on pf-testing, which is a
         # separate fleet - probe it without failing the whole chain so an
@@ -248,15 +275,26 @@ jobs:
         run: python3 scripts/check_functional_runners.py smoke-testing
 
       - name: Probe performance fleet runner
+        if: ${{ contains(fromJSON(steps.selection.outputs.suites), 'performance') }}
         id: perf_probe
         env:
           GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          PERFORMANCE_OPTIONAL: ${{ contains(fromJSON(steps.selection.outputs.optional_suites), 'performance') }}
         run: |
-          if python3 scripts/check_functional_runners.py pf-testing; then
-            echo "performance_ready=online" >> "$GITHUB_OUTPUT"
-          else
-            echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
-          fi
+          # TEMPORARY: the pf-testing environment is broken, so the
+          # performance lane is disabled until it is repaired. Forcing
+          # offline keeps the chain on its designed skip path: the lane job
+          # is skipped, aggregate receives --allow-skipped performance
+          # (required=false in scheduled-validations.json), and the report
+          # records the optional-lane skip with its reason.
+          # Restore the probe below once the environment is healthy again.
+          # if python3 scripts/check_functional_runners.py pf-testing; then
+          #   echo "performance_ready=online" >> "$GITHUB_OUTPUT"
+          # else
+          #   echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
+          #   test "$PERFORMANCE_OPTIONAL" = true
+          # fi
+          echo "performance_ready=offline" >> "$GITHUB_OUTPUT"
 
   validation:
     if: ${{ github.event_name == 'workflow_dispatch' && !inputs.validation_runner_inspect_only && inputs.validation_retain_evidence_run_id == '' && inputs.validation_package_sha == '' && (inputs.validation_case != '' || inputs.validation_tools_only || inputs.validation_native_tools || inputs.validation_shared_tools || inputs.validation_manager_tools || inputs.validation_cleanup_run_id != '' || inputs.validation_cleanup_retained_evidence) }}
@@ -580,6 +618,10 @@ jobs:
             > "${VALIDATION_ROOT}/shared-fixture-manifest.json"
           printf 'VALIDATION_HEAL_SHARED_DIRECTORY=%s\n' "${SHARED_DIRECTORY}" >> "${GITHUB_ENV}"
 
+      - name: Reject quarantined suite environment before canonical validation
+        if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' && inputs.validation_case != 'environment.inspect' }}
+        run: python3 scripts/functional_environment.py check --suite heal
+
       - name: Run selected canonical validation case
         if: ${{ !inputs.validation_tools_only && inputs.validation_cleanup_run_id == '' && inputs.validation_case != 'environment.inspect' }}
         env:
@@ -665,7 +707,7 @@ jobs:
 
   upgrade:
     needs: [prepare]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'upgrade') }}
     uses: ./.github/workflows/rustfs-upgrade-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -673,7 +715,7 @@ jobs:
 
   s3:
     needs: [prepare, upgrade]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 's3') }}
     uses: ./.github/workflows/rustfs-s3-compat-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -681,7 +723,7 @@ jobs:
 
   kms:
     needs: [prepare, s3]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'kms') }}
     uses: ./.github/workflows/rustfs-kms-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -689,7 +731,7 @@ jobs:
 
   tier:
     needs: [prepare, kms]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'tier') }}
     uses: ./.github/workflows/rustfs-tier-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -697,7 +739,7 @@ jobs:
 
   storage:
     needs: [prepare, tier]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'storage') }}
     uses: ./.github/workflows/rustfs-storage-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -705,7 +747,7 @@ jobs:
 
   heal:
     needs: [prepare, storage]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'heal') }}
     uses: ./.github/workflows/rustfs-heal-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -713,7 +755,7 @@ jobs:
 
   pool:
     needs: [prepare, heal]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'pool') }}
     uses: ./.github/workflows/rustfs-pool-expand-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -721,7 +763,7 @@ jobs:
 
   security:
     needs: [prepare, pool]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'security') }}
     uses: ./.github/workflows/rustfs-security-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -729,7 +771,7 @@ jobs:
 
   replication:
     needs: [prepare, security]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'replication') }}
     uses: ./.github/workflows/rustfs-replication-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -737,7 +779,7 @@ jobs:
 
   fault-tolerance:
     needs: [prepare, replication]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'fault-tolerance') }}
     uses: ./.github/workflows/rustfs-fault-tolerance-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -745,15 +787,15 @@ jobs:
 
   table:
     needs: [prepare, fault-tolerance]
-    if: ${{ always() && needs.prepare.result == 'success' }}
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'table') }}
     uses: ./.github/workflows/rustfs-table-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
     secrets: inherit
 
   performance:
-    needs: [prepare, table]
-    if: ${{ always() && needs.prepare.result == 'success' && needs.prepare.outputs.performance_ready == 'online' }}
+    needs: [prepare]
+    if: ${{ always() && needs.prepare.result == 'success' && contains(fromJSON(needs.prepare.outputs.suites || '[]'), 'performance') && needs.prepare.outputs.performance_ready == 'online' }}
     uses: ./.github/workflows/rustfs-performance-test.yml
     with:
       chain_manifest: ${{ needs.prepare.outputs.manifest }}
@@ -781,8 +823,10 @@ jobs:
         env:
           CHAIN_MANIFEST: ${{ needs.prepare.outputs.manifest }}
           CHAIN_NEEDS: ${{ toJSON(needs) }}
+          CHAIN_PLAN: ${{ needs.prepare.outputs.plan }}
         run: >-
           python3 scripts/functional_chain_evidence.py summarize
+          --allow-skipped "${{ contains(fromJSON(needs.prepare.outputs.optional_suites || '[]'), 'performance') && needs.prepare.outputs.performance_ready != 'online' && 'performance' || '' }}"
           --directory "${RUNNER_TEMP}/chain-evidence"
           --output "${RUNNER_TEMP}/chain-report.json"
       - name: Retain chain report regardless of test verdict
@@ -799,9 +843,10 @@ jobs:
         env:
           CHAIN_MANIFEST: ${{ needs.prepare.outputs.manifest }}
           CHAIN_NEEDS: ${{ toJSON(needs) }}
+          CHAIN_PLAN: ${{ needs.prepare.outputs.plan }}
         run: >-
           python3 scripts/functional_chain_evidence.py aggregate
-          --allow-skipped "${{ needs.prepare.outputs.performance_ready == 'online' && '' || 'performance' }}"
+          --allow-skipped "${{ contains(fromJSON(needs.prepare.outputs.optional_suites || '[]'), 'performance') && needs.prepare.outputs.performance_ready != 'online' && 'performance' || '' }}"
           --directory "${RUNNER_TEMP}/chain-evidence"
           --output "${RUNNER_TEMP}/chain-complete.json"
       - name: Upload complete-chain evidence
