@@ -83,3 +83,14 @@ pub(crate) mod multipart_source_rpc {
         PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage,
     };
 }
+
+#[cfg(test)]
+pub(crate) mod scanner_peer_bucket {
+    use rustfs_ecstore::api::disk as ecstore_disk;
+    use rustfs_ecstore::api::erasure as ecstore_erasure;
+    use rustfs_ecstore::api::rpc as ecstore_rpc;
+
+    pub(crate) use ecstore_disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    pub(crate) use ecstore_erasure::{ReedSolomonEncoder, calc_shard_size};
+    pub(crate) use ecstore_rpc::PeerRestClient;
+}

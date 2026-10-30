@@ -506,6 +506,7 @@ struct LockAcquireQuorumResult {
     individual_locks: Vec<HeldLockEntry>,
     failure_kind: Option<LockAcquireFailureKind>,
     quorum_impossible: bool,
+    attempt_timed_out: bool,
 }
 
 impl DistributedLock {
@@ -886,9 +887,9 @@ impl DistributedLock {
     }
 
     async fn acquire_lock_quorum_with_retry(&self, request: &LockRequest) -> Result<LockAcquireQuorumResult> {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut attempt = 1;
-        let mut last_result = None;
+        let mut last_result: Option<LockAcquireQuorumResult> = None;
 
         loop {
             let elapsed = start.elapsed();
@@ -906,13 +907,22 @@ impl DistributedLock {
                 return Ok(result);
             }
 
-            last_result = Some(result);
-            let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng());
-            if start.elapsed().saturating_add(backoff) >= request.acquire_timeout {
+            // A final retry can time out without establishing whether the
+            // previously observed quorum failure has recovered.
+            let remaining = request.acquire_timeout.saturating_sub(start.elapsed());
+            let preserve_quorum_failure = result.attempt_timed_out
+                && remaining.is_zero()
+                && last_result.as_ref().is_some_and(|result| result.quorum_impossible);
+            if !preserve_quorum_failure {
+                last_result = Some(result);
+            }
+            if remaining.is_zero() {
                 break;
             }
-
-            tokio::time::sleep(backoff).await;
+            let backoff = Self::lock_acquire_retry_backoff(attempt, &mut rand::rng());
+            // Keep time for another acquire attempt instead of abandoning the
+            // caller's remaining budget when the jittered backoff grows large.
+            tokio::time::sleep(backoff.min(remaining / 2)).await;
             attempt += 1;
         }
 
@@ -927,6 +937,7 @@ impl DistributedLock {
                 individual_locks: Vec::new(),
                 failure_kind: Some(LockAcquireFailureKind::RetryableContention),
                 quorum_impossible: false,
+                attempt_timed_out: true,
             })
         }
     }
@@ -937,6 +948,7 @@ impl DistributedLock {
             individual_locks: Vec::new(),
             failure_kind: Some(LockAcquireFailureKind::RetryableContention),
             quorum_impossible: false,
+            attempt_timed_out: true,
         }
     }
 
@@ -966,6 +978,7 @@ impl DistributedLock {
             individual_locks,
             failure_kind: Some(failure_kind),
             quorum_impossible: matches!(failure_kind, LockAcquireFailureKind::UnrecoverableQuorum),
+            attempt_timed_out: true,
         }
     }
 
@@ -1134,6 +1147,7 @@ impl DistributedLock {
                     individual_locks,
                     failure_kind: Some(failure_kind),
                     quorum_impossible: true,
+                    attempt_timed_out: false,
                 });
             }
 
@@ -1176,6 +1190,7 @@ impl DistributedLock {
                     individual_locks,
                     failure_kind: None,
                     quorum_impossible: false,
+                    attempt_timed_out: false,
                 });
             }
 
@@ -1221,6 +1236,7 @@ impl DistributedLock {
                     individual_locks,
                     failure_kind: Some(failure_kind),
                     quorum_impossible,
+                    attempt_timed_out: false,
                 });
             }
         }
@@ -1245,6 +1261,7 @@ impl DistributedLock {
                 last_failure_kind.unwrap_or(LockAcquireFailureKind::RetryableContention)
             }),
             quorum_impossible: hard_failures > 0,
+            attempt_timed_out: false,
         })
     }
 }
@@ -2244,6 +2261,87 @@ mod tests {
             ),
             "unexpected result: {result:?}"
         );
+    }
+
+    fn clients_with_initial_quorum_loss(retries: &[AcquirePlan]) -> Vec<Arc<dyn LockClient>> {
+        (0..4)
+            .map(|index| {
+                let first = if index < 2 {
+                    AcquirePlan::Success { delay: Duration::ZERO }
+                } else {
+                    AcquirePlan::Failure {
+                        error: "Remote lock RPC failed: node unavailable",
+                        delay: Duration::ZERO,
+                    }
+                };
+                let mut plans = vec![first];
+                plans.extend_from_slice(retries);
+                Arc::new(SequencedClient::new(plans, Arc::new(Mutex::new(Vec::new())))) as Arc<dyn LockClient>
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_guard_preserves_quorum_failure_when_last_retry_times_out() {
+        let clients = clients_with_initial_quorum_loss(&[AcquirePlan::Success {
+            delay: Duration::from_secs(1),
+        }]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(180));
+
+        let result = lock.acquire_guard(&request).await;
+        assert!(
+            matches!(result, Err(LockError::QuorumNotReached { required: 3, .. })),
+            "a late inconclusive retry must not hide an observed quorum failure: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_guard_preserves_quorum_failure_when_retry_backoff_fits_but_attempt_times_out() {
+        let clients = clients_with_initial_quorum_loss(&[AcquirePlan::Success {
+            delay: Duration::from_secs(1),
+        }]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(500));
+
+        let result = lock.acquire_guard(&request).await;
+        assert!(
+            matches!(result, Err(LockError::QuorumNotReached { required: 3, .. })),
+            "an inconclusive final attempt must not hide an observed quorum failure: {result:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_guard_recovers_quorum_with_shortened_retry() {
+        let clients = clients_with_initial_quorum_loss(&[AcquirePlan::Success { delay: Duration::ZERO }]);
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(180));
+
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("a retry should recover from quorum loss")
+            .expect("a recovered quorum should acquire the lock");
+        assert_eq!(guard.entries.len(), 3);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_guard_replaces_quorum_failure_with_later_contention() {
+        let clients = clients_with_initial_quorum_loss(
+            &[AcquirePlan::Failure {
+                error: "Lock acquisition timeout",
+                delay: Duration::ZERO,
+            }; 64],
+        );
+        let lock = DistributedLock::new("test".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_millis(180));
+
+        let result = lock.acquire_guard(&request).await;
+        assert!(matches!(result, Ok(None)), "later contention should replace the earlier quorum failure");
     }
 
     #[tokio::test]

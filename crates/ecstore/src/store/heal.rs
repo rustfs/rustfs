@@ -2958,9 +2958,18 @@ mod tests {
         let (configuration, _) = read_config_no_lock_preserve_empty_with_metadata(store.clone(), &object)
             .await
             .expect("read the current bucket configuration");
-        save_config(store.clone(), &object, configuration)
-            .await
-            .expect("publish a newer config revision in the same bucket incarnation");
+        crate::config::com::save_config_with_opts(
+            store.clone(),
+            &object,
+            configuration,
+            &ObjectOptions {
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("publish a newer config revision on the target disk");
         let committed =
             std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("new target configuration");
         assert!(

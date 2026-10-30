@@ -89,6 +89,20 @@ class ProcessReceiptTest(unittest.TestCase):
         self.assertEqual(receipt.environment_digest(changed, self.public),
                          receipt.environment_digest(self.environment, self.public))
 
+    def test_prefix_and_profiler_environment_is_bound_without_revealing_values(self):
+        options = {
+            "RUSTFS_SCANNER_PREFIX_ATTRIBUTION": '{"bucket":"bucket","hot_prefix":"hot/","cold_prefix":"cold/"}',
+            "HOTPATH_ALLOC_CUMULATIVE": "0",
+            "HOTPATH_PROMETHEUS_PORT": "19191",
+        }
+        raw = self.environment + b"".join((key + "=" + value).encode() + b"\0" for key, value in options.items())
+        expected = {**self.public, **options}
+        self.assertEqual(receipt.environment_digest(raw, expected), receipt.fingerprint(expected))
+        with self.assertRaises(ValueError):
+            receipt.environment_digest(raw, {**expected, "HOTPATH_ALLOC_CUMULATIVE": "1"})
+        with self.assertRaises(ValueError):
+            receipt.environment_digest(raw + b"HOTPATH_UNRECOGNIZED=1\0", expected)
+
     def test_scanner_schedule_is_bound_to_actual_process_environment(self):
         schedule = {"RUSTFS_SCANNER_START_DELAY_SECS": "1", "RUSTFS_SCANNER_CYCLE": "5"}
         self.public.update(schedule)

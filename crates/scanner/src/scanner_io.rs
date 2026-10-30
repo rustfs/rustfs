@@ -939,6 +939,7 @@ pub struct ScannerBucketScanPlan {
     publication_epoch: Option<u64>,
     dirty_usage_buckets: Arc<DirtyUsageBuckets>,
     bucket_failures: ScannerBucketFailureState,
+    bucket_completions: Option<Arc<Mutex<ScannerBucketCompletions>>>,
     pending_maintenance_work: Arc<AtomicBool>,
     cache_cycle_floor: Arc<AtomicU64>,
     cold_zero_walk_reuse_observed: Arc<AtomicBool>,
@@ -1273,20 +1274,14 @@ enum ScannerCycleActivityStatus {
     Unverified,
 }
 
-async fn scanner_cycle_activity_status<S>(
-    store: &S,
-    distributed: bool,
+fn scanner_cycle_activity_status(
     before: &crate::scanner::ScannerActivitySnapshot,
-) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>)
-where
-    S: ScannerStorage,
-{
-    // Read the storage movement barrier before sampling the activity
-    // generations. A movement that starts during this await must invalidate
-    // the earlier baseline. Ordinary PUT tails are not part of the barrier:
-    // they shade their bucket and are certified per bucket below.
-    let publication_blocked = store.scanner_data_usage_publication_blocked().await;
-    match crate::scanner::probe_scanner_activity(store, distributed).await {
+    observed: std::result::Result<crate::scanner::ScannerActivitySnapshot, String>,
+    publication_blocked: bool,
+    certification: Option<&ScannerRemoteDirtyUsageCertification>,
+    certification_required: bool,
+) -> (ScannerCycleActivityStatus, Vec<(String, String, u64)>) {
+    match observed {
         Ok(after) => {
             let veto = if publication_blocked {
                 Some(crate::scanner::ScannerActivityGuardrailVeto::new(
@@ -1310,10 +1305,15 @@ where
                 );
                 global_metrics().record_scanner_guardrail_veto(veto.reason());
                 ScannerCycleActivityStatus::Changed
-            } else if let Some(moved) = crate::scanner::scanner_peer_dirty_usage_moved(before, &after) {
-                // Per-bucket certification covers the local dirty map only;
-                // a peer whose dirty state moved keeps today's whole-cycle
-                // outcome until scoped acknowledgements can name its buckets.
+            } else if certification_required && certification.is_none()
+                || certification.is_some_and(|proof| !proof.matches_activity(&after))
+            {
+                ScannerCycleActivityStatus::Unverified
+            } else if let Some(moved) =
+                crate::scanner::scanner_peer_dirty_usage_moved(before, &after).filter(|_| certification.is_none())
+            {
+                // Without a complete producer proof, retain the original
+                // whole-cycle fallback for a moving peer.
                 tracing::info!(
                     target: "rustfs::scanner::io",
                     event = EVENT_SCANNER_SET_STATE,
@@ -1747,6 +1747,8 @@ pub(crate) struct ScannerCycleResult {
     partial_bucket_progress: bool,
     dirty_usage_clear: Option<DirtyUsageBuckets>,
     remote_dirty_usage_acknowledgements: Vec<crate::scanner::ScannerDirtyUsageAcknowledgement>,
+    remote_dirty_usage_certification: Option<ScannerRemoteDirtyUsageCertification>,
+    remote_dirty_usage_pending: bool,
     distributed_segment_invalidation_evidence: Option<DistributedSegmentInvalidationEvidence>,
     segment_reuse_activation_preflight: ScannerSegmentReuseActivationPreflight,
     remote_publication_lease_targets: Vec<(String, String, u64)>,
@@ -1769,6 +1771,8 @@ impl ScannerCycleResult {
             partial_bucket_progress: false,
             dirty_usage_clear,
             remote_dirty_usage_acknowledgements: Vec::new(),
+            remote_dirty_usage_certification: None,
+            remote_dirty_usage_pending: false,
             distributed_segment_invalidation_evidence: None,
             segment_reuse_activation_preflight: scanner_segment_reuse_activation_preflight(),
             remote_publication_lease_targets: Vec::new(),
@@ -1892,6 +1896,26 @@ impl ScannerCycleResult {
         self
     }
 
+    fn with_remote_dirty_usage_certification(mut self, certification: Option<ScannerRemoteDirtyUsageCertification>) -> Self {
+        self.publication_expectation = None;
+        self.remote_dirty_usage_certification = certification;
+        self
+    }
+
+    pub(crate) fn remote_dirty_usage_certification(&self) -> Option<&ScannerRemoteDirtyUsageCertification> {
+        self.remote_dirty_usage_certification.as_ref()
+    }
+
+    pub(crate) fn with_remote_dirty_usage_pending(mut self, pending: bool) -> Self {
+        self.publication_expectation = None;
+        self.remote_dirty_usage_pending = pending;
+        self
+    }
+
+    pub(crate) fn has_remote_dirty_usage_pending(&self) -> bool {
+        self.remote_dirty_usage_pending
+    }
+
     fn with_distributed_segment_invalidation_evidence(
         mut self,
         evidence: Option<DistributedSegmentInvalidationEvidence>,
@@ -1973,9 +1997,12 @@ mod guards;
 pub(crate) use guards::ScannerServiceCohort;
 mod io_cache;
 mod io_cycle;
+mod peer_certification;
 #[cfg(test)]
 use io_cache::{ScannerSetCacheGeneration, prepare_scoped_set_scan};
 pub(crate) use io_cycle::{ScannerCycleRequest, nsscanner_with_storage_status_scoped};
+pub(crate) use peer_certification::ScannerRemoteDirtyUsageCertification;
+use peer_certification::{ScannerBucketCompletions, ScannerRemoteDirtyUsageWindow};
 mod io_disk;
 #[cfg(test)]
 mod publish_gate_tests;

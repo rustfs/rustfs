@@ -809,6 +809,16 @@ async fn scan_and_persist_local_bucket(
     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
     let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
     let scan_ctx = ctx.child_token();
+    #[cfg(feature = "e2e-test-hooks")]
+    let _ = crate::e2e_barrier::checkpoint(
+        "bucket_walk",
+        serde_json::json!({
+            "epoch": leader_epoch, "cycle": next_cycle,
+            "pool": source.pool_index, "set": source.set_index,
+            "bucket": bucket, "drive": disk.path().display().to_string(),
+        }),
+    )
+    .await;
     let scan = crate::workload_admission::with_scanner_node_requests(
         node_tx,
         ScannerIODisk::nsscanner_disk(
@@ -1093,6 +1103,25 @@ pub(crate) async fn scan_remote_bucket(
     let result = async {
         let rpc_deadline = Instant::now() + NS_SCANNER_MAX_RPC_LIFETIME;
         let open_deadline = (Instant::now() + NS_SCANNER_STALL_TIMEOUT).min(rpc_deadline);
+        #[cfg(feature = "e2e-test-hooks")]
+        if crate::e2e_barrier::worker_observation::enabled() {
+            let location = disk.get_disk_location();
+            // RemoteDisk::get_disk_id reads the same cached ID used by disk_ref; no RPC.
+            let disk_uuid = crate::storage_api::owner::EcstoreDiskAPI::get_disk_id(disk)
+                .await
+                .ok()
+                .flatten();
+            crate::e2e_barrier::worker_observation::opening(serde_json::json!({
+                "epoch": leader_epoch, "cycle": next_cycle, "request_id": request_id,
+                "wire_session_id": session_id, "wire_session_sequence": session_sequence,
+                "server_epoch": server_epoch, "bucket": bucket, "pool": expected_source.pool_index,
+                "set": expected_source.set_index, "disk_index": location.disk_idx, "disk_uuid": disk_uuid,
+                "worker_endpoint": crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk).grid_host(),
+                "worker_path": disk.path().display().to_string(),
+                "reuse_plan_sha256": crate::e2e_barrier::hex(&scan_plan_digest.0),
+                "coverage_plan_sha256": crate::e2e_barrier::hex(&checkpoint_plan_digest.0),
+            }));
+        }
         let open_stream = disk.open_ns_scanner_stream(crate::NsScannerOpenRequest {
             request_id,
             server_epoch,
@@ -1446,6 +1475,17 @@ where
                     StorageError::other("remote namespace scanner returned trailing bytes after terminal frame"),
                     last_phase,
                 ));
+            }
+            #[cfg(feature = "e2e-test-hooks")]
+            if matches!(&result, Ok(RemoteScannerOutcome::Complete { .. })) && crate::e2e_barrier::worker_observation::enabled() {
+                crate::e2e_barrier::worker_observation::complete(
+                    authenticator.request_id,
+                    [
+                        last_progress.objects_scanned,
+                        last_progress.directories_started,
+                        last_progress.entries_visited,
+                    ],
+                );
             }
             return result;
         }

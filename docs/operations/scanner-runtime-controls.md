@@ -662,7 +662,9 @@ typed terminal result:
 | `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
 | `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
 | `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total` | Associated candidates whose discovered data-directory ID differs from the ID selected from quorum metadata by storage. Both IDs must be non-nil and refer to the same kind, bucket, and object name. This is an observation of two samples, not an identity or content verdict, and can overlap `scope` values such as `insufficient_scan`. |
 | `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_task_deep_check_observations_total` | The first associated observation of a completed, non-dry-run canonical task for which storage reported completing its Deep check path. A `Normal` request can enter that path internally. Restart or recent-history eviction can allow recounts. This does not certify all bytes or candidate coverage. |
 | `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
 | `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
 
@@ -672,6 +674,12 @@ can include a deferred object; the `disposition` label preserves that distinctio
 payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
 contract does not bind the candidate's content identity and leader epoch. No
 verified-byte or full-bucket coverage counter is advanced here.
+
+The data-directory and Deep check observations do not prove continuous lock
+ownership or the object's identity at task completion. They can also be
+reported when namespace locking is disabled or explicitly skipped. A mismatch
+does not change the candidate's identity scope, and a Deep check observation
+does not make a `Normal` terminal satisfy a Deep candidate.
 
 The scanner status response also exposes `heal_observation` without requiring
 a metrics exporter. Reading status does not start an observer. `state` is
@@ -923,3 +931,13 @@ config:
 ```
 
 Use `extraEnv` for environment variables that are not represented by chart values, including every heal knob above.
+
+## Diagnostic same-bucket prefix attribution
+
+Build with `diagnostic-prefix-attribution` to enable bounded diagnostic counters. The feature is disabled in ordinary builds. Set `RUSTFS_SCANNER_PREFIX_ATTRIBUTION` before starting RustFS to a JSON object with one bucket and two disjoint prefixes, for example `{"bucket":"bench","hot_prefix":"hot/","cold_prefix":"cold/"}`. Prefixes must end in `/` and have no empty, `.` or `..` path component. A missing, malformed or overlapping scope disables attribution; it does not emit zero. Restart to change the scope.
+
+`rustfs_scanner_object_metadata_prefix_visits_total` classifies stored Scanner paths by disk into the fixed classes `hot`, `cold`, `other` and `ambiguous`. Its scope digest uses the `scanner-prefix-attribution-v2` domain; raw bucket and prefix text are not labels, but the digest is not a secrecy guarantee. A path containing a component ending in the encoded directory suffix is `ambiguous`, because a directory marker and a literal key can share that representation. Never count it as hot or cold. Other path normalization and filesystem aliases can also prevent recovery of the original S3 key, so this is not general raw-key attribution.
+
+An attempt is recorded immediately before calling `get_size_with_tier_names` after node admission. A concurrent cancellation can still prevent its internal metadata read. Attempts include failures and repeated visits, and are not unique objects, native I/O or durable progress. A separate `rustfs_scanner_object_metadata_prefix_successes_total` increments only when that call returns success; it does not certify publication. An operation crossing a measurement boundary can produce a success in one window and an attempt in another. The class handles are registered for a valid matching bucket so an observed zero can be distinguished from a missing series.
+
+Use a controlled canonical dataset and independently verify its inventory and per-disk scope before interpreting these counts. Require complete per-disk series for all four classes, unchanged scope, no resets and genuinely matching source windows; missing data or nonzero ambiguous counts cannot establish cold attribution. A zero ambiguous count does not prove a complete scan or rule out other path aliases. Build both comparison legs with the same feature and configuration, and separately measure its overhead. This diagnostic alone does not establish clone-byte attribution, physical cold cache, foreground latency or SSD acceptance.

@@ -9,21 +9,23 @@ it never turns synthetic harness output into release evidence.
 from __future__ import annotations
 
 import argparse
-from datetime import datetime, timedelta, timezone
+from dataclasses import dataclass
+from datetime import datetime
 import json
-import math
+import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any
 
 from scanner_abba import (
-    P2_WORK_MULTIPLE_LIMIT,
     RELEASE_PROFILE_ARTIFACTS,
     RELEASE_SCHEDULER_BOUNDS,
     SCENARIOS,
     digest,
+    measured_provenance_verified,
     read_json,
     require,
     sha,
@@ -33,40 +35,32 @@ from scanner_abba import (
 ROOT = Path(__file__).resolve().parents[1]
 G10_FIELDS = ("scheduler_bound_evidence", "pressure_recovery_evidence")
 P1_FIELDS = ("cold_walk_share_measurement", "foreground_latency_throughput_measurement", "profile_evidence")
-P2_FIELDS = ("post_stop_convergence_measurement", "cold_segment_reuse_measurement")
 P3_FIELDS = ("two_hour_pressure_measurement", "heal_capacity_measurement", "recovery_window_measurement")
-PRESSURE_METRICS = (
-    "foreground_p95_ms",
-    "foreground_p99_ms",
-    "throughput_ops",
-    "error_rate",
-    "heal_lock_wait_p99_ms",
-    "attempt_cost_samples",
-)
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
 
 def git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
 
 
-def finite_number(value: Any, name: str, minimum: float = 0.0) -> float:
-    require(type(value) in (int, float) and math.isfinite(value) and value >= minimum, f"invalid {name}")
-    return float(value)
+@dataclass(frozen=True)
+class VerifiedPressureObservations:
+    source_revision: str
+    window: tuple[str, str, str, str]
+    fields: dict[str, dict[str, dict[str, Any]]]
+    profile_costs: dict[str, int]
+    profile_identities: dict[str, tuple[str, int]]
+
+
+def pressure_inputs_verified(_abba_dir: Path, _recovery_path: Path, _profiles: dict[str, Path],
+                             _window: tuple[str, str, str, str]) -> VerifiedPressureObservations | None:
+    # The verifier must derive each field from original, independently bound
+    # observations. A self-reported flag or a count from a different window is
+    # not a verified observation.
+    return None
 
 
 def positive_int(value: Any, name: str, minimum: int = 1) -> int:
     require(type(value) is int and value >= minimum, f"invalid {name}")
     return value
-
-
-def positive_int_from_sources(cli_value: int | None, manifest_values: dict[str, Any], key: str) -> int:
-    if cli_value is not None:
-        return positive_int(cli_value, key)
-    return positive_int(manifest_values.get(key), key)
 
 
 def parse_artifact_arg(value: str) -> tuple[str, Path, str]:
@@ -90,6 +84,7 @@ def load_measured_abba(abba_dir: Path, source_revision: str) -> tuple[dict[str, 
     require(manifest.get("evidence") == "measured", "ABBA manifest must be measured")
     require(report.get("evidence") == "measured", "ABBA report must be measured")
     require(report.get("status") == "pass" and report.get("performance") == "pass", "ABBA report must pass")
+    require(measured_provenance_verified(abba_dir), "ABBA source windows and client percentiles are not independently verified")
     require(manifest.get("candidate", {}).get("revision") == source_revision, "candidate revision must match checkout")
     duration = positive_int(manifest.get("duration_seconds"), "duration_seconds", 7200)
     require(duration >= 7200, "P3 two-hour pressure evidence requires at least 7200 seconds")
@@ -121,38 +116,6 @@ def load_measured_abba(abba_dir: Path, source_revision: str) -> tuple[dict[str, 
     return manifest, report, measures
 
 
-def comparison_rows(report: dict[str, Any], scenario: str, comparison: str) -> list[dict[str, Any]]:
-    rows = [
-        item for item in report.get("comparisons", [])
-        if item.get("scenario") == scenario and item.get("comparison") == comparison
-    ]
-    require(rows, f"missing {scenario}/{comparison} comparisons")
-    return rows
-
-
-def worst_metric(measures: list[dict[str, Any]], key: str) -> float:
-    return max(finite_number(item["metrics"].get(key), key) for item in measures)
-
-
-def sum_metric(measures: list[dict[str, Any]], key: str) -> float:
-    return sum(finite_number(item["metrics"].get(key), key) for item in measures)
-
-
-def post_stop_convergence_multiples(report: dict[str, Any]) -> list[float]:
-    values: list[float] = []
-    for index, comparison in enumerate(report.get("comparisons", [])):
-        raw = comparison.get("p2_post_stop_work_multiples")
-        if raw is None:
-            continue
-        require(isinstance(raw, list), f"comparison {index} p2_post_stop_work_multiples must be a list")
-        for value in raw:
-            if value is None:
-                continue
-            values.append(finite_number(value, "p2 post-stop work multiple", 0.0))
-    require(values, "P2 requires measured post-stop convergence rows")
-    return values
-
-
 PROFILE_ARTIFACT_REQUIRED_METRICS = {
     "allocation-profile": ("resolved_samples", "allocation_bytes"),
     "flamegraph": ("resolved_samples",),
@@ -162,7 +125,8 @@ PROFILE_ARTIFACT_REQUIRED_METRICS = {
 
 
 def copy_profile_artifacts(out_dir: Path, artifacts: dict[str, tuple[Path, str]], source_revision: str,
-                           run_id: str, window_id: str, profile_costs: dict[str, int]) -> dict[str, Any]:
+                           run_id: str, window_id: str, profile_costs: dict[str, int],
+                           profile_identities: dict[str, tuple[str, int]]) -> dict[str, Any]:
     copied: dict[str, Any] = {}
     profile_dir = out_dir / "artifacts" / "profiles"
     raw_dir = profile_dir / "raw"
@@ -172,6 +136,9 @@ def copy_profile_artifacts(out_dir: Path, artifacts: dict[str, tuple[Path, str]]
         source, artifact_format = artifacts[kind]
         raw_target = raw_dir / f"{kind}{source.suffix or '.artifact'}"
         shutil.copyfile(source, raw_target)
+        expected_hash, expected_size = profile_identities[kind]
+        require(raw_target.stat().st_size == expected_size and digest(raw_target) == expected_hash,
+                f"profile artifact differs from verified observation: {kind}")
         target = profile_dir / f"P1-profile_evidence-{kind}.json"
         payload = {
             "schema": 1,
@@ -239,12 +206,8 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     out_dir = args.out_dir.resolve()
     require(not out_dir.exists(), "output directory must be new")
     source_revision = args.source_revision or git_head()
-    manifest, report, measures = load_measured_abba(args.abba_dir.resolve(), source_revision)
-    recovery = recovery_evidence(args.recovery_window_json.resolve(), source_revision)
-    release_evidence = manifest["release_evidence"]
-    scheduler = release_evidence["scheduler"]
-    profile_measurements = release_evidence.get("profile", {}).get("measurements", {})
-    require(isinstance(profile_measurements, dict), "ABBA manifest profile measurements must be an object")
+    manifest, _, _ = load_measured_abba(args.abba_dir.resolve(), source_revision)
+    recovery_evidence(args.recovery_window_json.resolve(), source_revision)
 
     profile_inputs = {}
     profile_formats = {}
@@ -256,237 +219,99 @@ def build_descriptor(args: argparse.Namespace) -> Path:
     missing_profiles = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(profile_inputs))
     require(not missing_profiles, "missing profile artifacts: " + ", ".join(missing_profiles))
 
-    out_dir.mkdir(parents=True)
     duration = positive_int(manifest["duration_seconds"], "duration_seconds", 7200)
-    started_at = args.started_at or utc_now()
-    if args.finished_at:
-        finished_at = args.finished_at
-    else:
+    started_at, finished_at = args.started_at, args.finished_at
+    run_id, window_id = args.run_id, args.measurement_window_id
+    require(all(isinstance(value, str) and value.strip() for value in (started_at, finished_at, run_id, window_id)),
+            "original measurement window timestamps and identifiers are required")
+    try:
         started = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
-        finished_at = (started + timedelta(seconds=duration)).isoformat().replace("+00:00", "Z")
-    run_id = args.run_id or f"scheduler-pressure-{source_revision[:12]}"
-    window_id = args.measurement_window_id or f"scheduler-pressure-window-{source_revision[:12]}"
-    command = [
-        "scripts/run_scanner_heal_scheduler_pressure_evidence.py",
-        "--abba-dir", "<abba-dir>",
-        "--recovery-window-json", "<recovery-window-json>",
-        "--profile-artifact", "<kind=artifact>",
-    ]
-    running_heal = comparison_rows(report, "running-heal", "build")
-    require(any(row.get("w10", {}).get("status") == "observed" for row in running_heal),
-            "G10 requires observed running-heal pacing benefit")
-    require(all(row.get("w11", {}).get("status") == "observed" for row in running_heal),
-            "P3 requires observed bounded retry-window rows")
-    cold_hot = comparison_rows(report, "cold-hot", "build")
-    p1_rows = [row.get("p1") for row in cold_hot]
-    require(all(isinstance(row, dict) and row.get("observed_reduction", -1) >= row.get("required_reduction", 1)
-                for row in p1_rows), "P1 cold-hot rows did not meet required reduction")
-    candidate_walked_segments = 0
-    candidate_cold_segments = 0
-    for index, row in enumerate(p1_rows):
-        require(isinstance(row, dict), f"P1 row {index} missing cold-hot measurement")
-        candidate_walked_segments += int(finite_number(row.get("candidate_walk_objects"),
-                                                       "candidate_walk_objects", 1))
-        candidate_cold_segments += int(finite_number(row.get("candidate_cold_walk_objects"),
-                                                     "candidate_cold_walk_objects", 0))
-    require(candidate_cold_segments == 0, "P2 requires zero cold-segment walks in measured cold-hot rows")
-    p2_multiples = post_stop_convergence_multiples(report)
-    p2_limit = float(P2_WORK_MULTIPLE_LIMIT)
-    p2_worst = max(p2_multiples)
-    require(p2_worst <= p2_limit, "P2 post-stop convergence exceeded work multiple limit")
-    profile_costs = {
-        "resolved_samples": positive_int_from_sources(args.resolved_samples, profile_measurements, "resolved_samples"),
-        "allocation_bytes": positive_int_from_sources(args.allocation_bytes, profile_measurements, "allocation_bytes"),
-        "rss_peak_bytes": positive_int_from_sources(args.rss_peak_bytes, profile_measurements, "rss_peak_bytes"),
-        "save_operations": positive_int_from_sources(args.save_operations, profile_measurements, "save_operations"),
-        "saved_bytes": positive_int_from_sources(args.saved_bytes, profile_measurements, "saved_bytes"),
-    }
+        finished = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+    except ValueError:
+        raise ValueError("invalid original measurement window") from None
+    require(started.tzinfo is not None and finished.tzinfo is not None and (finished - started).total_seconds() >= duration,
+            "invalid original measurement window")
+    window = (run_id, window_id, started_at, finished_at)
+    observations = pressure_inputs_verified(args.abba_dir.resolve(), args.recovery_window_json.resolve(), profile_inputs, window)
+    require(isinstance(observations, VerifiedPressureObservations) and observations.window == window
+            and observations.source_revision == source_revision,
+            "independent verified pressure observations are unavailable")
+    expected_fields = {"G10": G10_FIELDS, "P1": P1_FIELDS, "P3": P3_FIELDS}
+    require(type(observations.fields) is dict and set(observations.fields) == set(expected_fields),
+            "verified pressure observations do not cover required gates")
+    reserved = {"artifact", "sha256", "artifact_format", "schema", "source_revision", "run_id",
+                "measurement_window_id", "started_at", "finished_at", "command", "evidence_type",
+                "gate", "field", "profile_artifacts", "resolved_samples", "allocation_bytes",
+                "rss_peak_bytes", "save_operations", "saved_bytes"}
+    for gate, names in expected_fields.items():
+        rows = observations.fields[gate]
+        require(type(rows) is dict and set(rows) == set(names), f"verified {gate} observations are incomplete")
+        for field in names:
+            row = rows[field]
+            require(type(row) is dict and not reserved.intersection(row)
+                    and isinstance(row.get("summary"), str) and row["summary"].strip(),
+                    f"invalid verified {gate}.{field} observation")
 
-    common = {
-        "evidence_type": "measured",
-        "source_revision": source_revision,
-        "run_id": run_id,
-        "measurement_window_id": window_id,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "command": command,
-    }
-    total_walk = int(sum_metric(measures, "walk_objects"))
-    total_cold = int(sum_metric(measures, "cold_walk_objects"))
-    total_healed = int(sum_metric(measures, "healed_objects"))
-    total_bytes = sum(item.get("oracle", {}).get("bytes", 0) for item in measures)
-    total_versions = sum(item.get("oracle", {}).get("versions", 0) for item in measures)
-    profile_refs = copy_profile_artifacts(
-        out_dir,
-        {kind: (profile_inputs[kind], profile_formats[kind]) for kind in RELEASE_PROFILE_ARTIFACTS},
-        source_revision,
-        run_id,
-        window_id,
-        profile_costs,
-    )
+    profile_keys = ("resolved_samples", "allocation_bytes", "rss_peak_bytes", "save_operations", "saved_bytes")
+    require(type(observations.profile_costs) is dict and set(observations.profile_costs) == set(profile_keys),
+            "verified profile observations are incomplete")
+    profile_costs = {key: positive_int(observations.profile_costs[key], key) for key in profile_keys}
+    require(type(observations.profile_identities) is dict
+            and set(observations.profile_identities) == set(RELEASE_PROFILE_ARTIFACTS),
+            "verified profile identities are incomplete")
+    for kind, identity in observations.profile_identities.items():
+        require(type(identity) is tuple and len(identity) == 2 and sha(identity[0])
+                and type(identity[1]) is int and identity[1] > 0, f"invalid verified profile identity: {kind}")
+    for key in profile_keys:
+        supplied = getattr(args, key)
+        require(supplied is None or supplied == profile_costs[key], f"profile {key} differs from verified observation")
 
-    gates: dict[str, Any] = {
-        "G10": {
-            "status": "pass",
-            "lane": "scheduler-pressure",
-            "evidence_type": "measured",
-            "evidence_fields": {
-                "scheduler_bound_evidence": write_field(out_dir, "G10", "scheduler_bound_evidence", {
-                    **common,
-                    "summary": "Measured ABBA scheduler-pressure run bounded deferred work and rejected duplicate admission.",
-                    "max_deferred_items": scheduler["max_deferred_items"],
-                    "max_deferred_bytes": scheduler["max_deferred_bytes"],
-                    "max_retry_age_seconds": scheduler["max_retry_age_seconds"],
-                    "duplicate_task_count": int(worst_metric(measures, "heal_duplicate_task_count")),
-                    "scheduler_bounds": list(RELEASE_SCHEDULER_BOUNDS),
-                    "duplicate_task_bound_observed": scheduler["duplicate_task_bound_observed"]
-                    and int(worst_metric(measures, "heal_duplicate_task_count")) == 0,
-                }),
-                "pressure_recovery_evidence": write_field(out_dir, "G10", "pressure_recovery_evidence", {
-                    **common,
-                    "summary": "Measured ABBA running-heal rows observed pressure pacing and foreground recovery metrics.",
-                    "pressure_pacing_engaged": True,
-                    "recovery_window_seconds": positive_int(recovery.get("pressure_recovery_window_seconds"), "pressure recovery window"),
-                    "lock_hold_p95_ms": int(worst_metric(measures, "heal_lock_hold_p95_ms")),
-                    "foreground_latency_p95_ms": int(worst_metric(measures, "p95_ms")),
-                    "pressure_metrics": {
-                        "foreground_p95_ms": worst_metric(measures, "p95_ms"),
-                        "foreground_p99_ms": worst_metric(measures, "p99_ms"),
-                        "throughput_ops": min(finite_number(item["metrics"].get("throughput_ops"), "throughput_ops", 1) for item in measures),
-                        "error_rate": 0.0,
-                        "heal_lock_wait_p99_ms": worst_metric(measures, "heal_lock_wait_p99_ms"),
-                        "attempt_cost_samples": max(1.0, sum_metric(measures, "healed_objects")),
-                        "foreground_pressure_samples": int(sum_metric(measures, "foreground_pressure_samples")),
-                        "foreground_pressure_high_samples": max(1, int(sum_metric(measures, "foreground_pressure_high_samples"))),
-                    },
-                }),
-            },
-        },
-        "P1": {
-            "status": "pass",
-            "lane": "scheduler-pressure",
-            "evidence_type": "measured",
-            "evidence_fields": {
-                "cold_walk_share_measurement": write_field(out_dir, "P1", "cold_walk_share_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured ABBA cold-hot rows met the required cold-walk share reduction.",
-                    "cold_walk_share": 0.0 if total_walk == 0 else total_cold / total_walk,
-                    "walk_objects": total_walk,
-                    "cold_walk_objects": total_cold,
-                }),
-                "foreground_latency_throughput_measurement": write_field(out_dir, "P1", "foreground_latency_throughput_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured ABBA foreground latency and throughput remained within the release thresholds.",
-                    "foreground_latency_p95_ms": int(worst_metric(measures, "p95_ms")),
-                    "foreground_latency_p99_ms": int(worst_metric(measures, "p99_ms")),
-                    "throughput_ops_per_second": int(min(finite_number(item["metrics"].get("throughput_ops"), "throughput_ops", 1) for item in measures)),
-                    "error_count": int(sum_metric(measures, "errors")),
-                    "foreground_p95_ms": worst_metric(measures, "p95_ms"),
-                    "foreground_p99_ms": worst_metric(measures, "p99_ms"),
-                    "throughput_ops": min(finite_number(item["metrics"].get("throughput_ops"), "throughput_ops", 1) for item in measures),
-                    "error_rate": 0.0,
-                }),
-                "profile_evidence": write_field(out_dir, "P1", "profile_evidence", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured profile artifacts are bound to the scheduler-pressure measurement window.",
-                    **profile_costs,
-                    "profile_artifacts": profile_refs,
-                }),
-            },
-        },
-        "P2": {
-            "status": "pass",
-            "lane": "scheduler-pressure",
-            "evidence_type": "measured",
-            "evidence_fields": {
-                "post_stop_convergence_measurement": write_field(out_dir, "P2", "post_stop_convergence_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured ABBA rows converged after writes stopped within the bounded work multiple.",
-                    "writes_stopped": True,
-                    "last_mutation_observed": True,
-                    "first_complete_publication": True,
-                    "post_stop_samples": len(p2_multiples),
-                    "post_stop_work_multiple": p2_worst,
-                    "post_stop_work_multiple_limit": p2_limit,
-                    "post_stop_work_multiples": p2_multiples,
-                }),
-                "cold_segment_reuse_measurement": write_field(out_dir, "P2", "cold_segment_reuse_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured ABBA cold-hot rows reused cold segments without walking cold objects.",
-                    "hot_walked_segments": candidate_walked_segments,
-                    "cold_walked_segments": candidate_cold_segments,
-                    "full_walk_oracle_equivalent": True,
-                    "published_root_equivalent": True,
-                    "walk_objects": candidate_walked_segments,
-                    "cold_walk_objects": candidate_cold_segments,
-                }),
-            },
-        },
-        "P3": {
-            "status": "pass",
-            "lane": "scheduler-pressure",
-            "evidence_type": "measured",
-            "evidence_fields": {
-                "two_hour_pressure_measurement": write_field(out_dir, "P3", "two_hour_pressure_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured full ABBA scheduler-pressure matrix completed a two-hour fixed-load window per cell.",
-                    "fixed_offered_load": True,
-                    "foreground_latency_p99_ms": int(worst_metric(measures, "p99_ms")),
-                    "attempt_cost_samples": max(1, int(sum_metric(measures, "healed_objects"))),
-                    "abba_legs": ["A1", "B1", "B2", "A2"],
-                    "scenarios": list(SCENARIOS),
-                    "foreground_p95_ms": worst_metric(measures, "p95_ms"),
-                    "foreground_p99_ms": worst_metric(measures, "p99_ms"),
-                    "throughput_ops": min(finite_number(item["metrics"].get("throughput_ops"), "throughput_ops", 1) for item in measures),
-                }),
-                "heal_capacity_measurement": write_field(out_dir, "P3", "heal_capacity_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured ABBA cells retained heal capacity without duplicate task admission.",
-                    "completed_heal_objects": max(1, total_healed),
-                    "duplicate_task_count": int(worst_metric(measures, "heal_duplicate_task_count")),
-                    "heal_capacity": {
-                        "objects": max(1, total_healed),
-                        "versions": max(1, int(total_versions)),
-                        "bytes": max(1, int(total_bytes)),
-                        "completed_objects": max(1, total_healed),
-                    },
-                }),
-                "recovery_window_measurement": write_field(out_dir, "P3", "recovery_window_measurement", {
-                    **common,
-                    "duration_seconds": duration,
-                    "summary": "Measured restart/crash recovery window is bound to the same scheduler-pressure release window.",
-                    "pressure_recovery_window_seconds": positive_int(recovery.get("pressure_recovery_window_seconds"), "pressure recovery window"),
-                    "lock_hold_p95_ms": positive_int(recovery.get("lock_hold_p95_ms"), "lock hold p95", 0),
-                    "fault_modes": ["process-restart", "process-crash-restart"],
-                    "recovery_p95_ms": finite_number(recovery.get("recovery_p95_ms"), "recovery p95", 1),
-                    "recovery_p99_ms": finite_number(recovery.get("recovery_p99_ms"), "recovery p99", 1),
-                }),
-            },
-        },
-    }
-    descriptor = out_dir / "release-bundle-scheduler-pressure.json"
-    write_json(descriptor, {
-        "schema": 1,
-        "evidence": "measured",
-        "source_revision": source_revision,
-        "gates": gates,
-    })
-    for gate in ("G10", "P1", "P2", "P3"):
-        subprocess.check_call([
-            sys.executable,
-            str(ROOT / "scripts/check_test_wiring.py"),
-            "--check-scanner-heal-release-bundle-gate",
-            str(descriptor),
-            gate,
-        ], cwd=ROOT)
-    return descriptor
+    command = ["scripts/run_scanner_heal_scheduler_pressure_evidence.py", "--abba-dir", "<abba-dir>",
+               "--recovery-window-json", "<recovery-window-json>", "--profile-artifact", "<kind=artifact>"]
+    common = {"evidence_type": "measured", "source_revision": source_revision, "run_id": run_id,
+              "measurement_window_id": window_id, "started_at": started_at, "finished_at": finished_at,
+              "command": command}
+    out_dir.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix=".scheduler-pressure-", dir=out_dir.parent) as temporary:
+        staging = Path(temporary) / "bundle"
+        staging.mkdir()
+        profile_refs = copy_profile_artifacts(
+            staging, {kind: (profile_inputs[kind], profile_formats[kind]) for kind in RELEASE_PROFILE_ARTIFACTS},
+            source_revision, run_id, window_id, profile_costs, observations.profile_identities,
+        )
+        gates: dict[str, Any] = {}
+        for gate, names in expected_fields.items():
+            fields = {}
+            for field in names:
+                evidence = {**common, **observations.fields[gate][field]}
+                if gate == "P1" and field == "profile_evidence":
+                    evidence.update(profile_costs, profile_artifacts=profile_refs)
+                fields[field] = write_field(staging, gate, field, evidence)
+            gates[gate] = {"status": "pass", "lane": "scheduler-pressure", "evidence_type": "measured",
+                           "evidence_fields": fields}
+        descriptor = staging / "release-bundle-scheduler-pressure.json"
+        write_json(descriptor, {"schema": 1, "evidence": "measured", "source_revision": source_revision, "gates": gates})
+        out_dir.mkdir(mode=0o700)
+        # Both directories are on the same filesystem. Move the artifacts
+        # without a second copy, then check the actual destination before
+        # publishing the descriptor.
+        os.rename(staging / "artifacts", out_dir / "artifacts")
+        pending = out_dir / ".release-bundle-scheduler-pressure.pending.json"
+        os.link(descriptor, pending)
+        try:
+            for gate in ("G10", "P1", "P3"):
+                subprocess.check_call([
+                    sys.executable,
+                    str(ROOT / "scripts/check_test_wiring.py"),
+                    "--check-scanner-heal-release-bundle-gate",
+                    str(pending),
+                    gate,
+                ], cwd=ROOT)
+            final = out_dir / descriptor.name
+            os.link(pending, final)
+        finally:
+            pending.unlink()
+    return final
 
 
 def write_self_test_abba(root: Path, source_revision: str) -> tuple[Path, Path, list[Path]]:
@@ -601,8 +426,54 @@ def write_self_test_abba(root: Path, source_revision: str) -> tuple[Path, Path, 
     return abba_dir, recovery, profiles
 
 
+def self_test_observations(source_revision: str, profiles: dict[str, Path]) -> VerifiedPressureObservations:
+    """Synthetic packaging fixture; it is never produced by the verifier."""
+    pressure = {"foreground_p95_ms": 10.0, "foreground_p99_ms": 20.0, "throughput_ops": 100.0,
+                "error_rate": 0.0, "heal_lock_wait_p99_ms": 10.0, "attempt_cost_samples": 10,
+                "foreground_pressure_samples": 100, "foreground_pressure_high_samples": 10}
+    profile_costs = {"resolved_samples": 4, "allocation_bytes": 1024, "rss_peak_bytes": 2048,
+                     "save_operations": 2, "saved_bytes": 4096}
+    fields = {
+        "G10": {
+            "scheduler_bound_evidence": {"summary": "Fixture bounds", "max_deferred_items": 10,
+                "max_deferred_bytes": 1048576, "max_retry_age_seconds": 30, "duplicate_task_count": 0,
+                "scheduler_bounds": list(RELEASE_SCHEDULER_BOUNDS), "duplicate_task_bound_observed": True},
+            "pressure_recovery_evidence": {"summary": "Fixture pressure", "pressure_pacing_engaged": True,
+                "recovery_window_seconds": 30, "lock_hold_p95_ms": 5, "foreground_latency_p95_ms": 10,
+                "pressure_metrics": pressure},
+        },
+        "P1": {
+            "cold_walk_share_measurement": {"summary": "Fixture cold share", "duration_seconds": 7200,
+                "cold_walk_share": 0.2, "walk_objects": 100, "cold_walk_objects": 20},
+            "foreground_latency_throughput_measurement": {"summary": "Fixture foreground", "duration_seconds": 7200,
+                "foreground_latency_p95_ms": 10, "foreground_latency_p99_ms": 20,
+                "throughput_ops_per_second": 100, "error_count": 0, "foreground_p95_ms": 10.0,
+                "foreground_p99_ms": 20.0, "throughput_ops": 100.0, "error_rate": 0.0},
+            "profile_evidence": {"summary": "Fixture profile", "duration_seconds": 7200},
+        },
+        "P3": {
+            "two_hour_pressure_measurement": {"summary": "Fixture two-hour pressure", "duration_seconds": 7200,
+                "fixed_offered_load": True, "foreground_latency_p99_ms": 20, "attempt_cost_samples": 10,
+                "abba_legs": ["A1", "B1", "B2", "A2"], "scenarios": list(SCENARIOS),
+                "foreground_p95_ms": 10.0, "foreground_p99_ms": 20.0, "throughput_ops": 100.0},
+            "heal_capacity_measurement": {"summary": "Fixture heal capacity", "duration_seconds": 7200,
+                "completed_heal_objects": 10, "duplicate_task_count": 0,
+                "heal_capacity": {"objects": 10, "versions": 10, "bytes": 4096, "completed_objects": 10}},
+            "recovery_window_measurement": {"summary": "Fixture recovery", "duration_seconds": 7200,
+                "pressure_recovery_window_seconds": 30, "lock_hold_p95_ms": 5,
+                "fault_modes": ["process-restart", "process-crash-restart"], "recovery_p95_ms": 100.0,
+                "recovery_p99_ms": 200.0},
+        },
+    }
+    identities = {kind: (digest(path), path.stat().st_size) for kind, path in profiles.items()}
+    return VerifiedPressureObservations(source_revision, ("fixture-run-0001", "fixture-window-0001",
+                                        "2026-01-01T00:00:00Z", "2026-01-01T02:00:00Z"), fields, profile_costs, identities)
+
+
 def run_self_test() -> None:
     import tempfile
+    from unittest import mock
+    import check_test_wiring as wiring
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -618,12 +489,55 @@ def run_self_test() -> None:
             "--rss-peak-bytes", "2048",
             "--save-operations", "2",
             "--saved-bytes", "4096",
+            "--started-at", "2026-01-01T00:00:00Z",
+            "--finished-at", "2026-01-01T02:00:00Z",
+            "--run-id", "fixture-run-0001",
+            "--measurement-window-id", "fixture-window-0001",
         ]
         for kind, path in zip(RELEASE_PROFILE_ARTIFACTS, profiles):
             argv.extend(["--profile-artifact", f"{kind}={path}"])
         args = parse_args(argv)
-        descriptor = build_descriptor(args)
+        for claim in (None, "verified"):
+            if claim is not None:
+                report = read_json(abba_dir / "report.json")
+                report["measurement_provenance"] = claim
+                write_json(abba_dir / "report.json", report)
+            try:
+                load_measured_abba(abba_dir, source_revision)
+            except ValueError as err:
+                require("not independently verified" in str(err), "wrong self-test failure for unverified ABBA")
+            else:
+                raise ValueError("self-test accepted unverified ABBA")
+        with mock.patch(f"{__name__}.measured_provenance_verified", return_value=True):
+            try:
+                build_descriptor(args)
+            except ValueError as err:
+                require("verified pressure observations" in str(err),
+                        "wrong self-test failure for unverified pressure inputs")
+            else:
+                raise ValueError("self-test accepted unverified pressure inputs")
+        def verify_fixture(command, cwd):
+            require(cwd == ROOT and command[2] == "--check-scanner-heal-release-bundle-gate",
+                    "unexpected self-test checker invocation")
+            with mock.patch.object(wiring, "measured_provenance_verified", return_value=True):
+                status = wiring.scanner_heal_release_bundle_gate_status(ROOT, Path(command[3]), command[4])
+            require(status["decision"] == "verified", "fixture gate validation failed")
+
+        # Exercise packaging with a simulated verifier; this fixture is not
+        # measurement evidence and the output stays inside the temp directory.
+        with mock.patch(f"{__name__}.measured_provenance_verified", return_value=True), \
+             mock.patch(f"{__name__}.pressure_inputs_verified", return_value=self_test_observations(
+                 source_revision, dict(zip(RELEASE_PROFILE_ARTIFACTS, profiles)))), \
+             mock.patch.object(subprocess, "check_call", side_effect=verify_fixture):
+            descriptor = build_descriptor(args)
         require(descriptor.is_file(), "self-test descriptor missing")
+        require("P2" not in read_json(descriptor)["gates"], "self-test manufactured P2 evidence")
+        for gate in ("P1", "P3"):
+            checked = subprocess.run([sys.executable, str(ROOT / "scripts/check_test_wiring.py"),
+                                      "--check-scanner-heal-release-bundle-gate", str(descriptor), gate],
+                                     cwd=ROOT, capture_output=True, text=True, check=False)
+            require(checked.returncode == 1 and "not independently verified" in checked.stdout,
+                    f"self-test accepted unverified {gate} evidence")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)

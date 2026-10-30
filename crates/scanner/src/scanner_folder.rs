@@ -36,7 +36,7 @@ use crate::scanner_budget::{ScannerCycleBudget, ScannerCycleBudgetReason};
 use crate::scanner_io::{
     SCANNER_SKIP_FILE_ERROR, ScannerIODisk as _, is_scanner_metadata_corrupt_error, is_scanner_metadata_transient_error,
 };
-use crate::sleeper::DynamicSleeper;
+use crate::sleeper::{DynamicSleeper, PacingDebt};
 use crate::storage_api::owner::{
     EcstoreBucketLifecycleConfiguration as BucketLifecycleConfiguration, EcstoreEventArgs,
     EcstoreLifecycleRuleFilter as LifecycleRuleFilter, EcstoreObjectLockConfiguration as ObjectLockConfiguration,
@@ -797,6 +797,7 @@ pub struct FolderScanner {
     resolved_failed_object_paths: HashSet<String>,
 
     sleeper: DynamicSleeper,
+    pacing_debt: PacingDebt,
     node_admission: Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
     // should_heal: Arc<dyn Fn() -> bool + Send + Sync>,
     disks: Vec<Arc<Disk>>,
@@ -808,6 +809,8 @@ pub struct FolderScanner {
     checkpoint_depth: usize,
     checkpoint_objects: u64,
     object_metadata_visits: metrics::Counter,
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    prefix_attribution: Option<prefix_attribution::VisitAttribution>,
     last_checkpoint_objects: u64,
     last_checkpoint_at: Instant,
     last_checkpoint_build_time: Duration,
@@ -833,6 +836,10 @@ pub struct FolderScanner {
     list_path_raw_options_observer: Option<mpsc::UnboundedSender<ListPathRawTimeoutSnapshot>>,
     #[cfg(test)]
     defer_abandoned_entries_until_finished: bool,
+    #[cfg(test)]
+    partial_heal_candidate_limit: Option<usize>,
+    #[cfg(test)]
+    partial_heal_discovery_observer: Option<mpsc::UnboundedSender<(usize, usize)>>,
 }
 
 struct RawEnumerationProgress {
@@ -1613,33 +1620,34 @@ impl FolderScanner {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
-        let result = match send_scanner_heal_request(candidate_type, request, scanner_disk_heal_scope(&self.local_disk)).await {
-            Ok(result) => result,
-            Err(err) => {
-                self.update_pending_scanner_heal_after_admission(
-                    kind,
-                    &bucket,
-                    object.as_deref(),
-                    version_id.as_deref(),
-                    scan_mode,
-                    HealAdmissionResult::Full,
-                );
-                error!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_HEAL_ADMISSION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_HEAL,
-                    candidate_type,
-                    bucket = %bucket,
-                    object = object.as_deref().unwrap_or(""),
-                    priority = heal_priority_label(priority),
-                    state = "heal_channel_error",
-                    error = %err,
-                    "Scanner deferred heal request after channel error"
-                );
-                return Ok(HealAdmissionResult::Full);
-            }
-        };
+        let result =
+            match send_scanner_heal_request(candidate_type, request, None, scanner_disk_heal_scope(&self.local_disk)).await {
+                Ok(result) => result,
+                Err(err) => {
+                    self.update_pending_scanner_heal_after_admission(
+                        kind,
+                        &bucket,
+                        object.as_deref(),
+                        version_id.as_deref(),
+                        scan_mode,
+                        HealAdmissionResult::Full,
+                    );
+                    error!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_HEAL_ADMISSION,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_HEAL,
+                        candidate_type,
+                        bucket = %bucket,
+                        object = object.as_deref().unwrap_or(""),
+                        priority = heal_priority_label(priority),
+                        state = "heal_channel_error",
+                        error = %err,
+                        "Scanner deferred heal request after channel error"
+                    );
+                    return Ok(HealAdmissionResult::Full);
+                }
+            };
         self.update_pending_scanner_heal_after_admission(
             kind,
             &bucket,
@@ -1908,7 +1916,7 @@ impl FolderScanner {
                 // A candidate may be object payload rather than a namespace.
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
             } else {
-                wait_for_scanner_io(&ctx, self.sleeper.sleep_folder()).await?;
+                wait_for_scanner_io(&ctx, self.sleeper.sleep_folder_paced(&mut self.pacing_debt)).await?;
             }
 
             let mut queued_folders: Vec<QueuedFolder> = Vec::new();
@@ -2259,7 +2267,7 @@ impl FolderScanner {
                     continue;
                 }
 
-                let timer = self.sleeper.timer();
+                let work_started = tokio::time::Instant::now();
 
                 let heal_enabled = this_hash.mod_alt(
                     self.old_cache.info.next_cycle as u32 / folder.object_heal_prob_div,
@@ -2315,9 +2323,21 @@ impl FolderScanner {
 
                 let size_result = run_scanner_metadata_operation(self.node_admission.as_ref(), &ctx, async {
                     self.object_metadata_visits.increment(1);
-                    self.local_disk
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if let Some(attribution) = &self.prefix_attribution {
+                        attribution.record(&item.bucket, &item.prefix);
+                    }
+                    let result = self
+                        .local_disk
                         .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
-                        .await
+                        .await;
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if result.is_ok()
+                        && let Some(attribution) = &self.prefix_attribution
+                    {
+                        attribution.record_success(&item.bucket, &item.prefix);
+                    }
+                    result
                 })
                 .await?;
                 if self.node_admission.is_some() && ctx.is_cancelled() {
@@ -2416,7 +2436,8 @@ impl FolderScanner {
                             }
                         }
 
-                        timer.sleep().await;
+                        wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed()))
+                            .await?;
                         continue;
                     }
                 };
@@ -2439,7 +2460,7 @@ impl FolderScanner {
                 self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
                 self.maybe_send_checkpoint(&folder, &this_hash, into);
 
-                timer.sleep().await;
+                wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed())).await?;
 
                 if ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
@@ -2909,7 +2930,15 @@ impl FolderScanner {
                                 break;
                             }
 
-                            let discovery = entries.discover_heal_candidates(&bucket, MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(test)]
+                            let candidate_limit = self.partial_heal_candidate_limit.unwrap_or(MAX_META_CACHE_HEAL_CANDIDATES);
+                            #[cfg(not(test))]
+                            let candidate_limit = MAX_META_CACHE_HEAL_CANDIDATES;
+                            let discovery = entries.discover_heal_candidates(&bucket, candidate_limit);
+                            #[cfg(test)]
+                            if let Some(observer) = &self.partial_heal_discovery_observer {
+                                let _ = observer.send((discovery.candidates.len(), discovery.truncated_candidates.len()));
+                            }
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_CANDIDATES_TOTAL)
                                 .increment(u64::try_from(discovery.candidates.len()).unwrap_or(u64::MAX));
                             counter!(METRIC_SCANNER_HEAL_DISCOVERY_SUB_QUORUM_TOTAL).increment(
@@ -2995,13 +3024,22 @@ impl FolderScanner {
                                 if !seen_heal_candidates.insert(identity) {
                                     continue;
                                 }
-                                let request = build_object_heal_request(
-                                    bucket.clone(),
-                                    candidate.object.clone(),
-                                    version_id.clone(),
-                                    self.scan_mode,
-                                    HealChannelPriority::High,
-                                );
+                                let request = if candidate.is_unversioned() {
+                                    build_non_destructive_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                } else {
+                                    build_object_heal_request(
+                                        bucket.clone(),
+                                        candidate.object.clone(),
+                                        version_id.clone(),
+                                        self.scan_mode,
+                                        HealChannelPriority::High,
+                                    )
+                                };
                                 (self.update_current_path)(&candidate.object).await;
                                 let admission = self
                                     .send_required_scanner_heal_request(
@@ -3147,6 +3185,9 @@ impl FolderScanner {
             updates.cache.replace_hashed(&this_hash, &folder.parent, &flat);
         }
 
+        if folder.parent.is_none() {
+            wait_for_scanner_io(&ctx, self.sleeper.flush_pacing(&mut self.pacing_debt)).await?;
+        }
         self.finish_size_reconciliation_batch();
         done_folder();
         let scanned_objects = u64::try_from(into.objects).unwrap_or(u64::MAX);
@@ -3235,6 +3276,12 @@ pub(crate) async fn scan_data_folder_scoped(
         "bucket" => bucket_name.clone(),
         "disk" => base_path.clone()
     );
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    let prefix_attribution = prefix_attribution::configured_for(&bucket_name, &base_path);
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    if prefix_attribution.is_some() {
+        object_metadata_visits.increment(0);
+    }
     let next_cycle = cache.info.next_cycle;
     let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
@@ -3263,6 +3310,7 @@ pub(crate) async fn scan_data_folder_scoped(
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper,
+        pacing_debt: PacingDebt::default(),
         node_admission: crate::workload_admission::scanner_node_admission(),
         disks,
         disks_quorum,
@@ -3272,6 +3320,8 @@ pub(crate) async fn scan_data_folder_scoped(
         checkpoint_depth: 0,
         checkpoint_objects: 0,
         object_metadata_visits,
+        #[cfg(feature = "diagnostic-prefix-attribution")]
+        prefix_attribution,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
@@ -3293,6 +3343,10 @@ pub(crate) async fn scan_data_folder_scoped(
         list_path_raw_options_observer: None,
         #[cfg(test)]
         defer_abandoned_entries_until_finished: false,
+        #[cfg(test)]
+        partial_heal_candidate_limit: None,
+        #[cfg(test)]
+        partial_heal_discovery_observer: None,
     };
 
     let now = FolderScanner::now_secs();
@@ -3483,6 +3537,8 @@ pub(crate) async fn scan_data_folder_scoped(
 mod item_actions;
 mod ledger;
 mod native_io;
+#[cfg(feature = "diagnostic-prefix-attribution")]
+mod prefix_attribution;
 
 pub(crate) use item_actions::scanner_disk_heal_scope;
 use item_actions::*;

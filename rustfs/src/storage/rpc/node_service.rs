@@ -1401,8 +1401,13 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
                 .zip(&request.entries)
                 .map(|(guard, entry)| (guard, entry.generation))
                 .collect::<Vec<_>>();
-            rustfs_scanner::acknowledge_scoped_dirty_usage(&request.instance_id, &entries, request.probe_only)
-                .map_err(|err| Status::failed_precondition(err.to_string()))
+            #[cfg(feature = "e2e-test-hooks")]
+            observe_scoped_dirty_usage_ack("ack_before_apply", &request, None).await?;
+            let cleared = rustfs_scanner::acknowledge_scoped_dirty_usage(&request.instance_id, &entries, request.probe_only)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            #[cfg(feature = "e2e-test-hooks")]
+            observe_scoped_dirty_usage_ack("ack_after_apply", &request, Some(cleared)).await?;
+            Ok::<_, Status>(cleared)
         })
         .await
         .map_err(|_| Status::deadline_exceeded("scoped dirty usage incarnation validation timed out"))??;
@@ -1423,6 +1428,44 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
             .into();
         Ok(Response::new(response))
     }
+}
+
+/// Capture the real compare-and-remove boundary while the production
+/// incarnation fences are still held. Capability probes never pause here.
+#[cfg(feature = "e2e-test-hooks")]
+async fn observe_scoped_dirty_usage_ack(
+    stage: &str,
+    request: &ScannerScopedDirtyUsageAckRequest,
+    cleared: Option<u64>,
+) -> Result<(), Status> {
+    if request.probe_only {
+        return Ok(());
+    }
+    let dirty =
+        rustfs_scanner::scanner_dirty_usage_snapshot(rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+    let detail = serde_json::json!({
+        "owner_id": request.owner_id,
+        "instance_id": request.instance_id,
+        "probe_only": request.probe_only,
+        "entries": request.entries.iter().map(|entry| serde_json::json!({
+            "bucket": entry.bucket,
+            "bucket_incarnation": Uuid::from_slice(entry.bucket_incarnation.as_ref()).ok().map(|value| value.to_string()),
+            "generation": entry.generation,
+        })).collect::<Vec<_>>(),
+        "cleared": cleared,
+        "dirty_snapshot": {
+            "generation": dirty.generation,
+            "pending_bucket_count": dirty.pending_bucket_count,
+            "complete": dirty.complete,
+            "buckets": dirty.buckets.iter().map(|bucket| serde_json::json!({
+                "bucket": bucket.bucket,
+                "generation": bucket.generation,
+            })).collect::<Vec<_>>(),
+        },
+    });
+    rustfs_scanner::e2e_barrier::checkpoint(stage, detail)
+        .await
+        .map_err(|error| Status::internal(format!("scoped dirty usage test barrier failed: {error}")))
 }
 
 #[tonic::async_trait]
