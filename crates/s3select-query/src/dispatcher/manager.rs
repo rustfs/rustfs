@@ -1745,8 +1745,8 @@ mod tests {
         let mut input = test_input();
         input.key = "records.json".to_owned();
         input.request.input_serialization.csv = None;
-        input.request.input_serialization.json = Some(JSONInput {
-            type_: Some(JSONType::from_static(JSONType::LINES)),
+        input.request.input_serialization.json = Some(JsonInput {
+            r#type: Some(JsonType::LINES),
         });
         let input = Arc::new(input);
         let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
