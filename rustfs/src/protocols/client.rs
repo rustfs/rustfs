@@ -186,6 +186,7 @@ fn session_list_buckets_request(
         region: None,
         request_context: Some(RequestContext::fallback()),
         suppress_denial_log: false,
+        suppress_denial_audit: false,
     });
 
     S3Request {
@@ -380,6 +381,7 @@ impl ProtocolStorageClient {
             region: None,
             request_context: Some(RequestContext::fallback()),
             suppress_denial_log: false,
+            suppress_denial_audit: false,
         });
 
         let req = S3Request {

@@ -311,6 +311,7 @@ pub async fn cached_access(path: impl AsRef<Path>) -> io::Result<()> {
 }
 
 pub fn invalidate_bucket_cache(path: impl AsRef<Path>) {
+    crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
     BUCKET_EXISTENCE_CACHE.invalidate(path.as_ref());
 }
 

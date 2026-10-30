@@ -1390,6 +1390,18 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
 }
 
 impl ECStore {
+    pub(crate) fn all_disks_local_and_online(&self) -> bool {
+        !self.disk_map.is_empty()
+            && self.disk_map.values().all(|disks| {
+                !disks.is_empty()
+                    && disks.iter().all(|disk| {
+                        disk.as_ref().is_some_and(|d| {
+                            d.is_local() && d.runtime_state() == crate::disk::health_state::RuntimeDriveHealthState::Online
+                        })
+                    })
+            })
+    }
+
     /// `put_object` plus the rename_data old-size backfill
     /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
     /// Post-write hooks (immediate ILM transition enqueue, list-cache
@@ -1402,16 +1414,33 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
-        let result = match self.handle_put_object(bucket, object, data, opts).await {
-            Ok((object_info, old_current_size)) => {
-                enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts)
-                    .await
-                    .map(|object_info| (object_info, old_current_size))
-            }
-            Err(err) => Err(err),
-        };
+        let result = self.handle_put_object(bucket, object, data, opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object_with_old_current_size(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        let (oi, old_current_size) = box_copy_object_handler(move || {
+            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+        })
+        .await?;
+        let result = enqueue_transition_after_write(self, Ok(oi), LcEventSrc::S3CopyObject, dst_opts)
+            .await
+            .map(|oi| (oi, old_current_size));
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
         }
         result
     }
@@ -1492,20 +1521,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self,
-            box_copy_object_handler(move || {
-                self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-            })
-            .await,
-            LcEventSrc::S3CopyObject,
-            dst_opts,
-        )
-        .await;
-        if result.is_ok() {
-            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
-        }
-        result
+        self.copy_object_with_old_current_size(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            .await
+            .map(|(oi, _)| oi)
     }
 
     #[instrument(skip(self))]
@@ -1765,15 +1783,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self.as_ref(),
-            self.clone()
-                .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
-                .await,
-            LcEventSrc::S3CompleteMultipartUpload,
-            opts,
-        )
-        .await;
+        let result = self
+            .clone()
+            .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            .await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }

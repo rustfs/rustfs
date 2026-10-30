@@ -213,6 +213,7 @@ impl From<ObjectZipDownloadReqInfoSnapshot> for ReqInfo {
             region: current_region(),
             request_context: None,
             suppress_denial_log: false,
+            suppress_denial_audit: false,
         }
     }
 }
@@ -1458,6 +1459,7 @@ mod tests {
             region: current_region(),
             request_context: None,
             suppress_denial_log: false,
+            suppress_denial_audit: false,
         }
     }
 

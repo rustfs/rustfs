@@ -876,7 +876,7 @@ pub(crate) fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
+pub(super) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 

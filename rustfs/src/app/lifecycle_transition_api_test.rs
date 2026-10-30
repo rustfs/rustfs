@@ -2943,8 +2943,8 @@ async fn put_object_extract_computes_replication_decision_per_entry() {
 /// replication themselves. Without it a retention or legal hold applied after upload stays
 /// local and the replica keeps its previous, unprotected state (a WORM object that is still
 /// deletable on the peer). This observes the shared decision counter: each handler must
-/// compute a replication decision exactly once, which is the step that drives both the
-/// persisted pending marker and the schedule.
+/// compute a replication decision exactly once when replication is configured, which is
+/// the step that drives both the persisted pending marker and the schedule.
 #[tokio::test(flavor = "multi_thread", worker_threads = 1)]
 #[serial]
 #[ignore = "global-state usecase integration test: runs serialized in the CI ILM Integration (serial) lane, see ci.yml test-ilm-integration-serial and rustfs/backlog#1148 (ilm-1)"]
@@ -2993,7 +2993,27 @@ async fn object_lock_handlers_schedule_replication() {
          retention change never replicates and the peer copy stays unprotected"
     );
 
-    // PutObjectLegalHold must do the same.
+    // A bucket without a replication configuration can skip the decision.
+    MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
+    let no_replication_input = PutObjectLegalHoldInput::builder()
+        .bucket(bucket.clone())
+        .key(object.to_string())
+        .legal_hold(Some(ObjectLockLegalHold {
+            status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+        }))
+        .build()
+        .unwrap();
+    fs.put_object_legal_hold(build_request(no_replication_input, Method::PUT))
+        .await
+        .expect("legal hold without replication should succeed");
+    assert_eq!(
+        MUST_REPLICATE_OBJECT_CALLS.load(Ordering::SeqCst),
+        0,
+        "a bucket without replication must skip the decision"
+    );
+
+    // A configured bucket must still evaluate the metadata replication decision.
+    install_delete_replication_config(&bucket, true, false, None).await;
     MUST_REPLICATE_OBJECT_CALLS.store(0, Ordering::SeqCst);
     let legal_hold_input = PutObjectLegalHoldInput::builder()
         .bucket(bucket.clone())

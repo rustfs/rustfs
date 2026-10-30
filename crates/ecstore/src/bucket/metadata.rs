@@ -1508,7 +1508,11 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
     bucket: &str,
     parse: bool,
 ) -> Result<(BucketMetadata, bool)> {
-    let (mut bm, persisted) = match read_bucket_metadata(api.clone(), bucket).await {
+    let (metadata_res, incarnation_res) = tokio::join!(
+        Box::pin(read_bucket_metadata(api.clone(), bucket)),
+        Box::pin(load_bucket_incarnation(api.clone(), bucket)),
+    );
+    let (mut bm, persisted) = match metadata_res {
         Ok(res) => (res, true),
         Err(err) => {
             if err != Error::ConfigNotFound {
@@ -1519,7 +1523,7 @@ pub(crate) async fn load_bucket_metadata_parse_with_presence(
         }
     };
 
-    let incarnation = load_bucket_incarnation(api.clone(), bucket).await?;
+    let incarnation = incarnation_res?;
     if persisted {
         if bm.name.is_empty() {
             bm.name = bucket.to_string();
