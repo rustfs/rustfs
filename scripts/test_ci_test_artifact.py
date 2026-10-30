@@ -54,7 +54,7 @@ class ArtifactIdentityTests(unittest.TestCase):
                          "configuration": "workspace", "profile": "test", "features": [],
                          "build_environment": {key: "" for key in artifact.BUILD_ENVIRONMENT},
                          "system": "Linux", "machine": "x86_64", "repository": "owner/repo",
-                         "run_id": "123", "run_attempt": "2"}
+                         "run_id": "123"}
         self.digest = hashlib.sha256(self.archive.read_bytes()).hexdigest()
         self.size = self.archive.stat().st_size
         self.record = {"schema": 1, "identity": copy.deepcopy(self.identity),
@@ -76,10 +76,21 @@ class ArtifactIdentityTests(unittest.TestCase):
                      "configuration": "e2e", "profile": "release", "features": ["rio-v2"],
                      "build_environment": {**self.identity["build_environment"], "RUSTFLAGS": "-C opt-level=3"},
                      "system": "Darwin", "machine": "aarch64", "repository": "other/repo",
-                     "run_id": "124", "run_attempt": "3"}
+                     "run_id": "124"}
         for key, value in mutations.items():
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, "identity mismatch"):
                 self.verify(expected={**self.identity, key: value})
+
+    def test_failed_job_rerun_reuses_the_archive_but_another_run_does_not(self):
+        with patch.object(artifact, "source_identity", return_value=self.identity["source"]), \
+                patch.object(artifact, "output", return_value="fixture"), \
+                patch.object(artifact, "file_hash", return_value="d" * 64), \
+                patch.dict(os.environ, {"GITHUB_RUN_ID": "123", "GITHUB_RUN_ATTEMPT": "1"}, clear=True):
+            producer = artifact.identity("workspace")
+            with patch.dict(os.environ, {"GITHUB_RUN_ATTEMPT": "2"}):
+                self.assertEqual(artifact.identity("workspace"), producer)
+            with patch.dict(os.environ, {"GITHUB_RUN_ID": "124"}):
+                self.assertNotEqual(artifact.identity("workspace"), producer)
 
     def test_modified_truncated_and_empty_archives_are_rejected(self):
         for key, value in (("schema", 2), ("sha256", "f" * 64), ("size_bytes", self.size + 1)):
