@@ -13,7 +13,6 @@
 // limitations under the License.
 
 use super::*;
-use crate::DataUsageBucketService;
 use std::path::Path;
 
 const BUCKETS: usize = 17;
@@ -182,9 +181,11 @@ fn cold_bucket_service_new_bucket_joins_behind_existing_waiters() {
     order.sort_by(|left, right| left.name.cmp(&right.name));
     ScannerBucketServiceRound::new(ledger.clone()).order_buckets(&mut order);
     assert_eq!(order[0].name, "bucket-01", "a stream of new buckets must not displace waiters");
+    let arrival = ledger.buckets["a-new-bucket"].waiting_since;
+    assert!(arrival > ledger.buckets["bucket-01"].waiting_since);
     assert!(
-        ledger.buckets["a-new-bucket"].waiting_since > ledger.buckets["bucket-00"].waiting_since,
-        "an arrival queues behind the bucket served last"
+        arrival < ledger.buckets["bucket-00"].waiting_since,
+        "an arrival must not wait behind a bucket that already had its turn"
     );
 }
 
@@ -253,7 +254,7 @@ fn cold_bucket_service_budget_stop_and_resource_veto_add_no_debt() {
     drop(vetoed);
 
     let mut stopped = work();
-    stopped.claim_service(round.clone(), "bucket-03", ctx.clone(), budget.clone());
+    stopped.claim_service(round.clone(), "bucket-03", ctx, budget.clone());
     budget.cancel_for_runtime();
     drop(stopped);
 
@@ -265,33 +266,6 @@ fn cold_bucket_service_budget_stop_and_resource_veto_add_no_debt() {
     assert_eq!(ledger.buckets["bucket-02"].service_quanta, 0);
     assert_eq!(ledger.buckets["bucket-03"].service_quanta, 1, "the budget was really spent");
     assert_eq!(ledger.failure_debt(), (0, None), "budget-cancelled work is progress-only");
-}
-
-#[test]
-fn cold_bucket_service_order_is_bounded_keeping_the_newest_positions() {
-    let mut ledger = DataUsageBucketServiceLedger {
-        publication_epoch: EPOCH,
-        next_sequence: 5000,
-        ..Default::default()
-    };
-    for sequence in 0..5000_u64 {
-        ledger.buckets.insert(
-            format!("bucket-{sequence:06}"),
-            DataUsageBucketService {
-                waiting_since: sequence,
-                ..Default::default()
-            },
-        );
-    }
-    let bounded = ledger.bounded();
-    assert_eq!(bounded.buckets.len(), 4096);
-    assert!(bounded.buckets.contains_key("bucket-004999"));
-    assert!(!bounded.buckets.contains_key("bucket-000000"));
-    assert_eq!(
-        restore(Some(bounded.clone()), &[]).publication_epoch,
-        EPOCH,
-        "a bounded order must pass its own validation"
-    );
 }
 
 #[test]

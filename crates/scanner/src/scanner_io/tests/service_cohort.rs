@@ -355,7 +355,7 @@ async fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket(
     }
     let hot = names[0].clone();
     let _failing = fail_coordinator_bucket_scan(&names[1]);
-    let mut waited = vec![0_usize; BUCKETS];
+    let mut waited = [0_usize; BUCKETS];
     for round in 1..=(ROUND_BOUND * 3) {
         record_dirty_usage_bucket(&hot);
         let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));

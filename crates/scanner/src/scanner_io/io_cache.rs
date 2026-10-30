@@ -1926,17 +1926,6 @@ impl ScannerIOCache for SetDisks {
             )
             .await;
         } else {
-            if let Some(ledger) = service_ledger {
-                persist_scanner_service_ledger(
-                    self.clone(),
-                    source,
-                    ledger,
-                    want_cycle,
-                    leader_epoch,
-                    expected_publication_epoch,
-                )
-                .await;
-            }
             let mut incomplete_scope = cache;
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
@@ -1984,6 +1973,20 @@ impl ScannerIOCache for SetDisks {
                 cancelled = ctx.is_cancelled(),
                 "Scanner set cache publish skipped because cycle did not complete cleanly"
             );
+            // Publish the scope first: a contended cache lock must not delay it.
+            // A stopped owner leaves the set cache untouched; only a budget stop
+            // or a finished incomplete cycle hands its order to the next one.
+            if let Some(ledger) = service_ledger.filter(|_| !ctx.is_cancelled() || budget.budget_elapsed()) {
+                persist_scanner_service_ledger(
+                    self.clone(),
+                    source,
+                    ledger,
+                    want_cycle,
+                    leader_epoch,
+                    expected_publication_epoch,
+                )
+                .await;
+            }
         }
 
         debug!(

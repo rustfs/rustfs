@@ -505,7 +505,7 @@ impl ScannerBucketServiceRound {
             }
         }
         state.claimed.clear();
-        Some(std::mem::take(&mut state.ledger).bounded())
+        Some(std::mem::take(&mut state.ledger))
     }
 }
 

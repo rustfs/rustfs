@@ -77,8 +77,6 @@ static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 pub const DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION: u16 = 1;
 const DATA_USAGE_SCAN_CURSOR_MAX_BYTES: usize = 16 * 1024;
-const DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS: usize = 4096;
-const DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DataUsageCacheRevision {
@@ -638,9 +636,13 @@ impl Serialize for DataUsageBucketService {
     }
 }
 
-/// Durable first-in-first-out service order of one set. It only orders work:
+/// Durable first-in-first-out service order of one set, in generations: every
+/// bucket at or below `generation_floor` still waits for its turn and everything
+/// above it was served, so a new bucket queues behind waiters but ahead of
+/// buckets that already had a turn. It only orders work:
 /// no entry proves coverage, authorizes a skip or releases a responsibility,
-/// so losing it restarts fairness and nothing else.
+/// so losing it restarts fairness and nothing else. Like the set cache's bucket
+/// entries and incarnations, it holds one record per bucket of the inventory.
 #[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
 pub struct DataUsageBucketServiceLedger {
     /// Movement epoch the order was built under; another epoch invalidates it.
@@ -649,14 +651,17 @@ pub struct DataUsageBucketServiceLedger {
     #[serde(default)]
     pub next_sequence: u64,
     #[serde(default)]
+    pub generation_floor: u64,
+    #[serde(default)]
     pub buckets: HashMap<String, DataUsageBucketService>,
 }
 
 impl Serialize for DataUsageBucketServiceLedger {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(3))?;
+        let mut map = serializer.serialize_map(Some(4))?;
         map.serialize_entry("publication_epoch", &self.publication_epoch)?;
         map.serialize_entry("next_sequence", &self.next_sequence)?;
+        map.serialize_entry("generation_floor", &self.generation_floor)?;
         map.serialize_entry("buckets", &self.buckets)?;
         map.end()
     }
@@ -695,14 +700,25 @@ impl DataUsageBucketServiceLedger {
                 _ => arrivals.push((bucket, incarnation)),
             }
         }
-        if !arrivals.is_empty() {
-            ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        if arrivals.is_empty() {
+            let floor = ledger.generation_floor;
+            if ledger.buckets.values().all(|service| service.waiting_since > floor) {
+                ledger.generation_floor = ledger.next_sequence;
+            }
+            return ledger;
+        }
+        // Open one position between the waiters and the served buckets.
+        let floor = ledger.generation_floor;
+        ledger.generation_floor = floor.saturating_add(1);
+        ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        for service in ledger.buckets.values_mut().filter(|service| service.waiting_since > floor) {
+            service.waiting_since = service.waiting_since.saturating_add(1);
         }
         for (bucket, incarnation) in arrivals {
             ledger.buckets.insert(
                 bucket.to_owned(),
                 DataUsageBucketService {
-                    waiting_since: ledger.next_sequence,
+                    waiting_since: ledger.generation_floor,
                     incarnation,
                     ..Default::default()
                 },
@@ -712,8 +728,7 @@ impl DataUsageBucketServiceLedger {
     }
 
     fn is_valid(&self) -> bool {
-        self.buckets.len() <= DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS
-            && self.buckets.keys().map(String::len).sum::<usize>() <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES
+        self.generation_floor <= self.next_sequence
             && self
                 .buckets
                 .iter()
@@ -753,33 +768,6 @@ impl DataUsageBucketServiceLedger {
         if let Some(service) = self.buckets.get_mut(bucket) {
             service.failure_debt = service.failure_debt.saturating_add(1);
         }
-    }
-
-    /// Keeps the persisted set cache bounded. The longest waiters are dropped:
-    /// an untracked bucket joins as a new arrival on the next restore.
-    pub(crate) fn bounded(mut self) -> Self {
-        let name_bytes = self.buckets.keys().map(String::len).sum::<usize>();
-        if self.buckets.len() <= DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS && name_bytes <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES {
-            return self;
-        }
-        let mut newest = self.buckets.into_iter().collect::<Vec<_>>();
-        newest.sort_by(|left, right| {
-            right
-                .1
-                .waiting_since
-                .cmp(&left.1.waiting_since)
-                .then_with(|| left.0.cmp(&right.0))
-        });
-        let mut retained_bytes = 0_usize;
-        self.buckets = newest
-            .into_iter()
-            .take(DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS)
-            .take_while(|(bucket, _)| {
-                retained_bytes = retained_bytes.saturating_add(bucket.len());
-                retained_bytes <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES
-            })
-            .collect();
-        self
     }
 
     /// Buckets holding unpaid failures and the first of them by name.
