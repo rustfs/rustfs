@@ -3742,6 +3742,171 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn fused_delete_recovery_survives_interrupted_prepare_and_publication() {
+        for published in [false, true] {
+            let (_temp, disk, _info, original) = fixture().await;
+            let transaction = Uuid::new_v4();
+            let prepared = disk
+                .try_fused_recoverable_delete_version(
+                    "recovery",
+                    "object",
+                    &request(),
+                    &DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                    transaction,
+                    None,
+                )
+                .await
+                .expect("prepare fused deletion");
+            assert_eq!(prepared, Some(()), "the test must exercise the fused path");
+
+            if published {
+                let (_, sole, target_absent) = disk
+                    .try_publish_prepared_delete_local("recovery", "object", transaction, None)
+                    .await
+                    .expect("publish fused receipt")
+                    .expect("fused publication must apply");
+                assert!(sole && target_absent);
+            }
+
+            let mut state = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect persisted state after interruption");
+            if published {
+                assert_eq!(state.state, DeleteRecoveryState::QuorumCommitted);
+                for action in [DeleteRecoveryAction::FinishCommit, DeleteRecoveryAction::FinalizeCommit] {
+                    state = disk
+                        .settle_delete_transaction("recovery", "object", transaction, state.fingerprint, action)
+                        .await
+                        .expect("finish published deletion through recovery");
+                }
+                assert_eq!(state.state, DeleteRecoveryState::Absent);
+                assert!(disk.read_all("recovery", "object/xl.meta").await.is_err());
+            } else {
+                assert_eq!(state.state, DeleteRecoveryState::NewPrepared);
+                state = disk
+                    .settle_delete_transaction(
+                        "recovery",
+                        "object",
+                        transaction,
+                        state.fingerprint,
+                        DeleteRecoveryAction::Rollback,
+                    )
+                    .await
+                    .expect("roll back uncommitted fused deletion");
+                assert_eq!(state.state, DeleteRecoveryState::Absent);
+                assert_eq!(
+                    disk.read_all("recovery", "object/xl.meta")
+                        .await
+                        .expect("restore original metadata")
+                        .as_ref(),
+                    original
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fused_delete_recovery_preserves_or_removes_shard_after_interruption() {
+        use crate::erasure::coding::BitrotWriter;
+
+        for mode in 0..3 {
+            let published = mode != 0;
+            let (_temp, disk, _info, _) = fixture().await;
+            let data_dir = Uuid::new_v4();
+            let payload = Bytes::from_static(b"original shard");
+            let mut info = test_file_info("object", Uuid::nil(), Some(data_dir), None);
+            info.size = i64::try_from(payload.len()).expect("payload size");
+            info.erasure.block_size = payload.len();
+            info.parts[0].size = payload.len();
+            info.parts[0].actual_size = info.size;
+            let original = test_meta(info.clone());
+            let mut writer = BitrotWriter::new(
+                std::io::Cursor::new(Vec::new()),
+                info.erasure.shard_size(),
+                HashAlgorithm::HighwayHash256S,
+            );
+            writer.write(&payload).await.expect("encode shard");
+            writer.shutdown().await.expect("finish shard encoding");
+            let encoded = writer.into_inner().into_inner();
+            let root = disk.io_get_object_path("recovery", "object").expect("object path");
+            fs::write(root.join(STORAGE_FORMAT_FILE), &original)
+                .await
+                .expect("write shard metadata");
+            let shard_dir = root.join(data_dir.to_string());
+            fs::create_dir_all(&shard_dir).await.expect("create shard directory");
+            fs::write(shard_dir.join("part.1"), &encoded)
+                .await
+                .expect("write original shard");
+            let transaction = Uuid::new_v4();
+            assert_eq!(
+                disk.try_fused_recoverable_delete_version(
+                    "recovery",
+                    "object",
+                    &request(),
+                    &DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                    transaction,
+                    None,
+                )
+                .await
+                .expect("prepare fused shard deletion"),
+                Some(()),
+                "the test must exercise the fused path"
+            );
+            if published {
+                let (journal, sole, target_absent) = disk
+                    .try_publish_prepared_delete_local("recovery", "object", transaction, None)
+                    .await
+                    .expect("publish fused receipt")
+                    .expect("fused publication must apply");
+                assert!(sole && target_absent);
+                if mode == 2 {
+                    assert!(
+                        disk.try_finish_and_finalize_prepared_delete_local("recovery", "object", transaction, &journal, None)
+                            .await
+                            .expect("finish fused deletion"),
+                        "the fused finalization must apply"
+                    );
+                    assert!(!shard_dir.exists(), "fused finalization must remove the shard");
+                    assert!(!root.join(STORAGE_FORMAT_FILE).exists());
+                    assert!(!root.join(transaction.to_string()).exists());
+                    continue;
+                }
+            }
+            let mut state = disk
+                .inspect_delete_transaction("recovery", "object", transaction)
+                .await
+                .expect("inspect persisted state");
+            let actions = if published {
+                vec![DeleteRecoveryAction::FinishCommit, DeleteRecoveryAction::FinalizeCommit]
+            } else {
+                vec![DeleteRecoveryAction::Rollback]
+            };
+            for action in actions {
+                state = disk
+                    .settle_delete_transaction("recovery", "object", transaction, state.fingerprint, action)
+                    .await
+                    .expect("recover shard deletion");
+            }
+            assert_eq!(state.state, DeleteRecoveryState::Absent);
+            if published {
+                assert!(!shard_dir.exists(), "committed deletion must remove the shard");
+            } else {
+                assert_eq!(fs::read(root.join(STORAGE_FORMAT_FILE)).await.expect("restore metadata"), original);
+                assert_eq!(fs::read(shard_dir.join("part.1")).await.expect("restore shard"), encoded);
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn delete_recovery_uncommitted_inline_rolls_back_exact_bytes() {
         let (_temp, disk, _info, original) = fixture().await;
         let transaction = Uuid::new_v4();

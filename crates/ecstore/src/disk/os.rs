@@ -286,6 +286,7 @@ mod dir_fsync_failures {
 
     static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    #[cfg(target_os = "linux")]
     pub(super) fn has_any() -> bool {
         !FAILURES.lock().is_empty()
     }
@@ -327,14 +328,9 @@ pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path:
     Ok(())
 }
 
-#[cfg(any(test, all(feature = "test-util", unix)))]
+#[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
 pub(crate) fn has_dir_fsync_test_failures() -> bool {
     dir_fsync_failures::has_any()
-}
-
-#[cfg(all(not(test), feature = "test-util", not(unix)))]
-pub(crate) fn has_dir_fsync_test_failures() -> bool {
-    false
 }
 
 /// Pause a real namespace mutation inside its physical executor.
@@ -2417,6 +2413,7 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn is_active() -> bool {
         !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
     }
