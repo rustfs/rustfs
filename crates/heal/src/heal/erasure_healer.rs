@@ -1349,6 +1349,8 @@ impl ErasureSetHealer {
             };
             (
                 HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Metadata,
                         bucket: RUSTFS_META_BUCKET.to_string(),
@@ -2758,6 +2760,8 @@ mod resume_loop_tests {
                 .unwrap_or(Some(HealObjectDisposition::Repaired));
             let receipt = if error.is_none() {
                 disposition.map(|disposition| HealObjectReceipt {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Object,
                         bucket: bucket.to_owned(),

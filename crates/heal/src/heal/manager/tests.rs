@@ -1386,6 +1386,8 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
         durable_anchor: None,
     };
     let matching = HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket".to_string(),
@@ -1537,6 +1539,8 @@ fn unverified_legacy_fixture(bucket: &str) -> (MrfRepairNoticeTarget, crate::hea
         durable_anchor: Some(anchor.clone()),
     };
     let outcome = HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -1731,6 +1735,8 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
     outcome.execution = HealExecutionOutcome::Completed;
     outcome.coverage = crate::heal::outcome::HealTraversalCoverage::Complete;
     outcome.record(HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -1744,6 +1750,8 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
         detail: None,
     });
     outcome.record(HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -3113,6 +3121,8 @@ async fn local_automatic_query_preserves_source_path_token_and_state() {
                 },
                 disposition: HealObjectDisposition::VerifiedHealthy,
                 detail: None,
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
             });
             snapshot.outcome = Some(Arc::new(outcome));
             snapshot.seqed_items = vec![(

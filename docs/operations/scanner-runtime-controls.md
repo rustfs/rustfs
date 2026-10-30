@@ -630,7 +630,9 @@ typed terminal result:
 | `rustfs_scanner_heal_pending_tasks` | Canonical tasks awaiting a terminal observation. |
 | `rustfs_scanner_heal_pending_oldest_seconds` | Age of the oldest retained pending candidate; refreshed every five seconds. |
 | `rustfs_scanner_heal_candidate_terminal_total` | Associated candidates, labeled by object `disposition`, expected `scan_mode`, and unresolved `scope`. |
+| `rustfs_scanner_heal_candidate_selected_data_dir_mismatch_observations_total` | Associated candidates whose discovered data-directory ID differs from the ID selected from quorum metadata by storage. Both IDs must be non-nil and refer to the same kind, bucket, and object name. This is an observation of two samples, not an identity or content verdict, and can overlap `scope` values such as `insufficient_scan`. |
 | `rustfs_scanner_heal_task_terminal_observations_total` | Associated task observations, deduplicated within the bounded recent history. This is not an execution count. |
+| `rustfs_scanner_heal_task_deep_check_observations_total` | The first associated observation of a completed, non-dry-run canonical task for which storage reported completing its Deep check path. A `Normal` request can enter that path internally. Restart or recent-history eviction can allow recounts. This does not certify all bytes or candidate coverage. |
 | `rustfs_scanner_heal_candidate_unknown_total` | Candidates whose integrity remains unknown, labeled by reason. |
 | `rustfs_scanner_heal_completion_lost_total` | Terminal notifications skipped by a lagging observer. |
 
@@ -640,6 +642,12 @@ can include a deferred object; the `disposition` label preserves that distinctio
 payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
 contract does not bind the candidate's content identity and leader epoch. No
 verified-byte or full-bucket coverage counter is advanced here.
+
+The data-directory and Deep check observations do not prove continuous lock
+ownership or the object's identity at task completion. They can also be
+reported when namespace locking is disabled or explicitly skipped. A mismatch
+does not change the candidate's identity scope, and a Deep check observation
+does not make a `Normal` terminal satisfy a Deep candidate.
 
 The scanner status response also exposes `heal_observation` without requiring
 a metrics exporter. Reading status does not start an observer. `state` is

@@ -1236,6 +1236,7 @@ impl SetDisks {
                         result.object_size =
                             ObjectInfo::from_file_info(&latest_meta, bucket, object, true).get_actual_size()? as usize;
                         result.resolved_version_id = Some(*latest_meta.version_id.unwrap_or_default().as_bytes());
+                        result.quorum_selected_data_dir = selected_heal_data_dir(&latest_meta, opts);
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
@@ -3265,6 +3266,13 @@ impl SetDisks {
     }
 }
 
+fn selected_heal_data_dir(metadata: &FileInfo, opts: &HealOpts) -> Option<[u8; 16]> {
+    if opts.read_repair || opts.dry_run || metadata.deleted || metadata.is_remote() {
+        return None;
+    }
+    metadata.data_dir.filter(|id| !id.is_nil()).map(|id| *id.as_bytes())
+}
+
 fn finalize_object_heal_result(
     mut result: HealResultItem,
     mut error: Option<Error>,
@@ -3287,6 +3295,9 @@ fn finalize_object_heal_result(
             required: 1,
             achieved: 0,
         });
+    }
+    if error.is_some() {
+        result.quorum_selected_data_dir = None;
     }
     (result, error)
 }
@@ -4002,6 +4013,7 @@ mod heal_result_report_tests {
             metadata_verified: true,
             metadata_repair_verified: true,
             legacy_identity_unverified: true,
+            quorum_selected_data_dir: Some([1; 16]),
             ..Default::default()
         };
 
@@ -4012,6 +4024,7 @@ mod heal_result_report_tests {
         assert!(!result.metadata_verified);
         assert!(!result.metadata_repair_verified);
         assert!(!result.legacy_identity_unverified);
+        assert_eq!(result.quorum_selected_data_dir, None);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -4023,6 +4036,134 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn selected_data_dir_is_a_quorum_metadata_observation() {
+        let generation = Uuid::new_v4();
+        let mut metadata = FileInfo {
+            data_dir: Some(generation),
+            ..Default::default()
+        };
+        let opts = HealOpts::default();
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), Some(*generation.as_bytes()));
+        assert_eq!(
+            super::selected_heal_data_dir(&metadata, &HealOpts { no_lock: true, ..opts }),
+            Some(*generation.as_bytes())
+        );
+        assert_eq!(super::selected_heal_data_dir(&metadata, &HealOpts { dry_run: true, ..opts }), None);
+        assert_eq!(
+            super::selected_heal_data_dir(
+                &metadata,
+                &HealOpts {
+                    read_repair: true,
+                    ..opts
+                }
+            ),
+            None
+        );
+        metadata.data_dir = Some(Uuid::nil());
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.data_dir = None;
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.data_dir = Some(generation);
+        metadata.deleted = true;
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.deleted = false;
+        metadata.transition_status = TRANSITION_COMPLETE.to_owned();
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+    }
+
+    #[test]
+    fn failed_heal_does_not_publish_selected_generation() {
+        let result = rustfs_madmin::heal_commands::HealResultItem {
+            quorum_selected_data_dir: Some([1; 16]),
+            ..Default::default()
+        };
+        let mut absence = None;
+        let (result, error) =
+            super::finalize_object_heal_result(result, Some(Error::FileNotFound), &mut absence, false, "b", "o");
+        assert!(error.is_some());
+        assert_eq!(result.quorum_selected_data_dir, None);
+    }
+
+    #[tokio::test]
+    async fn heal_result_observes_current_generation_after_unversioned_overwrite() {
+        let (_temp_dirs, _disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-result-generation";
+        let object = "object.bin";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create test bucket");
+
+        let put_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut first = PutObjReader::from_vec(vec![0x11; 1024 * 1024]);
+        let first_info = set
+            .put_object(bucket, object, &mut first, &put_opts)
+            .await
+            .expect("write first generation");
+        let first_generation = first_info.data_dir.expect("first object data directory");
+        let heal_opts = HealOpts {
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (first_result, first_error) =
+            crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &heal_opts)
+                .await
+                .expect("heal first generation");
+        assert!(first_error.is_none());
+        assert_eq!(first_result.quorum_selected_data_dir, Some(*first_generation.as_bytes()));
+
+        let mut second = PutObjReader::from_vec(vec![0x22; 1024 * 1024]);
+        let second_info = set
+            .put_object(bucket, object, &mut second, &put_opts)
+            .await
+            .expect("overwrite unversioned object");
+        let second_generation = second_info.data_dir.expect("second object data directory");
+        assert_ne!(first_generation, second_generation);
+        let (second_result, second_error) =
+            crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &heal_opts)
+                .await
+                .expect("heal second generation");
+        assert!(second_error.is_none());
+        assert_eq!(second_result.quorum_selected_data_dir, Some(*second_generation.as_bytes()));
+        assert_ne!(second_result.quorum_selected_data_dir, first_result.quorum_selected_data_dir);
+
+        let (unlocked_result, unlocked_error) = crate::storage_api_contracts::heal::HealOperations::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            "",
+            &HealOpts {
+                no_lock: true,
+                ..heal_opts
+            },
+        )
+        .await
+        .expect("observe quorum selection without a namespace lock");
+        assert!(unlocked_error.is_none());
+        assert_eq!(unlocked_result.quorum_selected_data_dir, Some(*second_generation.as_bytes()));
+
+        for opts in [
+            HealOpts {
+                read_repair: true,
+                ..heal_opts
+            },
+            HealOpts {
+                dry_run: true,
+                ..heal_opts
+            },
+        ] {
+            let (result, error) =
+                crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &opts)
+                    .await
+                    .expect("observe heal without an eligible lock");
+            assert!(error.is_none());
+            assert_eq!(result.quorum_selected_data_dir, None);
+        }
     }
 
     #[test]

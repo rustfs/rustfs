@@ -32,6 +32,7 @@ pub(crate) use rustfs_ecstore::api::disk::{DiskOption, STORAGE_FORMAT_FILE, endp
 pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
 pub(crate) use rustfs_ecstore::api::object::test_util::DeleteAfterObjectLockSnapshotBarrier;
+pub(crate) use rustfs_ecstore::api::object::{ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion};
 pub(crate) use rustfs_ecstore::api::runtime::global_tier_config_mgr as get_global_tier_config_mgr;
 pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
 // Shared lifecycle/tier test utilities (rustfs/backlog#1148 ilm-6). The mock
@@ -45,18 +46,19 @@ use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod lifecycle {
     pub(crate) use super::storage_contracts::{
-        BucketOperations, BucketOptions, CompletePart, ListOperations, MakeBucketOptions, MultipartOperations, ObjectIO,
-        ObjectOperations,
+        BucketOperations, BucketOptions, CompletePart, ListOperations, MakeBucketOptions, MultipartOperations, NamespaceLocking,
+        ObjectIO, ObjectOperations,
     };
 
     pub(crate) use super::{
         BUCKET_LIFECYCLE_CONFIG, BUCKET_VERSIONING_CONFIG, BucketVersioningSys, DeleteAfterObjectLockSnapshotBarrier, DiskOption,
         ECStore, EcstoreError, Endpoint, EndpointServerPools, Endpoints, ExpiryState, IlmAction, LcEvent, LcEventSrc,
-        MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, TRANSITION_PENDING, TransitionCleanupStoreBarrier,
-        TransitionOptions, assert_transition_meta_consistent, enqueue_transition_for_existing_objects,
-        expire_transitioned_object, free_version_count, get_bucket_metadata, get_global_tier_config_mgr, init_background_expiry,
-        init_bucket_metadata_sys, init_local_disks, is_err_object_not_found, is_err_version_not_found, new_disk,
-        path2_bucket_object_with_base_path, recover_transition_transaction_records, recover_transition_transaction_records_at,
-        register_mock_tier_util, update_bucket_metadata, wait_for_free_version_absence,
+        MockWarmBackend, PoolEndpoints, STORAGE_FORMAT_FILE, ShardIntegrityWriteMode, TRANSITION_PENDING,
+        TransitionCleanupStoreBarrier, TransitionOptions, WriteCommitGuard, WriteCompletion, assert_transition_meta_consistent,
+        enqueue_transition_for_existing_objects, expire_transitioned_object, free_version_count, get_bucket_metadata,
+        get_global_tier_config_mgr, init_background_expiry, init_bucket_metadata_sys, init_local_disks, is_err_object_not_found,
+        is_err_version_not_found, new_disk, path2_bucket_object_with_base_path, recover_transition_transaction_records,
+        recover_transition_transaction_records_at, register_mock_tier_util, update_bucket_metadata,
+        wait_for_free_version_absence,
     };
 }

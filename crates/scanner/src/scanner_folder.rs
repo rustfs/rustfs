@@ -1615,33 +1615,34 @@ impl FolderScanner {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
-        let result = match send_scanner_heal_request(candidate_type, request, scanner_disk_heal_scope(&self.local_disk)).await {
-            Ok(result) => result,
-            Err(err) => {
-                self.update_pending_scanner_heal_after_admission(
-                    kind,
-                    &bucket,
-                    object.as_deref(),
-                    version_id.as_deref(),
-                    scan_mode,
-                    HealAdmissionResult::Full,
-                );
-                error!(
-                    target: "rustfs::scanner::folder",
-                    event = EVENT_SCANNER_HEAL_ADMISSION,
-                    component = LOG_COMPONENT_SCANNER,
-                    subsystem = LOG_SUBSYSTEM_HEAL,
-                    candidate_type,
-                    bucket = %bucket,
-                    object = object.as_deref().unwrap_or(""),
-                    priority = heal_priority_label(priority),
-                    state = "heal_channel_error",
-                    error = %err,
-                    "Scanner deferred heal request after channel error"
-                );
-                return Ok(HealAdmissionResult::Full);
-            }
-        };
+        let result =
+            match send_scanner_heal_request(candidate_type, request, None, scanner_disk_heal_scope(&self.local_disk)).await {
+                Ok(result) => result,
+                Err(err) => {
+                    self.update_pending_scanner_heal_after_admission(
+                        kind,
+                        &bucket,
+                        object.as_deref(),
+                        version_id.as_deref(),
+                        scan_mode,
+                        HealAdmissionResult::Full,
+                    );
+                    error!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_HEAL_ADMISSION,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_HEAL,
+                        candidate_type,
+                        bucket = %bucket,
+                        object = object.as_deref().unwrap_or(""),
+                        priority = heal_priority_label(priority),
+                        state = "heal_channel_error",
+                        error = %err,
+                        "Scanner deferred heal request after channel error"
+                    );
+                    return Ok(HealAdmissionResult::Full);
+                }
+            };
         self.update_pending_scanner_heal_after_admission(
             kind,
             &bucket,

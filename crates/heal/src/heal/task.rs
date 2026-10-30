@@ -705,11 +705,20 @@ impl HealTask {
         if !receipt.verified_for(expected) {
             return false;
         }
+        let quorum_selected_data_dir = receipt.quorum_selected_data_dir.filter(|generation| !generation.is_nil());
+        let deep_check_observed = receipt.deep_check_observed
+            && quorum_selected_data_dir.is_some()
+            && matches!(
+                receipt.disposition,
+                HealObjectDisposition::Repaired | HealObjectDisposition::VerifiedHealthy
+            );
         let mut outcome = self.outcome.write().await;
         outcome.record(HealObjectOutcome {
             identity: receipt.identity,
             disposition: receipt.disposition,
             detail: None,
+            quorum_selected_data_dir,
+            deep_check_observed,
         });
         true
     }
@@ -719,6 +728,8 @@ impl HealTask {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
             outcome.record(HealObjectOutcome {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason,
@@ -1004,6 +1015,8 @@ impl HealTask {
             let mut outcome = self.outcome.write().await;
             outcome.attempt_failed();
             outcome.record(HealObjectOutcome {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity,
                 disposition: HealObjectDisposition::Deferred {
                     reason: HealDeferredReason::RetiredMarkerProof,
@@ -1165,6 +1178,8 @@ impl HealTask {
                     }
                 };
                 outcome.record(HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity,
                     disposition,
                     detail: result.as_ref().err().map(ToString::to_string),
