@@ -835,7 +835,6 @@ impl LocalDisk {
                 if no_inline {
                     if sync_data_shards
                         && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
-                        && !super::take_presynced_tmp_data_dir(src_data_path)
                         && let Err(err) = os::sync_dir_files_std(src_data_path)
                         && err.kind() != ErrorKind::NotFound
                     {

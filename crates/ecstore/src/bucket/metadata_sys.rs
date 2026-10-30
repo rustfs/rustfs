@@ -1817,10 +1817,12 @@ pub(crate) fn current_local_meta_mutation_gen() -> u64 {
     LOCAL_META_MUTATION_GEN.load(std::sync::atomic::Ordering::Acquire)
 }
 
+type LocalAuthorityCache = Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct BucketMetadataSys {
     metadata_map: Arc<RwLock<HashMap<String, Arc<BucketMetadata>>>>,
-    local_authority_cache: Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>,
+    local_authority_cache: LocalAuthorityCache,
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
     metadata_publish_locks: Arc<MetadataPublishLockRegistry>,

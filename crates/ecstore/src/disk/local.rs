@@ -2985,7 +2985,7 @@ fn has_inline_commit_test_failpoints(dst_path: &str) -> bool {
             == Some(dst_path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
     has_inline_commit_test_failpoints(dst_path)
         || RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
@@ -3007,7 +3007,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         || os::file_sync_probe::is_active()
 }
 
-#[cfg(all(not(test), feature = "test-util"))]
+#[cfg(all(not(test), feature = "test-util", target_os = "linux"))]
 pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
     RENAME_DATA_FAIL_AFTER_METADATA_COMMIT
         .lock()
@@ -3017,7 +3017,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         || os::has_dir_fsync_test_failures()
 }
 
-#[cfg(not(any(test, feature = "test-util")))]
+#[cfg(all(not(any(test, feature = "test-util")), target_os = "linux"))]
 pub(super) fn has_rename_data_test_failpoints(_dst_path: &str) -> bool {
     false
 }
@@ -3686,25 +3686,6 @@ fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_s
 #[cfg(not(target_os = "linux"))]
 fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
 
-static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
-
-fn mark_presynced_tmp_data_dir(dir: PathBuf) {
-    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
-    if set.len() >= 4096 {
-        set.clear();
-    }
-    set.insert(dir);
-}
-
-fn unmark_presynced_tmp_data_dir(dir: &Path) {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir);
-}
-
-pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
-}
-
 fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
     if let Some(parent) = file_path.parent()
         && (volume_dir.as_os_str().is_empty() || !volume_dir.starts_with(parent))
@@ -3731,7 +3712,6 @@ struct LazyLocalFileWriter {
     volume_dir: PathBuf,
     reclaim_len: usize,
     reclaim_on_shutdown: bool,
-    sync_on_close: bool,
     bytes_written: usize,
     state: LazyLocalFileWriterState,
 }
@@ -3745,13 +3725,12 @@ enum LazyLocalFileWriterState {
 }
 
 impl LazyLocalFileWriter {
-    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool, sync_on_close: bool) -> Self {
+    fn new(file_path: PathBuf, volume_dir: PathBuf, reclaim_len: usize, reclaim_on_shutdown: bool) -> Self {
         Self {
             file_path,
             volume_dir,
             reclaim_len,
             reclaim_on_shutdown,
-            sync_on_close,
             bytes_written: 0,
             state: LazyLocalFileWriterState::Unopened,
         }
@@ -3762,7 +3741,6 @@ impl LazyLocalFileWriter {
         let close_after = self.reclaim_len > 0 && self.bytes_written.saturating_add(len) >= self.reclaim_len;
         let reclaim_len = self.bytes_written.saturating_add(len).max(self.reclaim_len);
         let reclaim_on_shutdown = self.reclaim_on_shutdown;
-        let sync_on_close = self.sync_on_close;
         match std::mem::replace(&mut self.state, LazyLocalFileWriterState::Closed) {
             LazyLocalFileWriterState::Unopened => {
                 let file_path = self.file_path.clone();
@@ -3771,15 +3749,8 @@ impl LazyLocalFileWriter {
                     let mut file = open_lazy_local_file_std(&file_path, &volume_dir, reclaim_on_shutdown)?;
                     std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
                     if close_after {
-                        if sync_on_close {
-                            file.sync_data().map_err(to_file_error)?;
-                        }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
-                        if sync_on_close && let Some(parent) = file_path.parent() {
-                            os::fsync_dir_std(parent).map_err(to_file_error)?;
-                            mark_presynced_tmp_data_dir(parent.to_path_buf());
-                        }
                         Ok((None, len))
                     } else {
                         Ok((Some(file), len))
@@ -4859,25 +4830,11 @@ impl LocalIoBackend for StdBackend {
                 }
 
                 let reclaim_on_shutdown = should_reclaim_file_cache_after_write(size_hint);
-                let sync_on_close = if volume == RUSTFS_META_TMP_BUCKET {
-                    if path.ends_with("/part.1") {
-                        !os::file_fdatasync_group_commit_enabled()
-                    } else {
-                        if let Some(parent) = file_path.parent() {
-                            unmark_presynced_tmp_data_dir(parent);
-                        }
-                        false
-                    }
-                } else {
-                    false
-                };
-
                 Ok(Box::new(LazyLocalFileWriter::new(
                     file_path,
                     volume_dir,
                     size_hint.max(0) as usize,
                     reclaim_on_shutdown,
-                    sync_on_close,
                 )))
             }
             WriteMode::Append => {
@@ -20044,17 +20001,20 @@ mod test {
         ensure_test_volume(&disk, bucket).await;
         ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
 
-        let tmp_data_dir = dir
-            .path()
-            .join(RUSTFS_META_TMP_BUCKET)
-            .join(tmp_object)
-            .join(new_data_dir.to_string());
-        fs::create_dir_all(&tmp_data_dir)
+        let shard_path = format!("{tmp_object}/{new_data_dir}/part.1");
+        let mut writer = disk
+            .create_file("", RUSTFS_META_TMP_BUCKET, &shard_path, 8)
             .await
-            .expect("new tmp data dir should be created");
-        fs::write(tmp_data_dir.join("part.1"), b"new-data")
-            .await
-            .expect("new tmp data should be written");
+            .expect("open staged shard writer");
+        writer.write_all(b"new-data").await.expect("write staged shard");
+        writer.shutdown().await.expect("close staged shard");
+        let resolved_tmp_data_dir = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{new_data_dir}"))
+            .expect("tmp data dir path should resolve");
+        assert!(
+            !os::fsync_dir_recorder::was_fsynced(&resolved_tmp_data_dir),
+            "the staged writer must not sync before the destination policy is known"
+        );
 
         let new_fi = test_file_info(object, version_id, Some(new_data_dir), None);
         disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, new_fi, bucket, object)

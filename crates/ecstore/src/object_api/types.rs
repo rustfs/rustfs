@@ -144,6 +144,8 @@ pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock:
         .is_some_and(|(_, fence)| fence.is_lock_lost())
 }
 
+type FreshPutQuota = std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>;
+
 #[derive(Debug)]
 pub struct ObjectLockConfigSnapshot {
     store_id: Option<Uuid>,
@@ -154,8 +156,7 @@ pub struct ObjectLockConfigSnapshot {
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
     metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
-    fresh_put_quota:
-        std::sync::Mutex<Option<std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>>>,
+    fresh_put_quota: std::sync::Mutex<Option<FreshPutQuota>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -242,10 +243,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
-    pub(crate) fn set_fresh_put_quota(
-        &self,
-        quota: std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>,
-    ) {
+    pub(crate) fn set_fresh_put_quota(&self, quota: FreshPutQuota) {
         if self._lifecycle_guard.is_some() && self.metadata_transaction_guard.is_some() {
             *self
                 .fresh_put_quota
@@ -254,9 +252,7 @@ impl ObjectLockConfigSnapshot {
         }
     }
 
-    pub(crate) fn take_fresh_put_quota(
-        &self,
-    ) -> Option<std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>> {
+    pub(crate) fn take_fresh_put_quota(&self) -> Option<FreshPutQuota> {
         self.fresh_put_quota
             .lock()
             .expect("fresh_put_quota mutex should not be poisoned")

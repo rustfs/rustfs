@@ -1147,7 +1147,8 @@ impl DefaultObjectUsecase {
         let replicate_force_delete = force_delete && !replica && has_active_delete_rule(&delete_config_snapshot, &key);
         let mut force_delete_intent = None;
 
-        let need_eager_pre_stat = cfg!(test) || opts.http_preconditions.is_some();
+        // A version purge needs the original marker identity for replication.
+        let need_eager_pre_stat = opts.http_preconditions.is_some() || opts.version_id.is_some();
         let existing_object_info = if need_eager_pre_stat {
             match Box::pin(store.get_object_info_for_delete(&bucket, &key, &opts)).await {
                 Ok(obj_info) => Some(obj_info),
