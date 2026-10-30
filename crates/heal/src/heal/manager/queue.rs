@@ -109,7 +109,9 @@ pub(super) enum QueuePushOutcome {
 
 #[derive(Debug, Clone)]
 pub(super) struct CompletedHealStatus {
+    pub(super) task_id: String,
     pub(super) heal_type: HealType,
+    pub(super) source: HealRequestSource,
     /// Options used to execute the task, retained for token-scoped status.
     pub(super) options: HealOptions,
     pub(super) status: HealTaskStatus,
@@ -137,6 +139,7 @@ impl CompletedHealStatus {
     fn measure_retained_bytes(&self) -> usize {
         let mut bytes = size_of::<Self>();
         let mut add = |amount: usize| bytes = bytes.saturating_add(amount);
+        add(self.task_id.capacity());
         add(self.outcome.as_ref().map_or(0, |outcome| outcome.retained_bytes()));
         match &self.heal_type {
             HealType::Cluster => {}
@@ -258,7 +261,9 @@ impl CompletedHealStatus {
             outcome.finish(Some(crate::heal::outcome::HealAbortReason::Cancelled));
         }
         let mut snapshot = Self {
+            task_id: task.id.clone(),
             heal_type: task.heal_type.clone(),
+            source: task.source,
             options: task.options.clone(),
             status,
             progress: Some(task.get_progress().await),

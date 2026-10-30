@@ -222,12 +222,12 @@ impl JournalState {
         Some(entries)
     }
 
-    fn from_replay_record(record: ScannerDurableDirtyUsageReplayRecord) -> Option<Self> {
+    fn from_replay_record(record: &ScannerDurableDirtyUsageReplayRecord) -> Option<Self> {
         if record.entries.is_empty() || record.entries.len() > DURABLE_DIRTY_USAGE_REPLAY_MAX_ENTRIES {
             return None;
         }
         let mut state = JournalState::default();
-        for entry in record.entries {
+        for entry in &record.entries {
             if entry.bucket.is_empty()
                 || entry.bucket.contains(['/', '\\', '\0'])
                 || entry.bucket == "."
@@ -242,7 +242,7 @@ impl JournalState {
             {
                 return None;
             }
-            let scope = match entry.scope {
+            let scope = match &entry.scope {
                 ScannerDurableDirtyUsageReplayScope::WholeBucket => JournalScope::WholeBucket,
                 ScannerDurableDirtyUsageReplayScope::TopLevelEntries { entries } => {
                     if entries.is_empty() || entries.len() > DURABLE_DIRTY_USAGE_REPLAY_MAX_TOP_LEVEL_ENTRIES {
@@ -254,18 +254,18 @@ impl JournalState {
                     {
                         return None;
                     }
-                    JournalScope::TopLevelEntries(entries)
+                    JournalScope::TopLevelEntries(entries.clone())
                 }
             };
             state.scope_bytes += journal_scope_bytes(&scope);
             if state
                 .buckets
                 .insert(
-                    entry.bucket,
+                    entry.bucket.clone(),
                     JournalBucketState {
                         generation: entry.generation,
                         scope,
-                        producers: entry.producers,
+                        producers: entry.producers.clone(),
                     },
                 )
                 .is_some()
@@ -338,7 +338,7 @@ async fn replay_durable_dirty_usage_journal(store: Arc<ECStore>, owner: &str) ->
             ..Default::default()
         };
     };
-    match rustfs_scanner::replay_durable_dirty_usage_producer_record(&replay) {
+    match replay.replay() {
         Ok(replayed) => {
             debug!(
                 event = EVENT_SCANNER_DIRTY_USAGE_JOURNAL,
@@ -368,7 +368,7 @@ async fn replay_durable_dirty_usage_journal(store: Arc<ECStore>, owner: &str) ->
     }
 }
 
-fn decode_owned_replay_record(owner: &str, bytes: &[u8]) -> Option<(JournalState, Vec<u8>)> {
+fn decode_owned_replay_record(owner: &str, bytes: &[u8]) -> Option<(JournalState, ScannerDurableDirtyUsageReplayRecord)> {
     if bytes.len() > DURABLE_DIRTY_USAGE_REPLAY_MAX_BYTES {
         return None;
     }
@@ -377,9 +377,8 @@ fn decode_owned_replay_record(owner: &str, bytes: &[u8]) -> Option<(JournalState
         return None;
     }
     let replay = record.replay?;
-    let bytes = serde_json::to_vec(&replay).ok()?;
-    let state = JournalState::from_replay_record(replay)?;
-    Some((state, bytes))
+    let state = JournalState::from_replay_record(&replay)?;
+    Some((state, replay))
 }
 
 fn encode_owned_replay_record(owner: &str, state: &JournalState) -> Result<Vec<u8>, serde_json::Error> {
@@ -1065,7 +1064,7 @@ mod tests {
                 producers: BTreeSet::from([SegmentInvalidationProducerIdentity::Replication]),
             }],
         };
-        let mut state = JournalState::from_replay_record(record).expect("valid replay record should hydrate");
+        let mut state = JournalState::from_replay_record(&record).expect("valid replay record should hydrate");
         state.record_mutation(
             "videos".to_string(),
             "clips/object",
@@ -1092,7 +1091,7 @@ mod tests {
                 producers: BTreeSet::from([SegmentInvalidationProducerIdentity::Replication]),
             }],
         };
-        let mut state = JournalState::from_replay_record(record).expect("valid replay record should hydrate");
+        let mut state = JournalState::from_replay_record(&record).expect("valid replay record should hydrate");
         state.record_mutation(
             "photos".to_string(),
             "2026/object",

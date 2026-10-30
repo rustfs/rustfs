@@ -21,10 +21,10 @@ use std::time::{Duration, Instant, SystemTime};
 
 use crate::ReplTargetSizeSummary;
 use crate::data_usage_define::{
-    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageEntry, DataUsageHash, DataUsageHashMap,
-    DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason, MAX_DATA_USAGE_CACHE_DEPTH,
-    PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry, SizeSummary, hash_path,
-    scan_frontier_covers_path,
+    DATA_USAGE_SCAN_CHECKPOINT_VERSION, DataUsageCache, DataUsageCacheInfo, DataUsageCacheSource, DataUsageEntry, DataUsageHash,
+    DataUsageHashMap, DataUsageRawEnumerationCursor, DataUsageScanCheckpoint, DataUsageScanCheckpointReason,
+    MAX_DATA_USAGE_CACHE_DEPTH, PendingScannerHeal, PendingScannerHealKind, ScannerSizeSummaryExt, SizeReconciliationEntry,
+    SizeSummary, hash_path, scan_frontier_covers_path,
 };
 use crate::error::ScannerError;
 use crate::raw_page_index::{RawEnumerationPageIndex, RawEnumerationPageWriter};
@@ -1612,7 +1612,7 @@ impl FolderScanner {
         let candidate_type = pending_scanner_heal_candidate_type(kind);
         let priority = request.priority;
         let scan_mode = request.scan_mode.unwrap_or(self.scan_mode);
-        let result = match send_scanner_heal_request(candidate_type, request).await {
+        let result = match send_scanner_heal_request(candidate_type, request, scanner_disk_heal_scope(&self.local_disk)).await {
             Ok(result) => result,
             Err(err) => {
                 self.update_pending_scanner_heal_after_admission(
@@ -2273,6 +2273,7 @@ impl FolderScanner {
                     lifecycle: active_life_cycle.clone(),
                     object_lock: active_object_lock.clone(),
                     replication: active_replication.clone(),
+                    heal_scope: None,
                     heal_enabled,
                     heal_bitrot: self.scan_mode == HealScanMode::Deep,
                     debug: self.data_usage_scanner_debug,
@@ -3497,6 +3498,7 @@ pub(crate) async fn scan_data_folder_scoped(
 mod item_actions;
 mod ledger;
 
+pub(crate) use item_actions::scanner_disk_heal_scope;
 use item_actions::*;
 pub use item_actions::{GetSizeFn, ScannerItem};
 use ledger::*;

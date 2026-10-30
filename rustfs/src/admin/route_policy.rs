@@ -387,6 +387,18 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier-stats", LIST_TIER, RouteRiskLevel::Sensitive),
     admin(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}", LIST_TIER, RouteRiskLevel::Sensitive),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/tier/{tier}/deletion-check",
+        LIST_TIER,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/rustfs/admin/v3/tier/{tier}/cleanup-retry",
+        SET_TIER,
+        RouteRiskLevel::High,
+    ),
     admin(HttpMethod::Delete, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Put, "/rustfs/admin/v3/tier", SET_TIER, RouteRiskLevel::High),
     admin(HttpMethod::Post, "/rustfs/admin/v3/tier/{tiername}", SET_TIER, RouteRiskLevel::High),
@@ -2509,6 +2521,10 @@ mod tests {
 
     #[test]
     fn route_policy_uses_tier_actions_for_transition_routes() {
+        assert_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", LIST_TIER);
+        assert_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", SET_TIER);
+        assert_not_action(HttpMethod::Get, "/rustfs/admin/v3/tier/{tier}/deletion-check", SET_TIER);
+        assert_not_action(HttpMethod::Post, "/rustfs/admin/v3/tier/{tier}/cleanup-retry", LIST_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records", LIST_TIER);
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", LIST_TIER);
         assert_action(HttpMethod::Post, "/rustfs/admin/v3/ilm/recovery/records/{control_id}", SET_TIER);

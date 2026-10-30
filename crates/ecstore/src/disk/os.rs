@@ -286,6 +286,11 @@ mod dir_fsync_failures {
 
     static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn has_any() -> bool {
+        !FAILURES.lock().is_empty()
+    }
+
     pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
         FAILURES.lock().insert(dir.to_path_buf(), kind);
     }
@@ -321,6 +326,11 @@ pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path:
         .ok_or(DiskError::DiskNotFound)??;
     dir_fsync_failures::set(&path, kind);
     Ok(())
+}
+
+#[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
+pub(crate) fn has_dir_fsync_test_failures() -> bool {
+    dir_fsync_failures::has_any()
 }
 
 /// Pause a real namespace mutation inside its physical executor.
@@ -370,6 +380,17 @@ pub(crate) mod prepared_publication_test_hooks {
             let _pause = super::enter_blocking_test_hook();
             hook();
         }
+    }
+
+    pub(crate) fn has_any_hooks() -> bool {
+        if !BEFORE_PUBLICATION.lock().is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -758,7 +779,7 @@ fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
     file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
 }
 
-fn file_fdatasync_group_commit_enabled() -> bool {
+pub(crate) fn file_fdatasync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = file_fdatasync_group_commit_override::get() {
         return enabled;
@@ -2392,6 +2413,10 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
+    pub(crate) fn is_active() -> bool {
+        !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
+    }
+
     pub(super) fn set_failing(root: &Path) -> ProbeGuard {
         configure(root, Some(1), false)
     }
@@ -2553,18 +2578,25 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
-#[allow(
-    dead_code,
-    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+    )
 )]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir.as_ref())? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            sync_file(&entry.path())?;
-        }
-    }
-    fsync_dir_std(dir)
+    let dir = dir.as_ref();
+    let files = regular_files(dir)?;
+    rustfs_io_metrics::record_put_rename_fdatasync_batch(rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, files.len());
+    sync_files(&files)?;
+    let fsync_started = rustfs_io_metrics::put_stage_timer();
+    let result = fsync_dir_std(dir);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+        fsync_started,
+    );
+    result
 }
 
 /// Async wrapper around [`sync_dir_files_std`]. Large directories flush files
@@ -3808,6 +3840,23 @@ pub(crate) async fn rename_all_with_prepared_source(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
+    guard.directories.prepare_destination().map_err(to_file_error)?;
+    #[cfg(test)]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+    }
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, destination)
+        .map_err(to_file_error)?;
+    guard.directories.rename(source, destination, None).map_err(to_file_error)?;
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub(crate) async fn rename_all_with_commit_guard(
     src_file_path: impl AsRef<Path>,
@@ -4709,6 +4758,27 @@ impl PublicationRoot {
         return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
         #[cfg(not(target_os = "linux"))]
         std::fs::File::open(path)
+    }
+
+    pub(crate) fn check_writable(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let directory = self.open_directory(path)?;
+        #[cfg(target_os = "linux")]
+        let probe_directory = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe_directory = path;
+
+        // Keep the Linux parent handle pinned through deletion, including when
+        // a startup timeout detaches the blocking task.
+        let mut probe = tempfile::Builder::new()
+            .prefix(".rustfs-write-check-")
+            .tempfile_in(probe_directory)?;
+        let write_result = std::io::Write::write_all(probe.as_file_mut(), b"rustfs");
+        let delete_result = probe.close();
+        write_result.and(delete_result)
     }
 
     pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {
@@ -6462,6 +6532,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {

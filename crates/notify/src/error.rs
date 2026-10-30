@@ -38,6 +38,12 @@ pub enum NotificationError {
     #[error("Configuration error: {0}")]
     Configuration(String),
 
+    #[error("Target configuration changed during validation")]
+    ConfigurationConflict,
+
+    #[error("Notification configuration convergence failed (persisted: {persisted}): {detail}")]
+    ConfigurationConvergence { persisted: bool, detail: String },
+
     #[error("ARN not found: {0}")]
     ARNNotFound(String),
 

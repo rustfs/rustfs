@@ -73,6 +73,7 @@ struct DeleteCommitContext<'a> {
     incarnation: Option<Uuid>,
     options: Option<&'a ObjectOptions>,
     guard: Option<Arc<super::super::ObjectLockDiagGuard>>,
+    transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
 }
 
 impl<'a> DeleteCommitContext<'a> {
@@ -81,17 +82,37 @@ impl<'a> DeleteCommitContext<'a> {
             incarnation: options.expected_bucket_incarnation_id,
             options: Some(options),
             guard: guard.cloned(),
+            transaction_guard: None,
         }
     }
 
+    fn with_transaction_guard(mut self, guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>) -> Self {
+        self.transaction_guard = guard.cloned();
+        self
+    }
+
+    fn ensure_transaction_lock_held(&self, bucket: &str, object: &str) -> Result<()> {
+        if self.transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+            return Err(StorageError::NamespaceLockQuorumUnavailable {
+                mode: "delete_transaction",
+                bucket: bucket.to_owned(),
+                object: object.to_owned(),
+                required: 1,
+                achieved: 0,
+            });
+        }
+        Ok(())
+    }
+
     fn can_commit(&self, bucket: &str, object: &str) -> bool {
-        self.options.is_none_or(|options| {
-            ensure_delete_commit_locks_held(self.guard.as_deref(), bucket, object, options).is_ok()
-                && options
-                    .scanner_publication_commit_scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.can_commit())
-        })
+        !self.transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+            && self.options.is_none_or(|options| {
+                ensure_delete_commit_locks_held(self.guard.as_deref(), bucket, object, options).is_ok()
+                    && options
+                        .scanner_publication_commit_scope
+                        .as_ref()
+                        .is_none_or(|scope| scope.can_commit())
+            })
     }
 }
 
@@ -137,13 +158,15 @@ fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
 }
 
 fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
-    })
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true))
+    }
 }
 
 fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
@@ -3604,7 +3627,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let read_policy = crate::set_disk::get_object_read_policy();
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
-        tokio::spawn(async move {
+        let producer = async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
@@ -3687,7 +3710,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             };
             let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
-        });
+        };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
+        tokio::spawn(producer);
 
         Ok(reader)
     }
@@ -3852,6 +3878,7 @@ impl SetDisks {
         object: &str,
         opts: &ObjectOptions,
         lock_guard: Option<&Arc<super::super::ObjectLockDiagGuard>>,
+        transaction_guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>,
     ) -> Result<bool> {
         if is_meta_bucketname(bucket)
             || opts.version_id.is_some()
@@ -3888,6 +3915,7 @@ impl SetDisks {
                 object,
                 DeleteRecoveryContext {
                     explicit_delete: true,
+                    transaction_guard: transaction_guard.cloned(),
                     namespace_owner: Some(Arc::new((
                         self.ctx.begin_namespace_commit(),
                         lock_guard.cloned(),
@@ -5497,8 +5525,10 @@ impl SetDisks {
                 );
 
                 let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                let all_commit_disks_local = commit_disks.iter().flatten().all(|disk| disk.is_local());
                 let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
+                    && (all_commit_disks_local
+                        || commit_set.tier_free_version_rename_data_source_capable()
                         || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
                 let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
                     && commit_tier_free_version_receipt_sink.is_some()
@@ -5604,9 +5634,11 @@ impl SetDisks {
                 );
                 let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Ok(rename_commit) = rename_result.as_mut() {
-                    commit_set.observe_tier_free_version_rename_data_source_capability(
-                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
-                    );
+                    if rename_commit.tail_drain.is_none() || !rename_commit.old_current_source_all_successful_checked {
+                        commit_set.observe_tier_free_version_rename_data_source_capability(
+                            rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                        );
+                    }
                     commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
@@ -5674,7 +5706,12 @@ impl SetDisks {
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
-                                  targets| {
+                                  targets,
+                                  old_current_source_all_successful_checked,
+                                  all_online_local_succeeded| {
+                                cleanup_set.observe_tier_free_version_rename_data_source_capability(
+                                    old_current_source_all_successful_checked,
+                                );
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
@@ -5701,7 +5738,10 @@ impl SetDisks {
                                         )
                                         .await;
                                     let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
-                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                    if zero_target_cleanup
+                                        && (all_online_local_succeeded
+                                            || rename_tail_cleanup_zero_target_tmp_delete_skip_enabled())
+                                    {
                                         rustfs_io_metrics::record_put_object_stage_duration(
                                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
                                             1.0,
@@ -8178,12 +8218,22 @@ fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteObjectCommitPause {
+    BeforeNamespace,
+    BeforeCommit,
+    AfterPublish,
+}
+
+#[cfg(test)]
 struct DeleteObjectCommitBarrierState {
     bucket: String,
     object: String,
-    pause_after_publish: bool,
+    pause: DeleteObjectCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -8198,21 +8248,27 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, false)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeCommit)
+    }
+
+    pub(crate) fn install_before_namespace(bucket: &str, object: &str) -> Self {
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeNamespace)
     }
 
     #[cfg(feature = "test-util")]
     pub(crate) fn install_after_publish(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, true)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::AfterPublish)
     }
 
-    fn install_with_mode(bucket: &str, object: &str, pause_after_publish: bool) -> Self {
+    fn install_with_mode(bucket: &str, object: &str, pause: DeleteObjectCommitPause) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
-            pause_after_publish,
+            pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = DELETE_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -8232,6 +8288,19 @@ impl DeleteObjectCommitBarrier {
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        assert_eq!(self.state.pause, DeleteObjectCommitPause::BeforeNamespace);
+        let pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("delete object must poll its actual namespace acquisition to Pending");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -8249,13 +8318,52 @@ impl Drop for DeleteObjectCommitBarrier {
 }
 
 #[cfg(test)]
+async fn pause_delete_object_before_namespace(bucket: &str, object: &str) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_object_namespace(bucket: &str, object: &str, acquired: bool) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        if acquired {
+            barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            barrier.namespace_pending.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
 async fn pause_delete_object_commit(bucket: &str, object: &str) {
     let barrier = DELETE_OBJECT_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && !barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeCommit
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -8270,7 +8378,9 @@ async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::AfterPublish
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -8877,8 +8987,11 @@ impl SetDisks {
         fi: &FileInfo,
         force_del_marker: bool,
         delete_marker_purge: Option<MrfDeleteMarkerPurge>,
-        commit_context: DeleteCommitContext<'_>,
+        mut commit_context: DeleteCommitContext<'_>,
     ) -> Result<()> {
+        if !is_meta_bucketname(bucket) && commit_context.transaction_guard.is_none() {
+            commit_context.transaction_guard = Some(self.acquire_delete_transaction_lock(bucket, object).await?);
+        }
         let source_bucket_incarnation_id = commit_context.incarnation;
         let transported = delete_file_info_with_replication_transport_metadata(fi);
         let fi = &transported;
@@ -8887,6 +9000,7 @@ impl SetDisks {
             Arc::new((
                 self.ctx.begin_namespace_commit(),
                 commit_context.guard.clone(),
+                commit_context.transaction_guard.clone(),
                 commit_context
                     .options
                     .and_then(|options| options.object_lock_config_snapshot.clone()),
@@ -8926,7 +9040,11 @@ impl SetDisks {
 
         for disk in disks.iter() {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            let transaction_guard = commit_context.transaction_guard.as_ref();
             futures.push(async move {
+                if transaction_guard.is_some_and(|guard| guard.is_lock_lost()) {
+                    return Err(DiskError::DiskOngoingReq);
+                }
                 if let Some(disk) = disk {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
@@ -8976,6 +9094,7 @@ impl SetDisks {
             }
         }
 
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         let mut quorum_result = resolve_tiered_decommission_write_quorum_result(&errs, write_quorum, bucket, object);
         if !is_meta_bucketname(bucket) && errs.iter().flatten().any(super::delete_recovery::unsupported_recovery) {
             quorum_result = Err(DiskError::UnsupportedDisk.into());
@@ -9008,6 +9127,7 @@ impl SetDisks {
                 write_quorum,
                 DeleteRecoveryContext {
                     recovery_ticket,
+                    transaction_guard: commit_context.transaction_guard.clone(),
                     namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
                     ..DeleteRecoveryContext::new(source_bucket_incarnation_id, &|| commit_context.can_commit(bucket, object))
                 },
@@ -9017,6 +9137,7 @@ impl SetDisks {
         }
         #[cfg(test)]
         pause_delete_before_cleanup(bucket).await;
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         let mut rollback_futures = Vec::new();
         for (index, err) in errs.iter().enumerate() {
             if structured_cleanup {
@@ -9042,7 +9163,11 @@ impl SetDisks {
             let object = object.to_string();
             let fi = fi.clone();
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
+            let transaction_guard = commit_context.transaction_guard.as_ref();
             rollback_futures.push(async move {
+                if transaction_guard.is_some_and(|guard| guard.is_lock_lost()) {
+                    return;
+                }
                 if should_rollback {
                     // The dedicated undo path never forwards the marker-only creation flag.
                     if let Err(err) = disk
@@ -9099,6 +9224,7 @@ impl SetDisks {
         }
 
         join_all(rollback_futures).await;
+        commit_context.ensure_transaction_lock_held(bucket, object)?;
         drop(namespace_owner);
         if quorum_result.is_ok()
             && errs.iter().any(Option::is_some)
@@ -9558,9 +9684,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         &self,
         bucket: &str,
         objects: Vec<ObjectToDelete>,
-        opts: ObjectOptions,
+        mut opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
-        let current_generations = opts.conditional_delete_generations.as_deref();
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -9655,6 +9780,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             }
         }
 
+        let outer_namespace_lock_fence = opts.namespace_lock_fence.clone();
+        let mut transaction_guards = std::collections::BTreeMap::new();
+        if !is_meta_bucketname(bucket) {
+            // Every raw batch lock is acquired first. Canonical sorting also
+            // gives aliases of one disk key exactly one transaction owner.
+            let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
+            for key in keys {
+                match self.acquire_delete_transaction_lock(bucket, &key).await {
+                    Ok(guard) => {
+                        opts.add_namespace_lock_guard(&guard);
+                        transaction_guards.insert(key, guard);
+                    }
+                    Err(error) => {
+                        for (index, lock_name) in lock_names.iter().enumerate() {
+                            if lock_name.as_ref() == key {
+                                del_errs[index] = Some(error.clone());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let transaction_guards = Arc::new(transaction_guards);
+        let current_generations = opts.conditional_delete_generations.as_deref();
         let object_lock_config = if is_meta_bucketname(bucket) {
             Arc::new(ObjectLockConfigSnapshot::new(ObjectLockConfigState::ConfirmedAbsent))
         } else {
@@ -9752,6 +9901,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         &dobj.object_name,
                         DeleteRecoveryContext {
                             dry_run: !opts.no_lock,
+                            transaction_guard: transaction_guards.get(lock_names[i].as_ref()).cloned(),
                             namespace_owner: opts.delete_mutation_owner.clone(),
                             ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &|| {
                                 ensure_delete_commit_locks_held(None, bucket, &dobj.object_name, &opts).is_ok()
@@ -10033,6 +10183,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let namespace_owner = (!is_meta_bucketname(bucket)).then(|| {
             Arc::new((
                 self.ctx.begin_namespace_commit(),
+                Arc::clone(&transaction_guards),
                 opts.delete_mutation_owner.clone(),
                 opts.object_lock_config_snapshot.clone(),
                 opts.scanner_publication_commit_scope.clone(),
@@ -10208,6 +10359,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         }
 
         let results = join_all(futures).await;
+        if transaction_guards.values().any(|guard| guard.is_lock_lost()) {
+            for (index, object) in objects.iter().enumerate() {
+                if del_errs[index].is_none() {
+                    accounting[index] = None;
+                    del_errs[index] = Some(StorageError::NamespaceLockQuorumUnavailable {
+                        mode: "delete_transaction",
+                        bucket: bucket.to_owned(),
+                        object: object.object_name.clone(),
+                        required: 1,
+                        achieved: 0,
+                    });
+                }
+            }
+            if dist_erasure {
+                self.release_dist_delete_object_locks_batch(dist_batch_lock_ids).await;
+            }
+            return (del_objects, del_errs, accounting);
+        }
 
         let mut del_obj_errs: Vec<Vec<Option<DiskError>>> = vec![vec![None; objects.len()]; disks.len()];
 
@@ -10303,6 +10472,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let group = &vers[index];
                 let recovery_ticket = recovery_tickets[index].clone();
                 let namespace_owner = namespace_owner.clone();
+                let transaction_guard = transaction_guards
+                    .get(object_name_disk_identity(&group.name).as_ref())
+                    .cloned();
                 let disks = &disks;
                 let opts = &opts;
                 async move {
@@ -10323,6 +10495,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             DeleteRecoveryContext {
                                 recovery_ticket,
                                 namespace_owner,
+                                transaction_guard,
                                 ..DeleteRecoveryContext::new(opts.expected_bucket_incarnation_id, &can_commit)
                             },
                         )
@@ -10369,7 +10542,11 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 let object = fi_vers.name.clone();
                 let versions = fi_vers.clone();
                 let disk_namespace_owner = namespace_owner.clone();
+                let transaction_guard = transaction_guards.get(object_name_disk_identity(&object).as_ref()).cloned();
                 rollback_futures.push(async move {
+                    if transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost()) {
+                        return;
+                    }
                     if should_rollback {
                         let errs = disk
                             .delete_versions_with_namespace_owner(
@@ -10445,7 +10622,16 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if del_errs[index].is_none() {
                 let object = &objects[index].object_name;
                 let result = match ensure_delete_commit_locks_held(None, bucket, object, &opts) {
-                    Ok(()) => self.reclaim_missing_delete_residue(bucket, object, &opts, None).await,
+                    Ok(()) => {
+                        self.reclaim_missing_delete_residue(
+                            bucket,
+                            object,
+                            &opts,
+                            None,
+                            transaction_guards.get(object_name_disk_identity(object).as_ref()),
+                        )
+                        .await
+                    }
                     Err(err) => Err(err),
                 };
                 if let Err(err) = result {
@@ -10453,6 +10639,13 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 }
             }
         }
+
+        // Deferred recovery takes fresh raw and transaction locks. Discard the
+        // completed leases' deadlines while retaining every caller-owned fence.
+        opts.namespace_lock_fence = outer_namespace_lock_fence;
+        // Release inner owners before reacquiring any raw key lock.
+        drop(namespace_owner);
+        drop(transaction_guards);
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
@@ -10559,7 +10752,30 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(Arc::new(self.acquire_write_lock_diag("delete_object", bucket, object).await?))
+            #[cfg(test)]
+            let guard = {
+                pause_delete_object_before_namespace(bucket, object).await;
+                let guard = self
+                    .acquire_write_lock_diag_with_pending_hook("delete_object", bucket, object, || {
+                        notify_delete_object_namespace(bucket, object, false);
+                    })
+                    .await?;
+                notify_delete_object_namespace(bucket, object, true);
+                guard
+            };
+            #[cfg(not(test))]
+            let guard = self.acquire_write_lock_diag("delete_object", bucket, object).await?;
+            Some(Arc::new(guard))
+        } else {
+            None
+        };
+        // Lock order: the caller's raw object lock, then this target set's
+        // transaction key. The inner key remains distinct even when pool
+        // client quorums overlap, and no_lock never bypasses journal ownership.
+        let transaction_guard = if !is_meta_bucketname(bucket) && (!opts.delete_prefix || opts.delete_prefix_object) {
+            let guard = self.acquire_delete_transaction_lock(bucket, object).await?;
+            opts.add_namespace_lock_guard(&guard);
+            Some(guard)
         } else {
             None
         };
@@ -10663,7 +10879,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                             if let Some((_, deleted_object)) = replication_delete {
@@ -10697,7 +10914,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                         }
@@ -10717,7 +10935,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                                 &delete_request,
                                 false,
                                 None,
-                                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                                DeleteCommitContext::request(&opts, _lock_guard.as_ref())
+                                    .with_transaction_guard(transaction_guard.as_ref()),
                             )
                             .await?;
                         }
@@ -10806,6 +11025,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket,
                     object,
                     DeleteRecoveryContext {
+                        transaction_guard: transaction_guard.clone(),
                         namespace_owner: Some(Arc::new((
                             self.ctx.begin_namespace_commit(),
                             _lock_guard.clone(),
@@ -10846,7 +11066,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 if is_err_object_not_found(err) {
                     ensure_delete_commit_locks_held(_lock_guard.as_deref(), bucket, object, &opts)?;
                     if self
-                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref())
+                        .reclaim_missing_delete_residue(bucket, object, &opts, _lock_guard.as_ref(), transaction_guard.as_ref())
                         .await?
                     {
                         if let Some(scope) = scanner_publication_commit_scope.as_ref() {
@@ -10896,7 +11116,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &dfi,
                 false,
                 None,
-                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -10998,7 +11218,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 &fi,
                 should_force_delete_marker_for_missing_version(&opts),
                 delete_marker_purge.clone(),
-                DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+                DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
             )
             .await
             .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -11063,7 +11283,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             &dfi,
             opts.delete_marker,
             delete_marker_purge,
-            DeleteCommitContext::request(&opts, _lock_guard.as_ref()),
+            DeleteCommitContext::request(&opts, _lock_guard.as_ref()).with_transaction_guard(transaction_guard.as_ref()),
         )
         .await
         .map_err(|e| to_object_err(e, vec![bucket, object]))?;
@@ -11838,13 +12058,12 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let bucket_lifecycle_guard = if let Some(expected_incarnation_id) = opts.expected_bucket_incarnation_id
             && opts.bucket_lifecycle_lock_fence.is_none()
         {
-            let guard = metadata_sys::object_store_in(&self.ctx)
-                .await?
-                .acquire_bucket_lifecycle_read_lock(bucket)
-                .await?;
-            self.validate_bucket_incarnation(bucket, expected_incarnation_id, opts)
-                .await?;
-            Some(guard)
+            Some(
+                metadata_sys::object_store_in(&self.ctx)
+                    .await?
+                    .acquire_bucket_incarnation_fence_with_options(bucket, expected_incarnation_id, Some(opts))
+                    .await?,
+            )
         } else {
             None
         };
@@ -21485,6 +21704,206 @@ mod put_object_tmp_cleanup_tests {
     }
 
     #[tokio::test]
+    async fn deep_heal_preserves_committed_generation_during_old_data_cleanup() {
+        use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+
+        for (disk_count, parity, read_repair) in [(4, 2, false), (4, 2, true), (16, 4, false), (16, 4, true)] {
+            let (dirs, disks, set) = super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated(
+                disk_count, 0, parity,
+            )
+            .await;
+            let bucket = "native-heal-commit-cleanup";
+            let object = format!("generation-{disk_count}-{parity}-{read_repair}.bin");
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create actual fixture volume");
+            }
+            let options = ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x17; TEST_OBJECT_SIZE]), &options)
+                .await
+                .expect("acknowledge original generation on every disk");
+            let old = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual original generation");
+            let old_dir = old.data_dir.expect("original external data directory");
+            let old_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(old_dir.to_string())
+                .join("part.1");
+            assert!(tokio::fs::try_exists(&old_part).await.expect("original part exists"));
+
+            // Cleanup slots follow the writer's shuffled erasure distribution,
+            // not the physical fixture order. Pause every real cleanup slot so
+            // no physical old shard can disappear before the proof below.
+            let barriers: Vec<_> = (0..disk_count)
+                .map(|slot| rename_fanout_barrier::arm(&object, slot, rename_fanout_barrier::PHASE_CLEANUP))
+                .collect();
+            let writer_set = Arc::clone(&set);
+            let writer_object = object.clone();
+            let writer_options = options.clone();
+            let payload = vec![0xa3; TEST_OBJECT_SIZE];
+            let writer_payload = payload.clone();
+            let writer = tokio::spawn(async move {
+                writer_set
+                    .put_object(bucket, &writer_object, &mut PutObjReader::from_vec(writer_payload), &writer_options)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), async {
+                for barrier in &barriers {
+                    barrier.wait_until_paused().await;
+                }
+            })
+            .await
+            .expect("overwrite commits before its real old-data cleanup pause");
+            assert!(!writer.is_finished(), "tail-drained ACK must remain pending at cleanup");
+            assert!(
+                tokio::fs::try_exists(&old_part)
+                    .await
+                    .expect("old source still present at pause")
+            );
+
+            let mut committed = Vec::new();
+            let mut healthy_metadata = Vec::new();
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read independently committed physical generation without GET");
+                assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (disk_count - parity, parity));
+                assert!(info.data.is_none(), "use actual external parts");
+                assert_ne!(info.data_dir, Some(old_dir));
+                committed.push(info);
+                healthy_metadata.push(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("committed raw metadata"),
+                );
+            }
+            let new_dir = committed[0].data_dir.expect("new committed data directory");
+            assert!(committed.iter().all(|info| info.data_dir == Some(new_dir)));
+            let new_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(new_dir.to_string())
+                .join("part.1");
+            let expected_part = tokio::fs::read(&new_part).await.expect("exact new source bytes");
+            let mut committed_parts = Vec::new();
+            for dir in &dirs {
+                let original = dir.path().join(bucket).join(&object).join(old_dir.to_string()).join("part.1");
+                assert!(
+                    tokio::fs::try_exists(original)
+                        .await
+                        .expect("every old cleanup slot is paused")
+                );
+                committed_parts.push(
+                    tokio::fs::read(dir.path().join(bucket).join(&object).join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("every new encoded shard before fault"),
+                );
+            }
+            tokio::fs::remove_file(&new_part)
+                .await
+                .expect("remove only the newly committed target shard");
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} old_cleanup_paused new_generation_committed target_part_missing"
+            );
+
+            let (result, error) = tokio::time::timeout(
+                Duration::from_secs(30),
+                set.heal_object(
+                    bucket,
+                    &object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("real locked Heal must progress during old cleanup")
+            .expect("complete actual deep Heal");
+            assert!(error.is_none(), "new generation must remain repairable: {error:?}");
+            assert_eq!(result.drives_healed(), Some(1));
+            // Shared data-phase repair deliberately does not certify full integrity.
+            assert_eq!(result.integrity_verified, !read_repair);
+            assert_eq!(tokio::fs::read(&new_part).await.expect("rebuilt part before any GET"), expected_part);
+            let repaired = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual repaired generation");
+            assert_eq!(repaired.data_dir, Some(new_dir));
+            assert_eq!(repaired.mod_time, committed[0].mod_time);
+            for (disk, expected) in disks.iter().zip(&healthy_metadata).skip(1) {
+                assert_eq!(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("healthy raw metadata after Heal"),
+                    *expected
+                );
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} locked_heal_completed new_generation_part_rebuilt_before_get"
+            );
+
+            for barrier in &barriers {
+                barrier.release();
+            }
+            let acknowledged = tokio::time::timeout(Duration::from_secs(30), writer)
+                .await
+                .expect("cleanup drains")
+                .expect("writer joins")
+                .expect("overwrite ACK remains successful");
+            assert_eq!(acknowledged.size, i64::try_from(payload.len()).expect("fixture size fits i64"));
+            drop(barriers);
+            for (slot, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(bucket).join(&object);
+                assert!(
+                    !tokio::fs::try_exists(root.join(old_dir.to_string()))
+                        .await
+                        .expect("old cleanup completed")
+                );
+                assert_eq!(
+                    tokio::fs::read(root.join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("new shard survives cleanup before GET"),
+                    committed_parts[slot],
+                    "old cleanup must preserve every exact committed encoded shard"
+                );
+            }
+            let mut reader = set
+                .get_object_reader(bucket, &object, None, HeaderMap::new(), &options)
+                .await
+                .expect("read final acknowledged generation");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read complete final payload");
+            assert_eq!(body, payload);
+            for disk in &disks {
+                let final_info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("final physical generation");
+                assert_eq!(final_info.data_dir, Some(new_dir), "old cleanup must not revert the healed generation");
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} overwrite_ack_preserved final_physical_generation_and_full_body_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn committed_put_releases_namespace_lock_before_old_data_cleanup() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "put-commit-lock-window";
@@ -25406,6 +25825,7 @@ mod delete_objects_lock_gating_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn delete_object_aborts_when_outer_lock_is_lost_at_commit() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "single-lost-outer-lock";
@@ -25626,6 +26046,13 @@ mod delete_objects_lock_gating_tests {
             .as_fast_lock_manager()
             .expect("isolated fixture should use the local lock manager");
         let lock_metrics = lock_manager.get_metrics().shard_metrics;
+        let raw_key = ObjectKey::new(bucket, "obj-a");
+        let raw_holder = lock_manager.get_lock_info(&raw_key).expect("outer holder must be visible");
+        let transaction_key = ObjectKey::with_version(
+            bucket,
+            "obj-a",
+            format!("rustfs:delete-transaction:{}:{}", set_disks.pool_index, set_disks.set_index),
+        );
         assert_eq!(lock_manager.current_lock_counts(), (1, 0));
         let mut delete = Box::pin(set_disks.delete_objects(
             bucket,
@@ -25642,23 +26069,43 @@ mod delete_objects_lock_gating_tests {
         // than a second on CI without waiting for the namespace lock at all.
         let deletion = futures::future::poll_fn(|cx| {
             let result = std::future::Future::poll(delete.as_mut(), cx);
+            let current_holder = lock_manager.get_lock_info(&raw_key).expect("outer holder must remain held");
+            assert_eq!(
+                (current_holder.mode, &current_holder.owner, current_holder.acquired_at),
+                (raw_holder.mode, &raw_holder.owner, raw_holder.acquired_at),
+                "no_lock must preserve the original raw object holder"
+            );
+            let transaction_holder = lock_manager.get_lock_info(&transaction_key);
+            if let Some(holder) = &transaction_holder {
+                assert_eq!(holder.mode, rustfs_lock::LockMode::Exclusive);
+            }
             assert_eq!(
                 lock_manager.current_lock_counts(),
-                (1, 0),
-                "no_lock batch delete must preserve the outer holder without adding lock waiters"
+                (1 + u64::from(transaction_holder.is_some()), 0),
+                "only the distinct transaction owner may be added, without raw-key waiters"
             );
             let current = lock_manager.get_metrics().shard_metrics;
-            assert_eq!(
-                (current.total_acquisitions(), current.timeouts),
-                (lock_metrics.total_acquisitions(), lock_metrics.timeouts),
-                "no_lock batch delete must not acquire or time out on another namespace lock"
+            assert!(
+                current.total_acquisitions() <= lock_metrics.total_acquisitions() + 1,
+                "the transaction owner must be reused by inline recovery"
             );
+            assert_eq!(current.timeouts, lock_metrics.timeouts, "the raw key must never be reacquired");
             result
         });
         let (deleted, errs) = tokio::time::timeout(Duration::from_secs(30), deletion)
             .await
             .expect("no_lock batch delete disk work should complete");
 
+        assert_eq!(lock_manager.current_lock_counts(), (1, 0));
+        assert!(
+            lock_manager.get_lock_info(&transaction_key).is_none(),
+            "the transaction owner must be released"
+        );
+        assert_eq!(
+            lock_manager.get_metrics().shard_metrics.total_acquisitions(),
+            lock_metrics.total_acquisitions() + 1,
+            "no_lock still requires exactly one distinct transaction owner"
+        );
         assert!(errs[0].is_none(), "no_lock batch delete should not fail with a lock error: {:?}", errs[0]);
         assert!(deleted[0].found, "existing object must still be deleted");
         for disk in &disk_stores {

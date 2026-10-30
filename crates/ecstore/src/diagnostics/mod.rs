@@ -15,5 +15,7 @@
 // #730: diagnostics constants are staged for request-path telemetry migration.
 
 pub(crate) mod admin_server_info;
+#[cfg(feature = "diagnostic-local-batch")]
+pub(crate) mod batch_read_diagnostics;
 pub(crate) mod get;
 pub(crate) mod object_lock;

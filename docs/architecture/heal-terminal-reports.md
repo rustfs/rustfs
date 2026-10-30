@@ -4,6 +4,10 @@ Admin heal tokens retain their terminal status for ten minutes from the original
 
 ## Publication and Recovery
 
+Authenticated token queries first inspect the receiving node's in-memory automatic tasks. An original Scanner, MRF, automatic-Heal, or read-repair token can return its path-bound snapshot on that node, including the retained outcome and incremental cursor. The task source and original ID remain attached to the completion snapshot; aliases cannot enter this local query path. The local lookup never reads administrator recovery records.
+
+Administrator tokens and unknown local identities continue through the cluster coordinator. Starting and cancelling tasks retain their coordinator route. Querying another node does not discover or aggregate a remote automatic task, and this path does not extend automatic-task retention across process restart.
+
 The original schema-1 `terminal-root-heal-<token>.json` remains the commit marker. Its separate `heal-terminal-report-<token>.json` report has its own schema version and embeds the exact terminal identity. Both files belong to the same coordinator disk as the pending intent.
 
 Publication writes the report through the storage owner's conditional file update, writes the terminal marker, and then conditionally removes the pending intent. Recovery never treats a report without its marker as committed. A committed terminal continues to suppress stale pending work even when its report is unreadable. An initial publication failure leaves the existing responsibility available for recovery.

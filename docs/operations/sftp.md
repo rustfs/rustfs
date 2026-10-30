@@ -158,7 +158,7 @@ When a session ends mid-upload the server aborts the in-flight multipart upload.
 - a burst of simultaneous disconnects exhausts the global abort task pool (sized at twice the CPU parallelism, between `ABORT_PERMITS_FLOOR` 8 and `ABORT_PERMITS_CEILING` 128);
 - the server process is killed outright.
 
-Orphaned uploads are not permanent. The background stale-upload cleanup aborts incomplete multipart uploads older than `DEFAULT_STALE_UPLOADS_EXPIRY` (24 hours), checked every `DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL` (6 hours). An `AbortIncompleteMultipartUpload` bucket lifecycle rule reclaims them as well and gives per-bucket control of the window. The log lines when a session-drop abort is skipped or fails:
+Background stale-upload cleanup considers incomplete multipart uploads after `DEFAULT_STALE_UPLOADS_EXPIRY` (24 hours from initiation), on a `DEFAULT_STALE_UPLOADS_CLEANUP_INTERVAL` schedule (6 hours). A bucket `AbortIncompleteMultipartUpload` rule can make an upload eligible earlier. Both paths retain their lock and cleanup-authority checks: low-quorum or otherwise uncertain residue can remain, so neither the schedule nor a lifecycle rule guarantees physical reclamation. See [stale-upload recovery](scanner-runtime-controls.md#migrating-from-minio-scanner-settings). The log lines when a session-drop abort is skipped or fails:
 
 ```text
 skipped abort of orphaned multipart upload on session drop, principal lacks s3:AbortMultipartUpload, bucket lifecycle rules must reclaim parts
@@ -187,6 +187,6 @@ Every line below logs at warn level except `SFTP server listening` and `SFTP aut
 | `SFTP write would exceed the S3 multipart parts limit` | Client hit the per-upload size cap; raise the part size if legitimate. |
 | `SFTP close rejected: trailing part would exceed S3 multipart parts limit` | Same cap hit at file close. |
 | `root READDIR truncated` | A principal can see more than 10000 buckets; listing was cut off. |
-| `skipped abort of orphaned multipart upload` | Orphaned parts on storage until background cleanup or a lifecycle rule reclaims them. |
-| `abort permit pool exhausted on session drop` | Mass-disconnect burst; orphaned parts on storage until reclaimed. |
+| `skipped abort of orphaned multipart upload` | Parts may remain until cleanup has sufficient authority to reclaim them. |
+| `abort permit pool exhausted on session drop` | Mass-disconnect burst; parts may remain when cleanup authority is unavailable. |
 | `RUSTFS_SFTP_` prefix in a warning | A tuning variable was rejected and its default applied. |
