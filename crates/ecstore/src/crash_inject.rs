@@ -84,13 +84,19 @@ pub(crate) enum CrashPoint {
 }
 
 #[cfg(test)]
-pub(crate) use armed::{arm, disarm, should_crash_at};
+pub(crate) use armed::{arm, disarm, is_armed, should_crash_at};
 
 /// Production no-op: the compiler inlines this to `false`, so armed crash points
 /// exist only in `#[cfg(test)]` builds and never add a branch to real commits.
 #[cfg(not(test))]
 #[inline(always)]
 pub(crate) fn should_crash_at(_point: CrashPoint, _key: &str) -> bool {
+    false
+}
+
+#[cfg(not(test))]
+#[inline(always)]
+pub(crate) fn is_armed(_point: CrashPoint, _key: &str) -> bool {
     false
 }
 
@@ -130,6 +136,10 @@ mod armed {
     /// was somehow never reached and would otherwise fire inside the retry.
     pub(crate) fn disarm(point: CrashPoint, key: &str) {
         guard().retain(|(p, k)| !(*p == point && k == key));
+    }
+
+    pub(crate) fn is_armed(point: CrashPoint, key: &str) -> bool {
+        guard().iter().any(|(p, k)| *p == point && k == key)
     }
 
     /// Returns `true` (consuming the arm) iff a crash is armed for exactly this
