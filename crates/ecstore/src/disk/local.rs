@@ -20125,6 +20125,61 @@ mod test {
         );
     }
 
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_presynced_shard_keeps_directory_sync() {
+        let _group_commit = os::set_dst_dir_fsync_group_commit_for_test(false);
+        let _file_group_commit = os::set_file_fdatasync_group_commit_for_test(false);
+        for mode in [DurabilityMode::Strict, DurabilityMode::Relaxed] {
+            let _mode = durability_mode_override::set(mode);
+            let dir = tempfile::tempdir().expect("temp dir should be created");
+            let endpoint =
+                Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
+            let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
+            let bucket = "presynced-shard-bucket";
+            let object = "dir/object";
+            let tmp_object = "tmp-presynced-write";
+            let data_dir = Uuid::new_v4();
+            ensure_test_volume(&disk, bucket).await;
+            ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+            let shard_path = format!("{tmp_object}/{data_dir}/part.1");
+            let mut writer = disk
+                .create_file(bucket, RUSTFS_META_TMP_BUCKET, &shard_path, 8)
+                .await
+                .expect("open staged shard writer");
+            writer.write_all(b"new-data").await.expect("write staged shard");
+            writer.shutdown().await.expect("close staged shard");
+            let staged_dir = disk
+                .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
+                .expect("staged shard directory should resolve");
+            assert!(PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir), "the writer must pre-sync the shard");
+            assert!(!os::fsync_dir_recorder::was_fsynced(&staged_dir));
+
+            let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            fi.size = 8;
+            fi.parts[0].size = 8;
+            fi.parts[0].actual_size = 8;
+            disk.rename_data(RUSTFS_META_TMP_BUCKET, tmp_object, fi, bucket, object)
+                .await
+                .expect("rename_data should commit");
+            assert!(
+                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                "the fused commit must consume the pre-sync marker"
+            );
+            assert!(
+                os::fsync_dir_recorder::was_fsynced(&staged_dir),
+                "pre-syncing the payload must not skip the shard directory barrier"
+            );
+            let shard = disk
+                .get_object_path(bucket, &format!("{object}/{data_dir}/part.1"))
+                .expect("committed shard should resolve");
+            assert_eq!(fs::read(shard).await.expect("committed shard should be readable"), b"new-data");
+        }
+    }
+
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn test_rename_data_legacy_off_skips_all_fsyncs() {

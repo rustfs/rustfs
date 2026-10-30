@@ -836,13 +836,19 @@ impl LocalDisk {
                 prepared_metadata_source.write_all(&new_dst_buf, sync_commit_metadata)?;
 
                 if no_inline {
-                    if sync_data_shards
-                        && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
-                        && !super::take_presynced_tmp_data_dir(src_data_path)
-                        && let Err(err) = os::sync_dir_files_std(src_data_path)
-                        && err.kind() != ErrorKind::NotFound
-                    {
-                        return Err(err);
+                    if sync_data_shards && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref() {
+                        let sync_result = if super::take_presynced_tmp_data_dir(src_data_path) {
+                            // The payload was synced, but its part.1 directory entry
+                            // must also be persisted before moving the data directory.
+                            os::fsync_dir_std(src_data_path)
+                        } else {
+                            os::sync_dir_files_std(src_data_path)
+                        };
+                        if let Err(err) = sync_result
+                            && err.kind() != ErrorKind::NotFound
+                        {
+                            return Err(err);
+                        }
                     }
                     if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref()
                         && let Err(err) = os::rename_all_with_commit_guard_on_thread(src_data_path, dst_data_path, &guard)

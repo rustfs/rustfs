@@ -2413,7 +2413,6 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
-    #[cfg(target_os = "linux")]
     pub(crate) fn is_active() -> bool {
         !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
     }
