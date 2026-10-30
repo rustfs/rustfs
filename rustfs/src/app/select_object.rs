@@ -600,9 +600,10 @@ fn validate_select_request(headers: &http::HeaderMap, input: &mut SelectObjectCo
     if input.request.expression.len() > MAX_SELECT_EXPRESSION_BYTES {
         return Err(S3Error::new(S3ErrorCode::ExpressionTooLong));
     }
-    if input.request.expression_type.as_str() != ExpressionType::SQL {
+    let Some(expression_type) = canonical_enum(input.request.expression_type.as_str(), &[ExpressionType::SQL]) else {
         return Err(S3Error::new(S3ErrorCode::InvalidExpressionType));
-    }
+    };
+    input.request.expression_type = ExpressionType::from_static(expression_type);
 
     normalize_input_serialization(&mut input.request.input_serialization)?;
     let compressed_input = is_compressed_input(&input.request.input_serialization);
@@ -649,6 +650,15 @@ fn is_compressed_input(input: &InputSerialization) -> bool {
         .is_some_and(|compression| compression.as_str() != CompressionType::NONE)
 }
 
+/// Matches an S3 enum value in any ASCII case, as MinIO does, and returns the
+/// canonical spelling that downstream code compares against.
+fn canonical_enum(value: &str, allowed: &[&'static str]) -> Option<&'static str> {
+    allowed
+        .iter()
+        .copied()
+        .find(|candidate| candidate.eq_ignore_ascii_case(value))
+}
+
 fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()> {
     let format_count =
         usize::from(input.csv.is_some()) + usize::from(input.json.is_some()) + usize::from(input.parquet.is_some());
@@ -659,19 +669,20 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         return Err(S3Error::new(S3ErrorCode::ObjectSerializationConflict));
     }
 
-    if let Some(compression) = input.compression_type.as_ref() {
-        match compression.as_str() {
-            CompressionType::NONE => {}
-            CompressionType::GZIP | CompressionType::BZIP2 => {
-                if input.parquet.is_some() {
-                    return Err(S3Error::with_message(
-                        S3ErrorCode::InvalidRequestParameter,
-                        INVALID_REQUEST_PARAMETER_MESSAGE,
-                    ));
-                }
-            }
-            _ => return Err(map_select_error_to_s3(&SelectError::InvalidCompressionFormat)),
+    if let Some(compression) = input.compression_type.as_mut() {
+        let Some(canonical) = canonical_enum(
+            compression.as_str(),
+            &[CompressionType::NONE, CompressionType::GZIP, CompressionType::BZIP2],
+        ) else {
+            return Err(map_select_error_to_s3(&SelectError::InvalidCompressionFormat));
+        };
+        if canonical != CompressionType::NONE && input.parquet.is_some() {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequestParameter,
+                INVALID_REQUEST_PARAMETER_MESSAGE,
+            ));
         }
+        *compression = CompressionType::from_static(canonical);
     }
     input
         .compression_type
@@ -681,15 +692,16 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
         let file_header_info = csv
             .file_header_info
             .get_or_insert_with(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
-        if !matches!(
+        let Some(canonical) = canonical_enum(
             file_header_info.as_str(),
-            FileHeaderInfo::NONE | FileHeaderInfo::USE | FileHeaderInfo::IGNORE
-        ) {
+            &[FileHeaderInfo::NONE, FileHeaderInfo::USE, FileHeaderInfo::IGNORE],
+        ) else {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidFileHeaderInfo,
                 "The FileHeaderInfo value is not valid. Only NONE, USE, and IGNORE are supported.",
             ));
-        }
+        };
+        *file_header_info = FileHeaderInfo::from_static(canonical);
         validate_single_byte(csv.comments.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_character(csv.quote_character.as_deref())?;
         validate_single_character(csv.quote_escape_character.as_deref())?;
@@ -699,9 +711,10 @@ fn normalize_input_serialization(input: &mut InputSerialization) -> S3Result<()>
 
     if let Some(json) = input.json.as_mut() {
         let json_type = json.type_.get_or_insert_with(|| JSONType::from_static(JSONType::LINES));
-        if !matches!(json_type.as_str(), JSONType::DOCUMENT | JSONType::LINES) {
+        let Some(canonical) = canonical_enum(json_type.as_str(), &[JSONType::DOCUMENT, JSONType::LINES]) else {
             return Err(S3Error::new(S3ErrorCode::InvalidJsonType));
-        }
+        };
+        *json_type = JSONType::from_static(canonical);
     }
 
     Ok(())
@@ -716,15 +729,16 @@ fn normalize_output_serialization(output: &mut OutputSerialization) -> S3Result<
         return Err(S3Error::new(S3ErrorCode::ObjectSerializationConflict));
     }
 
-    if let Some(csv) = output.csv.as_ref() {
+    if let Some(csv) = output.csv.as_mut() {
         validate_single_byte(csv.field_delimiter.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_single_byte(csv.quote_escape_character.as_deref(), S3ErrorCode::InvalidRequestParameter)?;
         validate_output_record_delimiter(csv.record_delimiter.as_deref())?;
-        if let Some(quote_fields) = csv.quote_fields.as_ref()
-            && !matches!(quote_fields.as_str(), QuoteFields::ALWAYS | QuoteFields::ASNEEDED)
-        {
-            return Err(S3Error::new(S3ErrorCode::InvalidQuoteFields));
+        if let Some(quote_fields) = csv.quote_fields.as_mut() {
+            let Some(canonical) = canonical_enum(quote_fields.as_str(), &[QuoteFields::ALWAYS, QuoteFields::ASNEEDED]) else {
+                return Err(S3Error::new(S3ErrorCode::InvalidQuoteFields));
+            };
+            *quote_fields = QuoteFields::from_static(canonical);
         }
         return Ok(SelectOutputFormat::Csv(csv.clone()));
     }
@@ -3637,6 +3651,132 @@ mod tests {
             error.message(),
             Some("The FileHeaderInfo value is not valid. Only NONE, USE, and IGNORE are supported.")
         );
+    }
+
+    fn json_input(json_type: &str) -> SelectObjectContentInput {
+        let mut input = base_input();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.json = Some(JSONInput {
+            type_: Some(JSONType::from(json_type.to_string())),
+        });
+        input
+    }
+
+    #[test]
+    fn validate_matches_enum_values_case_insensitively_and_canonicalizes_them() {
+        for (value, expected) in [
+            ("gzip", CompressionType::GZIP),
+            ("bZip2", CompressionType::BZIP2),
+            ("none", CompressionType::NONE),
+        ] {
+            let mut input = base_input();
+            input.request.input_serialization.compression_type = Some(CompressionType::from(value.to_string()));
+            validate_select_request(&HeaderMap::new(), &mut input).expect("CompressionType should match any case");
+            assert_eq!(
+                input
+                    .request
+                    .input_serialization
+                    .compression_type
+                    .as_ref()
+                    .map(|v| v.as_str()),
+                Some(expected)
+            );
+        }
+
+        for (value, expected) in [("lines", JSONType::LINES), ("Document", JSONType::DOCUMENT)] {
+            let mut input = json_input(value);
+            validate_select_request(&HeaderMap::new(), &mut input).expect("JSON Type should match any case");
+            let json_type = input
+                .request
+                .input_serialization
+                .json
+                .as_ref()
+                .and_then(|json| json.type_.as_ref());
+            assert_eq!(json_type.map(|v| v.as_str()), Some(expected));
+        }
+        let mut input = json_input("document");
+        validate_select_request(&HeaderMap::new(), &mut input).expect("lowercase DOCUMENT should be accepted");
+        assert!(is_json_document(input.request.input_serialization.json.as_ref().expect("JSON input")));
+
+        for (value, expected) in [
+            ("use", FileHeaderInfo::USE),
+            ("Ignore", FileHeaderInfo::IGNORE),
+            ("none", FileHeaderInfo::NONE),
+        ] {
+            let mut input = base_input();
+            input
+                .request
+                .input_serialization
+                .csv
+                .as_mut()
+                .expect("base input should use CSV")
+                .file_header_info = Some(FileHeaderInfo::from(value.to_string()));
+            validate_select_request(&HeaderMap::new(), &mut input).expect("FileHeaderInfo should match any case");
+            let csv = input.request.input_serialization.csv.as_ref().expect("CSV input");
+            assert_eq!(csv.file_header_info.as_ref().map(|v| v.as_str()), Some(expected));
+        }
+
+        for (value, expected) in [("always", QuoteFields::ALWAYS), ("AsNeeded", QuoteFields::ASNEEDED)] {
+            let mut input = base_input();
+            input
+                .request
+                .output_serialization
+                .csv
+                .as_mut()
+                .expect("base output should use CSV")
+                .quote_fields = Some(QuoteFields::from(value.to_string()));
+            let validation = validate_select_request(&HeaderMap::new(), &mut input).expect("QuoteFields should match any case");
+            let SelectOutputFormat::Csv(csv) = validation.output_format else {
+                panic!("CSV output expected");
+            };
+            assert_eq!(csv.quote_fields.as_ref().map(|v| v.as_str()), Some(expected));
+        }
+
+        let mut input = base_input();
+        input.request.expression_type = ExpressionType::from("sql".to_string());
+        validate_select_request(&HeaderMap::new(), &mut input).expect("ExpressionType should match any case");
+        assert_eq!(input.request.expression_type.as_str(), ExpressionType::SQL);
+    }
+
+    #[test]
+    fn validate_still_rejects_unknown_enum_values_in_any_case() {
+        for value in ["gzipx", "snappy", " GZIP"] {
+            let mut input = base_input();
+            input.request.input_serialization.compression_type = Some(CompressionType::from(value.to_string()));
+            let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown compression must fail");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidCompressionFormat, "{value}");
+        }
+        for value in ["ndjson", "lines "] {
+            let error =
+                validate_select_request(&HeaderMap::new(), &mut json_input(value)).expect_err("unknown JSON type must fail");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidJsonType, "{value}");
+        }
+        let mut input = base_input();
+        input
+            .request
+            .input_serialization
+            .csv
+            .as_mut()
+            .expect("base input should use CSV")
+            .file_header_info = Some(FileHeaderInfo::from("used".to_string()));
+        let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown header mode must fail");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidFileHeaderInfo);
+
+        let mut input = base_input();
+        input
+            .request
+            .output_serialization
+            .csv
+            .as_mut()
+            .expect("base output should use CSV")
+            .quote_fields = Some(QuoteFields::from("never".to_string()));
+        let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown QuoteFields must fail");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidQuoteFields);
+
+        let mut input = base_input();
+        input.request.expression_type = ExpressionType::from("sqlite".to_string());
+        let error = validate_select_request(&HeaderMap::new(), &mut input).expect_err("unknown ExpressionType must fail");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidExpressionType);
     }
 
     #[test]

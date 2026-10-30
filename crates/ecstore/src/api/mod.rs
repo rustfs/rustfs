@@ -14,12 +14,16 @@
 
 //! Explicit ECStore public facades for outer crate compatibility boundaries.
 
-#[cfg(feature = "diagnostic-read-version-caller")]
+#[cfg(any(feature = "diagnostic-read-version-caller", feature = "diagnostic-local-batch"))]
 pub mod diagnostic {
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use crate::cluster::rpc::runtime_sources::{
         current_read_version_entry_source, observe_read_version_context_boundary, with_captured_read_version_context,
         with_read_version_entry, with_read_version_spawn_context,
     };
+    #[cfg(feature = "diagnostic-local-batch")]
+    pub use crate::diagnostics::batch_read_diagnostics::{current_request_id, in_request_context, request_context};
+    #[cfg(feature = "diagnostic-read-version-caller")]
     pub use rustfs_io_metrics::internode_metrics::{ReadVersionContextBoundary, ReadVersionEntrySource};
 }
 
@@ -139,6 +143,12 @@ pub mod bucket {
 
         pub mod rule {
             pub use crate::bucket::lifecycle::rule::{Filter, NoncurrentVersionTransitionOps, TransitionOps};
+        }
+
+        pub mod tier_free_version_recovery {
+            pub use crate::bucket::lifecycle::tier_free_version_recovery::{
+                TierCleanupRetryReport, TierCleanupRetryStatus, retry_tier_free_version_cleanup,
+            };
         }
 
         pub mod tier_delete_journal {
@@ -385,10 +395,10 @@ pub mod config {
             ServerConfigCorruptError, ServerConfigSaveResult, ServerConfigSnapshot, delete_config, delete_config_no_lock,
             is_server_config_corrupt_error, lookup_configs, read_config, read_config_no_lock, read_config_with_metadata,
             read_config_without_migrate, read_config_without_migrate_no_lock, read_existing_server_config_no_lock,
-            read_server_config_snapshot, save_config, save_config_no_lock, save_config_with_opts, save_config_with_opts_quiet,
-            save_server_config, save_server_config_no_lock, save_server_config_snapshot,
-            save_server_config_snapshot_with_generation, server_config_path, try_migrate_server_config,
-            with_config_object_read_lock, with_config_object_write_lock, with_server_config_read_lock,
+            read_server_config_snapshot, read_server_config_with_generation, save_config, save_config_no_lock,
+            save_config_with_opts, save_config_with_opts_quiet, save_server_config, save_server_config_no_lock,
+            save_server_config_snapshot, save_server_config_snapshot_with_generation, server_config_path,
+            try_migrate_server_config, with_config_object_read_lock, with_config_object_write_lock, with_server_config_read_lock,
             with_server_config_write_lock,
         };
     }

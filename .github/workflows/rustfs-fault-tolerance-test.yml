@@ -50,10 +50,6 @@ on:
         description: 'Reset the nodes after the test (DESTROYS test data/config)'
         type: boolean
         default: true
-  repository_dispatch:
-    # Chain handoff: dispatched when the replication suite finishes, ahead of
-    # the performance suite.
-    types: [rustfs-chain-fault-tolerance]
 
 permissions:
   contents: read
@@ -80,7 +76,7 @@ jobs:
   fault-tolerance-test:
     runs-on: smoke-testing
     timeout-minutes: 60
-    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' || github.event_name == 'repository_dispatch' }}
+    if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' }}
     steps:
       - name: Checkout repository (for report parser)
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -135,6 +131,13 @@ jobs:
           aws --version
           echo "auto-testing: ${AUTO_TESTING_SHA}"
           df -h /data | tail -1
+
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-fault-tolerance.json
+        run: python3 scripts/functional_environment.py enter --suite fault-tolerance
 
       - name: Cleanup environment (before)
         timeout-minutes: 5
@@ -194,21 +197,21 @@ jobs:
           jq -e --arg testing_sha "${AUTO_TESTING_SHA}" '
             .schema_version == 1 and
             .auto_testing_sha == $testing_sha and
-            .selected_scenarios == ["A", "B", "C", "C2", "D", "E"] and
+            .selected_scenarios == ["A", "B", "C", "C2", "D", "E", "F"] and
             .complete == true and
-            .counts.expected == 44 and
-            .counts.seen == 44 and
+            .counts.expected == 54 and
+            .counts.seen == 54 and
             .counts.harness_errors == 0 and
-            (.expected_cases | length) == 44 and
-            (.expected_cases | unique | length) == 44 and
-            (.seen_cases | length) == 44 and
-            (.seen_cases | unique | length) == 44 and
+            (.expected_cases | length) == 54 and
+            (.expected_cases | unique | length) == 54 and
+            (.seen_cases | length) == 54 and
+            (.seen_cases | unique | length) == 54 and
             (.seen_cases | sort) == (.expected_cases | sort) and
             (.missing_cases | length) == 0 and
             (.harness_errors | length) == 0 and
-            (.cases | length) == 44 and
+            (.cases | length) == 54 and
             ([.cases[].case_id] | sort) == (.expected_cases | sort) and
-            ([.cases[].case_id] | unique | length) == 44 and
+            ([.cases[].case_id] | unique | length) == 54 and
             all(.cases[]; .verdict == "pass" or .verdict == "known-divergence" or .verdict == "UNEXPECTED") and
             .counts.unexpected == ([.cases[] | select(.verdict == "UNEXPECTED")] | length) and
             .counts.known_divergence == ([.cases[] | select(.verdict == "known-divergence")] | length)
@@ -305,58 +308,27 @@ jobs:
           if-no-files-found: warn
 
       - name: Cleanup environment (after)
+        id: environment_cleanup
         timeout-minutes: 5
-        if: ${{ always() && inputs.cleanup_after != 'false' }}
+        if: ${{ always() && inputs.cleanup_after != 'false' && steps.environment.outcome == 'success' }}
         run: |
-          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}" || true
+          ./auto-testing/rustfs-fault-tolerance-test.sh --cleanup -y --log-file "${LOG_FILE}"
 
-      - name: "Continue functional chain (next: Performance)"
-        # Only chain-triggered runs forward to the next suite; standalone
-        # workflow_dispatch runs stop after their own cleanup. A failed
-        # handoff retries, then files an alert issue in rustfs/backlog.
-        if: ${{ always() && github.event_name == 'repository_dispatch' }}
-        continue-on-error: true
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
         env:
-          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
-        run: |
-          set -uo pipefail
-          if [ -z "${GH_TOKEN:-}" ]; then
-            echo "PF_TESTING_GH_TOKEN is not configured; cannot dispatch the next suite" >&2
-            exit 1
-          fi
-          DISPATCHED=0
-          for attempt in 1 2 3; do
-            if gh api --method POST repos/rustfs/rustfs/dispatches \
-              -f event_type='rustfs-chain-performance' \
-              -F 'client_payload[from_suite]=fault-tolerance'; then
-              echo "dispatched next suite Performance (attempt ${attempt})"
-              DISPATCHED=1
-              break
-            fi
-            echo "dispatch attempt ${attempt} failed; retrying in ${attempt}0s" >&2
-            sleep "${attempt}0"
-          done
-          if [ "${DISPATCHED:-0}" -ne 1 ]; then
-            echo "ERROR: functional chain stalled: could not dispatch Performance after 3 attempts" >&2
-            TITLE="[functional][chain] stalled after fault-tolerance (run ${GITHUB_RUN_ID})"
-            BODY_FILE="$(mktemp)"
-            {
-              echo "The functional chain could not hand off from **fault-tolerance** to **Performance** after 3 attempts."
-              echo ""
-              echo "- Failed suite job: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
-              echo "- Expected next event: 'rustfs-chain-performance'"
-              echo "- Likely cause: PF_TESTING_GH_TOKEN lacks contents:write on rustfs/rustfs, or the GitHub API was unavailable."
-              echo "- Recovery: re-dispatch manually with"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-              echo "  gh api --method POST repos/rustfs/rustfs/dispatches -f event_type='rustfs-chain-performance'"
-              FENCE="$(printf "\x60\x60\x60")"; echo "  ${FENCE}"
-            } > "${BODY_FILE}"
-            gh issue create -R rustfs/backlog --title "${TITLE}" \
-              --body-file "${BODY_FILE}" --label functional-test \
-              || gh issue create -R rustfs/backlog --title "${TITLE}" --body-file "${BODY_FILE}" \
-              || echo "could not file the stall alert issue either; check the token" >&2
-            exit 1
-          fi
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-fault-tolerance.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 scripts/functional_environment.py finish --suite fault-tolerance --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Retain environment ownership and cleanup receipt
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: functional-environment-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/environment-fault-tolerance.json
+          if-no-files-found: error
 
       - name: Notify on failure
         if: failure()
@@ -391,3 +363,13 @@ jobs:
           name: functional-chain-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}
           path: ${{ runner.temp }}/chain-fault-tolerance-${{ github.run_id }}-${{ github.run_attempt }}/fault-tolerance.json
           if-no-files-found: error
+
+      - name: Enforce suite and report result
+        if: ${{ always() }}
+        env:
+          SUITE_OUTCOME: ${{ steps.test.outcome }}
+          REPORT_OUTCOME: ${{ steps.chain_report.outcome }}
+        run: |
+          test "$SUITE_OUTCOME" = success
+          test "$REPORT_OUTCOME" = success
+          python3 scripts/functional_chain_evidence.py verify-report --suite fault-tolerance --report "${FUNCTIONAL_ARTIFACTS_DIR}/suite.log"

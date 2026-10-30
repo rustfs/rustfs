@@ -4711,6 +4711,27 @@ impl PublicationRoot {
         std::fs::File::open(path)
     }
 
+    pub(crate) fn check_writable(&self, path: &Path) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        let directory = self.open_directory(path)?;
+        #[cfg(target_os = "linux")]
+        let probe_directory = {
+            use std::os::fd::AsRawFd;
+            PathBuf::from(format!("/proc/self/fd/{}/.", directory.as_raw_fd()))
+        };
+        #[cfg(not(target_os = "linux"))]
+        let probe_directory = path;
+
+        // Keep the Linux parent handle pinned through deletion, including when
+        // a startup timeout detaches the blocking task.
+        let mut probe = tempfile::Builder::new()
+            .prefix(".rustfs-write-check-")
+            .tempfile_in(probe_directory)?;
+        let write_result = std::io::Write::write_all(probe.as_file_mut(), b"rustfs");
+        let delete_result = probe.close();
+        write_result.and(delete_result)
+    }
+
     pub(crate) fn create_truncate(&self, path: &Path) -> io::Result<std::fs::File> {
         #[cfg(target_os = "linux")]
         {

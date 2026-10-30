@@ -64,7 +64,7 @@ impl ProcessAttributes {
     /// Returns an error if the process does not exist or information
     /// cannot be retrieved.
     pub fn from_pid(pid: Pid) -> Result<Self, ProcessAttributeError> {
-        let mut system = System::new();
+        let mut system = System::new().map_err(|error| ProcessAttributeError::SystemError(std::sync::Arc::new(error)))?;
         system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[pid]), true);
 
         let process = system
@@ -100,6 +100,8 @@ impl ProcessAttributes {
 pub enum ProcessAttributeError {
     /// Failed to get current process PID
     PidError(String),
+    /// System information is unavailable.
+    SystemError(std::sync::Arc<sysinfo::Error>),
     /// Process not found
     ProcessNotFound(u32),
 }
@@ -109,11 +111,19 @@ impl std::fmt::Display for ProcessAttributeError {
         match self {
             Self::PidError(e) => write!(f, "Failed to get current PID: {}", e),
             Self::ProcessNotFound(pid) => write!(f, "Process not found: {}", pid),
+            Self::SystemError(error) => write!(f, "System information unavailable: {error}"),
         }
     }
 }
 
-impl std::error::Error for ProcessAttributeError {}
+impl std::error::Error for ProcessAttributeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::SystemError(error) => Some(error.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 /// Process status enumeration.
 ///
