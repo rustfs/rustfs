@@ -385,12 +385,6 @@ impl DefaultObjectUsecase {
             dst_opts.object_lock_config_snapshot =
                 Some(store.object_lock_config_snapshot(&bucket).await.map_err(ApiError::from)?);
         }
-        let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-
         // Hold the self-copy namespace write lock before opening the source reader, including
         // expected-current historical copies. With lock optimization disabled, the source
         // stream retains its read guard until EOF; taking the write lock later in ECStore
@@ -410,28 +404,42 @@ impl DefaultObjectUsecase {
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
-        if _self_copy_lock_guard.is_some() {
-            current_opts.no_lock = true;
-        }
-        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
-                if let Some(expected) = expected_current_version_id.as_deref()
-                    && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
-                {
-                    return Err(s3_error!(PreconditionFailed));
-                }
-                Some((existing_obj_info.size.max(0) as u64, quota_object_size(&existing_obj_info)))
+        let copy_prelookup_required = self_copy_lock
+            || expected_current_version_id.is_some()
+            || dest_version_id.is_some()
+            || (!super::shared::put_like_write_creates_new_version(&dst_opts)
+                && object_lock_checks_required_for_state(&object_lock_config_state));
+        let previous_current_sizes: Option<Option<(u64, Result<u64, StorageError>)>> = if copy_prelookup_required {
+            let mut current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, dest_version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            if _self_copy_lock_guard.is_some() {
+                current_opts.no_lock = true;
             }
-            Err(err) => {
-                if expected_current_version_id.is_some() {
-                    return Err(s3_error!(PreconditionFailed));
+            Some(match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &dst_opts)?;
+                    if let Some(expected) = expected_current_version_id.as_deref()
+                        && existing_obj_info.version_id.unwrap_or_default().to_string() != expected
+                    {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                    Some((existing_obj_info.size.max(0) as u64, quota_object_size(&existing_obj_info)))
                 }
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+                Err(err) => {
+                    if expected_current_version_id.is_some() {
+                        return Err(s3_error!(PreconditionFailed));
+                    }
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    None
                 }
-                None
-            }
+            })
+        } else {
+            None
         };
 
         let (mut effective_sse, mut effective_kms_key_id) = resolve_bucket_default_sse(
@@ -753,10 +761,11 @@ impl DefaultObjectUsecase {
         if let Some(quota_check) = quota_check.as_ref() {
             apply_quota_admission(&mut dst_opts, quota_check)?;
         }
-        let previous_current_size = match previous_current_sizes {
-            Some((_, Ok(logical_size))) if quota_enabled => Some(logical_size),
-            Some((_, Err(err))) if quota_enabled => return Err(ApiError::from(err).into()),
-            Some((physical_size, _)) => Some(physical_size),
+        let prelookup_previous_current_size: Option<Option<u64>> = match previous_current_sizes {
+            Some(Some((_, Ok(logical_size)))) if quota_enabled => Some(Some(logical_size)),
+            Some(Some((_, Err(err)))) if quota_enabled => return Err(ApiError::from(err).into()),
+            Some(Some((physical_size, _))) => Some(Some(physical_size)),
+            Some(None) => Some(None),
             None => None,
         };
         if let Some(quota_check) = quota_check.as_ref() {
@@ -785,8 +794,8 @@ impl DefaultObjectUsecase {
                 let _self_copy_lock_guard = _self_copy_lock_guard;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
 
-                let oi = store
-                    .copy_object(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
+                let (oi, backfilled_old_current_size) = store
+                    .copy_object_with_old_current_size(&src_bucket, &src_key, &bucket, &key, &mut src_info, &src_opts, &dst_opts)
                     .await
                     .map_err(ApiError::from)?;
 
@@ -800,13 +809,22 @@ impl DefaultObjectUsecase {
                 maybe_enqueue_transition_immediate(&oi, LcEventSrc::S3CopyObject).await;
                 let _ = invalidate_object_data_cache_after_copy_success(&cache_adapter, &bucket, &key).await;
 
-                let dest_versioned = BucketVersioningSys::prefix_enabled(&bucket, &key).await;
+                let dest_versioned = dst_opts.versioned;
                 if has_bucket_metadata {
                     let committed_size = quota_accounting_object_size(&oi, quota_enabled)?;
-                    if dest_versioned {
-                        record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                    } else {
-                        record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                    match prelookup_previous_current_size
+                        .or_else(|| previous_current_size_from_backfill(backfilled_old_current_size))
+                    {
+                        Some(previous_current_size) => {
+                            if dest_versioned {
+                                record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
+                            } else {
+                                record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                            }
+                        }
+                        None => {
+                            record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, dest_versioned).await;
+                        }
                     }
                 }
 
