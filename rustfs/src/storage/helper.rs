@@ -117,7 +117,23 @@ pub struct EnabledOperationHelper {
 impl OperationHelper {
     /// Create a new OperationHelper for S3 requests.
     pub fn new(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation) -> Self {
-        let op_event_matches = operation_matches_event_name(op, event);
+        Self::build(req, event, op, false)
+    }
+
+    /// Create an OperationHelper that only emits an audit entry, never a bucket notification.
+    ///
+    /// For operations that have no notification event of their own (`UploadPart`, the
+    /// bucket configuration writes) or whose event is internal (`AbortMultipartUpload`).
+    /// Unlike `new` it does not call `record_s3_op`, so per-operation metrics stay as the
+    /// handlers already report them.
+    pub fn audit_only(req: &S3Request<impl Send + Sync>, op: S3Operation) -> Self {
+        let event = op.to_event_name().unwrap_or(EventName::AuditS3Operation);
+        Self::build(req, event, op, true)
+    }
+
+    fn build(req: &S3Request<impl Send + Sync>, event: EventName, op: S3Operation, audit_only: bool) -> Self {
+        // `audit_only` derives the event from the operation, so there is nothing to cross-check.
+        let op_event_matches = audit_only || operation_matches_event_name(op, event);
         debug_assert!(op_event_matches, "operation/event mismatch: op={} event={}", op.as_str(), event.as_str());
         if !op_event_matches {
             counter!(
@@ -134,7 +150,11 @@ impl OperationHelper {
         }
 
         let audit_enabled = is_audit_module_enabled();
-        let notify_enabled = should_build_notification_event(is_notify_module_enabled());
+        let notify_enabled = !audit_only && should_build_notification_event(is_notify_module_enabled());
+        if audit_only && !audit_enabled {
+            // Nothing to record and no metric to bump: skip the path parsing below.
+            return Self::Disabled;
+        }
 
         let path = req.uri.path().trim_start_matches('/');
         let mut segs = path.splitn(2, '/');
@@ -146,7 +166,9 @@ impl OperationHelper {
             .filter(|value| !value.is_empty())
             .unwrap_or(path_bucket);
 
-        record_s3_op(op);
+        if !audit_only {
+            record_s3_op(op);
+        }
 
         // Fast path: when both chains are disabled, avoid audit/notify builder work.
         if !audit_enabled && !notify_enabled {
@@ -416,6 +438,22 @@ impl OperationHelper {
     }
 }
 
+/// Runs `handler` on `req` and records the outcome as an audit-only entry for `op`.
+///
+/// The helper is built before the request is handed over so it sees the original headers
+/// and extensions, and it completes with the handler's result, so failed requests are audited too.
+pub(crate) async fn audit_only_operation<I, O, F, Fut>(req: S3Request<I>, op: S3Operation, handler: F) -> S3Result<S3Response<O>>
+where
+    I: Send + Sync,
+    F: FnOnce(S3Request<I>) -> Fut,
+    Fut: Future<Output = S3Result<S3Response<O>>>,
+{
+    let helper = OperationHelper::audit_only(&req, op);
+    let result = handler(req).await;
+    let _helper = helper.complete(&result);
+    result
+}
+
 fn should_build_notification_event(notify_module_enabled: bool) -> bool {
     notify_module_enabled || rustfs_notify::notification_system().is_some_and(|system| system.has_live_listeners())
 }
@@ -468,7 +506,7 @@ mod tests {
     use rustfs_s3_types::EventName;
     use rustfs_utils::http::headers::{AMZ_REQUEST_ID, REQUEST_ID_HEADER};
     use s3s::dto::{DeleteObjectTaggingInput, DeleteObjectTaggingOutput, GetObjectInput, GetObjectOutput};
-    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response};
+    use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
     use std::sync::{Arc, Mutex};
     use temp_env::{async_with_vars, with_vars};
 
@@ -736,6 +774,151 @@ mod tests {
                 assert_eq!(event_args.req_params.get("principalId").map(String::as_str), Some("notifyTag"));
             },
         );
+    }
+
+    /// Operations without a notification event still produce an audit entry, and the
+    /// audit-only constructor never builds a notification event, even with notify on.
+    #[test]
+    fn audit_only_helper_audits_operations_without_a_notification_event() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for (op, uri, expected_event) in [
+                    (S3Operation::UploadPart, "/audit-bucket/object.txt", EventName::AuditS3Operation),
+                    (S3Operation::UploadPartCopy, "/audit-bucket/object.txt", EventName::AuditS3Operation),
+                    (S3Operation::PutBucketPolicy, "/audit-bucket", EventName::AuditS3Operation),
+                    (S3Operation::PutBucketVersioning, "/audit-bucket", EventName::AuditS3Operation),
+                    (
+                        S3Operation::AbortMultipartUpload,
+                        "/audit-bucket/object.txt",
+                        EventName::ObjectRemovedAbortMultipartUpload,
+                    ),
+                ] {
+                    let input = DeleteObjectTaggingInput::builder()
+                        .bucket("audit-bucket".to_string())
+                        .key("object.txt".to_string())
+                        .build()
+                        .unwrap();
+                    let mut req = build_request(input, Method::PUT, Uri::from_static(uri));
+                    req.extensions.insert(ReqInfo {
+                        cred: Some(Credentials {
+                            access_key: "auditor".to_string(),
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    });
+
+                    let result = Ok(S3Response::new(DeleteObjectTaggingOutput::default()));
+                    let mut helper = OperationHelper::audit_only(&req, op).complete(&result);
+                    assert!(!helper.wants_object_info(), "{} must not build a notification event", op.as_str());
+                    assert!(helper.event_args().is_none(), "{} must not build a notification event", op.as_str());
+                    let OperationHelper::Enabled(state) = &mut helper else {
+                        panic!("helper should be enabled when the audit switch is on");
+                    };
+                    let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                    assert_eq!(entry.event, expected_event, "{}", op.as_str());
+                    assert_eq!(entry.api.name.as_deref(), Some(op.as_str()));
+                    assert_eq!(entry.api.bucket.as_deref(), Some("audit-bucket"));
+                    assert_eq!(entry.api.status.as_deref(), Some("success"));
+                    assert_eq!(entry.access_key.as_deref(), Some("auditor"));
+                }
+            },
+        );
+    }
+
+    /// With audit off, the audit-only helper does no work: it is the disabled helper.
+    #[test]
+    fn audit_only_helper_is_disabled_when_audit_is_off() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("false")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket/object.txt"));
+                assert!(matches!(
+                    OperationHelper::audit_only(&req, S3Operation::UploadPart),
+                    OperationHelper::Disabled
+                ));
+            },
+        );
+    }
+
+    /// A failed audit-only operation is audited with a failure status, the error message and
+    /// the error's status code.
+    #[test]
+    fn audit_only_helper_records_failure_status_and_error() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
+                let result: S3Result<S3Response<DeleteObjectTaggingOutput>> =
+                    Err(S3Error::with_message(S3ErrorCode::AccessDenied, "policy refused".to_string()));
+                let mut helper = OperationHelper::audit_only(&req, S3Operation::PutBucketPolicy).complete(&result);
+                let OperationHelper::Enabled(state) = &mut helper else {
+                    panic!("helper should be enabled when the audit switch is on");
+                };
+                let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                assert_eq!(entry.api.status.as_deref(), Some("failure"));
+                assert_eq!(entry.api.status_code, Some(403));
+                assert_eq!(entry.error.as_deref(), Some("policy refused"));
+            },
+        );
+    }
+
+    /// A failed request is audited with its failure status, and the wrapper hands the
+    /// handler's result back unchanged.
+    #[tokio::test]
+    async fn audit_only_operation_returns_the_handler_result_unchanged() {
+        async_with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("true")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            async {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                let input = DeleteObjectTaggingInput::builder()
+                    .bucket("audit-bucket".to_string())
+                    .key("object.txt".to_string())
+                    .build()
+                    .unwrap();
+                let req = build_request(input, Method::PUT, Uri::from_static("/audit-bucket"));
+                let err = super::audit_only_operation(req, S3Operation::PutBucketPolicy, |req| async move {
+                    assert_eq!(req.input.bucket, "audit-bucket");
+                    Err::<S3Response<DeleteObjectTaggingOutput>, _>(S3Error::new(S3ErrorCode::AccessDenied))
+                })
+                .await
+                .unwrap_err();
+                assert_eq!(*err.code(), S3ErrorCode::AccessDenied);
+            },
+        )
+        .await;
     }
 
     #[test]

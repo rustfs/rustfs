@@ -46,6 +46,11 @@ on:
   schedule:
     - cron: "11 0 * * *" # Nightly 00:11 UTC, after the 22:41 UTC cache-warm run
   workflow_dispatch:
+    inputs:
+      rehearse_workspace_shards:
+        description: Compare one full execution with at most two resource-safe shards of the same archive
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -89,6 +94,7 @@ jobs:
       connect: ${{ steps.scope.outputs.connect || 'true' }}
       packages: ${{ steps.scope.outputs.packages }}
       full_validation: ${{ steps.scope.outputs.full_validation || 'true' }}
+      rehearse_shards: ${{ steps.scope.outputs.rehearse_shards || 'false' }}
     steps:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
@@ -99,6 +105,7 @@ jobs:
         env:
           CI_BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || github.event.before }}
           CI_EVENT_ACTION: ${{ github.event.action }}
+          CI_REHEARSE_SHARDS: ${{ inputs.rehearse_workspace_shards && 'true' || 'false' }}
         run: |
           if [[ "$GITHUB_EVENT_NAME" != "pull_request" ]]; then
             python3 -I scripts/ci_gate.py select
@@ -108,9 +115,9 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT"; then
-            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' >> "$GITHUB_OUTPUT"
-            echo "Legacy policy has no verification plan; retaining the full matrix."
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^rehearse_shards=' "$GITHUB_OUTPUT"; then
+            printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
+            echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
       - name: Retain verification plan
         if: steps.scope.outputs.plan != ''
@@ -268,6 +275,8 @@ jobs:
     # requires the same runner image until the hosted-runtime pilot passes.
     runs-on: sm-standard-4
     timeout-minutes: 90
+    outputs:
+      workspace_shards: ${{ steps.shards.outputs.workspace_shards || '[]' }}
     env:
       CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
     steps:
@@ -355,6 +364,90 @@ jobs:
             artifacts/ilm-integration
           retention-days: 3
           if-no-files-found: error
+
+      - name: Prepare bounded shards from this candidate's observed durations
+        id: shards
+        if: needs.classify-changes.outputs.rehearse_shards == 'true'
+        run: |
+          python3 scripts/ci_test_shards.py prepare \
+            --listing artifacts/test-and-lint/core-test-listing.json \
+            --junit target/nextest/ci/junit.xml --output artifacts/workspace-shard-plan
+      - name: Upload same-run shard plan
+        if: needs.classify-changes.outputs.rehearse_shards == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+          retention-days: 3
+          if-no-files-found: error
+
+  workspace-shards:
+    name: Workspace shards (${{ matrix.shard }})
+    if: needs.classify-changes.outputs.rehearse_shards == 'true'
+    needs: [classify-changes, workspace-tests]
+    # Reuse the producer image and checkout path for the full RustFS archive.
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 2
+      matrix:
+        shard: ${{ fromJSON(needs.workspace-tests.outputs.workspace_shards || '[]') }}
+    env:
+      CI_PACKAGES: ${{ needs.classify-changes.outputs.packages }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/test-runtime
+      - name: Protect Connect test home
+        run: chmod go-w "$(realpath "$HOME")"
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-test-binaries-${{ github.run_attempt }}
+          path: ${{ runner.temp }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+      - name: Verify and execute this shard without compilation
+        env:
+          SHARD_INDEX: ${{ matrix.shard }}
+        run: |
+          python3 scripts/ci_test_artifact.py verify --configuration workspace --archive "$RUNNER_TEMP/workspace-tests.tar.zst"
+          python3 scripts/ci_test_shards.py execute --plan artifacts/workspace-shard-plan \
+            --archive "$RUNNER_TEMP/workspace-tests.tar.zst" --index "$SHARD_INDEX" --output artifacts/workspace-shard-result
+      - name: Retain shard evidence including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: workspace-shard-result-${{ matrix.shard }}-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-result
+          retention-days: 3
+          if-no-files-found: error
+
+  workspace-shard-evidence:
+    name: Workspace shard completeness
+    if: always() && needs.classify-changes.outputs.rehearse_shards == 'true'
+    needs: [classify-changes, workspace-tests, workspace-shards]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: workspace-shard-plan-${{ github.run_attempt }}
+          path: artifacts/workspace-shard-plan
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: workspace-shard-result-*-${{ github.run_attempt }}
+          path: artifacts/workspace-shards
+      - name: Require the exact union of successful shard executions
+        run: |
+          python3 scripts/ci_test_shards.py verify --plan artifacts/workspace-shard-plan --evidence artifacts/workspace-shards
+          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace-shard-plan/listing.json artifacts/workspace-shards/combined.xml
 
   connect-feature-boundaries:
     name: Connect Feature Boundaries
@@ -1406,6 +1499,8 @@ jobs:
       - quick-checks
       - test-and-lint
       - workspace-tests
+      - workspace-shards
+      - workspace-shard-evidence
       - core-contract
       - connect-feature-boundaries
       - test-and-lint-rio-v2
