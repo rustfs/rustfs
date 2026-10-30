@@ -90,6 +90,14 @@ impl FastLockGuard {
         &self.owner
     }
 
+    /// The physical acquisition was force-released before registration.
+    pub(crate) fn abandon_unregistered(&mut self) {
+        if !self.released {
+            self.released = true;
+            record_lock_held_release(self.mode);
+        }
+    }
+
     /// Keep excluding writers while permitting reads of the committed version.
     pub fn downgrade_committed_tail(&mut self) -> bool {
         if self.released {

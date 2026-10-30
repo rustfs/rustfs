@@ -375,6 +375,8 @@ pub struct ObjectLockState {
     // First cache line: Most frequently accessed data
     /// Atomic state for fast operations
     pub atomic_state: AtomicLockState,
+    /// Changes whenever an administrator force-releases this state.
+    pub(crate) force_epoch: AtomicU64,
 
     // Second cache line: Notification mechanisms
     /// Notification for readers (traditional)
@@ -418,6 +420,7 @@ impl ObjectLockState {
     pub fn new() -> Self {
         Self {
             atomic_state: AtomicLockState::new(),
+            force_epoch: AtomicU64::new(0),
             read_notify: Notify::new(),
             write_notify: Notify::new(),
             optimized_notify: OptimizedNotify::new(),

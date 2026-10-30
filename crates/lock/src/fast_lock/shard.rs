@@ -15,6 +15,7 @@
 use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant, SystemTime};
 use tokio::time::timeout;
 
@@ -31,6 +32,11 @@ struct ActiveGuardInfo {
     mode: LockMode,
     owner: Arc<str>,
     committed_tail: bool,
+}
+
+pub(crate) struct AcquiredLock {
+    state: Arc<ObjectLockState>,
+    force_epoch: u64,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -135,12 +141,16 @@ impl LockShard {
 
     /// Acquire lock with fast path optimization
     pub async fn acquire_lock(&self, request: &ObjectLockRequest) -> Result<(), LockResult> {
+        self.acquire_guarded(request).await.map(|_| ())
+    }
+
+    pub(crate) async fn acquire_guarded(&self, request: &ObjectLockRequest) -> Result<AcquiredLock, LockResult> {
         let start_time = Instant::now();
 
         // Try fast path first
-        if let Some(_state) = self.try_fast_path(request) {
+        if let Some(acquired) = self.try_fast_path(request) {
             self.metrics.record_fast_path_success();
-            return Ok(());
+            return Ok(acquired);
         }
 
         // Slow path with waiting
@@ -159,7 +169,7 @@ impl LockShard {
     }
 
     /// Try fast path lock acquisition (lock-free when possible)
-    fn try_fast_path(&self, request: &ObjectLockRequest) -> Option<Arc<ObjectLockState>> {
+    fn try_fast_path(&self, request: &ObjectLockRequest) -> Option<AcquiredLock> {
         // First try to get existing state without write lock
         {
             let objects = self.objects.read();
@@ -170,14 +180,16 @@ impl LockShard {
                 test_pause(TestPausePoint::FastExisting, &request.key);
 
                 // Try atomic acquisition
-                let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
-                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
-                };
+                let force_epoch = state.force_epoch.load(Ordering::Acquire);
+                let success = force_epoch != u64::MAX
+                    && match request.mode {
+                        LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+                        LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
+                    };
                 drop(objects);
 
                 if success {
-                    return Some(state);
+                    return Some(AcquiredLock { state, force_epoch });
                 }
             }
         }
@@ -197,10 +209,11 @@ impl LockShard {
                 #[cfg(test)]
                 test_pause(TestPausePoint::FastWriteExisting, &request.key);
 
-                let acquired = state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout);
+                let force_epoch = state.force_epoch.load(Ordering::Acquire);
+                let acquired = force_epoch != u64::MAX && state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout);
                 drop(objects);
                 if acquired {
-                    return Some(state);
+                    return Some(AcquiredLock { state, force_epoch });
                 }
             } else {
                 // Create new state from pool and acquire immediately
@@ -208,7 +221,7 @@ impl LockShard {
                 let state = Arc::new(*state_box);
                 if state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout) {
                     objects.insert(request.key.clone(), state.clone());
-                    return Some(state);
+                    return Some(AcquiredLock { state, force_epoch: 0 });
                 }
             }
         }
@@ -217,7 +230,7 @@ impl LockShard {
     }
 
     /// Slow path with async waiting
-    async fn acquire_lock_slow_path(&self, request: &ObjectLockRequest, start_time: Instant) -> Result<(), LockResult> {
+    async fn acquire_lock_slow_path(&self, request: &ObjectLockRequest, start_time: Instant) -> Result<AcquiredLock, LockResult> {
         // Use adaptive timeout based on current load and request priority
         let adaptive_timeout = self.calculate_adaptive_timeout(request);
         let deadline = start_time + adaptive_timeout;
@@ -236,7 +249,7 @@ impl LockShard {
 
         loop {
             // Keep the state in the map until its acquisition attempt completes.
-            let (state, success) = {
+            let (state, success, force_epoch) = {
                 let mut objects = self.objects.write();
                 let state = match objects.get(&request.key) {
                     Some(state) => state.clone(),
@@ -251,17 +264,19 @@ impl LockShard {
 
                 #[cfg(test)]
                 test_pause(TestPausePoint::SlowLookup, &request.key);
-                let success = match request.mode {
-                    LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
-                    LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
-                };
+                let force_epoch = state.force_epoch.load(Ordering::Acquire);
+                let success = force_epoch != u64::MAX
+                    && match request.mode {
+                        LockMode::Shared => state.try_acquire_shared_fast(&request.owner, request.lock_timeout),
+                        LockMode::Exclusive => state.try_acquire_exclusive_fast(&request.owner, request.lock_timeout),
+                    };
                 drop(objects);
-                (state, success)
+                (state, success, force_epoch)
             };
 
             if success {
                 self.metrics.record_slow_path_success();
-                return Ok(());
+                return Ok(AcquiredLock { state, force_epoch });
             }
 
             // Check timeout
@@ -478,8 +493,21 @@ impl LockShard {
         self.active_guards.lock().insert(guard_id, None);
     }
 
-    pub(crate) fn register_guard_with_info(&self, guard_id: u64, key: &ObjectKey, mode: LockMode, owner: &Arc<str>) {
+    pub(crate) fn register_guard_with_info(
+        &self,
+        guard_id: u64,
+        key: &ObjectKey,
+        mode: LockMode,
+        owner: &Arc<str>,
+        acquired: &AcquiredLock,
+    ) -> bool {
         let mut guards = self.active_guards.lock();
+        let objects = self.objects.read();
+        if !objects.get(key).is_some_and(|state| {
+            Arc::ptr_eq(state, &acquired.state) && state.force_epoch.load(Ordering::Acquire) == acquired.force_epoch
+        }) {
+            return false;
+        }
         guards.insert(
             guard_id,
             Some(ActiveGuardInfo {
@@ -489,6 +517,7 @@ impl LockShard {
                 committed_tail: false,
             }),
         );
+        true
     }
 
     /// Unregister a guard (called when guard is dropped)
@@ -769,6 +798,11 @@ impl LockShard {
         let mut guards = self.active_guards.lock();
         let objects = self.objects.write();
         let Some(state) = objects.get(key) else { return 0 };
+        // Acquisitions completed before this point but not yet registered
+        // must not later create guards for the released generation.
+        let _ = state
+            .force_epoch
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |epoch| epoch.checked_add(1));
         let tail = guards.iter().find_map(|(&id, info)| {
             info.as_ref()
                 .filter(|info| info.committed_tail && info.key == *key)
@@ -1105,6 +1139,59 @@ mod tests {
                 .is_err(),
             "old reader drops must not release the new tail"
         );
+    }
+
+    #[tokio::test]
+    async fn forced_unregistered_reader_cannot_release_a_new_tail() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "force-unregistered-reader");
+        let shard = manager.get_shard(&key).clone();
+        let owner: Arc<str> = Arc::from("same-owner");
+        let request = ObjectLockRequest::new_read(key.clone(), owner.clone());
+        let acquired = shard
+            .acquire_guarded(&request)
+            .await
+            .expect("old reader acquired before registration");
+        assert_eq!(manager.force_unlock(&key), 1);
+        let mut tail = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("new writer");
+        assert!(tail.downgrade_committed_tail());
+        let mut old = FastLockGuard::new(key.clone(), LockMode::Shared, owner, shard.clone());
+        assert!(!shard.register_guard_with_info(old.guard_id(), old.key(), old.mode(), old.owner(), &acquired));
+        old.abandon_unregistered();
+        drop(old);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, "competitor"))
+                .await
+                .is_err(),
+            "an old reader must not release a new committed tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn force_unlock_on_another_key_keeps_unregistered_acquisition_valid() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "unrelated-acquisition");
+        let shard = manager.get_shard(&key).clone();
+        let owner: Arc<str> = Arc::from("owner");
+        let request = ObjectLockRequest::new_read(key.clone(), owner.clone());
+        let acquired = shard.acquire_guarded(&request).await.expect("reader acquired");
+        let other = (0..1000)
+            .map(|index| ObjectKey::new("bucket", format!("other-{index}")))
+            .find(|other| Arc::ptr_eq(&shard, manager.get_shard(other)))
+            .expect("another key on the same shard");
+        let other_guard = manager
+            .acquire_write_lock(other.clone(), "other")
+            .await
+            .expect("other writer");
+        assert_eq!(manager.force_unlock(&other), 1);
+        drop(other_guard);
+        let guard = FastLockGuard::new(key.clone(), LockMode::Shared, owner, shard.clone());
+        assert!(shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner(), &acquired));
+        drop(guard);
+        assert!(manager.acquire_write_lock(key, "next").await.is_ok());
     }
 
     fn start_acquisition(
