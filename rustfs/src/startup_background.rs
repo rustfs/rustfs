@@ -27,13 +27,30 @@ use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_heal::{
     create_ahm_services_cancel_token, heal::storage::ECStoreHealStorage, init_heal_manager_with_workload_provider,
 };
-use std::{io::Result, sync::Arc};
+use std::{
+    io::Result,
+    sync::{Arc, OnceLock},
+};
 use tracing::{debug, info};
 
 const LOG_COMPONENT_MAIN: &str = "main";
 const LOG_SUBSYSTEM_STARTUP: &str = "startup";
 const EVENT_BACKGROUND_SERVICES_CONFIGURED: &str = "background_services_configured";
 const EVENT_ODM_BACKFILL_RECOVERY_CONFIGURED: &str = "odm_backfill_recovery_configured";
+
+static BACKGROUND_NODE_ADMISSION: OnceLock<Arc<rustfs_concurrency::adaptive::NodeAdmission>> = OnceLock::new();
+
+pub(crate) fn background_node_admission() -> Option<Arc<rustfs_concurrency::adaptive::NodeAdmission>> {
+    BACKGROUND_NODE_ADMISSION.get().cloned()
+}
+
+#[cfg(test)]
+pub(crate) fn install_background_node_admission_for_test(owner: Arc<rustfs_concurrency::adaptive::NodeAdmission>) {
+    assert!(
+        BACKGROUND_NODE_ADMISSION.set(owner).is_ok(),
+        "test requires an unpublished background owner"
+    );
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct BackgroundServicePlan {
@@ -79,19 +96,33 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         let admission = adaptive.then(|| rustfs_concurrency::adaptive::NodeAdmission::new(crate::background_admission::MAXIMUM));
         #[cfg(not(any(target_os = "linux", all(test, unix))))]
         let admission = None;
-        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()).with_admission(admission.clone()));
-        init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider.clone())).await?;
-        if let Some(admission) = &admission
-            && !rustfs_scanner::set_scanner_node_admission(admission.clone())
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        let memory = admission
+            .as_ref()
+            .map(|_| crate::storage_api::startup::background::BackgroundMemoryBudget::new());
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        if let Some(memory) = &memory
+            && !memory.install()
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
-                "scanner node admission is already initialized",
+                "background memory admission is already initialized",
+            ));
+        }
+        let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()).with_admission(admission.clone()));
+        init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider.clone())).await?;
+        if let Some(admission) = &admission
+            && (BACKGROUND_NODE_ADMISSION.set(admission.clone()).is_err()
+                || !rustfs_scanner::set_scanner_node_admission(admission.clone()))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "background node admission is already initialized",
             ));
         }
         #[cfg(any(target_os = "linux", all(test, unix)))]
-        if let Some(admission) = admission {
-            crate::background_admission::start(admission, background_cancel.clone(), workload_provider);
+        if let (Some(admission), Some(memory)) = (admission, memory) {
+            crate::background_admission::start(admission, memory, store.clone(), background_cancel.clone(), workload_provider);
         }
     }
 

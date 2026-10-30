@@ -84,7 +84,7 @@ rustfs-heal-contracts = { workspace = true }
 rustfs-madmin = { workspace = true }
 rustfs-utils = { workspace = true }
 tokio = { workspace = true, features = ["sync", "io-util", "time", "macros", "fs", "rt-multi-thread"] }
-tokio-util = { workspace = true, features = ["io", "compat"] }
+tokio-util = { workspace = true, features = ["io", "compat", "rt"] }
 tonic = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
@@ -100,6 +100,7 @@ crc-fast = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+rustfs-ecstore = { workspace = true, features = ["test-util"] }
 rustfs-filemeta = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 rustfs-test-utils = { workspace = true }

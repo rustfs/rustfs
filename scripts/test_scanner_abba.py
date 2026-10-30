@@ -260,6 +260,45 @@ class ScannerAbbaTest(unittest.TestCase):
         with patch.dict(os.environ, {"SCANNER_ABBA_TEST_FAULT": fault}), contextlib.redirect_stdout(io.StringIO()):
             return harness.run(copy.deepcopy(self.manifest), self.adapter, self.root / "out", self.root / "data")
 
+    def test_owned_command_never_signals_a_reaped_leader(self):
+        command = harness.OwnedCommand.__new__(harness.OwnedCommand)
+        command.process = Mock(pid=123, returncode=74)
+        with patch.object(harness.os, "killpg") as kill:
+            self.assertFalse(command._signal_group(signal.SIGKILL))
+        kill.assert_not_called()
+
+    def test_darwin_permission_error_requires_an_owned_zombie_only_group(self):
+        command = harness.OwnedCommand.__new__(harness.OwnedCommand)
+        command.process = Mock(pid=123, returncode=None)
+        for states, empty in [("123 123 Z\n999 999 S\n", True),
+                              ("123 123 Z\n124 123 S\n", False),
+                              ("999 999 Z\n", False)]:
+            with self.subTest(states=states), patch.object(harness.sys, "platform", "darwin"), \
+                    patch.object(harness.os, "killpg", side_effect=PermissionError), \
+                    patch.object(harness.subprocess, "check_output", return_value=states):
+                if empty:
+                    self.assertFalse(command._signal_group(signal.SIGKILL))
+                else:
+                    with self.assertRaises(PermissionError):
+                        command._signal_group(signal.SIGKILL)
+        with patch.object(harness.sys, "platform", "linux"), \
+                patch.object(harness.os, "killpg", side_effect=PermissionError), \
+                patch.object(harness.subprocess, "check_output") as inspect:
+            with self.assertRaises(PermissionError):
+                command._signal_group(signal.SIGKILL)
+        inspect.assert_not_called()
+
+    @unittest.skipUnless(sys.platform == "darwin", "Darwin zombie-only process groups reject signals")
+    def test_darwin_exited_http_group_keeps_original_status(self):
+        with (self.root / "exited-command.log").open("wb") as log:
+            command = harness.OwnedCommand([sys.executable, "-c", "raise SystemExit(74)"], log)
+            try:
+                self.assertEqual(command.wait(5), 74)
+                self.assertIsNone(command.process.returncode, "leader PID remains reserved through group cleanup")
+                self.assertEqual(command.finish(terminate=True), 74)
+            finally:
+                command.finish()
+
     def test_adapter_timeout_reaps_group_after_parent_exits_on_term(self):
         request = self.root / "request.json"
         harness.write_json(request, {})
@@ -694,7 +733,7 @@ class ScannerAbbaTest(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "release_evidence"):
                     harness.validate_manifest(manifest)
 
-    def test_measured_result_must_echo_release_evidence(self):
+    def measured_result(self):
         manifest = self.measured_manifest()
         request = {
             "schema": 1,

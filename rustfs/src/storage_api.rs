@@ -183,10 +183,13 @@ pub(crate) mod server {
 
     pub(crate) mod http {
         #[cfg(test)]
-        pub(crate) use crate::storage::storage_api::ecstore_disk::{DiskAPI, DiskOption, new_disk};
+        pub(crate) use crate::storage::storage_api::ecstore_disk::{
+            DiskAPI, DiskOption, new_disk, with_background_resource_unit,
+        };
         pub(crate) use crate::storage::storage_api::{
-            ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, tonic_boot_epoch_challenge,
-            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
+            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, rpc_background_admission,
+            tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
+            verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -196,7 +199,8 @@ pub(crate) mod server {
         #[cfg(test)]
         pub(crate) use crate::storage::storage_api::{
             Endpoint, EndpointServerPools, Endpoints, PeerRestClient, PoolEndpoints, ScannerScopedDirtyUsageAckEntry,
-            gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers, verify_tonic_boot_epoch_response,
+            find_local_disk_by_ref, gen_signature_headers, gen_tonic_replay_scope_headers, gen_tonic_signature_headers,
+            init_local_disks, verify_tonic_boot_epoch_response,
         };
 
         pub(crate) mod ecfs {
@@ -369,9 +373,13 @@ pub(crate) mod startup {
     }
 
     pub(crate) mod background {
+        #[cfg(any(target_os = "linux", test))]
+        pub(crate) use crate::storage::storage_api::BackgroundMemoryBudget;
         pub(crate) use crate::storage::storage_api::{
             BitrotSelfTestError, ECStore, bitrot_self_test, set_workload_admission_snapshot_provider,
         };
+        #[cfg(any(target_os = "linux", all(test, unix)))]
+        pub(crate) use crate::storage::storage_api::{PhysicalDiskSample, PhysicalDiskSampler};
     }
 
     pub(crate) mod bucket_metadata {

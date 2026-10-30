@@ -17,6 +17,7 @@ use crate::cluster::rpc::client::{
     node_service_delete_recovery_client, node_service_time_out_client, node_service_time_out_client_for_class,
     node_service_time_out_client_no_auth,
 };
+use crate::cluster::rpc::http_auth::{current_rpc_background_request, with_rpc_background_request};
 use crate::cluster::rpc::internode_data_transport::{
     InternodeDataTransport, NsScannerCapabilityRequest, NsScannerStreamRequest, ReadStreamRequest, WalkDirStreamRequest,
     WriteStreamRequest,
@@ -570,6 +571,7 @@ struct RetryingRemoteReader {
     reader: Option<FileReader>,
     transport: Arc<dyn InternodeDataTransport>,
     request: ReadStreamRequest,
+    background: bool,
     emitted: usize,
     retried: bool,
     initial_read_timeout: Option<Duration>,
@@ -590,6 +592,7 @@ impl RetryingRemoteReader {
             reader: Some(reader),
             transport,
             request,
+            background: current_rpc_background_request(),
             emitted: 0,
             retried: false,
             initial_read_timeout,
@@ -607,9 +610,10 @@ impl RetryingRemoteReader {
         let request = resumed_read_request(&self.request, self.emitted)?;
         let recovery_timeout = self.recovery_timeout;
         let transport = Arc::clone(&self.transport);
-        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
-            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_fresh(request)).await
-        })));
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(with_rpc_background_request(
+            self.background,
+            async move { with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_fresh(request)).await },
+        ))));
         Ok(())
     }
 
@@ -717,6 +721,7 @@ struct RetryingRemoteChunkReader {
     reader: Option<rustfs_rio::ChunkReaderBox>,
     transport: Arc<dyn InternodeDataTransport>,
     request: ReadStreamRequest,
+    background: bool,
     emitted: usize,
     retried: bool,
     initial_read_timeout: Option<Duration>,
@@ -737,6 +742,7 @@ impl RetryingRemoteChunkReader {
             reader: Some(reader),
             transport,
             request,
+            background: current_rpc_background_request(),
             emitted: 0,
             retried: false,
             initial_read_timeout,
@@ -754,9 +760,10 @@ impl RetryingRemoteChunkReader {
         let request = resumed_read_request(&self.request, self.emitted)?;
         let recovery_timeout = self.recovery_timeout;
         let transport = Arc::clone(&self.transport);
-        self.resume = Some(AbortOnDropTask::new(tokio::spawn(async move {
-            with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_chunks_fresh(request)).await
-        })));
+        self.resume = Some(AbortOnDropTask::new(tokio::spawn(with_rpc_background_request(
+            self.background,
+            async move { with_remote_read_recovery_timeout(recovery_timeout, transport.open_read_chunks_fresh(request)).await },
+        ))));
         Ok(())
     }
 
@@ -7767,6 +7774,98 @@ mod tests {
             assert!(matches!(second_errors.first().and_then(Option::as_ref), Some(DiskError::FileNotFound)));
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn remote_read_retries_preserve_signed_admission_after_sender_scope_ends() {
+        use crate::cluster::rpc::{rpc_background_admission, verify_rpc_signature};
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        for background in [false, true] {
+            for chunked in [false, true] {
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("retry listener");
+                let address = listener.local_addr().expect("retry address");
+                let server = tokio::spawn(async move {
+                    let (mut socket, _) = listener.accept().await.expect("fresh connection");
+                    let mut bytes = Vec::new();
+                    while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                        let mut chunk = [0; 1024];
+                        let read = socket.read(&mut chunk).await.expect("retry request");
+                        assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete headers");
+                        bytes.extend_from_slice(&chunk[..read]);
+                    }
+                    let request = std::str::from_utf8(&bytes).expect("HTTP request");
+                    let mut lines = request.split("\r\n");
+                    let target = lines
+                        .next()
+                        .expect("request line")
+                        .split_whitespace()
+                        .nth(1)
+                        .expect("target")
+                        .to_owned();
+                    let mut headers = http::HeaderMap::new();
+                    for line in lines.take_while(|line| !line.is_empty()) {
+                        let (name, value) = line.split_once(':').expect("header");
+                        headers.append(
+                            http::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                            http::HeaderValue::from_str(value.trim()).expect("header value"),
+                        );
+                    }
+                    socket
+                        .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 6\r\nconnection: close\r\n\r\n456789")
+                        .await
+                        .expect("retry response");
+                    (target, headers)
+                });
+                let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+                let request = ReadStreamRequest {
+                    endpoint: format!("http://{address}"),
+                    ..resume_request(10)
+                };
+                let create = async {
+                    let transport = Arc::new(TcpHttpInternodeDataTransport);
+                    if chunked {
+                        Box::new(RetryingRemoteChunkReader::new_with_timeouts(
+                            resume_step_chunk_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec())),
+                            transport,
+                            request,
+                            None,
+                            None,
+                        )) as FileReader
+                    } else {
+                        Box::new(RetryingRemoteReader::new_with_timeouts(
+                            resume_step_reader(ResumeReadStep::PartialThenReset(b"0123".to_vec())),
+                            transport,
+                            request,
+                            None,
+                            None,
+                        )) as FileReader
+                    }
+                };
+                let mut reader = if background {
+                    with_background_resource_unit(gate.try_acquire().expect("sender admission"), create).await
+                } else {
+                    create.await
+                };
+                assert_eq!(gate.snapshot().active, 0, "retry reader cannot retain sender disk capacity");
+                let mut output = Vec::new();
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    with_rpc_background_request(!background, reader.read_to_end(&mut output)),
+                )
+                .await
+                .expect("bounded retry")
+                .expect("resumed body");
+                assert_eq!(output, b"0123456789", "chunked={chunked}, background={background}");
+                let (target, headers) = server.await.expect("captured retry");
+                assert!(target.contains("offset=11") && target.contains("length=6"), "{target}");
+                assert_eq!(rpc_background_admission(&headers).expect("admission marker"), background);
+                verify_rpc_signature(&target, &http::Method::GET, &headers).expect("signed retry class");
+            }
+        }
     }
 
     #[tokio::test]

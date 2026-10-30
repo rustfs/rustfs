@@ -5615,3 +5615,140 @@ async fn resumable_erasure_set_execution_is_cancelled_while_object_heal_is_pendi
     assert!(storage.bucket_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
     assert!(storage.object_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
 }
+
+#[tokio::test]
+async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_persistence() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let identity = replacement_identity("replacement-a", "device-a", "mount-a");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), vec![identity.clone()]);
+    let ownership = Arc::downgrade(&execution);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let storage = Arc::new(MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
+        replacement_execution_fixture: Mutex::new(Some(execution)),
+        replacement_format_barrier: Some((entered.clone(), release.clone())),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        ..Default::default()
+    });
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(storage.clone(), None));
+    let parent = manager.test_work_parent();
+    let waiter = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute_owned(Some(parent)).await }
+    });
+    entered.notified().await;
+    waiter.abort();
+    assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+    task.cancel_token.cancel();
+    assert!(ownership.upgrade().is_some(), "issued format I/O still owns execution");
+    let stopping = manager.clone();
+    let mut first_stop = tokio::spawn(async move { stopping.stop().await });
+    let first_pending = tokio::time::timeout(Duration::from_millis(30), &mut first_stop)
+        .await
+        .is_err();
+    first_stop.abort();
+    let first_cancelled = first_stop.await.is_err_and(|error| error.is_cancelled());
+    let stopping = manager.clone();
+    let mut retry = tokio::spawn(async move { stopping.stop().await });
+    let retry_pending = tokio::time::timeout(Duration::from_millis(30), &mut retry).await.is_err();
+    // Release actual owned work before the assertions/temporary disk cleanup.
+    release.notify_one();
+    let drained = tokio::time::timeout(Duration::from_secs(5), retry).await;
+    assert!(first_pending && first_cancelled && retry_pending);
+    drained
+        .expect("same owned executor drains")
+        .expect("stop waiter joins")
+        .expect("normal owned completion");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ownership.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("executor drains after storage completes");
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failure state")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("cancel")),
+        "{:?}",
+        state.error_message
+    );
+    assert!(!task.replacement_is_running());
+    assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_owned_mutation_registers_after_handoff_and_survives_cancelled_waiters() {
+    let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage::default()),
+        None,
+    ));
+    let parent = manager.test_work_parent();
+    let stopping = manager.clone();
+    let mut first = tokio::spawn(async move { stopping.stop().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager.stop_handoff_completed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager closed new admission while the accepted parent remains live");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
+    let ownership = Arc::downgrade(&execution);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        execution
+            .run_owned(&parent, async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = finished_tx.send(());
+            })
+            .await
+    });
+    entered_rx.await.expect("accepted descendant starts after tracker closure");
+    waiter.abort();
+    let waiter_cancelled = waiter.await.is_err_and(|error| error.is_cancelled());
+    let first_pending = tokio::time::timeout(Duration::from_millis(30), &mut first).await.is_err();
+    first.abort();
+    let first_cancelled = first.await.is_err_and(|error| error.is_cancelled());
+    let stopping = manager.clone();
+    let mut retry = tokio::spawn(async move { stopping.stop().await });
+    let retry_pending = tokio::time::timeout(Duration::from_millis(30), &mut retry).await.is_err();
+    let retained = ownership.upgrade().is_some();
+    let _ = release_tx.send(());
+    let drained = tokio::time::timeout(Duration::from_secs(5), retry).await;
+    let finished = finished_rx.await.is_ok();
+    assert!(waiter_cancelled && first_pending && first_cancelled && retry_pending && retained && finished);
+    drained
+        .expect("actual mutation finishes")
+        .expect("repeat waiter joins")
+        .expect("same manager owner drains");
+    assert!(ownership.upgrade().is_none());
+    manager.stop().await.expect("repeat successful receipt remains successful");
+}
+
+#[tokio::test]
+async fn replacement_owned_mutation_panic_keeps_manager_join_failed() {
+    let manager = crate::HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage::default()), None);
+    let parent = manager.test_work_parent();
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
+    let result = execution
+        .run_owned::<()>(&parent, async { panic!("owned replacement mutation panic") })
+        .await;
+    drop(parent);
+    assert!(result.is_err());
+    assert!(manager.stop().await.is_err(), "actual child panic must fail the manager owner");
+    assert!(manager.stop().await.is_err(), "repeat drain cannot erase the child panic");
+}

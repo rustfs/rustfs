@@ -378,10 +378,25 @@ class OwnedCommand:
                 time.sleep(min(0.05, remaining))
 
     def _signal_group(self, sig):
+        if self.process.returncode is not None:
+            return False
         try:
             os.killpg(self.process.pid, sig)
             return True
         except ProcessLookupError:
+            return False
+        except PermissionError:
+            if sys.platform != "darwin":
+                raise
+            # Darwin rejects signals to zombie-only groups. The unreaped
+            # session leader reserves this PGID; require its zombie plus no
+            # live members before treating EPERM as completed cleanup.
+            states = subprocess.check_output(["ps", "-axo", "pid=,pgid=,stat="], text=True, timeout=1)
+            group = [(pid, state) for pid, pgid, state in (line.split() for line in states.splitlines())
+                     if pgid == str(self.process.pid)]
+            if not any(pid == str(self.process.pid) and state.startswith("Z") for pid, state in group) \
+                    or any(not state.startswith("Z") for _, state in group):
+                raise
             return False
 
     def finish(self, terminate=False):

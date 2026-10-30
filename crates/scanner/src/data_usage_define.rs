@@ -31,7 +31,8 @@ pub use rustfs_data_usage::{
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSegmentInvalidationProof, DataUsageSnapshotSetState,
     LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary,
     SizeReconciliationEntry, SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
-    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, clone_cache_value, hash_path,
+    prefix_usage_in_cache,
 };
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -793,7 +794,7 @@ impl DataUsageCache {
         let known_tiers = tier_names.iter().map(String::as_str).collect::<HashSet<_>>();
         for entry in self.cache.values_mut() {
             let Some(tiers) = entry.all_tier_stats.as_mut() else { continue };
-            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).cloned().unwrap_or_default();
+            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).map(clone_cache_value).unwrap_or_default();
             let companion_present = entry.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty());
             let migrate_existing_unknown = !companion_present;
             let mut retired = TierStats::default();
@@ -970,7 +971,7 @@ impl DataUsageCache {
                 || self.validated_raw_enumeration_cursor().is_some()
                 || self.validated_raw_enumeration_page_index().is_some());
         let handoff_frontier = cross_epoch_checkpoint
-            .then(|| self.validated_scan_frontier().map(str::to_owned))
+            .then(|| self.validated_scan_frontier().map(clone_cache_value))
             .flatten();
         let reusable = identity.is_valid()
             && name != DATA_USAGE_ROOT
@@ -1256,18 +1257,18 @@ impl DataUsageCache {
         let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
         self.info.scan_coverage_receipt = match frontier {
             Some(through) => Some(DataUsageScanCoverageReceipt {
-                through: through.to_owned(),
+                through: clone_cache_value(through),
                 digest: self.coverage_prefix_digest(through)?,
             }),
             None => None,
         };
-        self.info.scan_resume_after = frontier.map(str::to_owned);
+        self.info.scan_resume_after = frontier.map(clone_cache_value);
         let reason = self
             .info
             .scan_checkpoint
             .as_ref()
             .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
-        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(through.to_owned(), reason));
+        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(clone_cache_value(through), reason));
         Ok(())
     }
 
@@ -1303,26 +1304,32 @@ impl DataUsageCache {
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
-        self.cache.insert(hash.key(), e);
+        self.cache.insert(clone_cache_value(&hash.0), e);
         if !parent.is_empty() {
             let parent_hash = hash_path(parent);
-            self.cache.entry(parent_hash.key()).or_default().add_child(&hash);
+            self.cache
+                .entry(clone_cache_value(&parent_hash.0))
+                .or_default()
+                .add_child(&hash);
         }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        self.cache.insert(hash.key(), e.clone());
+        self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_default().add_child(hash);
+            self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
         }
     }
 
     pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
-        self.cache.get(&hash_path(path).key())
+        self.cache.get(&clone_cache_value(&hash_path(path).0))
     }
 
     pub fn find_children_copy(&self, h: &DataUsageHash) -> DataUsageHashMap {
-        self.cache.get(&h.0).map(|entry| entry.children.clone()).unwrap_or_default()
+        self.cache
+            .get(&h.0)
+            .map(|entry| clone_cache_value(&entry.children))
+            .unwrap_or_default()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
@@ -1346,7 +1353,7 @@ impl DataUsageCache {
         }
         let (entry, visited) = self.checked_flatten_inner(path)?;
         let root_parent_only = {
-            let path_key = hash_path(path).key();
+            let path_key = clone_cache_value(&hash_path(path).0);
             self.cache
                 .get(DATA_USAGE_ROOT)
                 .is_some_and(|root| root_is_parent_only(root, &path_key))
@@ -1379,7 +1386,7 @@ impl DataUsageCache {
     }
 
     fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
-        let root_key = hash_path(path).key();
+        let root_key = clone_cache_value(&hash_path(path).0);
         let (root_key, root) = self.cache.get_key_value(&root_key)?;
         if root.compacted && !root.children.is_empty() {
             return None;
@@ -1465,22 +1472,28 @@ impl DataUsageCache {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
-        if !visited.insert(hash.key()) {
+        if !visited.insert(clone_cache_value(&hash.0)) {
             return;
         }
 
-        if let Some(e) = src.cache.get(&hash.string()) {
-            self.cache.insert(hash.key(), e.clone());
+        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
+            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
             if depth < MAX_DATA_USAGE_CACHE_DEPTH {
                 for ch in e.children.iter() {
-                    if *ch == hash.key() {
+                    if *ch == clone_cache_value(&hash.0) {
                         continue;
                     }
-                    self.copy_with_children_guard(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()), visited, depth + 1);
+                    self.copy_with_children_guard(
+                        src,
+                        &DataUsageHash(clone_cache_value(ch)),
+                        &Some(clone_cache_value(hash)),
+                        visited,
+                        depth + 1,
+                    );
                 }
             }
             if let Some(parent) = parent {
-                self.cache.entry(parent.key()).or_default().add_child(hash);
+                self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
             }
         }
     }
@@ -1507,7 +1520,7 @@ impl DataUsageCache {
         match self.cache.get_key_value(&hash_path(path).key()) {
             Some((key, root)) => {
                 if root.children.is_empty() {
-                    return Some(root.clone());
+                    return Some(clone_cache_value(root));
                 }
                 let mut visited = HashSet::new();
                 visited.insert(key.as_str());
@@ -1522,7 +1535,7 @@ impl DataUsageCache {
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        let want = hash.key();
+        let want = clone_cache_value(&hash.0);
         if let Some(last_index) = want.rfind('/')
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
@@ -1532,22 +1545,22 @@ impl DataUsageCache {
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                return Some(DataUsageHash(k.clone()));
+                return Some(DataUsageHash(clone_cache_value(k)));
             }
         }
         None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        self.cache.get(&hash.key()).is_some_and(|due| due.compacted)
+        self.cache.get(&clone_cache_value(&hash.0)).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
         if self.cache.len() < limit {
             return;
         }
-        let top = hash_path(&self.info.name).key();
-        let Some(top_e) = self.find(&top).cloned() else {
+        let top = clone_cache_value(&hash_path(&self.info.name).0);
+        let Some(top_e) = self.find(&top).map(clone_cache_value) else {
             return;
         };
 
@@ -1574,14 +1587,14 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            let mut flat = self.size_recursive(&clone_cache_value(&path.0)).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
             return;
         }
 
-        let total = self.total_children_rec(&path.key());
+        let total = self.total_children_rec(&clone_cache_value(&path.0));
         if total < limit {
             return;
         }
@@ -1594,12 +1607,12 @@ impl DataUsageCache {
         let mut candidate_index = 0;
         while remove > 0 && candidate_index < candidates.len() {
             let e = &candidates[candidate_index];
-            let candidate = e.path.clone();
+            let candidate = clone_cache_value(&e.path);
             if candidate == *path && !compact_self {
                 break;
             }
-            let removing = self.total_children_rec(&candidate.key());
-            let mut flat = match self.size_recursive(&candidate.key()) {
+            let removing = self.total_children_rec(&clone_cache_value(&candidate.0));
+            let mut flat = match self.size_recursive(&clone_cache_value(&candidate.0)) {
                 Some(flat) => flat,
                 None => {
                     candidate_index += 1;
@@ -1645,7 +1658,7 @@ impl DataUsageCache {
             if o.root().is_none() {
                 return;
             }
-            *self = o.clone();
+            *self = clone_cache_value(o);
             return;
         };
 
@@ -1658,7 +1671,8 @@ impl DataUsageCache {
         }
 
         existing_root.merge(&other_root);
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+        self.cache
+            .insert(clone_cache_value(&hash_path(&self.info.name).0), existing_root);
 
         let root_hash = self.root_hash();
         for key in other_root.children.iter() {
@@ -1669,7 +1683,7 @@ impl DataUsageCache {
             if let Some(existing) = self.cache.get_mut(key) {
                 existing.merge(&flat);
             } else {
-                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+                self.replace_hashed(&DataUsageHash(clone_cache_value(key)), &Some(clone_cache_value(&root_hash)), &flat);
             }
         }
     }
@@ -1679,7 +1693,7 @@ impl DataUsageCache {
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.find(&self.info.name).cloned()
+        self.find(&self.info.name).map(clone_cache_value)
     }
 
     /// Convert cache to DataUsageInfo for a specific path
@@ -1713,7 +1727,7 @@ impl DataUsageCache {
 
                 for (arn, stat) in rs.targets.iter() {
                     bui.replication_info.insert(
-                        arn.clone(),
+                        clone_cache_value(arn),
                         BucketTargetUsageInfo {
                             replication_pending_size: stat.pending_size,
                             replicated_size: stat.replicated_size,
@@ -1726,7 +1740,7 @@ impl DataUsageCache {
                     );
                 }
             }
-            buckets_usage.insert(bucket_name.clone(), bui);
+            buckets_usage.insert(clone_cache_value(bucket_name), bui);
         }
 
         DataUsageInfo {
@@ -1765,7 +1779,7 @@ struct Inner {
 
 fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
     let mut visited = HashSet::new();
-    visited.insert(path.key());
+    visited.insert(clone_cache_value(&path.0));
     add_with_guard(data_usage_cache, path, candidates, &mut visited, 0)
 }
 
@@ -1776,15 +1790,16 @@ fn add_with_guard(
     visited: &mut HashSet<String>,
     depth: usize,
 ) -> usize {
-    let e = match data_usage_cache.cache.get(&path.key()) {
+    let e = match data_usage_cache.cache.get(&clone_cache_value(&path.0)) {
         Some(e) => e,
         None => return 0,
     };
     let mut objects = e.objects;
     if depth < MAX_DATA_USAGE_CACHE_DEPTH {
         for ch in e.children.iter() {
-            if visited.insert(ch.clone()) {
-                objects += add_with_guard(data_usage_cache, &DataUsageHash(ch.clone()), candidates, visited, depth + 1);
+            if visited.insert(clone_cache_value(ch)) {
+                objects +=
+                    add_with_guard(data_usage_cache, &DataUsageHash(clone_cache_value(ch)), candidates, visited, depth + 1);
             }
         }
     }
@@ -1794,7 +1809,7 @@ fn add_with_guard(
     if !e.children.is_empty() {
         candidates.push(Inner {
             objects,
-            path: path.clone(),
+            path: clone_cache_value(path),
         });
     }
     objects
@@ -1810,7 +1825,7 @@ fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut Has
     }
 
     for k in entry.children.iter() {
-        if !found.insert(k.to_string()) {
+        if !found.insert(clone_cache_value(k)) {
             continue;
         }
         if let Some(ch) = duc.cache.get(k) {

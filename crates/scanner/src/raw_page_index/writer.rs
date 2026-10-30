@@ -16,6 +16,7 @@ use super::{
     RawEnumerationPageBuilder, RawEnumerationPageIndex, RawEnumerationPageIndexError, RawEnumerationPageIndexInner,
     RawEnumerationPageIndexState, owner_entry_is_valid,
 };
+use crate::data_usage_define::clone_cache_value;
 use std::collections::{BTreeSet, HashSet};
 
 /// Exclusive, validated owner of an index during one directory enumeration.
@@ -111,7 +112,7 @@ impl RawEnumerationPageWriter {
                 entries: Vec::new(),
                 terminal: false,
             });
-            self.indexed.insert(entry.clone());
+            self.indexed.insert(clone_cache_value(&entry));
             // The building page is normalized (strictly increasing) on every
             // path that reaches here, so a positional insert keeps it so.
             let position = building.entries.binary_search(&entry).unwrap_or_else(|position| position);
@@ -137,7 +138,7 @@ impl RawEnumerationPageWriter {
     }
 
     pub(crate) fn checkpoint(&self) -> Result<RawEnumerationPageIndex, RawEnumerationPageIndexError> {
-        let mut inner = self.inner.clone();
+        let mut inner = clone_cache_value(&self.inner);
         if inner.building.is_some() {
             inner.commit_building_page(self.committed_entries)?;
         }

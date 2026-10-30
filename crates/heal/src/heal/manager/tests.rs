@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
 mod admission_timing;
+mod owned_workers;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
@@ -6618,6 +6619,7 @@ fn admin_bucket_discovery_retries_keep_the_existing_budget() {
 async fn check_node_admission_task_retry(source: HealRequestSource) {
     use crate::heal::outcome::HealFailureClass;
     use crate::heal::storage::ECStoreHealStorage;
+    use crate::heal::storage_api::owner::{PhysicalDiskSample, PhysicalDiskSampler};
     use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
     use rustfs_heal_contracts::heal_channel::HealScanMode;
     use std::num::NonZeroU16;
@@ -6630,6 +6632,18 @@ async fn check_node_admission_task_retry(source: HealRequestSource) {
     env.make_bucket("admission-retry", false).await;
     env.put_object_bytes("admission-retry", "existing", b"repair me".to_vec())
         .await;
+    let mut physical = PhysicalDiskSampler::default();
+    physical.publish(
+        PhysicalDiskSample::collect(&env.ecstore).with_test_single_device(),
+        ResourcePressure::Unknown,
+    );
+    assert!(
+        env.ecstore
+            .physical_heal_plan("existing", &Default::default())
+            .expect("fixture placement")
+            .is_some(),
+        "physical discovery must be ready before testing node capacity"
+    );
     let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one node unit"));
     let storage: Arc<dyn HealStorageAPI> =
         Arc::new(ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone())));
@@ -6669,6 +6683,10 @@ async fn check_node_admission_task_retry(source: HealRequestSource) {
             pressure: ResourcePressure::Unknown,
             completed_units: None,
         }),
+    );
+    physical.publish(
+        PhysicalDiskSample::collect(&env.ecstore).with_test_single_device(),
+        ResourcePressure::Unknown,
     );
     let retried = HealTask::from_request(retry, storage);
     retried

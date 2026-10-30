@@ -305,7 +305,7 @@ moka = { workspace = true, features = ["future", "sync"] }
 xxhash-rust = { workspace = true, features = ["xxh3"] }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 tokio-stream.workspace = true
-tokio-util = { workspace = true, features = ["io", "compat", "time"] }
+tokio-util = { workspace = true, features = ["io", "compat", "time", "rt"] }
 tonic = { workspace = true, features = ["gzip", "deflate"] }
 tower = { workspace = true, features = ["timeout"] }
 tower-http = { workspace = true, features = ["trace", "compression-full", "cors", "catch-panic", "timeout", "limit", "request-id", "add-extension"] }

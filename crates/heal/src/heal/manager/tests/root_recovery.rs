@@ -3136,3 +3136,65 @@ async fn root_recovery_conflicting_record_does_not_block_other_replays() {
         );
     }
 }
+
+#[cfg(not(windows))]
+#[tokio::test]
+async fn owned_terminal_gc_waits_for_actual_native_receipt_read() {
+    use crate::heal::storage_api::{
+        EcstoreLocalPublicationPause as LocalPublicationPause, EcstoreLocalPublicationStage as LocalPublicationStage,
+    };
+
+    let (_temp, disk) = recovery_disk().await;
+    let manager = recovery_manager(vec![disk.clone()]);
+    let request = root_request();
+    let completed_at = SystemTime::now()
+        .checked_sub(KEEP_HEAL_TASK_STATUS_DURATION + Duration::from_secs(1))
+        .expect("expired fixture time");
+    let completed = completed_admin_status(&request.heal_type, completed_at);
+    manager
+        .publish_admin_terminal(&request.id, &request.heal_type, request.source, &completed)
+        .await
+        .expect("persist real expired terminal");
+    let path = format!("terminal-root-heal-{}.json", request.id);
+    assert!(
+        !disk
+            .read_all(RUSTFS_META_BUCKET, &path)
+            .await
+            .expect("nonempty real terminal")
+            .is_empty()
+    );
+    let mut pause =
+        LocalPublicationPause::install(disk.as_ref(), RUSTFS_META_BUCKET, &path, LocalPublicationStage::NativeReadOpen)
+            .expect("native bounded terminal-read pause");
+    manager
+        .start_root_recovery_terminal_gc()
+        .await
+        .expect("actual slot-3 producer");
+    tokio::time::timeout(Duration::from_secs(5), pause.entered())
+        .await
+        .expect("terminal GC native read entry deadline")
+        .expect("real bounded terminal read entered");
+    let mut stop = Box::pin(manager.stop());
+    let first = tokio::time::timeout(Duration::from_millis(30), stop.as_mut()).await;
+    let held = first.is_err();
+    let unlocked = manager.admin_start_shutdown.try_lock().is_ok()
+        && manager.active_heals.try_lock().is_ok()
+        && manager.completed_heals.try_lock().is_ok();
+    drop(pause);
+    let result = match first {
+        Ok(result) => Ok(result),
+        Err(_) => tokio::time::timeout(Duration::from_secs(5), stop).await,
+    };
+    assert!(held, "terminal mutation branch must finish before its receipt");
+    assert!(unlocked, "join may not hold manager locks");
+    result.expect("released terminal GC joins").expect("terminal GC stop");
+    assert!(matches!(disk.read_all(RUSTFS_META_BUCKET, &path).await, Err(DiskError::FileNotFound)));
+    let registration = manager.workers.registration.lock().unwrap();
+    assert!(
+        registration.fixed[3]
+            .as_ref()
+            .expect("actual terminal GC receipt")
+            .peek()
+            .is_some()
+    );
+}

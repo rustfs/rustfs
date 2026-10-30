@@ -19,10 +19,14 @@ use crate::heal::{
         ReplacementPhase, ReplacementRecoveryBlock, ReplacementRecoveryCandidate, ResumeGc, ResumeManager, ResumeState,
         ResumeUtils, merge_replacement_recovery_candidate, replacement_retry_is_exhausted_active,
     },
-    storage::HealStorageAPI,
+    storage::{HealStorageAPI, run_local_metadata},
     task::{HealOptions, HealPriority, HealRequest, HealTask, HealTaskStatus, HealType, demote_to_debug_when},
 };
 use crate::{Error, Result};
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use metrics::{counter, gauge, histogram};
 use rustfs_concurrency::WorkloadAdmissionSnapshotProvider;
 use rustfs_concurrency::workload::{ForegroundPressure, foreground_pressure};
@@ -32,8 +36,10 @@ use rustfs_heal_contracts::heal_channel::{
     HealAdmissionDropReason, HealAdmissionReceipt, HealAdmissionResult, HealRequestSource,
 };
 use rustfs_madmin::heal_commands::HealResultItem;
+use std::future::Future;
 #[cfg(test)]
 use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{BinaryHeap, HashMap, HashSet},
     sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard},
@@ -44,10 +50,205 @@ use tokio::{
     time::{interval, sleep},
 };
 use tokio_util::sync::CancellationToken;
+use tokio_util::task::{TaskTracker, task_tracker::TaskTrackerToken};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use super::{DiskError, Endpoint, HealDiskExt as _, local_disk_map_read};
+
+// Four long-lived loops have fixed receipts; finished dynamic jobs leave the
+// tracker immediately. No manager/cache lock is needed by a drain waiter.
+type HealWorkerJoin = Shared<BoxFuture<'static, std::result::Result<(), Arc<tokio::task::JoinError>>>>;
+
+struct HealWorkerRegistration {
+    open: bool,
+    stopping: usize,
+    fixed: [Option<HealWorkerJoin>; 4],
+}
+
+#[derive(Clone)]
+struct HealWorkers {
+    registration: Arc<StdMutex<HealWorkerRegistration>>,
+    tasks: TaskTracker,
+    startup: TaskTracker,
+    failed: Arc<AtomicBool>,
+}
+
+#[derive(Clone)]
+pub(super) struct HealWork {
+    owner: HealWorkers,
+    _token: TaskTrackerToken,
+}
+
+// Each in-flight stop owns its own intent. Dropping one waiter cannot reopen
+// startup while another stop still owns the handoff boundary.
+struct HealStopIntent(HealWorkers);
+
+impl Drop for HealStopIntent {
+    fn drop(&mut self) {
+        if let Ok(mut registration) = self.0.registration.lock() {
+            registration.stopping -= 1;
+            if registration.stopping == 0 && registration.open {
+                self.0.startup.reopen();
+            }
+        }
+    }
+}
+
+struct HealWorkGuard {
+    work: HealWork,
+    completed: bool,
+}
+
+impl Drop for HealWorkGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.work.owner.failed.store(true, Ordering::Release);
+        }
+    }
+}
+
+impl HealWork {
+    fn spawn<F, Fut, T>(&self, work: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce(HealWork) -> Fut + Send + 'static,
+        Fut: Future<Output = T> + Send + 'static,
+        T: Send + 'static,
+    {
+        // Clone before spawn, while the live parent prevents an empty tracker.
+        let guard = HealWorkGuard {
+            work: self.clone(),
+            completed: false,
+        };
+        tokio::spawn(async move {
+            let mut guard = guard;
+            let output = work(guard.work.clone()).await;
+            guard.completed = true;
+            output
+        })
+    }
+}
+
+impl HealWorkers {
+    fn new() -> Self {
+        Self {
+            registration: Arc::new(StdMutex::new(HealWorkerRegistration {
+                open: true,
+                stopping: 0,
+                fixed: std::array::from_fn(|_| None),
+            })),
+            tasks: TaskTracker::new(),
+            startup: TaskTracker::new(),
+            failed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    fn enter_start(&self) -> Result<(HealWorkGuard, TaskTrackerToken)> {
+        let registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::other("heal worker registration poisoned"))?;
+        if !registration.open || registration.stopping != 0 {
+            return Err(Error::other("heal manager workers are stopping or terminally closed"));
+        }
+        Ok((
+            HealWorkGuard {
+                work: HealWork {
+                    owner: self.clone(),
+                    _token: self.tasks.token(),
+                },
+                completed: false,
+            },
+            self.startup.token(),
+        ))
+    }
+
+    fn begin_stop(&self) -> Result<HealStopIntent> {
+        let mut registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::other("heal worker registration poisoned"))?;
+        registration.stopping += 1;
+        self.startup.close();
+        Ok(HealStopIntent(self.clone()))
+    }
+
+    fn spawn_fixed<F, Fut>(&self, slot: usize, work: F) -> Result<()>
+    where
+        F: FnOnce(HealWork) -> Fut + Send + 'static,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        let mut registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::other("heal worker registration poisoned"))?;
+        if !registration.open || registration.fixed[slot].is_some() {
+            return Err(Error::other("heal manager loop is closed or already registered"));
+        }
+        let parent = HealWork {
+            owner: self.clone(),
+            _token: self.tasks.token(),
+        };
+        let task = parent.spawn(work);
+        registration.fixed[slot] = Some(async move { task.await.map_err(Arc::new) }.boxed().shared());
+        Ok(())
+    }
+
+    fn close(&self) -> Result<()> {
+        let mut registration = self
+            .registration
+            .lock()
+            .map_err(|_| Error::other("heal worker registration poisoned"))?;
+        registration.open = false;
+        self.tasks.close();
+        Ok(())
+    }
+
+    async fn wait(&self) -> Result<()> {
+        let fixed = {
+            let registration = self
+                .registration
+                .lock()
+                .map_err(|_| Error::other("heal worker registration poisoned"))?;
+            if registration.open {
+                return Err(Error::other("heal worker admission is not closed"));
+            }
+            registration.fixed.clone()
+        };
+        let mut join_failed = false;
+        for task in fixed.into_iter().flatten() {
+            join_failed |= task.await.is_err();
+        }
+        self.tasks.wait().await;
+        if join_failed || self.failed.load(Ordering::Acquire) {
+            return Err(Error::other("heal owned worker panicked or was unexpectedly cancelled"));
+        }
+        Ok(())
+    }
+}
+
+pub(super) fn spawn_heal_work<F, Fut, T>(parent: Option<&HealWork>, work: F) -> tokio::task::JoinHandle<T>
+where
+    F: FnOnce(Option<HealWork>) -> Fut + Send + 'static,
+    Fut: Future<Output = T> + Send + 'static,
+    T: Send + 'static,
+{
+    match parent {
+        Some(parent) => parent.spawn(move |child| work(Some(child))),
+        None => tokio::spawn(work(None)),
+    }
+}
+
+async fn inspect_resume_disk(
+    gc: &mut ResumeGc,
+    disk: &super::DiskStore,
+    admission: Option<&Arc<rustfs_concurrency::adaptive::NodeAdmission>>,
+    cancellation: &CancellationToken,
+) -> Result<()> {
+    run_local_metadata(disk, admission, cancellation, gc.inspect_disk(disk))
+        .await?
+        .map(|_| ())
+}
 
 const KEEP_HEAL_TASK_STATUS_DURATION: Duration = Duration::from_secs(10 * 60);
 // Each cache includes alias tokens in its count and byte budget. Eviction
@@ -1023,6 +1224,7 @@ pub struct HealState {
 
 /// Heal manager
 pub struct HealManager {
+    workers: HealWorkers,
     /// Heal config
     config: Arc<RwLock<HealConfig>>,
     /// Heal state
@@ -1197,15 +1399,22 @@ impl HealManager {
         )
     }
 
-    fn schedule_mainline_throttle_recheck(notify: Arc<Notify>, delay: Duration) {
+    fn schedule_mainline_throttle_recheck(
+        notify: Arc<Notify>,
+        delay: Duration,
+        parent: Option<&HealWork>,
+        cancel: CancellationToken,
+    ) {
         if delay.is_zero() {
             notify.notify_one();
             return;
         }
 
-        tokio::spawn(async move {
-            sleep(delay).await;
-            notify.notify_one();
+        spawn_heal_work(parent, move |_parent| async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {},
+                _ = sleep(delay) => notify.notify_one(),
+            }
         });
     }
 
@@ -1621,9 +1830,10 @@ impl HealManager {
     /// Start the bounded resume-state inspector.  Destructive GC remains
     /// disabled until the durable owner/CAS contract from backlog#1927 is
     /// available; this task therefore cannot remove an active or stale file.
-    async fn start_resume_gc(&self) {
+    async fn start_resume_gc(&self) -> Result<()> {
         let cancel = self.cancel_token.clone();
-        tokio::spawn(async move {
+        let admission = self.storage.background_node_admission();
+        self.workers.spawn_fixed(2, move |_parent| async move {
             let mut gc_by_disk = HashMap::<String, ResumeGc>::new();
             let mut ticker = interval(RESUME_GC_INTERVAL);
             loop {
@@ -1639,7 +1849,7 @@ impl HealManager {
                             let gc = gc_by_disk.entry(disk_key).or_default();
                             tokio::select! {
                                 _ = cancel.cancelled() => return,
-                                result = gc.inspect_disk(&disk) => {
+                                result = inspect_resume_disk(gc, &disk, admission.as_ref(), &cancel) => {
                                     if let Err(error) = result {
                                         warn!(
                                             target: "rustfs::heal::manager",
@@ -1658,13 +1868,14 @@ impl HealManager {
                     }
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
-    async fn start_root_recovery_terminal_gc(&self) {
+    async fn start_root_recovery_terminal_gc(&self) -> Result<()> {
         let cancel = self.cancel_token.clone();
         let root_recovery = self.root_recovery.clone();
-        tokio::spawn(async move {
+        self.workers.spawn_fixed(3, move |_parent| async move {
             let mut ticker = interval(RESUME_GC_INTERVAL);
             loop {
                 tokio::select! {
@@ -1703,7 +1914,8 @@ impl HealManager {
                     }
                 }
             }
-        });
+        })?;
+        Ok(())
     }
 
     /// Create new HealManager
@@ -1728,6 +1940,7 @@ impl HealManager {
     ) -> Self {
         let config = config.unwrap_or_default();
         Self {
+            workers: HealWorkers::new(),
             config: Arc::new(RwLock::new(config)),
             state: Arc::new(RwLock::new(HealState::default())),
             active_heals: Arc::new(Mutex::new(HashMap::new())),
@@ -1774,8 +1987,10 @@ impl HealManager {
 
     /// Start HealManager
     pub async fn start(&self) -> Result<()> {
+        let (mut starting, _startup_token) = self.workers.enter_start()?;
         let mut state = self.state.write().await;
         if state.is_running {
+            starting.completed = true;
             warn!(
                 target: "rustfs::heal::manager",
                 event = EVENT_HEAL_MANAGER_STATE,
@@ -1828,8 +2043,8 @@ impl HealManager {
         self.process_unclean_shutdown().await;
 
         // Inspect resume artifacts in a bounded, fail-closed background task.
-        self.start_resume_gc().await;
-        self.start_root_recovery_terminal_gc().await;
+        self.start_resume_gc().await?;
+        self.start_root_recovery_terminal_gc().await?;
 
         // start auto disk scanner to heal unformatted disks
         if self.config.read().await.enable_auto_heal {
@@ -1853,11 +2068,31 @@ impl HealManager {
             state = "running",
             "Heal manager started"
         );
+        starting.completed = true;
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn test_work_parent(&self) -> HealWork {
+        assert!(self.workers.registration.lock().unwrap().open, "test root parent precedes stop");
+        HealWork {
+            owner: self.workers.clone(),
+            _token: self.workers.tasks.token(),
+        }
+    }
+
+    /// Durable stop handoff completed; owned workers may still be joining.
+    pub(crate) fn stop_handoff_completed(&self) -> bool {
+        self.cancel_token.is_cancelled()
     }
 
     /// Stop HealManager
     pub async fn stop(&self) -> Result<()> {
+        let _stop_intent = self.workers.begin_stop()?;
+        // TaskTracker registers its notification before checking closed/empty.
+        // Stop admission first; wait outside admin/active/cache locks so startup
+        // can finish its existing recovery and register all four loop receipts.
+        self.workers.startup.wait().await;
         let _admin_start_guard = self.admin_start_shutdown.lock().await;
         info!(
             target: "rustfs::heal::manager",
@@ -1874,29 +2109,32 @@ impl HealManager {
         let mut active_heals = self.active_heals.lock().await;
         let queue = self.heal_queue.lock().await;
         let retrying = self.retrying_heals.lock().await;
-        for task in active_heals.values() {
-            if root_recovery::is_admin_heal_recovery(&task.heal_type, task.source) {
-                if task.get_status().await == HealTaskStatus::Completed {
-                    self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
-                } else {
-                    let mut request = match task.retry_request_with_remaining_timeout().await {
-                        Ok(request) => request,
-                        Err(Error::TaskTimeout) => {
-                            let mut request = task.retry_request();
-                            request.options.timeout = Some(Duration::ZERO);
-                            request
-                        }
-                        Err(error) => return Err(error),
-                    };
-                    request.retry_attempts = task.retry_attempts;
-                    self.root_recovery.persist(&request).await?;
+        if !self.cancel_token.is_cancelled() {
+            for task in active_heals.values() {
+                if root_recovery::is_admin_heal_recovery(&task.heal_type, task.source) {
+                    if task.get_status().await == HealTaskStatus::Completed {
+                        self.root_recovery.remove(&task.id, &task.heal_type, task.source).await?;
+                    } else {
+                        let mut request = match task.retry_request_with_remaining_timeout().await {
+                            Ok(request) => request,
+                            Err(Error::TaskTimeout) => {
+                                let mut request = task.retry_request();
+                                request.options.timeout = Some(Duration::ZERO);
+                                request
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        request.retry_attempts = task.retry_attempts;
+                        self.root_recovery.persist(&request).await?;
+                    }
                 }
             }
+            for request in queue.requests().chain(retrying.values().map(|retrying| &retrying.request)) {
+                self.root_recovery.persist(request).await?;
+            }
+            self.workers.close()?;
+            self.cancel_token.cancel();
         }
-        for request in queue.requests().chain(retrying.values().map(|retrying| &retrying.request)) {
-            self.root_recovery.persist(request).await?;
-        }
-        self.cancel_token.cancel();
         drop(retrying);
         drop(queue);
 
@@ -1939,6 +2177,12 @@ impl HealManager {
             );
         }
         crate::set_heal_queue_length(0);
+
+        // Completion paths reacquire active/cache locks. Never wait while
+        // holding admin, active, queue, retry, cache or state guards.
+        drop(active_heals);
+        drop(_admin_start_guard);
+        self.workers.wait().await?;
 
         // update state
         let mut state = self.state.write().await;

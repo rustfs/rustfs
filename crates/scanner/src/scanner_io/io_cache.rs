@@ -11,8 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
 use super::*;
+/// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
+use crate::data_usage_define::clone_cache_value;
 
 pub(super) async fn collect_completed_bucket_results(
     ctx: CancellationToken,
@@ -202,7 +203,7 @@ pub(super) fn prepare_scoped_set_scan(
             lkg_last_update: old_cache.info.last_update,
             lkg_leader_epoch: Some(old_cache.info.leader_epoch),
             lkg_scan_plan_digest: old_cache.info.scan_plan_digest,
-            scan_bucket_incarnations: old_cache.info.scan_bucket_incarnations.clone(),
+            scan_bucket_incarnations: clone_cache_value(&old_cache.info.scan_bucket_incarnations),
             ..Default::default()
         },
         cache: HashMap::new(),
@@ -396,8 +397,8 @@ impl ScannerIOCache for SetDisks {
                             scan_plan_digest: Some(scan_plan_digest),
                             scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                            segment_invalidation_proof: completed_segment_invalidation_proof.clone(),
-                            scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
+                            segment_invalidation_proof: clone_cache_value(&completed_segment_invalidation_proof),
+                            scan_bucket_incarnations: clone_cache_value(&current_bucket_incarnations).unwrap_or_default(),
                             ..Default::default()
                         },
                         cache: HashMap::new(),
@@ -452,8 +453,8 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no online disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
-            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            let lkg = old_cache.info.snapshot_complete.then(|| clone_cache_value(&old_cache));
+            let mut incomplete_scope = clone_cache_value(&lkg).unwrap_or_default();
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;
@@ -552,8 +553,8 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no usable namespace scanner disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
-            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            let lkg = old_cache.info.snapshot_complete.then(|| clone_cache_value(&old_cache));
+            let mut incomplete_scope = clone_cache_value(&lkg).unwrap_or_default();
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;
@@ -729,7 +730,7 @@ impl ScannerIOCache for SetDisks {
                     lkg_leader_epoch: old_cache.info.lkg_leader_epoch,
                     lkg_scan_plan_digest: old_cache.info.lkg_scan_plan_digest,
                     segment_invalidation_proof: None,
-                    scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
+                    scan_bucket_incarnations: clone_cache_value(&current_bucket_incarnations).unwrap_or_default(),
                     ..Default::default()
                 },
                 cache: HashMap::new(),
@@ -755,7 +756,7 @@ impl ScannerIOCache for SetDisks {
 
         for bucket in scan_order.iter() {
             if let Some(c) = old_cache.find(&bucket.name) {
-                cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
+                cache.replace(&bucket.name, DATA_USAGE_ROOT, clone_cache_value(c));
             }
 
             if let Err(e) = bucket_tx.send(bucket.clone()).await {

@@ -30,6 +30,7 @@ use crate::{
     storage_api::startup::storage::bootstrap_instance_ctx,
 };
 use std::io::{Error, Read as _, Result, Write as _};
+use std::process::ExitCode;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, instrument};
@@ -54,8 +55,8 @@ const STARTUP_THREAD_NAME: &str = "rustfs-main";
 /// release build; 8 MiB keeps the budget Linux and macOS already had.
 const STARTUP_THREAD_STACK_SIZE: usize = 8 * 1024 * 1024;
 
-pub fn run_process() {
-    run_on_startup_thread(run_process_on_current_thread);
+pub fn run_process() -> ExitCode {
+    run_on_startup_thread(run_process_on_current_thread)
 }
 
 /// Run `f` on a thread whose stack is [`STARTUP_THREAD_STACK_SIZE`] on every
@@ -73,26 +74,30 @@ fn run_on_startup_thread<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stat
     }
 }
 
-fn run_process_on_current_thread() {
+fn run_process_on_current_thread() -> ExitCode {
     // Building the process runtime is a startup fatal boundary.
     let (runtime, dial9_guard) = crate::server::build_tokio_runtime().expect("Failed to build Tokio runtime");
     let result = runtime.block_on(async_main());
 
-    // Flush and seal the trace segment before any exit path. `process::exit`
-    // below does not run destructors, and neither does returning from `main`
-    // for a guard held in a `static`. Under feature sets where the dial9 guard
-    // carries no Drop impl (e.g. `--features sftp`), this is an intentional no-op.
+    // Preserve the existing trace flush/seal order before runtime teardown.
+    // A disabled telemetry guard remains a no-op.
     #[allow(clippy::drop_non_drop)]
     drop(dial9_guard);
 
-    if let Err(ref e) = result {
+    let exit_code = if let Err(ref e) = result {
         if e.to_string() != OBSERVABILITY_INIT_FATAL_ALREADY_REPORTED {
             // Tracing may not be initialized when startup fails this early.
             emit_fatal_stderr("Server runtime failed", e);
         }
         let _ = crate::startup_runtime_sources::shutdown_observability_guard();
-        std::process::exit(1);
-    }
+        ExitCode::FAILURE
+    } else {
+        ExitCode::SUCCESS
+    };
+    drop(result);
+    // block_on has left its entered scope; the startup thread owns teardown.
+    drop(runtime);
+    exit_code
 }
 
 fn format_fatal_stderr_message(context: &str, error: impl std::fmt::Display) -> String {
@@ -2092,6 +2097,13 @@ mod tests {
             std::thread::current().name().map(str::to_owned)
         });
         assert_eq!(name.as_deref(), Some(STARTUP_THREAD_NAME));
+    }
+
+    #[test]
+    fn startup_thread_returns_process_exit_codes() {
+        for code in [ExitCode::SUCCESS, ExitCode::FAILURE] {
+            assert_eq!(run_on_startup_thread(move || code), code);
+        }
     }
 
     #[test]
