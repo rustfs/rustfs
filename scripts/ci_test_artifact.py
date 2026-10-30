@@ -55,8 +55,10 @@ def identity(configuration):
         "build_environment": build_environment(),
         "system": platform.system(),
         "machine": platform.machine(),
+        # Bound to the run but not the attempt: "Re-run failed jobs" does not
+        # rerun a successful producer, so its consumers must accept the
+        # earlier attempt's archive. Source and tree are fixed within a run.
         "run_id": os.environ.get("GITHUB_RUN_ID", "local"),
-        "run_attempt": os.environ.get("GITHUB_RUN_ATTEMPT", "local"),
         "repository": os.environ.get("GITHUB_REPOSITORY", "local"),
     }
 
