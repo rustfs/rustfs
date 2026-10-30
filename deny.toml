@@ -96,4 +96,8 @@ exceptions = [
     # transitively via `bzip2`. Not on a hot path.
     # owner: rustfs-maintainers  review: 2026-07
     { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
+    # `aws-lc-fips-sys` declares ISC, Apache-2.0, and the OpenSSL license for
+    # the FIPS-validated AWS-LC module when the optional `fips` feature is enabled.
+    # owner: rustfs-maintainers  review: 2026-10
+    { allow = ["OpenSSL"], crate = "aws-lc-fips-sys" },
 ]
