@@ -3038,12 +3038,12 @@ mod tests {
         let exit = native.exit_signal.as_ref().expect("fixture cleanup lifecycle");
         exit.send(()).expect("stop the existing idle cleanup task");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while exit.receiver_count() != 0 || root_file.strong_count() != 2 {
+            while exit.receiver_count() != 0 || root_file.strong_count() != 3 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("only LocalDisk's publication and mount fields may retain the initial root FD");
+        .expect("only LocalDisk's publication, mount and I/O backend fields may retain the initial root FD");
         let transaction = Uuid::new_v4();
         let applied = apply(&native, transaction).await;
         let committed = native
