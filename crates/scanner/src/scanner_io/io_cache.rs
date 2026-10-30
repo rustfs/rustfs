@@ -308,6 +308,7 @@ impl ScannerIOCache for SetDisks {
             publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
+            bucket_completions,
             pending_maintenance_work,
             cache_cycle_floor,
             cold_zero_walk_reuse_observed,
@@ -809,6 +810,8 @@ impl ScannerIOCache for SetDisks {
             let scope_clone = scope.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
             let expected_publication_epoch_clone = expected_publication_epoch;
+            #[cfg(feature = "e2e-test-hooks")]
+            let worker_incarnations = current_bucket_incarnations.clone();
             let remote_server_epoch = match worker_mode {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
@@ -909,7 +912,7 @@ impl ScannerIOCache for SetDisks {
                             break;
                         };
                         remote_session_sequence = next_sequence;
-                        let remote_outcome = crate::remote_scanner::scan_remote_bucket(
+                        let remote_scan = crate::remote_scanner::scan_remote_bucket(
                             &disk,
                             ctx_clone.clone(),
                             budget_clone.clone(),
@@ -925,8 +928,13 @@ impl ScannerIOCache for SetDisks {
                                 skip_healing: healing,
                                 scan_mode,
                             },
-                        )
-                        .await;
+                        );
+                        #[cfg(feature = "e2e-test-hooks")]
+                        let remote_scan = crate::e2e_barrier::worker_observation::with_incarnation(
+                            worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)).copied(),
+                            remote_scan,
+                        );
+                        let remote_outcome = remote_scan.await;
                         match remote_outcome {
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Complete {
                                 usage,
@@ -1323,6 +1331,23 @@ impl ScannerIOCache for SetDisks {
                     let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
 
                     let scan_ctx = ctx_clone.child_token();
+                    #[cfg(feature = "e2e-test-hooks")]
+                    {
+                        let disk_uuid = if crate::e2e_barrier::worker_observation::enabled() {
+                            crate::storage_api::owner::EcstoreDiskAPI::get_disk_id(disk.as_ref()).await.ok().flatten()
+                        } else { None };
+                        let location = disk.get_disk_location();
+                        let _ = crate::e2e_barrier::checkpoint("bucket_walk", serde_json::json!({
+                            "epoch": leader_epoch, "cycle": want_cycle,
+                            "pool": source.pool_index, "set": source.set_index,
+                            "bucket": bucket.name, "drive": disk.path().display().to_string(),
+                            "worker_kind": "local", "worker_path": disk.path().display().to_string(),
+                            "worker_endpoint": crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk.as_ref()).grid_host(),
+                            "disk_uuid": disk_uuid,
+                            "disk_index": location.disk_idx,
+                            "bucket_incarnation": worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)),
+                        })).await;
+                    }
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
                         budget_clone.clone(),
@@ -1750,6 +1775,22 @@ impl ScannerIOCache for SetDisks {
 
         if let Some(err) = first_join_err {
             return Err(err);
+        }
+
+        // Record only actual worker completions, before adding carried values.
+        // The root's cold entries cannot certify a newly observed peer tuple.
+        if let Some(completions) = bucket_completions {
+            let completed_incarnations = completed_buckets
+                .iter()
+                .filter_map(|bucket| {
+                    current_bucket_incarnations
+                        .as_ref()?
+                        .get(bucket)
+                        .filter(|incarnation| !incarnation.is_nil())
+                        .map(|incarnation| (bucket.clone(), *incarnation))
+                })
+                .collect();
+            completions.lock().await.insert(source, completed_incarnations);
         }
 
         let carried_buckets = carry_partial_bucket_values(
