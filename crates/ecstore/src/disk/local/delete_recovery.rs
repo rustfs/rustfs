@@ -2152,6 +2152,9 @@ impl LocalDisk {
                         meta.data.remove(vec![fi_clone.version_id.unwrap_or_default(), uuid])?;
                         let old_path = path_join(&[file_path.as_path(), Path::new(uuid.to_string().as_str())]);
                         check_path_length(old_path.to_string_lossy().as_ref())?;
+                        if old_path.join(STORAGE_FORMAT_FILE).exists() {
+                            return Ok(None);
+                        }
                     }
                     if !meta.versions.is_empty() {
                         return Ok(None);
@@ -2258,6 +2261,9 @@ impl LocalDisk {
                     std::fs::create_dir_all(parent)?;
                 }
                 std::fs::rename(staged.path(), &destination)?;
+                if sync {
+                    os::fsync_dir_std(&file_path)?;
+                }
                 let mut reserved_data_path = None;
                 if let Some(uuid) = old_dir {
                     let old_path = file_path.join(uuid.to_string());
@@ -2465,18 +2471,48 @@ impl LocalDisk {
             .collect();
 
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
+            let committed = format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+            let recovery_committed = format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
+            let reserved = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}");
             for data_dir in &data_dirs {
                 for base in [&root, &rollback] {
                     let dir_path = base.join(data_dir.to_string());
                     match std::fs::read_dir(&dir_path) {
                         Ok(entries) => {
+                            let mut removable = Vec::new();
+                            let mut preserve_dir = false;
                             for entry in entries {
-                                ignore_not_found(std::fs::remove_file(entry?.path()))?;
+                                let entry = entry?;
+                                let name = entry.file_name();
+                                let Some(name) = name.to_str() else {
+                                    preserve_dir = true;
+                                    continue;
+                                };
+                                if entry.file_type()?.is_file()
+                                    && (delete_recovery_part_file(name)
+                                        || name == committed
+                                        || name == recovery_committed
+                                        || name == reserved
+                                        || is_delete_transaction_marker(name, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX))
+                                {
+                                    removable.push(entry.path());
+                                } else {
+                                    preserve_dir = true;
+                                }
+                            }
+                            for path in removable {
+                                ignore_not_found(std::fs::remove_file(path))?;
                             }
                             if sync {
                                 os::fsync_dir_std(&dir_path)?;
                             }
-                            ignore_not_found(std::fs::remove_dir(&dir_path))?;
+                            if !preserve_dir {
+                                match std::fs::remove_dir(&dir_path) {
+                                    Ok(()) => {}
+                                    Err(err) if err.kind() == ErrorKind::NotFound || is_dir_not_empty_error(&err) => {}
+                                    Err(err) => return Err(err),
+                                }
+                            }
                         }
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
                         Err(err) => return Err(err),

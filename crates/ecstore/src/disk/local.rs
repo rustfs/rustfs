@@ -2988,6 +2988,14 @@ fn has_inline_commit_test_failpoints(dst_path: &str) -> bool {
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
     has_inline_commit_test_failpoints(dst_path)
+        || INLINE_PREPARATION_BEFORE_BACKUP
+            .lock()
+            .expect("test preparation hook lock should not be poisoned")
+            .contains_key(dst_path)
+        || !RENAME_DATA_AFTER_FIRST_PUBLICATION
+            .lock()
+            .expect("test publication hook lock should not be poisoned")
+            .is_empty()
         || RENAME_DATA_FAIL_BEFORE_OLD_METADATA_BACKUP
             .lock()
             .expect("test failpoint lock should not be poisoned")
@@ -3787,11 +3795,18 @@ impl LazyLocalFileWriter {
                 }));
             }
             LazyLocalFileWriterState::Open(mut file) => {
+                let file_path = self.file_path.clone();
                 self.state = LazyLocalFileWriterState::Writing(tokio::task::spawn_blocking(move || {
                     std::io::Write::write_all(&mut file, &payload).map_err(to_file_error)?;
                     if close_after {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
                         Ok((None, len))
                     } else {
                         Ok((Some(file), len))
@@ -3903,15 +3918,25 @@ impl AsyncWrite for LazyLocalFileWriter {
                     }));
                 }
                 LazyLocalFileWriterState::Open(file) => {
+                    let file_path = self.file_path.clone();
                     let reclaim_len = self.bytes_written.max(self.reclaim_len);
                     let reclaim_on_shutdown = self.reclaim_on_shutdown;
+                    let sync_on_close = self.sync_on_close;
                     self.state = LazyLocalFileWriterState::Closing(tokio::task::spawn_blocking(move || {
+                        if sync_on_close {
+                            file.sync_data().map_err(to_file_error)?;
+                        }
                         reclaim_std_file_cache(&file, reclaim_len, reclaim_on_shutdown);
                         drop(file);
+                        if sync_on_close && let Some(parent) = file_path.parent() {
+                            mark_presynced_tmp_data_dir(parent.to_path_buf());
+                        }
                         Ok(())
                     }));
                 }
-                LazyLocalFileWriterState::Writing(_) | LazyLocalFileWriterState::Closing(_) => unreachable!(),
+                other => {
+                    self.state = other;
+                }
             }
         }
         let LazyLocalFileWriterState::Closing(fut) = &mut self.state else {
@@ -13118,8 +13143,8 @@ impl DiskAPI for LocalDisk {
         let probe_active = os::file_sync_probe::is_active();
         #[cfg(not(test))]
         let probe_active = false;
-        let sync_on_close = volume == RUSTFS_META_TMP_BUCKET
-            && !origvolume.is_empty()
+        let sync_on_close = cfg!(target_os = "linux")
+            && volume == RUSTFS_META_TMP_BUCKET
             && path.ends_with("/part.1")
             && effective_durability(origvolume).syncs_data_shards()
             && !os::file_fdatasync_group_commit_enabled()
@@ -13696,7 +13721,7 @@ impl DiskAPI for LocalDisk {
 
             let xl_rel_path = format!("{path}/{STORAGE_FORMAT_FILE}");
             if self.multipart_source_admission(volume, &xl_rel_path, true, false)?.is_none()
-                && !crash_inject::should_crash_at(CrashPoint::MetaWriteAfterTmpBeforeRename, &xl_rel_path)
+                && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, &xl_rel_path)
                 && !has_delete_version_test_failpoints()
                 && !has_rename_data_test_failpoints(&xl_rel_path)
             {
@@ -20153,7 +20178,7 @@ mod test {
             writer.write_all(b"new-data").await.expect("write staged shard");
             writer.shutdown().await.expect("close staged shard");
             let staged_dir = disk
-                .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
+                .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
                 .expect("staged shard directory should resolve");
             assert!(PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir), "the writer must pre-sync the shard");
             assert!(!os::fsync_dir_recorder::was_fsynced(&staged_dir));

@@ -404,7 +404,8 @@ impl DefaultObjectUsecase {
         }
         dst_opts.expected_current_version_id = expected_current_version_id.clone();
 
-        let copy_prelookup_required = expected_current_version_id.is_some()
+        let copy_prelookup_required = self_copy_lock
+            || expected_current_version_id.is_some()
             || dest_version_id.is_some()
             || (!super::shared::put_like_write_creates_new_version(&dst_opts)
                 && object_lock_checks_required_for_state(&object_lock_config_state));

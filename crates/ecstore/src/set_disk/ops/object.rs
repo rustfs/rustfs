@@ -46,8 +46,8 @@ use super::super::{
     build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
     check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
     classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
-    collect_inline_data_shard_fileinfos_by_index, contains_key_str, debug, delete_file_info_version_id, disk,
-    ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
+    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
+    disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
     get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
     get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
     get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
@@ -158,7 +158,15 @@ fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
 }
 
 fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
-    rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true))
+    }
 }
 
 fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
@@ -4451,10 +4459,9 @@ impl SetDisks {
                             if let Some(disk) = disk_op
                                 && disk.is_online().await
                             {
-                                match crate::io_support::bitrot::create_bitrot_writer_with_orig_volume(
+                                match create_bitrot_writer(
                                     is_inline_buffer,
                                     Some(disk),
-                                    bucket,
                                     RUSTFS_META_TMP_BUCKET,
                                     &tmp_obj,
                                     shard_file_size,

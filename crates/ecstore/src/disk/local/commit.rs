@@ -742,9 +742,9 @@ impl LocalDisk {
             && !os::dst_dir_fsync_group_commit_enabled()
             && !os::file_fdatasync_group_commit_enabled()
             && !super::has_rename_data_test_failpoints(dst_path)
-            && !crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, dst_path)
-            && !crash_inject::should_crash_at(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
-            && !crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterDataRename, dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterMetaCommit, dst_path)
             && !super::has_delete_version_test_failpoints()
         {
             #[cfg(test)]
@@ -785,10 +785,9 @@ impl LocalDisk {
                     &dst_volume_dir_owned,
                     &publication_root_owned,
                 )?;
-                // A new inline version can share xl.meta with older versions
-                // without having a rollback_data_dir. Keep the backup-aware
-                // path when a failed metadata sync must restore that file.
-                if is_cancelled() || (!no_inline && sync_commit_metadata && has_dst_buf.is_some()) {
+                // An existing xl.meta can share versions or require rollback
+                // restoration when a post-rename directory sync fails.
+                if is_cancelled() || (sync_commit_metadata && has_dst_buf.is_some()) {
                     return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
                 }
                 let mut xlmeta = FileMeta::new();

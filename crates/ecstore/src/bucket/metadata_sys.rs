@@ -3082,7 +3082,7 @@ impl BucketMetadataSys {
             .then(|| {
                 self.local_authority_cache
                     .lock()
-                    .expect("local_authority_cache should not be poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .get(bucket)
                     .filter(|(cached_gen, _)| *cached_gen == gen_before)
                     .map(|(_, bm)| Arc::clone(bm))
@@ -3142,7 +3142,7 @@ impl BucketMetadataSys {
             {
                 self.local_authority_cache
                     .lock()
-                    .expect("local_authority_cache should not be poisoned")
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(bucket.to_string(), (gen_before, Arc::clone(&metadata)));
             }
             Ok(BucketMetadataAuthority::Authoritative(metadata))

@@ -2578,9 +2578,12 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
-#[allow(
-    dead_code,
-    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+    )
 )]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
     let dir = dir.as_ref();

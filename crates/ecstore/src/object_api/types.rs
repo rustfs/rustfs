@@ -245,17 +245,14 @@ impl ObjectLockConfigSnapshot {
 
     pub(crate) fn set_fresh_put_quota(&self, quota: FreshPutQuota) {
         if self._lifecycle_guard.is_some() && self.metadata_transaction_guard.is_some() {
-            *self
-                .fresh_put_quota
-                .lock()
-                .expect("fresh_put_quota mutex should not be poisoned") = Some(quota);
+            *self.fresh_put_quota.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(quota);
         }
     }
 
     pub(crate) fn take_fresh_put_quota(&self) -> Option<FreshPutQuota> {
         self.fresh_put_quota
             .lock()
-            .expect("fresh_put_quota mutex should not be poisoned")
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take()
     }
 
