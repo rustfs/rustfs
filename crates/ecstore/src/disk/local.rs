@@ -3017,7 +3017,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         || os::has_dir_fsync_test_failures()
 }
 
-#[cfg(all(not(any(test, feature = "test-util")), target_os = "linux"))]
+#[cfg(any(not(any(test, feature = "test-util")), not(target_os = "linux")))]
 pub(super) fn has_rename_data_test_failpoints(_dst_path: &str) -> bool {
     false
 }

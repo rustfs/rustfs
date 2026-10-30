@@ -6530,6 +6530,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {
