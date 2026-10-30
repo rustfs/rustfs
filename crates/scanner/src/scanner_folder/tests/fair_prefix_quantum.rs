@@ -145,7 +145,11 @@ async fn fair_prefix_quantum_nested_wide_directories_converge_across_restarts() 
         max_entries: Some(8),
         ..Default::default()
     };
-    let finished = run_until_finished(&disk_root, cache, config, 60).await;
+    // 41 root and 40 prefix entries at 8 per round, then 80 objects at the 7
+    // that survive each object-budget stop. Rebuilding a dropped index costs
+    // a full prefix enumeration per classification round and overruns this.
+    const ROUND_BOUND: usize = 6 + 5 + 12 + 2;
+    let finished = run_until_finished(&disk_root, cache, config, ROUND_BOUND).await;
     let totals = finished.checked_flatten("bucket").expect("bucket root");
     let expected = u64::try_from(WIDTH * 2).expect("fixture size");
     assert_eq!((totals.objects as u64, totals.versions as u64), (expected, expected));

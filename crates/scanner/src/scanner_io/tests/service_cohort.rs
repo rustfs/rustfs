@@ -468,6 +468,31 @@ async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
     clear_dirty_usage_buckets_for_tests();
 }
 
+/// A one-object share stops inside its first child, so the frontier never
+/// moves. Requeueing that bucket would spin until the cycle deadline.
+#[tokio::test]
+#[serial]
+async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeueing() {
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    create_cohort_bucket_objects(&store, "a-flat", 3).await;
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+        max_objects: Some(1),
+        ..Default::default()
+    });
+    let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget).await;
+    assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+    assert!(usage.is_none());
+    let ledger = load_set_cache(&store).await.info.scan_bucket_service.expect("saved order");
+    assert!(
+        ledger.buckets["a-flat"].service_quanta <= 3,
+        "turns without durable motion must end: {ledger:?}"
+    );
+    assert_eq!(ledger.failure_debt(), (0, None));
+    clear_dirty_usage_buckets_for_tests();
+}
+
 #[tokio::test]
 #[serial]
 async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners() {
