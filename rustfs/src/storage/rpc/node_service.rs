@@ -8915,28 +8915,47 @@ mod tests {
             ))
         }
 
-        async fn internal_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+        async fn internal_snapshot_once(
+            root: &std::path::Path,
+        ) -> std::io::Result<std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>>> {
             let mut snapshot = std::collections::BTreeMap::new();
             let mut directories = (0..4)
                 .map(|index| std::path::PathBuf::from(format!("disk{index}/{RUSTFS_META_BUCKET}")))
                 .collect::<Vec<_>>();
             while let Some(relative) = directories.pop() {
-                let mut entries = tokio::fs::read_dir(root.join(&relative))
-                    .await
-                    .expect("read internal snapshot directory");
+                let mut entries = tokio::fs::read_dir(root.join(&relative)).await?;
                 snapshot.insert(relative.clone(), None);
-                while let Some(entry) = entries.next_entry().await.expect("read internal snapshot entry") {
+                while let Some(entry) = entries.next_entry().await? {
                     let path = relative.join(entry.file_name());
-                    let file_type = entry.file_type().await.expect("read internal snapshot entry type");
+                    let file_type = entry.file_type().await?;
                     if file_type.is_dir() {
                         directories.push(path);
                     } else {
                         assert!(file_type.is_file(), "fixture snapshot must contain only directories and regular files");
-                        snapshot.insert(path, Some(tokio::fs::read(entry.path()).await.expect("read snapshot file bytes")));
+                        snapshot.insert(path, Some(tokio::fs::read(entry.path()).await?));
                     }
                 }
             }
-            snapshot
+            Ok(snapshot)
+        }
+
+        async fn internal_snapshot(root: &std::path::Path) -> std::collections::BTreeMap<std::path::PathBuf, Option<Vec<u8>>> {
+            // Startup cleanup can remove temporary paths after the namespace
+            // commit drains. Capture the complete tree only once it is stable.
+            super::timeout(Duration::from_secs(10), async {
+                let mut previous = None;
+                loop {
+                    match internal_snapshot_once(root).await {
+                        Ok(snapshot) if previous.as_ref() == Some(&snapshot) => return snapshot,
+                        Ok(snapshot) => previous = Some(snapshot),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => previous = None,
+                        Err(error) => panic!("read internal snapshot: {error}"),
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .expect("internal snapshot must stabilize within ten seconds")
         }
 
         fn file_info(object: &str, version: Uuid, body: Bytes) -> FileInfo {
