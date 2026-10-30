@@ -103,6 +103,10 @@ jobs:
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib rename_all_ -- --nocapture
 
+      - name: Test multipart parent durability barriers
+        shell: pwsh
+        run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
+
       - name: Test Windows path conversion
         shell: pwsh
         run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"

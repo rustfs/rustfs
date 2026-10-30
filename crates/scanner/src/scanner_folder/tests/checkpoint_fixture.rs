@@ -20,7 +20,9 @@ use crate::{DataUsageCacheSource, DataUsageScanPlanDigest};
 use std::io::Cursor;
 use tokio::io::AsyncReadExt;
 
+mod completed_compaction;
 mod deep_compacted;
+mod memory_budget;
 mod periodic_snapshot;
 mod segment_observation;
 
@@ -44,27 +46,37 @@ fn scan_options(scan_mode: HealScanMode) -> ScannerDiskScanOptions {
 /// Real cache persistence codec and CAS calls, backed by two bounded local files.
 #[derive(Debug)]
 struct FixtureStore {
-    root: tempfile::TempDir,
+    root: std::path::PathBuf,
+    _owned_root: Option<tempfile::TempDir>,
     reject_save: AtomicBool,
 }
 
 impl FixtureStore {
     fn new() -> Arc<Self> {
+        let root = tempfile::tempdir().expect("checkpoint fixture storage directory");
         Arc::new(Self {
-            root: tempfile::tempdir().expect("checkpoint fixture storage directory"),
+            root: root.path().to_path_buf(),
+            _owned_root: Some(root),
+            reject_save: AtomicBool::new(false),
+        })
+    }
+
+    fn reopen(root: std::path::PathBuf) -> Arc<Self> {
+        assert!(root.is_dir(), "reopen only an existing checkpoint fixture directory");
+        Arc::new(Self {
+            root,
+            _owned_root: None,
             reject_save: AtomicBool::new(false),
         })
     }
 
     fn path(&self, object: &str) -> std::path::PathBuf {
         assert!(object.ends_with(CACHE_NAME) || object.ends_with(&format!("{CACHE_NAME}.bkp")));
-        self.root
-            .path()
-            .join(if object.ends_with(".bkp") { "backup" } else { "main" })
+        self.root.join(if object.ends_with(".bkp") { "backup" } else { "main" })
     }
 
     async fn strict_load(&self) -> DataUsageCache {
-        let bytes = tokio::fs::read(self.root.path().join("main"))
+        let bytes = tokio::fs::read(self.root.join("main"))
             .await
             .expect("saved checkpoint fixture must exist");
         decode_fixture(&bytes).expect("saved checkpoint fixture must contain a valid bucket root")
@@ -773,7 +785,13 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
         matches!(state, crate::scanner_io::DataUsageCacheScanState::Prepared { .. }),
         "Normal complete is not Deep Current"
     );
-    cache.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, identity);
+    // The first sweep already compacts this prefix. Select its sampling
+    // cycle so the bounded scan exercises interruption rather than reuse.
+    let sampling_cycles = data_usage_update_dir_cycles();
+    let sampling_cycle = (12..12 + sampling_cycles)
+        .find(|cycle| hash_path("bucket/prefix").mod_(*cycle, sampling_cycles))
+        .expect("one prefix sampling cycle per rotation");
+    cache.prepare_bucket_checkpoint("bucket", u64::from(sampling_cycle), 7, SOURCE, PLAN, identity);
     assert!(cache.info.scan_progress.is_none(), "complete unchanged baseline uses existing sampling");
     let parent = CancellationToken::new();
     let budget = ScannerCycleBudget::new_with_progress_tracking(
@@ -825,7 +843,7 @@ async fn check_complete_sampling_resumption(resume_mode: HealScanMode) {
             .load_with_revisions(store.clone(), CACHE_NAME)
             .await
             .expect("reload partial each recovery round");
-        loaded.prepare_bucket_checkpoint("bucket", 12, 7, SOURCE, PLAN, resumed_identity);
+        loaded.prepare_bucket_checkpoint("bucket", u64::from(sampling_cycle), 7, SOURCE, PLAN, resumed_identity);
         assert!(loaded.info.scan_progress.is_some(), "sampling partial must enter forward validation");
         loaded.info.skip_healing = true;
         let parent = CancellationToken::new();
@@ -1320,7 +1338,7 @@ where
         .load_with_revisions(store.clone(), CACHE_NAME)
         .await
         .expect("load final checkpoint");
-    let before = tokio::fs::read(store.root.path().join("main"))
+    let before = tokio::fs::read(store.root.join("main"))
         .await
         .expect("read durable checkpoint bytes");
     let epoch_error = loaded
@@ -1335,7 +1353,7 @@ where
         .await
         .expect_err("injected save failure must not report durable progress");
     assert_eq!(
-        tokio::fs::read(store.root.path().join("main"))
+        tokio::fs::read(store.root.join("main"))
             .await
             .expect("read unchanged checkpoint bytes"),
         before

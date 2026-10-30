@@ -17,6 +17,7 @@ mod auth;
 pub mod console;
 pub mod handlers;
 mod plugin_contract;
+pub(crate) mod plugin_runner;
 pub(crate) mod replication_metrics_wire;
 // Contract inventory is validated by tests before later runtime integration.
 pub(crate) mod route_policy;
@@ -64,6 +65,8 @@ pub fn make_admin_route(
 fn register_admin_routes(r: &mut S3Router<AdminOperation>) -> std::io::Result<()> {
     health::register_health_route(r)?;
     sts::register_admin_auth_route(r)?;
+    handlers::plugin_delegation::register_plugin_delegation_route(r)?;
+    handlers::plugin_attempt::register_plugin_attempt_route(r)?;
 
     account::register_account_route(r)?;
     mfa::register_mfa_route(r)?;

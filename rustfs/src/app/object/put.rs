@@ -18,7 +18,7 @@ use super::*;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_put_read_quorum_error};
+use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_read_quorum_error};
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -1118,7 +1118,7 @@ impl PutObjectCompletion {
 /// Record the failed completion and hand the error back to the caller.
 fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
     let err = if matches!(&completion, PutObjectCompletion::S3(_)) {
-        normalize_put_read_quorum_error(err)
+        normalize_read_quorum_error(err)
     } else {
         err
     };
@@ -1211,7 +1211,7 @@ impl DefaultObjectUsecase {
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
         self.execute_put_object_boxed(_fs, req)
             .await
-            .map_err(normalize_put_read_quorum_error)
+            .map_err(normalize_read_quorum_error)
     }
 
     fn execute_put_object_boxed<'a>(
@@ -1272,6 +1272,7 @@ impl DefaultObjectUsecase {
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
+        reject_veeam_sosapi_mutation(|| self.object_store(), req.input.bucket.as_str(), req.input.key.as_str()).await?;
         if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
@@ -1435,7 +1436,10 @@ impl DefaultObjectUsecase {
 
         let output = PutObjectOutput {
             e_tag,
-            server_side_encryption: committed.effective_sse.clone(),
+            server_side_encryption: committed
+                .effective_sse
+                .clone()
+                .filter(|_| committed.sse_customer_algorithm.is_none()),
             sse_customer_algorithm: committed.sse_customer_algorithm.clone(),
             sse_customer_key_md5: committed.sse_customer_key_md5.clone(),
             ssekms_key_id: committed.effective_kms_key_id.clone(),
@@ -1504,6 +1508,8 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5,
         } = sse;
+
+        reject_veeam_sosapi_mutation(|| self.object_store(), bucket.as_str(), key.as_str()).await?;
 
         // The app check preserves the existing S3 error contract; the storage
         // commit path reserves the exact net logical growth under its locks.
@@ -2086,7 +2092,8 @@ impl DefaultObjectUsecase {
             let put_admission = put_admission;
             let table_publication_guard = origin.take_table_publication_guard();
             let table_data_plane_publication_guards = origin.table_data_plane_publication_guards();
-            async move {
+            // Keep the large commit future off the request stack when propagating task-local context.
+            Box::pin(async move {
                 let _table_publication_guard = table_publication_guard;
                 let _table_data_plane_publication_guards = table_data_plane_publication_guards;
                 let _put_admission = put_admission;
@@ -2142,6 +2149,7 @@ impl DefaultObjectUsecase {
                                 result = "error",
                                 error_code = %err.code.as_str(),
                                 storage_error_code = ?diagnostic.storage_code,
+                                lock_failure_reason = diagnostic.lock_reason,
                                 io_error_kind = ?diagnostic.io_kind,
                                 rpc_error_code = ?diagnostic.rpc_code,
                                 pool_metadata_reason = diagnostic.pool_metadata.map(|context| context.reason),
@@ -2246,12 +2254,17 @@ impl DefaultObjectUsecase {
                 rustfs_io_metrics::record_put_object_stage_duration_from("app_capacity_update", capacity_update_stage_start);
 
                 Ok::<_, S3Error>(PutObjectCommitResult { obj_info, put_versioned })
-            }
+            })
         };
         #[cfg(feature = "diagnostic-read-version-caller")]
         let put_commit_future = crate::app::storage_api::diagnostic::with_read_version_spawn_context(
             crate::app::storage_api::diagnostic::ReadVersionEntrySource::AppPutOwner,
             crate::app::storage_api::diagnostic::ReadVersionContextBoundary::AppPutOwner,
+            put_commit_future,
+        );
+        #[cfg(not(feature = "diagnostic-read-version-caller"))]
+        let put_commit_future = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+            rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
             put_commit_future,
         );
         let put_commit = spawn_traced_join(put_commit_future);
@@ -2333,6 +2346,68 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+
+    #[test]
+    #[serial_test::serial]
+    fn put_commit_lock_failure_keeps_request_operation_in_spawned_owner() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
+        use rustfs_lock::LockError;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (store, context) = runtime.block_on(Box::pin(real_store_test_context()));
+        let bucket = format!("put-lock-context-{}", Uuid::new_v4());
+        runtime
+            .block_on(Box::pin(store.make_bucket(&bucket, &MakeBucketOptions::default())))
+            .expect("test bucket");
+        let input = PutObjectInput::builder()
+            .bucket(bucket)
+            .key("test-object".to_string())
+            .body(Some(StreamingBlob::from_bytes(Bytes::from_static(b"payload"))))
+            .content_length(Some(7))
+            .build()
+            .expect("PUT input");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let mut request = S3HttpRequestGuard::new("PUT");
+        let error = metrics::with_local_recorder(&recorder, || {
+            let fs = FS::new();
+            let mut future = Box::pin(PUT_STORAGE_TEST_FAILURE.scope(
+                (
+                    PutStorageTestStage::Commit,
+                    StorageError::Lock(LockError::timeout("private-bucket/private-key", Duration::from_secs(5))),
+                ),
+                Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))),
+            ));
+            runtime.block_on(std::future::poll_fn(|cx| {
+                request.in_scope(|| std::future::Future::poll(future.as_mut(), cx))
+            }))
+        })
+        .expect_err("lock failure must reject the PUT");
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+
+        let rows = snapshotter.snapshot().into_vec();
+        let (key, _, _, value) = rows
+            .iter()
+            .find(|(key, _, _, _)| key.key().name() == "rustfs_s3_lock_failures_total")
+            .expect("spawned commit lock failure must be counted");
+        assert!(matches!(value, DebugValue::Counter(1)));
+        let labels = key
+            .key()
+            .labels()
+            .map(|label| (label.key(), label.value()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(labels["op"], S3Operation::PutObject.as_str());
+        assert_eq!(labels["resource_class"], "object_namespace");
+        assert_eq!(labels["mode"], "unknown");
+        assert_eq!(labels["reason"], "timeout");
+        assert!(!labels.values().any(|value| value.contains("private")));
+    }
 
     #[tokio::test]
     #[serial_test::serial]
@@ -3964,6 +4039,12 @@ mod tests {
     async fn sse_c_put_is_accepted_on_a_bucket_with_default_encryption() {
         use md5::{Digest as _, Md5};
 
+        let context = crate::storage::storage_api::bootstrap_instance_ctx();
+        assert!(
+            context.object_encryption_resolver().is_some(),
+            "real SSE-C reads need the production encryption resolver"
+        );
+
         for (algorithm, kms_key_id, prefix) in [
             (ServerSideEncryption::AES256, None, "ssec-over-aes256-default"),
             (ServerSideEncryption::AWS_KMS, Some("bucket-key"), "ssec-over-kms-default"),
@@ -3985,14 +4066,69 @@ mod tests {
                 .content_length(Some(i64::try_from(payload.len()).expect("test payload length must fit i64")))
                 .sse_customer_algorithm(Some("AES256".to_string()))
                 .sse_customer_key(Some(base64_simd::STANDARD.encode_to_string(customer_key)))
-                .sse_customer_key_md5(Some(key_md5))
+                .sse_customer_key_md5(Some(key_md5.clone()))
                 .build()
                 .expect("SSE-C PUT input must build");
 
-            DefaultObjectUsecase::from_global()
+            let usecase = DefaultObjectUsecase::from_global();
+            let response = usecase
                 .execute_put_object(&FS::new(), build_request(input, Method::PUT))
                 .await
                 .unwrap_or_else(|err| panic!("a {algorithm} default bucket must accept an SSE-C PUT: {err:?}"));
+            assert_eq!(response.output.server_side_encryption, None);
+            assert_eq!(response.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(response.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+
+            let encoded_key = base64_simd::STANDARD.encode_to_string(customer_key);
+            let mut read_headers = HeaderMap::new();
+            read_headers.insert("x-amz-server-side-encryption-customer-algorithm", HeaderValue::from_static("AES256"));
+            read_headers.insert(
+                "x-amz-server-side-encryption-customer-key",
+                HeaderValue::from_str(&encoded_key).expect("encoded customer key is a valid header"),
+            );
+            read_headers.insert(
+                "x-amz-server-side-encryption-customer-key-md5",
+                HeaderValue::from_str(&key_md5).expect("customer key MD5 is a valid header"),
+            );
+            let head_input = HeadObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(encoded_key.clone()))
+                .sse_customer_key_md5(Some(key_md5.clone()))
+                .build()
+                .expect("SSE-C HEAD input must build");
+            let mut head_request = build_request(head_input, Method::HEAD);
+            head_request.headers = read_headers.clone();
+            let head = Box::pin(usecase.execute_head_object(head_request))
+                .await
+                .expect("matching SSE-C key must authorize HEAD");
+            assert_eq!(head.output.server_side_encryption, None);
+            assert_eq!(head.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(head.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+
+            let get_input = GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("ledger.csv".to_string())
+                .sse_customer_algorithm(Some("AES256".to_string()))
+                .sse_customer_key(Some(encoded_key))
+                .sse_customer_key_md5(Some(key_md5.clone()))
+                .build()
+                .expect("SSE-C GET input must build");
+            let mut get_request = build_request(get_input, Method::GET);
+            get_request.headers = read_headers;
+            let get = Box::pin(usecase.execute_get_object(get_request))
+                .await
+                .expect("matching SSE-C key must authorize GET");
+            assert_eq!(get.output.server_side_encryption, None);
+            assert_eq!(get.output.sse_customer_algorithm.as_deref(), Some("AES256"));
+            assert_eq!(get.output.sse_customer_key_md5.as_deref(), Some(key_md5.as_str()));
+            let mut body = get.output.body.expect("SSE-C GET must include the decrypted body");
+            let mut plaintext = Vec::new();
+            while let Some(chunk) = body.next().await {
+                plaintext.extend_from_slice(&chunk.expect("SSE-C body must decrypt completely"));
+            }
+            assert_eq!(plaintext, payload, "header classification must preserve the complete decrypted payload");
 
             let stored = store
                 .get_object_info(&bucket, "ledger.csv", &ObjectOptions::default())

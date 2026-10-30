@@ -143,6 +143,8 @@ pub(crate) mod protocols {
         pub(crate) use crate::storage::storage_api::{StorageObjectOptions, StoragePutObjReader};
         pub(crate) type FS = crate::storage::storage_api::FS;
         pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;
+        #[cfg(all(test, any(feature = "webdav", feature = "sftp")))]
+        pub(crate) use s3s::S3ErrorCode;
         #[cfg(test)]
         pub(crate) use s3s::dto::ListObjectsV2Input;
 
@@ -242,6 +244,13 @@ pub(crate) mod server {
 
     pub(crate) mod layer {
         pub(crate) use crate::storage::storage_api::apply_cors_headers;
+
+        #[cfg(feature = "diagnostic-local-batch")]
+        pub(crate) mod batch_diagnostic {
+            #[cfg(test)]
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::current_request_id;
+            pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{in_request_context, request_context};
+        }
 
         pub(crate) mod request_context {
             pub(crate) use crate::storage::storage_api::request_context_consumer::{
@@ -457,6 +466,8 @@ pub(crate) mod workload {
     }
 
     pub(crate) mod concurrency {
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::concurrency_consumer::ConcurrencyManager;
         pub(crate) use crate::storage::storage_api::concurrency_consumer::get_concurrency_manager;
     }
 }

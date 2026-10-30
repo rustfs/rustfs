@@ -34,7 +34,7 @@ use crate::common::{
 };
 use crate::replication_extension_test::LOOPBACK_REPLICATION_TARGET_ENV;
 use aws_sdk_s3::Client;
-use aws_sdk_s3::config::retry::RetryConfig;
+use aws_sdk_s3::config::{Credentials, retry::RetryConfig};
 use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
 use aws_sdk_s3::operation::{get_object::GetObjectError, put_object::PutObjectError};
 use aws_sdk_s3::primitives::ByteStream;
@@ -185,13 +185,12 @@ impl DistCluster {
         if node_idx >= self.cluster.nodes.len() {
             return Err("node_idx is invalid".into());
         }
-        Ok(Client::from_conf(build_test_s3_config(
-            &self.cluster.nodes[node_idx].url,
-            access_key,
-            secret_key,
-            None,
-            "cluster-iam-test",
-        )))
+        let config = self.cluster.create_s3_client(node_idx)?.config().to_builder();
+        Ok(Client::from_conf(
+            config
+                .credentials_provider(Credentials::new(access_key, secret_key, None, None, "cluster-iam-test"))
+                .build(),
+        ))
     }
 
     /// Stop the fleet, drop retired pools from the command line, and restart
@@ -347,7 +346,10 @@ fn relocate_pool_storage(cluster: &mut RustFSTestClusterEnvironment, node_idx: u
     Ok(pool_run_root)
 }
 
-fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+pub(super) fn configure_node_logs(cluster: &mut RustFSTestClusterEnvironment, capture_dir: Option<&Path>) -> TestResult {
+    if let Ok(filter) = std::env::var("RUSTFS_E2E_LOG_FILTER") {
+        cluster.set_env("RUST_LOG", filter);
+    }
     if let Some(directory) = capture_dir {
         std::fs::create_dir_all(directory)?;
         for node_idx in 0..cluster.nodes.len() {
@@ -1179,11 +1181,16 @@ pub(crate) async fn retrying_get_equals(
                 )
                 .into()),
                 Err(error) => {
-                    if matches!(s3_probe_error_code(error.as_ref()), Some("SlowDown" | "ServiceUnavailable")) {
-                        Ok(false)
-                    } else {
-                        Err(error)
-                    }
+                    let retryable = match s3_probe_error_code(error.as_ref()) {
+                        Some("SlowDown" | "ServiceUnavailable") => true,
+                        // GET preserves this compatibility code for a lost data quorum.
+                        Some("SlowDownRead") => error
+                            .downcast_ref::<SdkError<GetObjectError>>()
+                            .and_then(SdkError::raw_response)
+                            .is_some_and(|response| response.status().as_u16() == 503),
+                        _ => false,
+                    };
+                    if retryable { Ok(false) } else { Err(error) }
                 }
             }
         },
@@ -1319,6 +1326,62 @@ mod retry_tests {
             .expect_err("replication may lag, but it must not return corrupt bytes");
         assert!(error.to_string().contains("bytes mismatch"));
         assert_eq!(target.requests().len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn retrying_get_allows_read_quorum_recovery() -> TestResult {
+        use aws_sdk_s3::config::Region;
+        use aws_smithy_http_client::test_util::{ReplayEvent, StaticReplayClient};
+        use aws_smithy_types::body::SdkBody;
+
+        let endpoint = "http://read-quorum.example.invalid";
+        let event = |status: u16, body: &'static str| {
+            ReplayEvent::new(
+                http::Request::builder()
+                    .method(Method::GET)
+                    .uri(format!("{endpoint}/retry-probe/key?x-id=GetObject"))
+                    .body(SdkBody::empty())
+                    .expect("build replay request"),
+                http::Response::builder()
+                    .status(status)
+                    .header("content-type", "application/xml")
+                    .header("content-length", body.len())
+                    .body(SdkBody::from(body))
+                    .expect("build replay response"),
+            )
+        };
+        for status in [503, 403, 500] {
+            let transport = StaticReplayClient::new(vec![
+                event(status, "<Error><Code>SlowDownRead</Code></Error>"),
+                event(200, "expected bytes"),
+            ]);
+            let client = Client::from_conf(
+                aws_sdk_s3::Config::builder()
+                    .behavior_version_latest()
+                    .credentials_provider(Credentials::new(FAKE_ACCESS_KEY, FAKE_SECRET_KEY, None, None, "read-quorum-test"))
+                    .region(Region::new("us-east-1"))
+                    .endpoint_url(endpoint)
+                    .force_path_style(true)
+                    .retry_config(RetryConfig::disabled())
+                    .http_client(transport.clone())
+                    .build(),
+            );
+            let result = retrying_get_equals(&client, "retry-probe", "key", b"expected bytes", Duration::from_secs(5)).await;
+            if status == 503 {
+                result?;
+                assert_eq!(
+                    transport.actual_requests().count(),
+                    2,
+                    "the probe must retry the read-quorum error exactly once"
+                );
+                transport.assert_requests_match(&[]);
+            } else {
+                let error = result.expect_err("the compatibility code must not hide a non-503 failure");
+                assert_eq!(s3_probe_error_code(error.as_ref()), Some("SlowDownRead"));
+                assert_eq!(transport.actual_requests().count(), 1, "non-availability errors must fail immediately");
+            }
+        }
         Ok(())
     }
 

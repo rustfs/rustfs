@@ -31,7 +31,10 @@ use std::sync::Mutex;
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
 mod incremental_enumeration;
+mod listing_completion;
 mod metadata_visits;
+mod node_admission;
+mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
 fn reset_alert_cooldowns() {
@@ -337,7 +340,10 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         .await
         .expect("failed to create test directory");
 
-    let endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+    let mut endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("failed to create endpoint");
+    endpoint.set_pool_index(0);
+    endpoint.set_set_index(0);
+    endpoint.set_disk_index(0);
     let disk = new_disk(
         &endpoint,
         &DiskOption {
@@ -354,7 +360,6 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         root: temp_dir.to_string_lossy().to_string(),
         old_cache: DataUsageCache::default(),
         new_cache: DataUsageCache::default(),
-        update_cache: DataUsageCache::default(),
         data_usage_scanner_debug: false,
         heal_object_select: 0,
         scan_mode: HealScanMode::Normal,
@@ -366,13 +371,13 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
         pacing_debt: PacingDebt::default(),
+        node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
-        updates: None,
+        usage_updates: None,
         checkpoint_tx: None,
         checkpoint_ancestors: Vec::new(),
         checkpoint_depth: 0,
-        last_update: SystemTime::UNIX_EPOCH,
         checkpoint_objects: 0,
         object_metadata_visits: metrics::Counter::noop(),
         last_checkpoint_objects: 0,
@@ -393,13 +398,11 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         resume_failed_paths: Vec::new(),
         coverage_gap: false,
         raw_enumeration_progress: Vec::new(),
-        pending_heal_sync_deferred: false,
-        pending_heal_batch_dirty: false,
-        pending_heal_sync_count: 0,
         pending_size_reconciliation_keys: HashSet::new(),
         pending_size_reconciliation_scopes: HashSet::new(),
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
+        defer_abandoned_entries_until_finished: false,
     };
 
     (scanner, temp_dir)
@@ -712,7 +715,6 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     scanner.finish_size_reconciliation_batch();
 
     assert_eq!(scanner.new_cache.info.size_reconciliation.len(), 1);
-    assert_eq!(scanner.update_cache.info.size_reconciliation.len(), 1);
     assert_eq!(scanner.new_cache.info.size_reconciliation[&entry.key].attempts, 2);
 
     let encoded = rmp_serde::to_vec_named(&scanner.new_cache.info).expect("size ledger should encode");
@@ -726,7 +728,6 @@ async fn malformed_size_reconciliation_replays_after_restart() {
     scanner.apply_size_reconciliation(&resolved);
     scanner.finish_size_reconciliation_batch();
     assert!(scanner.new_cache.info.size_reconciliation.is_empty());
-    assert!(scanner.update_cache.info.size_reconciliation.is_empty());
 }
 
 #[tokio::test]
@@ -770,6 +771,7 @@ fn test_classify_get_size_failure_marks_metadata_heal_object_path() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -801,6 +803,7 @@ fn test_classify_get_size_failure_records_transient_metadata_error_without_heal(
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -857,6 +860,7 @@ async fn test_heal_replication_skips_only_unversioned_data_versions() {
         lifecycle: None,
         object_lock: None,
         replication: Some(Arc::new(ReplicationConfig::new(None, None))),
+        heal_scope: None,
         heal_enabled: false,
         heal_bitrot: false,
         debug: false,
@@ -1534,7 +1538,6 @@ async fn mrf_ownership_legacy_notices_preserve_pending_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.heal_object_select = 1;
 
     let version = Uuid::new_v4().to_string();
@@ -1681,7 +1684,6 @@ async fn test_pending_heal_prune_expires_stale_entries() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("stale"), None, 1, 1);
     stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
@@ -1692,7 +1694,6 @@ async fn test_pending_heal_prune_expires_stale_entries() {
 
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("fresh"));
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
     assert!(scanner.pending_heals_changed);
 }
 
@@ -1701,7 +1702,6 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let mut stale = pending_heal(PendingScannerHealKind::Object, "bucket", Some("object"), None, 1, 1);
     stale.first_seen = FolderScanner::now_secs().saturating_sub(MAX_PENDING_SCANNER_HEAL_AGE_SECS + 1);
@@ -1719,7 +1719,6 @@ async fn test_pending_heal_update_keeps_stale_entry_until_retry_prune() {
     assert_eq!(scanner.new_cache.info.pending_heals.len(), 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].attempts, 1);
     assert_eq!(scanner.new_cache.info.pending_heals[0].object.as_deref(), Some("object"));
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
 }
 
 #[tokio::test]
@@ -1727,7 +1726,6 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     let (mut scanner, temp_dir) = build_test_scanner().await;
     let _guard = TestGuard::new(u64::MAX, usize::MAX, &mut scanner, temp_dir);
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     scanner.update_pending_scanner_heal_after_admission(
         PendingScannerHealKind::Object,
@@ -1753,7 +1751,6 @@ async fn test_pending_heal_queue_full_deduplicates_object_entry() {
     assert_eq!(pending.attempts, 1);
     assert_eq!(pending.last_admission_result, "dropped");
     assert_eq!(pending.last_admission_reason, "queue_full");
-    assert_eq!(scanner.update_cache.info.pending_heals, scanner.new_cache.info.pending_heals);
     assert!(scanner.pending_heals_changed);
 }
 
@@ -1879,7 +1876,6 @@ async fn test_scan_folder_keeps_old_cache_bounded_by_loaded_entries() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
     for directory in 0..16 {
         for object in 0..32 {
@@ -2267,6 +2263,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
         lifecycle: None,
         object_lock: None,
         replication: None,
+        heal_scope: None,
         heal_enabled: true,
         heal_bitrot: true,
         debug: false,
@@ -2278,7 +2275,7 @@ async fn test_heal_actions_returns_actual_size_without_inline_heal() {
     };
     let mut size_summary = SizeSummary::default();
 
-    let size = item.heal_actions(&object_info, 123, &mut size_summary).await;
+    let size = item.heal_actions(&object_info, 123, &mut size_summary, None).await;
     assert_eq!(size, 123);
 }
 
@@ -2299,7 +2296,6 @@ async fn test_scan_folder_skips_unreadable_child_directory() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2327,7 +2323,6 @@ async fn test_scan_folder_treats_child_removed_before_open_as_empty() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket/gone".to_string(),
@@ -2360,7 +2355,6 @@ async fn scan_folder_charges_each_enumerated_entry_to_the_disk_budget() {
     scanner.sleeper = SCANNER_SLEEPER.for_disk(&temp_dir);
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2487,7 +2481,6 @@ async fn test_scan_folder_missing_bucket_root_still_reports_not_found() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -2511,7 +2504,7 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
     let _guard = TestGuard::new(60, 100, &mut scanner, temp_dir.clone());
     let heal_starts = Arc::new(AtomicUsize::new(0));
     let heal_starts_clone = heal_starts.clone();
-    let healed_versions = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+    let healed_versions = Arc::new(Mutex::new(Vec::new()));
     let healed_versions_clone = healed_versions.clone();
     let (_commands, mut heal_rx) = rustfs_heal_contracts::heal_channel::init_heal_channels()
         .expect("heal channels should initialize once for scanner tests");
@@ -2523,7 +2516,7 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
                 healed_versions_clone
                     .lock()
                     .expect("heal version capture lock should not be poisoned")
-                    .push(request.object_version_id);
+                    .push((request.object_prefix, request.object_version_id, request.pool_index, request.set_index));
                 let _ = response_tx.send(Ok(rustfs_heal_contracts::heal_channel::HealAdmissionReceipt {
                     result: HealAdmissionResult::Accepted,
                     task_id: request.id,
@@ -2604,8 +2597,89 @@ async fn test_scan_folder_exits_when_abandoned_child_listing_finishes() {
             .lock()
             .expect("heal version capture lock should not be poisoned")
             .iter()
-            .any(|version| version.as_deref() == Some(orphan_version_text.as_str())),
+            .any(|(_, version, _, _)| version.as_deref() == Some(orphan_version_text.as_str())),
         "sub-quorum orphan version must be submitted as an exact heal candidate"
+    );
+    assert!(
+        healed_versions
+            .lock()
+            .expect("heal scope capture lock should not be poisoned")
+            .iter()
+            .filter(|(object, _, _, _)| object.is_some())
+            .all(|(_, _, pool, set)| (*pool, *set) == (Some(0), Some(0))),
+        "high-priority discovered objects must retain the scanning disk's scope"
+    );
+    let bucket_admission = scanner
+        .send_required_scanner_heal_request(
+            PendingScannerHealKind::Bucket,
+            bucket.to_string(),
+            None,
+            None,
+            build_bucket_heal_request(bucket.to_string(), HealChannelPriority::High),
+        )
+        .await
+        .expect("submit bucket request");
+    assert_eq!(bucket_admission, HealAdmissionResult::Accepted);
+    assert_eq!(
+        healed_versions.lock().expect("read captured bucket scope").last(),
+        Some(&(None, None, None, None)),
+        "bucket healing must retain its cross-pool scope"
+    );
+    scanner.new_cache.info.name = bucket.to_string();
+    scanner.new_cache.info.pending_heals = vec![pending_heal(
+        PendingScannerHealKind::Object,
+        bucket,
+        Some("pending-object"),
+        Some(&orphan_version_text),
+        0,
+        1,
+    )];
+    scanner
+        .retry_pending_scanner_heals()
+        .await
+        .expect("retry persisted object heal");
+    assert_eq!(
+        healed_versions.lock().expect("read retried object scope").last(),
+        Some(&(Some("pending-object".to_string()), Some(orphan_version_text.clone()), Some(0), Some(0))),
+        "persisted retries must bind the current scanning disk"
+    );
+    let unscoped_endpoint = Endpoint::try_from(temp_dir.to_string_lossy().as_ref()).expect("parse uninitialized endpoint");
+    scanner.local_disk = new_disk(
+        &unscoped_endpoint,
+        &DiskOption {
+            cleanup: false,
+            health_check: false,
+        },
+    )
+    .await
+    .expect("open disk without initialized location");
+    let request_count = healed_versions.lock().expect("count admitted requests").len();
+    let deferred = scanner
+        .send_required_scanner_heal_request(
+            PendingScannerHealKind::Object,
+            bucket.to_string(),
+            Some("unscoped-object".to_string()),
+            Some(orphan_version_text.clone()),
+            build_object_heal_request(
+                bucket.to_string(),
+                "unscoped-object".to_string(),
+                Some(orphan_version_text),
+                HealScanMode::Deep,
+                HealChannelPriority::High,
+            ),
+        )
+        .await
+        .expect("defer object with unknown disk location");
+    assert_eq!(deferred, HealAdmissionResult::Full);
+    assert_eq!(healed_versions.lock().expect("count unchanged admissions").len(), request_count);
+    assert!(
+        scanner
+            .new_cache
+            .info
+            .pending_heals
+            .iter()
+            .any(|entry| entry.object.as_deref() == Some("unscoped-object")),
+        "an unscoped high-priority object must remain pending"
     );
     for (path, expected) in expected_metadata {
         assert_eq!(
@@ -2632,7 +2706,6 @@ async fn test_scan_folder_xl_meta_named_directory_uses_namespace_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
 
     let parent = CancellationToken::new();
@@ -2692,7 +2765,6 @@ async fn scan_corrupt_metadata_with_captured_logs(logs: &CapturedLogs) {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
 
     let parent = CancellationToken::new();
@@ -2843,7 +2915,6 @@ async fn test_scan_folder_missing_xl_meta_stops_erasure_data_dir_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
     scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest).for_disk_with_budget_for_tests(
         &temp_dir,
@@ -2936,8 +3007,9 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = true;
+    let (sender, _receiver) = mpsc::channel(1);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(sender, "bucket".to_string()));
     let namespace_hash = hash_path(&format!("bucket/{namespace_name}"));
     scanner.old_cache.replace_hashed(
         &namespace_hash,
@@ -2972,7 +3044,13 @@ async fn test_scan_folder_uuid_namespace_part_name_directory_is_not_data_dir() {
     assert_eq!(budget.reason(), Some(crate::scanner_budget::ScannerCycleBudgetReason::Directories));
     assert!(scanner.new_cache.info.failed_objects.is_empty());
     assert!(
-        scanner.update_cache.find(&namespace_hash.key()).is_some(),
+        scanner
+            .usage_updates
+            .as_ref()
+            .expect("requested progress")
+            .cache
+            .find(&namespace_hash.key())
+            .is_some(),
         "an existing UUID namespace must retain its cached subtree"
     );
 }
@@ -2993,7 +3071,6 @@ async fn test_scan_folder_non_erasure_metadata_keeps_namespace_descent() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.is_erasure_mode = false;
 
     let parent = CancellationToken::new();
@@ -3034,7 +3111,6 @@ async fn scoped_root_scan_reuses_clean_top_level_entries_and_rescans_dirty_entri
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
     scanner.old_cache.replace(
         "bucket/clean",
@@ -3093,7 +3169,6 @@ async fn scan_hot_cold_segment_fixture(scoped: bool) -> (DataUsageEntry, Vec<Str
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     if scoped {
         scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
         scanner.old_cache.replace(
@@ -3179,7 +3254,6 @@ async fn scoped_root_scan_preserves_erasure_health_walks() {
     scanner.is_erasure_mode = true;
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
     scanner.old_cache.replace("bucket", "", DataUsageEntry::default());
     scanner.old_cache.replace(
         "bucket/clean",
@@ -3223,11 +3297,9 @@ async fn test_scan_folder_compacted_parent_sends_partial_update() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
-    scanner.last_update = SystemTime::UNIX_EPOCH;
 
     let (tx, mut rx) = mpsc::channel(1);
-    scanner.updates = Some(tx);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(tx, "bucket".to_string()));
 
     let folder = CachedFolder {
         name: "bucket".to_string(),
@@ -4228,7 +4300,6 @@ async fn test_scan_folder_ignores_symlinked_child_directory() {
 
     scanner.old_cache.info.name = "bucket".to_string();
     scanner.new_cache.info.name = "bucket".to_string();
-    scanner.update_cache.info.name = "bucket".to_string();
 
     let folder = CachedFolder {
         name: "bucket".to_string(),

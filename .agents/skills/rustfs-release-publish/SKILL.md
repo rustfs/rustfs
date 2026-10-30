@@ -25,18 +25,19 @@ Read only the current phase's procedure; retain completed evidence across turns.
 | 4–5 | [Run the downloaded binary, Console CRUD, and latest-rc matrix](references/preview-acceptance.md). Every check must pass. |
 | Confirmation | Complete the gate below and end the turn. |
 | 6 | After fresh confirmation, [publish and verify the final tag](references/final-release.md) at `PREVIEW_HASH`. |
-| 7 | [Reconcile Security Advisories, milestones, installation references, and the website](references/post-release-updates.md) only after complete publication. |
+| 7 | [Reconcile Security Advisories, milestones, installation references, and the website; reconcile main and remove the completed release branch](references/post-release-updates.md) only after complete publication. |
 
 ## Human Confirmation
 
-After Phases 3–5 pass, recheck that the release branch still equals `PREVIEW_HASH`. Report the target, branch, preview tag/hash, branch CI run, preview Release URL, Console result, and rc matrix. Explicitly ask whether to publish the final tag and end the turn without creating/pushing it.
+After Phases 3–5 pass, recheck that the release branch still equals `PREVIEW_HASH` and that the current Console asset tag/digest match the preview's recorded build inputs. Report the target, branch, preview tag/hash, branch CI run, preview Release URL, accepted Console asset identity/result, and rc matrix. Explicitly ask whether to publish the final tag and end the turn without creating/pushing it.
 
-Only a new affirmative user reply to that exact report authorizes Phase 6. The original release request, earlier confirmation, silence, or automated follow-up does not count. Confirmation binds the target, preview tag, and hash; a changed value or repeated/failed acceptance cycle invalidates it. Revalidate and obtain fresh confirmation before continuing.
+Only a new affirmative user reply to that exact report authorizes Phase 6. The original release request, earlier confirmation, silence, or automated follow-up does not count. Confirmation binds the target, preview tag, hash, and accepted build inputs; a changed value or repeated/failed acceptance cycle invalidates it. Revalidate and obtain fresh confirmation before continuing.
 
 ## Recovery
 
 - Before the final tag exists, land fixes on main, backport to the candidate, verify target versions, and restart branch CI/acceptance. Use a new preview iteration once a preview was tagged; main may advance independently.
+- If only an external build input changed, record it, create a new preview iteration even when the source SHA is unchanged, and repeat the affected build and artifact acceptance before fresh confirmation. Reuse source checks whose inputs remain valid.
 - Once the final tag exists, retry publication jobs for that exact tag. A source fix requires a newly confirmed target, not retagging or a newer preview. Phase 7 retries recheck artifact availability and superseding releases.
-- If abandoned after the bump merged, report the unpublished version on main and record whether to revert or let the next release overwrite it. Deleting candidate branches or preview tags requires an explicit decision.
+- If abandoned after the bump merged, report the unpublished version on main and record whether to revert or let the next release overwrite it. Deleting unpublished candidate branches or preview tags requires an explicit decision. Completed release branches follow Phase 7 cleanup; keep release tags.
 
 Report completed phase results and incomplete work with evidence: Console previous/latest tags, release need, hash and run/Release URLs; target, branch CI/SHA, previews and hash, confirmation state; preview/final assets, latest-channel state, Console/rc results and cleanup; advisory reconciliation results and pending disclosure decisions; both milestone states, installation PR checks/merge state, and website text/link/PR/deployment state. Keep artifact publication separate from follow-up delivery; do not call an open PR a live update. Report deviations and their authorization.

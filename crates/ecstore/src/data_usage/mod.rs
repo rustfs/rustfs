@@ -28,7 +28,7 @@ use crate::{
     error::{Error, classify_system_path_failure_reason},
     object_api::{ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
-    store::{ECStore, list_objects::list_marker_key},
+    store::ECStore,
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
@@ -216,7 +216,7 @@ pub async fn lookup_degraded_bucket_usage_baseline(store: Arc<ECStore>, bucket: 
     // Stale or empty cache: refresh through the TTL-bounded loader. A failed
     // refresh carries the previous baseline forward, so quota admission keeps
     // its last grounded values through a backend read outage.
-    let _ = load_data_usage_from_backend_cached(store).await;
+    let _ = project_data_usage_from_backend_cached(store, |_| ()).await;
     let cache = data_usage_snapshot_cache().read().await;
     cache
         .as_ref()
@@ -237,31 +237,34 @@ struct CachedDataUsageSnapshot {
 }
 
 impl CachedDataUsageSnapshot {
-    fn result(&self) -> Result<DataUsageInfo, Error> {
+    fn result<T>(&self, project: impl FnOnce(&DataUsageInfo) -> T) -> Result<T, Error> {
         self.info
-            .clone()
+            .as_ref()
+            .map(project)
             .ok_or_else(|| Error::other("data usage snapshot load recently failed"))
     }
 }
 
-fn fresh_cached_data_usage_snapshot(
+fn fresh_cached_data_usage_snapshot<T>(
     cache: &Option<CachedDataUsageSnapshot>,
     now: tokio::time::Instant,
     ttl: Duration,
-) -> Option<Result<DataUsageInfo, Error>> {
+    project: impl FnOnce(&DataUsageInfo) -> T,
+) -> Option<Result<T, Error>> {
     cache
         .as_ref()
         .filter(|cached| now.duration_since(cached.loaded_at) < ttl)
-        .map(CachedDataUsageSnapshot::result)
+        .map(|cached| cached.result(project))
 }
 
-fn cache_data_usage_snapshot_result(
+fn cache_data_usage_snapshot_result<T>(
     cache: &mut Option<CachedDataUsageSnapshot>,
     result: Result<LoadedUsageBaseline, Error>,
     loaded_at: tokio::time::Instant,
     refresh_generation: u64,
     current_generation: u64,
-) -> Option<Result<DataUsageInfo, Error>> {
+    project: impl FnOnce(&DataUsageInfo) -> T,
+) -> Option<Result<T, Error>> {
     if current_generation != refresh_generation {
         return None;
     }
@@ -280,12 +283,13 @@ fn cache_data_usage_snapshot_result(
                     degraded_baseline.entry(bucket.clone()).or_insert(*size);
                 }
             }
+            let projected = project(&info);
             *cache = Some(CachedDataUsageSnapshot {
-                info: Some(info.clone()),
+                info: Some(info),
                 loaded_at,
                 degraded_baseline,
             });
-            Ok(info)
+            Ok(projected)
         }
         Err(e) => {
             // Keep the previous baseline through a failed refresh: quota
@@ -1486,12 +1490,63 @@ async fn normalize_loaded_data_usage(
 /// `save_data_usage_in_backend` invalidates the cache so a fresh scanner save
 /// is visible immediately in the saving process.
 pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<DataUsageInfo, Error> {
+    project_data_usage_from_backend_cached(store, DataUsageInfo::clone).await
+}
+
+/// Read one bucket's persisted usage without cloning the complete snapshot.
+pub async fn load_bucket_usage_from_backend_cached(
+    store: Arc<ECStore>,
+    bucket: &str,
+    incarnation: uuid::Uuid,
+) -> Result<Option<u64>, Error> {
+    project_data_usage_from_backend_cached(store, |info| certified_bucket_usage(info, bucket, incarnation)).await
+}
+
+fn certified_bucket_usage(info: &DataUsageInfo, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
+    if incarnation.is_nil()
+        || !info.is_complete_bucket_usage_snapshot()
+        || info.usage_snapshot_observational
+        || info.scanner_cycle.is_none()
+        || info.scanner_epoch.is_none()
+    {
+        return None;
+    }
+    let pending_count = u64::try_from(info.usage_snapshot_pending_buckets.len()).ok()?;
+    if pending_count != info.usage_snapshot_pending_bucket_count {
+        return None;
+    }
+    match info.usage_snapshot_converged {
+        Some(true) if pending_count == 0 => {}
+        Some(false)
+            if pending_count > 0
+                && info.usage_snapshot_pending_buckets.windows(2).all(|pair| pair[0] < pair[1])
+                && info
+                    .usage_snapshot_pending_buckets
+                    .binary_search_by(|pending| pending.as_str().cmp(bucket))
+                    .is_err() => {}
+        _ => return None,
+    }
+    let usage = info.buckets_usage.get(bucket)?;
+    let certified = usage
+        .bucket_incarnation
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())?;
+    (certified == incarnation).then_some(usage.size)
+}
+
+// Project under the cache guard so scalar readers never copy the snapshot's
+// bucket maps. The owned API shares the same TTL, refresh and invalidation path.
+async fn project_data_usage_from_backend_cached<T>(
+    store: Arc<ECStore>,
+    project: impl Fn(&DataUsageInfo) -> T,
+) -> Result<T, Error> {
     let ttl = Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
 
     loop {
         {
             let cache = data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, &project) {
                 return result;
             }
         }
@@ -1503,7 +1558,7 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
             .await;
         {
             let cache = data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, &project) {
                 return result;
             }
         }
@@ -1512,9 +1567,14 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
         let result = load_data_usage_from_backend_with_baseline(store.clone()).await;
         let loaded_at = tokio::time::Instant::now();
         let mut cache = data_usage_snapshot_cache().write().await;
-        if let Some(result) =
-            cache_data_usage_snapshot_result(&mut cache, result, loaded_at, refresh_generation, data_usage_snapshot_generation())
-        {
+        if let Some(result) = cache_data_usage_snapshot_result(
+            &mut cache,
+            result,
+            loaded_at,
+            refresh_generation,
+            data_usage_snapshot_generation(),
+            &project,
+        ) {
             return result;
         }
         drop(cache);
@@ -1532,7 +1592,8 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
     loop {
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            {
                 return result;
             }
         }
@@ -1543,7 +1604,8 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
             .await;
         {
             let cache = admin_data_usage_snapshot_cache().read().await;
-            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl) {
+            if let Some(result) = fresh_cached_data_usage_snapshot(&cache, tokio::time::Instant::now(), ttl, DataUsageInfo::clone)
+            {
                 return result;
             }
         }
@@ -1564,6 +1626,7 @@ pub async fn load_admin_data_usage_from_backend_cached(store: Arc<ECStore>) -> R
             loaded_at,
             refresh_generation,
             admin_data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         ) {
             return result;
         }
@@ -1945,8 +2008,8 @@ fn advance_version_listing_cursor(
     let next_version_marker = next_version_marker
         .filter(|next_version_marker| !next_version_marker.is_empty())
         .ok_or_else(|| Error::other(format!("bucket {bucket} version listing was truncated without a version marker")))?;
-    let current_key_marker = marker.as_deref().map(list_marker_key);
-    let next_key_marker = list_marker_key(&next_marker);
+    let current_key_marker = marker.as_deref();
+    let next_key_marker = next_marker.as_str();
     if current_key_marker == Some(next_key_marker) && version_marker.as_deref() == Some(next_version_marker.as_str()) {
         return Err(Error::other(format!(
             "bucket {bucket} version listing returned a repeated continuation marker"
@@ -2277,8 +2340,10 @@ async fn get_persisted_bucket_usage(bucket: &str) -> Option<u64> {
 }
 
 async fn persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
-    let info = load_data_usage_from_backend_cached(store).await.ok()?;
-    info.buckets_usage.get(bucket).map(|usage| usage.size)
+    project_data_usage_from_backend_cached(store, |info| info.buckets_usage.get(bucket).map(|usage| usage.size))
+        .await
+        .ok()
+        .flatten()
 }
 
 async fn reload_persisted_bucket_usage(store: Arc<ECStore>, bucket: &str) -> Option<u64> {
@@ -2375,6 +2440,7 @@ where
         tokio::time::Instant::now(),
         refresh_generation,
         data_usage_snapshot_generation(),
+        |_| (),
     )
     .is_some()
 }
@@ -2891,6 +2957,8 @@ pub async fn init_compression_total_memory_from_backend(store: Arc<ECStore>) {
 
 #[cfg(test)]
 mod tests {
+    mod snapshot_projection;
+
     use super::*;
     use crate::layout::endpoints::EndpointServerPools;
     use crate::runtime::instance::InstanceContext;
@@ -4572,15 +4640,29 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache");
         assert!(matches!(first, Err(Error::ErasureReadQuorum)));
 
-        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
-            .expect("the failed load must remain cached within the TTL");
+        let cached = fresh_cached_data_usage_snapshot(
+            &cache,
+            loaded_at + Duration::from_secs(1),
+            Duration::from_secs(30),
+            DataUsageInfo::clone,
+        )
+        .expect("the failed load must remain cached within the TTL");
         assert!(cached.is_err());
 
-        assert!(fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(30), Duration::from_secs(30)).is_none());
+        assert!(
+            fresh_cached_data_usage_snapshot(
+                &cache,
+                loaded_at + Duration::from_secs(30),
+                Duration::from_secs(30),
+                DataUsageInfo::clone
+            )
+            .is_none()
+        );
     }
 
     #[test]
@@ -4601,14 +4683,20 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
         assert_snapshot_bucket(&first, "bucket");
 
-        let cached = fresh_cached_data_usage_snapshot(&cache, loaded_at + Duration::from_secs(1), Duration::from_secs(30))
-            .expect("successful load must remain cached within the TTL")
-            .expect("cached success must remain successful");
+        let cached = fresh_cached_data_usage_snapshot(
+            &cache,
+            loaded_at + Duration::from_secs(1),
+            Duration::from_secs(30),
+            DataUsageInfo::clone,
+        )
+        .expect("successful load must remain cached within the TTL")
+        .expect("cached success must remain successful");
         assert_snapshot_bucket(&cached, "bucket");
     }
 
@@ -4633,6 +4721,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         )
         .expect("an uninterrupted refresh should populate the cache")
         .expect("successful load must be returned");
@@ -4666,6 +4755,7 @@ mod tests {
             loaded_at,
             refresh_generation,
             data_usage_snapshot_generation(),
+            DataUsageInfo::clone,
         );
 
         assert!(stale_result.is_none());
@@ -5119,20 +5209,20 @@ mod tests {
         );
         assert!(ensure_truncated_version_page_has_entries("bucket-a", 0).is_err());
         ensure_truncated_version_page_has_entries("bucket-a", 1).expect("a truncated page with an entry can advance");
+    }
 
-        let mut tagged_marker = Some("object-a[rustfs_cache:v2,id:old]".to_string());
-        let mut tagged_version_marker = Some("version-a".to_string());
-        assert!(
-            advance_version_listing_cursor(
-                "bucket-a",
-                &mut tagged_marker,
-                &mut tagged_version_marker,
-                Some("object-a[rustfs_cache:v2,id:new]".to_string()),
-                Some("version-a".to_string()),
-            )
-            .is_err(),
-            "different cache tags for the same logical marker must not count as progress"
-        );
+    #[test]
+    fn version_listing_cursor_compares_literal_cache_shaped_keys() {
+        let mut marker = Some("object-a".to_string());
+        let mut version_marker = Some("version-a".to_string());
+        advance_version_listing_cursor(
+            "bucket-a",
+            &mut marker,
+            &mut version_marker,
+            Some("object-a[rustfs_cache:v2,id:old]".to_string()),
+            Some("version-a".to_string()),
+        )
+        .expect("a distinct literal key advances the cursor");
     }
 
     #[test]

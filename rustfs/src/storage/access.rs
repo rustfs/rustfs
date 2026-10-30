@@ -22,7 +22,7 @@ use crate::auth::{
     get_request_auth_type_with_query, get_session_token, parse_presigned_multipart_max_total_object_size,
     parse_presigned_put_max_content_length, reject_unsigned_amz_headers_on_sigv4_request,
 };
-use crate::error::{ApiError, normalize_put_read_quorum_error};
+use crate::error::{ApiError, normalize_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
 use crate::storage::request_context::RequestContext;
@@ -63,6 +63,13 @@ use std::sync::Arc;
 use std::sync::OnceLock;
 use time::OffsetDateTime;
 use url::{Url, form_urlencoded};
+
+fn iam_authorization_error(err: IamError) -> ApiError {
+    match err {
+        IamError::IAMActionNotAllowed => ApiError::access_denied(),
+        other => ApiError::from(other),
+    }
+}
 
 const EVENT_OBJECT_TAG_AUTHORIZATION: &str = "object_tag_authorization";
 const LOG_COMPONENT_ACCESS: &str = "storage_access";
@@ -241,6 +248,30 @@ impl TableDataPlaneListCursor {
 }
 
 impl TableDataPlaneListAccess {
+    #[cfg(test)]
+    pub(crate) fn test_listing_fixture(bucket: &str) -> Self {
+        let resource = |table: &str, prefix: &str, allowed| TableDataPlaneListResource {
+            resource: crate::table_catalog::TableDataPlaneResource {
+                table_bucket: bucket.to_owned(),
+                namespace: "test".to_owned(),
+                table: table.to_owned(),
+                table_id: table.to_owned(),
+                warehouse_object_prefix: prefix.to_owned(),
+            },
+            allowed,
+        };
+        Self {
+            bucket: bucket.to_owned(),
+            principal_fingerprint: "principal".to_owned(),
+            snapshot_fingerprint: "snapshot".to_owned(),
+            cursor_key: [0x42; 32],
+            resources: vec![
+                resource("table-id", "tables/table-id/", true),
+                resource("denied-id", "tables/zz-denied/", false),
+            ],
+        }
+    }
+
     pub(crate) fn allows_object(&self, object: &str) -> bool {
         if crate::table_catalog::is_reserved_table_object_key(object) {
             return false;
@@ -1459,7 +1490,7 @@ async fn authorize_request_with_location_constraint<T>(
             let allowed = iam_store
                 .try_eval_prepared(&prepared, &final_args)
                 .await
-                .map_err(ApiError::from)?;
+                .map_err(iam_authorization_error)?;
             if !allowed
                 && matches!(
                     action,
@@ -1481,7 +1512,7 @@ async fn authorize_request_with_location_constraint<T>(
                 if !iam_store
                     .try_eval_prepared(&prepared, &final_args)
                     .await
-                    .map_err(ApiError::from)?
+                    .map_err(iam_authorization_error)?
                 {
                     return Err(denial.deny("iam_explicit_deny", action));
                 }
@@ -3378,7 +3409,7 @@ impl S3Access for FS {
             Ok(())
         }
         .await
-        .map_err(normalize_put_read_quorum_error)
+        .map_err(normalize_read_quorum_error)
     }
 
     /// Checks whether the PutObjectAcl request has accesses to the resources.
@@ -3593,6 +3624,14 @@ mod tests {
     use serial_test::serial;
     use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
+
+    #[test]
+    fn terminal_iam_denial_is_access_denied_and_backend_failure_stays_internal() {
+        let denied = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IAMActionNotAllowed));
+        assert_eq!(denied.code(), &S3ErrorCode::AccessDenied);
+        let unavailable = s3s::S3Error::from(super::iam_authorization_error(rustfs_iam::error::Error::IamSysNotInitialized));
+        assert_eq!(unavailable.code(), &S3ErrorCode::InternalError);
+    }
 
     struct UnreadyIam;
 

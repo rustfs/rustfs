@@ -235,6 +235,9 @@ impl ScannerFixture {
     }
 
     async fn queued_request(&self) -> HealRequest {
+        // Let the immediate interval tick cross the timer's millisecond boundary
+        // before the ready loop keeps virtual time fixed during filesystem I/O.
+        tokio::time::sleep(Duration::ZERO).await;
         // Keep the paused clock from advancing while filesystem workers
         // finish. A wall-clock deadline also bounds a broken admission path.
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
@@ -255,6 +258,16 @@ impl ScannerFixture {
         assert_eq!(request.id, self.task_id, "scanner must replay the durable UUID");
         assert_eq!(request.heal_endpoints, vec![self.local_targets[0].clone()]);
         assert_eq!(request.source, HealRequestSource::AutoHeal);
+        assert!(
+            self.manager
+                .heal_queue
+                .lock()
+                .await
+                .heap
+                .iter()
+                .any(|item| item.request.id == request.id && item.replacement_targets_frozen),
+            "replayed durable targets cannot expand"
+        );
         assert!(matches!(
             request.heal_type,
             HealType::ErasureSet { set_disk_id, buckets }
@@ -291,10 +304,12 @@ async fn finish_without_advancing_clock<T>(future: impl Future<Output = T>) -> T
     }
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 #[serial_test::serial(replacement_auto_scan)]
 async fn scanner_tick_recovers_remote_survivor_after_all_local_targets_are_formatted() {
     let fixture = ScannerFixture::new(false).await;
+    // Durable fixture writes must finish before virtual scanner time begins.
+    tokio::time::pause();
     fixture
         .manager
         .start_auto_disk_scanner()
@@ -303,11 +318,12 @@ async fn scanner_tick_recovers_remote_survivor_after_all_local_targets_are_forma
     fixture.assert_original_owner_is_queued().await;
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 #[serial_test::serial(replacement_auto_scan)]
 async fn scanner_tick_finishes_existing_owner_before_admitting_new_unformatted_targets() {
     temp_env::async_with_vars([(rustfs_config::ENV_UNSAFE_BYPASS_DISK_CHECK, Some("true"))], async {
         let fixture = ScannerFixture::new(true).await;
+        tokio::time::pause();
         fixture
             .manager
             .start_auto_disk_scanner()
@@ -381,7 +397,7 @@ async fn recovery_disk_index_keeps_first_snapshot_and_sorted_unique_endpoints() 
     );
 }
 
-#[tokio::test(start_paused = true)]
+#[tokio::test]
 #[serial_test::serial(replacement_auto_scan)]
 async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
     // backlog#2902 step 3: two survivors hold the same revision of a sibling
@@ -427,6 +443,7 @@ async fn scanner_tick_blocks_only_the_conflicting_generation_of_a_set() {
             ..HealConfig::default()
         }),
     );
+    tokio::time::pause();
     fixture
         .manager
         .start_auto_disk_scanner()

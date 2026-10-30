@@ -179,6 +179,8 @@ impl NodeService {
         &self,
         request: Request<GenerallyLockRequest>,
     ) -> Result<Response<GenerallyLockResponse>, Status> {
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         // Parse the request to extract resource and owner
         let args: LockRequest = match serde_json::from_str(&request.args) {
@@ -192,6 +194,8 @@ impl NodeService {
             }
         };
 
+        #[cfg(feature = "e2e-test-hooks")]
+        super::e2e_rpc_delay::locks(super::e2e_rpc_delay::Method::Lock, std::slice::from_ref(&args), request_id.as_deref()).await;
         let lock_client = self.get_lock_client()?;
         match lock_client.acquire_lock(&args).await {
             Ok(result) => {
@@ -218,6 +222,8 @@ impl NodeService {
         &self,
         request: Request<BatchGenerallyLockRequest>,
     ) -> Result<Response<BatchGenerallyLockResponse>, Status> {
+        #[cfg(feature = "e2e-test-hooks")]
+        let request_id = super::e2e_rpc_delay::request_id(&request);
         let request = request.into_inner();
         let mut results = vec![lock_result_from_error("request was not processed"); request.args.len()];
         let mut valid_requests = Vec::with_capacity(request.args.len());
@@ -236,6 +242,11 @@ impl NodeService {
         }
 
         if !valid_requests.is_empty() {
+            #[cfg(feature = "e2e-test-hooks")]
+            if valid_requests.len() == request.args.len() {
+                super::e2e_rpc_delay::locks(super::e2e_rpc_delay::Method::LockBatch, &valid_requests, request_id.as_deref())
+                    .await;
+            }
             let lock_client = self.get_lock_client()?;
             match lock_client.acquire_locks_batch(&valid_requests).await {
                 Ok(batch_results) => {

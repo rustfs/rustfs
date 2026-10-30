@@ -188,7 +188,13 @@ impl FileMeta {
         if !buf.is_empty() {
             InlineData::validate_slice(buf).map_err(|e| {
                 error!("data validation failed: {}", e);
-                e
+                // Validation only examines bytes already read. Classify damage
+                // as repairable corruption only for formats we understand.
+                if InlineData::version_ok_slice(buf) && Self::decode_xl_headers(meta).is_ok() {
+                    Error::FileCorrupt
+                } else {
+                    e
+                }
             })?;
         }
 
@@ -597,7 +603,7 @@ impl FileMeta {
                 return false;
             }
 
-            let mut is_delete_marker = false;
+            let mut is_delete_marker = true;
 
             let _ = Self::decode_versions(meta, versions, |_: usize, hdr: &[u8], _: &[u8]| {
                 let mut header = FileMetaVersionHeader::default();
@@ -605,6 +611,9 @@ impl FileMeta {
                     return Err(Error::DoneForNow);
                 }
 
+                if header.free_version() {
+                    return Ok(());
+                }
                 is_delete_marker = header.version_type == VersionType::Delete;
 
                 Err(Error::DoneForNow)

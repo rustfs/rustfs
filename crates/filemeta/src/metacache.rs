@@ -51,12 +51,6 @@ pub struct MetadataResolutionParams {
     pub requested_versions: usize,
     pub bucket: String,
     pub strict: bool,
-    /// Number of set drives that were unreachable when the listing snapshot was
-    /// taken. Write-quorum enforcement relaxes each version's required quorum by
-    /// this amount (never below `obj_quorum`): a version legally committed at
-    /// write quorum can have that many of its metadata copies on drives no
-    /// reader could consult, and must not be dropped for it.
-    pub write_quorum_slack: usize,
     pub candidates: Vec<Vec<FileMetaShallowVersion>>,
 }
 
@@ -139,14 +133,13 @@ impl MetaCacheEntry {
             return idx.is_none() || idx.unwrap() == self.name.len() - separator.len();
         }
 
-        let ext = self.name.trim_start_matches(dir);
+        // Strip `dir` exactly once: a repeated strip would treat `a/a/b` as a
+        // direct child of `a/`.
+        let Some(ext) = self.name.strip_prefix(dir) else {
+            return false;
+        };
 
-        if ext.len() != self.name.len() {
-            let idx = ext.find(separator);
-            return idx.is_none() || idx.unwrap() == ext.len() - separator.len();
-        }
-
-        false
+        ext.find(separator).is_none_or(|idx| idx == ext.len() - separator.len())
     }
 
     pub fn is_object(&self) -> bool {
@@ -159,10 +152,11 @@ impl MetaCacheEntry {
 
     pub fn is_latest_delete_marker(&mut self) -> bool {
         if let Some(cached) = &self.cached {
-            if cached.versions.is_empty() {
-                return true;
-            }
-            return cached.versions[0].header.version_type == VersionType::Delete;
+            return cached
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete);
         }
 
         if !FileMeta::is_xl2_v1_format(&self.metadata) {
@@ -179,12 +173,11 @@ impl MetaCacheEntry {
         }
 
         match self.xl_meta() {
-            Ok(res) => {
-                if res.versions.is_empty() {
-                    return true;
-                }
-                res.versions[0].header.version_type == VersionType::Delete
-            }
+            Ok(res) => res
+                .versions
+                .iter()
+                .find(|version| !version.header.free_version())
+                .is_none_or(|version| version.header.version_type == VersionType::Delete),
             Err(_) => true,
         }
     }
@@ -418,11 +411,7 @@ impl MetaCacheEntries {
     }
 
     pub fn resolve(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
-        self.resolve_inner(params, false)
-    }
-
-    pub fn resolve_with_write_quorum(&self, params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
-        self.resolve_inner(params, true)
+        Self::resolve_inner(&self.0, params)
     }
 
     /// Resolve the cross-disk UNION of every version present on ANY disk slot.
@@ -447,7 +436,6 @@ impl MetaCacheEntries {
             requested_versions: 0,
             bucket: bucket.to_string(),
             strict: false,
-            write_quorum_slack: 0,
             candidates: Vec::new(),
         })
     }
@@ -631,8 +619,8 @@ impl MetaCacheEntries {
         discovery
     }
 
-    fn resolve_inner(&self, mut params: MetadataResolutionParams, enforce_write_quorum: bool) -> Option<MetaCacheEntry> {
-        if self.0.is_empty() {
+    fn resolve_inner(entries: &[Option<MetaCacheEntry>], mut params: MetadataResolutionParams) -> Option<MetaCacheEntry> {
+        if entries.is_empty() {
             debug!(
                 bucket = %params.bucket,
                 dir_quorum = params.dir_quorum,
@@ -652,7 +640,7 @@ impl MetaCacheEntries {
         let mut objs_agree = 0;
         let mut objs_valid = 0;
 
-        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
+        for (entry_idx, entry) in entries.iter().flatten().enumerate() {
             debug!(entry = %entry.name, "metacache resolve examining candidate entry");
             if entry.name.is_empty() {
                 continue;
@@ -688,7 +676,9 @@ impl MetaCacheEntries {
             };
 
             let same_name = entry.name == current_selected.name;
-            let outcome = if let Some(fm) = &entry.cached {
+            let outcome = if std::ptr::eq(entry, *current_selected) {
+                Some(true)
+            } else if let Some(fm) = &entry.cached {
                 let (res, maybe_prev) = selected_borrowed.compare_cached(fm, same_name, params.strict);
                 if let Some(prev) = maybe_prev {
                     fallback_borrowed.push((*current_selected_idx, prev));
@@ -753,45 +743,29 @@ impl MetaCacheEntries {
             return directory.cloned();
         }
 
+        // Every valid copy agrees and `objs_valid` already reached the quorum.
         if objs_agree == objs_valid {
-            let required_quorum = if enforce_write_quorum {
-                selected_borrowed
-                    .versions
-                    .as_slice()
-                    .first()
-                    .map(|(hdr, _, meta)| {
-                        crate::filemeta::write_quorum_from_header_and_meta(hdr, meta, params.obj_quorum)
-                            .saturating_sub(params.write_quorum_slack)
-                            .max(params.obj_quorum)
-                    })
-                    .unwrap_or(params.obj_quorum)
-            } else {
-                params.obj_quorum
-            };
-
-            if objs_agree >= required_quorum {
-                debug!(
-                    selected = %selected_ref.name,
-                    objs_agree,
-                    objs_valid,
-                    "metacache resolve reused selected candidate because all valid object entries agreed"
-                );
-                let selected_fm = selected_ref
-                    .cached
-                    .clone()
-                    .unwrap_or_else(|| selected_borrowed.into_file_meta());
-                return Some(MetaCacheEntry {
-                    name: selected_ref.name.clone(),
-                    metadata: selected_ref.metadata.clone(),
-                    cached: Some(selected_fm),
-                    reusable: selected_ref.reusable,
-                });
-            }
+            debug!(
+                selected = %selected_ref.name,
+                objs_agree,
+                objs_valid,
+                "metacache resolve reused selected candidate because all valid object entries agreed"
+            );
+            let selected_fm = selected_ref
+                .cached
+                .clone()
+                .unwrap_or_else(|| selected_borrowed.into_file_meta());
+            return Some(MetaCacheEntry {
+                name: selected_ref.name.clone(),
+                metadata: selected_ref.metadata.clone(),
+                cached: Some(selected_fm),
+                reusable: selected_ref.reusable,
+            });
         }
 
         let selected_meta_ver = selected_borrowed.meta_ver;
         let mut streams: Vec<Vec<(&crate::FileMetaVersionHeader, &[u8])>> = Vec::with_capacity(objs_valid);
-        for (entry_idx, entry) in self.0.iter().flatten().enumerate() {
+        for (entry_idx, entry) in entries.iter().flatten().enumerate() {
             if entry.name.is_empty() || entry.is_dir() || invalid_entries.contains(&entry_idx) {
                 continue;
             }
@@ -820,8 +794,6 @@ impl MetaCacheEntries {
             params.obj_quorum,
             params.strict,
             params.requested_versions,
-            enforce_write_quorum,
-            params.write_quorum_slack,
             streams,
         );
         if versions.is_empty() {
@@ -902,12 +874,6 @@ fn normalize_version_id(version_id: Option<Uuid>) -> Option<Uuid> {
 }
 
 #[derive(Debug, Default)]
-pub struct MetaCacheEntriesSortedResult {
-    pub entries: Option<MetaCacheEntriesSorted>,
-    pub err: Option<Error>,
-}
-
-#[derive(Debug, Default)]
 pub struct MetaCacheEntriesSorted {
     pub o: MetaCacheEntries,
     pub list_id: Option<String>,
@@ -921,17 +887,35 @@ impl MetaCacheEntriesSorted {
         entries
     }
 
+    /// Drop every entry whose name is at or before `marker`.
+    ///
+    /// Entries are sorted by name, so this keeps the suffix starting at the
+    /// first name strictly after the marker; when no such entry exists the
+    /// page is empty. The split index is taken over the raw slots so that
+    /// `None` placeholders cannot shift it.
     pub fn forward_past(&mut self, marker: Option<String>) {
-        if let Some(val) = marker
-            && let Some(idx) = self.o.0.iter().flatten().position(|v| v.name > val)
-        {
-            self.o.0 = self.o.0.split_off(idx);
-        }
+        let Some(val) = marker else {
+            return;
+        };
+        let idx = self
+            .o
+            .0
+            .iter()
+            .position(|v| v.as_ref().is_some_and(|v| v.name > val))
+            .unwrap_or(self.o.0.len());
+        self.o.0 = self.o.0.split_off(idx);
     }
 }
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 const METACACHE_READ_CHUNK_SIZE: usize = 64 << 10;
+/// msgpack `false`: the entry-stream terminator, and the only byte a legacy
+/// reader accepts after it (see `MetacacheWriter::close_with_limit_reached`).
+const METACACHE_TERMINATOR: u8 = 0xc2;
+/// Terminator markers a writer appends after the first one to carry the
+/// producer-stop trailer: one marks a stop at the per-disk limit, two mark
+/// the end of the namespace.
+const METACACHE_TRAILER_MAX_MARKERS: u8 = 2;
 
 #[derive(Debug)]
 pub struct MetacacheWriter<W> {
@@ -1006,8 +990,29 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
     }
 
     pub async fn close(&mut self) -> Result<()> {
+        self.close_with_limit_reached(false).await
+    }
+
+    /// Terminates the stream and records whether the producer stopped at its
+    /// own limit instead of at the end of its namespace.
+    ///
+    /// The trailer is encoded as extra terminator markers after the usual
+    /// `false`: one more means "stopped at the limit", two more mean "reached
+    /// the end of the namespace". Repeating the terminator is the only
+    /// encoding every deployed reader already tolerates: a legacy
+    /// `MetacacheReader` keeps polling a stream after its first `false` and
+    /// reports a clean EOF for each repeated `false`, whereas any other
+    /// trailing byte would decode as a corrupt entry. A legacy writer emits a
+    /// single `false`, which a new reader reports as "no trailer". Rolling
+    /// upgrades are therefore safe in both directions. The exhausted stream
+    /// gets the longer trailer so that a trailer cut short by the transport
+    /// can only be misread as "may have more", never as "complete".
+    pub async fn close_with_limit_reached(&mut self, limit_reached: bool) -> Result<()> {
         self.init().await?;
-        rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        let markers = 2 + usize::from(!limit_reached);
+        for _ in 0..markers {
+            rmp::encode::write_bool(&mut self.buf, false).map_err(|e| Error::other(format!("{e:?}")))?;
+        }
         self.flush().await?;
         Ok(())
     }
@@ -1021,6 +1026,12 @@ pub struct MetacacheReader<R> {
     buf: Vec<u8>,
     pos: usize,
     has_current: bool,
+    /// The terminator has been consumed; later reads report EOF without
+    /// touching `rd`.
+    terminated: bool,
+    /// Trailer decoded after the terminator; `None` while the stream is open
+    /// and for streams written before the trailer existed.
+    limit_reached: Option<bool>,
 }
 
 impl<R: AsyncRead + Unpin> MetacacheReader<R> {
@@ -1033,6 +1044,66 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             buf: Vec::new(),
             pos: 0,
             has_current: false,
+            terminated: false,
+            limit_reached: None,
+        }
+    }
+
+    /// Whether the producer stopped at its own limit, as recorded by
+    /// `MetacacheWriter::close_with_limit_reached`. `None` until the
+    /// terminator has been read, and for legacy streams without a trailer.
+    pub fn limit_reached(&self) -> Option<bool> {
+        self.limit_reached
+    }
+
+    /// Consumes the trailer that may follow the terminator just read.
+    ///
+    /// EOF is not an error here: it is how a legacy writer ends a stream. A
+    /// foreign byte ends the trailer too; nothing after the terminator is an
+    /// entry, so it is left unread.
+    async fn read_trailer(&mut self) -> Result<()> {
+        self.terminated = true;
+        let mut markers = 0u8;
+        while markers < METACACHE_TRAILER_MAX_MARKERS {
+            match self.peek_byte().await? {
+                Some(METACACHE_TERMINATOR) => {
+                    self.pos += 1;
+                    markers += 1;
+                }
+                _ => break,
+            }
+        }
+        self.limit_reached = match markers {
+            0 => None,
+            1 => Some(true),
+            _ => Some(false),
+        };
+        self.reset();
+        Ok(())
+    }
+
+    async fn peek_byte(&mut self) -> Result<Option<u8>> {
+        if self.pos < self.buf.len() {
+            return Ok(Some(self.buf[self.pos]));
+        }
+        self.buf.clear();
+        self.pos = 0;
+        let extra = usize::from(METACACHE_TRAILER_MAX_MARKERS);
+        if let Err(e) = self.buf.try_reserve(extra) {
+            let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
+            self.err = Some(err.clone());
+            return Err(err);
+        }
+        let mut dst = bytes::BufMut::limit(&mut self.buf, extra);
+        match self.rd.read_buf(&mut dst).await {
+            Ok(0) => Ok(None),
+            Ok(_) => Ok(Some(self.buf[0])),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => Ok(None),
+            Err(e) => {
+                let err = Error::from(e);
+                self.err = Some(err.clone());
+                Err(err)
+            }
         }
     }
 
@@ -1230,9 +1301,13 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         }
 
         while n > 0 {
+            if self.terminated {
+                return Ok(());
+            }
             match rmp::decode::read_bool(&mut self.read_more(1).await?) {
                 Ok(res) => {
                     if !res {
+                        self.read_trailer().await?;
                         return Ok(());
                     }
                 }
@@ -1263,9 +1338,14 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
             return Err(err.clone());
         }
 
+        if self.terminated {
+            return Ok(None);
+        }
+
         match rmp::decode::read_bool(&mut self.read_more(1).await?) {
             Ok(res) => {
                 if !res {
+                    self.read_trailer().await?;
                     return Ok(None);
                 }
             }
@@ -1443,6 +1523,58 @@ mod tests {
     use tokio::sync::{Notify, oneshot};
     use uuid::Uuid;
 
+    fn named_entry(name: &str) -> MetaCacheEntry {
+        MetaCacheEntry {
+            name: name.to_owned(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn is_in_dir_strips_the_directory_prefix_once() {
+        assert!(named_entry("a/b").is_in_dir("a/", "/"));
+        assert!(named_entry("a/b/").is_in_dir("a/", "/"));
+        assert!(named_entry("a/").is_in_dir("a/", "/"));
+        // `a/a/b` lives in `a/a/`, not directly in `a/`.
+        assert!(!named_entry("a/a/b").is_in_dir("a/", "/"));
+        assert!(!named_entry("b/c").is_in_dir("a/", "/"));
+        assert!(named_entry("top").is_in_dir("", "/"));
+        assert!(named_entry("top/").is_in_dir("", "/"));
+        assert!(!named_entry("top/leaf").is_in_dir("", "/"));
+    }
+
+    #[test]
+    fn forward_past_drops_every_entry_at_or_before_the_marker() {
+        let sorted = |names: &[&str]| MetaCacheEntriesSorted {
+            o: MetaCacheEntries(names.iter().map(|name| Some(named_entry(name))).collect()),
+            ..Default::default()
+        };
+
+        let mut entries = sorted(&["a", "b", "c"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["c"]);
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("b".to_owned()));
+        assert!(entries.entries().is_empty(), "nothing sorts after the marker");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(Some("z".to_owned()));
+        assert!(entries.entries().is_empty(), "a marker past every entry empties the page");
+
+        let mut entries = sorted(&["a", "b"]);
+        entries.forward_past(None);
+        assert_eq!(entries.entries().len(), 2, "no marker keeps the page intact");
+
+        // A `None` slot before the split point must not shift the retained suffix.
+        let mut entries = MetaCacheEntriesSorted {
+            o: MetaCacheEntries(vec![None, Some(named_entry("a")), Some(named_entry("b")), Some(named_entry("c"))]),
+            ..Default::default()
+        };
+        entries.forward_past(Some("a".to_owned()));
+        assert_eq!(entries.entries().iter().map(|e| e.name.as_str()).collect::<Vec<_>>(), ["b", "c"]);
+    }
+
     #[tokio::test]
     async fn test_writer() {
         let mut f = Cursor::new(Vec::new());
@@ -1555,7 +1687,10 @@ mod tests {
         for _ in 0..1000 {
             bytes.extend_from_slice(&[0xc3, 0xa1, b'x', 0xc4, 1, 0x42]);
         }
-        bytes.push(0xc2);
+        let mut legacy = bytes.clone();
+        legacy.push(METACACHE_TERMINATOR);
+        // A current writer that reached the end of its namespace.
+        bytes.extend_from_slice(&[METACACHE_TERMINATOR; 3]);
         let mut reader = MetacacheReader::new(FragmentedReader {
             data: &bytes,
             chunk: METACACHE_READ_CHUNK_SIZE,
@@ -1563,6 +1698,16 @@ mod tests {
         });
         assert_eq!(reader.read_all().await.expect("decode page").len(), 1000);
         assert_eq!(reader.rd.reads, 1, "a ready page smaller than 64 KiB needs one stream read");
+        assert_eq!(reader.limit_reached(), Some(false));
+
+        let mut reader = MetacacheReader::new(FragmentedReader {
+            data: &legacy,
+            chunk: METACACHE_READ_CHUNK_SIZE,
+            reads: 0,
+        });
+        assert_eq!(reader.read_all().await.expect("decode legacy page").len(), 1000);
+        assert_eq!(reader.rd.reads, 2, "a legacy stream needs one more read to learn that no trailer follows");
+        assert_eq!(reader.limit_reached(), None);
     }
 
     #[tokio::test]
@@ -1599,6 +1744,100 @@ mod tests {
         let mut reader = MetacacheReader::new(Cursor::new(stream));
         reader.skip(1).await.expect("complete entry must be skippable");
         assert_eq!(reader.peek().await.expect_err("skip must restore between-entry state"), Error::Unexpected);
+    }
+
+    #[tokio::test]
+    async fn trailer_round_trips_limit_reached_through_a_new_reader() {
+        for limit_reached in [false, true] {
+            let entries = (0..3)
+                .map(|i| MetaCacheEntry {
+                    name: format!("item{i}"),
+                    metadata: vec![i as u8, 7],
+                    ..Default::default()
+                })
+                .collect::<Vec<_>>();
+            let mut output = Cursor::new(Vec::new());
+            let mut writer = MetacacheWriter::new(&mut output);
+            writer.write(&entries).await.expect("entries should be written");
+            writer
+                .close_with_limit_reached(limit_reached)
+                .await
+                .expect("stream should close with a trailer");
+            let bytes = output.into_inner();
+
+            let mut reader = MetacacheReader::new(Cursor::new(bytes.clone()));
+            assert_eq!(reader.limit_reached(), None, "the trailer is unknown until the terminator is read");
+            assert_eq!(reader.read_all().await.expect("stream should decode"), entries);
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            // Polling past the terminator stays a clean EOF and never decodes
+            // the trailer as data.
+            assert!(reader.peek().await.expect("EOF must be idempotent").is_none());
+            reader.skip(1).await.expect("skipping past EOF must be a no-op");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+
+            // Skipping through the terminator decodes the trailer as well.
+            let mut reader = MetacacheReader::new(Cursor::new(bytes));
+            reader.skip(10).await.expect("skip must stop at the terminator");
+            assert_eq!(reader.limit_reached(), Some(limit_reached));
+            assert!(reader.peek().await.expect("EOF after skip").is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_stream_without_trailer_reads_as_no_trailer() {
+        // A pre-trailer writer: version, one entry, a single terminator.
+        let stream = vec![0xcc, 2, 0xc3, 0xa1, b'x', 0xc4, 1, 0x42, METACACHE_TERMINATOR];
+        let mut reader = MetacacheReader::new(Cursor::new(stream));
+        let entries = reader.read_all().await.expect("legacy stream must decode");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "x");
+        assert_eq!(reader.limit_reached(), None);
+        assert!(reader.peek().await.expect("legacy EOF must be idempotent").is_none());
+    }
+
+    #[tokio::test]
+    async fn trailer_stream_decodes_for_a_reader_that_stops_at_the_first_terminator() {
+        // Emulates the decoding loop of a reader that predates the trailer: it
+        // yields every entry, and whatever it can still read afterwards must
+        // decode as another clean terminator rather than as an entry.
+        let entries = (0..3)
+            .map(|i| MetaCacheEntry {
+                name: format!("item{i}"),
+                metadata: vec![i as u8],
+                ..Default::default()
+            })
+            .collect::<Vec<_>>();
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("entries should be written");
+        writer
+            .close_with_limit_reached(true)
+            .await
+            .expect("stream should close at the limit");
+        let bytes = output.into_inner();
+
+        let mut cursor = &bytes[..];
+        assert_eq!(rmp::decode::read_u8(&mut cursor).expect("version"), METACACHE_STREAM_VERSION);
+        let mut decoded = Vec::new();
+        while rmp::decode::read_bool(&mut cursor).expect("entry marker") {
+            let len = rmp::decode::read_str_len(&mut cursor).expect("name length") as usize;
+            let name = from_utf8(&cursor[..len]).expect("name is utf8").to_owned();
+            cursor = &cursor[len..];
+            let len = rmp::decode::read_bin_len(&mut cursor).expect("metadata length") as usize;
+            let metadata = cursor[..len].to_vec();
+            cursor = &cursor[len..];
+            decoded.push(MetaCacheEntry {
+                name,
+                metadata,
+                ..Default::default()
+            });
+        }
+        assert_eq!(decoded, entries);
+        assert!(!cursor.is_empty(), "the trailer must follow the first terminator");
+        assert!(
+            cursor.iter().all(|byte| *byte == METACACHE_TERMINATOR),
+            "every trailer byte must be a terminator a legacy reader accepts: {cursor:?}"
+        );
     }
 
     #[tokio::test]
@@ -2201,17 +2440,6 @@ mod tests {
         }
     }
 
-    fn metacache_entry_without_header_ec(mut entry: MetaCacheEntry) -> MetaCacheEntry {
-        let mut cached = entry.cached.take().expect("test entry should have cached metadata");
-        for version in cached.versions.iter_mut() {
-            version.header.ec_m = 0;
-            version.header.ec_n = 0;
-        }
-        entry.metadata = cached.marshal_msg().expect("test file metadata should marshal");
-        entry.cached = Some(cached);
-        entry
-    }
-
     fn metacache_dir_entry(name: &str) -> MetaCacheEntry {
         MetaCacheEntry {
             name: name.to_string(),
@@ -2713,243 +2941,72 @@ mod tests {
     }
 
     #[test]
-    fn resolve_rejects_low_parity_partial_latest_below_required_object_quorum() {
+    fn resolve_interrupted_null_overwrite_is_independent_of_reader_order() {
         let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 7, 1);
-        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
-
-        let resolved = MetaCacheEntries(vec![
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry),
-            Some(old_entry.clone()),
-            Some(old_entry),
-        ])
-        .resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 5,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        });
-
-        assert!(resolved.is_none());
+        let old_entry = metacache_entry_with_mod_time(old_mod_time, "old-etag");
+        let new_entry = metacache_entry_with_mod_time(new_mod_time, "new-etag");
+        // Every placement of the new generation across four readers. Both
+        // generations share the null version id, so the most common header
+        // wins and a tie keeps the newer one.
+        for placement in 0_u32..16 {
+            let new_copies = placement.count_ones();
+            let entries = (0..4)
+                .map(|slot| {
+                    Some(if placement & (1 << slot) != 0 {
+                        new_entry.clone()
+                    } else {
+                        old_entry.clone()
+                    })
+                })
+                .collect();
+            let resolved = MetaCacheEntries(entries)
+                .resolve(MetadataResolutionParams {
+                    dir_quorum: 2,
+                    obj_quorum: 2,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    ..Default::default()
+                })
+                .unwrap_or_else(|| panic!("placement {placement:04b}: one generation always reaches quorum"));
+            let info = resolved.to_fileinfo("bucket").expect("resolved metadata should decode");
+            let expected = if new_copies >= 2 { "new-etag" } else { "old-etag" };
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some(expected), "placement {placement:04b}");
+        }
     }
 
     #[test]
-    fn resolve_rejects_zero_parity_partial_latest_below_required_object_quorum() {
-        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 0);
-
-        let resolved = MetaCacheEntries(vec![
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry),
-        ])
-        .resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 5,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        });
-
-        assert!(resolved.is_none());
-    }
-
-    #[test]
-    fn resolve_accepts_low_parity_latest_at_required_object_quorum() {
-        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        let new_entry = metacache_entry_with_erasure(new_mod_time, "new-etag", 7, 1);
-
-        let resolved = MetaCacheEntries(vec![
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry.clone()),
-            Some(new_entry),
-        ])
-        .resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 5,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        })
-        .expect("latest metadata should resolve after satisfying its own write quorum");
-
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(new_mod_time));
-        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new-etag"));
-    }
-
-    #[test]
-    fn resolve_skips_low_parity_partial_latest_and_returns_committed_previous_version() {
+    fn resolve_merge_keeps_the_newest_version_at_listing_quorum() {
         let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
         let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
-        let new_and_old_entry =
-            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 4, 4), (new_mod_time, "new-etag", 7, 1)]);
-
-        let resolved = MetaCacheEntries(vec![
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry),
-            Some(old_entry.clone()),
-            Some(old_entry),
-        ])
-        .resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 5,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        })
-        .expect("previous committed metadata should resolve after rejecting partial latest");
-
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(old_mod_time));
-        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
-    }
-
-    #[test]
-    fn resolve_skips_legacy_header_low_parity_partial_latest_using_payload_quorum() {
-        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
-        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 4, 4);
-        let new_and_old_entry = metacache_entry_without_header_ec(metacache_entry_with_erasure_versions(&[
-            (old_mod_time, "old-etag", 4, 4),
-            (new_mod_time, "new-etag", 7, 1),
-        ]));
-
-        let resolved = MetaCacheEntries(vec![
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry.clone()),
-            Some(new_and_old_entry),
-            Some(old_entry.clone()),
-            Some(old_entry),
-        ])
-        .resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 5,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        })
-        .expect("previous committed metadata should resolve after rejecting legacy-header partial latest");
-
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(old_mod_time));
-        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
-    }
-
-    #[test]
-    fn resolve_with_write_quorum_relaxes_requirement_by_unreachable_drives() {
-        let mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        // EC 2+2 version, write quorum 3 of 4: committed with one holder drive
-        // now offline, so only 2 of the 3 reachable drives carry the metadata.
-        let entry = metacache_entry_with_erasure(mod_time, "etag", 2, 2);
-        let entries = || MetaCacheEntries(vec![Some(entry.clone()), Some(entry.clone()), None]);
-
-        let resolved = entries()
-            .resolve_with_write_quorum(MetadataResolutionParams {
-                obj_quorum: 2,
-                requested_versions: 1,
-                bucket: "bucket".to_string(),
-                strict: true,
-                write_quorum_slack: 1,
-                ..Default::default()
-            })
-            .expect("committed version should resolve when the missing copy sits on an unreachable drive");
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(mod_time));
-
-        // Without the slack the same sample is rejected outright.
-        let rejected = entries().resolve_with_write_quorum(MetadataResolutionParams {
-            obj_quorum: 3,
-            requested_versions: 1,
-            bucket: "bucket".to_string(),
-            strict: true,
-            ..Default::default()
-        });
-        assert!(rejected.is_none());
-    }
-
-    #[test]
-    fn resolve_with_write_quorum_slack_accepts_committed_latest_during_merge() {
-        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
-        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        // The newer EC 2+2 version committed at write quorum 3 of 4; one holder
-        // drive is offline, and a third reachable drive still carries only the
-        // previous version. The candidates disagree, so the merge path (not the
-        // all-agree branch) must honor the slack.
+        // The merge counts metadata copies only; the EC geometry of a version
+        // does not raise the quorum a listing needs (MinIO mergeXLV2Versions).
         let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 2, 2);
         let new_and_old_entry =
             metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 2, 2), (new_mod_time, "new-etag", 2, 2)]);
-
-        let resolved = MetaCacheEntries(vec![Some(new_and_old_entry.clone()), Some(new_and_old_entry), Some(old_entry)])
-            .resolve_with_write_quorum(MetadataResolutionParams {
-                obj_quorum: 2,
-                requested_versions: 1,
-                bucket: "bucket".to_string(),
-                strict: true,
-                write_quorum_slack: 1,
-                ..Default::default()
-            })
-            .expect("committed latest should survive the merge when its missing copy is on an unreachable drive");
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(new_mod_time));
-        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new-etag"));
-    }
-
-    #[test]
-    fn resolve_with_write_quorum_slack_keeps_partial_latest_hidden_during_merge() {
-        let old_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_300).expect("valid timestamp");
-        let new_mod_time = OffsetDateTime::from_unix_timestamp(1_705_312_400).expect("valid timestamp");
-        // The newer EC 2+2 version (write quorum 3) reached only ONE drive: even
-        // with one drive unreachable (slack 1) it cannot prove the relaxed
-        // quorum of 2, so the committed previous version must win the merge.
-        let old_entry = metacache_entry_with_erasure(old_mod_time, "old-etag", 2, 2);
-        let new_and_old_entry =
-            metacache_entry_with_erasure_versions(&[(old_mod_time, "old-etag", 2, 2), (new_mod_time, "new-etag", 2, 2)]);
-
-        let resolved = MetaCacheEntries(vec![Some(new_and_old_entry), Some(old_entry.clone()), Some(old_entry)])
-            .resolve_with_write_quorum(MetadataResolutionParams {
-                obj_quorum: 2,
-                requested_versions: 1,
-                bucket: "bucket".to_string(),
-                strict: true,
-                write_quorum_slack: 1,
-                ..Default::default()
-            })
-            .expect("committed previous version should resolve after rejecting the partial latest");
-        let info = resolved
-            .to_fileinfo("bucket")
-            .expect("resolved committed metadata should decode as file info");
-        assert_eq!(info.mod_time, Some(old_mod_time));
-        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("old-etag"));
+        for (new_copies, expected) in [(2, (new_mod_time, "new-etag")), (1, (old_mod_time, "old-etag"))] {
+            let mut entries = vec![Some(new_and_old_entry.clone()); new_copies];
+            entries.extend(vec![Some(old_entry.clone()); 3 - new_copies]);
+            let resolved = MetaCacheEntries(entries)
+                .resolve(MetadataResolutionParams {
+                    dir_quorum: 2,
+                    obj_quorum: 2,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    ..Default::default()
+                })
+                .expect("a version at listing quorum must resolve");
+            let info = resolved
+                .to_fileinfo("bucket")
+                .expect("resolved metadata should decode as file info");
+            assert_eq!(info.mod_time, Some(expected.0), "new copies: {new_copies}");
+            assert_eq!(
+                info.metadata.get("etag").map(String::as_str),
+                Some(expected.1),
+                "new copies: {new_copies}"
+            );
+        }
     }
 
     #[test]
@@ -2973,46 +3030,36 @@ mod tests {
         let mut object = metacache_entry_with_erasure(modified, "marker-etag", 2, 2);
         object.name = "folder/".to_string();
         let directory = metacache_dir_entry("folder/");
-        for enforce_write_quorum in [false, true] {
-            for (object_copies, directory_copies) in [(3, 1), (3, 3), (2, 3), (0, 3), (2, 2)] {
-                for reverse in [false, true] {
-                    let mut entries = vec![Some(object.clone()); object_copies];
-                    entries.extend(vec![Some(directory.clone()); directory_copies]);
-                    if reverse {
-                        entries.reverse();
-                    }
-                    let entries = MetaCacheEntries(entries);
-                    let params = MetadataResolutionParams {
-                        dir_quorum: 3,
-                        obj_quorum: 3,
-                        requested_versions: 1,
-                        bucket: "bucket".to_string(),
-                        strict: true,
-                        ..Default::default()
-                    };
-                    let resolved = if enforce_write_quorum {
-                        entries.resolve_with_write_quorum(params)
-                    } else {
-                        entries.resolve(params)
-                    };
-                    let context = format!(
-                        "objects={object_copies}, directories={directory_copies}, reverse={reverse}, write={enforce_write_quorum}"
+        for (object_copies, directory_copies) in [(3, 1), (3, 3), (2, 3), (0, 3), (2, 2)] {
+            for reverse in [false, true] {
+                let mut entries = vec![Some(object.clone()); object_copies];
+                entries.extend(vec![Some(directory.clone()); directory_copies]);
+                if reverse {
+                    entries.reverse();
+                }
+                let resolved = MetaCacheEntries(entries).resolve(MetadataResolutionParams {
+                    dir_quorum: 3,
+                    obj_quorum: 3,
+                    requested_versions: 1,
+                    bucket: "bucket".to_string(),
+                    strict: true,
+                    ..Default::default()
+                });
+                let context = format!("objects={object_copies}, directories={directory_copies}, reverse={reverse}");
+                if object_copies >= 3 {
+                    let resolved = resolved.expect("metadata at quorum must shadow a same-named prefix");
+                    assert!(resolved.is_object(), "{context}");
+                    assert_eq!(
+                        resolved
+                            .to_fileinfo("bucket")
+                            .expect("marker metadata should decode")
+                            .mod_time,
+                        Some(modified)
                     );
-                    if object_copies >= 3 {
-                        let resolved = resolved.expect("metadata at quorum must shadow a same-named prefix");
-                        assert!(resolved.is_object(), "{context}");
-                        assert_eq!(
-                            resolved
-                                .to_fileinfo("bucket")
-                                .expect("marker metadata should decode")
-                                .mod_time,
-                            Some(modified)
-                        );
-                    } else if directory_copies >= 3 {
-                        assert!(resolved.expect("prefix at quorum must remain a fallback").is_dir(), "{context}");
-                    } else {
-                        assert!(resolved.is_none(), "{context}");
-                    }
+                } else if directory_copies >= 3 {
+                    assert!(resolved.expect("prefix at quorum must remain a fallback").is_dir(), "{context}");
+                } else {
+                    assert!(resolved.is_none(), "{context}");
                 }
             }
         }
@@ -3826,13 +3873,12 @@ mod tests {
             }));
         }
         let resolved_ec = MetaCacheEntries(distinct_ec_entries)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 2,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve distinct ec");
@@ -3880,7 +3926,6 @@ mod tests {
             requested_versions: 0,
             bucket: "bucket".to_string(),
             strict: false,
-            write_quorum_slack: 0,
             candidates: Vec::new(),
         })
         .expect("resolve keep_first");
@@ -3907,7 +3952,6 @@ mod tests {
             requested_versions: 0,
             bucket: "bucket".to_string(),
             strict: false,
-            write_quorum_slack: 0,
             candidates: Vec::new(),
         })
         .expect("resolve prefer_second");
@@ -4018,24 +4062,22 @@ mod tests {
         }));
 
         let res_uncached = MetaCacheEntries(uncached_disagree)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 3,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve uncached disagree");
         let res_cached = MetaCacheEntries(cached_disagree)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 3,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve cached disagree");
@@ -4064,13 +4106,12 @@ mod tests {
             reusable: false,
         }));
         let res_agree_corrupt = MetaCacheEntries(agree_with_corrupt)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 3,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve agree with corrupt");
@@ -4097,13 +4138,12 @@ mod tests {
             }));
         }
         let res_supplement = MetaCacheEntries(supplement_entries)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 3,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve supplement");
@@ -4138,13 +4178,12 @@ mod tests {
             }));
         }
         let res_outlier_last = MetaCacheEntries(outlier_last)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 3,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve outlier_last");
@@ -4207,13 +4246,12 @@ mod tests {
             reusable: false,
         }));
         let res_mixed_empty = MetaCacheEntries(mixed_empty_entries)
-            .resolve_with_write_quorum(MetadataResolutionParams {
+            .resolve(MetadataResolutionParams {
                 dir_quorum: 2,
                 obj_quorum: 4,
                 requested_versions: 1,
                 bucket: "bucket".to_string(),
                 strict: true,
-                write_quorum_slack: 0,
                 candidates: Vec::new(),
             })
             .expect("resolve mixed empty");

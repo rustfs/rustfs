@@ -203,6 +203,29 @@ pub(crate) async fn make_local_set_disks_with_ctx(
         disks.push(Some(disk));
     }
 
+    // This constructor owns a complete real local cohort, including every
+    // formatted physical slot. It bypasses ECStore's normal startup binding.
+    let topology = crate::layout::endpoints::EndpointServerPools(vec![crate::layout::endpoints::PoolEndpoints {
+        legacy: false,
+        set_count: 1,
+        drives_per_set: drive_count,
+        endpoints: endpoints.clone().into(),
+        cmd_line: String::new(),
+        platform: "test".into(),
+    }]);
+    let authority = ctx
+        .bind_multipart_proof_topology(&topology)
+        .expect("blackbox fixture must register its complete local topology");
+    crate::disk::multipart_source::bind_multipart_proof_snapshot(&disks, &authority)
+        .expect("blackbox native handles must belong to the registered instance");
+    for (slot, disk) in disks.iter().enumerate() {
+        assert_eq!(
+            disk.as_ref().expect("blackbox fixture disk").get_disk_id().await.unwrap(),
+            Some(format.erasure.sets[0][slot]),
+            "blackbox fixture must bind the actual complete formatted cohort"
+        );
+    }
+
     let set_disks = SetDisks::new_with_instance_ctx(
         "ecstore-validation-blackbox".to_string(),
         Arc::new(RwLock::new(disks)),

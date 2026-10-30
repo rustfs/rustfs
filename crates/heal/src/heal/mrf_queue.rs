@@ -27,6 +27,11 @@
 
 use super::{DiskStore, HealDiskExt as _, local_disk_map_read};
 use crate::heal::manager::{HealManager, MrfRepairNoticeTarget};
+use crate::heal::storage_api::{
+    EcstoreMrfLifecycleWriterFleetProofToken, ecstore_acquire_mrf_lifecycle_writer_fleet_proof,
+    ecstore_mrf_lifecycle_writer_fleet_proof_current, ecstore_mrf_lifecycle_writer_fleet_proof_matches,
+    ecstore_with_mrf_lifecycle_writer_fleet_proof,
+};
 use futures::{StreamExt, stream};
 use metrics::{counter, gauge};
 use rustfs_common::mrf_channel::{
@@ -37,6 +42,7 @@ use rustfs_heal_contracts::heal_channel::{HealAdmissionDropReason, HealAdmission
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::{self, Write};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -58,12 +64,18 @@ static GLOBAL_MRF_LIFECYCLE_SENDER: std::sync::OnceLock<mpsc::Sender<MrfLifecycl
 pub enum MrfLifecycleControlError {
     #[error("MRF lifecycle controller is unavailable")]
     Unavailable,
+    #[error("the MRF checkpoint is unreadable; retain its files and restore a compatible reader")]
+    CheckpointUnreadable,
     #[error("the requested responsibility changed or does not exist")]
     StaleGeneration,
     #[error("the responsibility is not held as unverified legacy")]
     NotHeld,
     #[error("the bucket incarnation changed")]
     IncarnationChanged,
+    #[error("the current bucket identity is unresolved; the responsibility remains held")]
+    BucketIdentityUnresolved,
+    #[error("the current bucket identity is unavailable; retry after storage recovers")]
+    BucketIdentityUnavailable(#[source] Box<crate::Error>),
     #[error("operator action is invalid: {0}")]
     InvalidAction(String),
     #[error("the lifecycle checkpoint could not be persisted")]
@@ -115,7 +127,7 @@ pub async fn list_legacy_responsibilities(
         .send(MrfLifecycleCommand::List { after, limit, response })
         .await
         .map_err(|_| MrfLifecycleControlError::Unavailable)?;
-    receiver.await.map_err(|_| MrfLifecycleControlError::Unavailable)
+    receiver.await.map_err(|_| MrfLifecycleControlError::Unavailable)?
 }
 
 pub async fn recheck_legacy_responsibility(
@@ -172,7 +184,7 @@ enum MrfLifecycleCommand {
     List {
         after: Option<Uuid>,
         limit: usize,
-        response: tokio::sync::oneshot::Sender<MrfLegacyResponsibilitySnapshot>,
+        response: tokio::sync::oneshot::Sender<Result<MrfLegacyResponsibilitySnapshot, MrfLifecycleControlError>>,
     },
     Recheck {
         responsibility_id: Uuid,
@@ -206,6 +218,10 @@ pub(crate) const MRF_SCOPED_JOURNAL_PATH: &str = "buckets/.heal/mrf/journal-scop
 const MRF_LIFECYCLE_PATHS: [&str; 2] = [".heal-mrf-lifecycle.0.bin", ".heal-mrf-lifecycle.1.bin"];
 const MRF_LIFECYCLE_MAGIC: &[u8; 8] = b"RFMFLC01";
 const MRF_LIFECYCLE_FORMAT_VERSION: u8 = 1;
+const MRF_LIFECYCLE_FORMAT_VERSION_V2: u8 = 2;
+
+/// Highest supported lifecycle format; every format from 1 through this value is readable.
+pub const MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION: u8 = MRF_LIFECYCLE_FORMAT_VERSION_V2;
 
 /// Record format tag.
 const MRF_JOURNAL_FORMAT: u8 = 1;
@@ -246,6 +262,8 @@ pub(crate) struct MrfConsumerConfig {
     pub flush_threshold: usize,
     /// Backoff after the heal manager reports a full admission.
     pub admission_backoff: Duration,
+    /// Permit new V2 states only after an authenticated reader-fleet observation.
+    pub lifecycle_v2_writer_enabled: bool,
 }
 
 impl Default for MrfConsumerConfig {
@@ -266,6 +284,10 @@ impl Default for MrfConsumerConfig {
             flush_interval: Duration::from_millis(500),
             flush_threshold: 1000,
             admission_backoff: Duration::from_secs(5),
+            lifecycle_v2_writer_enabled: rustfs_utils::get_env_bool(
+                rustfs_config::ENV_MRF_LIFECYCLE_V2_ENABLE,
+                rustfs_config::DEFAULT_MRF_LIFECYCLE_V2_ENABLE,
+            ),
         }
     }
 }
@@ -388,11 +410,24 @@ impl MrfQueue {
 
 /// Append one encoded record to `out`.
 pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
+    let start = out.len();
+    match encode_intent_to_writer(intent, out) {
+        Ok(true) => true,
+        _ => {
+            out.truncate(start);
+            false
+        }
+    }
+}
+
+// A caller supplying a fallible writer must discard its output after an
+// error; only the Vec adapter above can roll back its own partial record.
+fn encode_intent_to_writer(intent: &MrfIntent, out: &mut impl Write) -> io::Result<bool> {
     let Ok(bucket_len) = u32::try_from(intent.bucket.len()) else {
-        return false;
+        return Ok(false);
     };
     let Ok(object_len) = u32::try_from(intent.object.len()) else {
-        return false;
+        return Ok(false);
     };
     let scope = (!matches!(intent.kind, rustfs_common::mrf_channel::MrfKind::MetadataCorruption))
         .then_some(intent.scope)
@@ -401,62 +436,68 @@ pub(crate) fn encode_intent(intent: &MrfIntent, out: &mut Vec<u8>) -> bool {
     let purge = match intent.kind {
         MrfKind::DeleteMarkerPurge => match intent.delete_marker_purge.as_ref().filter(|payload| payload.is_valid()) {
             Some(payload) if version_id.is_some() && scope.is_some() => Some(payload),
-            _ => return false,
+            _ => return Ok(false),
         },
         _ if intent.delete_marker_purge.is_none() => None,
-        _ => return false,
+        _ => return Ok(false),
     };
-    let start = out.len();
-    out.push(MRF_JOURNAL_FORMAT);
-    out.push(if purge.is_some() {
-        MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
-    } else if scope.is_some() {
-        MRF_JOURNAL_VERSION_SCOPED
-    } else {
-        MRF_JOURNAL_VERSION
-    });
-    out.push(match intent.kind {
-        rustfs_common::mrf_channel::MrfKind::DecodeFailure => 1,
-        rustfs_common::mrf_channel::MrfKind::MetadataCorruption => 2,
-        rustfs_common::mrf_channel::MrfKind::PartialWrite => 3,
-        rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => 4,
-    });
-    out.push(intent.attempts);
-    out.extend_from_slice(&intent.enqueued_at_ms.to_le_bytes());
-    match version_id {
-        Some(bytes) => {
-            out.push(1);
-            out.extend_from_slice(&bytes);
-        }
-        None => out.push(0),
-    }
-    if let Some(scope) = scope {
-        out.extend_from_slice(&scope.pool_index.to_le_bytes());
-        out.extend_from_slice(&scope.set_index.to_le_bytes());
-    }
-    out.extend_from_slice(&bucket_len.to_le_bytes());
-    out.extend_from_slice(&object_len.to_le_bytes());
-    out.extend_from_slice(intent.bucket.as_bytes());
-    out.extend_from_slice(intent.object.as_bytes());
-    if let Some(purge) = purge {
-        let Ok(marker_len) = u32::try_from(purge.marker.len()) else {
-            out.truncate(start);
-            return false;
+    let marker_len = match purge {
+        Some(payload) => match u32::try_from(payload.marker.len()) {
+            Ok(length) => Some(length),
+            Err(_) => return Ok(false),
+        },
+        None => None,
+    };
+    let mut crc = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
+    {
+        let mut write_record = |bytes: &[u8]| -> io::Result<()> {
+            out.write_all(bytes)?;
+            crc.update(bytes);
+            Ok(())
         };
-        out.extend_from_slice(purge.bucket_incarnation_id.as_bytes());
-        out.extend_from_slice(purge.marker_incarnation_id.as_bytes());
-        out.extend_from_slice(&purge.marker_identity);
-        out.extend_from_slice(&marker_len.to_le_bytes());
-        out.extend_from_slice(&purge.marker);
+        write_record(&[MRF_JOURNAL_FORMAT])?;
+        write_record(&[if purge.is_some() {
+            MRF_JOURNAL_VERSION_DELETE_MARKER_PURGE
+        } else if scope.is_some() {
+            MRF_JOURNAL_VERSION_SCOPED
+        } else {
+            MRF_JOURNAL_VERSION
+        }])?;
+        write_record(&[match intent.kind {
+            rustfs_common::mrf_channel::MrfKind::DecodeFailure => 1,
+            rustfs_common::mrf_channel::MrfKind::MetadataCorruption => 2,
+            rustfs_common::mrf_channel::MrfKind::PartialWrite => 3,
+            rustfs_common::mrf_channel::MrfKind::DeleteMarkerPurge => 4,
+        }])?;
+        write_record(&[intent.attempts])?;
+        write_record(&intent.enqueued_at_ms.to_le_bytes())?;
+        match version_id {
+            Some(bytes) => {
+                write_record(&[1])?;
+                write_record(&bytes)?;
+            }
+            None => write_record(&[0])?,
+        }
+        if let Some(scope) = scope {
+            write_record(&scope.pool_index.to_le_bytes())?;
+            write_record(&scope.set_index.to_le_bytes())?;
+        }
+        write_record(&bucket_len.to_le_bytes())?;
+        write_record(&object_len.to_le_bytes())?;
+        write_record(intent.bucket.as_bytes())?;
+        write_record(intent.object.as_bytes())?;
+        if let Some(purge) = purge {
+            let Some(marker_len) = marker_len else { return Ok(false) };
+            write_record(purge.bucket_incarnation_id.as_bytes())?;
+            write_record(purge.marker_incarnation_id.as_bytes())?;
+            write_record(&purge.marker_identity)?;
+            write_record(&marker_len.to_le_bytes())?;
+            write_record(&purge.marker)?;
+        }
     }
-    let mut hasher = crc_fast::Digest::new(crc_fast::CrcAlgorithm::Crc32IsoHdlc);
-    hasher.update(&out[start..]);
-    let Ok(checksum) = u32::try_from(hasher.finalize()) else {
-        out.truncate(start);
-        return false;
-    };
-    out.extend_from_slice(&checksum.to_le_bytes());
-    true
+    let checksum = u32::try_from(crc.finalize()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "invalid MRF CRC"))?;
+    out.write_all(&checksum.to_le_bytes())?;
+    Ok(true)
 }
 
 fn decode_one(data: &[u8]) -> Option<(MrfIntent, usize)> {
@@ -615,16 +656,32 @@ struct MrfLifecyclePayload {
     records: Vec<ResponsibilityCheckpoint>,
 }
 
+#[derive(Debug, thiserror::Error)]
+enum MrfReplayError {
+    #[error(transparent)]
+    Snapshot(#[from] snapshot::SnapshotError),
+    #[error("MRF lifecycle checkpoint is invalid")]
+    InvalidLifecycle,
+    #[error("MRF lifecycle checkpoint could not be decoded")]
+    Lifecycle(#[source] serde_json::Error),
+}
+
 fn encode_mrf_lifecycle_checkpoint(
+    format_version: u8,
     owner: Uuid,
     sequence: u64,
     records: Vec<ResponsibilityCheckpoint>,
     byte_limit: usize,
 ) -> Option<Vec<u8>> {
-    if owner.is_nil()
+    if !matches!(format_version, MRF_LIFECYCLE_FORMAT_VERSION | MRF_LIFECYCLE_FORMAT_VERSION_V2)
+        || owner.is_nil()
         || sequence == 0
         || sequence == u64::MAX
         || records.iter().any(|record| !record.is_valid())
+        || (format_version == MRF_LIFECYCLE_FORMAT_VERSION
+            && records.iter().any(|record| {
+                matches!(record.state, partial_write::ResponsibilityState::SourceAndCurrentGenerationUnknown { .. })
+            }))
         || records
             .iter()
             .map(|record| record.responsibility_id)
@@ -641,7 +698,7 @@ fn encode_mrf_lifecycle_checkpoint(
         return None;
     }
     let payload = MrfLifecyclePayload {
-        format_version: MRF_LIFECYCLE_FORMAT_VERSION,
+        format_version,
         checkpoint_owner: owner,
         checkpoint_sequence: sequence,
         records,
@@ -653,36 +710,41 @@ fn encode_mrf_lifecycle_checkpoint(
     let digest: [u8; 32] = sha2::Sha256::digest(&payload).into();
     let mut encoded = Vec::with_capacity(8 + 1 + 8 + 32 + payload.len());
     encoded.extend_from_slice(MRF_LIFECYCLE_MAGIC);
-    encoded.push(MRF_LIFECYCLE_FORMAT_VERSION);
+    encoded.push(format_version);
     encoded.extend_from_slice(&u64::try_from(payload.len()).ok()?.to_le_bytes());
     encoded.extend_from_slice(&digest);
     encoded.extend_from_slice(&payload);
     Some(encoded)
 }
 
-fn decode_mrf_lifecycle_checkpoint(data: &[u8], byte_limit: usize) -> Option<MrfLifecyclePayload> {
+fn decode_mrf_lifecycle_checkpoint(data: &[u8], byte_limit: usize) -> Result<MrfLifecyclePayload, MrfReplayError> {
     const HEADER_LEN: usize = 8 + 1 + 8 + 32;
     if data.len() < HEADER_LEN || data.len() > byte_limit || &data[..8] != MRF_LIFECYCLE_MAGIC {
-        return None;
+        return Err(MrfReplayError::InvalidLifecycle);
     }
-    if data[8] != MRF_LIFECYCLE_FORMAT_VERSION {
-        return None;
+    if !matches!(data[8], MRF_LIFECYCLE_FORMAT_VERSION | MRF_LIFECYCLE_FORMAT_VERSION_V2) {
+        return Err(snapshot::SnapshotError::Unsupported.into());
     }
-    let payload_len = usize::try_from(u64::from_le_bytes(data[9..17].try_into().ok()?)).ok()?;
+    let payload_len = usize::try_from(u64::from_le_bytes(data[9..17].try_into().map_err(|_| MrfReplayError::InvalidLifecycle)?))
+        .map_err(|_| MrfReplayError::InvalidLifecycle)?;
     if payload_len != data.len().saturating_sub(HEADER_LEN) {
-        return None;
+        return Err(MrfReplayError::InvalidLifecycle);
     }
     let payload = &data[HEADER_LEN..];
     let digest: [u8; 32] = sha2::Sha256::digest(payload).into();
     if digest != data[17..49] {
-        return None;
+        return Err(MrfReplayError::InvalidLifecycle);
     }
-    let decoded: MrfLifecyclePayload = serde_json::from_slice(payload).ok()?;
-    if decoded.format_version != MRF_LIFECYCLE_FORMAT_VERSION
+    let decoded: MrfLifecyclePayload = serde_json::from_slice(payload).map_err(MrfReplayError::Lifecycle)?;
+    if decoded.format_version != data[8]
         || decoded.checkpoint_owner.is_nil()
         || decoded.checkpoint_sequence == 0
         || decoded.checkpoint_sequence == u64::MAX
         || decoded.records.iter().any(|record| !record.is_valid())
+        || (decoded.format_version == MRF_LIFECYCLE_FORMAT_VERSION
+            && decoded.records.iter().any(|record| {
+                matches!(record.state, partial_write::ResponsibilityState::SourceAndCurrentGenerationUnknown { .. })
+            }))
         || decoded
             .records
             .iter()
@@ -698,14 +760,29 @@ fn decode_mrf_lifecycle_checkpoint(data: &[u8], byte_limit: usize) -> Option<Mrf
             .len()
             != decoded.records.len()
     {
-        return None;
+        return Err(MrfReplayError::InvalidLifecycle);
     }
-    Some(decoded)
+    Ok(decoded)
+}
+
+struct IntentDigestWriter(sha2::Sha256);
+
+impl Write for IntentDigestWriter {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
 }
 
 fn intent_digest(intent: &MrfIntent) -> Option<[u8; 32]> {
-    let mut encoded = Vec::new();
-    encode_intent(intent, &mut encoded).then(|| sha2::Sha256::digest(encoded).into())
+    let mut encoded = IntentDigestWriter(sha2::Sha256::new());
+    encode_intent_to_writer(intent, &mut encoded)
+        .ok()?
+        .then(|| encoded.0.finalize().into())
 }
 
 // ---------------------------------------------------------------------------
@@ -754,8 +831,8 @@ async fn read_mrf_lifecycle_checkpoint(
     sequence: u64,
     checkpoint_max_bytes: usize,
     byte_limit: usize,
-) -> Option<Vec<ResponsibilityCheckpoint>> {
-    let bytes = snapshot::read_committed_companion(
+) -> Result<Option<MrfLifecyclePayload>, MrfReplayError> {
+    let Some(bytes) = snapshot::read_committed_companion(
         &journal_disks().await,
         owner,
         sequence,
@@ -763,10 +840,15 @@ async fn read_mrf_lifecycle_checkpoint(
         checkpoint_max_bytes,
         byte_limit,
     )
-    .await
-    .ok()??;
+    .await?
+    else {
+        return Ok(None);
+    };
     let decoded = decode_mrf_lifecycle_checkpoint(&bytes, byte_limit)?;
-    (decoded.checkpoint_owner == owner && decoded.checkpoint_sequence == sequence).then_some(decoded.records)
+    if decoded.checkpoint_owner != owner || decoded.checkpoint_sequence != sequence {
+        return Err(MrfReplayError::InvalidLifecycle);
+    }
+    Ok(Some(decoded))
 }
 
 /// Write the snapshot to every local disk; returns true when at least one
@@ -931,6 +1013,9 @@ struct MrfRuntime {
     config: MrfConsumerConfig,
     checkpoint_owner: Uuid,
     next_checkpoint_sequence: u64,
+    // Preserve an observed format across checkpoint ownership changes.
+    // Without a V2 checkpoint, keep writing V1 until writer rollout is qualified.
+    lifecycle_format_version: u8,
     new_since_flush: usize,
     /// True while the in-memory pending set has changed since the last
     /// journal flush (push, pop, or an attempts bump that alters the encoded
@@ -944,6 +1029,7 @@ struct MrfRuntime {
     /// True when replay observed a responsibility that cannot be discharged by
     /// a complete verified repair proof in this process.
     retain_replay_journal: bool,
+    replay_readable: bool,
     /// Durable responsibilities accepted from replay and waiting for an
     /// exact storage-owned proof before the startup journal can be deleted.
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
@@ -999,6 +1085,9 @@ impl MrfRuntime {
         intent: MrfIntent,
         source_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(), MrfDurableAdmissionError> {
+        if !self.replay_readable || self.partial_writes.pending_lifecycle_transition.is_some() {
+            return Err(MrfDurableAdmissionError::Persistence);
+        }
         self.partial_writes.admit_with_source_incarnation(
             intent,
             source_bucket_incarnation_id,
@@ -1009,10 +1098,17 @@ impl MrfRuntime {
         Ok(())
     }
 
-    fn list_unverified_legacy(&self, after: Option<Uuid>, limit: usize) -> MrfLegacyResponsibilitySnapshot {
+    fn list_unverified_legacy(
+        &self,
+        after: Option<Uuid>,
+        limit: usize,
+    ) -> Result<MrfLegacyResponsibilitySnapshot, MrfLifecycleControlError> {
+        if !self.replay_readable {
+            return Err(MrfLifecycleControlError::CheckpointUnreadable);
+        }
         let (responsibilities, next_cursor) = self.partial_writes.list_unverified_legacy(after, limit);
         let lifecycle = self.partial_writes.lifecycle_summary();
-        MrfLegacyResponsibilitySnapshot {
+        Ok(MrfLegacyResponsibilitySnapshot {
             contract_version: 2,
             node_local: true,
             checkpoint_owner: self.runtime_checkpoint.map(|(owner, _)| owner),
@@ -1023,7 +1119,7 @@ impl MrfRuntime {
             operator_accepted_count: lifecycle.operator_accepted_count,
             responsibilities,
             next_cursor,
-        }
+        })
     }
 
     async fn verify_legacy_generation_incarnation(
@@ -1032,10 +1128,16 @@ impl MrfRuntime {
         responsibility_id: Uuid,
         expected_bucket_incarnation_id: Uuid,
     ) -> Result<MrfIntent, MrfLifecycleControlError> {
+        if !self.replay_readable {
+            return Err(MrfLifecycleControlError::CheckpointUnreadable);
+        }
         let (intent, state, source_bucket_incarnation_id) = self
             .partial_writes
             .intent_for_responsibility(responsibility_id)
             .ok_or(MrfLifecycleControlError::StaleGeneration)?;
+        if matches!(state, partial_write::ResponsibilityState::SourceAndCurrentGenerationUnknown { .. }) {
+            return Err(MrfLifecycleControlError::BucketIdentityUnresolved);
+        }
         if state.bucket_incarnation_id() != Some(expected_bucket_incarnation_id) {
             return Err(MrfLifecycleControlError::IncarnationChanged);
         }
@@ -1047,7 +1149,8 @@ impl MrfRuntime {
         let anchor = manager
             .durable_mrf_repair_anchor(&intent)
             .await
-            .ok_or(MrfLifecycleControlError::IncarnationChanged)?;
+            .map_err(|error| MrfLifecycleControlError::BucketIdentityUnavailable(Box::new(error)))?
+            .ok_or(MrfLifecycleControlError::BucketIdentityUnresolved)?;
         if anchor.bucket_incarnation_id != expected_bucket_incarnation_id {
             return Err(MrfLifecycleControlError::IncarnationChanged);
         }
@@ -1060,6 +1163,12 @@ impl MrfRuntime {
         responsibility_id: Uuid,
         expected_bucket_incarnation_id: Uuid,
     ) -> Result<(), MrfLifecycleControlError> {
+        if !self.replay_readable {
+            return Err(MrfLifecycleControlError::CheckpointUnreadable);
+        }
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return Err(MrfLifecycleControlError::Persistence);
+        }
         if self.partial_writes.is_active_responsibility(responsibility_id) {
             return Ok(());
         }
@@ -1088,6 +1197,12 @@ impl MrfRuntime {
         responsibility_id: Uuid,
         expected_bucket_incarnation_id: Option<Uuid>,
     ) -> Result<(), MrfLifecycleControlError> {
+        if !self.replay_readable {
+            return Err(MrfLifecycleControlError::CheckpointUnreadable);
+        }
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return Err(MrfLifecycleControlError::Persistence);
+        }
         let (intent, state, source_incarnation) = self
             .partial_writes
             .intent_for_responsibility(responsibility_id)
@@ -1096,14 +1211,20 @@ impl MrfRuntime {
             return Err(MrfLifecycleControlError::StaleGeneration);
         }
         if expected_bucket_incarnation_id.is_none()
-            && (source_incarnation.is_some() || !matches!(state, partial_write::ResponsibilityState::Active))
+            && (source_incarnation.is_some()
+                || !matches!(
+                    state,
+                    partial_write::ResponsibilityState::Active {}
+                        | partial_write::ResponsibilityState::SourceAndCurrentGenerationUnknown { .. }
+                ))
         {
             return Err(MrfLifecycleControlError::StaleGeneration);
         }
         let anchor = manager
             .durable_mrf_repair_anchor(&intent)
             .await
-            .ok_or(MrfLifecycleControlError::IncarnationChanged)?;
+            .map_err(|error| MrfLifecycleControlError::BucketIdentityUnavailable(Box::new(error)))?
+            .ok_or(MrfLifecycleControlError::BucketIdentityUnresolved)?;
         if Some(anchor.bucket_incarnation_id) == expected_bucket_incarnation_id {
             return Ok(());
         }
@@ -1133,6 +1254,12 @@ impl MrfRuntime {
         manager: &HealManager,
         request: MrfLegacyRiskAcceptanceRequest,
     ) -> Result<(), MrfLifecycleControlError> {
+        if !self.replay_readable {
+            return Err(MrfLifecycleControlError::CheckpointUnreadable);
+        }
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return Err(MrfLifecycleControlError::Persistence);
+        }
         let responsibility_id = request.responsibility_id;
         if self
             .partial_writes
@@ -1169,6 +1296,39 @@ impl MrfRuntime {
         Ok(())
     }
 
+    async fn handle_lifecycle_command(&mut self, manager: &HealManager, command: MrfLifecycleCommand) {
+        match command {
+            MrfLifecycleCommand::List { after, limit, response } => {
+                let _ = response.send(self.list_unverified_legacy(after, limit));
+            }
+            MrfLifecycleCommand::Recheck {
+                responsibility_id,
+                expected_bucket_incarnation_id,
+                response,
+            } => {
+                let result = self
+                    .recheck_legacy_generation(manager, responsibility_id, expected_bucket_incarnation_id)
+                    .await;
+                let _ = response.send(result);
+            }
+            MrfLifecycleCommand::Refresh {
+                responsibility_id,
+                expected_bucket_incarnation_id,
+                response,
+            } => {
+                let result = self
+                    .refresh_legacy_generation(manager, responsibility_id, expected_bucket_incarnation_id)
+                    .await;
+                let _ = response.send(result);
+            }
+            MrfLifecycleCommand::AcceptUnverifiedRisk { request, response } => {
+                let result = self.accept_legacy_risk(manager, request).await;
+                let _ = response.send(result);
+            }
+        }
+        self.publish_metrics();
+    }
+
     fn snapshot(&self) -> (Vec<u8>, Vec<u8>) {
         let mut authoritative = Vec::new();
         let mut legacy = Vec::new();
@@ -1186,6 +1346,14 @@ impl MrfRuntime {
     }
 
     async fn flush(&mut self) -> bool {
+        // A new snapshot or compatibility mirror must never replace an owner
+        // whose lifecycle records this process could not read completely.
+        if !self.replay_readable {
+            return false;
+        }
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return self.flush_pending_lifecycle(None).await;
+        }
         let (authoritative, legacy) = self.snapshot();
         let lifecycle_byte_limit = self.config.journal_max_bytes.saturating_mul(4);
         let lifecycle_checkpoint = if self.partial_writes.depth() == 0 {
@@ -1195,6 +1363,7 @@ impl MrfRuntime {
             (records.len() == self.partial_writes.depth())
                 .then(|| {
                     encode_mrf_lifecycle_checkpoint(
+                        self.lifecycle_format_version,
                         self.checkpoint_owner,
                         self.next_checkpoint_sequence,
                         records,
@@ -1237,7 +1406,179 @@ impl MrfRuntime {
                 }
             }
         };
-        let authoritative_persisted = write_journal(MRF_SCOPED_JOURNAL_PATH, &authoritative).await;
+        self.finish_flush(
+            &authoritative,
+            &legacy,
+            committed_persisted,
+            committed_on_disk,
+            lifecycle_checkpoint.is_some(),
+        )
+        .await
+    }
+
+    async fn pending_lifecycle_commit_matches(
+        &self,
+        authoritative: &[u8],
+        lifecycle: &[u8],
+    ) -> Result<bool, snapshot::SnapshotError> {
+        let Some(checkpoint) = snapshot::inspect_local_committed_snapshot(self.config.journal_max_bytes).await? else {
+            return Ok(false);
+        };
+        if checkpoint.owner() != self.checkpoint_owner
+            || checkpoint.sequence() != self.next_checkpoint_sequence
+            || checkpoint.payload() != authoritative
+        {
+            return Ok(false);
+        }
+        let companion = snapshot::read_committed_companion(
+            &journal_disks().await,
+            self.checkpoint_owner,
+            self.next_checkpoint_sequence,
+            &MRF_LIFECYCLE_PATHS,
+            self.config.journal_max_bytes,
+            self.config.journal_max_bytes.saturating_mul(4),
+        )
+        .await?;
+        Ok(companion.as_deref() == Some(lifecycle))
+    }
+
+    async fn flush_pending_lifecycle(&mut self, proof: Option<EcstoreMrfLifecycleWriterFleetProofToken>) -> bool {
+        if !self.replay_readable {
+            return false;
+        }
+        let Some(pending) = self.partial_writes.pending_lifecycle_transition.as_mut() else {
+            return false;
+        };
+        let now = tokio::time::Instant::now();
+        if now < pending.next_attempt {
+            return false;
+        }
+        pending.next_attempt = now
+            + self
+                .config
+                .admission_backoff
+                .clamp(Duration::from_secs(5), Duration::from_secs(60));
+        let intent = pending.intent.clone();
+        let record = pending.record.clone();
+        let mut records = self.partial_writes.checkpoint_records(intent_digest);
+        let Some(current) = records.iter_mut().find(|current| {
+            current.responsibility_id == record.responsibility_id && current.intent_digest == record.intent_digest
+        }) else {
+            return false;
+        };
+        if !matches!(current.state, partial_write::ResponsibilityState::Active {})
+            || current.source_bucket_incarnation_id.is_some()
+        {
+            return false;
+        }
+        *current = record.clone();
+        let lifecycle_limit = self.config.journal_max_bytes.saturating_mul(4);
+        let Some(lifecycle) = encode_mrf_lifecycle_checkpoint(
+            MRF_LIFECYCLE_FORMAT_VERSION_V2,
+            self.checkpoint_owner,
+            self.next_checkpoint_sequence,
+            records,
+            lifecycle_limit,
+        ) else {
+            return false;
+        };
+        let (authoritative, legacy) = self.snapshot();
+        // A lost publication result must not regenerate the body or downgrade
+        // the owner. An exact committed readback resolves it without new writes.
+        let already_committed = match self.pending_lifecycle_commit_matches(&authoritative, &lifecycle).await {
+            Ok(committed) => committed,
+            Err(_) => return false,
+        };
+        let (authoritative, lifecycle) = if already_committed {
+            (authoritative, lifecycle)
+        } else {
+            let proof = match proof {
+                Some(proof) => proof,
+                None => {
+                    let Some(proof) =
+                        ecstore_acquire_mrf_lifecycle_writer_fleet_proof(MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION).await
+                    else {
+                        counter!("rustfs_heal_mrf_lifecycle_writer_blocked_total", "reason" => "reader_fleet").increment(1);
+                        return false;
+                    };
+                    proof
+                }
+            };
+            let disks = journal_disks().await;
+            let owner = self.checkpoint_owner;
+            let sequence = self.next_checkpoint_sequence;
+            let limit = self.config.journal_max_bytes;
+            // The task and native CAS workers share one permit. A dropped
+            // waiter or disk timeout cannot release a still-running worker.
+            let published = tokio::spawn(async move {
+                let proof = Arc::new(proof);
+                // All replicas share one fresh pre-commit observation; native
+                // workers still check expiry and revocation independently.
+                let observed = tokio::sync::OnceCell::new();
+                let result = ecstore_with_mrf_lifecycle_writer_fleet_proof(
+                    Arc::clone(&proof),
+                    snapshot::publish_committed_snapshot_with_companion_guarded(
+                        &disks,
+                        owner,
+                        sequence,
+                        &authoritative,
+                        limit,
+                        Some((&MRF_LIFECYCLE_PATHS, &lifecycle, lifecycle_limit)),
+                        |stage| {
+                            let proof = &proof;
+                            let observed = &observed;
+                            async move {
+                                if matches!(stage, snapshot::SnapshotPublicationStage::Manifest)
+                                    && !*observed
+                                        .get_or_init(|| ecstore_mrf_lifecycle_writer_fleet_proof_matches(proof))
+                                        .await
+                                {
+                                    return false;
+                                }
+                                ecstore_mrf_lifecycle_writer_fleet_proof_current(proof)
+                            }
+                        },
+                    ),
+                )
+                .await;
+                (result, authoritative, lifecycle)
+            })
+            .await;
+            let Ok((result, authoritative, lifecycle)) = published else {
+                return false;
+            };
+            if result.is_err()
+                && !self
+                    .pending_lifecycle_commit_matches(&authoritative, &lifecycle)
+                    .await
+                    .unwrap_or(false)
+            {
+                return false;
+            }
+            (authoritative, lifecycle)
+        };
+        if !self.partial_writes.restore_state(&intent, &record) {
+            return false;
+        }
+        self.partial_writes.pending_lifecycle_transition = None;
+        self.lifecycle_format_version = MRF_LIFECYCLE_FORMAT_VERSION_V2;
+        self.runtime_checkpoint = Some((self.checkpoint_owner, self.next_checkpoint_sequence));
+        self.next_checkpoint_sequence = self.next_checkpoint_sequence.saturating_add(1);
+        self.journal_on_disk = true;
+        self.dirty = true;
+        self.finish_flush(&authoritative, &legacy, true, true, !lifecycle.is_empty())
+            .await
+    }
+
+    async fn finish_flush(
+        &mut self,
+        authoritative: &[u8],
+        legacy: &[u8],
+        committed_persisted: bool,
+        committed_on_disk: bool,
+        lifecycle_ready: bool,
+    ) -> bool {
+        let authoritative_persisted = write_journal(MRF_SCOPED_JOURNAL_PATH, authoritative).await;
         if !authoritative.is_empty() {
             counter!("rustfs_heal_mrf_journal_fsync_total").increment(1);
         }
@@ -1246,7 +1587,7 @@ impl MrfRuntime {
         // snapshot has reached at least one disk. This ordering prevents an
         // old reader from observing a newer epoch that a new reader cannot
         // see when the canonical write is unavailable.
-        let legacy_persisted = authoritative_persisted && write_journal(MRF_JOURNAL_PATH, &legacy).await;
+        let legacy_persisted = authoritative_persisted && write_journal(MRF_JOURNAL_PATH, legacy).await;
         let lifecycle_persisted = if self.partial_writes.depth() == 0 {
             let mut all_deleted = true;
             for path in MRF_LIFECYCLE_PATHS {
@@ -1254,7 +1595,7 @@ impl MrfRuntime {
             }
             all_deleted
         } else {
-            lifecycle_checkpoint.is_some() && committed_persisted
+            lifecycle_ready && committed_persisted
         };
         // Keep dirty until the committed checkpoint, authoritative snapshot,
         // and compatibility mirror have all been accepted; otherwise a
@@ -1275,18 +1616,38 @@ impl MrfRuntime {
     /// Drain pending intents into the heal manager until it is full, the
     /// queue empties, or attempts are exhausted.
     async fn dispatch_partial_writes(&mut self, manager: &HealManager) {
-        if self
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return;
+        }
+        let changed = self
             .partial_writes
             .dispatch_collecting_lifecycle_change(manager, &self.config)
-            .await
+            .await;
+        if self.config.lifecycle_v2_writer_enabled
+            && let Some(candidate) = self.partial_writes.take_unresolved_generation_candidate()
         {
+            if let Some(proof) = ecstore_acquire_mrf_lifecycle_writer_fleet_proof(MRF_LIFECYCLE_READER_MAX_FORMAT_VERSION).await {
+                self.partial_writes.pending_lifecycle_transition = Some(candidate);
+                self.dirty = true;
+                self.flush_pending_lifecycle(Some(proof)).await;
+                return;
+            }
+            counter!("rustfs_heal_mrf_lifecycle_writer_blocked_total", "reason" => "reader_fleet").increment(1);
+        }
+        if changed {
             self.dirty = true;
             self.flush().await;
         }
     }
 
     async fn dispatch(&mut self, manager: &HealManager) {
+        if !self.replay_readable || self.partial_writes.pending_lifecycle_transition.is_some() {
+            return;
+        }
         self.dispatch_partial_writes(manager).await;
+        if self.partial_writes.pending_lifecycle_transition.is_some() {
+            return;
+        }
         if let Some(until) = self.backoff_until {
             if tokio::time::Instant::now() < until {
                 return;
@@ -1301,6 +1662,9 @@ impl MrfRuntime {
                 }
                 if self.flush().await {
                     self.dispatch_partial_writes(manager).await;
+                }
+                if self.partial_writes.pending_lifecycle_transition.is_some() {
+                    return;
                 }
                 continue;
             }
@@ -1357,6 +1721,9 @@ impl MrfRuntime {
     }
 
     async fn delete_idle_recovery_anchors(&mut self) -> bool {
+        if !self.replay_readable {
+            return false;
+        }
         let runtime_deleted = match self.runtime_checkpoint {
             Some((owner, sequence)) => {
                 match snapshot::delete_committed_snapshots_through(owner, sequence, self.config.journal_max_bytes).await {
@@ -1518,10 +1885,12 @@ pub async fn replay_journal_once(manager: &Arc<HealManager>) -> usize {
         config,
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: replay.next_checkpoint_sequence,
+        lifecycle_format_version: replay.lifecycle_format_version,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: replay.journal_on_disk,
         retain_replay_journal: replay.retain_journal_for_replay,
+        replay_readable: replay.source_readable,
         durable_replay_anchors: replay.durable_replay_anchors,
         replay_cleanup: replay.cleanup,
         runtime_checkpoint: None,
@@ -1537,10 +1906,12 @@ struct ReplayOutcome {
     replayed: usize,
     journal_on_disk: bool,
     retain_journal_for_replay: bool,
+    source_readable: bool,
     durable_replay_anchors: Vec<MrfDurableRepairAnchor>,
     partial_writes: Vec<(MrfIntent, Option<ResponsibilityCheckpoint>)>,
     cleanup: Option<ReplayCleanup>,
     next_checkpoint_sequence: u64,
+    lifecycle_format_version: u8,
 }
 
 fn replay_must_retain_journal(
@@ -1559,9 +1930,11 @@ enum ReplayCleanup {
 }
 
 struct ReplaySource {
-    data: Vec<u8>,
+    intents: Vec<MrfIntent>,
+    truncated_bytes: usize,
     cleanup: ReplayCleanup,
     lifecycle: HashMap<[u8; 32], VecDeque<ResponsibilityCheckpoint>>,
+    lifecycle_format_version: u8,
 }
 
 fn take_lifecycle_record(
@@ -1576,24 +1949,44 @@ fn take_lifecycle_record(
     record
 }
 
-async fn read_replay_source(
-    max_bytes: usize,
-    lifecycle_max_bytes: usize,
-) -> Result<Option<ReplaySource>, snapshot::SnapshotError> {
+async fn read_replay_source(max_bytes: usize, lifecycle_max_bytes: usize) -> Result<Option<ReplaySource>, MrfReplayError> {
     if let Some(committed) = snapshot::inspect_local_committed_snapshot(max_bytes).await? {
         let owner = committed.owner();
         let sequence = committed.sequence();
-        let records = read_mrf_lifecycle_checkpoint(owner, sequence, max_bytes, lifecycle_max_bytes)
-            .await
-            .unwrap_or_default();
+        let (intents, truncated_bytes) = decode_journal(committed.payload());
+        let checkpoint = read_mrf_lifecycle_checkpoint(owner, sequence, max_bytes, lifecycle_max_bytes).await?;
+        if let Some(checkpoint) = checkpoint.as_ref() {
+            // Validate the complete owner before rearming or submitting any
+            // intent. Different source generations may share an intent digest.
+            let mut counts = HashMap::new();
+            for intent in intents.iter().filter(|intent| intent.kind.is_durable()) {
+                let digest = intent_digest(intent).ok_or(MrfReplayError::InvalidLifecycle)?;
+                *counts.entry(digest).or_insert(0usize) += 1;
+            }
+            for record in &checkpoint.records {
+                match counts.get_mut(&record.intent_digest) {
+                    Some(count) if *count > 0 => *count -= 1,
+                    _ => return Err(MrfReplayError::InvalidLifecycle),
+                }
+            }
+            if counts.values().any(|count| *count != 0) {
+                return Err(MrfReplayError::InvalidLifecycle);
+            }
+        }
+        let (lifecycle_format_version, records) = match checkpoint {
+            Some(checkpoint) => (checkpoint.format_version, checkpoint.records),
+            None => (MRF_LIFECYCLE_FORMAT_VERSION, Vec::new()),
+        };
         let mut lifecycle: HashMap<[u8; 32], VecDeque<ResponsibilityCheckpoint>> = HashMap::with_capacity(records.len());
         for record in records {
             lifecycle.entry(record.intent_digest).or_default().push_back(record);
         }
         return Ok(Some(ReplaySource {
-            data: committed.payload().to_vec(),
+            intents,
+            truncated_bytes,
             cleanup: ReplayCleanup::Committed { owner, sequence },
             lifecycle,
+            lifecycle_format_version,
         }));
     }
     // The scoped file is a complete authoritative legacy snapshot. Fall back
@@ -1606,10 +1999,13 @@ async fn read_replay_source(
             None => return Ok(None),
         },
     };
+    let (intents, truncated_bytes) = decode_journal(&data);
     Ok(Some(ReplaySource {
-        data,
+        intents,
+        truncated_bytes,
         cleanup: ReplayCleanup::Legacy,
         lifecycle: HashMap::new(),
+        lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
     }))
 }
 
@@ -1649,10 +2045,12 @@ async fn replay_into(
                 replayed: 0,
                 journal_on_disk: false,
                 retain_journal_for_replay: false,
+                source_readable: true,
                 durable_replay_anchors: Vec::new(),
                 partial_writes: Vec::new(),
                 cleanup: None,
                 next_checkpoint_sequence: 1,
+                lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             };
         }
         Err(err) => {
@@ -1665,10 +2063,12 @@ async fn replay_into(
                 replayed: 0,
                 journal_on_disk: true,
                 retain_journal_for_replay: true,
+                source_readable: false,
                 durable_replay_anchors: Vec::new(),
                 partial_writes: Vec::new(),
                 cleanup: None,
                 next_checkpoint_sequence: 1,
+                lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             };
         }
     };
@@ -1677,11 +2077,10 @@ async fn replay_into(
         ReplayCleanup::Legacy => 1,
         ReplayCleanup::Committed { sequence, .. } => sequence.saturating_add(1),
     };
-    let data = source.data;
     let mut lifecycle = source.lifecycle;
-    let (decoded, truncated) = decode_journal(&data);
-    let replayed = decoded.len();
-    let intents = decoded;
+    let intents = source.intents;
+    let truncated = source.truncated_bytes;
+    let replayed = intents.len();
     if truncated > 0 {
         tracing::warn!(
             target: "rustfs::heal::mrf",
@@ -1712,7 +2111,7 @@ async fn replay_into(
                 rustfs_common::mrf_channel::release_mrf_intent(&intent);
                 continue;
             }
-            if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+            if let Ok(Some(anchor)) = manager.durable_mrf_repair_anchor(&intent).await {
                 durable_replay_anchors.push(anchor);
             }
             let restored = intent_digest(&intent).and_then(|digest| take_lifecycle_record(&mut lifecycle, digest));
@@ -1750,7 +2149,7 @@ async fn replay_into(
                 // Adopt durable replay into its single checkpointed owner. The
                 // runtime dispatches it after publishing the successor, avoiding
                 // a duplicate task in the startup-replay and steady-state paths.
-                if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+                if let Ok(Some(anchor)) = manager.durable_mrf_repair_anchor(&intent).await {
                     durable_replay_anchors.push(anchor.clone());
                 }
                 let restored = intent_digest(&intent).and_then(|digest| take_lifecycle_record(&mut lifecycle, digest));
@@ -1759,7 +2158,7 @@ async fn replay_into(
             }
             match submit_mrf_heal_request(manager, &intent, None).await {
                 Ok(HealAdmissionResult::Accepted) | Ok(HealAdmissionResult::Merged) => {
-                    if let Some(anchor) = manager.durable_mrf_repair_anchor(&intent).await {
+                    if let Ok(Some(anchor)) = manager.durable_mrf_repair_anchor(&intent).await {
                         durable_replay_anchors.push(anchor);
                     } else {
                         accepted_without_durable_anchor = true;
@@ -1811,10 +2210,12 @@ async fn replay_into(
         replayed,
         journal_on_disk,
         retain_journal_for_replay,
+        source_readable: true,
         durable_replay_anchors,
         partial_writes,
         cleanup: journal_on_disk.then_some(cleanup),
         next_checkpoint_sequence,
+        lifecycle_format_version: source.lifecycle_format_version,
     }
 }
 
@@ -1833,10 +2234,12 @@ async fn run_mrf_consumer(
         config: config.clone(),
         checkpoint_owner: Uuid::new_v4(),
         next_checkpoint_sequence: 1,
+        lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
         new_since_flush: 0,
         dirty: false,
         journal_on_disk: false,
         retain_replay_journal: false,
+        replay_readable: true,
         durable_replay_anchors: Vec::new(),
         replay_cleanup: None,
         runtime_checkpoint: None,
@@ -1848,9 +2251,11 @@ async fn run_mrf_consumer(
     let replay = replay_into(&manager, &mut runtime.queue, &mut runtime.backoff_until).await;
     runtime.journal_on_disk = replay.journal_on_disk;
     runtime.retain_replay_journal = replay.retain_journal_for_replay;
+    runtime.replay_readable = replay.source_readable;
     runtime.durable_replay_anchors = replay.durable_replay_anchors;
     runtime.replay_cleanup = replay.cleanup;
     runtime.next_checkpoint_sequence = replay.next_checkpoint_sequence;
+    runtime.lifecycle_format_version = replay.lifecycle_format_version;
     runtime.adopt_replayed_partial_writes(replay.partial_writes);
     // Anything still pending (e.g. the manager was full and backoff armed)
     // must be re-persisted by the next flush before replay can delete the
@@ -1872,6 +2277,29 @@ async fn run_mrf_consumer(
     let mut durable_batch = Vec::with_capacity(runtime.config.replay_batch);
 
     loop {
+        if runtime.partial_writes.pending_lifecycle_transition.is_some() {
+            tokio::select! {
+                received = durable_receiver.recv_many(&mut durable_batch, runtime.config.replay_batch) => {
+                    if received == 0 {
+                        return;
+                    }
+                    for submission in durable_batch.drain(..) {
+                        let _ = submission.response.send(Err(MrfDurableAdmissionError::Persistence));
+                    }
+                }
+                command = lifecycle_receiver.recv() => {
+                    let Some(command) = command else {
+                        return;
+                    };
+                    runtime.handle_lifecycle_command(manager.as_ref(), command).await;
+                }
+                _ = flush_tick.tick() => {
+                    runtime.flush().await;
+                    runtime.publish_metrics();
+                }
+            }
+            continue;
+        }
         tokio::select! {
             received = durable_receiver.recv_many(&mut durable_batch, runtime.config.replay_batch) => {
                 if received == 0 {
@@ -1896,44 +2324,7 @@ async fn run_mrf_consumer(
                 let Some(command) = command else {
                     return;
                 };
-                match command {
-                    MrfLifecycleCommand::List { after, limit, response } => {
-                        let _ = response.send(runtime.list_unverified_legacy(after, limit));
-                    }
-                    MrfLifecycleCommand::Recheck {
-                        responsibility_id,
-                        expected_bucket_incarnation_id,
-                        response,
-                    } => {
-                        let result = runtime
-                            .recheck_legacy_generation(
-                                manager.as_ref(),
-                                responsibility_id,
-                                expected_bucket_incarnation_id,
-                            )
-                            .await;
-                        let _ = response.send(result);
-                    }
-                    MrfLifecycleCommand::Refresh {
-                        responsibility_id,
-                        expected_bucket_incarnation_id,
-                        response,
-                    } => {
-                        let result = runtime
-                            .refresh_legacy_generation(
-                                manager.as_ref(),
-                                responsibility_id,
-                                expected_bucket_incarnation_id,
-                            )
-                            .await;
-                        let _ = response.send(result);
-                    }
-                    MrfLifecycleCommand::AcceptUnverifiedRisk { request, response } => {
-                        let result = runtime.accept_legacy_risk(manager.as_ref(), request).await;
-                        let _ = response.send(result);
-                    }
-                }
-                runtime.publish_metrics();
+                runtime.handle_lifecycle_command(manager.as_ref(), command).await;
             }
             received = receiver.recv_many(&mut batch, runtime.config.replay_batch) => {
                 if received == 0 {
@@ -2053,17 +2444,18 @@ mod tests {
     use crate::heal::manager::HealConfig;
     use crate::heal::storage::{ECStoreHealStorage, HealStorageAPI};
     use crate::heal::{DiskError, RUSTFS_META_BUCKET};
-    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
+    use rustfs_common::mrf_channel::{MrfIntent, MrfKind, MrfScope, MrfVerifiedRepairDisposition, MrfVerifiedRepairEvent};
     use serde_json::{Map, Value, json};
     use serial_test::serial;
     use std::env;
     use std::fs;
-    use std::io::Write as _;
     use std::path::{Path, PathBuf};
     use std::sync::Arc as StdArc;
     use std::time::{Duration as StdDuration, Instant};
 
     mod empty_events_tests;
+    mod lifecycle_replay_tests;
+    mod lifecycle_v2_reader_tests;
 
     #[tokio::test(start_paused = true)]
     async fn journal_disk_io_bounds_fanout_and_collects_every_result() {
@@ -2182,6 +2574,73 @@ mod tests {
     }
 
     #[test]
+    fn streaming_intent_codec_preserves_existing_wire_bytes_and_digest() {
+        let mut plain = intent("b", "o", 0);
+        plain.version_id = None;
+        let mut scoped = plain.clone();
+        scoped.kind = MrfKind::PartialWrite;
+        scoped.version_id = Some([7; 16]);
+        scoped.scope = Some(MrfScope {
+            pool_index: 2,
+            set_index: 3,
+        });
+        let mut purge = scoped.clone();
+        purge.kind = MrfKind::DeleteMarkerPurge;
+        let incarnation = Uuid::from_u128(1);
+        purge.delete_marker_purge = MrfDeleteMarkerPurge::new(incarnation, incarnation, [9; 32], vec![1, 2]);
+        let cases = [
+            (plain, "010101000068e5cf8b010000000100000001000000626f883931f3"),
+            (
+                scoped,
+                "010203000068e5cf8b010000010707070707070707070707070707070702000000030000000100000001000000626f59661dd0",
+            ),
+            (
+                purge,
+                "010304000068e5cf8b010000010707070707070707070707070707070702000000030000000100000001000000626f00000000000000000000000000000001000000000000000000000000000000010909090909090909090909090909090909090909090909090909090909090909020000000102304b263e",
+            ),
+        ];
+        for (intent, expected_hex) in cases {
+            let encoded = encoded_payload(&intent);
+            let actual_hex: String = encoded.iter().map(|byte| format!("{byte:02x}")).collect();
+            assert_eq!(actual_hex, expected_hex);
+            let expected_digest: [u8; 32] = sha2::Sha256::digest(&encoded).into();
+            assert_eq!(intent_digest(&intent), Some(expected_digest));
+        }
+    }
+
+    #[test]
+    fn streaming_intent_codec_propagates_writer_failure_and_rejects_invalid_record() {
+        struct PartialFailure(Vec<u8>);
+        impl Write for PartialFailure {
+            fn write(&mut self, input: &[u8]) -> io::Result<usize> {
+                let remaining = 5usize.saturating_sub(self.0.len());
+                if remaining == 0 {
+                    return Err(io::Error::from(io::ErrorKind::WouldBlock));
+                }
+                let written = remaining.min(input.len());
+                self.0.extend_from_slice(&input[..written]);
+                Ok(written)
+            }
+            fn flush(&mut self) -> io::Result<()> {
+                Ok(())
+            }
+        }
+        let valid = intent("b", "o", 0);
+        let mut partial = PartialFailure(Vec::new());
+        assert_eq!(
+            encode_intent_to_writer(&valid, &mut partial).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+        assert_eq!(partial.0.len(), 5, "the caller must discard a partially written fallible output");
+        let mut invalid = valid;
+        invalid.kind = MrfKind::DeleteMarkerPurge;
+        let mut bytes = b"prefix".to_vec();
+        assert!(!encode_intent(&invalid, &mut bytes));
+        assert_eq!(bytes, b"prefix");
+        assert_eq!(intent_digest(&invalid), None);
+    }
+
+    #[test]
     fn lifecycle_checkpoint_is_bound_checksummed_and_strictly_decoded() {
         let owner = Uuid::new_v4();
         let held_incarnation = Uuid::new_v4();
@@ -2223,7 +2682,7 @@ mod tests {
             },
         };
         let records = vec![record, accepted];
-        let encoded = encode_mrf_lifecycle_checkpoint(owner, 42, records.clone(), 8192)
+        let encoded = encode_mrf_lifecycle_checkpoint(MRF_LIFECYCLE_FORMAT_VERSION, owner, 42, records.clone(), 8192)
             .expect("lifecycle checkpoint should fit the configured bound");
         let decoded = decode_mrf_lifecycle_checkpoint(&encoded, 8192).expect("valid lifecycle checkpoint");
         assert_eq!(decoded.checkpoint_owner, owner);
@@ -2232,9 +2691,9 @@ mod tests {
 
         let mut torn = encoded.clone();
         *torn.last_mut().expect("non-empty checkpoint") ^= 0xff;
-        assert!(decode_mrf_lifecycle_checkpoint(&torn, 8192).is_none());
-        assert!(decode_mrf_lifecycle_checkpoint(&encoded, encoded.len() - 1).is_none());
-        assert!(encode_mrf_lifecycle_checkpoint(Uuid::nil(), 42, Vec::new(), 8192).is_none());
+        assert!(decode_mrf_lifecycle_checkpoint(&torn, 8192).is_err());
+        assert!(decode_mrf_lifecycle_checkpoint(&encoded, encoded.len() - 1).is_err());
+        assert!(encode_mrf_lifecycle_checkpoint(MRF_LIFECYCLE_FORMAT_VERSION, Uuid::nil(), 42, Vec::new(), 8192).is_none());
     }
 
     fn w13_timestamp() -> String {
@@ -2358,10 +2817,12 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            lifecycle_format_version: replay.lifecycle_format_version,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: replay.journal_on_disk,
             retain_replay_journal: replay.retain_journal_for_replay,
+            replay_readable: replay.source_readable,
             durable_replay_anchors: replay.durable_replay_anchors,
             replay_cleanup: replay.cleanup,
             runtime_checkpoint: None,
@@ -2497,10 +2958,12 @@ mod tests {
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: true,
             journal_on_disk: false,
             retain_replay_journal: false,
+            replay_readable: true,
             durable_replay_anchors: Vec::new(),
             replay_cleanup: None,
             runtime_checkpoint: None,
@@ -3089,10 +3552,12 @@ mod tests {
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,
             retain_replay_journal: false,
+            replay_readable: true,
             durable_replay_anchors: vec![anchor],
             replay_cleanup: Some(cleanup),
             runtime_checkpoint: None,
@@ -3140,10 +3605,12 @@ mod tests {
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,
             retain_replay_journal: false,
+            replay_readable: true,
             durable_replay_anchors: Vec::new(),
             replay_cleanup: None,
             runtime_checkpoint: None,
@@ -3188,10 +3655,12 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 9,
+            lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: true,
             retain_replay_journal: false,
+            replay_readable: true,
             durable_replay_anchors: Vec::new(),
             replay_cleanup: Some(ReplayCleanup::Committed {
                 owner: replay_owner,
@@ -3299,6 +3768,7 @@ mod tests {
             .expect("the fixture bucket must have a persisted incarnation");
         let lifecycle_limit = config.journal_max_bytes.saturating_mul(4);
         let lifecycle = encode_mrf_lifecycle_checkpoint(
+            MRF_LIFECYCLE_FORMAT_VERSION,
             replay_owner,
             11,
             vec![ResponsibilityCheckpoint {
@@ -3306,7 +3776,7 @@ mod tests {
                 responsibility_id: Uuid::new_v4(),
                 source_bucket_incarnation_id: Some(source_bucket_incarnation_id),
                 last_operator_acceptance: None,
-                state: partial_write::ResponsibilityState::Active,
+                state: partial_write::ResponsibilityState::Active {},
             }],
             lifecycle_limit,
         )
@@ -3362,10 +3832,12 @@ mod tests {
             config,
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: replay.next_checkpoint_sequence,
+            lifecycle_format_version: replay.lifecycle_format_version,
             new_since_flush: 0,
             dirty: false,
             journal_on_disk: replay.journal_on_disk,
             retain_replay_journal: replay.retain_journal_for_replay,
+            replay_readable: replay.source_readable,
             durable_replay_anchors: replay.durable_replay_anchors,
             replay_cleanup: replay.cleanup,
             runtime_checkpoint: None,
@@ -3609,10 +4081,12 @@ mod tests {
             config: MrfConsumerConfig::default(),
             checkpoint_owner: Uuid::new_v4(),
             next_checkpoint_sequence: 1,
+            lifecycle_format_version: MRF_LIFECYCLE_FORMAT_VERSION,
             new_since_flush: 0,
             dirty: true,
             journal_on_disk: false,
             retain_replay_journal: false,
+            replay_readable: true,
             durable_replay_anchors: Vec::new(),
             replay_cleanup: None,
             runtime_checkpoint: None,

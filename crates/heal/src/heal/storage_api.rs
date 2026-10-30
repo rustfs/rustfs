@@ -26,10 +26,26 @@ pub(crate) use rustfs_ecstore::api::disk::{
     RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
-pub(crate) use rustfs_ecstore::api::error::{Error as EcstoreErrorType, StorageError as EcstoreStorageError};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::error::PoolMetadataError as EcstorePoolMetadataError;
+pub(crate) use rustfs_ecstore::api::error::{
+    Error as EcstoreErrorType, PoolMetadataFailure as EcstorePoolMetadataFailure, StorageError as EcstoreStorageError,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
+};
+pub(crate) use rustfs_ecstore::api::notification::{
+    MrfLifecycleWriterFleetProofToken as EcstoreMrfLifecycleWriterFleetProofToken,
+    acquire_mrf_lifecycle_writer_fleet_proof as ecstore_acquire_mrf_lifecycle_writer_fleet_proof,
+    mrf_lifecycle_writer_fleet_proof_current as ecstore_mrf_lifecycle_writer_fleet_proof_current,
+    mrf_lifecycle_writer_fleet_proof_matches as ecstore_mrf_lifecycle_writer_fleet_proof_matches,
+    with_mrf_lifecycle_writer_fleet_proof as ecstore_with_mrf_lifecycle_writer_fleet_proof,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::notification::{
+    new_global_notification_sys as ecstore_new_global_notification_sys,
+    start_remote_version_state_fleet_probe as ecstore_start_remote_version_state_fleet_probe,
 };
 pub(crate) use rustfs_ecstore::api::runtime::local_disk_map_read as ecstore_local_disk_map_read;
 #[cfg(test)]
@@ -41,6 +57,9 @@ pub(crate) use rustfs_ecstore::api::storage::{
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    #[cfg(test)]
+    pub(crate) use super::EcstorePoolMetadataError;
+    pub(crate) use super::EcstorePoolMetadataFailure;
     pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
 
     pub(crate) use super::{

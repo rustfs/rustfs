@@ -28,6 +28,7 @@ pub(crate) const EVENT_OIDC_DIAGNOSTICS: &str = "oidc_diagnostics";
 const EVENT_OIDC_STATE: &str = "oidc_state";
 
 pub mod cache;
+pub mod delegation;
 pub mod error;
 pub mod federation;
 pub mod keyring;

@@ -112,12 +112,13 @@ covers the separate `reload_unknown_bucket_usage` trigger only.
 This consumer removal needs no format change, writer activation or quota
 migration. Among D3-capable nodes, an older node can report the old floor while
 a newer node reports unknown; both keep ledger admission and return a successful
-best-effort report. Snapshot-protocol buckets (`reservation_protocol = None`)
-still take `get_real_time_usage`, including early refresh, the legacy and
-observed degraded baseline, and fail-closed admission when no grounded value
-exists. Earlier nodes that still make scanner availability a durable-write
-veto must first reach the D3 baseline; this change does not prove that earlier
-fleet safe.
+best-effort report. Read-only `get_quota_stats` uses optional reporting for
+all buckets, including snapshot-protocol and quota-free buckets. Snapshot-protocol
+admission (`reservation_protocol = None`) still takes `get_real_time_usage`,
+including early refresh, the legacy and observed degraded baseline, and
+fails closed when no grounded value exists. Earlier nodes that still make
+scanner availability a durable-write veto must first reach the D3 baseline;
+this change does not prove that earlier fleet safe.
 
 Rollback to a D3 reader before this consumer removal restores floor-based
 optional reporting. No scanner snapshot, backup, quota record or reservation

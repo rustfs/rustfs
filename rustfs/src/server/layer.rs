@@ -29,6 +29,8 @@ use crate::server::{
 };
 use crate::shared_types::ReadinessDegradedReason;
 use crate::storage_api::server::layer::apply_cors_headers;
+#[cfg(feature = "diagnostic-local-batch")]
+use crate::storage_api::server::layer::batch_diagnostic;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
 use futures::future::Either;
@@ -43,6 +45,7 @@ use rustfs_common::GlobalReadiness;
 use rustfs_common::trace_bus::{
     TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit, telemetry_trace_subscriber_count,
 };
+use rustfs_concurrency::foreground::{CompletionOutcome, ForegroundClass, ForegroundObservation};
 use rustfs_io_metrics::s3_http_metrics::S3HttpRequestGuard;
 use rustfs_obs::HTTP_SERVER_LOG_TARGET;
 #[cfg(feature = "swift")]
@@ -54,6 +57,7 @@ use s3s::S3Error;
 use s3s::S3ErrorCode;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::cell::Cell;
 use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
@@ -71,6 +75,10 @@ const HTTP_REQUEST_INFLIGHT_SLOW_EVENT: &str = "http_request_inflight_slow";
 const LOG_COMPONENT_SERVER: &str = "server";
 const LOG_SUBSYSTEM_HTTP: &str = "http";
 const REDACTED_QUERY_VALUE: &str = "redacted";
+#[cfg(feature = "diagnostic-local-batch")]
+type BatchDiagnosticRequest = Option<Arc<str>>;
+#[cfg(not(feature = "diagnostic-local-batch"))]
+type BatchDiagnosticRequest = ();
 const OBJECT_ZIP_DOWNLOADS_PATH: &str = "/v3/object-zip-downloads/";
 const HTTP_REQUEST_INFLIGHT_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 static HTTP_SERVER_ERROR_LOGS: [rustfs_utils::LogThrottle; 100] = [const { rustfs_utils::LogThrottle::new(5_000) }; 100];
@@ -213,12 +221,16 @@ fn uses_server_owned_s3_request_id<B>(req: &HttpRequest<B>, console_redirect_ena
 #[derive(Clone, Default)]
 pub struct ExternalRequestContextLayer {
     console_redirect_enabled: bool,
+    #[cfg(test)]
+    feedback_recorder: Option<&'static rustfs_concurrency::foreground::ForegroundRecorder>,
 }
 
 impl ExternalRequestContextLayer {
     pub(crate) fn new(console_redirect_enabled: bool) -> Self {
         Self {
             console_redirect_enabled,
+            #[cfg(test)]
+            feedback_recorder: None,
         }
     }
 }
@@ -230,6 +242,8 @@ impl<S> Layer<S> for ExternalRequestContextLayer {
         ExternalRequestContextService {
             inner,
             console_redirect_enabled: self.console_redirect_enabled,
+            #[cfg(test)]
+            feedback_recorder: self.feedback_recorder,
         }
     }
 }
@@ -238,13 +252,15 @@ impl<S> Layer<S> for ExternalRequestContextLayer {
 pub struct ExternalRequestContextService<S> {
     inner: S,
     console_redirect_enabled: bool,
+    #[cfg(test)]
+    feedback_recorder: Option<&'static rustfs_concurrency::foreground::ForegroundRecorder>,
 }
 
 impl<S, B, ResBody> Service<HttpRequest<B>> for ExternalRequestContextService<S>
 where
     S: Service<HttpRequest<B>, Response = Response<ResBody>>,
 {
-    type Response = Response<ResBody>;
+    type Response = Response<ForegroundResponseBody<ResBody>>;
     type Error = S::Error;
     type Future = ExternalRequestContextFuture<S::Future>;
 
@@ -275,20 +291,48 @@ where
         } else {
             req.headers().get(REQUEST_ID_HEADER).cloned()
         };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let diagnostic_request = is_s3
+            .then(|| batch_diagnostic::request_context(&request_context.request_id))
+            .flatten();
+        #[cfg(not(feature = "diagnostic-local-batch"))]
+        let diagnostic_request = ();
         req.extensions_mut().insert(request_context);
 
         // This outer boundary includes readiness, rate-limit and auth
         // rejections. Metric attribution never depends on an enabled span.
+        let mut feedback = is_s3
+            .then(|| {
+                #[cfg(test)]
+                if let Some(recorder) = self.feedback_recorder {
+                    return Some(recorder.start());
+                }
+                crate::foreground_observation::start_request()
+            })
+            .flatten();
+        let head_request = req.method() == Method::HEAD;
         let mut metrics = is_s3.then(|| s3_http_request_guard(req.method().as_str()));
+        #[cfg(feature = "diagnostic-local-batch")]
+        let inner = batch_diagnostic::in_request_context(diagnostic_request.as_ref(), || match metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
+            None => self.inner.call(req),
+        });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let inner = match metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| self.inner.call(req)),
             None => self.inner.call(req),
         };
+        if let Some(feedback) = feedback.as_mut() {
+            feedback.set_class(foreground_class(metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
+        }
         ExternalRequestContextFuture {
             inner,
+            diagnostic_request,
             request_id,
             is_s3,
             metrics,
+            feedback,
+            head_request,
         }
     }
 }
@@ -333,9 +377,12 @@ pin_project! {
     pub struct ExternalRequestContextFuture<F> {
         #[pin]
         inner: F,
+        diagnostic_request: BatchDiagnosticRequest,
         request_id: Option<HeaderValue>,
         is_s3: bool,
         metrics: Option<S3HttpRequestGuard>,
+        feedback: Option<ForegroundObservation<'static>>,
+        head_request: bool,
     }
 }
 
@@ -343,19 +390,31 @@ impl<F, ResBody, E> Future for ExternalRequestContextFuture<F>
 where
     F: Future<Output = Result<Response<ResBody>, E>>,
 {
-    type Output = Result<Response<ResBody>, E>;
+    type Output = Result<Response<ForegroundResponseBody<ResBody>>, E>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let this = self.project();
+        #[cfg(feature = "diagnostic-local-batch")]
+        let result = batch_diagnostic::in_request_context(this.diagnostic_request.as_ref(), || match this.metrics.as_mut() {
+            Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
+            None => this.inner.poll(cx),
+        });
+        #[cfg(not(feature = "diagnostic-local-batch"))]
         let result = match this.metrics.as_mut() {
             Some(metrics) => metrics.in_scope(|| this.inner.poll(cx)),
             None => this.inner.poll(cx),
         };
+        if let Some(feedback) = this.feedback.as_mut() {
+            feedback.set_class(foreground_class(this.metrics.as_ref().and_then(S3HttpRequestGuard::operation)));
+        }
         let mut response = match result {
             Poll::Ready(Ok(response)) => response,
             Poll::Ready(Err(error)) => {
                 if let Some(metrics) = this.metrics.as_mut() {
                     metrics.service_error();
+                }
+                if let Some(mut feedback) = this.feedback.take() {
+                    feedback.finish(CompletionOutcome::Failed);
                 }
                 return Poll::Ready(Err(error));
             }
@@ -374,7 +433,126 @@ where
             }
         }
 
-        Poll::Ready(Ok(response))
+        let status = response.status();
+        let suppressed = *this.head_request
+            || status.is_informational()
+            || status == StatusCode::NO_CONTENT
+            || status == StatusCode::NOT_MODIFIED;
+        Poll::Ready(Ok(response.map(|body| {
+            ForegroundResponseBody::new(
+                body,
+                this.feedback.take(),
+                !status.is_client_error() && !status.is_server_error(),
+                suppressed,
+            )
+        })))
+    }
+}
+
+fn foreground_class(operation: Option<rustfs_s3_ops::S3Operation>) -> ForegroundClass {
+    use rustfs_s3_ops::S3Operation;
+    match operation {
+        Some(S3Operation::GetObject | S3Operation::SelectObjectContent) => ForegroundClass::Read,
+        Some(
+            S3Operation::PutObject
+            | S3Operation::CopyObject
+            | S3Operation::UploadPart
+            | S3Operation::UploadPartCopy
+            | S3Operation::CompleteMultipartUpload
+            | S3Operation::AbortMultipartUpload
+            | S3Operation::DeleteObject
+            | S3Operation::DeleteObjects,
+        ) => ForegroundClass::Write,
+        Some(_) => ForegroundClass::Metadata,
+        None => ForegroundClass::Other,
+    }
+}
+
+pin_project! {
+    /// Inline ownership of a foreground observation through the response body.
+    /// EOF means the server produced the body, not that the client acknowledged
+    /// its bytes. Other drops are censored and never successful latency samples.
+    pub struct ForegroundResponseBody<B> {
+        #[pin]
+        inner: B,
+        // Body::is_end_stream only has a shared reference. Empty responses can
+        // finish there without being polled; Cell adds no mutex or allocation.
+        observation: Cell<Option<ForegroundObservation<'static>>>,
+        succeeded: bool,
+    }
+}
+
+fn finish_foreground_observation(observation: &Cell<Option<ForegroundObservation<'_>>>, outcome: CompletionOutcome) {
+    if let Some(mut observation) = observation.take() {
+        observation.finish(outcome);
+    }
+}
+
+impl<B> ForegroundResponseBody<B> {
+    fn new(inner: B, observation: Option<ForegroundObservation<'static>>, succeeded: bool, suppressed: bool) -> Self {
+        let body = Self {
+            inner,
+            observation: Cell::new(observation),
+            succeeded,
+        };
+        if suppressed {
+            body.complete();
+        }
+        body
+    }
+
+    fn complete(&self) {
+        finish_foreground_observation(
+            &self.observation,
+            if self.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            },
+        );
+    }
+}
+
+impl<B: Body> Body for ForegroundResponseBody<B> {
+    type Data = B::Data;
+    type Error = B::Error;
+
+    fn poll_frame(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let mut this = self.project();
+        let result = this.inner.as_mut().poll_frame(cx);
+        if this.observation.get_mut().is_none() {
+            return result;
+        }
+        let outcome = match &result {
+            Poll::Ready(Some(Err(_))) => Some(CompletionOutcome::Failed),
+            Poll::Ready(None) => Some(if *this.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            }),
+            Poll::Ready(Some(Ok(_))) if this.inner.as_ref().get_ref().is_end_stream() => Some(if *this.succeeded {
+                CompletionOutcome::Success
+            } else {
+                CompletionOutcome::Failed
+            }),
+            _ => None,
+        };
+        if let Some(outcome) = outcome {
+            finish_foreground_observation(this.observation, outcome);
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        let finished = self.inner.is_end_stream();
+        if finished {
+            self.complete();
+        }
+        finished
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
     }
 }
 
@@ -2456,6 +2634,409 @@ fn rewrite_double_slash_root(uri: &Uri) -> Option<Uri> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_external_request_uses_server_id_not_client_header() {
+        const CHILD: &str = "RUSTFS_TEST_BATCH_REQUEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().expect("current test executable"))
+                .args([
+                    "--exact",
+                    "server::layer::tests::diagnostic_external_request_uses_server_id_not_client_header",
+                    "--nocapture",
+                ])
+                .env(CHILD, "1")
+                .env("RUSTFS_DIAGNOSTIC_LOCAL_BATCH_SAMPLE_EVERY", "1")
+                .status()
+                .expect("run isolated request correlation test");
+            assert!(status.success(), "isolated request correlation test failed");
+            return;
+        }
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(std::io::sink)
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            let inner = tower::service_fn(|request: HttpRequest<Full<Bytes>>| {
+                let context = request
+                    .extensions()
+                    .get::<RequestContext>()
+                    .expect("canonical request context");
+                let expected = context.request_id.clone();
+                assert_ne!(expected, "client-controlled-id");
+                assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
+                async move {
+                    assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some(expected.as_str()));
+                    Ok::<_, std::convert::Infallible>(Response::new(Full::new(Bytes::new())))
+                }
+            });
+            let mut service = ExternalRequestContextLayer::new(false).layer(inner);
+            let request = HttpRequest::builder()
+                .method(Method::GET)
+                .uri("/diagnostic-bucket/object")
+                .header(REQUEST_ID_HEADER, "client-controlled-id")
+                .body(Full::new(Bytes::new()))
+                .expect("test request");
+            let response = futures::executor::block_on(service.call(request)).expect("correlated response");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert!(batch_diagnostic::current_request_id().is_none());
+        });
+    }
+
+    #[cfg(feature = "diagnostic-local-batch")]
+    #[test]
+    fn diagnostic_request_scope_is_present_on_every_poll_and_restored() {
+        let mut polls = 0;
+        let inner = std::future::poll_fn(|cx| {
+            assert_eq!(batch_diagnostic::current_request_id().as_deref(), Some("server-owned-test"));
+            polls += 1;
+            if polls == 1 {
+                cx.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Ok::<_, std::convert::Infallible>(Response::new(http_body_util::Full::new(Bytes::new()))))
+            }
+        });
+        let future = ExternalRequestContextFuture {
+            inner,
+            diagnostic_request: Some(Arc::from("server-owned-test")),
+            request_id: None,
+            is_s3: false,
+            metrics: None,
+            feedback: None,
+            head_request: false,
+        };
+        let response = futures::executor::block_on(future).expect("diagnostic request future");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(polls, 2);
+        assert!(batch_diagnostic::current_request_id().is_none());
+    }
+    #[tokio::test]
+    async fn foreground_feedback_unobserved_body_is_a_direct_passthrough() {
+        struct EndProbe(Full<Bytes>);
+        impl Body for EndProbe {
+            type Data = Bytes;
+            type Error = Infallible;
+
+            fn poll_frame(
+                mut self: Pin<&mut Self>,
+                cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+                Pin::new(&mut self.0).poll_frame(cx)
+            }
+
+            fn is_end_stream(&self) -> bool {
+                panic!("unobserved frame polling must not add EOF queries")
+            }
+
+            fn size_hint(&self) -> http_body::SizeHint {
+                self.0.size_hint()
+            }
+        }
+
+        let mut body =
+            ForegroundResponseBody::new(EndProbe(Full::new(Bytes::from_static(b"unobserved body"))), None, false, false);
+        assert_eq!(body.size_hint().exact(), Some(15));
+        assert_eq!(
+            body.frame().await.expect("frame").expect("data").into_data().expect("bytes"),
+            Bytes::from_static(b"unobserved body")
+        );
+        assert!(body.frame().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_empty_head_and_bodyless_responses_finish_once() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|req: Request<()>| async move {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::HeadObject);
+            let status = match req.uri().path() {
+                "/bucket/no-content" => StatusCode::NO_CONTENT,
+                "/bucket/not-modified" => StatusCode::NOT_MODIFIED,
+                _ => StatusCode::OK,
+            };
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(status)
+                    .body(Empty::<Bytes>::new())
+                    .expect("empty response"),
+            )
+        }));
+        for (method, path) in [
+            (Method::GET, "/bucket/empty"),
+            (Method::HEAD, "/bucket/head"),
+            (Method::GET, "/bucket/no-content"),
+            (Method::GET, "/bucket/not-modified"),
+        ] {
+            let response = service
+                .call(Request::builder().method(method).uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+            assert!(response.body().is_end_stream());
+            assert!(response.body().is_end_stream(), "repeated inspection is idempotent");
+            drop(response);
+        }
+        let window = reader.sample().expect("completed empty bodies");
+        let metadata = window.classes[2].expect("metadata count");
+        assert_eq!(window.started, Some(4));
+        assert_eq!(
+            (window.in_flight, metadata.finished, metadata.failed, metadata.cancelled),
+            (Some(0), 4, 0, 0)
+        );
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_preserves_service_and_body_errors() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let layer = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        };
+        let mut service = layer.layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            Err::<Response<Empty<Bytes>>, _>(io::Error::new(io::ErrorKind::PermissionDenied, "service sentinel"))
+        }));
+        let error = match service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("service error must be preserved"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(error.to_string(), "service sentinel");
+
+        let mut streaming = layer.layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            let frames = futures::stream::iter([
+                Ok(http_body::Frame::data(Bytes::from_static(b"partial"))),
+                Err(io::Error::new(io::ErrorKind::UnexpectedEof, "body sentinel")),
+            ]);
+            Ok::<_, Infallible>(Response::new(http_body_util::StreamBody::new(frames)))
+        }));
+        let mut response = streaming
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("headers");
+        assert_eq!(
+            response
+                .body_mut()
+                .frame()
+                .await
+                .expect("partial frame")
+                .expect("data frame")
+                .into_data()
+                .expect("bytes"),
+            Bytes::from_static(b"partial")
+        );
+        let error = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("error frame")
+            .expect_err("must preserve body error");
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        assert_eq!(error.to_string(), "body sentinel");
+        drop(response);
+        let window = reader.sample().expect("failed requests");
+        assert_eq!((window.started, window.in_flight), (Some(2), Some(0)));
+        for class in [0, 1] {
+            let counts = window.classes[class].expect("known class");
+            assert_eq!((counts.finished, counts.failed, counts.cancelled), (1, 1, 0));
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_http_failure_and_trailers_are_preserved() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            let mut trailers = HeaderMap::new();
+            trailers.insert("x-body-sentinel", HeaderValue::from_static("unchanged"));
+            let frames = futures::stream::iter([
+                Ok::<_, Infallible>(http_body::Frame::data(Bytes::from_static(b"failure"))),
+                Ok(http_body::Frame::trailers(trailers)),
+            ]);
+            Ok::<_, Infallible>(
+                Response::builder()
+                    .status(503)
+                    .body(http_body_util::StreamBody::new(frames))
+                    .expect("response"),
+            )
+        }));
+        let mut response = service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("headers");
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            response
+                .body_mut()
+                .frame()
+                .await
+                .expect("data")
+                .expect("frame")
+                .into_data()
+                .expect("bytes"),
+            Bytes::from_static(b"failure")
+        );
+        assert_eq!(reader.sample().expect("before trailers").in_flight, Some(1));
+        let trailers = response
+            .body_mut()
+            .frame()
+            .await
+            .expect("trailers")
+            .expect("frame")
+            .into_trailers()
+            .expect("trailers");
+        assert_eq!(trailers["x-body-sentinel"], "unchanged");
+        assert!(response.body_mut().frame().await.is_none());
+        drop(response);
+        let window = reader.sample().expect("complete failure body");
+        let other = window.classes[3].expect("pre-dispatch failure");
+        assert_eq!((window.in_flight, other.finished, other.failed, other.cancelled), (Some(0), 1, 1, 0));
+    }
+
+    #[test]
+    fn foreground_feedback_classifies_synchronous_dispatch_before_first_poll() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            std::future::pending::<Result<Response<Empty<Bytes>>, Infallible>>()
+        }));
+        let request = service.call(Request::builder().uri("/bucket/object").body(()).expect("request"));
+        drop(request);
+        let window = reader.sample().expect("cancelled unpolled request");
+        let write = window.classes[1].expect("dispatched write");
+        assert_eq!((window.started, window.in_flight, write.cancelled), (Some(1), Some(0), 1));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_excludes_control_plane_and_internal_requests() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            Ok::<_, Infallible>(Response::new(Empty::<Bytes>::new()))
+        }));
+        for path in ["/health/ready", "/rustfs/admin/v3/info", "/minio/health/live"] {
+            let response = service
+                .call(Request::builder().uri(path).body(()).expect("request"))
+                .await
+                .expect("response");
+            assert!(response.body().is_end_stream());
+        }
+        let window = reader.sample().expect("no S3 events");
+        assert_eq!((window.started, window.in_flight), (Some(0), Some(0)));
+        assert!(window.classes.iter().all(|class| class.expect("known class").finished == 0));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_keeps_body_ownership_after_response_headers() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let layer = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        };
+        let inner = tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"body is still owned"))))
+        });
+        let mut response = layer
+            .layer(inner)
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("response headers");
+        let headers = reader.sample().expect("header boundary");
+        assert_eq!(headers.started, Some(1));
+        assert_eq!(headers.in_flight, Some(1), "headers do not finish the body");
+        assert_eq!(headers.classes[0].expect("read count").finished, 0);
+        let frame = response.body_mut().frame().await.expect("data frame").expect("body success");
+        assert_eq!(frame.into_data().expect("data"), Bytes::from_static(b"body is still owned"));
+        drop(response);
+        let body = reader.sample().expect("body boundary");
+        let read = body.classes[0].expect("read count");
+        assert_eq!((body.in_flight, read.finished, read.failed, read.cancelled), (Some(0), 1, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_records_dropped_body_as_censored() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::GetObject);
+            Ok::<_, Infallible>(Response::new(Full::new(Bytes::from_static(b"undrained"))))
+        }));
+        let response = service
+            .call(Request::builder().uri("/bucket/object").body(()).expect("request"))
+            .await
+            .expect("response");
+        drop(response);
+        let window = reader.sample().expect("cancelled body");
+        assert_eq!(window.started, Some(1));
+        let read = window.classes[0].expect("read count");
+        assert_eq!((window.in_flight, read.finished, read.cancelled, read.p99), (Some(0), 1, 1, None));
+    }
+
+    #[tokio::test]
+    async fn foreground_feedback_counts_cancellation_before_headers() {
+        use rustfs_concurrency::foreground::ForegroundRecorder;
+        let recorder = Box::leak(Box::new(ForegroundRecorder::new()));
+        let mut reader = recorder.take_reader().expect("isolated reader");
+        let mut service = ExternalRequestContextLayer {
+            feedback_recorder: Some(recorder),
+            ..Default::default()
+        }
+        .layer(tower::service_fn(|_: Request<()>| async {
+            rustfs_io_metrics::record_s3_op(rustfs_s3_ops::S3Operation::PutObject);
+            std::future::pending::<Result<Response<Full<Bytes>>, Infallible>>().await
+        }));
+        let mut pending = Box::pin(
+            service.call(
+                Request::builder()
+                    .method("PUT")
+                    .uri("/bucket/object")
+                    .body(())
+                    .expect("request"),
+            ),
+        );
+        assert!(matches!(futures::poll!(pending.as_mut()), Poll::Pending));
+        drop(pending);
+        let window = reader.sample().expect("cancelled service future");
+        assert_eq!(window.started, Some(1));
+        let write = window.classes[1].expect("write count");
+        assert_eq!((window.in_flight, write.finished, write.cancelled), (Some(0), 1, 1));
+    }
+
     #[tokio::test]
     async fn console_prefix_process_case_browser_redirect() {
         if std::env::var_os("RUSTFS_TEST_CONSOLE_PREFIX_PROCESS").is_none() {

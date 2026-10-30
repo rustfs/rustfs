@@ -446,7 +446,6 @@ fn bench_metacache_resolve(c: &mut Criterion) {
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: false,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -463,24 +462,6 @@ fn bench_metacache_resolve(c: &mut Criterion) {
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: false,
-                    write_quorum_slack: 0,
-                    candidates: Vec::new(),
-                });
-                black_box(resolved);
-            }
-        });
-    });
-
-    group.bench_function("8_disks_write_quorum/1000_objects", |b| {
-        b.iter(|| {
-            for entries in &sets_8_agree {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
-                    dir_quorum: 4,
-                    obj_quorum: 4,
-                    requested_versions: 1,
-                    bucket: "bucket".to_string(),
-                    strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -491,13 +472,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_disagree_merge/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_disagree {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -508,13 +488,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_agree_13_versions/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_agree_13v {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);
@@ -525,13 +504,12 @@ fn bench_metacache_resolve(c: &mut Criterion) {
     group.bench_function("8_disks_disagree_13_versions/1000_objects", |b| {
         b.iter(|| {
             for entries in &sets_8_disagree_13v {
-                let resolved = entries.resolve_with_write_quorum(MetadataResolutionParams {
+                let resolved = entries.resolve(MetadataResolutionParams {
                     dir_quorum: 4,
                     obj_quorum: 4,
                     requested_versions: 1,
                     bucket: "bucket".to_string(),
                     strict: true,
-                    write_quorum_slack: 0,
                     candidates: Vec::new(),
                 });
                 black_box(resolved);

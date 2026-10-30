@@ -36,9 +36,6 @@ allow-git = [
     # Official s3s repository pinned for Iceberg SigV4 path encoding support.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
-    # Official signer pinned to the reviewed SigV4a fix in smithy-rs#4958.
-    # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/smithy-lang/smithy-rs",
     # Upstream OIDC/OAuth2 crypto migrations, pinned to reviewed PR commits.
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/ramosbugs/openidconnect-rs",

@@ -118,6 +118,8 @@ struct MockStorage;
 
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
+        task_id: "fixture-token".to_string(),
+        source: HealRequestSource::Internal,
         outcome: None,
         heal_type: HealType::Cluster,
         options: HealOptions::default(),
@@ -2506,6 +2508,301 @@ fn test_heal_request_and_task_metric_labels_match() {
 }
 
 #[tokio::test]
+async fn automatic_replacement_queued_targets_merge_without_changing_fifo_or_token() {
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    let created_at = owner.created_at;
+    let first = manager
+        .submit_heal_request_with_receipt(owner)
+        .await
+        .expect("queue first target");
+    assert_eq!(first.result, HealAdmissionResult::Accepted);
+
+    let other = HealRequest::object("bucket".to_string(), "unrelated".to_string(), None);
+    let other_id = other.id.clone();
+    manager.submit_heal_request(other).await.expect("queue unrelated work");
+    let merged = manager
+        .submit_heal_request_with_receipt(automatic_replacement_request(&["replacement-b", "replacement-a"]))
+        .await
+        .expect("merge all fresh targets");
+    assert_eq!(merged.result, HealAdmissionResult::Merged);
+    assert_eq!(merged.task_id, owner_id);
+
+    let mut queue = manager.heal_queue.lock().await;
+    assert_eq!(queue.len(), 2);
+    let owner = queue.pop_next().expect("original task remains first");
+    assert_eq!(owner.id, owner_id);
+    assert_eq!(owner.created_at, created_at);
+    assert_eq!(owner.heal_endpoints, ["replacement-a", "replacement-b"]);
+    assert_eq!(queue.pop_next().expect("unrelated task remains queued").id, other_id);
+}
+
+fn automatic_replacement_request(targets: &[&str]) -> HealRequest {
+    let mut request = HealRequest::new(
+        HealType::ErasureSet {
+            buckets: Vec::new(),
+            set_disk_id: "pool_0_set_1".to_string(),
+        },
+        HealOptions {
+            pool_index: Some(0),
+            set_index: Some(1),
+            ..Default::default()
+        },
+        HealPriority::Normal,
+    );
+    request.source = HealRequestSource::AutoHeal;
+    request.heal_endpoints = targets.iter().map(|target| (*target).to_string()).collect();
+    request
+}
+
+#[tokio::test]
+async fn automatic_replacement_frozen_targets_reject_late_disks_but_cover_duplicates() {
+    for state in ["active", "retrying", "grace", "recovered", "recovery_anchor"] {
+        let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+        let manager = HealManager::new_without_root_recovery_for_test(storage.clone(), None);
+        let mut owner = automatic_replacement_request(&["replacement-a"]);
+        let owner_id = owner.id.clone();
+        if state == "grace" {
+            let now = SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("test clock")
+                .as_secs();
+            let task = HealTask::from_request(owner, storage.clone());
+            owner = retry_request_for_result_with_budget(
+                &task,
+                &Err(Error::DanglingDeleteDeferred {
+                    retry_not_before: now + 60,
+                }),
+            )
+            .await
+            .expect("grace wait keeps the generation replayable")
+            .0;
+            assert_eq!(owner.retry_attempts, 0, "grace must not consume a failure retry");
+        }
+        match state {
+            "active" => {
+                manager
+                    .active_heals
+                    .lock()
+                    .await
+                    .insert(owner_id.clone(), Arc::new(HealTask::from_request(owner, storage.clone())));
+            }
+            "retrying" => {
+                manager.retrying_heals.lock().await.insert(
+                    owner_id.clone(),
+                    RetryingHeal {
+                        request: owner,
+                        error: "target unavailable".to_string(),
+                        cancel_token: CancellationToken::new(),
+                    },
+                );
+            }
+            "grace" | "recovered" => {
+                let config = manager.config.read().await.clone();
+                let mut queue = manager.heal_queue.lock().await;
+                let context = if state == "grace" { "retry" } else { "auto_scan" };
+                assert_eq!(
+                    HealManager::admit_request_to_queue(&mut queue, owner, &config, context, true).result,
+                    HealAdmissionResult::Accepted
+                );
+                assert!(
+                    queue
+                        .heap
+                        .iter()
+                        .any(|item| item.request.id == owner_id && item.replacement_targets_frozen),
+                    "zero retries cannot mean the scope is fresh"
+                );
+            }
+            _ => {
+                manager.submit_heal_request(owner).await.expect("queue frozen generation");
+                if state == "recovery_anchor" {
+                    manager
+                        .replacement_recovery_anchors
+                        .lock()
+                        .expect("recovery anchors")
+                        .insert(owner_id.clone(), "survivor".to_string());
+                }
+            }
+        }
+
+        let late = manager
+            .submit_heal_request(automatic_replacement_request(&["replacement-b"]))
+            .await
+            .expect("classify late target");
+        assert_eq!(late, HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning), "{state}");
+        let covered = manager
+            .submit_heal_request_with_receipt(automatic_replacement_request(&["replacement-a"]))
+            .await
+            .expect("covered target remains owned");
+        assert_eq!(covered.result, HealAdmissionResult::Merged, "{state}");
+        assert_eq!(covered.task_id, owner_id, "{state}");
+        let targets = match state {
+            "active" => manager.active_heals.lock().await[&owner_id].heal_endpoints.clone(),
+            "retrying" => manager.retrying_heals.lock().await[&owner_id].request.heal_endpoints.clone(),
+            _ => {
+                manager
+                    .heal_queue
+                    .lock()
+                    .await
+                    .pop_next()
+                    .expect("retained generation")
+                    .heal_endpoints
+            }
+        };
+        assert_eq!(targets, ["replacement-a"], "{state}: frozen scope must not grow");
+    }
+}
+
+#[tokio::test]
+async fn automatic_replacement_merge_preserves_options_policy_and_recovery_identity() {
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    manager
+        .submit_heal_request(automatic_replacement_request(&["replacement-a"]))
+        .await
+        .expect("queue fresh generation");
+    for variant in [
+        "dry_run",
+        "bucket_scope",
+        "pool_scope",
+        "retried_incoming",
+        "recovery_anchor",
+        "merge_disabled",
+    ] {
+        let mut incoming = automatic_replacement_request(&["replacement-b"]);
+        match variant {
+            "dry_run" => incoming.options.dry_run = true,
+            "bucket_scope" => {
+                if let HealType::ErasureSet { buckets, .. } = &mut incoming.heal_type {
+                    buckets.push("other-bucket".to_string());
+                }
+            }
+            "pool_scope" => incoming.options.pool_index = Some(2),
+            "retried_incoming" => {
+                incoming.heal_endpoints = vec!["replacement-a".to_string()];
+                incoming.retry_attempts = 1;
+            }
+            "recovery_anchor" => {
+                incoming.heal_endpoints = vec!["replacement-a".to_string()];
+                manager
+                    .replacement_recovery_anchors
+                    .lock()
+                    .expect("recovery anchors")
+                    .insert(incoming.id.clone(), "survivor".to_string());
+            }
+            "merge_disabled" => {
+                manager.config.write().await.low_priority_merge_enable = false;
+                incoming.priority = HealPriority::Low;
+            }
+            _ => unreachable!("test variant"),
+        }
+        let result = manager
+            .submit_heal_request(incoming)
+            .await
+            .expect("classify incompatible generation");
+        let reason = if variant == "merge_disabled" {
+            HealAdmissionDropReason::PolicyDropped
+        } else {
+            HealAdmissionDropReason::AlreadyRunning
+        };
+        assert_eq!(result, HealAdmissionResult::Dropped(reason), "{variant}");
+        let queue = manager.heal_queue.lock().await;
+        assert_eq!(queue.len(), 1, "{variant}");
+        assert_eq!(
+            queue.requests().next().expect("original generation").heal_endpoints,
+            ["replacement-a"],
+            "{variant}"
+        );
+    }
+}
+
+#[test]
+fn automatic_replacement_direct_admission_checks_frozen_targets_before_capacity() {
+    let config = HealConfig {
+        queue_size: 1,
+        ..HealConfig::default()
+    };
+    let mut queue = PriorityHealQueue::new();
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let admit = |queue: &mut PriorityHealQueue, request, frozen| {
+        HealManager::admit_request_to_queue(queue, request, &config, "auto_scan", frozen).result
+    };
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-b"]), false),
+        HealAdmissionResult::Merged
+    );
+    let mut replay = automatic_replacement_request(&["replacement-a"]);
+    replay.id = owner_id.clone();
+    assert_eq!(admit(&mut queue, replay, true), HealAdmissionResult::Merged);
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-c"]), false),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-a"]), false),
+        HealAdmissionResult::Merged
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-a"]), true),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert_eq!(queue.len(), 1);
+    let owner = queue.pop_next().expect("frozen owner retained");
+    assert_eq!(owner.id, owner_id);
+    assert_eq!(owner.heal_endpoints, ["replacement-a", "replacement-b"]);
+
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let mut conflicting_replay = automatic_replacement_request(&["replacement-b"]);
+    conflicting_replay.id = owner_id.clone();
+    assert_eq!(
+        admit(&mut queue, conflicting_replay, true),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-c"]), false),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+
+    let mut queue = PriorityHealQueue::new();
+    let owner = automatic_replacement_request(&["replacement-a"]);
+    let owner_id = owner.id.clone();
+    assert_eq!(queue.push(owner), QueuePushOutcome::Accepted);
+    let mut incompatible_replay = automatic_replacement_request(&["replacement-a"]);
+    incompatible_replay.id = owner_id.clone();
+    incompatible_replay.options.dry_run = true;
+    assert_eq!(
+        admit(&mut queue, incompatible_replay, true),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+    assert!(
+        queue
+            .heap
+            .iter()
+            .any(|item| item.request.id == owner_id && item.replacement_targets_frozen)
+    );
+    assert_eq!(
+        admit(&mut queue, automatic_replacement_request(&["replacement-b"]), false),
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+}
+
+#[tokio::test]
 async fn test_submit_heal_request_returns_merged_for_duplicate() {
     let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
     let manager = HealManager::new_without_root_recovery_for_test(storage, None);
@@ -2774,6 +3071,181 @@ async fn test_active_duplicate_token_can_query_and_cancel_original_task() {
             .expect("cancelled task remains queryable"),
         HealTaskStatus::Cancelled
     );
+}
+
+#[tokio::test]
+async fn local_automatic_query_preserves_source_path_token_and_state() {
+    use crate::heal::channel::HealChannelProcessor;
+    use crate::heal::outcome::{
+        HealExecutionOutcome, HealObjectDisposition, HealObjectIdentity, HealObjectKind, HealObjectOutcome, HealTaskOutcome,
+        HealTraversalCoverage,
+    };
+
+    for source in [
+        HealRequestSource::Scanner,
+        HealRequestSource::Mrf,
+        HealRequestSource::AutoHeal,
+        HealRequestSource::ReadRepair,
+        HealRequestSource::Admin,
+        HealRequestSource::Internal,
+    ] {
+        for state in ["queued", "active", "retrying", "completed", "displaced"] {
+            let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+            let manager = Arc::new(HealManager::new_without_root_recovery_for_test(storage.clone(), None));
+            let mut request = HealRequest::object("bucket".to_string(), "object".to_string(), None);
+            request.source = source;
+            let token = request.id.clone();
+            let task = Arc::new(HealTask::from_request(request.clone(), storage));
+            let mut snapshot = CompletedHealStatus::snapshot(&task, HealTaskStatus::Completed).await;
+            assert_eq!(snapshot.source, source, "completion must retain actual task source");
+            let mut outcome = HealTaskOutcome::default();
+            outcome.execution = HealExecutionOutcome::Completed;
+            outcome.coverage = HealTraversalCoverage::Complete;
+            outcome.record(HealObjectOutcome {
+                identity: HealObjectIdentity {
+                    kind: HealObjectKind::Object,
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    version_id: None,
+                    bucket_incarnation_id: Some(uuid::Uuid::nil()),
+                    pool_index: Some(0),
+                    set_index: Some(0),
+                },
+                disposition: HealObjectDisposition::VerifiedHealthy,
+                detail: None,
+            });
+            snapshot.outcome = Some(Arc::new(outcome));
+            snapshot.seqed_items = vec![(
+                3,
+                HealResultItem {
+                    bucket: "bucket".to_string(),
+                    object: "object".to_string(),
+                    ..Default::default()
+                },
+            )];
+            snapshot.min_seq = 3;
+            snapshot.next_seq = 4;
+            let expected_status = match state {
+                "queued" => {
+                    manager.heal_queue.lock().await.push(request.clone());
+                    HealTaskStatus::Pending
+                }
+                "active" => {
+                    manager.active_heals.lock().await.insert(token.clone(), task);
+                    HealTaskStatus::Pending
+                }
+                "retrying" => {
+                    manager.retrying_heals.lock().await.insert(
+                        token.clone(),
+                        RetryingHeal {
+                            request: request.clone(),
+                            error: "transient".to_string(),
+                            cancel_token: CancellationToken::new(),
+                        },
+                    );
+                    HealTaskStatus::Retrying {
+                        error: "transient".to_string(),
+                        retry_attempt: request.retry_attempts,
+                    }
+                }
+                "completed" => {
+                    manager.completed_heals.lock().await.insert(token.clone(), Arc::new(snapshot));
+                    HealTaskStatus::Completed
+                }
+                "displaced" => {
+                    let terminal = record_displaced_terminal(&manager.displaced_terminals, &request);
+                    terminal.status.clone()
+                }
+                _ => unreachable!("fixed test states"),
+            };
+            let automatic = !matches!(source, HealRequestSource::Admin | HealRequestSource::Internal);
+            let report = manager
+                .get_local_automatic_task_report("bucket/object", &token, Some(2))
+                .await
+                .expect("local source lookup");
+            assert_eq!(report.is_some(), automatic, "source={source:?} state={state}");
+            if let Some(report) = report {
+                assert_eq!(report.status, expected_status);
+                if state == "completed" {
+                    let outcome = report.outcome.as_ref().expect("retained structured outcome");
+                    assert_eq!(outcome.objects.len(), 1);
+                    assert_eq!(outcome.objects[0].identity.object, "object");
+                    assert_eq!(outcome.objects[0].identity.pool_index, Some(0));
+                    assert_eq!(outcome.objects[0].identity.set_index, Some(0));
+                    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::VerifiedHealthy);
+                    assert_eq!(report.min_seq, 3);
+                    assert_eq!(report.next_seq, 4);
+                    assert_eq!(report.result_items.len(), 1);
+                    assert_eq!(report.result_items[0].object, "object");
+                }
+                let processor = HealChannelProcessor::new(manager.clone());
+                let local = processor
+                    .execute_local_automatic_query("bucket/object", &token, Some(2))
+                    .await
+                    .expect("local response")
+                    .expect("automatic task response");
+                let direct = processor
+                    .execute_query_request_since("bucket/object".to_string(), token.clone(), Some(2))
+                    .await
+                    .expect("original query response");
+                assert!(local.success);
+                assert_eq!(local.request_id, direct.request_id);
+                assert_eq!(local.data, direct.data, "same report encoding and cursor contract");
+                assert_eq!(local.error, direct.error);
+                let coordinator = Arc::new(HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None));
+                let missing = HealChannelProcessor::new(coordinator)
+                    .execute_query_request("bucket/object".to_string(), token.clone())
+                    .await
+                    .expect("coordinator query");
+                let body: serde_json::Value =
+                    serde_json::from_slice(missing.data.as_deref().expect("coordinator response")).expect("coordinator JSON");
+                assert_eq!(body["summary"], "notFound", "a remote manager does not own the automatic task");
+                if state == "completed" {
+                    let completed = manager
+                        .completed_heals
+                        .lock()
+                        .await
+                        .get(&token)
+                        .cloned()
+                        .expect("original completion");
+                    manager
+                        .completed_heals
+                        .lock()
+                        .await
+                        .insert("retired-alias".to_string(), completed);
+                    assert!(
+                        manager
+                            .get_local_automatic_task_report("bucket/object", "retired-alias", None)
+                            .await
+                            .expect("retired alias lookup")
+                            .is_none()
+                    );
+                }
+            }
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/other", &token, None)
+                    .await
+                    .expect("wrong path lookup")
+                    .is_none()
+            );
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/object", "unknown", None)
+                    .await
+                    .expect("unknown token lookup")
+                    .is_none()
+            );
+            manager.insert_task_alias("admin-alias", &token).await;
+            assert!(
+                manager
+                    .get_local_automatic_task_report("bucket/object", "admin-alias", None)
+                    .await
+                    .expect("alias lookup")
+                    .is_none()
+            );
+        }
+    }
 }
 
 #[tokio::test]
@@ -3592,6 +4064,38 @@ async fn test_retry_request_rescans_batch_when_all_exhausted_objects_are_retryab
 }
 
 #[tokio::test]
+async fn admin_exhausted_batches_do_not_restart_the_traversal() {
+    for heal_type in [
+        HealType::Bucket {
+            bucket: "bucket".to_owned(),
+        },
+        HealType::Prefix {
+            bucket: "bucket".to_owned(),
+            prefix: "prefix/".to_owned(),
+        },
+        HealType::Cluster,
+    ] {
+        let mut request = HealRequest::new(heal_type, HealOptions::default(), HealPriority::Normal);
+        request.source = HealRequestSource::Admin;
+        let task = HealTask::from_request(request, Arc::new(MockStorage));
+        let result = Err(task
+            .record_batch_failure(BatchHealFailure {
+                scope: "completed-admin-traversal".to_owned(),
+                failed: 1,
+                retryable: 1,
+                permanent: 0,
+                first_object: "exhausted-object".to_owned(),
+                first_error: Error::Storage(EcstoreError::SlowDown).to_string(),
+            })
+            .await);
+        assert!(
+            retry_request_for_result_with_budget(&task, &result).await.is_none(),
+            "the exhausted admin batch must retain its original object receipts"
+        );
+    }
+}
+
+#[tokio::test]
 async fn test_retry_request_does_not_rescan_cancelled_or_timed_out_retryable_batch() {
     for terminal_error in [Error::TaskCancelled, Error::TaskTimeout] {
         let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
@@ -3673,6 +4177,8 @@ async fn insert_retrying_request(manager: &HealManager, request: HealRequest) ->
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: request.source,
+            task_id: request.id.clone(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type,
             options: request.options.clone(),
@@ -4521,6 +5027,8 @@ async fn test_retrying_completion_outranks_the_queue_for_the_same_id() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: request.source,
+            task_id: request.id.clone(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: request.heal_type.clone(),
             options: request.options.clone(),
@@ -4560,6 +5068,8 @@ async fn test_get_task_status_reads_recent_completed_status() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: HealRequestSource::Internal,
+            task_id: "completed-token".to_string(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Bucket {
                 bucket: "bucket".to_string(),
@@ -4593,6 +5103,8 @@ async fn test_get_task_report_for_path_reads_completed_items() {
         Arc::new(CompletedHealStatus {
             progress: None,
             outcome: None,
+            source: HealRequestSource::Internal,
+            task_id: "completed-token".to_string(),
             retained_bytes: std::sync::OnceLock::new(),
             heal_type: HealType::Object {
                 bucket: "bucket".to_string(),
@@ -6091,4 +6603,111 @@ fn admin_bucket_discovery_retries_keep_the_existing_budget() {
         retry_request_for_result(&task, &error).is_none(),
         "persistent incompleteness must terminate"
     );
+}
+
+async fn check_node_admission_task_retry(source: HealRequestSource) {
+    use crate::heal::outcome::HealFailureClass;
+    use crate::heal::storage::ECStoreHealStorage;
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
+    use rustfs_heal_contracts::heal_channel::HealScanMode;
+    use std::num::NonZeroU16;
+
+    let root = TempDir::new().expect("isolated real storage");
+    let env = rustfs_test_utils::TestECStoreEnv::builder()
+        .base_dir(root.path())
+        .build()
+        .await;
+    env.make_bucket("admission-retry", false).await;
+    env.put_object_bytes("admission-retry", "existing", b"repair me".to_vec())
+        .await;
+    let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one node unit"));
+    let storage: Arc<dyn HealStorageAPI> =
+        Arc::new(ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone())));
+    let mut request = HealRequest::object("admission-retry".to_string(), "existing".to_string(), None);
+    request.source = source;
+    request.options.scan_mode = HealScanMode::Deep;
+    let task = HealTask::from_request(request, storage.clone());
+    let result = task.execute().await;
+    let error = result
+        .as_ref()
+        .expect_err("closed node admission must defer an existing object");
+    assert!(
+        matches!(error, Error::TransientSkip { .. }),
+        "typed resource deferral must survive HealTask: {error:?}"
+    );
+    assert!(error.is_recoverable_heal());
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(
+        outcome.objects[0].disposition,
+        HealObjectDisposition::Failed(HealFailureClass::Recoverable)
+    );
+    assert_eq!(gate.completed(), Some(0));
+    let (retry, delay, _) = retry_request_for_result_with_budget(&task, &result)
+        .await
+        .expect("scheduler must retain retry responsibility");
+    assert_eq!(retry.id, task.id);
+    assert_eq!(retry.source, source);
+    assert_eq!(retry.priority, task.priority);
+    assert_eq!(retry.retry_attempts, 1);
+    assert!(delay > Duration::ZERO);
+    gate.update(
+        &mut FeedbackController::new(),
+        Some(FeedbackObservation {
+            generation: 1,
+            max_concurrency: 1,
+            pressure: ResourcePressure::Unknown,
+            completed_units: None,
+        }),
+    );
+    let retried = HealTask::from_request(retry, storage);
+    retried
+        .execute()
+        .await
+        .expect("restored node capacity lets the same real repair finish");
+    assert_eq!(gate.completed(), Some(1));
+    assert_eq!(gate.snapshot().active, 0);
+    let outcome = retried.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    // The default fixture writes legacy metadata without an independent
+    // integrity identity. Admission recovery must not turn that into proof.
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Unknown);
+    assert_eq!(
+        outcome.objects[0].detail.as_deref(),
+        Some(rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL)
+    );
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(outcome.counters.unknown, 1);
+}
+
+fn run_node_admission_task_retry(source: HealRequestSource) {
+    // Match the existing real-storage heal fixture's bounded stack budget.
+    const STACK_SIZE: usize = 8 * 1024 * 1024;
+    std::thread::Builder::new()
+        .name("node-admission-real-storage".to_owned())
+        .stack_size(STACK_SIZE)
+        .spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(4)
+                .thread_stack_size(STACK_SIZE)
+                .enable_all()
+                .build()
+                .expect("node-admission storage runtime");
+            runtime.block_on(check_node_admission_task_retry(source));
+        })
+        .expect("node-admission test thread")
+        .join()
+        .expect("node-admission test must finish");
+}
+
+#[test]
+#[serial_test::serial]
+fn node_admission_scanner_task_stays_retryable_and_finishes_after_recovery() {
+    run_node_admission_task_retry(HealRequestSource::Scanner);
+}
+
+#[test]
+#[serial_test::serial]
+fn node_admission_read_repair_task_stays_retryable_and_finishes_after_recovery() {
+    run_node_admission_task_retry(HealRequestSource::ReadRepair);
 }

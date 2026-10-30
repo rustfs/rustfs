@@ -339,6 +339,19 @@ message RenameDataResponse {
   bytes rename_data_resp_bin = 4;
 }
 
+// Fixed-scope native pool.bin recovery. The typed MessagePack payload never
+// accepts an arbitrary volume or object path.
+message PoolMetaNativeRecoveryRequest {
+  string disk = 1;
+  bytes payload = 2;
+}
+
+message PoolMetaNativeRecoveryResponse {
+  bool success = 1;
+  optional Error error = 2;
+  bytes payload = 3;
+}
+
 message MakeVolumesRequest {
   string disk = 1;  // indicate which one in the disks
   repeated string volumes = 2;
@@ -400,6 +413,21 @@ message RecoverDeleteTransactionRequest {
 }
 
 message RecoverDeleteTransactionResponse {
+  bool success = 1;
+  uint32 protocol_version = 2;
+  bytes result = 3;
+  optional Error error = 4;
+}
+
+// Fixed multipart-upload scope; operation bytes never select another volume.
+message RecoverMultipartSourceRequest {
+  string disk = 1;
+  string path = 2;
+  uint32 protocol_version = 3;
+  bytes operation = 4;
+}
+
+message RecoverMultipartSourceResponse {
   bool success = 1;
   uint32 protocol_version = 2;
   bytes result = 3;
@@ -1266,6 +1294,7 @@ service NodeService {
   rpc Delete(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc DeleteAtIncarnation(DeleteRequest) returns (DeleteResponse) {}; // auth-policy: body-bound
   rpc RecoverDeleteTransaction(RecoverDeleteTransactionRequest) returns (RecoverDeleteTransactionResponse) {}; // auth-policy: body-bound
+  rpc RecoverMultipartSource(RecoverMultipartSourceRequest) returns (RecoverMultipartSourceResponse) {}; // auth-policy: body-bound
   rpc AcquireSnapshotLease(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc AcquireQuotaMutationFence(SnapshotLeaseRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
   rpc RenewSnapshotLease(SnapshotLeaseRenewRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
@@ -1285,8 +1314,13 @@ service NodeService {
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  // The method itself requires source-preserving multipart publication on every peer.
+  rpc RenameMultipartData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataWithQuotaFence(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc RenameDataWithPoolMetaCas(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc UndoPoolMetaWrite(DeleteVersionRequest) returns (DeleteVersionResponse) {}; // auth-policy: body-bound
+  rpc PoolMetaNativeRecovery(PoolMetaNativeRecoveryRequest) returns (PoolMetaNativeRecoveryResponse) {}; // auth-policy: body-bound
   rpc MakeVolumes(MakeVolumesRequest) returns (MakeVolumesResponse) {}; // auth-policy: body-bound
   rpc MakeVolume(MakeVolumeRequest) returns (MakeVolumeResponse) {}; // auth-policy: body-bound
   rpc ListVolumes(ListVolumesRequest) returns (ListVolumesResponse) {}; // auth-policy: read-only

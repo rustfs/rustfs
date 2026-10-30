@@ -1051,6 +1051,21 @@ async fn route_cluster_heal_control(
         })
 }
 
+async fn query_heal_status_on_owner<L, C, CF>(
+    local: L,
+    coordinator: C,
+) -> S3Result<rustfs_heal_contracts::heal_channel::HealChannelResponse>
+where
+    L: Future<Output = S3Result<Option<rustfs_heal_contracts::heal_channel::HealChannelResponse>>>,
+    C: FnOnce() -> CF,
+    CF: Future<Output = S3Result<rustfs_heal_contracts::heal_channel::HealChannelResponse>>,
+{
+    match local.await? {
+        Some(response) => Ok(response),
+        None => coordinator().await,
+    }
+}
+
 async fn execute_after_heal_start_preflight<P, PF, E, EF, T>(
     endpoints: &EndpointServerPools,
     options: &HealOpts,
@@ -1514,20 +1529,41 @@ impl Operation for HealHandler {
         let heal_path = encode_heal_control_path(&hip.bucket, &hip.obj_prefix);
         if !hip.client_token.is_empty() && !hip.force_start && !hip.force_stop {
             let client_token = hip.client_token.clone();
-            let request_id = uuid::Uuid::new_v4().to_string();
-            let context = app_context
-                .clone()
-                .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
-            let route = prepare_heal_control_route(&context)?;
-            let envelope = rustfs_protos::heal_control::Envelope::query(
-                request_id.clone(),
-                new_heal_control_metadata(&route)?,
-                heal_path,
-                client_token.clone(),
-                hip.since_seq,
+            // Automatic workers run on their owning node. Only an exact
+            // path/token/source snapshot can answer locally; Admin tokens and
+            // unknown identities retain the coordinator authority boundary.
+            let response = query_heal_status_on_owner(
+                async {
+                    let Some(manager) = rustfs_heal::get_heal_manager() else {
+                        return Ok(None);
+                    };
+                    let processor = rustfs_heal::HealChannelProcessor::new(manager.clone());
+                    timeout(
+                        PEER_HEAL_STATUS_TIMEOUT,
+                        processor.execute_local_automatic_query(&heal_path, &client_token, hip.since_seq),
+                    )
+                    .await
+                    .map_err(|_| cluster_heal_control_unavailable("local_task_query_expired"))?
+                    .map_err(|_| cluster_heal_control_unavailable("local_task_query_failed"))
+                },
+                || async {
+                    let request_id = uuid::Uuid::new_v4().to_string();
+                    let context = app_context
+                        .clone()
+                        .ok_or_else(|| cluster_heal_control_unavailable("app_context_unavailable"))?;
+                    let route = prepare_heal_control_route(&context)?;
+                    let envelope = rustfs_protos::heal_control::Envelope::query(
+                        request_id.clone(),
+                        new_heal_control_metadata(&route)?,
+                        heal_path.clone(),
+                        client_token.clone(),
+                        hip.since_seq,
+                    )
+                    .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
+                    submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token.clone()).await
+                },
             )
-            .map_err(|err| s3_error!(InternalError, "encode heal control query failed: {err}"))?;
-            let response = submit_cluster_heal_channel_command(context, route, envelope, &request_id, client_token).await?;
+            .await?;
             if !response.success {
                 return Err(s3_error!(
                     InternalError,
@@ -1733,6 +1769,10 @@ struct MrfLegacyResponsibilityActionResponse {
 fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifecycleControlError) -> s3s::S3Error {
     use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
     match error {
+        MrfLifecycleControlError::CheckpointUnreadable => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "MRF checkpoint is unreadable; retain its files and restore a compatible reader",
+        ),
         MrfLifecycleControlError::Unavailable | MrfLifecycleControlError::Persistence => {
             admin_error(S3ErrorCode::ServiceUnavailable, "MRF lifecycle operation could not be completed")
         }
@@ -1745,6 +1785,14 @@ fn map_mrf_lifecycle_control_error(error: rustfs_heal::heal::mrf_queue::MrfLifec
         MrfLifecycleControlError::IncarnationChanged => admin_error(
             S3ErrorCode::InvalidRequest,
             "bucket incarnation changed; refresh the MRF responsibility listing",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnresolved => admin_error(
+            S3ErrorCode::InvalidRequest,
+            "current bucket identity is unresolved; the MRF responsibility remains held",
+        ),
+        MrfLifecycleControlError::BucketIdentityUnavailable(_) => admin_error(
+            S3ErrorCode::ServiceUnavailable,
+            "current bucket identity is unavailable; retry after storage recovers",
         ),
         MrfLifecycleControlError::InvalidAction(reason) => admin_error(S3ErrorCode::InvalidRequest, reason),
     }
@@ -1960,9 +2008,9 @@ mod tests {
         build_replacement_recovery_status_response, encode_background_heal_status, encode_heal_control_path,
         encode_heal_start_success, encode_heal_task_status, execute_after_heal_start_preflight, heal_channel_response_items,
         heal_channel_response_progress, heal_channel_response_summary, heal_control_response_id, json_response,
-        map_heal_response, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query, peer_topology_complete,
-        query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status, reject_heal_admission,
-        validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
+        map_heal_response, map_mrf_lifecycle_control_error, merge_peer_heal_statuses, parse_mrf_legacy_responsibility_query,
+        peer_topology_complete, query_peer_heal_status, query_peer_replacement_recovery_status, read_cluster_heal_status,
+        reject_heal_admission, validate_heal_request_mode, validate_heal_target, validate_mrf_legacy_responsibility_action,
     };
     use crate::storage::rpc::node_service::heal::{
         NodeHealProgress, NodeHealStatusSnapshot, NodeReplacementRecoveryStatusSnapshot, encode_node_replacement_recovery_status,
@@ -1982,6 +2030,54 @@ mod tests {
     use serde_json::json;
     use std::sync::atomic::{AtomicBool, Ordering};
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn local_automatic_heal_query_preserves_owner_and_coordinator_errors() {
+        let response = || rustfs_heal_contracts::heal_channel::HealChannelResponse {
+            request_id: "original-token".to_string(),
+            success: true,
+            data: Some(b"retained-owner-report".to_vec()),
+            error: None,
+        };
+        let called = AtomicBool::new(false);
+        let local = super::query_heal_status_on_owner(async { Ok(Some(response())) }, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(response())
+        })
+        .await
+        .expect("local automatic owner response");
+        assert!(!called.load(Ordering::SeqCst));
+        assert_eq!(local.request_id, "original-token");
+        assert_eq!(local.data.as_deref(), Some(b"retained-owner-report".as_slice()));
+
+        let fallback = super::query_heal_status_on_owner(async { Ok(None) }, || async {
+            called.store(true, Ordering::SeqCst);
+            Ok(response())
+        })
+        .await
+        .expect("unknown local identity uses coordinator");
+        assert!(called.swap(false, Ordering::SeqCst));
+        assert_eq!(fallback.data, local.data);
+
+        let error = super::query_heal_status_on_owner(
+            async { Err(super::admin_error(S3ErrorCode::InternalError, "local lookup failed")) },
+            || async {
+                called.store(true, Ordering::SeqCst);
+                Ok(response())
+            },
+        )
+        .await
+        .expect_err("local failure must not become coordinator success");
+        assert_eq!(error.code(), &S3ErrorCode::InternalError);
+        assert!(!called.load(Ordering::SeqCst));
+
+        let error = super::query_heal_status_on_owner(async { Ok(None) }, || async {
+            Err(super::admin_error(S3ErrorCode::ServiceUnavailable, "coordinator unavailable"))
+        })
+        .await
+        .expect_err("coordinator error must remain visible");
+        assert_eq!(error.code(), &S3ErrorCode::ServiceUnavailable);
+    }
 
     #[test]
     fn mrf_legacy_only_refresh_accepts_an_unobserved_incarnation() {
@@ -2086,6 +2182,21 @@ mod tests {
             let uri = Uri::try_from(format!("/rustfs/admin/v4/heal/mrf/responsibilities?{query}")).expect("well-formed URI");
             assert!(parse_mrf_legacy_responsibility_query(&uri).is_err(), "accepted invalid query {query}");
         }
+    }
+
+    #[test]
+    fn mrf_lifecycle_errors_distinguish_unresolved_identity_and_storage_failure() {
+        use rustfs_heal::heal::mrf_queue::MrfLifecycleControlError;
+
+        let unresolved = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnresolved);
+        assert_eq!(unresolved.code(), &S3ErrorCode::InvalidRequest);
+        let unavailable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::BucketIdentityUnavailable(Box::new(
+            rustfs_heal::Error::Io(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "private storage detail")),
+        )));
+        assert_eq!(unavailable.code(), &S3ErrorCode::ServiceUnavailable);
+        assert!(!unavailable.to_string().contains("private storage detail"));
+        let unreadable = map_mrf_lifecycle_control_error(MrfLifecycleControlError::CheckpointUnreadable);
+        assert_eq!(unreadable.code(), &S3ErrorCode::ServiceUnavailable);
     }
     use time::{OffsetDateTime, format_description::well_known::Rfc3339};
     use tokio::sync::mpsc;

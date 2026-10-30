@@ -107,7 +107,7 @@ flate2.workspace = true
 http.workspace = true
 http-body-util.workspace = true
 hyper = { workspace = true, features = ["http2", "http1", "server"] }
-hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "tracing"] }
+hyper-util = { workspace = true, features = ["tokio", "server-auto", "server-graceful", "client-legacy", "tracing"] }
 reqwest = { workspace = true, features = ["json", "multipart", "stream"] }
 rustfs-signer.workspace = true
 
@@ -146,6 +146,7 @@ zip.workspace = true
 clap = { workspace = true, features = ["derive", "env"] }
 
 [dev-dependencies]
+same-file.workspace = true
 aws-smithy-http-client = { workspace = true, default-features = false, features = ["test-util"] }
 rustfs-heal.workspace = true
 tempfile.workspace = true

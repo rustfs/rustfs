@@ -1,0 +1,44 @@
+[package]
+name = "zstd"
+version = "0.13.3"
+publish = false
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+description = "RustFS internal adapter for zstd 0.13 consumers using the fixed codec"
+
+[dependencies]
+zstd_fixed = { package = "zstd", version = "=0.14.3", default-features = false }
+
+[features]
+default = ["legacy", "arrays", "zdict_builder"]
+arrays = ["zstd_fixed/arrays"]
+bindgen = ["zstd_fixed/bindgen"]
+debug = ["zstd_fixed/debug"]
+doc-cfg = ["zstd_fixed/doc-cfg"]
+experimental = ["zstd_fixed/experimental"]
+fat-lto = ["zstd_fixed/fat-lto"]
+legacy = ["zstd_fixed/legacy"]
+no_asm = ["zstd_fixed/no_asm"]
+pkg-config = ["zstd_fixed/pkg-config"]
+thin = ["zstd_fixed/thin"]
+thin-lto = ["zstd_fixed/thin-lto"]
+wasm = ["zstd_fixed/wasm"]
+zdict_builder = ["zstd_fixed/zdict_builder"]
+zstdmt = ["zstd_fixed/zstdmt"]
+
+[dev-dependencies]
+zstd-safe = { version = "8.2.0", features = ["seekable"] }
+toml = "1.1.8"
+semver = "1.0.28"
+apache-avro.workspace = true
+arrow-array = "59.3.2"
+arrow-ipc = { version = "59.3.2", features = ["zstd"] }
+arrow-schema = "59.3.2"
+parquet = { version = "59.3.2", default-features = false, features = ["arrow", "zstd"] }
+kafka-protocol = { version = "0.18.0", default-features = false, features = ["zstd"] }
+bytes.workspace = true
+
+[lints]
+workspace = true

@@ -280,7 +280,7 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
             continue;
         }
 
-        if !parts[part_idx].etag.is_empty() {
+        if !parts[part_idx].etag.is_empty() && parts[part_idx].error.is_none() {
             present_count += 1;
             let part = &parts[part_idx];
             let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
@@ -603,6 +603,10 @@ pub(in crate::set_disk) async fn submit_read_repair_heal_with_submitter(
     request.object_version_id = version_id.filter(|value| !value.is_empty()).map(str::to_string);
     // A degraded read's surviving minority is not a recreate instruction; the
     // locked storage read decides whether the target is absent (backlog#2900).
+    // Reader failures include checksum damage that metadata-only healing cannot detect.
+    if matches!(reason, "missing_shards" | "decode_error") {
+        request.scan_mode = Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep);
+    }
 
     let request_id = request.id.clone();
     let bucket = bucket.to_string();
@@ -1118,9 +1122,9 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     // offset can be advanced to the failing stripe. A parity reader that was
     // opened eagerly during setup is pinned at the stripe-0 stream position
     // and could never be engaged mid-object, so swap it for an unopened
-    // deferred reader carrying a stripe handle. The eager open already proved
-    // the shard is reachable; no shard bytes were read from it, and the
-    // ready/error bookkeeping that quorum decisions rely on is left untouched.
+    // deferred reader carrying a stripe handle. The eager setup already proved
+    // the shard is reachable; the ready/error bookkeeping that quorum decisions
+    // rely on is left untouched.
     // Gate off (default): keep the eagerly opened parity readers exactly as
     // before — the lockstep path reads them on every stripe.
     if !demand_bound_lockstep {
@@ -1217,8 +1221,8 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
 }
 
 /// When all online shards are local and mmap-read is enabled, materialize
-/// shard bytes with one `batch_shard_pread` instead of per-shard
-/// `spawn_blocking` via `open_disk_reader`.
+/// shard bytes in batches instead of per-shard `spawn_blocking` via
+/// `open_disk_reader`. Demand-bound reads add parity batches only as needed.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn try_create_bitrot_readers_via_batch_pread(
@@ -1232,18 +1236,29 @@ async fn try_create_bitrot_readers_via_batch_pread(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    strategy: BitrotReaderSetupStrategy,
 ) -> Option<BitrotReaderSetup> {
     use crate::disk::local::batch_shard_pread;
+    use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
 
+    let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
+    let record_decision = |decision| {
+        record_local_batch_read_decision(decision, prepare_started.map(|started| started.elapsed()));
+    };
     let (adj_off, adj_len) = adjust_shard_read_params(read_offset, read_length, shard_size, &checksum_algo);
     if adj_len > object_mmap_read_max_length() {
+        record_decision(LocalBatchReadDecision::ReadCapExceeded);
         return None;
     }
 
     let mut batch_items: Vec<(usize, std::path::PathBuf, usize, usize)> = Vec::new();
     for (idx, disk_op) in disks.iter().enumerate() {
         if files.get(idx).is_some_and(|fi| fi.data.is_some()) {
+            record_decision(LocalBatchReadDecision::InlineData);
             return None;
         }
         if let Some(disk) = disk_op.as_ref() {
@@ -1251,49 +1266,78 @@ async fn try_create_bitrot_readers_via_batch_pread(
             let path_str = format!("{object}/{data_dir}/part.{part_number}");
             match disk.get_object_path_for_io_if_local(bucket, &path_str) {
                 Some(Ok(p)) => batch_items.push((idx, p, adj_off, adj_len)),
-                _ => return None,
+                Some(Err(_)) => {
+                    record_decision(LocalBatchReadDecision::InvalidPath);
+                    return None;
+                }
+                None => {
+                    record_decision(LocalBatchReadDecision::NonLocalShard);
+                    return None;
+                }
             }
         }
     }
 
     if batch_items.is_empty() {
+        record_decision(LocalBatchReadDecision::NoLocalShards);
         return None;
     }
 
-    let requests: Vec<_> = batch_items.iter().map(|(_, p, off, len)| (p.clone(), *off, *len)).collect();
-    #[cfg(test)]
-    for (disk_index, _, _, _) in &batch_items {
-        disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, *disk_index);
-    }
-    let batch_results = batch_shard_pread(requests).await;
-
+    // Legacy lockstep consumes every shard, so keep its coalesced batch even
+    // when setup prefers data blocks. Only demand-bound decode can leave the
+    // parity readers unopened; preading them here would discard their bytes
+    // when fill_deferred_bitrot_readers installs stripe-aligned reserves.
+    let data_first = strategy != BitrotReaderSetupStrategy::AllShards
+        && crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
     let mut setup = BitrotReaderSetup::new(disks.len());
-    for (i, (idx, _, _, _)) in batch_items.iter().enumerate() {
-        setup.mark_scheduled(*idx);
-        match &batch_results[i] {
-            Ok(bytes) => {
-                let reader = BitrotReader::new(
-                    ShardReader::InMemory(Cursor::new(bytes.clone())),
-                    shard_size,
-                    checksum_algo.clone(),
-                    skip_verify_bitrot,
-                );
-                setup.apply_reader_result(*idx, Ok(Some(reader)));
-            }
-            Err(e) => {
-                setup.apply_reader_result(*idx, Err(e.clone()));
-            }
-        }
-    }
-
-    for (idx, disk_op) in disks.iter().enumerate() {
-        if setup.scheduled[idx] {
-            continue;
-        }
-        setup.mark_scheduled(idx);
-        if disk_op.is_none() {
+    for (idx, disk) in disks.iter().enumerate() {
+        if disk.is_none() {
+            setup.mark_scheduled(idx);
             setup.apply_reader_result(idx, Ok(None));
         }
+    }
+    let mut batch_size = if data_first {
+        batch_items.iter().take_while(|(idx, _, _, _)| *idx < data_shards).count()
+    } else {
+        batch_items.len()
+    };
+    let mut pending = batch_items.into_iter();
+    record_decision(LocalBatchReadDecision::Selected);
+    loop {
+        let mut indices = Vec::with_capacity(batch_size.min(pending.len()));
+        let requests: Vec<_> = pending
+            .by_ref()
+            .take(batch_size)
+            .map(|(idx, path, offset, length)| {
+                setup.mark_scheduled(idx);
+                indices.push(idx);
+                #[cfg(test)]
+                disk_call_counters::record(object, disk_call_counters::KIND_DISK_SHARD_OPEN, idx);
+                (path, offset, length)
+            })
+            .collect();
+        if !requests.is_empty() {
+            for (idx, result) in indices.into_iter().zip(batch_shard_pread(requests).await) {
+                let result = result.map(|bytes| {
+                    Some(BitrotReader::new(
+                        ShardReader::InMemory(Cursor::new(bytes)),
+                        shard_size,
+                        checksum_algo.clone(),
+                        skip_verify_bitrot,
+                    ))
+                });
+                setup.apply_reader_result(idx, result);
+            }
+        }
+        if !data_first || setup.has_setup_quorum(data_shards, parity_shards, mode) || pending.len() == 0 {
+            break;
+        }
+        // A missing/corrupt data file needs replacement parity. Reuse the
+        // canonical target, including the extra verification source required
+        // for reconstruction, and retry only the outstanding deficit.
+        batch_size = setup
+            .scheduling_target(data_shards, parity_shards, mode)
+            .saturating_sub(setup.available_shards());
     }
 
     Some(setup)
@@ -1312,7 +1356,12 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _shard_size: usize,
     _checksum_algo: HashAlgorithm,
     _skip_verify_bitrot: bool,
+    _data_shards: usize,
+    _parity_shards: usize,
+    _mode: BitrotReaderSetupMode,
+    _strategy: BitrotReaderSetupStrategy,
 ) -> Option<BitrotReaderSetup> {
+    rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::UnsupportedPlatform, None);
     None
 }
 
@@ -1476,11 +1525,19 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
 ) -> BitrotReaderSetup {
     let strategy = get_bitrot_reader_setup_strategy(mode, prefer_data_blocks_first);
 
-    if use_mmap_read
-        && !matches!(
-            crate::set_disk::get_object_read_policy(),
-            crate::set_disk::GetObjectReadPolicy::CopySource
-        )
+    let batch_read_enabled = if !use_mmap_read {
+        rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::MmapDisabled, None);
+        false
+    } else if matches!(
+        crate::set_disk::get_object_read_policy(),
+        crate::set_disk::GetObjectReadPolicy::CopySource
+    ) {
+        rustfs_io_metrics::record_local_batch_read_decision(rustfs_io_metrics::LocalBatchReadDecision::CopySource, None);
+        false
+    } else {
+        true
+    };
+    if batch_read_enabled
         && let Some(mut setup) = try_create_bitrot_readers_via_batch_pread(
             files,
             disks,
@@ -1492,6 +1549,10 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             shard_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
+            data_shards,
+            parity_shards,
+            mode,
+            strategy,
         )
         .await
     {
@@ -3051,6 +3112,123 @@ impl RenameRollbackReceipt {
     }
 }
 
+/// Physical callbacks retain this holder, never independent logical-guard
+/// references. A verified quorum success can release those references without
+/// revoking native mutation leases, accounting or resource ownership.
+pub(in crate::set_disk) struct MultipartLogicalGuards {
+    payload: parking_lot::Mutex<Option<Box<dyn Send + Sync>>>,
+}
+
+impl MultipartLogicalGuards {
+    pub(in crate::set_disk) fn new(payload: impl Send + Sync + 'static) -> Arc<Self> {
+        Arc::new(Self {
+            payload: parking_lot::Mutex::new(Some(Box::new(payload))),
+        })
+    }
+
+    fn release_after_native_quorum(&self) {
+        let payload = self.payload.lock().take();
+        drop(payload);
+    }
+}
+
+/// The only owner of the original native publication capabilities. The full
+/// non-early-ACK fanout has no producer after `join_all`; consuming this owner
+/// makes the success decision irreversible even if a later quota/tail step fails.
+struct PublishingMultipartCapabilities {
+    publications: Vec<Option<crate::disk::multipart_source::MultipartPublicationResult>>,
+    authority: crate::disk::multipart_source::ProofVerificationContext,
+    commit_owner: Option<Arc<dyn Send + Sync>>,
+    logical_guards: Option<Arc<MultipartLogicalGuards>>,
+}
+
+impl PublishingMultipartCapabilities {
+    fn new(
+        slots: usize,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+        commit_owner: Option<Arc<dyn Send + Sync>>,
+        logical_guards: Option<Arc<MultipartLogicalGuards>>,
+    ) -> Self {
+        Self {
+            publications: (0..slots).map(|_| None).collect(),
+            authority,
+            commit_owner,
+            logical_guards,
+        }
+    }
+
+    fn succeeded(self) {
+        // This consumes the only failed-owner capability collection before
+        // logical locks can become available to a subsequent operation.
+        drop(self.publications);
+        if let Some(logical_guards) = self.logical_guards {
+            logical_guards.release_after_native_quorum();
+        }
+    }
+
+    async fn failed_owned(
+        self,
+        disks: &[Option<DiskStore>],
+        file_infos: &[FileInfo],
+        source: &str,
+        target: (&str, &str),
+        namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
+    ) {
+        let Some(info) = disks.iter().zip(file_infos).find_map(|(disk, info)| {
+            (disk.is_some() && info.has_valid_erasure_geometry() && info.erasure.distribution.len() == disks.len())
+                .then_some(info)
+        }) else {
+            return;
+        };
+        let has_capability = self.publications.iter().any(Option::is_some);
+        let mut capabilities = self.publications;
+        let mut physical_disks = vec![None; disks.len()];
+        let mut physical_capabilities = (0..disks.len()).map(|_| None).collect::<Vec<_>>();
+        for (physical, logical) in info.erasure.distribution.iter().copied().enumerate() {
+            let Some(logical) = logical.checked_sub(1).filter(|slot| *slot < disks.len()) else { return };
+            physical_disks[physical] = disks[logical].clone();
+            physical_capabilities[physical] = capabilities[logical].take();
+        }
+        let source = source.to_owned();
+        let target = (target.0.to_owned(), target.1.to_owned());
+        let authority = self.authority;
+        let namespace_owner = self
+            .commit_owner
+            .or_else(|| namespace_commit_guard.map(|owner| owner as Arc<dyn Send + Sync>));
+        let recovery = tokio::spawn(crate::disk::with_optional_resource_unit(
+            crate::disk::current_resource_unit(),
+            async move {
+                // Own the capabilities, accounting and physical recovery tails
+                // independently of both the request and its undo waiter.
+                let _namespace_owner = namespace_owner.clone();
+                let _ = super::multipart_source::recover_source(
+                    &physical_disks,
+                    &target.0,
+                    &target.1,
+                    &source,
+                    Some(physical_capabilities),
+                    &authority,
+                    namespace_owner,
+                )
+                .await;
+            },
+        ));
+        if has_capability {
+            let timeout = crate::disk::disk_store::get_max_timeout_duration();
+            if timeout.is_zero() {
+                let _ = recovery.await;
+            } else {
+                let _ = tokio::time::timeout(timeout, recovery).await;
+            }
+        }
+        // Zero acknowledged capabilities cannot authorize synchronous Undo.
+        // Inspecting unknown outcomes must not add another full disk deadline
+        // to the original publication timeout. Dropping the JoinHandle only
+        // detaches its owner; a later retry can confirm a completed target.
+        // The original write-quorum error remains the API result in every case.
+    }
+}
+
 struct RenameRollbackOwnership {
     receipt: Option<RenameRollbackReceipt>,
     namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
@@ -3286,6 +3464,8 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     scanner_publication_commit_scope: Option<crate::object_api::ScannerPublicationCommitScope>,
     namespace_commit_guard: Option<Arc<crate::runtime::instance::NamespaceCommitGuard>>,
     rollback_receipt: Option<RenameRollbackReceipt>,
+    multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
+    multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3299,7 +3479,22 @@ impl<'a> RenameDataFenceOptions<'a> {
             scanner_publication_commit_scope: None,
             namespace_commit_guard: None,
             rollback_receipt: None,
+            multipart_proof_authority: None,
+            multipart_commit_owner: None,
         }
+    }
+
+    pub(in crate::set_disk) fn with_multipart_commit_owner(mut self, owner: Arc<MultipartLogicalGuards>) -> Self {
+        self.multipart_commit_owner = Some(owner);
+        self
+    }
+
+    pub(in crate::set_disk) fn with_multipart_proof_authority(
+        mut self,
+        authority: crate::disk::multipart_source::ProofVerificationContext,
+    ) -> Self {
+        self.multipart_proof_authority = Some(authority);
+        self
     }
 
     pub(in crate::set_disk) fn with_rollback_receipt(mut self, receipt: RenameRollbackReceipt) -> Self {
@@ -3775,6 +3970,8 @@ impl SetDisks {
             scanner_publication_commit_scope: _scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
+            multipart_proof_authority: _,
+            multipart_commit_owner: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4164,6 +4361,16 @@ impl SetDisks {
     ) -> disk::error::Result<RenameDataCommit> {
         let (src_bucket, src_object) = src;
         let (dst_bucket, dst_object) = dst;
+        let protected_multipart = src_bucket == RUSTFS_META_MULTIPART_BUCKET
+            && file_infos.iter().any(|info| {
+                rustfs_utils::http::contains_key_str(
+                    &info.metadata,
+                    crate::disk::multipart_source::MULTIPART_SOURCE_CONDITION_SUFFIX,
+                )
+            });
+        if protected_multipart && allow_early_ack {
+            return Err(DiskError::UnsupportedDisk);
+        }
         if allow_early_ack && put_rename_early_ack_enabled() {
             return Self::rename_data_owned_early_ack_with_fence(
                 disks,
@@ -4182,6 +4389,8 @@ impl SetDisks {
             scanner_publication_commit_scope,
             namespace_commit_guard,
             rollback_receipt,
+            multipart_proof_authority,
+            multipart_commit_owner,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4198,6 +4407,11 @@ impl SetDisks {
                 file_info.validate_for_erasure_write()?;
             }
         }
+        let multipart_proof_authority = if protected_multipart {
+            Some(multipart_proof_authority.ok_or(DiskError::UnsupportedDisk)?)
+        } else {
+            None
+        };
         let mut errs = Vec::with_capacity(disks.len());
 
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -4214,12 +4428,19 @@ impl SetDisks {
         let fanout_dst_bucket = dst_bucket.clone();
         let fanout_dst_object = dst_object.clone();
         let fanout_publication_scope = scanner_publication_commit_scope.clone();
+        let logical_guards = multipart_commit_owner;
+        let multipart_commit_owner = logical_guards
+            .as_ref()
+            .map(|owner| Arc::new((namespace_commit_guard.clone(), owner.clone())) as Arc<dyn Send + Sync>);
+        let fanout_namespace_owner = multipart_commit_owner
+            .clone()
+            .or_else(|| namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>));
         let fanout_namespace_commit_guard = namespace_commit_guard.clone();
         // Keep one coordinator task so a cancelled caller cannot drop partially
         // completed disk mutations. Per-disk futures stay ordered in `join_all`,
         // preserving slot-indexed quorum and convergence accounting without a
         // scheduler task for every disk.
-        let fanout = tokio::spawn(async move {
+        let fanout_future = async move {
             // Keep the storage-owned movement permit attached to the actual
             // fan-out owner, even if the caller future is cancelled.
             let _fanout_publication_scope = fanout_publication_scope;
@@ -4238,7 +4459,7 @@ impl SetDisks {
                     let dst_bucket = fanout_dst_bucket.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let publication_scope = scanner_publication_commit_scope.clone();
-                    let namespace_commit_guard = fanout_namespace_commit_guard.clone();
+                    let namespace_owner = fanout_namespace_owner.clone();
 
                     async move {
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
@@ -4299,9 +4520,7 @@ impl SetDisks {
                                     &dst_object,
                                     disk::RenameDataGuards {
                                         scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        namespace_owner: namespace_owner.clone(),
                                         ..Default::default()
                                     },
                                 )
@@ -4348,7 +4567,15 @@ impl SetDisks {
             #[cfg(test)]
             rollback_fault_injection::after_fanout(&fanout_dst_object);
             (results, fanout_file_infos)
-        });
+        };
+        let fanout = if protected_multipart {
+            tokio::spawn(crate::disk::with_optional_resource_unit(
+                crate::disk::current_resource_unit(),
+                fanout_future,
+            ))
+        } else {
+            tokio::spawn(fanout_future)
+        };
 
         let mut disk_versions = vec![None; disk_count];
         let mut data_dirs = vec![None; disk_count];
@@ -4395,21 +4622,54 @@ impl SetDisks {
             );
         }
 
+        let mut multipart_capabilities = multipart_proof_authority.map(|authority| {
+            PublishingMultipartCapabilities::new(results.len(), authority, multipart_commit_owner, logical_guards)
+        });
         let mut dispatch_states = Vec::with_capacity(results.len());
-        for (idx, (dispatch_state, result)) in results.iter().enumerate() {
-            dispatch_states.push(*dispatch_state);
+        for (idx, (dispatch_state, result)) in results.into_iter().enumerate() {
+            dispatch_states.push(dispatch_state);
             match result {
-                Ok(Ok(res)) => {
+                Ok(Ok(mut res)) => {
+                    if let Some(owner) = multipart_capabilities.as_mut() {
+                        let publication = res.multipart_source.take().map(|result| *result);
+                        let valid = publication.as_ref().is_some_and(|publication| {
+                            publication.verify_with_authority(&owner.authority).is_ok()
+                                && publication.proof.snapshot.lineage == publication.publication.lineage
+                                && publication.proof.snapshot.generation == publication.publication.source_generation
+                                && publication.proof.snapshot.phase
+                                    == crate::disk::multipart_source::MultipartSourcePhase::ConsumedUnsealed
+                                && !owner
+                                    .publications
+                                    .iter()
+                                    .flatten()
+                                    .any(|existing| existing.proof.snapshot.disk_id == publication.proof.snapshot.disk_id)
+                                && crate::disk::multipart_source::publication_identity(&file_infos[idx])
+                                    .ok()
+                                    .flatten()
+                                    .as_ref()
+                                    == Some(&publication.publication)
+                                && file_infos[idx]
+                                    .erasure
+                                    .distribution
+                                    .get(publication.proof.snapshot.physical_slot)
+                                    == Some(&(idx + 1))
+                        });
+                        if !valid {
+                            errs.push(Some(DiskError::FileCorrupt));
+                            continue;
+                        }
+                        owner.publications[idx] = publication;
+                    }
                     data_dirs[idx] = res.rollback_data_dir.or(res.old_data_dir);
                     cleanup_data_dirs[idx] = res.cleanup_data_dir;
-                    disk_versions[idx].clone_from(&res.sign);
+                    disk_versions[idx] = res.sign;
                     old_current_sizes[idx] = res.old_current_size;
                     old_current_source_checked[idx] = res.old_current_source_checked;
-                    old_current_sources[idx] = res.old_current_source.clone();
+                    old_current_sources[idx] = res.old_current_source;
                     errs.push(None);
                 }
                 Ok(Err(e)) => {
-                    errs.push(Some(e.clone()));
+                    errs.push(Some(e));
                 }
                 Err(_) => {
                     errs.push(Some(DiskError::Unexpected));
@@ -4461,20 +4721,31 @@ impl SetDisks {
                 );
             }
 
-            rollback_failed_rename(
-                disks,
-                file_infos,
-                &errs,
-                &dispatch_states,
-                &data_dirs,
-                (&dst_bucket, &dst_object),
-                RenameRollbackOwnership {
-                    receipt: rollback_receipt,
-                    namespace_commit_guard,
-                },
-            )
-            .await;
+            if let Some(owner) = multipart_capabilities {
+                // Destination-only Undo cannot restore a consumed MPU head.
+                // Only this failed owner can spend the original native caps.
+                owner
+                    .failed_owned(disks, &file_infos, &src_object, (&dst_bucket, &dst_object), namespace_commit_guard)
+                    .await;
+            } else {
+                rollback_failed_rename(
+                    disks,
+                    file_infos,
+                    &errs,
+                    &dispatch_states,
+                    &data_dirs,
+                    (&dst_bucket, &dst_object),
+                    RenameRollbackOwnership {
+                        receipt: rollback_receipt,
+                        namespace_commit_guard,
+                    },
+                )
+                .await;
+            }
             return Err(ret_err);
+        }
+        if let Some(owner) = multipart_capabilities {
+            owner.succeeded();
         }
 
         // The write is authoritatively committed, so the per-disk rollback
@@ -4556,7 +4827,10 @@ impl SetDisks {
         };
         let online_disks = Self::eval_disks(disks, &errs);
         let committed_slot = online_disks.iter().position(Option::is_some).ok_or(DiskError::Unexpected)?;
-        let committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
+        let mut committed_file_info = std::mem::take(&mut file_infos[committed_slot]);
+        if protected_multipart {
+            crate::disk::multipart_source::strip_transport_condition(&mut committed_file_info.metadata);
+        }
         let cleanup_disks = if let Some(data_dir) = data_dir {
             disks
                 .iter()
@@ -5019,14 +5293,10 @@ impl SetDisks {
         let disks = self.get_disks_internal().await;
         let transaction_path = part_transaction_path(dst_object);
         let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
-        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
-        let current_meta_path = format!("{dst_object}.meta");
 
         let reads = disks.iter().map(|disk| {
             let disk = disk.clone();
             let transaction_meta_path = transaction_meta_path.clone();
-            let rollback_path = rollback_path.clone();
-            let current_meta_path = current_meta_path.clone();
             async move {
                 let Some(disk) = disk else {
                     return PartTransactionObservation {
@@ -5036,44 +5306,20 @@ impl SetDisks {
                         err: Some(DiskError::DiskNotFound),
                     };
                 };
-                let transaction_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
-                    Ok(meta) => Some(meta),
-                    Err(DiskError::FileNotFound) => None,
-                    Err(err) => {
-                        return PartTransactionObservation {
-                            transaction_meta: None,
-                            current_meta: None,
-                            rollback: false,
-                            err: Some(err),
-                        };
-                    }
-                };
-                let rollback = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
-                    Ok(_) => true,
-                    Err(DiskError::FileNotFound) => false,
-                    Err(err) => {
-                        return PartTransactionObservation {
-                            transaction_meta,
-                            current_meta: None,
-                            rollback: false,
-                            err: Some(err),
-                        };
-                    }
-                };
-                let current_meta = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
-                    Ok(meta) => Some(meta),
-                    Err(DiskError::FileNotFound | DiskError::DiskNotFound) => None,
-                    Err(_) => None,
+                let (transaction_meta, err) = match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &transaction_meta_path).await {
+                    Ok(meta) => (Some(meta), None),
+                    Err(DiskError::FileNotFound) => (None, None),
+                    Err(err) => (None, Some(err)),
                 };
                 PartTransactionObservation {
                     transaction_meta,
-                    current_meta,
-                    rollback,
-                    err: None,
+                    current_meta: None,
+                    rollback: false,
+                    err,
                 }
             }
         });
-        let observations = join_all(reads).await;
+        let mut observations = join_all(reads).await;
         let read_errs = observations
             .iter()
             .map(|observation| observation.err.clone())
@@ -5088,6 +5334,42 @@ impl SetDisks {
             .all(|observation| observation.transaction_meta.is_none())
         {
             return Ok(false);
+        }
+
+        let rollback_path = format!("{transaction_path}/{PART_TRANSACTION_ROLLBACK}");
+        let current_meta_path = format!("{dst_object}.meta");
+        let details = disks.iter().zip(observations.iter_mut()).map(|(disk, observation)| {
+            let disk = disk.clone();
+            let rollback_path = rollback_path.clone();
+            let current_meta_path = current_meta_path.clone();
+            async move {
+                if observation.err.is_some() {
+                    return;
+                }
+                let Some(disk) = disk else {
+                    observation.err = Some(DiskError::DiskNotFound);
+                    return;
+                };
+                match disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &rollback_path).await {
+                    Ok(_) => observation.rollback = true,
+                    Err(DiskError::FileNotFound) => {}
+                    Err(err) => {
+                        observation.err = Some(err);
+                        return;
+                    }
+                }
+                if let Ok(meta) = disk.read_all(RUSTFS_META_MULTIPART_BUCKET, &current_meta_path).await {
+                    observation.current_meta = Some(meta);
+                }
+            }
+        });
+        join_all(details).await;
+        let read_errs = observations
+            .iter()
+            .map(|observation| observation.err.clone())
+            .collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&read_errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
         }
 
         let mut current_counts: HashMap<Bytes, usize> = HashMap::new();
@@ -5531,6 +5813,19 @@ impl SetDisks {
             return Ok(());
         }
 
+        // A metadata update that misses write quorum is not rolled back, so
+        // refuse it before writing when the target disks cannot reach quorum
+        // even if every write succeeds; otherwise the change a caller reports
+        // as failed would be served and spread by heal.
+        let write_quorum = fi.write_quorum(self.default_write_quorum());
+        let reachable = disks
+            .iter()
+            .map(|disk| disk.is_none().then_some(DiskError::DiskNotFound))
+            .collect::<Vec<_>>();
+        if let Some(err) = reduce_write_quorum_errs(&reachable, OBJECT_OP_IGNORED_ERRS, write_quorum) {
+            return Err(err);
+        }
+
         self.invalidate_get_object_metadata_cache(bucket, object).await;
 
         let mut futures = Vec::with_capacity(disks.len());
@@ -5560,7 +5855,7 @@ impl SetDisks {
             }
         }
 
-        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, fi.write_quorum(self.default_write_quorum())) {
+        if let Some(err) = reduce_write_quorum_errs(&errs, OBJECT_OP_IGNORED_ERRS, write_quorum) {
             return Err(err);
         }
 
@@ -6115,40 +6410,6 @@ impl SetDisks {
         }
 
         Ok(purged)
-    }
-
-    /// Reclaim metadata-less directory trees discovered by a recursive empty
-    /// bucket listing. The initial directory read fails closed if any slot is
-    /// unavailable; per-prefix purges then reuse the full cross-disk scan.
-    pub(crate) async fn purge_orphan_dir_objects_in_bucket(&self, bucket: &str) -> bool {
-        let disks = self.get_disks_internal().await;
-        if disks.is_empty() || disks.iter().any(Option::is_none) {
-            return false;
-        }
-
-        let mut prefixes = HashSet::new();
-        for disk in disks.iter().flatten() {
-            let entries = match disk.list_dir("", bucket, "", 0).await {
-                Ok(entries) => entries,
-                Err(_) => return false,
-            };
-            prefixes.extend(
-                entries
-                    .into_iter()
-                    .filter(|entry| entry.ends_with(SLASH_SEPARATOR) && is_safe_orphan_dir_entry(entry)),
-            );
-        }
-
-        let mut prefixes = prefixes.into_iter().collect::<Vec<_>>();
-        prefixes.sort_unstable();
-        let mut purged = false;
-        for prefix in prefixes {
-            match self.purge_orphan_dir_object(bucket, &prefix).await {
-                Ok(prefix_purged) => purged |= prefix_purged,
-                Err(_) => return false,
-            }
-        }
-        purged
     }
 
     /// Orphan cleanup must not infer a complete scan from only the online
@@ -7662,6 +7923,575 @@ mod tests {
             disks.push(Some(disk));
         }
         (dirs, disks)
+    }
+
+    #[cfg(unix)]
+    async fn local_batch_quorum_fixture(
+        bucket: &str,
+        object: &str,
+    ) -> (Vec<TempDir>, Vec<Option<DiskStore>>, Vec<FileInfo>, Vec<u8>) {
+        let payload: Vec<_> = (0..1024 * 1024)
+            .map(|index| u8::try_from(index % 251).expect("bounded byte"))
+            .collect();
+        let (dirs, disks) = call_counter_local_disks(bucket, 8).await;
+        let mut files = inline_metadata_fanout_fileinfos_with_geometry(bucket, object, &payload, false, 4, 4).await;
+        for (file, disk) in files.iter_mut().zip(&disks) {
+            let path = format!("{object}/{}/part.1", file.data_dir.expect("fixture data directory"));
+            disk.as_ref()
+                .expect("fixture disk")
+                .write_all(bucket, &path, file.data.take().expect("encoded fixture shard"))
+                .await
+                .expect("external shard fixture should write");
+        }
+        (dirs, disks, files, payload)
+    }
+
+    #[cfg(unix)]
+    async fn local_batch_quorum_setup(
+        files: &[FileInfo],
+        disks: &[Option<DiskStore>],
+        bucket: &str,
+        object: &str,
+        mode: BitrotReaderSetupMode,
+    ) -> BitrotReaderSetup {
+        let erasure = coding::Erasure::new_with_options(4, 4, files[0].erasure.block_size, false);
+        create_bitrot_readers_until_quorum_with_preference(
+            files,
+            disks,
+            bucket,
+            object,
+            1,
+            0,
+            erasure.shard_file_offset(0, 1024 * 1024, 1024 * 1024),
+            erasure.shard_size(),
+            HashAlgorithm::HighwayHash256S,
+            false,
+            true,
+            4,
+            4,
+            mode,
+            false,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[cfg(unix)]
+    async fn local_batch_quorum_decode(setup: BitrotReaderSetup, block_size: usize) -> (Vec<u8>, Option<std::io::Error>) {
+        let erasure = coding::Erasure::new_with_options(4, 4, block_size, false);
+        let mut output = Vec::new();
+        let (_, error) = erasure
+            .decode_with_stripe_handles_and_reopeners(
+                &mut output,
+                setup.readers,
+                0,
+                1024 * 1024,
+                1024 * 1024,
+                None,
+                setup.deferred_stripe_handles,
+                setup.deferred_reopeners,
+            )
+            .await;
+        (output, error)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_healthy_reads_only_data_when_demand_bound() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("false")),
+            ],
+            crate::erasure::coding::decode::with_decode_read_policy(
+                crate::erasure::coding::decode::DecodeReadPolicy::DemandBound,
+                async {
+                    let bucket = "batch-data-only";
+                    let object = "healthy-one-mib";
+                    let (_dirs, disks, files, payload) = local_batch_quorum_fixture(bucket, object).await;
+                    let calls = disk_call_counters::observe(object);
+                    let setup = local_batch_quorum_setup(&files, &disks, bucket, object, BitrotReaderSetupMode::ReadQuorum).await;
+                    assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 4);
+                    assert_eq!(setup.available_shards(), 4);
+                    assert_eq!(setup.deferred_shards(), 4);
+                    for index in 4..8 {
+                        assert_eq!(calls.for_disk(disk_call_counters::KIND_DISK_SHARD_OPEN, index), 0);
+                        assert!(!setup.attempted[index], "parity must stay unopened until needed");
+                    }
+                    let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
+                    assert!(error.is_none(), "healthy decode failed: {error:?}");
+                    assert_eq!(output, payload);
+                    assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 4);
+                },
+            ),
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_preserves_legacy_and_all_shards_override() {
+        for (data_first, demand_bound) in [("true", "false"), ("false", "true")] {
+            temp_env::async_with_vars(
+                [
+                    (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some(data_first)),
+                    ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some(demand_bound)),
+                ],
+                async {
+                    let bucket = "batch-legacy";
+                    let object = "all-shards";
+                    let (_dirs, disks, files, payload) = local_batch_quorum_fixture(bucket, object).await;
+                    let calls = disk_call_counters::observe(object);
+                    let setup = local_batch_quorum_setup(&files, &disks, bucket, object, BitrotReaderSetupMode::ReadQuorum).await;
+                    assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 8);
+                    assert_eq!(setup.available_shards(), 8);
+                    let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
+                    assert!(error.is_none(), "legacy decode failed: {error:?}");
+                    assert_eq!(output, payload);
+                },
+            )
+            .await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_recovers_missing_truncated_and_bitrot_data() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true")),
+            ],
+            async {
+                for fault in ["missing", "truncated", "bitrot"] {
+                    let bucket = "batch-degraded";
+                    let object = format!("degraded-{fault}");
+                    let (dirs, disks, files, payload) = local_batch_quorum_fixture(bucket, &object).await;
+                    let path = dirs[0]
+                        .path()
+                        .join(bucket)
+                        .join(&object)
+                        .join(files[0].data_dir.expect("fixture directory").to_string())
+                        .join("part.1");
+                    match fault {
+                        "missing" => tokio::fs::remove_file(&path).await.expect("remove data shard"),
+                        "truncated" => tokio::fs::write(&path, b"short").await.expect("truncate data shard"),
+                        _ => {
+                            let mut bytes = tokio::fs::read(&path).await.expect("read bitrot fixture");
+                            bytes[32] ^= 0xff;
+                            tokio::fs::write(&path, bytes)
+                                .await
+                                .expect("corrupt data without changing length");
+                        }
+                    }
+                    let setup =
+                        local_batch_quorum_setup(&files, &disks, bucket, &object, BitrotReaderSetupMode::ReadQuorum).await;
+                    assert_eq!(setup.available_shards(), 4);
+                    if fault == "bitrot" {
+                        assert_eq!(setup.attempted_shards(), 4, "bitrot is detected on decode, not pread");
+                    } else {
+                        assert_eq!(setup.attempted_shards(), 5, "setup reads only one replacement parity shard");
+                    }
+                    let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
+                    assert!(error.is_none(), "{fault} should recover: {error:?}");
+                    assert_eq!(output, payload, "{fault} must reconstruct the exact body");
+                }
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_keeps_extra_reconstruction_verification_source() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_CODEC_STREAMING_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true")),
+            ],
+            async {
+                let bucket = "batch-verification";
+                let object = "missing-data";
+                let (_dirs, mut disks, files, payload) = local_batch_quorum_fixture(bucket, object).await;
+                disks[0] = None;
+                let calls = disk_call_counters::observe(object);
+                let setup =
+                    local_batch_quorum_setup(&files, &disks, bucket, object, BitrotReaderSetupMode::VerifyReconstruction).await;
+                assert_eq!(setup.available_shards(), 5, "degraded reconstruction needs quorum plus verification");
+                assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 5);
+                assert!(setup.ready[4] && setup.ready[5], "two parity sources must be available");
+                assert!(!setup.attempted[6] && !setup.attempted[7], "unneeded parity stays deferred");
+                let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
+                assert!(error.is_none(), "verified reconstruction failed: {error:?}");
+                assert_eq!(output, payload);
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_fails_without_read_quorum() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true")),
+            ],
+            async {
+                let bucket = "batch-no-quorum";
+                let object = "all-data-offline";
+                let (_dirs, mut disks, files, _payload) = local_batch_quorum_fixture(bucket, object).await;
+                disks[..5].fill(None);
+                let setup = local_batch_quorum_setup(&files, &disks, bucket, object, BitrotReaderSetupMode::ReadQuorum).await;
+                assert_eq!(setup.available_shards(), 3);
+                assert!(!setup.has_setup_quorum(4, 4, BitrotReaderSetupMode::ReadQuorum));
+                assert_eq!(setup.deferred_shards(), 0);
+                let (output, error) = local_batch_quorum_decode(setup, files[0].erasure.block_size).await;
+                assert!(error.is_some(), "insufficient shards must fail closed");
+                assert!(output.is_empty(), "no unverified bytes may be emitted");
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_batch_quorum_recovers_late_bitrot_after_range_offset() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_GET_DATA_BLOCKS_FIRST_READER_SETUP, Some("true")),
+                ("RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE", Some("true")),
+            ],
+            async {
+                let bucket = "batch-ranged";
+                let object = "late-bitrot";
+                let (_dirs, disks) = call_counter_local_disks(bucket, 8).await;
+                let erasure = coding::Erasure::new_with_options(4, 4, 64, false);
+                let payload: Vec<u8> = (0..192).collect();
+                let mut shards = vec![Vec::new(); 8];
+                for block in payload.chunks(64) {
+                    for (index, shard) in erasure
+                        .encode_data(block)
+                        .expect("encode range stripe")
+                        .into_iter()
+                        .enumerate()
+                    {
+                        let mut writer = coding::BitrotWriterWrapper::new(
+                            coding::CustomWriter::new_inline_buffer(),
+                            erasure.shard_size(),
+                            HashAlgorithm::HighwayHash256S,
+                        );
+                        writer.write(&shard).await.expect("write range stripe");
+                        writer.shutdown().await.expect("finish range stripe");
+                        shards[index].extend(writer.into_inline_data().expect("range stripe bytes"));
+                    }
+                }
+                // Corrupt the third stripe; the first requested stripe is healthy.
+                shards[0][2 * (32 + erasure.shard_size()) + 32] ^= 0xff;
+                let mut files = vec![FileInfo::new(object, 4, 4); 8];
+                let data_dir = Uuid::new_v4();
+                for ((file, disk), bytes) in files.iter_mut().zip(&disks).zip(shards) {
+                    file.data_dir = Some(data_dir);
+                    disk.as_ref()
+                        .expect("fixture disk")
+                        .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from(bytes))
+                        .await
+                        .expect("write multi-stripe shard");
+                }
+                let calls = disk_call_counters::observe(object);
+                let setup = create_bitrot_readers_until_quorum_with_preference(
+                    &files,
+                    &disks,
+                    bucket,
+                    object,
+                    1,
+                    erasure.shard_size(),
+                    2 * erasure.shard_size(),
+                    erasure.shard_size(),
+                    HashAlgorithm::HighwayHash256S,
+                    false,
+                    true,
+                    4,
+                    4,
+                    BitrotReaderSetupMode::ReadQuorum,
+                    false,
+                    None,
+                    None,
+                )
+                .await;
+                assert_eq!(calls.total(disk_call_counters::KIND_DISK_SHARD_OPEN), 4);
+                let mut output = Vec::new();
+                let (written, error) = erasure
+                    .decode_with_stripe_handles_and_reopeners(
+                        &mut output,
+                        setup.readers,
+                        64,
+                        128,
+                        payload.len(),
+                        None,
+                        setup.deferred_stripe_handles,
+                        setup.deferred_reopeners,
+                    )
+                    .await;
+                assert!(error.is_none(), "late bitrot must recover from stripe-aligned parity: {error:?}");
+                assert_eq!(written, 128);
+                assert_eq!(output, payload[64..]);
+            },
+        )
+        .await;
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_batch_read_decisions_follow_the_actual_reader_setup_entry() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("reader setup validation runtime");
+        let recorder = CapturingRecorder::default();
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        metrics::with_local_recorder(&recorder, || {
+            runtime.block_on(temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_OBJECT_MMAP_READ_MAX_LENGTH, Some("4")),
+                    (rustfs_config::ENV_INTERNODE_PREWARM, Some("false")),
+                ],
+                async {
+                    let bucket = "batch-path-attribution";
+                    let object = "object";
+                    let (_dirs, disks) = call_counter_local_disks(bucket, 2).await;
+                    let data_dir = Uuid::new_v4();
+                    let mut files = vec![FileInfo::new(object, 1, 1); 2];
+                    for (file, disk) in files.iter_mut().zip(&disks) {
+                        file.data_dir = Some(data_dir);
+                        disk.as_ref()
+                            .expect("local disk")
+                            .write_all(bucket, &format!("{object}/{data_dir}/part.1"), Bytes::from_static(b"data"))
+                            .await
+                            .expect("write batch fixture");
+                    }
+                    assert_eq!(object_mmap_read_max_length(), 4, "cap must be controlled by this test");
+                    for length in [3, 4] {
+                        let setup = create_bitrot_readers_until_quorum_with_preference(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            length,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            true,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            false,
+                            None,
+                            None,
+                        )
+                        .await;
+                        assert_eq!(setup.readers.iter().flatten().count(), 2);
+                    }
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            5,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none(),
+                        "a read above the adjusted-length cap must fall back"
+                    );
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::HighwayHash256S,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none(),
+                        "checksum overhead must be included in the read cap"
+                    );
+                    let mut inline_files = files.clone();
+                    inline_files[0].data = Some(Bytes::from_static(b"data"));
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &inline_files,
+                            &disks,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    let mut endpoint = Endpoint::try_from("http://127.0.0.1:1/disk").expect("remote placeholder endpoint");
+                    endpoint.is_local = false;
+                    let remote = new_disk(
+                        &endpoint,
+                        &DiskOption {
+                            cleanup: false,
+                            health_check: false,
+                        },
+                    )
+                    .await
+                    .expect("remote placeholder must initialize without a connection");
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &[Some(remote), None],
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none(),
+                        "any remote shard must keep the setup out of the local batch path"
+                    );
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &disks,
+                            bucket,
+                            "../outside",
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    let missing = vec![None, None];
+                    assert!(
+                        try_create_bitrot_readers_via_batch_pread(
+                            &files,
+                            &missing,
+                            bucket,
+                            object,
+                            1,
+                            0,
+                            4,
+                            4,
+                            HashAlgorithm::None,
+                            false,
+                            1,
+                            1,
+                            BitrotReaderSetupMode::ReadQuorum,
+                            BitrotReaderSetupStrategy::AllShards,
+                        )
+                        .await
+                        .is_none()
+                    );
+                    for (use_mmap, policy) in [
+                        (false, crate::set_disk::GetObjectReadPolicy::Default),
+                        (true, crate::set_disk::GetObjectReadPolicy::CopySource),
+                    ] {
+                        crate::set_disk::with_get_object_read_policy(policy, async {
+                            create_bitrot_readers_until_quorum_with_preference(
+                                &files,
+                                &missing,
+                                bucket,
+                                object,
+                                1,
+                                0,
+                                4,
+                                4,
+                                HashAlgorithm::None,
+                                false,
+                                use_mmap,
+                                1,
+                                1,
+                                BitrotReaderSetupMode::ReadQuorum,
+                                false,
+                                None,
+                                None,
+                            )
+                            .await;
+                        })
+                        .await;
+                    }
+                },
+            ));
+        });
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+        let metric = "rustfs_io_get_object_local_batch_decisions_total";
+        for (decision, expected) in [
+            ("selected", 2),
+            ("read_cap_exceeded", 2),
+            ("inline_data", 1),
+            ("invalid_path", 1),
+            ("non_local_shard", 1),
+            ("no_local_shards", 1),
+            ("mmap_disabled", 1),
+            ("copy_source", 1),
+        ] {
+            assert_eq!(recorder.counter_value(metric, &[("decision", decision)]), expected, "{decision}");
+        }
+        assert_eq!(
+            recorder.counter_value("rustfs_io_get_object_local_batch_shards_total", &[("outcome", "success")]),
+            4
+        );
+        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 14);
+        assert_eq!(recorder.histogram_sample_count("rustfs_io_get_object_local_batch_prepare_seconds"), 8);
     }
 
     async fn reopen_local_disk(dir: &TempDir) -> DiskStore {
@@ -9253,7 +10083,7 @@ mod tests {
             "lifecycle-inline-data-get-fanout-bucket",
             "lifecycle-inline-data-get-object",
             GET_OBJECT_PATH_LEGACY_DUPLEX,
-            None,
+            false,
         );
     }
 
@@ -9264,7 +10094,7 @@ mod tests {
             "lifecycle-bounded-inline-data-get-fanout-bucket",
             "lifecycle-bounded-inline-data-get-object",
             GET_OBJECT_PATH_LEGACY_DUPLEX,
-            Some("true"),
+            true,
         );
     }
 
@@ -9275,7 +10105,7 @@ mod tests {
             RUSTFS_META_BUCKET,
             "buckets/.usage-cache/lifecycle-inline-data-get-object",
             GET_OBJECT_PATH_INTERNAL_META,
-            None,
+            false,
         );
     }
 
@@ -9376,7 +10206,7 @@ mod tests {
         bucket: &'static str,
         object_prefix: &str,
         expected_path: &'static str,
-        bounded_fanout_env: Option<&'static str>,
+        bounded_fanout: bool,
     ) {
         const DISKS: usize = 4;
         let object = object_with_initial_data_shards(bucket, object_prefix, 2, 3);
@@ -9396,16 +10226,26 @@ mod tests {
                     [
                         ("RUSTFS_GET_METADATA_EARLY_STOP_ENABLE", Some("true")),
                         ("RUSTFS_GET_METADATA_DATA_READ_EARLY_STOP_ENABLE", Some("true")),
-                        ("RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT", bounded_fanout_env),
+                        (
+                            "RUSTFS_GET_METADATA_EARLY_STOP_BOUNDED_FANOUT",
+                            Some(if bounded_fanout { "true" } else { "false" }),
+                        ),
                     ],
                     async {
-                        let barrier_disk = if bounded_fanout_env.is_some() {
-                            bounded_spare_disk_index(bucket, &object, 2, 2)
-                        } else {
-                            3
-                        };
+                        let barrier_disk = bounded_spare_disk_index(bucket, &object, 2, 2);
                         let barrier =
                             rename_fanout_barrier::arm(&object, barrier_disk, rename_fanout_barrier::PHASE_READ_VERSION);
+                        // Keep one initial bounded read pending so its hedge is scheduled;
+                        // eager fanout needs all quorum reads parked until the spare starts.
+                        let quorum_disks = if bounded_fanout {
+                            vec![bounded_metadata_fanout_order(bucket, &object, DISKS, 2)[0]]
+                        } else {
+                            (0..DISKS).filter(|&index| index != barrier_disk).collect()
+                        };
+                        let quorum_barriers = quorum_disks
+                            .into_iter()
+                            .map(|index| rename_fanout_barrier::arm(&object, index, rename_fanout_barrier::PHASE_READ_VERSION))
+                            .collect::<Vec<_>>();
                         let disks_for_read = disks.clone();
                         let object_for_read = object.clone();
                         let mut read = tokio::spawn(async move {
@@ -9427,6 +10267,9 @@ mod tests {
                         tokio::time::timeout(BARRIER_PAUSE_GUARD, barrier.wait_until_paused())
                             .await
                             .expect("metadata fanout should pause the spare metadata task");
+                        for quorum_barrier in &quorum_barriers {
+                            quorum_barrier.release();
+                        }
                         let (parts_metadata, errs, diagnostics) = tokio::time::timeout(BARRIER_PAUSE_GUARD, &mut read)
                             .await
                             .expect("verified inline quorum should abort the paused eager fanout")
@@ -11341,7 +12184,7 @@ mod tests {
                 let mut hooks = Vec::new();
                 let mut entered = Vec::new();
                 let mut releases = Vec::new();
-                let mut publication_paths = Vec::new();
+                let mut mutation_keys = Vec::new();
                 for (disk, info) in disks.iter().flatten().zip(&mut infos) {
                     disk.write_metadata(bucket, bucket, object, old.clone())
                         .await
@@ -11352,11 +12195,16 @@ mod tests {
                     let disk::Disk::Local(local) = disk.as_ref() else {
                         panic!("physical publication fixture requires local disks");
                     };
-                    // Linux IO paths use a mount FD, which is also the namespace lock key.
+                    // Hooks use pinned I/O paths; serialization uses the configured
+                    // object key shared by independently reopened disk handles.
                     let destination = local
                         .get_disk()
                         .get_object_path_for_io(bucket, object)
                         .expect("the publication path must resolve through the disk's mount lease");
+                    let mutation_key = local
+                        .get_disk()
+                        .get_object_path(bucket, object)
+                        .expect("the configured publication mutation key must resolve");
                     let (entered_tx, entered_rx) = oneshot::channel();
                     let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
                     hooks.push(os::prepared_publication_test_hooks::install(
@@ -11369,7 +12217,7 @@ mod tests {
                     ));
                     entered.push(entered_rx);
                     releases.push(release_tx);
-                    publication_paths.push(destination);
+                    mutation_keys.push(mutation_key);
                 }
                 let namespace_owner = ctx.begin_namespace_commit();
                 let namespace_probe = Arc::downgrade(&namespace_owner);
@@ -11416,10 +12264,10 @@ mod tests {
                 let pending_before_release = ctx.namespace_commits_pending();
                 let owner_alive_before_release = namespace_probe.upgrade().is_some();
                 let old_snapshot_generation = ctx.namespace_commit_generation();
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     assert!(
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination)
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key)
                             .now_or_never()
                             .is_none(),
                         "the physical publication must still own object serialization after the async timeout"
@@ -11450,11 +12298,11 @@ mod tests {
 
                 // Drain real syscalls before checking the regression, including on the RED run.
                 drop(releases);
-                for (disk, destination) in disks.iter().flatten().zip(&publication_paths) {
+                for (disk, mutation_key) in disks.iter().flatten().zip(&mutation_keys) {
                     let root = disk.path();
                     let lease = tokio::time::timeout(
                         Duration::from_secs(5),
-                        os::acquire_rename_data_mutation_lease(&root, bucket, destination),
+                        os::acquire_rename_data_mutation_lease(&root, bucket, mutation_key),
                     )
                     .await
                     .expect("released physical publishers must drain");
@@ -12356,6 +13204,20 @@ mod tests {
             .expect_err("mismatched and transient responses must not be treated as confirmed missing");
 
         assert_eq!(err, DiskError::ErasureReadQuorum);
+    }
+
+    #[test]
+    fn resolve_read_part_does_not_count_error_response_with_etag_as_a_vote() {
+        let healthy = read_part_test_part(1, "same-etag");
+        let mut failed = healthy.clone();
+        failed.error = Some("metadata read failed".to_owned());
+        let responses = vec![Some(vec![healthy.clone()]), Some(vec![healthy]), Some(vec![failed])];
+        let err = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 3)
+            .expect_err("an error-bearing response must not supply the third vote");
+        assert_eq!(err, DiskError::ErasureReadQuorum);
+        let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, 2)
+            .expect("the two healthy matching responses remain a valid quorum");
+        assert!(part.error.is_none());
     }
 
     #[test]
@@ -13360,6 +14222,61 @@ mod tests {
         assert!(reserve_read_repair_heal("bucket", &object, None, 3, 4).await.is_none());
         let key = ReadRepairHealCacheKey::new("bucket", &object, None, 3, 4);
         release_read_repair_heal_reservation(&key).await;
+    }
+
+    #[tokio::test]
+    async fn read_repair_reader_failure_requests_deep_scan_for_the_exact_version() {
+        fn captured() -> &'static std::sync::Mutex<Option<rustfs_heal_contracts::heal_channel::HealChannelRequest>> {
+            static REQUEST: OnceLock<std::sync::Mutex<Option<rustfs_heal_contracts::heal_channel::HealChannelRequest>>> =
+                OnceLock::new();
+            REQUEST.get_or_init(|| std::sync::Mutex::new(None))
+        }
+        fn capture(request: rustfs_heal_contracts::heal_channel::HealChannelRequest) -> ReadRepairAdmissionFuture {
+            *captured().lock().expect("read-repair request capture must be available") = Some(request);
+            Box::pin(async { ReadRepairAdmissionOutcome::Response(HealAdmissionResult::Accepted) })
+        }
+
+        for (reason, expected_scan) in [
+            ("missing_shards", Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep)),
+            ("decode_error", Some(rustfs_heal_contracts::heal_channel::HealScanMode::Deep)),
+            ("metadata_read_error", None),
+        ] {
+            let object = format!("reader-failure-{}", Uuid::new_v4());
+            let version = Uuid::new_v4().to_string();
+            submit_read_repair_heal_with_submitter(
+                ReadRepairHealSubmission {
+                    bucket: "reader-failure",
+                    object: &object,
+                    version_id: Some(&version),
+                    pool_index: 1,
+                    set_index: 2,
+                    part_number: Some(1),
+                    reason,
+                    mrf_intent: None,
+                },
+                capture,
+            )
+            .await;
+            let request = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if let Some(request) = captured().lock().expect("captured request must be readable").take() {
+                        break request;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the actual asynchronous admission must be captured");
+            assert_eq!(request.scan_mode, expected_scan, "reader damage needs payload verification");
+            assert_eq!(request.source, HealRequestSource::ReadRepair);
+            assert_eq!(request.bucket, "reader-failure");
+            assert_eq!(request.object_prefix.as_deref(), Some(object.as_str()));
+            assert_eq!(request.object_version_id.as_deref(), Some(version.as_str()));
+            assert_eq!((request.pool_index, request.set_index), (Some(1), Some(2)));
+            assert_eq!(request.recreate_missing, None, "storage evidence decides absence");
+            let key = ReadRepairHealCacheKey::new("reader-failure", &object, Some(&version), 1, 2);
+            release_read_repair_heal_reservation(&key).await;
+        }
     }
 
     // ========================================================================

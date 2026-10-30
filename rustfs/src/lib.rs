@@ -76,6 +76,8 @@ pub mod allocator_reclaim;
 pub mod app;
 pub mod auth;
 pub mod auth_keystone;
+#[cfg(any(target_os = "linux", all(test, unix)))]
+mod background_admission;
 pub(crate) mod bitrot_selftest;
 pub mod capacity;
 pub mod cgroup_resources;
@@ -86,6 +88,7 @@ pub mod delete_tail_activity;
 pub mod diagnose;
 pub mod embedded;
 pub mod error;
+pub mod foreground_observation;
 pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;

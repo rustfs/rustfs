@@ -236,6 +236,7 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
 
     let mut clone_ns = Vec::new();
     let mut copy_ns = Vec::new();
+    let mut delete_ns = Vec::new();
     let mut flatten_ns = Vec::new();
     let mut encode_ns = Vec::new();
     let mut save_ns = Vec::new();
@@ -256,6 +257,14 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
         copy_ns.push(elapsed_ns(started));
         same_cache(&copied, &cache);
         drop(copied);
+
+        let mut deleted = cache.clone();
+        let root = hash_path("bucket");
+        let started = WallInstant::now();
+        deleted.delete_recursive(black_box(&root));
+        delete_ns.push(elapsed_ns(started));
+        assert!(deleted.cache.is_empty(), "delete the root and every reachable entry");
+        drop(deleted);
 
         let started = WallInstant::now();
         let aggregate = black_box(cache.checked_flatten("bucket").expect("valid fixture tree"));
@@ -326,6 +335,7 @@ async fn profile_case(objects: usize, scenario: &str, samples: usize) {
             "changed_entry_wire_bytes": changed_entry_wire_bytes, "save_body_bytes_per_sample": expected_wire.len() * 2,
             "snapshot_complete": cache.info.snapshot_complete,
             "clone": quantiles(clone_ns), "copy_with_children": quantiles(copy_ns), "checked_flatten": quantiles(flatten_ns),
+            "delete_recursive": quantiles(delete_ns),
             "encode": quantiles(encode_ns), "save_inclusive": quantiles(save_ns), "memory_backend_ingest": quantiles(ingest_ns),
         })
     );

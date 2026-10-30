@@ -31,6 +31,9 @@
 
 use std::sync::OnceLock;
 
+#[cfg(any(target_os = "linux", all(test, unix)))]
+pub(crate) mod live;
+
 // ============================================================================
 // Environment variable constants
 // ============================================================================
@@ -238,12 +241,15 @@ fn detect_container_resources() -> ContainerResources {
     let overridden = override_cores.is_some() || override_memory.is_some();
 
     // Get host values from a single sysinfo::System instance (avoids double init)
-    let (host_cores, host_memory) = {
-        let mut sys = sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_processes());
-        sys.refresh_cpu_all();
-        sys.refresh_memory();
-        (sys.cpus().len().max(1), sys.total_memory())
-    };
+    let (host_cores, host_memory) =
+        match sysinfo::System::new_with_specifics(sysinfo::RefreshKind::everything().without_processes()) {
+            Ok(mut sys) => {
+                sys.refresh_cpu_all();
+                sys.refresh_memory();
+                (sys.cpus().len().max(1), sys.total_memory())
+            }
+            Err(_) => (std::thread::available_parallelism().map_or(1, |cores| cores.get()), 0),
+        };
 
     // Determine effective values: override > cgroup > host
     let cpu_cores = override_cores.or(cgroup_cpus).unwrap_or(host_cores).max(1);

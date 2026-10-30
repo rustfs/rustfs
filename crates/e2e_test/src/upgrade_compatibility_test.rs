@@ -21,6 +21,7 @@ use crate::on_demand_migration::common::{ODM_SERVER_ENV, OdmTestEnv, SeedObject,
 use crate::replication_extension_test::{
     LOOPBACK_REPLICATION_TARGET_ENV, ReplicationTargetOptions, put_bucket_replication, set_replication_target_with_options,
 };
+use crate::storage_api::upgrade_compatibility::RUSTFS_META_MULTIPART_BUCKET;
 use aws_sdk_s3::Client;
 use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::primitives::ByteStream;
@@ -52,6 +53,8 @@ const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
 const VERSIONED_BUCKET: &str = "upgrade-versioned-data";
 const MIXED_BUCKET: &str = "upgrade-mixed-version-data";
+const PENDING_MULTIPART_BUCKET: &str = "upgrade-mpu-continuity";
+const PENDING_MULTIPART_KEY: &str = "pending/legacy-multipart.bin";
 const MIXED_NODE_COUNT: usize = 4;
 const UPGRADE_READINESS_BODY: &[u8] = b"upgrade write readiness";
 // Written by the "previous-seed" readiness probe through node 0 before any
@@ -301,18 +304,27 @@ async fn read_object(
     Ok((encryption, body))
 }
 
-async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
-    let created = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
-    let upload_id = created.upload_id().ok_or("CreateMultipartUpload omitted upload ID")?;
-    let mut completed_parts = Vec::with_capacity(parts.len());
+struct PendingMultipart {
+    upload_id: String,
+    completed_parts: Vec<CompletedPart>,
+    part_sizes: Vec<i64>,
+}
 
+async fn stage_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> Result<PendingMultipart, BoxError> {
+    let created = client.create_multipart_upload().bucket(bucket).key(key).send().await?;
+    let upload_id = created
+        .upload_id()
+        .ok_or("CreateMultipartUpload omitted upload ID")?
+        .to_owned();
+    let mut completed_parts = Vec::with_capacity(parts.len());
+    let mut part_sizes = Vec::with_capacity(parts.len());
     for (index, part) in parts.iter().enumerate() {
         let part_number = i32::try_from(index + 1)?;
         let uploaded = client
             .upload_part()
             .bucket(bucket)
             .key(key)
-            .upload_id(upload_id)
+            .upload_id(&upload_id)
             .part_number(part_number)
             .body(ByteStream::from(part.clone()))
             .send()
@@ -323,16 +335,38 @@ async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<
                 .e_tag(uploaded.e_tag().ok_or("UploadPart omitted ETag")?)
                 .build(),
         );
+        part_sizes.push(i64::try_from(part.len())?);
     }
+    Ok(PendingMultipart {
+        upload_id,
+        completed_parts,
+        part_sizes,
+    })
+}
 
-    client
+async fn complete_pending_multipart(
+    client: &Client,
+    bucket: &str,
+    key: &str,
+    pending: &PendingMultipart,
+) -> Result<aws_sdk_s3::operation::complete_multipart_upload::CompleteMultipartUploadOutput, BoxError> {
+    Ok(client
         .complete_multipart_upload()
         .bucket(bucket)
         .key(key)
-        .upload_id(upload_id)
-        .multipart_upload(CompletedMultipartUpload::builder().set_parts(Some(completed_parts)).build())
+        .upload_id(&pending.upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(pending.completed_parts.clone()))
+                .build(),
+        )
         .send()
-        .await?;
+        .await?)
+}
+
+async fn write_multipart(client: &Client, bucket: &str, key: &str, parts: &[Vec<u8>]) -> TestResult {
+    let pending = stage_multipart(client, bucket, key, parts).await?;
+    complete_pending_multipart(client, bucket, key, &pending).await?;
     Ok(())
 }
 
@@ -377,6 +411,330 @@ async fn write_multipart_load(clients: &[Client], phase: &str) -> Result<Vec<Str
         keys.extend(result??);
     }
     Ok(keys)
+}
+
+async fn write_mixed_put_load(clients: &[Client], phase: &str) -> Result<Vec<String>, BoxError> {
+    let mut tasks = JoinSet::new();
+    for worker in 0..MULTIPART_WORKERS {
+        let node = worker % clients.len();
+        let client = clients[node].clone();
+        let phase = phase.to_owned();
+        tasks.spawn(async move {
+            let mut keys = Vec::with_capacity(MULTIPART_UPLOADS_PER_WORKER);
+            for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
+                let key = format!("{phase}/put/{worker:02}/{upload:02}");
+                tokio::time::timeout(
+                    MIXED_MULTIPART_UPLOAD_TIMEOUT,
+                    client
+                        .put_object()
+                        .bucket(MIXED_BUCKET)
+                        .key(&key)
+                        .body(ByteStream::from(vec![u8::try_from(worker)?; 64 * 1024]))
+                        .send(),
+                )
+                .await
+                .map_err(|_| format!("node {node}: PUT {key} acknowledgement deadline exceeded"))??;
+                keys.push(key);
+            }
+            Ok::<_, BoxError>(keys)
+        });
+    }
+    let mut keys = Vec::with_capacity(MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER);
+    while let Some(result) = tasks.join_next().await {
+        keys.extend(result??);
+    }
+    Ok(keys)
+}
+
+async fn verify_load_bodies(clients: &[Client], phase: &str, operation: &str) -> TestResult {
+    for worker in 0..MULTIPART_WORKERS {
+        let reader = &clients[(worker + 1) % clients.len()];
+        for upload in 0..MULTIPART_UPLOADS_PER_WORKER {
+            let key = format!("{phase}/{operation}/{worker:02}/{upload:02}");
+            assert_eq!(
+                read_object(reader, MIXED_BUCKET, &key, None).await?.1,
+                vec![u8::try_from(worker)?; 64 * 1024],
+                "{phase}: acknowledged {key} body"
+            );
+        }
+    }
+    Ok(())
+}
+
+async fn exercise_homogeneous_multipart(cluster: &RustFSTestClusterEnvironment, phase: &str) -> TestResult {
+    let clients = cluster.create_all_clients()?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_drive_readmission(&clients, MIXED_BUCKET, phase, DRIVE_READMISSION_TIMEOUT).await?;
+    let keys = match write_multipart_load(&clients, phase).await {
+        Ok(keys) => keys,
+        Err(error) => {
+            let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR");
+            return observe_mixed_multipart_failure(cluster, phase, error, log_dir.as_deref().map(Path::new)).await;
+        }
+    };
+    assert_eq!(keys.len(), MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER);
+    verify_load_bodies(&clients, phase, "multipart").await?;
+    for (reader, client) in clients.iter().enumerate() {
+        wait_for_phase_listing(client, phase, keys.len(), &format!("homogeneous reader {reader}")).await?;
+    }
+    Ok(())
+}
+
+struct PendingSourceBytes {
+    root: PathBuf,
+    files: Vec<(PathBuf, Vec<u8>)>,
+}
+
+fn pending_source_bytes(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+) -> Result<Vec<PendingSourceBytes>, BoxError> {
+    let source_hash =
+        rustfs_utils::hex_sha256(format!("{PENDING_MULTIPART_BUCKET}/{PENDING_MULTIPART_KEY}").as_bytes(), str::to_owned);
+    let mut sources = Vec::new();
+    for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+        let hash_root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET).join(&source_hash);
+        let roots = std::fs::read_dir(&hash_root)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok(entry.file_type()?.is_dir().then(|| entry.path()))
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "pending upload source has not settled").into());
+        }
+        assert_eq!(roots.len(), 1, "the dedicated key has exactly one real pending upload");
+        let root = roots.into_iter().next().ok_or("pending upload source missing")?;
+        let mut files = vec![(PathBuf::from("xl.meta"), std::fs::read(root.join("xl.meta"))?)];
+        let data_dirs = std::fs::read_dir(&root)?
+            .map(|entry| {
+                let entry = entry?;
+                Ok((entry.file_type()?.is_dir() && entry.path().join("part.1").is_file()).then(|| entry.path()))
+            })
+            .collect::<Result<Vec<_>, std::io::Error>>()?
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+        if data_dirs.is_empty() {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "selected part publication has not settled").into());
+        }
+        assert_eq!(data_dirs.len(), 1, "the upload has one actual selected-part directory");
+        let data_dir = data_dirs.into_iter().next().ok_or("pending upload parts missing")?;
+        for part in &pending.completed_parts {
+            let number = part.part_number().ok_or("acknowledged part omitted its number")?;
+            for name in [format!("part.{number}"), format!("part.{number}.meta")] {
+                let path = data_dir.join(name);
+                files.push((path.strip_prefix(&root)?.to_owned(), std::fs::read(path)?));
+            }
+        }
+        sources.push(PendingSourceBytes { root, files });
+    }
+    assert_eq!(
+        sources.len(),
+        MIXED_NODE_COUNT,
+        "the controlled legacy fixture requires every physical source"
+    );
+    Ok(sources)
+}
+
+async fn wait_for_pending_source_bytes(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+) -> Result<Vec<PendingSourceBytes>, BoxError> {
+    let deadline = Instant::now() + DRIVE_READMISSION_TIMEOUT;
+    loop {
+        match pending_source_bytes(cluster, pending) {
+            Ok(sources) => return Ok(sources),
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                    && Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(500)).await
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+async fn assert_pending_parts(client: &Client, pending: &PendingMultipart) -> TestResult {
+    let listed = client
+        .list_parts()
+        .bucket(PENDING_MULTIPART_BUCKET)
+        .key(PENDING_MULTIPART_KEY)
+        .upload_id(&pending.upload_id)
+        .send()
+        .await?;
+    assert_eq!(listed.upload_id(), Some(pending.upload_id.as_str()));
+    assert_ne!(listed.is_truncated(), Some(true));
+    assert_eq!(listed.parts().len(), pending.completed_parts.len());
+    for ((actual, expected), expected_size) in listed.parts().iter().zip(&pending.completed_parts).zip(&pending.part_sizes) {
+        assert_eq!(actual.part_number(), expected.part_number());
+        assert_eq!(actual.e_tag(), expected.e_tag());
+        assert_eq!(actual.size(), Some(*expected_size));
+    }
+    Ok(())
+}
+
+async fn assert_mixed_pending_refusal(
+    cluster: &RustFSTestClusterEnvironment,
+    pending: &PendingMultipart,
+    sources: &[PendingSourceBytes],
+) -> TestResult {
+    let clients = cluster.create_all_clients()?;
+    assert_pending_parts(&clients[0], pending).await?;
+    let error = upgrade_probe_client(&clients[0])
+        .complete_multipart_upload()
+        .bucket(PENDING_MULTIPART_BUCKET)
+        .key(PENDING_MULTIPART_KEY)
+        .upload_id(&pending.upload_id)
+        .multipart_upload(
+            CompletedMultipartUpload::builder()
+                .set_parts(Some(pending.completed_parts.clone()))
+                .build(),
+        )
+        .send()
+        .await
+        .expect_err("one native participant cannot authorize a legacy MPU completion");
+    assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(503), "{error:?}");
+    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("ServiceUnavailable"));
+    for client in &clients {
+        assert_pending_parts(client, pending).await?;
+        let error = client
+            .get_object()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .key(PENDING_MULTIPART_KEY)
+            .send()
+            .await
+            .expect_err("the rejected Complete must not publish a target");
+        assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("NoSuchKey"));
+    }
+    for source in sources {
+        for entry in std::fs::read_dir(&source.root)? {
+            assert!(
+                !entry?.file_name().to_string_lossy().starts_with(".mpu-"),
+                "the failed preflight must not upgrade one physical legacy source"
+            );
+        }
+        for (relative, expected) in &source.files {
+            let actual = std::fs::read(source.root.join(relative))?;
+            assert!(actual == *expected, "rejected Complete changed actual source {}", relative.display());
+        }
+    }
+    Ok(())
+}
+
+struct CompletedPendingMultipart {
+    version_id: String,
+    etag: String,
+    body: Vec<u8>,
+}
+
+async fn assert_resumed_multipart(clients: &[Client], completed: &CompletedPendingMultipart) -> TestResult {
+    for (node, client) in clients.iter().enumerate() {
+        let response = client
+            .get_object()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .key(PENDING_MULTIPART_KEY)
+            .version_id(&completed.version_id)
+            .send()
+            .await?;
+        assert_eq!(response.version_id(), Some(completed.version_id.as_str()), "reader {node}");
+        assert_eq!(response.e_tag(), Some(completed.etag.as_str()), "reader {node}");
+        assert_eq!(
+            response.body.collect().await?.into_bytes().as_ref(),
+            completed.body.as_slice(),
+            "reader {node}"
+        );
+        assert_eq!(
+            read_object(client, PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, None)
+                .await?
+                .1,
+            completed.body
+        );
+        let versions = client
+            .list_object_versions()
+            .bucket(PENDING_MULTIPART_BUCKET)
+            .prefix(PENDING_MULTIPART_KEY)
+            .send()
+            .await?;
+        assert_eq!(versions.versions().len(), 1, "same-upload replay must not add a version");
+        assert_eq!(versions.versions()[0].version_id(), Some(completed.version_id.as_str()));
+        assert!(versions.delete_markers().is_empty());
+    }
+    Ok(())
+}
+
+async fn finish_pending_multipart(
+    clients: &[Client],
+    pending: &PendingMultipart,
+    body: Vec<u8>,
+) -> Result<CompletedPendingMultipart, BoxError> {
+    let complete = complete_pending_multipart(&clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, pending).await?;
+    let version_id = complete
+        .version_id()
+        .filter(|version| !version.is_empty() && *version != "null")
+        .ok_or("versioned legacy upload completion omitted a concrete version")?
+        .to_owned();
+    let etag = complete.e_tag().ok_or("CompleteMultipartUpload omitted ETag")?.to_owned();
+    let replay = complete_pending_multipart(&clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, pending).await?;
+    assert_eq!(replay.version_id(), Some(version_id.as_str()));
+    assert_eq!(replay.e_tag(), Some(etag.as_str()));
+    let completed = CompletedPendingMultipart { version_id, etag, body };
+    assert_resumed_multipart(clients, &completed).await?;
+    Ok(completed)
+}
+
+async fn wait_for_multipart_quiescence(cluster: &RustFSTestClusterEnvironment, sources: &[PendingSourceBytes]) -> TestResult {
+    let deadline = Instant::now() + LISTING_CONVERGENCE_TIMEOUT;
+    loop {
+        let pending_roots = sources.iter().filter(|source| source.root.exists()).count();
+        let mut native_controls = 0;
+        let mut remaining_upload_roots = 0;
+        for volume in cluster.nodes.iter().flat_map(|node| &node.data_dirs) {
+            let root = Path::new(volume).join(RUSTFS_META_MULTIPART_BUCKET);
+            if !root.exists() {
+                continue;
+            }
+            for entry in walkdir::WalkDir::new(root) {
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error)
+                        if error
+                            .io_error()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                    {
+                        native_controls += 1;
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                // Every fixture upload lives at MPI/<SHA>/<upload>. A born-only
+                // source can contain just xl.meta and its data directory, with
+                // no .mpu-* record. Only empty SHA parents may survive rollback.
+                if entry.depth() == 2 || (entry.depth() == 1 && !entry.file_type().is_dir()) {
+                    remaining_upload_roots += 1;
+                }
+                if entry.file_name().to_string_lossy().starts_with(".mpu-") {
+                    native_controls += 1;
+                }
+            }
+        }
+        if pending_roots == 0 && remaining_upload_roots == 0 && native_controls == 0 {
+            return Ok(());
+        }
+        if Instant::now() >= deadline {
+            return Err(format!(
+                "downgrade requires settled native MPU state: {pending_roots} fixed pending roots, {remaining_upload_roots} inventoried upload roots, {native_controls} native controls"
+            )
+            .into());
+        }
+        sleep(Duration::from_millis(500)).await;
+    }
 }
 
 async fn mixed_multipart_before(
@@ -625,14 +983,11 @@ async fn exercise_mixed_cluster(
         .await?;
     assert_eq!(read_object(current_client, MIXED_BUCKET, &previous_key, None).await?.1, previous_body);
 
-    let multipart_keys = match write_multipart_load(&clients, phase).await {
-        Ok(keys) => keys,
-        Err(error) => {
-            let log_dir = std::env::var_os("RUSTFS_E2E_LOG_DIR");
-            return observe_mixed_multipart_failure(cluster, phase, error, log_dir.as_deref().map(Path::new)).await;
-        }
-    };
-    let expected_count = multipart_keys.len() + 2;
+    // Native MPU mutations are operationally paused while RPC generations
+    // differ. Keep the same mixed traffic volume with ordinary PUT instead.
+    let written_keys = write_mixed_put_load(&clients, phase).await?;
+    let expected_count = written_keys.len() + 2;
+    verify_load_bodies(&clients, phase, "put").await?;
     for (label, client) in [("current", current_client), ("previous", previous_client)] {
         assert_eq!(
             read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
@@ -648,9 +1003,9 @@ async fn exercise_mixed_cluster(
         .await?;
     }
 
-    let last_multipart_key = format!("{phase}/multipart/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
+    let last_put_key = format!("{phase}/put/{:02}/{:02}", MULTIPART_WORKERS - 1, MULTIPART_UPLOADS_PER_WORKER - 1);
     assert_eq!(
-        read_object(previous_client, MIXED_BUCKET, &last_multipart_key, None).await?.1,
+        read_object(previous_client, MIXED_BUCKET, &last_put_key, None).await?.1,
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
@@ -711,7 +1066,7 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
 /// reduced-redundancy class then fails with 503 `ServiceUnavailable` until the
 /// serving node writes through every drive, on the previous release and on
 /// the current build alike.
-async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
+pub(crate) async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
     wait_for_upgrade_writes(
         clients,
         bucket,
@@ -790,12 +1145,20 @@ fn previous_baseline_writers(clients: &[Client], restarted_node: usize) -> &[Cli
 }
 
 async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnvironment, previous_binary: &Path) -> TestResult {
+    prepare_release_baseline(cluster, previous_binary, "previous").await
+}
+
+async fn prepare_release_baseline(
+    cluster: &mut RustFSTestClusterEnvironment,
+    previous_binary: &Path,
+    prefix: &str,
+) -> TestResult {
     let clients: Vec<_> = cluster.create_all_clients()?.iter().map(upgrade_probe_client).collect();
     // rc.5 can latch a non-elected node's write fence while its first startup
     // waits for pool metadata (#7473). First prove the elected writer can
     // persist data, then restart each old process once with three peers still
-    // readable. This preparation ends before any current binary is started.
-    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, "previous-seed", LISTING_CONVERGENCE_TIMEOUT).await?;
+    // readable. The same preparation is reused only after a quiescent homogeneous rollback.
+    wait_for_upgrade_write_readiness(&clients[..1], MIXED_BUCKET, &format!("{prefix}-seed"), LISTING_CONVERGENCE_TIMEOUT).await?;
     // A node that just came back is still replaying its startup traffic against
     // every peer. Killing the next node during that burst gives the fresh node
     // two failures in a row and it drops that peer's drive to Offline, where
@@ -805,7 +1168,7 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
     for node in [1, 2, 3, 0] {
         cluster.stop_node(node)?;
         cluster.start_node_from_binary(node, previous_binary).await?;
-        let context = format!("previous-restart-{node}");
+        let context = format!("{prefix}-restart-{node}");
         wait_for_upgrade_write_readiness(
             std::slice::from_ref(&clients[node]),
             MIXED_BUCKET,
@@ -822,15 +1185,17 @@ async fn prepare_previous_release_baseline(cluster: &mut RustFSTestClusterEnviro
         .await?;
     }
 
-    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, "previous-baseline", LISTING_CONVERGENCE_TIMEOUT).await?;
+    wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, &format!("{prefix}-baseline"), LISTING_CONVERGENCE_TIMEOUT).await?;
     for (reader, client) in clients.iter().enumerate() {
         assert_eq!(
-            read_object(client, MIXED_BUCKET, PREVIOUS_RELEASE_SEED_KEY, None).await?.1,
+            read_object(client, MIXED_BUCKET, &format!(".upgrade-readiness/{prefix}-seed/node-0"), None)
+                .await?
+                .1,
             UPGRADE_READINESS_BODY,
             "previous-release node {reader} must retain the seed across its rolling restart"
         );
         for writer in 0..clients.len() {
-            let key = format!(".upgrade-readiness/previous-baseline/node-{writer}");
+            let key = format!(".upgrade-readiness/{prefix}-baseline/node-{writer}");
             assert_eq!(
                 read_object(client, MIXED_BUCKET, &key, None).await?.1,
                 UPGRADE_READINESS_BODY,
@@ -1883,10 +2248,21 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.start_with_binary(&previous_binary).await?;
     cluster.create_test_bucket(MIXED_BUCKET).await?;
     prepare_previous_release_baseline(&mut cluster, &previous_binary).await?;
+    exercise_homogeneous_multipart(&cluster, "homogeneous-previous").await?;
+    cluster.create_test_bucket(PENDING_MULTIPART_BUCKET).await?;
+    let previous_clients = cluster.create_all_clients()?;
+    enable_versioning(&previous_clients[0], PENDING_MULTIPART_BUCKET).await?;
+    let pending_parts = vec![vec![0x63; 5 * 1024 * 1024], vec![0x7d; 4096]];
+    let pending = stage_multipart(&previous_clients[0], PENDING_MULTIPART_BUCKET, PENDING_MULTIPART_KEY, &pending_parts).await?;
+    let sources = wait_for_pending_source_bytes(&cluster, &pending).await?;
+    assert_pending_parts(&previous_clients[0], &pending).await?;
 
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
     exercise_mixed_cluster(&cluster, "one-current-node", 0, 1).await?;
+    // One controlled out-of-policy attempt proves fail-closed behavior below
+    // native write quorum; positive MPU writers remain paused while mixed.
+    assert_mixed_pending_refusal(&cluster, &pending, &sources).await?;
 
     for (node_idx, phase) in [(1, "two-current-nodes"), (2, "one-previous-node")] {
         cluster.stop_node(node_idx)?;
@@ -1898,6 +2274,9 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.start_node_from_binary(3, &current_binary).await?;
     let clients = cluster.create_all_clients()?;
     wait_for_drive_readmission(&clients, MIXED_BUCKET, "homogeneous-current", DRIVE_READMISSION_TIMEOUT).await?;
+    let completed_pending = finish_pending_multipart(&clients, &pending, pending_parts.concat()).await?;
+    exercise_homogeneous_multipart(&cluster, "homogeneous-current").await?;
+    verify_load_bodies(&clients, "homogeneous-previous", "multipart").await?;
 
     for (node_idx, client) in clients.iter().enumerate() {
         assert_eq!(
@@ -1914,47 +2293,6 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
             )
             .await?;
         }
-    }
-
-    if let Some(context) = evidence_context.as_ref() {
-        let phases = ["one-current-node", "two-current-nodes", "one-previous-node"];
-        let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
-        write_g09_evidence(
-            context,
-            "mixed_version_reader_evidence",
-            "mixed-version-reader",
-            &["old-writer-new-reader", "new-writer-old-reader"],
-            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
-            serde_json::json!({
-                "bucket": MIXED_BUCKET,
-                "phases": phases,
-                "objects_per_phase": objects_per_phase,
-                "assertions": [
-                    "current node reads objects written through previous-release client",
-                    "previous-release node reads objects written through current client",
-                    "all nodes list every mixed-version object after homogeneous-current convergence",
-                    "the previous-release seed survives the baseline restart and every upgrade phase"
-                ],
-            }),
-        )?;
-        write_g09_evidence(
-            context,
-            "mixed_version_writer_evidence",
-            "mixed-version-writer",
-            &["old-reader-new-writer", "new-reader-old-writer"],
-            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
-            serde_json::json!({
-                "bucket": MIXED_BUCKET,
-                "phases": phases,
-                "objects_per_phase": objects_per_phase,
-                "assertions": [
-                    "current writer publishes objects readable by previous-release node",
-                    "previous-release writer publishes objects readable by current node",
-                    "multipart writers continue at every individual node upgrade",
-                    "modern DELETE fails closed and preserves every byte while old peers remain"
-                ],
-            }),
-        )?;
     }
 
     let clients = cluster.create_all_clients()?;
@@ -1978,6 +2316,115 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
             Some("NoSuchKey"),
             "node {node}"
         );
+    }
+
+    wait_for_multipart_quiescence(&cluster, &sources).await?;
+    // No MPU mutation runs during a heterogeneous downgrade. All current
+    // callbacks and source controls settle before old binaries reopen volumes.
+    cluster.stop();
+    cluster.start_with_binary(&previous_binary).await?;
+    prepare_release_baseline(&mut cluster, &previous_binary, "rollback").await?;
+    let old_clients = cluster.create_all_clients()?;
+    assert_resumed_multipart(&old_clients, &completed_pending).await?;
+    for phase in ["homogeneous-previous", "homogeneous-current"] {
+        verify_load_bodies(&old_clients, phase, "multipart").await?;
+        for client in &old_clients {
+            wait_for_phase_listing(
+                client,
+                phase,
+                MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "previous reader after rollback",
+            )
+            .await?;
+        }
+    }
+    for phase in ["one-current-node", "two-current-nodes", "one-previous-node"] {
+        verify_load_bodies(&old_clients, phase, "put").await?;
+        for client in &old_clients {
+            wait_for_phase_listing(
+                client,
+                phase,
+                MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2,
+                "previous reader after rollback",
+            )
+            .await?;
+            for (key, body) in [
+                ("written-by-current", format!("{phase}: current RustFS build")),
+                ("written-by-previous", format!("{phase}: previous RustFS release")),
+            ] {
+                assert_eq!(
+                    read_object(client, MIXED_BUCKET, &format!("{phase}/{key}"), None).await?.1,
+                    body.as_bytes()
+                );
+            }
+        }
+    }
+    for (node, client) in old_clients.iter().enumerate() {
+        let error = client
+            .get_object()
+            .bucket(MIXED_BUCKET)
+            .key(PREVIOUS_RELEASE_SEED_KEY)
+            .send()
+            .await
+            .expect_err("current DELETE must remain visible to previous readers after rollback");
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("NoSuchKey"),
+            "reader {node}"
+        );
+    }
+    exercise_homogeneous_multipart(&cluster, "homogeneous-rollback").await?;
+
+    if let Some(context) = evidence_context.as_ref() {
+        let phases = ["one-current-node", "two-current-nodes", "one-previous-node"];
+        let objects_per_phase = MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER + 2;
+        write_g09_evidence(
+            context,
+            "mixed_version_reader_evidence",
+            "mixed-version-reader",
+            &["old-writer-new-reader", "new-writer-old-reader"],
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "mixed_load": "plain-put",
+                "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
+                "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "assertions": [
+                    "current node reads objects written through previous-release client",
+                    "previous-release node reads objects written through current client",
+                    "all nodes list every mixed-version object after homogeneous-current convergence",
+                    "the previous-release seed survives the baseline restart and every upgrade phase",
+                    "previous readers read every current-native MPU body after quiescent rollback",
+                    "same legacy upload resumes with identical body, ETag and version after full upgrade"
+                ],
+            }),
+        )?;
+        write_g09_evidence(
+            context,
+            "mixed_version_writer_evidence",
+            "mixed-version-writer",
+            &["old-reader-new-writer", "new-reader-old-writer"],
+            "upgrade_compatibility_test::rolling_upgrade_from_previous_release_preserves_mixed_version_contracts",
+            serde_json::json!({
+                "bucket": MIXED_BUCKET,
+                "phases": phases,
+                "objects_per_phase": objects_per_phase,
+                "mixed_load": "plain-put",
+                "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
+                "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
+                "assertions": [
+                    "current writer publishes objects readable by previous-release node",
+                    "previous-release writer publishes objects readable by current node",
+                    "mixed phases retain 16x16 plain PUT writers while positive multipart writers are paused",
+                    "16x16 multipart load runs in homogeneous previous, current and rollback phases",
+                    "one-current-node Complete returns typed 503 and preserves actual source authority and parts",
+                    "the same legacy upload completes and replays once fully upgraded without adding a version",
+                    "modern DELETE fails closed and preserves every byte while old peers remain"
+                ],
+            }),
+        )?;
     }
 
     Ok(())

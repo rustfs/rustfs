@@ -115,6 +115,7 @@ pub(crate) fn data_key_for_version(version_id: Option<Uuid>) -> String {
     }
 }
 
+#[cfg(test)]
 fn legacy_data_key_for_version(version_id: Option<Uuid>) -> Option<String> {
     if version_id.is_none() || version_id == Some(Uuid::nil()) {
         Some(Uuid::nil().to_string())
@@ -347,19 +348,21 @@ impl FileMeta {
         self.versions.sort_by(cmp_shallow_versions_for_order);
     }
 
+    fn find_inline_data_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<&[u8]>> {
+        if let Some(vid) = version_id.filter(|v| !v.is_nil()) {
+            let mut buf = Uuid::encode_buffer();
+            let key = vid.hyphenated().encode_lower(&mut buf);
+            InlineData::find_slice_in_raw(inline_data, key)
+        } else {
+            if let Some(data) = InlineData::find_slice_in_raw(inline_data, NULL_VERSION_ID)? {
+                return Ok(Some(data));
+            }
+            InlineData::find_slice_in_raw(inline_data, "00000000-0000-0000-0000-000000000000")
+        }
+    }
+
     fn find_inline_data_in_slice(inline_data: &[u8], version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
-        let key = data_key_for_version(version_id);
-        if let Some(data) = InlineData::find_in_slice(inline_data, key.as_str())? {
-            return Ok(Some(data));
-        }
-
-        if let Some(legacy_key) = legacy_data_key_for_version(version_id)
-            && legacy_key != key
-        {
-            return InlineData::find_in_slice(inline_data, legacy_key.as_str());
-        }
-
-        Ok(None)
+        Ok(Self::find_inline_data_slice(inline_data, version_id)?.map(<[u8]>::to_vec))
     }
 
     fn find_inline_data_for_version(&self, version_id: Option<Uuid>) -> Result<Option<Vec<u8>>> {
@@ -2422,6 +2425,52 @@ mod test {
                 FileMeta::load(&buf[..cut]).expect_err("every incomplete metadata frame must fail"),
                 Error::FileCorrupt,
                 "truncation at byte {cut} must remain repairable"
+            );
+        }
+    }
+
+    #[test]
+    fn truncated_inline_xlmeta_is_file_corrupt_only_for_supported_formats() {
+        let mut meta = FileMeta::new();
+        meta.data
+            .replace("fixture", vec![0x5a; 4095])
+            .expect("seed real inline framing");
+        let inline_len = meta.data.as_slice().len();
+        let original = meta.marshal_msg().expect("serialize valid inline metadata");
+        let inline_start = original.len() - inline_len;
+        let parsed = FileMeta::load(&original).expect("complete inline metadata must decode");
+        assert_eq!(parsed.data, meta.data);
+        for cut in inline_start + 1..original.len() {
+            assert_eq!(
+                FileMeta::load(&original[..cut]).expect_err("incomplete inline framing must fail"),
+                Error::FileCorrupt,
+                "inline truncation at byte {cut} must remain repairable"
+            );
+        }
+
+        for inline_version in [0, 2] {
+            let mut unsupported = original[..original.len() / 2].to_vec();
+            unsupported[inline_start] = inline_version;
+            assert_ne!(
+                FileMeta::load(&unsupported).expect_err("malformed unsupported inline format must fail"),
+                Error::FileCorrupt,
+                "unknown inline version must not authorize repair"
+            );
+        }
+        for (header_ver, meta_ver) in [
+            (XL_HEADER_VERSION + 1, XL_META_VERSION),
+            (XL_HEADER_VERSION, XL_META_VERSION + 1),
+        ] {
+            let mut headers = Vec::new();
+            rmp::encode::write_uint(&mut headers, u64::from(header_ver)).expect("write future header");
+            rmp::encode::write_uint(&mut headers, u64::from(meta_ver)).expect("write future metadata version");
+            rmp::encode::write_uint(&mut headers, 0).expect("write empty version count");
+            let mut unsupported = build_xl_buffer(&headers);
+            unsupported.extend_from_slice(&meta.data.as_slice()[..inline_len / 2]);
+            assert_ne!(
+                FileMeta::load(&unsupported).expect_err("unsupported metadata with truncated inline data must fail"),
+                Error::FileCorrupt,
+                "future metadata schema must not authorize repair"
             );
         }
     }

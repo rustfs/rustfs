@@ -1471,6 +1471,7 @@ mod tests {
             inner: QueueStore<QueuedPayload>,
             fail_put_failed_raw: Arc<std::sync::atomic::AtomicBool>,
             fail_del: Arc<std::sync::atomic::AtomicBool>,
+            delete_attempts: Arc<Semaphore>,
         }
 
         impl Store<QueuedPayload> for FailingFailedStore {
@@ -1499,10 +1500,13 @@ mod tests {
                 self.inner.get_raw(key)
             }
             fn del(&self, key: &Self::Key) -> Result<(), Self::Error> {
-                if self.fail_del.load(Ordering::SeqCst) {
-                    return Err(StoreError::Internal("injected del failure".to_string()));
-                }
-                self.inner.del(key)
+                let result = if self.fail_del.load(Ordering::SeqCst) {
+                    Err(StoreError::Internal("injected del failure".to_string()))
+                } else {
+                    self.inner.del(key)
+                };
+                self.delete_attempts.add_permits(1);
+                result
             }
             fn delete(&self) -> Result<(), Self::Error> {
                 self.inner.delete()
@@ -1986,6 +1990,7 @@ mod tests {
                 inner: inner.clone(),
                 fail_put_failed_raw: fail_flag.clone(),
                 fail_del: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                delete_attempts: Arc::new(Semaphore::new(0)),
             };
             // The target's terminal move writes through the rejecting failed handle, so the injected
             // failure is what the move hits.
@@ -2042,6 +2047,7 @@ mod tests {
                 inner: inner.clone(),
                 fail_put_failed_raw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fail_del: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                delete_attempts: Arc::new(Semaphore::new(0)),
             };
             let target = Arc::new(ProgrammedTarget::new(
                 Some(TargetError::JetStreamPublish {
@@ -2053,8 +2059,15 @@ mod tests {
             let tally = Arc::new(ReplayTally::default());
             let (cancel_tx, worker) = spawn_failing_store_worker(&store, target, tally.clone());
 
-            // Many scans run while the live delete keeps failing.
-            tokio::time::sleep(Duration::from_secs(300)).await;
+            // Observe repeated durable overwrites without auto-advancing through thousands of
+            // real filesystem writes. Keep the original virtual observation bound on progress.
+            tokio::time::timeout(Duration::from_secs(300), store.delete_attempts.acquire_many(8))
+                .await
+                .expect("replay should retry the failing delete eight times")
+                .expect("delete progress remains open")
+                .forget();
+            cancel_tx.send(()).await.expect("replay worker should remain cancellable");
+            worker.await.expect("replay worker should drain after cancellation");
             assert_eq!(
                 tally.permanent_failure.load(Ordering::SeqCst),
                 0,
@@ -2063,8 +2076,6 @@ mod tests {
             assert_eq!(inner.len(), 1, "the live entry stays for the next scan");
             assert_eq!(inner.failed_len(), 1, "the durable failed copy landed exactly once");
 
-            let _ = cancel_tx.send(()).await;
-            let _ = worker.await;
             let _ = inner.delete();
         }
 
@@ -2084,6 +2095,7 @@ mod tests {
                 inner: store.clone(),
                 fail_put_failed_raw: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 fail_del: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                delete_attempts: Arc::new(Semaphore::new(0)),
             };
             let target = Arc::new(ProgrammedTarget::new(
                 Some(TargetError::JetStreamPublish {

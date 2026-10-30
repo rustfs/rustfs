@@ -35,7 +35,7 @@ Bitrot cycle resolution differs because the canonical persistent key belongs to 
 | `scanner.delay` | `RUSTFS_SCANNER_DELAY` | factor | preset-derived | Overrides the sleep multiplier. Valid range is `0` through `10000` (`MAX_SCANNER_DELAY_FACTOR`). |
 | `scanner.max_wait` | `RUSTFS_SCANNER_MAX_WAIT_SECS` | seconds | preset-derived | Caps one scanner sleep. |
 | `scanner.cycle` | `RUSTFS_SCANNER_CYCLE` | seconds | preset-derived | Sets the interval between scanner cycles. |
-| `scanner.start_delay` | `RUSTFS_SCANNER_START_DELAY_SECS` (deprecated alias `RUSTFS_DATA_SCANNER_START_DELAY_SECS`) | seconds | unset | Sets startup delay and, for compatibility, the cycle interval when `scanner.cycle` is unset. |
+| `scanner.start_delay` | `RUSTFS_SCANNER_START_DELAY_SECS` (deprecated alias `RUSTFS_DATA_SCANNER_START_DELAY_SECS`) | seconds | unset | Sets an explicit startup delay and, for compatibility, the cycle interval when `scanner.cycle` is unset. When absent, startup uses the smaller of the cycle interval and 60 seconds, with jitter; see [Startup and cycle budgets](#startup-and-cycle-budgets). |
 | `scanner.cycle_max_duration` | `RUSTFS_SCANNER_CYCLE_MAX_DURATION_SECS` | seconds | `1800` (`DEFAULT_SCANNER_CYCLE_MAX_DURATION_SECS`) | Caps one cycle's runtime. An explicit `0` disables this budget. |
 | `scanner.cycle_max_objects` | `RUSTFS_SCANNER_CYCLE_MAX_OBJECTS` | objects | `0` (`DEFAULT_SCANNER_CYCLE_MAX_OBJECTS`) | Caps objects processed by one cycle. `0` disables this budget. |
 | `scanner.cycle_max_directories` | `RUSTFS_SCANNER_CYCLE_MAX_DIRECTORIES` | directories | `0` (`DEFAULT_SCANNER_CYCLE_MAX_DIRECTORIES`) | Caps directories entered by one cycle. `0` disables this budget. |
@@ -64,6 +64,65 @@ Speed presets (`crates/config/src/constants/scanner.rs`) set the base sleep mult
 | `slowest` | 100x | 15s | 30m |
 
 Use `scanner.delay`, `scanner.max_wait`, and `scanner.cycle` when the preset is close but one axis needs a precise override. With `idle_mode=true`, directory-level sleep is `1ms x factor` and object-level sleep is `time spent on the object x factor`, both capped at `max_wait`; a foreground-read floor of `FOREGROUND_READ_BACKOFF_PER_REQUEST_MS` (10ms) per concurrent GetObject/streaming read, capped at `FOREGROUND_READ_BACKOFF_MAX_MS` (250ms), is applied on top and can exceed the preset's `max_wait` (`crates/scanner/src/sleeper.rs`). The per-disk foreground-priority gate is independent of `idle_mode` and remains active when sleeps are disabled.
+
+### Startup and cycle budgets
+
+Startup and the recurring cycle interval are separate. With a warm, complete usage cache and no active replication, the implicit startup delay uses `min(scanner.cycle, 60s)`, with the existing ±10% jitter. An explicit `scanner.start_delay` retains its configured delay and jitter. A cold usage cache, a valid newer observation requiring refresh, or active replication with existing buckets can skip the startup delay. Starting an attempt promptly does not bypass leader election, recovery, data-movement pauses, or disk admission.
+
+Before this startup cap, a warm cache inherited the whole cycle interval. For example, `scanner.cycle=21600` could wait 5 hours 24 minutes to 6 hours 36 minutes after every process restart. For an explicit prompt start while retaining a six-hour recurring interval, set both `RUSTFS_SCANNER_CYCLE=21600` and `RUSTFS_SCANNER_START_DELAY_SECS=1`. Removing the cycle setting would allow the startup setting to supply the recurring interval through the compatibility fallback.
+
+The startup usage preflight is read-only and has a 30-second deadline. If it cannot finish, the scanner proceeds to its normal fenced attempt; the timeout does not certify usage or bypass recovery checks. Cancellation interrupts both preflight and startup delay. Runtime timing changes use elapsed startup time rather than starting a fresh wait. Updates with the same effective startup delay retain the original jitter sample and deadline, including cycle changes masked by an explicit startup delay or the implicit 60-second cap. Maintenance changes wake the delay so the existing scanner path can inspect the new rules. Pre-leadership retry waits also wake on runtime and maintenance changes.
+
+Cold-cache startup and startup without active replication avoid an extra bucket listing. Maintenance discovery keeps looking for replication after finding lifecycle rules in an earlier bucket. Once replication is found, both scheduling decisions are settled and remaining buckets need no startup inspection. Reapplying an unchanged resolved configuration does not reconfigure per-disk budgets or emit another configuration wakeup.
+
+The `cycle_max_duration`, `cycle_max_objects`, and `cycle_max_directories` controls bound a cycle's work; they do not guarantee that every budget can complete a sweep in bounded chunks. A partial scan preserves useful checkpoints and coverage, but reopening ancestors and revalidating directory entries costs work again. A budget below the minimum replay or traversal cost can repeatedly stop at the same directory. Cross-bucket fairness also needs to be distinguished from progress within one bucket. Use pacing controls to limit background I/O, and choose cycle budgets large enough for the namespace to advance.
+
+Budget cancellation alone does not publish complete usage or acknowledge dirty buckets. A partial cycle must retain that uncertainty; a growing directories-scanned counter is not proof of new coverage or published totals. Inspect checkpoint/frontier changes and publication status across attempts before changing budgets. A budget cancellation does not persist a disabled scheduler flag and does not justify deleting scanner state.
+
+When runtime configuration is applied, `metrics.cycle_interval_seconds`, `metrics.bitrot_cycle_enabled`, and the cycle-budget fields describe that configuration even before the first scan. They do not establish that a cycle is running; use `metrics.current_cycle_active`, `cycle_schedule`, `cycle_recovery`, leadership, and `data_movement_pause` to interpret inactivity. A running cycle retains its existing budget; a configuration update applies to later budget creation. Configuration refreshes retain timeout/no-progress diagnostics until a new cycle starts. If the first refresh fails validation, the retained effective configuration still initializes its metrics while the validation error remains reported; a failed refresh cannot replace a newer accepted configuration. Older releases initialized these configuration metrics only on the first cycle, so zero values during startup did not prove that scheduling was disabled.
+
+### Observing startup and a first publication
+
+The native status response exposes one node-local `metrics.startup` snapshot. Prometheus reads the same snapshot; it is not reconstructed from cycle counters or a persisted usage timestamp. These fields describe the latest local runtime and are not merged across nodes by the realtime API.
+
+| `metrics.startup.phase` | Prometheus `rustfs_scanner_startup_phase` | Meaning |
+|---|---:|---|
+| `unknown` | 0 | No runtime has been observed, or the report came from an older binary. |
+| `initializing` | 1 | Startup recovery-intent discovery/replay or maintenance/default configuration initialization is in progress. |
+| `usage_inspection` | 2 | The bounded read-only startup usage probe is in progress. No eventual attempt deadline has been chosen yet. |
+| `waiting` | 3 | The runtime is waiting for its actual sampled startup deadline. |
+| `attempted` | 4 | The runtime has entered the normal scanner leadership/recovery loop at least once. This does not prove leadership, an active bucket scan, or publication. |
+| `stopped` | 5 | The owner ended or was cancelled. Earlier start/attempt timestamps remain available; the planned wait is cleared. |
+
+`runtime_active` means the observation owner still exists, not that it is healthy or ready. `started_at_unix_secs` records that owner's creation. `phase_started_at_unix_secs` and `phase_age_seconds` describe its last transition or changed waiting deadline. `planned_attempt_at_unix_secs` is available only during an actual startup wait; it is a seconds-resolution estimate anchored to runtime start. The scheduler still uses its original monotonic deadline. `wait_remaining_seconds` and `wait_overdue_seconds` are derived from that deadline when read, so they do not require a polling task and remain useful if the wall clock changes. A deadline is eligibility to attempt the scanner's fenced path, not a promised scan-completion time.
+
+`first_attempt_at_unix_secs` is recorded immediately before the first normal scanner leadership acquisition attempt, after startup recovery-intent discovery/replay. Startup intent replay remains `initializing`, including any leadership locks it needs. Lock contention or recovery failure is still an attempt. Repeated attempts retain the first timestamp; restarting creates a fresh observation. Late updates from an older runtime cannot overwrite the new owner's state.
+
+Prometheus exports `rustfs_scanner_runtime_active`, `rustfs_scanner_startup_started_unix_seconds`, `rustfs_scanner_startup_phase_age_seconds`, `rustfs_scanner_startup_planned_attempt_unix_seconds`, `rustfs_scanner_startup_wait_remaining_seconds`, `rustfs_scanner_startup_wait_overdue_seconds`, and `rustfs_scanner_startup_first_attempt_unix_seconds` alongside the phase code. Optional times are zero when unavailable in Prometheus and null in native JSON. No bucket, path, or runtime-generation label is added.
+
+Do not gate every usage alert with `usage_last_durable_success > 0`: that timestamp is local to the process and starts at zero, so the guard hides a runtime that never publishes. It records a durable publication event, including observational publication; it is not proof that all buckets have authoritative converged usage. Keep separate checks for a missing runtime, an overdue startup attempt, no first publication within the expected workload window, and stale publications after a previous success.
+
+For an **expected-enabled SNSD job with no intentional recovery or movement pause**, these example expressions distinguish a missing runtime, stalled initialization, an overdue wait, and a missing first publication. Replace the job selector and windows with the deployment's expected startup and first-sweep times. The first-publication rule is not suitable for every distributed follower; check leadership, `cycle_recovery`, and `data_movement_pause` before applying it across a cluster.
+
+```yaml
+groups:
+  - name: rustfs-scanner-startup
+    rules:
+      - alert: RustFSScannerRuntimeMissing
+        expr: rustfs_scanner_runtime_active{job="rustfs-snsd"} == 0
+        for: 5m
+      - alert: RustFSScannerStartupInspectionStalled
+        expr: ((rustfs_scanner_startup_phase{job="rustfs-snsd"} == 1) or (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 2)) and (rustfs_scanner_startup_phase_age_seconds{job="rustfs-snsd"} > 120)
+        for: 1m
+      - alert: RustFSScannerStartupAttemptOverdue
+        expr: (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 3) and (rustfs_scanner_startup_wait_overdue_seconds{job="rustfs-snsd"} > 30)
+        for: 1m
+      - alert: RustFSScannerNoFirstUsagePublication
+        expr: (rustfs_scanner_startup_phase{job="rustfs-snsd"} == 4) and (rustfs_scanner_startup_phase_age_seconds{job="rustfs-snsd"} > 600) and (rustfs_scanner_usage_last_durable_success_unix_seconds{job="rustfs-snsd"} == 0)
+        for: 2m
+```
+
+An alert means the expected attempt or publication has not been observed; inspect progress, checkpoints, budgets, leadership, and pause reasons rather than treating every case as a dead scanner. None of these observations fills a missing success timestamp or acknowledges incomplete coverage.
 
 ### Walkers per disk
 
@@ -175,6 +234,29 @@ The request must be authenticated with an admin identity that has `ServerInfoAdm
 | `data_movement_pause` | Global-pause policy, current movement reason, operation epoch, start time, duration, and estimated movement work items. |
 | `pause_backlog` | Replicated durable pause ledger, post-pause catch-up phase, rate window, retry state, thresholds, and active alert reasons. |
 | `catch_up_estimate` | Movement work plus current dirty-usage and already discovered lifecycle queues. |
+| `heal_observation` | This process's bounded canonical heal observations, including retained pending tasks, typed terminals, and unknown integrity. |
+
+`metrics.usage_publication` describes one local publication attempt with its own
+`scanner_epoch` and `cycle`, even after `metrics.current_cycle` returns to zero.
+Its `class` distinguishes `progress_only`, `observational`, `complete_pending`,
+`complete_converged`, and `unknown`; `outcome` retains the persistence result.
+`pending_bucket_count` comes from the confirmed authoritative snapshot. It is
+null for progress-only, observational, failed, or unverified publication, and
+zero only for a confirmed converged snapshot. The live dirty-usage count can
+change independently after publication.
+
+An existing same-cycle snapshot may differ from the current retry. Its pending
+count comes from the existing target bytes, never the retry's count. A cached
+baseline or companion alone cannot confirm the current target; without an
+actual target read, confirmed write, or existing root readback proof, the class
+remains unknown. `snapshot_updated_at_unix_secs` is the snapshot's timestamp;
+`observed_at_unix_secs` is when this process recorded the observation.
+
+Starting another attempt replaces this record with running/unknown. Loss of
+leadership, stopping, reset, or restart clears it, and a late old attempt cannot
+restore it. These are local observations, not a restart-surviving or cluster-wide
+history. Publication convergence does not certify cycle completion, heal task
+completion, or verified object content.
 
 Example fields to inspect:
 
@@ -447,6 +529,24 @@ The OTLP exporter records these node-local histograms for completed manager admi
 
 The two new histograms aggregate all observed admission sources and results without per-request labels. An ordinary uninterrupted admission partitions the phase into wait and hold. Admin forceStart releases these guards while cancelling overlaps, then reacquires them: the cancellation gap is included only in the original total phase, and the second acquisition contributes to wait. Cancellation subroutine work is outside these outer admission guard intervals. Recording happens after all three guards are released. They measure manager admission ownership, not namespace/object-lock waiting during repair. The status field `maxLockPhaseMicros` remains a manager-lifetime maximum, not a p95 sample. Keep same-window histogram counts and bucket resolution when deriving percentiles; missing observations do not mean zero latency. These metrics do not establish performance acceptance by themselves.
 
+## Experimental shared node admission
+
+`RUSTFS_HEAL_ADAPTIVE_ADMISSION=true` enables Linux cgroup-v2 feedback shared by the heal manager’s four object-heal entry points and local Scanner namespace reads and object accounting. It is off by default while full SSD performance acceptance is pending. Unsupported platforms reject an enabled setting. This does not yet control the abandoned-child streaming list coordinator, bucket/format repair or physical devices, and it is not a replacement for existing worker, disk or byte budgets.
+
+The node samples its effective CPU quota/cpuset, ancestor memory headroom, CPU usage/throttling and CPU/memory/I/O pressure once per second. Sampling uses one blocking worker at a time. Resource reads retain their real start/end times: reads spanning over 20 ms or older than one second after all inputs return cannot renew admission. Counter rates use both read brackets conservatively. The concurrency cap is at most the rounded-up effective CPU count and 256 scheduling units; existing operator limits still apply independently. At most 1% memory headroom blocks new work. This is a pressure safeguard, not a memory reservation or a claim that concurrent repair buffers fit in the remaining bytes.
+
+Each complete sample leases admission for three seconds. Missing resource caps block new work; missing or low-confidence feedback retains at most one maintenance unit. CPU use above 90%, throttling or pressure above 1% of elapsed time, memory headroom at most 10%, foreground errors/cancellations, a foreground queue or a comparable foreground p99 regression reduce concurrency immediately. Recovery requires CPU use at most 70%, throttling/stalls at most 0.1% of elapsed time, at least 20% memory headroom, fresh foreground evidence and actual successful work. The existing controller probes one additional unit only after eight consecutive healthy seconds and cooldown. Limits affect new admission and do not revoke active work.
+
+The Scanner captures the same node owner once per bucket walk. Directory open/refill, entry type and size lookup, and object accounting try admission before their first storage poll; each unit ends when its operation future finishes. On contention, local and remote coordinators suspend the same traversal, release the bucket cache lease, and join the shared FIFO queue. They reacquire the cache lease and verify both cache revisions before resuming. A changed cache rejects the suspended result. Cancellation also drops the queued request; the existing cycle budget still bounds the walk. This retains directory and recursion state while allowing Heal to advance at capacity one, without repeatedly replaying a partially classified directory.
+
+Calls without a coordinating cache lease retain immediate resource deferral and useful partial-cache handling. Existing remote single-session ownership and local-disk admission shares remain in force. Disabled admission creates no request channel. Enabled walks use one bounded channel, with a response allocation and cache revision reads only on contention; the uncontended per-entry path adds no global lookup or task. The streaming abandoned-child coordinator requires a separate ownership boundary: retaining a node unit while it waits for a bounded-channel consumer that needs the same unit would deadlock at capacity one.
+
+Foreground comparison uses the existing complete response-body windows and shared admission snapshots. Each active class needs at least 100 completions and a finite p99 interval; this permits the percentile rank but is not a statistical confidence guarantee. Comparisons require the same active classes and rates within 80–125% of a retained reference. A changed workload resets recovery. The reference is an observed workload window, not an independent background-off baseline. A p99 interval can justify stability only when its upper bound is within 5% of the reference lower bound; a lower bound above 105% of the reference upper bound is pressure. Overlapping/uncertain comparisons cannot justify growth. Missing queues, stale or repeated cuts, uncertain cut boundaries and low counts are not idle evidence.
+
+Heal admission waits at most 250 ms before returning the existing typed transient deferral, before polling storage or taking namespace locks. No-lock callers never wait. Queued read repair uses the same node gate; direct foreground ECStore calls remain outside this heal-manager adapter. Cancellation releases the non-cloneable node scheduling unit. Native work retains separate physical-I/O units, and unsuccessful/cancelled/dry-run work cannot increment the node's completed-work counter. This scheduling counter is not an authoritative heal receipt and cannot discharge repair responsibility.
+
+The `rustfs_background_node_admission_limit` and `rustfs_background_node_admission_active` gauges describe the last published sample, not a live reservation proof. A blocked sampler can leave these exports stale even though the admission lease has expired. Full disk-owner feedback, shared scanner scheduling, escaping-buffer byte ownership and the matched-release SSD matrix/hot-shrink/72-hour soak remain required before enabling this by default or claiming optimal performance.
+
 ## Heal runtime controls
 
 Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/src/heal/manager.rs`), the MRF queue (`crates/heal/src/heal/mrf_queue.rs`), or the erasure-set healer (`crates/heal/src/heal/erasure_healer.rs`). The admin `heal` config subsystem accepts only `bitrot_cycle` (`HEAL_KEYS`), which is documented in the scanner table above. Constants live in `crates/config/src/constants/heal.rs` unless another file is named.
@@ -465,11 +565,11 @@ Heal knobs are environment-only and read by `HealConfig::default` (`crates/heal/
 | `RUSTFS_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE` | `true` (`DEFAULT_HEAL_EVENT_DRIVEN_SCHEDULER_ENABLE`) | Notify-driven scheduler wakeups. |
 | `RUSTFS_HEAL_SET_BULKHEAD_ENABLE` | `true` (`DEFAULT_HEAL_SET_BULKHEAD_ENABLE`) | Per-set bulkhead scheduling. |
 | `RUSTFS_HEAL_PAGE_PARALLEL_ENABLE` | `true` (`DEFAULT_HEAL_PAGE_PARALLEL_ENABLE`) | Page-level parallel object healing during erasure-set repair. |
-| `RUSTFS_HEAL_PAGE_OBJECT_CONCURRENCY` | `8` (`DEFAULT_HEAL_PAGE_OBJECT_CONCURRENCY`) | Concurrent object heals within one erasure-set page. Forced to `1` when page parallelism is off, for `Deep` scan mode, and for `AutoHeal`-sourced requests (`ErasureSetHealer::effective_heal_page_object_concurrency_for_source`). |
-| `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE` | `true` (`DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE`) | Defer best-effort starts and cooperatively pace running admin heal at safe work boundaries. |
-| `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running admin pacing; zero disables this class. |
-| `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running admin pacing; zero disables this class. |
-| `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running admin waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
+| `RUSTFS_HEAL_PAGE_OBJECT_CONCURRENCY` | `8` for ordinary heals; `2` for automatic replacement | Concurrent object heals within one erasure-set page. An explicit value applies to both; automatic replacement clamps it to the semaphore's supported range. Forced to `1` when page parallelism is off, for `Deep` scans, and for automatic heals without a replacement generation or object locks. |
+| `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE` | `true` (`DEFAULT_HEAL_MAINLINE_THROTTLE_ENABLE`) | Defer best-effort starts and cooperatively pace running admin and automatic replacement heals at safe work boundaries. |
+| `RUSTFS_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_READ_UTILIZATION_HIGH_PERCENT`, capped at 100) | Read-utilization high watermark for start admission and running heal pacing; zero disables this class. |
+| `RUSTFS_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT` | `80` (`DEFAULT_HEAL_MAINLINE_WRITE_UTILIZATION_HIGH_PERCENT`, capped at 100) | Write-utilization high watermark for start admission and running heal pacing; zero disables this class. |
+| `RUSTFS_HEAL_MAINLINE_MAX_SLEEP_MS` | `250` (`DEFAULT_HEAL_MAINLINE_MAX_SLEEP_MS`) | Start recheck interval; running waits cap each pacing-gate holder at 1000 ms. Zero disables running pacing. |
 | `RUSTFS_HEAL_OVERLAP_POLICY` | `merge` (`DEFAULT_HEAL_OVERLAP_POLICY`) | `merge` reuses the token of an equivalent active, queued, or retrying admin heal; incompatible same-target starts and intersecting admin scopes return `already_running` / `overlapping_paths`. Durable-only owners reject until recovered or replaced with `forceStart`. `minio_error` also rejects equivalent starts and preserves overlap rejection against background tasks. |
 | `RUSTFS_HEAL_MRF_ENABLE` | `true` (`DEFAULT_HEAL_MRF_ENABLE`) | MRF intent pipeline: error paths deliver repair intents to the heal runtime and unconsumed intents replay from the durable journal after restart. |
 | `RUSTFS_HEAL_MRF_QUEUE_SIZE` | `100000` (`DEFAULT_HEAL_MRF_QUEUE_SIZE`) | MRF in-memory queue capacity. |
@@ -499,6 +599,8 @@ Admin heal has three separate budgets. Increasing one does not extend the others
 | Task execution | `RUSTFS_HEAL_TASK_TIMEOUT_SECS` supplies the default of 300 seconds when the execution has no explicit timeout. Elapsed execution time is deducted before a recoverable scheduler retry, which keeps the request identity and remaining budget. Object/listing backoff and pressure pacing inside an execution consume that budget; time queued or in the scheduler's between-attempt backoff is not a new absolute wall-clock deadline. Zero is not an unlimited execution budget. |
 | Object/listing retry | A recursive bucket/prefix traversal retries recoverable failures at most three times after the initial attempt, with 2/4/8-second delays plus the existing task-derived jitter. Object retries also obey the bounded delayed window and its 30-second age, checked at safe boundaries; listing retries keep their cursor. These limits do not extend the task execution budget or force an in-flight storage operation to finish within the retry age. |
 
+Automatic replacement retries a transient object repair twice within its current page, waiting 250 ms and then 500 ms without holding page capacity. An exhausted retry remains unverified and still triggers the existing generation retry; target readback and checkpoint requirements are unchanged.
+
 For a large admin heal, select a finite configured execution budget appropriate to the expected work and contention, and inspect progress while it runs. Investigate stalled work and object failures before increasing this budget; a larger timeout must not hide lock or quorum problems. A longer HTTP or internode timeout does not keep a repair task alive past its execution budget. A successful start response returns the canonical token for accepted or merged work; it does not prove that repair has completed. Query that token without `forceStart`; terminal timeout/cancellation reports retain completed progress while the task report remains available.
 
 Capability preflight runs before constructing and admitting a start request. However, the public `cluster heal coordination unavailable` error can also follow a transport failure or an invalid coordinator response after a request was sent. An unknown or lost HTTP response is therefore not proof that no task was admitted.
@@ -509,13 +611,13 @@ Implementation references: `rustfs/src/admin/handlers/heal.rs` (`submit_cluster_
 
 ### Running admin heal pacing
 
-The manager passes its existing workload provider and a configuration snapshot into each admin execution. Bucket/prefix listing and object boundaries resample foreground pressure; erasure-set page workers also resample after earlier work releases page capacity. `High`, `Urgent`, and `force_start` do not exempt ordinary admin execution from this runtime pacing. The existing start-time bypass and overlap-control meanings are unchanged.
+The manager passes its existing workload provider and a configuration snapshot into each admin execution and automatic replacement generation. Bucket/prefix listing and object boundaries resample foreground pressure; erasure-set page workers also resample after earlier work releases page capacity. `High`, `Urgent`, and `force_start` do not exempt ordinary admin execution from this runtime pacing. The existing start-time bypass and overlap-control meanings are unchanged.
 
 Each execution has its own pacing latch, with no new global manager or cross-set pacing lock. The low watermark for each enabled class is `max(1, floor(high * 3 / 4))`: the default high watermark 80 therefore recovers below 60. High pressure latches pacing, and intermediate pressure resets the recovery window. Unpaced starts resume after sampled pressure remains below the low watermarks for four pause intervals, normally one second. While pressure persists, a pacing-gate holder waits only one interval, at most one second, then permits maintenance to continue. Concurrent page waiters serialize through this task-local gate; queue waiting still counts against the existing task execution timeout.
 
-The pacing gate holds neither namespace locks nor I/O/page permits while sleeping. At final page admission, each real permit acquisition gets a fresh, nonblocking pressure decision. Low-pressure work keeps that permit; only a unit that needs a pause releases capacity to wait. A unit that has completed one bounded pause may proceed despite persistent pressure, which supplies minimum maintenance progress without an endless acquire/pause loop. Existing object operations and commit tails are not interrupted because pressure rose. Cancellation and deadlines remain interruptible, and disabling pacing cannot bypass the global, per-set or page-concurrency hard caps. The existing `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE=false` setting is the operational opt-out for newly created executions; no additional request override is introduced.
+The pacing gate holds neither namespace locks nor I/O/page permits while sleeping. At final page admission, each real permit acquisition gets a fresh, nonblocking pressure decision. Low-pressure work keeps that permit; only a unit that needs a pause releases capacity to wait. A unit that has completed one bounded pause may proceed despite persistent pressure, which supplies minimum maintenance progress without an endless acquire/pause loop. Existing object operations and commit tails are not interrupted because pressure rose. Cancellation interrupts the pacing wait; replacement operations retain their execution lease until storage work settles. Disabling pacing cannot bypass the global, per-set or page-concurrency hard caps. The existing `RUSTFS_HEAL_MAINLINE_THROTTLE_ENABLE=false` setting is the operational opt-out for newly created executions; no additional request override is introduced.
 
-A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
+A missing provider, zero pause, or both class thresholds set to zero preserves unpaced execution. Missing counts follow the existing shared pressure interpreter; they are observations, not health, quorum or resource-ownership proof. The current provider exposes node-level workload classes, so this does not claim independent per-set foreground measurements or a hard global resource budget. Runtime waits increment `rustfs_heal_mainline_throttle_total` with `source=admin` or `source=auto_heal`, `result=delayed`, and a foreground-pressure or `recovery_window` reason. Real p99/throughput protection requires the separate W20 fixed-load ABBA measurements.
 
 ## Live Scanner Heal Completions
 
@@ -538,6 +640,26 @@ can include a deferred object; the `disposition` label preserves that distinctio
 payload bytes. Even `VerifiedHealthy` cannot certify scanner coverage: the current
 contract does not bind the candidate's content identity and leader epoch. No
 verified-byte or full-bucket coverage counter is advanced here.
+
+The scanner status response also exposes `heal_observation` without requiring
+a metrics exporter. Reading status does not start an observer. `state` is
+`not_started`, `active`, or `stopped`; unavailable pending counts are null.
+`retained_pending_tasks` counts canonical IDs in the existing bounded map,
+while `retained_pending_candidates` counts their associated discoveries.
+`queued_admissions` samples the local admission channel and is not an atomic
+cluster backlog. `terminal_task_observations_total` keeps the same bounded
+deduplication semantics as the exporter counter.
+
+`terminal_candidates` preserves execution, object disposition, scan mode, and
+unresolved scope. `unknown_candidates` includes admission rejection, overflow,
+loss, expiry, and missing terminal proof. These categories overlap: a completed
+task with a repaired or verified-healthy object can still have unknown scanner
+integrity. `integrity_state` therefore remains `unknown`, including when retained
+pending is zero. `lost_completion_notifications` counts skipped messages, not
+objects. Counts belong to the named local observer `generation`; runtime
+reinstallation starts a new generation and process restart clears it. Usage
+reset and scanner cycle changes do not clear pending heal observations, because
+canonical tasks can outlive a scanner cycle.
 
 The admission buffer, pending map, terminal channel, and recent history each hold
 at most 1,024 entries. Retained identities are capped at 4 KiB; terminal history
@@ -607,9 +729,15 @@ Only two MinIO scanner variables are recognized. `apply_external_env_compat` (`c
 | `scanner alert_excess_folders` (50000) | `scanner.alert_excess_folders` (65538) | Not mapped; see [Scanner Excess Alerts](scanner-excess-alerts.md). |
 | Any other `MINIO_SCANNER_*` | Corresponding `RUSTFS_SCANNER_*` from the tables above | Not mapped; rename explicitly. |
 
-Stale-upload cleanup differs in one crash-recovery detail. RustFS's stale multipart cleanup (`cleanup_stale_multipart_uploads_in_set`) takes a namespace write lock, re-checks the upload under write quorum (`check_multipart_upload_path_exists`), and fans the delete out to every disk, where the local recursive delete renames the directory into `.rustfs.sys/tmp/.trash/<uuid>` (`move_to_trash`). If the process dies mid fan-out after more disks than the parity count have already moved the upload directory, the next cleanup pass's quorum re-check fails (`FileNotFound` is not in `OBJECT_OP_IGNORED_ERRS`) and the candidate is skipped, so the remaining per-disk residue is not reclaimed by that job. The residue is invisible to the S3 API and only consumes disk space; the window is milliseconds wide. MinIO processes each disk independently and converges in the same scenario.
+Stale-upload cleanup takes the upload namespace write lock and rechecks cleanup authority before deletion. An incomplete legacy upload without sufficient identity or deletion quorum remains on disk; age and absence from an S3 listing do not establish that its recovery or publication authority has ended. A native Abort with a complete, validated closure certificate can recover a smaller residual after partial deletion, subject to the original-participant checks. Missing, unavailable or corrupt proof keeps the operation conservative. For an otherwise valid native Abort certificate, an unavailable participant identity is a retryable write-quorum failure; a known conflicting identity remains a corruption error, including when another participant is unavailable. See [the multipart authority contract](../architecture/erasure-coding.md#7-write-path-and-write-quorum).
+
+Size-filtered incomplete-upload rules also require every participant to answer the part listing and matching part metadata at write quorum. Unknown size skips only size-dependent rules. During a mixed-version upgrade, an older node can still evaluate those rules using the older empty-list behavior; fleet-wide protection requires every cleanup worker to run the updated version. Plan the rollout so older workers cannot perform size-filtered aborts while mixed versions are active.
+
+The `rustfs_stale_multipart_cleanup_blocked_total` counter has a bounded `stage` label: `recheck` for lock or authority recheck failures, `lock_lost` when a held cleanup lock is lost, and `delete` for a failed authorized deletion. It counts attempts, not unique uploads or bytes, and includes transient failures; it carries no bucket, key or upload labels. The `multipart_cleanup_lock_or_recheck_failed` debug event identifies a candidate path and the failure; `multipart_cleanup_lock_lost` identifies the path when a previously acquired cleanup lock is lost. Restore unavailable disks and retry through supported S3 or background recovery paths when their prerequisites hold. Preserve the disk state and seek an evidence-based recovery procedure when authority remains uncertain; do not recursively remove a residual solely because it is old or a destination object exists. The default expiry is measured from upload initiation, including internal data-movement uploads, and can affect long-running uploads even without a bucket lifecycle rule. This differs from [Amazon S3](https://docs.aws.amazon.com/AmazonS3/latest/userguide/mpuoverview.html), which retains parts until the upload is completed or stopped and offers an explicit lifecycle rule to abort incomplete uploads. The interval is a schedule, not a guaranteed reclamation deadline.
 
 ## Replacement Recovery Completion
+
+One reconnect sweep groups the newly attached blank disks in a set. If another reconnect is still pending, the ready targets are submitted after a one-second window rather than waiting indefinitely; later targets are submitted separately. Compatible automatic requests can add targets while the owner is still queued and has never executed or recovered a durable generation. Once execution or recovery fixes the target scope, later disks cannot join that generation or receive a merged receipt from it. Blank disks outside the frozen scope remain discoverable for the next automatic scan after the owner finishes.
 
 `POST /v3/background-heal/status` is an execution-queue view. `state=idle`, zero queue and active counts, an online disk, a readable object, or acceptance of an admin deep-heal request do not independently prove that a replacement disk contains every erasure shard.
 
@@ -735,7 +863,7 @@ For a mostly idle single-node, single-disk deployment with sustained CPU usage w
 6. If `primary_pressure` is `throttle_pause` and pause ratios are low, raise `scanner.delay` first.
 7. If individual sleeps are too short, raise `scanner.max_wait`.
 8. If each scan cycle finishes but starts too often, raise `scanner.cycle`.
-9. If scans must be broken into bounded chunks, set one of `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or `scanner.cycle_max_directories`.
+9. To bound one cycle, set `scanner.cycle_max_duration`, `scanner.cycle_max_objects`, or `scanner.cycle_max_directories`; confirm that checkpoints advance under that budget. These controls do not guarantee resumable bounded chunks for every directory shape; see [Startup and cycle budgets](#startup-and-cycle-budgets).
 10. Recheck `pacing_pressure`, `maintenance_control`, source work, and lifecycle transition status after one or more scanner cycles.
 
 Do not rely only on a longer cycle interval if lifecycle, replication, heal, or bitrot work must keep moving; use source work and transition status to confirm that background maintenance still progresses.

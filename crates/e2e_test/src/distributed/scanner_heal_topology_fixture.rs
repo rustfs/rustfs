@@ -216,6 +216,10 @@ pub(crate) struct TopologyRun {
 
 impl TopologyRun {
     pub(crate) async fn start(label: &str) -> TestResult<Self> {
+        Self::start_with_env(label, &[]).await
+    }
+
+    pub(crate) async fn start_with_env(label: &str, extra_env: &[(&str, &str)]) -> TestResult<Self> {
         let run_name = format!("scanner-heal-topology-{label}-{}", Uuid::new_v4().simple());
         // CI uploads RUSTFS_E2E_LOG_DIR; keep node logs, barrier observations
         // and evidence there so a failed lane can be diagnosed.
@@ -236,6 +240,7 @@ impl TopologyRun {
         let mut env: Vec<(&str, &str)> = TOPOLOGY_ENV.to_vec();
         env.extend_from_slice(FAST_DATA_USAGE_SCANNER_ENV);
         env.push((MOVEMENT_BARRIER_DIR_ENV, movement_dir_value.as_str()));
+        env.extend_from_slice(extra_env);
         let mut dist = DistCluster::new_stopped_with_env(DistLayout::SingleNodeFourDrive, &env).await?;
         dist.capture_logs_under(&log_dir)?;
         dist.cluster.start().await?;
@@ -329,6 +334,11 @@ impl FileBarrier {
         &self.nonce
     }
 
+    /// Keep the previous phase's release handle while arming a fresh nonce.
+    pub(crate) fn next_phase(&self) -> Self {
+        Self::new(self.dir.clone())
+    }
+
     fn write_atomic(&self, name: &str, body: &[u8]) -> TestResult {
         let tmp = self.dir.join(format!(".{name}.{}.tmp", Uuid::new_v4().simple()));
         std::fs::write(&tmp, body)?;
@@ -358,6 +368,10 @@ impl FileBarrier {
 
     pub(crate) fn release_movement_with_io_error(&self) -> TestResult {
         self.write_atomic(&format!("release.{}", self.nonce), b"io_error")
+    }
+
+    pub(crate) fn release_movement(&self) -> TestResult {
+        self.write_atomic(&format!("release.{}", self.nonce), b"continue")
     }
 
     pub(crate) fn reached_observations(&self) -> TestResult<Vec<Value>> {

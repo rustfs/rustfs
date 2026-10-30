@@ -31,8 +31,31 @@ use uuid::Uuid;
 use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
 
 const S3_MAX_KEYS: i32 = 1000;
-const LIST_CACHE_MARKER_TAG_PREFIX: &str = "[rustfs_cache:";
-const LIST_CACHE_MARKER_TAG_VERSIONS: &[&str] = &["v1", "v2"];
+
+fn invalid_continuation_token() -> S3Error {
+    S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string())
+}
+
+/// Encodes the server-side cursor into the wire `NextContinuationToken`.
+///
+/// AWS defines the token as opaque, so nothing in it is a promise to clients.
+/// The cursor is the plain last key of an ordinary listing, or the envelope
+/// another listing layer (on-demand migration list-through, table isolation)
+/// hands out; base64 keeps it URL-safe and is the only transform applied, so
+/// nodes from earlier releases read the same token.
+pub(crate) fn encode_list_objects_v2_continuation_token(cursor: &str) -> String {
+    base64_simd::STANDARD.encode_to_string(cursor.as_bytes())
+}
+
+/// Decodes a wire `ContinuationToken` into the server-side cursor it carries.
+/// A cursor issued by a 1.0.x server may still end in the metacache tag;
+/// ecstore strips it on the way in.
+fn decode_list_objects_v2_continuation_token(token: &str) -> Result<String, S3Error> {
+    let bytes = base64_simd::STANDARD
+        .decode_to_vec(token.as_bytes())
+        .map_err(|_| invalid_continuation_token())?;
+    String::from_utf8(bytes).map_err(|_| invalid_continuation_token())
+}
 
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
@@ -76,6 +99,8 @@ pub(crate) struct ListObjectsV2Params {
     pub response_start_after: Option<String>,
     pub start_after_for_query: Option<String>,
     pub response_continuation_token: Option<String>,
+    /// Server-side cursor carried by the request token; see
+    /// [`decode_list_objects_v2_continuation_token`].
     pub decoded_continuation_token: Option<String>,
 }
 
@@ -173,19 +198,9 @@ pub(crate) fn parse_list_objects_v2_params(
     // Save original continuation_token for response (per S3 API spec, must echo back if provided)
     let response_continuation_token = continuation_token.clone();
 
-    // Decode continuation_token from base64 for internal use
     let decoded_continuation_token = continuation_token
         .filter(|token| !token.is_empty())
-        .map(|token| {
-            base64_simd::STANDARD
-                .decode_to_vec(token.as_bytes())
-                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string()))
-                .and_then(|bytes| {
-                    String::from_utf8(bytes).map_err(|_| {
-                        S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid continuation token".to_string())
-                    })
-                })
-        })
+        .map(|token| decode_list_objects_v2_continuation_token(&token))
         .transpose()?;
 
     Ok(ListObjectsV2Params {
@@ -344,10 +359,9 @@ pub(crate) fn build_list_objects_v2_output(
     // KeyCount should include both objects and common prefixes per S3 API spec.
     let key_count = (objects.len() + common_prefixes.len()) as i32;
 
-    // Encode next_continuation_token to base64.
     let next_continuation_token = object_infos
         .next_continuation_token
-        .map(|token| base64_simd::STANDARD.encode_to_string(token.as_bytes()));
+        .map(|cursor| encode_list_objects_v2_continuation_token(&cursor));
 
     ListObjectsV2Output {
         is_truncated: Some(object_infos.is_truncated),
@@ -374,11 +388,25 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
         return None;
     }
 
-    if let Some(marker) = decoded_next_continuation_marker(v2) {
-        return Some(encode_list_output_value(
-            public_list_marker(&marker).to_owned(),
-            v2.encoding_type.as_ref(),
-        ));
+    // The token was built by this server around the internal cursor, which is
+    // the last raw key the walker scanned: on a delimiter page that folded into
+    // fewer prefixes than max-keys it lies past the last visible entry.
+    if let Some(mut marker) = v2
+        .next_continuation_token
+        .as_deref()
+        .and_then(|token| decode_list_objects_v2_continuation_token(token).ok())
+    {
+        // V2 cursors protect literal cache-shaped keys with an outer tag. V1
+        // exposes the key itself, which is sent back as a literal StartAfter.
+        // RUSTFS_COMPAT_TODO(listing-cursor-legacy-tag): Remove after supported upgrade sources stop issuing tagged V2 cursors.
+        let unescaped_len = marker
+            .strip_suffix("[rustfs_cache:v2,return:]")
+            .filter(|key| key.rfind("[rustfs_cache:").is_some_and(|start| key[start..].contains(']')))
+            .map(str::len);
+        if let Some(len) = unescaped_len {
+            marker.truncate(len);
+        }
+        return Some(encode_list_output_value(marker, v2.encoding_type.as_ref()));
     }
 
     let last_key = v2
@@ -419,54 +447,12 @@ fn calculate_next_marker(v2: &ListObjectsV2Output) -> Option<String> {
     }
 }
 
-fn public_list_marker(marker: &str) -> &str {
-    let Some(start_idx) = marker.rfind(LIST_CACHE_MARKER_TAG_PREFIX) else {
-        return marker;
-    };
-    let Some(tag_body) = marker[start_idx + 1..].strip_suffix(']') else {
-        return marker;
-    };
-
-    if is_list_cache_marker_tag(tag_body) {
-        &marker[..start_idx]
-    } else {
-        marker
-    }
-}
-
-fn is_list_cache_marker_tag(tag_body: &str) -> bool {
-    let mut has_supported_version = false;
-    let mut has_continuation_field = false;
-
-    for tag in tag_body.split(',') {
-        let Some((key, value)) = tag.split_once(':') else {
-            continue;
-        };
-
-        match key {
-            "rustfs_cache" => has_supported_version = LIST_CACHE_MARKER_TAG_VERSIONS.contains(&value),
-            "id" if !value.is_empty() => has_continuation_field = true,
-            "return" => has_continuation_field = true,
-            "p" | "s" if value.parse::<usize>().is_err() => return false,
-            _ => {}
-        }
-    }
-
-    has_supported_version && has_continuation_field
-}
-
-fn decoded_next_continuation_marker(v2: &ListObjectsV2Output) -> Option<String> {
-    let token = v2.next_continuation_token.as_ref()?;
-    let bytes = base64_simd::STANDARD.decode_to_vec(token.as_bytes()).ok()?;
-    String::from_utf8(bytes).ok()
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
         ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_buckets_output,
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        parse_list_object_versions_params, parse_list_objects_v2_params,
+        encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params, to_s3s_etag,
     };
     use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
@@ -551,30 +537,30 @@ mod tests {
         assert_eq!(output.next_marker, Some("zebra/".to_string()));
     }
 
+    // The V1 NextMarker is the cursor carried by the V2 token: the last raw key
+    // the walker scanned, which on a re-folded delimiter page lies past the last
+    // visible common prefix (ECA-03 / #944).
     #[test]
-    fn test_list_objects_next_marker_removes_internal_continuation_marker() {
-        let marker = "key-998[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+    fn test_list_objects_next_marker_uses_the_cursor_inside_the_v2_token() {
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
-            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
-            contents: Some(vec![Object {
-                key: Some("key-998".to_string()),
-                ..Default::default()
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token("data-1001")),
+            common_prefixes: Some(vec![CommonPrefix {
+                prefix: Some("data-".to_string()),
             }]),
             ..Default::default()
         };
 
         let output = build_list_objects_output(v2, None);
-        assert_eq!(output.next_marker.as_deref(), Some("key-998"));
+        assert_eq!(output.next_marker.as_deref(), Some("data-1001"));
     }
 
     #[test]
-    fn test_list_objects_next_marker_strips_internal_marker_when_url_encoded() {
-        let marker = "dir a/key[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+    fn test_list_objects_next_marker_url_encodes_the_v2_cursor() {
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
             encoding_type: Some(EncodingType::from_static(EncodingType::URL)),
-            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token("dir a/key")),
             contents: Some(vec![Object {
                 key: Some("dir%20a/key".to_string()),
                 ..Default::default()
@@ -586,37 +572,55 @@ mod tests {
         assert_eq!(output.next_marker.as_deref(), Some("dir%20a/key"));
     }
 
+    // A key that happens to end in the shape of the retired metacache tag is a
+    // key: the marker never carried a tag to strip, so nothing is stripped.
     #[test]
-    fn test_list_objects_next_marker_uses_visible_common_prefix_with_internal_token() {
-        let marker = "asdf[rustfs_cache:v2,id:list-cache-id,p:0,s:0]";
+    fn test_list_objects_next_marker_keeps_a_legacy_looking_key_suffix() {
+        let key = "key[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]";
         let v2 = ListObjectsV2Output {
             is_truncated: Some(true),
-            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
-            common_prefixes: Some(vec![CommonPrefix {
-                prefix: Some("asdf".to_string()),
-            }]),
-            ..Default::default()
-        };
-
-        let output = build_list_objects_output(v2, None);
-        assert_eq!(output.next_marker.as_deref(), Some("asdf"));
-    }
-
-    #[test]
-    fn test_list_objects_next_marker_preserves_cache_like_key_suffix() {
-        let marker = "key[rustfs_cache:v2]";
-        let v2 = ListObjectsV2Output {
-            is_truncated: Some(true),
-            next_continuation_token: Some(base64_simd::STANDARD.encode_to_string(marker.as_bytes())),
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token(key)),
             contents: Some(vec![Object {
-                key: Some(marker.to_string()),
+                key: Some(key.to_string()),
                 ..Default::default()
             }]),
             ..Default::default()
         };
 
         let output = build_list_objects_output(v2, None);
-        assert_eq!(output.next_marker.as_deref(), Some(marker));
+        assert_eq!(output.next_marker.as_deref(), Some(key));
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_returns_the_literal_key() {
+        for key in [
+            "key[rustfs_cache:v2,return:]",
+            "key[rustfs_cache:v1,id:x]suffix",
+            "key[rustfs_cache:v1,id:x][rustfs_cache:v2,return:]",
+        ] {
+            let cursor = format!("{key}[rustfs_cache:v2,return:]");
+            for encoding in [None, Some(EncodingType::from_static(EncodingType::URL))] {
+                let v2 = ListObjectsV2Output {
+                    is_truncated: Some(true),
+                    encoding_type: encoding.clone(),
+                    next_continuation_token: Some(encode_list_objects_v2_continuation_token(&cursor)),
+                    ..Default::default()
+                };
+                let expected = super::encode_list_output_value(key.to_owned(), encoding.as_ref());
+                assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(expected.as_str()));
+            }
+        }
+    }
+
+    #[test]
+    fn test_list_objects_next_marker_preserves_an_unescaped_literal_return_tag() {
+        let key = "key[rustfs_cache:v2,return:]";
+        let v2 = ListObjectsV2Output {
+            is_truncated: Some(true),
+            next_continuation_token: Some(encode_list_objects_v2_continuation_token(key)),
+            ..Default::default()
+        };
+        assert_eq!(build_list_objects_output(v2, None).next_marker.as_deref(), Some(key));
     }
 
     #[test]
@@ -736,6 +740,7 @@ mod tests {
             std::collections::HashMap::from([("x-amz-server-side-encryption".to_owned(), "aws:kms".to_owned())]),
             protected_metadata,
             std::collections::HashMap::new(),
+            std::collections::HashMap::from([("x-rustfs-encryption-original-size".to_owned(), "42".to_owned())]),
         ]
         .into_iter()
         .enumerate()
@@ -764,9 +769,9 @@ mod tests {
         let v1 = build_list_objects_output(v2.clone(), None);
         for listing in [&v1.contents, &v2.contents] {
             let entries = listing.as_ref().expect("listed objects");
-            assert_eq!(entries.len(), 4);
+            assert_eq!(entries.len(), 5);
             for (index, entry) in entries.iter().enumerate() {
-                assert_eq!(entry.e_tag.is_some(), index >= 2);
+                assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
                 assert_eq!(entry.key.as_deref(), Some(format!("object-{index}").as_str()));
                 assert_eq!(entry.size, Some(42));
             }
@@ -787,9 +792,9 @@ mod tests {
             None,
         );
         let versions = versions.versions.expect("listed versions");
-        assert_eq!(versions.len(), 4);
+        assert_eq!(versions.len(), 5);
         for (index, entry) in versions.iter().enumerate() {
-            assert_eq!(entry.e_tag.is_some(), index >= 2);
+            assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
             assert_eq!(entry.size, Some(42));
         }
     }
@@ -894,7 +899,7 @@ mod tests {
     }
 
     #[test]
-    fn test_list_objects_v2_next_continuation_token_is_base64_encoded() {
+    fn test_list_objects_v2_next_continuation_token_is_base64_of_the_cursor() {
         let object_infos = ListObjectsV2Info {
             next_continuation_token: Some("token-123".to_string()),
             ..Default::default()
@@ -914,10 +919,25 @@ mod tests {
 
         assert_eq!(output.continuation_token, Some("echo-token".to_string()));
         assert_eq!(output.start_after, Some("start-after".to_string()));
-        assert_eq!(
-            output.next_continuation_token,
-            Some(base64_simd::STANDARD.encode_to_string("token-123".as_bytes()))
-        );
+        let wire = output.next_continuation_token.expect("truncated page carries a token");
+        assert_eq!(wire, base64_simd::STANDARD.encode_to_string("token-123".as_bytes()));
+        assert!(!wire.contains("rustfs_cache"));
+
+        let parsed = parse_list_objects_v2_params(None, None, Some(1000), Some(wire.clone()), None).expect("round trip");
+        assert_eq!(parsed.response_continuation_token, Some(wire));
+        assert_eq!(parsed.decoded_continuation_token.as_deref(), Some("token-123"));
+    }
+
+    // A key that literally ends in the retired metacache tag survives the V2
+    // round trip unchanged: the API layer no longer strips anything.
+    #[test]
+    fn test_parse_list_objects_v2_params_round_trips_a_legacy_looking_literal_key() {
+        let key = "b[rustfs_cache:v1,return:]";
+        let wire = encode_list_objects_v2_continuation_token(key);
+
+        let parsed = parse_list_objects_v2_params(None, None, Some(2), Some(wire), None).expect("parse should succeed");
+
+        assert_eq!(parsed.decoded_continuation_token.as_deref(), Some(key));
     }
 
     #[test]
@@ -985,16 +1005,19 @@ mod tests {
         assert_eq!(parsed.decoded_continuation_token, None);
     }
 
+    // A token issued by a 1.0.x server is base64 of the marker with the metacache
+    // tag appended; it still paginates, and the tag is left for ecstore to strip.
     #[test]
-    fn test_parse_list_objects_v2_params_decodes_continuation_token() {
-        let raw = "token-123";
-        let encoded = base64_simd::STANDARD.encode_to_string(raw.as_bytes());
+    fn test_parse_list_objects_v2_params_decodes_plain_and_legacy_tagged_tokens() {
+        for raw in ["token-123", "key-998[rustfs_cache:v2,id:list-cache-id,src:walker,gen:live]"] {
+            let encoded = base64_simd::STANDARD.encode_to_string(raw.as_bytes());
 
-        let parsed =
-            parse_list_objects_v2_params(None, None, Some(1000), Some(encoded.clone()), None).expect("parse should succeed");
+            let parsed =
+                parse_list_objects_v2_params(None, None, Some(1000), Some(encoded.clone()), None).expect("parse should succeed");
 
-        assert_eq!(parsed.response_continuation_token, Some(encoded));
-        assert_eq!(parsed.decoded_continuation_token, Some(raw.to_string()));
+            assert_eq!(parsed.response_continuation_token, Some(encoded));
+            assert_eq!(parsed.decoded_continuation_token.as_deref(), Some(raw));
+        }
     }
 
     #[test]
@@ -1096,6 +1119,36 @@ mod tests {
                 prefix: Some("photos/".to_string())
             }]
         );
+    }
+
+    // ListObjectVersions NextKeyMarker is the plain last key of the page, as AWS
+    // defines it; earlier releases leaked the internal metacache tag here.
+    #[test]
+    fn test_build_list_object_versions_output_next_key_marker_is_the_plain_last_key() {
+        let object_infos = ListObjectVersionsInfo {
+            is_truncated: true,
+            next_marker: Some("obj-b".to_string()),
+            next_version_idmarker: Some("null".to_string()),
+            objects: vec![object_info("obj-a"), object_info("obj-b")],
+            prefixes: Vec::new(),
+        };
+
+        let output = build_list_object_versions_output(
+            object_infos,
+            "bucket-a".to_string(),
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 2,
+            },
+            None,
+        );
+
+        assert_eq!(output.is_truncated, Some(true));
+        assert_eq!(output.next_key_marker.as_deref(), Some("obj-b"));
+        assert_eq!(output.next_version_id_marker.as_deref(), Some("null"));
     }
 
     #[test]

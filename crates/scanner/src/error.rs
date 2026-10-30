@@ -36,6 +36,11 @@ pub enum ScannerError {
     #[error("Scanner error: {0}")]
     Other(String),
 
+    /// The persisted scanner cycle state could not be read (for example a lock timeout), so the
+    /// leader fence is unknown rather than known to have changed.
+    #[error("Scanner error: failed to read persisted scanner cycle state: {0}")]
+    CycleStateUnavailable(String),
+
     /// A remote namespace scanner request ID was already accepted.
     #[error("Remote namespace scanner request replay detected")]
     RemoteRequestReplay,
@@ -47,6 +52,10 @@ pub enum ScannerError {
     /// A remote namespace scanner request is already active for the target disk.
     #[error("Remote namespace scanner disk is already active")]
     RemoteDiskBusy,
+
+    /// Node resource pressure deferred work before its first storage poll.
+    #[error("Scanner node resource admission deferred")]
+    ResourceDeferred,
 
     /// Partial data usage cache produced before the scanner stopped.
     #[error("Scanner stopped with partial data usage cache")]

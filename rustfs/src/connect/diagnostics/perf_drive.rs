@@ -42,6 +42,12 @@ use zip::{CompressionMethod, ZipWriter, write::SimpleFileOptions};
 
 use crate::connect::DeviceIdentity;
 
+#[cfg(test)]
+#[path = "perf_drive/test_diagnostics.rs"]
+mod test_diagnostics;
+#[cfg(test)]
+use self::test_diagnostics::IoDiagnostic;
+
 pub const DRIVE_SCHEMA_VERSION: u16 = 1;
 pub const DRIVE_TOOL_ID: &str = "performance.drive";
 pub const DRIVE_CAPABILITY: &str = "performance.drive@1";
@@ -389,13 +395,36 @@ pub async fn measure_drive(
     let _lease = CollectorLease::acquire()?;
     let started = Instant::now();
     let deadline = tokio::time::Instant::now() + request.duration;
+    #[cfg(test)]
+    let scratch_diagnostic = IoDiagnostic::new("scratch_create", 0, 0, 0);
+    #[cfg(test)]
+    scratch_diagnostic.emit("start");
     let mut scratch = match ScratchGuard::create(request) {
         Ok(scratch) => scratch,
-        Err(error) => return Ok(failed_measurement(request, started.elapsed(), classify_io(&error), 0, 0, 0)),
+        Err(error) => {
+            #[cfg(test)]
+            scratch_diagnostic.emit("io_error");
+            return Ok(failed_measurement(request, started.elapsed(), classify_io(&error), 0, 0, 0));
+        }
     };
+    #[cfg(test)]
+    scratch_diagnostic.emit("complete");
 
     let measured = run_benchmark(request, &scratch, cancel, deadline).await;
+    #[cfg(test)]
+    let cleanup_diagnostic = IoDiagnostic::new("scratch_cleanup", 0, 0, 0);
+    #[cfg(test)]
+    cleanup_diagnostic.emit("start");
     let cleanup = scratch.cleanup();
+    #[cfg(test)]
+    {
+        cleanup_diagnostic.emit(if cleanup.is_ok() { "complete" } else { "io_error" });
+        eprintln!(
+            "connect_drive_total elapsed_us={} cleanup_succeeded={}",
+            started.elapsed().as_micros(),
+            cleanup.is_ok()
+        );
+    }
     let elapsed = started.elapsed().min(request.duration);
     if cleanup.is_err() {
         let (read_bytes, write_bytes, io_count) = match &measured {
@@ -661,7 +690,13 @@ async fn run_benchmark(
     cancel: &CancellationToken,
     deadline: tokio::time::Instant,
 ) -> Result<BenchmarkSample, BenchmarkFailure> {
+    #[cfg(test)]
+    let open_diagnostic = IoDiagnostic::new("file_open", 0, 0, 0);
+    #[cfg(test)]
+    open_diagnostic.emit("start");
     let std_file = scratch.open_file().map_err(BenchmarkFailure::Io)?;
+    #[cfg(test)]
+    open_diagnostic.emit("complete");
     let mut file = tokio::fs::File::from_std(std_file);
     let block_size = usize::try_from(request.block_bytes).map_err(|_| BenchmarkFailure::Verification)?;
     let write_buffer = vec![0xa5; block_size];
@@ -671,15 +706,36 @@ async fn run_benchmark(
     let write_started = Instant::now();
     while remaining > 0 {
         let length = usize::try_from(remaining.min(request.block_bytes)).map_err(|_| BenchmarkFailure::Verification)?;
-        cancellable(file.write_all(&write_buffer[..length]), cancel, deadline).await?;
+        cancellable(
+            file.write_all(&write_buffer[..length]),
+            cancel,
+            deadline,
+            #[cfg(test)]
+            IoDiagnostic::new("write", 0, write_bytes, io_count),
+        )
+        .await?;
         write_bytes = write_bytes.checked_add(length as u64).ok_or(BenchmarkFailure::Verification)?;
         io_count = io_count.checked_add(1).ok_or(BenchmarkFailure::Verification)?;
         remaining -= length as u64;
         tokio::task::yield_now().await;
     }
-    cancellable(file.sync_all(), cancel, deadline).await?;
+    cancellable(
+        file.sync_all(),
+        cancel,
+        deadline,
+        #[cfg(test)]
+        IoDiagnostic::new("sync_all", 0, write_bytes, io_count),
+    )
+    .await?;
     let write_latency = write_started.elapsed();
-    cancellable(file.seek(std::io::SeekFrom::Start(0)), cancel, deadline).await?;
+    cancellable(
+        file.seek(std::io::SeekFrom::Start(0)),
+        cancel,
+        deadline,
+        #[cfg(test)]
+        IoDiagnostic::new("seek", 0, write_bytes, io_count),
+    )
+    .await?;
 
     let mut read_buffer = vec![0_u8; block_size];
     remaining = request.scratch_bytes;
@@ -687,7 +743,14 @@ async fn run_benchmark(
     let read_started = Instant::now();
     while remaining > 0 {
         let length = usize::try_from(remaining.min(request.block_bytes)).map_err(|_| BenchmarkFailure::Verification)?;
-        cancellable(file.read_exact(&mut read_buffer[..length]), cancel, deadline).await?;
+        cancellable(
+            file.read_exact(&mut read_buffer[..length]),
+            cancel,
+            deadline,
+            #[cfg(test)]
+            IoDiagnostic::new("read", read_bytes, write_bytes, io_count),
+        )
+        .await?;
         if read_buffer[..length] != write_buffer[..length] {
             return Err(BenchmarkFailure::Verification);
         }
@@ -714,15 +777,26 @@ async fn cancellable<T, F>(
     operation: F,
     cancel: &CancellationToken,
     deadline: tokio::time::Instant,
+    #[cfg(test)] diagnostic: IoDiagnostic,
 ) -> Result<T, BenchmarkFailure>
 where
     F: std::future::Future<Output = std::io::Result<T>>,
 {
-    tokio::select! {
+    let result = tokio::select! {
         () = cancel.cancelled() => Err(BenchmarkFailure::Cancelled),
         () = tokio::time::sleep_until(deadline) => Err(BenchmarkFailure::TimedOut),
         result = operation => result.map_err(BenchmarkFailure::Io),
+    };
+    #[cfg(test)]
+    if let Err(error) = &result {
+        diagnostic.emit(match error {
+            BenchmarkFailure::Cancelled => "cancelled",
+            BenchmarkFailure::TimedOut => "timed_out",
+            BenchmarkFailure::Verification => "verification_failed",
+            BenchmarkFailure::Io(_) => "io_error",
+        });
     }
+    result
 }
 
 struct ScratchGuard {

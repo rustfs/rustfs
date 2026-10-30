@@ -16,8 +16,8 @@
 #
 # Forces a job failure and then runs .github/actions/schedule-failure-issue
 # through the exact `needs` + `always() && contains(needs.*.result,
-# 'failure')` wiring used by the real consumers (e2e-s3tests, mint, fuzz,
-# performance-ab). Dispatch it twice to verify both the issue-creation and
+# 'failure')` wiring used by the real consumers (e2e-s3tests, mint, fuzz).
+# Dispatch it twice to verify both the issue-creation and
 # the dedupe-comment paths, then close the resulting
 # "[scheduled-failure] Schedule Failure Alert Drill" issue in rustfs/backlog
 # (the default target repository). Requires the BACKLOG_ISSUE_TOKEN secret

@@ -72,7 +72,9 @@ completed or canceled probes do not consume shared discovery cursors.
 ## Entry points
 
 Every startup, including a clean restart, starts incremental raw discovery of
-local transaction records. During normal operation, deletion registers a
+local transaction records once the instance's bucket metadata system has been
+published. Bootstrap is not classified as a failed disk scope and cannot
+consume the initial discovery obligation. During normal operation, deletion registers a
 bounded, coalesced exact-key retry hint before preparing metadata. Synchronous
 completion clears only its own hint generation; an uncertain publication or
 unfinished cleanup remains eligible for automatic replay without another
@@ -82,6 +84,16 @@ Returning drives and queue overflow request discovery again, and a low-frequency
 bounded reconciliation scan covers records written through remote participants.
 Discovery advances by pages and retries failed sources separately, rather than
 rescanning every healthy bucket on each maintenance tick.
+
+Settlement uses a rolling window of at most four distinct keys, admitting at
+most sixteen attempts per maintenance tick. A slow shard verification or
+exact-key lock does not hold up other keys or later admission windows. A newer
+hint for an active key remains queued until that key's attempt completes.
+Cancellation retries admitted generations without clearing newer hints. Queue
+overflow remains covered by durable discovery, including after a restart.
+These limits bound background work, not the canonical rollback deadline or
+its durability checks.
+
 Corrupt record contents remain discoverable by their physical key; exact-key
 inspection rejects them without hiding later records. Unsafe paths, symlinks,
 and structural filesystem errors still stop that discovery scope.
@@ -92,6 +104,12 @@ same recovery core. Existing heal selection, lifecycle admission, namespace
 locking, and movement guards still apply. Prefix recovery settles only matching
 keys, including transactions hidden from listings. Dry-run inspects and reports without
 settling transactions.
+
+LIST does not remove historical residue on updated nodes. During a rolling
+upgrade, older nodes can still remove it while serving LIST. A bucket with
+hidden residue can still fail DeleteBucket; recover known keys with an
+unconditional exact-key DELETE, or inspect and remove eligible residue through
+administrator heal.
 
 An unconditional DELETE of a missing exact key, or an administrator heal with
 `remove` enabled, can authorize historical residue removal only when the
@@ -122,6 +140,36 @@ restore ambiguous data or bypass versioning and Object Lock protections.
 A missing specific-version DELETE first recovers hidden transactions and then
 reads the current version again. It must not acknowledge an unresolved hidden
 version as an idempotent no-op.
+
+## Historical heal backups
+
+Classify a retained backup from its original evidence before requesting any
+mutation. A readable current object, matching ETag or modification time does
+not prove that the transaction which created the backup completed.
+
+| Class | Evidence and handling |
+| --- | --- |
+| A: proven completed publication | The successful heal operation still owns its bucket, object and commit fences and has the exact backup returned by that publication. Its storage owner may unlink that backup. A historical pathname cannot reconstruct this authority after restart. |
+| B: identified unfinished transaction | A validated prepared journal or commit receipt identifies the delete/rollback owner. Use the existing transaction recovery path; do not treat its backup as a separate heal-cleanup candidate. |
+| C: unknown or conflicting history | Keep the backup and report its scope and inspection evidence. This includes a live write/heal backup without a durable success receipt, even when its metadata matches the current object. |
+
+For a known backup directory UUID, the existing
+`DiskAPI::inspect_delete_transaction(bucket, key, uuid)` reads the local or
+remote participant's evidence without settling it. Record the bucket
+incarnation, pool/set, UUID, metadata digests and inspection fingerprint. A
+result with no journal and a present `backup_digest` remains class C. In
+particular, delete state `Absent` can mean a matching live write backup rather
+than an absent file; it grants no cleanup permission. Delete discovery and
+administrator heal dry-run deliberately exclude those live backups, so their
+counts are not a complete inventory of historical heal files.
+
+Keep the original bytes through classification and repeated inspection. A
+changed fingerprint or scope requires a new inspection, not a retry of an old
+cleanup decision. Bucket recreation and active rebalance/decommission must
+reject or defer the original recovery admission. Ordinary object versions and
+tier free versions retain their own owners; local backup classification never
+authorizes deleting a remote tier object. There is no automatic historical-A
+cleaner for backups lacking the original publication authority.
 
 ## Upgrade and failure handling
 
@@ -206,7 +254,21 @@ curl with `--image`, and a unique Docker namespace. The optional
 `--baseline-binary` enables the mixed-version case. The harness uses synthetic
 S3 objects, localhost ports, labeled isolated volumes, and a non-root server.
 It stops only its own containers and keeps JSON results and logs in the chosen
-artifact directory. Production builds must not enable `e2e-test-hooks`.
+artifact directory. Production builds must not enable `e2e-test-hooks`. The `release-batch-crash`
+case accepts a normal release binary: it observes persisted preparation before
+SIGKILL in one round and persisted commit receipts in another, verifies automatic
+mixed inline/external recovery without a new DELETE
+or administrator request, and checks that a second clean restart is stable.
+This case does not pin an individual instruction or transaction phase.
+
+Physical settlement permits directory-only remnants that ordinary non-force
+bucket removal safely prunes. It rejects retained payloads, backup or transaction
+records, unknown files, and symbolic links. Final cleanup deletes only surviving
+objects before requiring ordinary bucket removal. An interrupted proof GC can
+also leave an empty transaction directory beside another drive's receipt.
+Recovery retires only that exact empty leaf before republishing a replay
+witness; a nonempty directory, including an empty nested prefix, remains
+protected. No recursive removal grants transaction authority.
 
 Run the preactivation/prepare/apply/decision process-stop cases, interrupted restore,
 returning and untouched peers, both generation orderings, version/retention
@@ -214,3 +276,52 @@ and prefix protection, administrator dry-run/removal, response-loss,
 permission/corruption, and mixed-version cases. Preserve the source identity
 of both binaries with the results. A passing process-stop matrix does not
 cover hardware power cuts, Windows runtime behavior, or DELETE throughput.
+
+
+## Performance acceptance
+
+Linux forward batch preparation admits at most eight independent keys per
+local disk request. Duplicate keys, ancestor/descendant keys, noncanonical
+paths, legacy operations, and rollback keep their ordered execution. Other
+platforms retain serial preparation. The existing per-key metadata lease,
+transaction publication, namespace ownership, and strict synchronization
+barriers still apply to every admitted operation.
+
+Use `scripts/test/delete_recovery_perf.py` for resource-matched release
+comparisons. Supply separate binaries and build receipts; each receipt binds
+`binary_sha256`, `source_head`, and the build fields `profile`, `opt_level`,
+`target`, `rustc`, `features`, `default_features`, `lto`, and `codegen_units`.
+Receipts must describe matching release builds at optimization level 3 without
+`e2e-test-hooks`. Preserve any source patch and the build command with them.
+For example:
+
+```sh
+python3 scripts/test/delete_recovery_perf.py \
+  --baseline-binary ./baseline/rustfs --baseline-receipt ./baseline/build.json \
+  --candidate-binary ./candidate/rustfs --candidate-receipt ./candidate/build.json \
+  --image rust:1.99.1-trixie --artifact-dir ./delete-performance-results \
+  --cpuset-cpus 2-5 --memory 4g
+```
+
+The runner uses an A1/B1/B2/A2 sequence with at least three repetitions per
+cohort. It checks original bytes and ETags, physical inline/external layouts,
+empty listings, physical cleanup, and bucket removal. Each sample also cleanly
+restarts its isolated server and waits for the bounded raw discovery page on
+every local disk. Startup observations retain whether discovery exceeded
+thirty seconds, including for historical baselines whose bootstrap race enters
+the thirty-second retry interval; the observation deadline is ninety seconds.
+A candidate exceeding the thirty-second budget fails acceptance even when the
+longer observation eventually completes.
+This separates server readiness and local discovery service time from the
+timed DELETE. DELETE begins no earlier than thirty-five seconds after restart
+in either variant, keeping process age and early maintenance phases comparable.
+Normal scanner/heal loops are disabled for this
+controlled attribution; automatic transaction recovery remains enabled.
+
+Cohorts share the same image, CPU set, memory limit, strict durability policy,
+and workload. A baseline or candidate drift above ten percent makes the result
+inconclusive and withholds improvement percentages. The artifact retains raw
+samples and per-operation cumulative disk service times. These concurrent
+service times are not an additive wall-clock decomposition. Four logical
+volumes on one Docker host filesystem do not represent four independent
+physical devices or establish hardware power-loss durability.
