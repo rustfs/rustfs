@@ -1376,6 +1376,51 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    pub fn catalog_restore_state_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/restore-state.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket)
+        )
+    }
+
+    pub fn catalog_restore_intent_path(&self, table_bucket: &str, restore_id: &str) -> String {
+        format!(
+            "{}/{}/{}/restores/{}.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket),
+            table_catalog_path_hash(restore_id)
+        )
+    }
+
+    pub fn legacy_backing_migration_fence_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.table_bucket_root_prefix(table_bucket),
+            "backing-migration",
+            "durable-strong-fence.json"
+        )
+    }
+
+    pub fn legacy_backing_migration_global_fence_path(&self) -> String {
+        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.json")
+    }
+
+    pub fn legacy_catalog_restore_intent_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/intent.json",
+            self.catalog_root,
+            "restore-intents",
+            table_catalog_path_hash(table_bucket)
+        )
+    }
+
+    pub fn legacy_catalog_snapshot_path(&self) -> String {
+        format!("{}/{}/{}", self.catalog_root, "strong-backing", "snapshot.json")
+    }
+
     pub fn catalog_backup_global_fence_lock_path(&self) -> String {
         format!("{}/{}/global-fence.lock", self.catalog_root, TABLE_CATALOG_BACKUP_ROOT)
     }
@@ -1993,17 +2038,24 @@ where
         }
     }
 
-    pub(crate) async fn restore_catalog_backup(
+    pub(crate) async fn restore_catalog_backup_with_id(
         &self,
         table_bucket: &str,
         backup_id: &str,
         expected_snapshot_etag: Option<&str>,
         allow_replace: bool,
+        restore_id: Option<&str>,
     ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
         match self {
             Self::ObjectBacked(store) => {
                 store
-                    .restore_object_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .restore_object_catalog_backup_with_id(
+                        table_bucket,
+                        backup_id,
+                        expected_snapshot_etag,
+                        allow_replace,
+                        restore_id,
+                    )
                     .await
             }
         }

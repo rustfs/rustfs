@@ -117,11 +117,12 @@ impl Operation for RestoreTableCatalogBackupHandler {
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
-            .restore_catalog_backup(
+            .restore_catalog_backup_with_id(
                 &warehouse,
                 &request.backup_id,
                 request.expected_snapshot_etag.as_deref(),
                 request.allow_replace,
+                request.restore_id.as_deref(),
             )
             .await
             .map_err(catalog_store_error);

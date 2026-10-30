@@ -443,6 +443,7 @@ where
     }
 
     pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        self.reject_legacy_catalog_global_state().await?;
         self.backend
             .acquire_read_lock(self.catalog_bucket(), &self.paths.catalog_backup_global_fence_lock_path())
             .await
@@ -452,16 +453,34 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
-        self.backend
+        let guard = self
+            .backend
             .acquire_read_lock(self.catalog_bucket(), &self.paths.catalog_backup_fence_lock_path(table_bucket))
-            .await
+            .await?;
+        self.ensure_no_active_restore(table_bucket).await?;
+        Ok(guard)
     }
 
     pub(super) async fn ensure_object_backed_catalog_write_permit_after_lock(
         &self,
-        _table_bucket: &str,
+        table_bucket: &str,
     ) -> TableCatalogStoreResult<()> {
-        Ok(())
+        self.ensure_no_active_restore(table_bucket).await
+    }
+
+    async fn with_catalog_restore_read<T>(
+        &self,
+        table_bucket: &str,
+        read: impl std::future::Future<Output = TableCatalogStoreResult<T>>,
+    ) -> TableCatalogStoreResult<T> {
+        // A persisted epoch also detects a restore that starts and finishes
+        // between these observations, even when catalog bytes return to an
+        // earlier value. No nested read lease is needed on this read path.
+        let restore_version = self.catalog_restore_read_version(table_bucket).await?;
+        let result = read.await?;
+        self.finish_catalog_restore_read(table_bucket, restore_version.as_deref())
+            .await?;
+        Ok(result)
     }
 
     async fn list_entry_page<T, P, V>(
@@ -1774,16 +1793,19 @@ where
     }
 
     pub(in crate::table_catalog) async fn warehouse_index_ready(&self, table_bucket: &str) -> TableCatalogStoreResult<bool> {
-        let Some((state, _)) = self
-            .read_entry::<TableWarehouseIndexStateEntry>(
-                self.catalog_bucket(),
-                &self.paths.warehouse_index_state_path(table_bucket),
-            )
-            .await?
-        else {
-            return Ok(false);
-        };
-        table_warehouse_index_state_ready(&state, table_bucket)
+        self.with_catalog_restore_read(table_bucket, async {
+            let Some((state, _)) = self
+                .read_entry::<TableWarehouseIndexStateEntry>(
+                    self.catalog_bucket(),
+                    &self.paths.warehouse_index_state_path(table_bucket),
+                )
+                .await?
+            else {
+                return Ok(false);
+            };
+            table_warehouse_index_state_ready(&state, table_bucket)
+        })
+        .await
     }
 
     async fn warehouse_index_entry_has_active_owner(&self, index: &TableWarehouseIndexEntry) -> TableCatalogStoreResult<bool> {
@@ -2890,25 +2912,28 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
-        self.require_table_bucket(table_bucket).await?;
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        if self.get_namespace(table_bucket, &namespace.public_name()).await?.is_none() {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "namespace {}/{}",
-                table_bucket,
-                namespace.public_name()
-            )));
-        }
-        let bridge_path = self.paths.external_catalog_bridge_path(table_bucket, &namespace, &table);
-        let Some((entry, _)) = self
-            .read_entry::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &bridge_path)
-            .await?
-        else {
-            return Ok(None);
-        };
-        validate_external_catalog_bridge_entry_object(&self.paths, &bridge_path, &entry)?;
-        Ok(Some(entry))
+        self.with_catalog_restore_read(table_bucket, async {
+            self.require_table_bucket(table_bucket).await?;
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            if self.get_namespace(table_bucket, &namespace.public_name()).await?.is_none() {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "namespace {}/{}",
+                    table_bucket,
+                    namespace.public_name()
+                )));
+            }
+            let bridge_path = self.paths.external_catalog_bridge_path(table_bucket, &namespace, &table);
+            let Some((entry, _)) = self
+                .read_entry::<ExternalCatalogBridgeEntry>(self.catalog_bucket(), &bridge_path)
+                .await?
+            else {
+                return Ok(None);
+            };
+            validate_external_catalog_bridge_entry_object(&self.paths, &bridge_path, &entry)?;
+            Ok(Some(entry))
+        })
+        .await
     }
 
     pub(crate) async fn put_external_catalog_bridge(
@@ -3067,17 +3092,20 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        self.table_commit_recovery_report_for_entry(&entry, 0).await
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            self.table_commit_recovery_report_for_entry(&entry, 0).await
+        })
+        .await
     }
 
     pub(crate) async fn recover_table_commits(
@@ -3147,18 +3175,21 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
 
-        self.get_table_maintenance_config_for_entry(&entry).await
+            self.get_table_maintenance_config_for_entry(&entry).await
+        })
+        .await
     }
 
     pub(super) async fn get_table_maintenance_config_for_entry(
@@ -3204,19 +3235,22 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceEffectiveConfig> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
 
-        self.get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
-            .await
+            self.get_effective_table_maintenance_config_for_entry_unlocked(table_bucket, &namespace, &table, &entry)
+                .await
+        })
+        .await
     }
 
     pub(super) async fn get_effective_table_maintenance_config_for_entry_unlocked(
@@ -3387,19 +3421,28 @@ where
         table: &str,
         job_id: &str,
     ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
 
-        self.get_table_metadata_maintenance_report_for_entry_unlocked(table_bucket, &namespace, &table, &entry.table_id, job_id)
+            self.get_table_metadata_maintenance_report_for_entry_unlocked(
+                table_bucket,
+                &namespace,
+                &table,
+                &entry.table_id,
+                job_id,
+            )
             .await
+        })
+        .await
     }
 
     pub(super) async fn get_table_metadata_maintenance_report_for_entry_unlocked(
@@ -3461,17 +3504,20 @@ where
         table: &str,
         now: OffsetDateTime,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        self.get_table_maintenance_scheduler_report_for_entry_at(&entry, now).await
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            self.get_table_maintenance_scheduler_report_for_entry_at(&entry, now).await
+        })
+        .await
     }
 
     pub(super) async fn get_table_maintenance_scheduler_report_for_entry_at(
@@ -4909,25 +4955,28 @@ where
     where
         P: TableCatalogObjectBackend,
     {
-        validate_table_snapshot_expiration_config(&config)?;
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
-            return Err(TableCatalogStoreError::Invalid(
-                "current metadata location must be inside the table metadata directory".to_string(),
-            ));
-        }
+        self.with_catalog_restore_read(table_bucket, async {
+            validate_table_snapshot_expiration_config(&config)?;
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "current metadata location must be inside the table metadata directory".to_string(),
+                ));
+            }
 
-        self.plan_table_snapshot_expiration_for_entry_with_backend(metadata_backend, &entry, config)
-            .await
+            self.plan_table_snapshot_expiration_for_entry_with_backend(metadata_backend, &entry, config)
+                .await
+        })
+        .await
     }
 
     pub(super) async fn plan_table_snapshot_expiration_for_entry_with_backend<P>(
@@ -4975,24 +5024,27 @@ where
         table: &str,
         config: TableCompactionPlanningConfig,
     ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
-        validate_table_compaction_planning_config(&config)?;
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
-            return Err(TableCatalogStoreError::Invalid(
-                "current metadata location must be inside the table metadata directory".to_string(),
-            ));
-        }
+        self.with_catalog_restore_read(table_bucket, async {
+            validate_table_compaction_planning_config(&config)?;
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            if !is_valid_table_metadata_location(&namespace, &table, &entry.metadata_location) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "current metadata location must be inside the table metadata directory".to_string(),
+                ));
+            }
 
-        self.plan_table_compaction_for_entry(&entry, config).await
+            self.plan_table_compaction_for_entry(&entry, config).await
+        })
+        .await
     }
 
     pub(super) async fn plan_table_compaction_for_entry(
@@ -5232,9 +5284,12 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableCatalogExport> {
-        self.table_catalog_export_with_recovery(table_bucket, namespace, table)
-            .await
-            .map(|(catalog, _)| catalog)
+        self.with_catalog_restore_read(table_bucket, async {
+            self.table_catalog_export_with_recovery(table_bucket, namespace, table)
+                .await
+                .map(|(catalog, _)| catalog)
+        })
+        .await
     }
 
     async fn table_catalog_export_with_recovery(
@@ -5295,10 +5350,13 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableCatalogDiagnosticsReport> {
-        let (catalog, commit_recovery) = self
-            .table_catalog_export_with_recovery(table_bucket, namespace, table)
-            .await?;
-        diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
+        self.with_catalog_restore_read(table_bucket, async {
+            let (catalog, commit_recovery) = self
+                .table_catalog_export_with_recovery(table_bucket, namespace, table)
+                .await?;
+            diagnose_table_catalog_from_export(&self.backend, catalog, commit_recovery, retain_recent_metadata_files).await
+        })
+        .await
     }
 
     pub(crate) async fn plan_table_metadata_maintenance(
@@ -5308,18 +5366,21 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, false)
-            .await
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, false)
+                .await
+        })
+        .await
     }
 
     pub(crate) async fn run_table_metadata_maintenance_planning(
@@ -6239,12 +6300,15 @@ where
     B: TableCatalogObjectBackend,
 {
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
-        let object = self.paths.table_bucket_entry_path(table_bucket);
-        let Some((entry, _)) = self.read_entry::<TableBucketEntry>(self.catalog_bucket(), &object).await? else {
-            return Ok(None);
-        };
-        validate_table_bucket_entry_object(&self.paths, &object, &entry)?;
-        Ok(Some(entry))
+        self.with_catalog_restore_read(table_bucket, async {
+            let object = self.paths.table_bucket_entry_path(table_bucket);
+            let Some((entry, _)) = self.read_entry::<TableBucketEntry>(self.catalog_bucket(), &object).await? else {
+                return Ok(None);
+            };
+            validate_table_bucket_entry_object(&self.paths, &object, &entry)?;
+            Ok(Some(entry))
+        })
+        .await
     }
 
     async fn put_table_bucket(&self, mut entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
@@ -6397,8 +6461,11 @@ where
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
-        self.list_active_namespaces_with_prefix(&self.paths.namespace_entries_prefix(table_bucket))
-            .await
+        self.with_catalog_restore_read(table_bucket, async {
+            self.list_active_namespaces_with_prefix(&self.paths.namespace_entries_prefix(table_bucket))
+                .await
+        })
+        .await
     }
 
     async fn list_namespaces_page(
@@ -6407,39 +6474,45 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
-        self.list_entry_page(
-            &self.paths.namespace_entries_prefix(table_bucket),
-            NAMESPACE_ENTRY_FILE,
-            cursor,
-            limit,
-            |entry: &NamespaceEntry| entry.state == TableCatalogEntryState::Active,
-            |object, entry: &NamespaceEntry| validate_namespace_entry_object(&self.paths, object, entry),
-        )
+        self.with_catalog_restore_read(table_bucket, async {
+            self.list_entry_page(
+                &self.paths.namespace_entries_prefix(table_bucket),
+                NAMESPACE_ENTRY_FILE,
+                cursor,
+                limit,
+                |entry: &NamespaceEntry| entry.state == TableCatalogEntryState::Active,
+                |object, entry: &NamespaceEntry| validate_namespace_entry_object(&self.paths, object, entry),
+            )
+            .await
+        })
         .await
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let namespace_path = self.paths.namespace_entry_path(table_bucket, &namespace);
-        let exact = self
-            .read_entry::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
-            .await?
-            .map(|(entry, _)| entry);
-        if let Some(entry) = exact.as_ref() {
-            validate_namespace_entry_object(&self.paths, &namespace_path, entry)?;
-        }
-        if exact
-            .as_ref()
-            .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
-        {
-            return Ok(exact);
-        }
-        if self.has_active_namespace_object(table_bucket, &namespace).await?
-            || self.has_active_namespace_descendant(table_bucket, &namespace).await?
-        {
-            return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
-        }
-        Ok(None)
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let namespace_path = self.paths.namespace_entry_path(table_bucket, &namespace);
+            let exact = self
+                .read_entry::<NamespaceEntry>(self.catalog_bucket(), &namespace_path)
+                .await?
+                .map(|(entry, _)| entry);
+            if let Some(entry) = exact.as_ref() {
+                validate_namespace_entry_object(&self.paths, &namespace_path, entry)?;
+            }
+            if exact
+                .as_ref()
+                .is_some_and(|entry| entry.state == TableCatalogEntryState::Active)
+            {
+                return Ok(exact);
+            }
+            if self.has_active_namespace_object(table_bucket, &namespace).await?
+                || self.has_active_namespace_descendant(table_bucket, &namespace).await?
+            {
+                return Ok(Some(synthetic_namespace_entry(table_bucket, &namespace)));
+            }
+            Ok(None)
+        })
+        .await
     }
 
     async fn update_namespace_properties(
@@ -6509,9 +6582,12 @@ where
     }
 
     async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
-        let parent = parse_namespace_for_store(parent)?;
-        let prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), parent.storage_id());
-        self.list_active_namespaces_with_prefix(&prefix).await
+        self.with_catalog_restore_read(table_bucket, async {
+            let parent = parse_namespace_for_store(parent)?;
+            let prefix = format!("{}{}/", self.paths.namespace_entries_prefix(table_bucket), parent.storage_id());
+            self.list_active_namespaces_with_prefix(&prefix).await
+        })
+        .await
     }
 
     async fn list_namespace_children(
@@ -6519,25 +6595,28 @@ where
         table_bucket: &str,
         parent: Option<&str>,
     ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
-        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
-            .ok_or_else(|| TableCatalogStoreError::Internal("catalog namespace list limit must be positive".to_string()))?;
-        let mut entries = Vec::new();
-        let mut cursor = None;
-        loop {
-            let page = self
-                .list_namespace_children_page_inner(table_bucket, parent, cursor.as_deref(), limit)
-                .await?;
-            entries.extend(page.entries);
-            let Some(next_cursor) = page.next_cursor else {
-                return Ok(entries);
-            };
-            if cursor.as_deref() == Some(next_cursor.as_str()) {
-                return Err(TableCatalogStoreError::Internal(
-                    "catalog namespace child pagination did not advance".to_string(),
-                ));
+        self.with_catalog_restore_read(table_bucket, async {
+            let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+                .ok_or_else(|| TableCatalogStoreError::Internal("catalog namespace list limit must be positive".to_string()))?;
+            let mut entries = Vec::new();
+            let mut cursor = None;
+            loop {
+                let page = self
+                    .list_namespace_children_page_inner(table_bucket, parent, cursor.as_deref(), limit)
+                    .await?;
+                entries.extend(page.entries);
+                let Some(next_cursor) = page.next_cursor else {
+                    return Ok(entries);
+                };
+                if cursor.as_deref() == Some(next_cursor.as_str()) {
+                    return Err(TableCatalogStoreError::Internal(
+                        "catalog namespace child pagination did not advance".to_string(),
+                    ));
+                }
+                cursor = Some(next_cursor);
             }
-            cursor = Some(next_cursor);
-        }
+        })
+        .await
     }
 
     async fn list_namespace_children_page(
@@ -6547,8 +6626,11 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
-        self.list_namespace_children_page_inner(table_bucket, parent, cursor, limit)
-            .await
+        self.with_catalog_restore_read(table_bucket, async {
+            self.list_namespace_children_page_inner(table_bucket, parent, cursor, limit)
+                .await
+        })
+        .await
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
@@ -6624,44 +6706,53 @@ where
     }
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        let read_version = self.table_rename_read_version(table_bucket).await?;
-        let namespace = parse_namespace_for_store(namespace)?;
-        let mut entries = Vec::new();
-        for object in self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.table_entries_prefix(table_bucket, &namespace))
-            .await?
-        {
-            if !object.ends_with(TABLE_ENTRY_FILE) {
-                continue;
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_rename_read_version(table_bucket).await?;
+            let namespace = parse_namespace_for_store(namespace)?;
+            let mut entries = Vec::new();
+            for object in self
+                .backend
+                .list_objects(self.catalog_bucket(), &self.paths.table_entries_prefix(table_bucket, &namespace))
+                .await?
+            {
+                if !object.ends_with(TABLE_ENTRY_FILE) {
+                    continue;
+                }
+                let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
+                    continue;
+                };
+                validate_table_entry_object(&self.paths, &object, &entry)?;
+                if entry.state == TableCatalogEntryState::Active {
+                    entries.push(entry);
+                }
             }
-            let Some((entry, _)) = self.read_entry::<TableEntry>(self.catalog_bucket(), &object).await? else {
-                continue;
-            };
-            validate_table_entry_object(&self.paths, &object, &entry)?;
-            if entry.state == TableCatalogEntryState::Active {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by(|left, right| left.table.cmp(&right.table));
-        self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
-        Ok(entries)
+            entries.sort_by(|left, right| left.table.cmp(&right.table));
+            self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
+            Ok(entries)
+        })
+        .await
     }
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
-        let read_version = self.table_rename_read_version(table_bucket).await?;
-        let entries = self.list_all_table_entries(table_bucket).await.map(|entries| {
-            entries
-                .into_iter()
-                .filter(|entry| entry.state == TableCatalogEntryState::Active)
-                .collect()
-        })?;
-        self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
-        Ok(entries)
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_rename_read_version(table_bucket).await?;
+            let entries = self.list_all_table_entries(table_bucket).await.map(|entries| {
+                entries
+                    .into_iter()
+                    .filter(|entry| entry.state == TableCatalogEntryState::Active)
+                    .collect()
+            })?;
+            self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
+            Ok(entries)
+        })
+        .await
     }
 
     async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
-        self.ensure_table_warehouse_prefix_available(candidate, None).await
+        self.with_catalog_restore_read(&candidate.table_bucket, async {
+            self.ensure_table_warehouse_prefix_available(candidate, None).await
+        })
+        .await
     }
 
     async fn list_tables_page(
@@ -6671,30 +6762,36 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
-        let read_version = self.table_rename_read_version(table_bucket).await?;
-        let namespace = parse_namespace_for_store(namespace)?;
-        let page = self
-            .list_entry_page(
-                &self.paths.table_entries_prefix(table_bucket, &namespace),
-                TABLE_ENTRY_FILE,
-                cursor,
-                limit,
-                |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
-                |object, entry: &TableEntry| validate_table_entry_object(&self.paths, object, entry).map(|_| ()),
-            )
-            .await?;
-        self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
-        Ok(page)
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_rename_read_version(table_bucket).await?;
+            let namespace = parse_namespace_for_store(namespace)?;
+            let page = self
+                .list_entry_page(
+                    &self.paths.table_entries_prefix(table_bucket, &namespace),
+                    TABLE_ENTRY_FILE,
+                    cursor,
+                    limit,
+                    |entry: &TableEntry| entry.state == TableCatalogEntryState::Active,
+                    |object, entry: &TableEntry| validate_table_entry_object(&self.paths, object, entry).map(|_| ()),
+                )
+                .await?;
+            self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
+            Ok(page)
+        })
+        .await
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
-        let read_version = self.table_rename_read_version(table_bucket).await?;
-        let entry = self
-            .load_table_entry(table_bucket, namespace, table)
-            .await
-            .map(|entry| entry.filter(|table| table.state == TableCatalogEntryState::Active))?;
-        self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
-        Ok(entry)
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_rename_read_version(table_bucket).await?;
+            let entry = self
+                .load_table_entry(table_bucket, namespace, table)
+                .await
+                .map(|entry| entry.filter(|table| table.state == TableCatalogEntryState::Active))?;
+            self.finish_table_rename_read(table_bucket, read_version.as_deref()).await?;
+            Ok(entry)
+        })
+        .await
     }
 
     async fn rename_table(
@@ -6914,26 +7011,29 @@ where
         if table_bucket.is_empty() || object.is_empty() {
             return Ok(None);
         }
-        let read_version = self.table_data_plane_read_version(table_bucket).await?;
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_data_plane_read_version(table_bucket).await?;
 
-        let resource = if self.warehouse_index_ready(table_bucket).await? {
-            self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
-        } else {
-            match self.backfill_table_warehouse_index_for_data_plane(table_bucket).await {
-                Ok(()) => self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await,
-                Err(err @ TableCatalogStoreError::Internal(_)) => {
-                    tracing::warn!(
-                        table_bucket = %table_bucket,
-                        error = %err,
-                        "failed to backfill table warehouse index; falling back to catalog scan"
-                    );
-                    self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
+            let resource = if self.warehouse_index_ready(table_bucket).await? {
+                self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
+            } else {
+                match self.backfill_table_warehouse_index_for_data_plane(table_bucket).await {
+                    Ok(()) => self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await,
+                    Err(err @ TableCatalogStoreError::Internal(_)) => {
+                        tracing::warn!(
+                            table_bucket = %table_bucket,
+                            error = %err,
+                            "failed to backfill table warehouse index; falling back to catalog scan"
+                        );
+                        self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
+                    }
+                    Err(err) => Err(err),
                 }
-                Err(err) => Err(err),
-            }
-        }?;
-        self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
-        Ok(resource)
+            }?;
+            self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
+            Ok(resource)
+        })
+        .await
     }
 
     async fn resolve_table_metadata_data_plane_resource(
@@ -6944,11 +7044,14 @@ where
         if table_bucket.is_empty() || table_identity_from_metadata_object_key(object).is_none() {
             return Ok(None);
         }
-        let read_version = self.table_data_plane_read_version(table_bucket).await?;
-        let entries = self.list_all_table_entries(table_bucket).await?;
-        let resource = table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)?;
-        self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
-        Ok(resource)
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_data_plane_read_version(table_bucket).await?;
+            let entries = self.list_all_table_entries(table_bucket).await?;
+            let resource = table_metadata_data_plane_resource_from_entries(&entries, table_bucket, object)?;
+            self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
+            Ok(resource)
+        })
+        .await
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
@@ -7478,26 +7581,29 @@ where
     }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let mut entries = Vec::new();
-        for object in self
-            .backend
-            .list_objects(self.catalog_bucket(), &self.paths.view_entries_prefix(table_bucket, &namespace))
-            .await?
-        {
-            if !object.ends_with(VIEW_ENTRY_FILE) {
-                continue;
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let mut entries = Vec::new();
+            for object in self
+                .backend
+                .list_objects(self.catalog_bucket(), &self.paths.view_entries_prefix(table_bucket, &namespace))
+                .await?
+            {
+                if !object.ends_with(VIEW_ENTRY_FILE) {
+                    continue;
+                }
+                let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? else {
+                    continue;
+                };
+                validate_view_entry_object(&self.paths, &object, &entry)?;
+                if entry.state == TableCatalogEntryState::Active {
+                    entries.push(entry);
+                }
             }
-            let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? else {
-                continue;
-            };
-            validate_view_entry_object(&self.paths, &object, &entry)?;
-            if entry.state == TableCatalogEntryState::Active {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by(|left, right| left.view.cmp(&right.view));
-        Ok(entries)
+            entries.sort_by(|left, right| left.view.cmp(&right.view));
+            Ok(entries)
+        })
+        .await
     }
 
     async fn list_views_page(
@@ -7507,27 +7613,33 @@ where
         cursor: Option<&str>,
         limit: NonZeroUsize,
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        self.list_entry_page(
-            &self.paths.view_entries_prefix(table_bucket, &namespace),
-            VIEW_ENTRY_FILE,
-            cursor,
-            limit,
-            |entry: &ViewEntry| entry.state == TableCatalogEntryState::Active,
-            |object, entry: &ViewEntry| validate_view_entry_object(&self.paths, object, entry).map(|_| ()),
-        )
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            self.list_entry_page(
+                &self.paths.view_entries_prefix(table_bucket, &namespace),
+                VIEW_ENTRY_FILE,
+                cursor,
+                limit,
+                |entry: &ViewEntry| entry.state == TableCatalogEntryState::Active,
+                |object, entry: &ViewEntry| validate_view_entry_object(&self.paths, object, entry).map(|_| ()),
+            )
+            .await
+        })
         .await
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let view = parse_table_for_store(view)?;
-        let object = self.paths.view_entry_path(table_bucket, &namespace, &view);
-        let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? else {
-            return Ok(None);
-        };
-        validate_view_entry_object(&self.paths, &object, &entry)?;
-        Ok((entry.state == TableCatalogEntryState::Active).then_some(entry))
+        self.with_catalog_restore_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let view = parse_table_for_store(view)?;
+            let object = self.paths.view_entry_path(table_bucket, &namespace, &view);
+            let Some((entry, _)) = self.read_entry::<ViewEntry>(self.catalog_bucket(), &object).await? else {
+                return Ok(None);
+            };
+            validate_view_entry_object(&self.paths, &object, &entry)?;
+            Ok((entry.state == TableCatalogEntryState::Active).then_some(entry))
+        })
+        .await
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
@@ -7722,7 +7834,10 @@ where
         table_id: &str,
         commit_id: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
-        self.read_commit_log_entry(table_bucket, table_id, commit_id).await
+        self.with_catalog_restore_read(table_bucket, async {
+            self.read_commit_log_entry(table_bucket, table_id, commit_id).await
+        })
+        .await
     }
 
     async fn get_commit_by_idempotency_key(
@@ -7731,8 +7846,11 @@ where
         table_id: &str,
         idempotency_key: &str,
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
-        self.read_commit_idempotency_entry(table_bucket, table_id, idempotency_key)
-            .await
+        self.with_catalog_restore_read(table_bucket, async {
+            self.read_commit_idempotency_entry(table_bucket, table_id, idempotency_key)
+                .await
+        })
+        .await
     }
 }
 

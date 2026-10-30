@@ -87,6 +87,16 @@ async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Respons
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
+async fn call_catalog_restore_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router
+        .insert("/iceberg/v1/{warehouse}/catalog/restore", ())
+        .expect("restore test route should insert");
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("restore test route should match");
+    RestoreTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
 async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router
@@ -2541,6 +2551,231 @@ fn table_maintenance_worker_condition_rejects_null_malformed_duplicate_and_unkno
     ] {
         assert!(serde_json::from_str::<TableMaintenanceWorkerRunRequest>(body).is_err(), "{body}");
     }
+}
+
+#[test]
+fn catalog_restore_request_accepts_legacy_and_explicit_restore_id() {
+    let legacy: CatalogRestoreRequest =
+        serde_json::from_str(r#"{"backup-id":"backup-a"}"#).expect("legacy restore request should parse");
+    assert_eq!(legacy.backup_id, "backup-a");
+    assert!(legacy.restore_id.is_none());
+    assert!(legacy.expected_snapshot_etag.is_none());
+    assert!(!legacy.allow_replace);
+
+    let explicit: CatalogRestoreRequest = serde_json::from_str(
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","expected-snapshot-etag":"target-a","allow-replace":true}"#,
+    )
+    .expect("restore request with id should parse");
+    assert_eq!(explicit.restore_id.as_deref(), Some("restore-a"));
+    assert_eq!(explicit.expected_snapshot_etag.as_deref(), Some("target-a"));
+    assert!(explicit.allow_replace);
+}
+
+#[test]
+fn catalog_restore_request_rejects_ambiguous_or_unknown_fields() {
+    for body in [
+        r#"{"backup-id":"backup-a","restore-id":42}"#,
+        r#"{"backup-id":"backup-a","restore-id":false}"#,
+        r#"{"backup-id":"backup-a","restore-id":[]}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","restore-id":"restore-b"}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","force":true}"#,
+        r#"{"backup-id":"backup-a","restoreId":"restore-a"}"#,
+    ] {
+        assert!(serde_json::from_str::<CatalogRestoreRequest>(body).is_err(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn catalog_restore_handler_authenticates_legacy_and_identified_requests_before_store_access() {
+    for body in [
+        r#"{"backup-id":"backup-a"}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a"}"#,
+    ] {
+        let request = S3Request {
+            input: Body::from(body.as_bytes().to_vec()),
+            method: Method::POST,
+            uri: "/iceberg/v1/warehouse/catalog/restore".parse().expect("restore URI"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let error = call_catalog_restore_handler(request)
+            .await
+            .expect_err("restore requires authentication before resolving an object store");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("authentication required"));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let bucket = format!("restore-request-{}", Uuid::new_v4().simple());
+            object_store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("restore bucket should be created");
+            enable_table_bucket_marker(&object_store, &bucket)
+                .await
+                .expect("restore bucket marker should be enabled");
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("request IAM format should be seeded");
+            let iam = rustfs_iam::build_iam_sys(object_store.clone())
+                .await
+                .expect("request IAM should initialize");
+            iam.create_user(
+                "restore-request-reader",
+                &AddOrUpdateUserReq {
+                    secret_key: "restore-request-reader-secret".to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("unprivileged restore caller should be created");
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam }),
+                Arc::new(RequestKms),
+            ));
+            let root_access_key = "restore-request-root";
+            let root_secret_key = "restore-request-root-secret";
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: root_access_key.to_string(),
+                secret_key: root_secret_key.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store);
+            let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+                backend.clone(),
+                crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+            );
+            catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("restore bucket catalog should be seeded");
+            let backup = catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("backup should be created");
+            let request = |body: serde_json::Value| {
+                let mut request = table_catalog_handler_request(context.clone(), root_access_key, root_secret_key);
+                request.method = Method::POST;
+                request.uri = format!("/iceberg/v1/{bucket}/catalog/restore")
+                    .parse()
+                    .expect("restore request URI");
+                request.input = Body::from(serde_json::to_vec(&body).expect("restore request body"));
+                request
+            };
+            let inventory = || async {
+                let mut objects = BTreeMap::new();
+                for path in backend
+                    .list_objects(crate::admin::storage_api::RUSTFS_META_BUCKET, "")
+                    .await
+                    .expect("catalog inventory should list")
+                {
+                    let object = backend
+                        .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &path)
+                        .await
+                        .expect("catalog inventory object should read")
+                        .expect("listed catalog object should exist");
+                    objects.insert(path, (object.data, object.etag));
+                }
+                objects
+            };
+            for restore_id in [String::new(), "x".repeat(1025)] {
+                let before = inventory().await;
+                let error = call_catalog_restore_handler(request(serde_json::json!({
+                    "backup-id": backup.backup_id,
+                    "restore-id": restore_id
+                })))
+                .await
+                .expect_err("invalid restore id must be rejected");
+                assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+                assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+                assert_eq!(inventory().await, before, "invalid id mutated catalog objects");
+            }
+            let body = serde_json::json!({"backup-id": backup.backup_id, "restore-id": "restore-a"});
+            let before = inventory().await;
+            let mut unauthenticated = request(body.clone());
+            unauthenticated.credentials = None;
+            let error = call_catalog_restore_handler(unauthenticated)
+                .await
+                .expect_err("unauthenticated restore must be rejected");
+            assert!(error.message().unwrap_or_default().contains("authentication required"));
+            assert_eq!(inventory().await, before, "unauthenticated restore mutated catalog objects");
+
+            let mut unauthorized = request(body.clone());
+            unauthorized.credentials = Some(s3s::auth::Credentials {
+                access_key: "restore-request-reader".to_string(),
+                secret_key: s3s::auth::SecretKey::from("restore-request-reader-secret".to_string()),
+            });
+            let error = call_catalog_restore_handler(unauthorized)
+                .await
+                .expect_err("unprivileged restore caller must be rejected");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(inventory().await, before, "unauthorized restore mutated catalog objects");
+
+            let initial = call_catalog_restore_handler(request(body.clone()))
+                .await
+                .expect("identified restore should succeed");
+            assert_eq!(initial.output.0, StatusCode::OK);
+            let initial = http_body_util::BodyExt::collect(initial.output.1)
+                .await
+                .expect("initial receipt body")
+                .to_bytes();
+            let initial: serde_json::Value = serde_json::from_slice(&initial).expect("initial receipt JSON");
+            let state_path = crate::table_catalog::TableCatalogObjectPaths::default().catalog_restore_state_path(&bucket);
+            let barrier = backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &state_path)
+                .await
+                .expect("restore barrier should read")
+                .expect("restore barrier should exist");
+            let barrier: serde_json::Value = serde_json::from_slice(&barrier.data).expect("restore barrier JSON");
+            assert_eq!(barrier["restore_id"], "restore-a", "handler did not forward explicit restore id");
+            let before = inventory().await;
+            let repeated = call_catalog_restore_handler(request(body))
+                .await
+                .expect("same restore id should replay");
+            assert_eq!(repeated.output.0, StatusCode::OK);
+            let repeated = http_body_util::BodyExt::collect(repeated.output.1)
+                .await
+                .expect("repeated receipt body")
+                .to_bytes();
+            let mut repeated: serde_json::Value = serde_json::from_slice(&repeated).expect("repeated receipt JSON");
+            assert_eq!(repeated["status"], "ALREADY_RESTORED");
+            repeated["status"] = initial["status"].clone();
+            assert_eq!(repeated, initial, "replay changed the persisted receipt");
+            assert_eq!(inventory().await, before, "replay changed object bytes or ETags");
+
+            let error = call_catalog_restore_handler(request(serde_json::json!({
+                "backup-id": backup.backup_id,
+                "restore-id": "restore-a",
+                "allow-replace": true
+            })))
+            .await
+            .expect_err("reuse with different request options must conflict");
+            assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+            assert_eq!(inventory().await, before, "request identity conflict mutated objects");
+        },
+    )
+    .await;
 }
 
 #[tokio::test]

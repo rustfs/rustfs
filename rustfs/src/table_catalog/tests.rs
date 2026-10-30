@@ -4904,21 +4904,18 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     let table_entry_path = TableCatalogObjectPaths::default().table_entry_path(bucket, &namespace, &table);
     backend.fail_next_put(RUSTFS_META_BUCKET, &table_entry_path).await;
     let interrupted_visibility = store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("first-restore"))
         .await
         .expect_err("restore should fail before publishing the table entry");
     assert!(
         matches!(interrupted_visibility, TableCatalogStoreError::Internal(message) if message.contains("injected put failure"))
     );
-    assert!(
-        store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
-            .await
-            .unwrap()
-            .is_none()
-    );
+    assert!(matches!(
+        store.load_table(bucket, &namespace.public_name(), &table.as_str()).await,
+        Err(TableCatalogStoreError::Unavailable(_))
+    ));
     store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("first-restore"))
         .await
         .expect("retrying after a pre-publication interruption should converge");
     assert!(
@@ -4936,7 +4933,7 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
 
     backend.fail_after_next_put(RUSTFS_META_BUCKET, &table_entry_path).await;
     let interrupted = store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("second-restore"))
         .await
         .expect_err("restore should surface an ambiguous post-write interruption");
     assert!(
@@ -4944,7 +4941,7 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     );
 
     let restored = store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("second-restore"))
         .await
         .expect("retrying an interrupted restore should converge");
     assert_eq!(restored.status, TableCatalogRestoreStatus::Restored);
@@ -4971,14 +4968,14 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     backend.seed_object(RUSTFS_META_BUCKET, &extra_path, b"stale".to_vec()).await;
     backend.fail_after_next_delete(RUSTFS_META_BUCKET, &extra_path).await;
     let interrupted_delete = store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("third-restore"))
         .await
         .expect_err("restore should surface an ambiguous post-delete interruption");
     assert!(
         matches!(interrupted_delete, TableCatalogStoreError::Internal(message) if message.contains("injected post-commit delete failure"))
     );
     store
-        .restore_object_catalog_backup(bucket, &first.backup_id, None, true)
+        .restore_object_catalog_backup_with_id(bucket, &first.backup_id, None, true, Some("third-restore"))
         .await
         .expect("retrying after interrupted replacement cleanup should converge");
     assert!(
@@ -5066,7 +5063,7 @@ async fn object_catalog_backup_restores_into_an_isolated_backend() {
         .seed_object(RUSTFS_META_BUCKET, &target_entry_path, b"changed-target".to_vec())
         .await;
     let error = target_store
-        .restore_object_catalog_backup(bucket, &backup.backup_id, None, false)
+        .restore_object_catalog_backup_with_id(bucket, &backup.backup_id, None, false, Some("new-restore"))
         .await
         .expect_err("restore must reject a changed target object without allow-replace");
     assert!(matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("target object changed")));

@@ -511,6 +511,8 @@ struct CatalogBackupRequest {
 struct CatalogRestoreRequest {
     #[serde(rename = "backup-id")]
     backup_id: String,
+    #[serde(default, rename = "restore-id")]
+    restore_id: Option<String>,
     #[serde(default, rename = "expected-snapshot-etag")]
     expected_snapshot_etag: Option<String>,
     #[serde(default, rename = "allow-replace")]
