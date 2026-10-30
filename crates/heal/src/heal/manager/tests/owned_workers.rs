@@ -70,7 +70,7 @@ async fn owned_manager_waits_actual_worker_without_holding_manager_locks() {
     let admin = manager.admin_start_shutdown.try_lock().expect("admin released before join");
     let active = manager.active_heals.try_lock().expect("active released before join");
     let cache = manager.completed_heals.try_lock().expect("cache released before join");
-    assert!(manager.workers.tasks.len() >= 1, "actual publication worker is still owned");
+    assert!(!manager.workers.tasks.is_empty(), "actual publication worker is still owned");
     drop((admin, active, cache));
     hook.publish.notify_one();
     tokio::time::timeout(Duration::from_secs(5), hook.handoff.notified())

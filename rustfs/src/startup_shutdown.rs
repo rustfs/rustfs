@@ -256,12 +256,14 @@ where
     true
 }
 
+type PendingCapacityShutdown = std::pin::Pin<Box<dyn Future<Output = std::result::Result<(), tokio::task::JoinError>> + Send>>;
+
 /// Own the same accepted capacity shutdown through the later lifecycle cleanup.
 pub(crate) struct CapacityShutdownReport {
     configured: bool,
     timed_out: bool,
     result: Option<std::result::Result<(), tokio::task::JoinError>>,
-    pending: Option<std::pin::Pin<Box<dyn Future<Output = std::result::Result<(), tokio::task::JoinError>> + Send>>>,
+    pending: Option<PendingCapacityShutdown>,
 }
 
 #[derive(Debug)]
@@ -499,7 +501,7 @@ impl FrontShutdownReport {
             && self.optional.is_empty()
     }
 
-    pub(crate) fn into_result(self) -> Result<(), FrontShutdownFailure> {
+    pub(crate) fn into_result(self) -> Result<(), Box<FrontShutdownFailure>> {
         if self.allows_marker_clear() {
             return Ok(());
         }
@@ -507,13 +509,13 @@ impl FrontShutdownReport {
             .into_iter()
             .any(|observation| observation.http12().is_some_and(|outcome| outcome.deadline_missed()));
         let incomplete_leaf_proof = !self.producers_retired();
-        Err(FrontShutdownFailure {
+        Err(Box::new(FrontShutdownFailure {
             s3: self.s3.error(),
             console: self.console.error(),
             optional: self.optional,
             deadline_missed,
             incomplete_leaf_proof,
-        })
+        }))
     }
 }
 

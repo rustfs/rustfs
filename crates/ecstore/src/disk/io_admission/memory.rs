@@ -519,19 +519,19 @@ mod tests {
         owner.set_sampled_limit(1024, Duration::from_secs(30));
         let ready = Arc::new(std::sync::Barrier::new(17));
         let release = Arc::new(std::sync::Barrier::new(17));
-        let workers: Vec<_> = (0..16)
-            .map(|_| {
-                let owner = owner.clone();
-                let ready = ready.clone();
-                let release = release.clone();
-                std::thread::spawn(move || {
-                    let reservation = owner.reserve(128).ok();
-                    ready.wait();
-                    release.wait();
-                    reservation.is_some()
-                })
-            })
-            .collect();
+        // Start every worker before the first barrier; lazy spawning would deadlock.
+        let mut workers = Vec::with_capacity(16);
+        for _ in 0..16 {
+            let owner = owner.clone();
+            let ready = ready.clone();
+            let release = release.clone();
+            workers.push(std::thread::spawn(move || {
+                let reservation = owner.reserve(128).ok();
+                ready.wait();
+                release.wait();
+                reservation.is_some()
+            }));
+        }
         ready.wait();
         let retained = owner.snapshot().used;
         release.wait();

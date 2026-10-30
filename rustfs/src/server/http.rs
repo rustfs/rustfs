@@ -3528,11 +3528,11 @@ mod tests {
         shutdown.signal();
         let result = shutdown.wait_checked().await;
         let mut client_timely = true;
-        if let Some(mut client) = client {
-            if tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err() {
-                client_timely = false;
-                let _ = client.await;
-            }
+        if let Some(mut client) = client
+            && tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err()
+        {
+            client_timely = false;
+            let _ = client.await;
         }
         let (panic_response, pending, same) = observations.expect("actual held H2 fixture observations");
         assert!(panic_response && pending && same && client_timely);
@@ -3729,11 +3729,11 @@ mod tests {
         shutdown.signal();
         let retired = shutdown.wait_checked().await;
         let mut client_timely = true;
-        if let Some(mut client) = client {
-            if tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err() {
-                client_timely = false;
-                let _ = client.await;
-            }
+        if let Some(mut client) = client
+            && tokio::time::timeout(Duration::from_secs(5), &mut client).await.is_err()
+        {
+            client_timely = false;
+            let _ = client.await;
         }
         assert!(
             observation.expect("actual H2 requests"),

@@ -10053,7 +10053,7 @@ impl LocalDisk {
         &self,
         volume: &str,
         path: &str,
-        buf: &[u8],
+        buf: Bytes,
         sync: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
         admission: Option<multipart_staging::MultipartSourceAdmission>,
@@ -10124,7 +10124,7 @@ impl LocalDisk {
         if volume == RUSTFS_META_MULTIPART_BUCKET {
             let owner = self.multipart_source_owner(volume, path, true, false, None).await?;
             return self
-                .write_all_meta_with_namespace_owner(volume, path, &data, true, owner)
+                .write_all_meta_with_namespace_owner(volume, path, data, true, owner)
                 .await;
         }
         if volume == RUSTFS_META_BUCKET && path == super::FORMAT_CONFIG_FILE {
@@ -13253,7 +13253,7 @@ impl DiskAPI for LocalDisk {
             self.write_all_meta_with_namespace_owner(
                 dst_volume,
                 &format!("{dst_path}.meta"),
-                &meta_for_legacy,
+                meta_for_legacy,
                 true,
                 source_owner.clone(),
             )

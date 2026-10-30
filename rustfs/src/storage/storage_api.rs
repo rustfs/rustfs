@@ -296,12 +296,14 @@ pub(crate) mod rpc_consumer {
             LocalPeerS3Client, MetricType, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, ReadMultipleReq,
             ReadMultipleResp, ReadOptions, RemoteBackgroundIo, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
             SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt, StoragePeerS3ClientExt, TierDailyStatsWire, UpdateMetadataOpts,
-            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
-            get_global_transition_state, get_local_server_property, reload_bucket_metadata, reload_transition_tier_config,
-            remove_bucket_metadata_if_absent, validate_batch_read_version_item_count, with_remote_background_io,
+            all_local_disk_path, collect_local_metrics, find_local_disk_by_ref_for_rpc, get_global_transition_state,
+            get_local_server_property, reload_bucket_metadata, reload_transition_tier_config, remove_bucket_metadata_if_absent,
+            validate_batch_read_version_item_count, with_remote_background_io,
         };
         pub(crate) type StorageResult<T> = super::super::Result<T>;
 
+        #[cfg(test)]
+        pub(crate) use super::super::find_local_disk_by_ref;
         #[cfg(test)]
         pub(crate) type HealBucketInfo = super::super::contract::bucket::BucketInfo;
 

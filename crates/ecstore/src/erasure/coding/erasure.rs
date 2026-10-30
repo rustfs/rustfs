@@ -1284,7 +1284,7 @@ mod tests {
         let codec = LegacyReedSolomonEncoder::with_workspace_cache(2, 1, true).expect("isolated cached codec");
         let memory = BackgroundMemoryBudget::new();
         memory.set_sampled_limit(512, Duration::from_secs(30));
-        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        let mut shards = [vec![7; 8], vec![9; 8], vec![0; 8]];
         let (resources, _) = test_resource_units(1);
         with_optional_resource_unit(Some(resources.with_memory_budget(memory.clone())), async {
             codec
@@ -1324,7 +1324,7 @@ mod tests {
         let codec = LegacyReedSolomonEncoder::with_workspace_cache(2, 1, true).expect("isolated cached codec");
         let first = BackgroundMemoryBudget::new();
         first.set_sampled_limit(256, Duration::from_secs(30));
-        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        let mut shards = [vec![7; 8], vec![9; 8], vec![0; 8]];
         let (resources, _) = test_resource_units(1);
         with_optional_resource_unit(Some(resources.with_memory_budget(first.clone())), async {
             codec
@@ -1350,7 +1350,7 @@ mod tests {
         use std::time::Duration;
 
         let codec = ReedSolomonEncoder::new(2, 1).expect("modern codec");
-        let mut shards = vec![vec![7; 8], vec![9; 8], vec![0; 8]];
+        let mut shards = [vec![7; 8], vec![9; 8], vec![0; 8]];
         codec
             .encode(shards.iter_mut().map(Vec::as_mut_slice).collect())
             .expect("valid parity");

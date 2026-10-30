@@ -293,7 +293,7 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
     StartupShutdownFailure {
         capacity: capacity_error,
         maintenance: maintenance_result.err(),
-        fronts: front_result.into_result().err(),
+        fronts: front_result.into_result().err().map(|failure| *failure),
         observability: observability_error,
     }
     .into_result()
@@ -556,7 +556,7 @@ mod tests {
         let error = StartupShutdownFailure {
             capacity: None,
             maintenance: None,
-            fronts: fronts.into_result().err(),
+            fronts: fronts.into_result().err().map(|failure| *failure),
             observability: None,
         }
         .into_result()
@@ -601,7 +601,7 @@ mod tests {
         let error = StartupShutdownFailure {
             capacity: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, capacity)),
             maintenance: Some(std::io::Error::other(maintenance)),
-            fronts: fronts.into_result().err(),
+            fronts: fronts.into_result().err().map(|failure| *failure),
             observability: Some(Box::new(std::io::Error::other("observability combination failure"))),
         }
         .into_result()
@@ -656,7 +656,7 @@ mod tests {
         let error = StartupShutdownFailure {
             capacity: None,
             maintenance: None,
-            fronts: report.into_result().err(),
+            fronts: report.into_result().err().map(|failure| *failure),
             observability: Some(Box::new(std::io::Error::other("later observation failure"))),
         }
         .into_result()

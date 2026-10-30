@@ -111,15 +111,14 @@ pub(crate) async fn init_background_service_runtime(store: Arc<ECStore>) -> Resu
         }
         let heal_storage = Arc::new(ECStoreHealStorage::new(store.clone()).with_admission(admission.clone()));
         init_heal_manager_with_workload_provider(heal_storage, None, Some(workload_provider.clone())).await?;
-        if let Some(admission) = &admission {
-            if BACKGROUND_NODE_ADMISSION.set(admission.clone()).is_err()
-                || !rustfs_scanner::set_scanner_node_admission(admission.clone())
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::AlreadyExists,
-                    "background node admission is already initialized",
-                ));
-            }
+        if let Some(admission) = &admission
+            && (BACKGROUND_NODE_ADMISSION.set(admission.clone()).is_err()
+                || !rustfs_scanner::set_scanner_node_admission(admission.clone()))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                "background node admission is already initialized",
+            ));
         }
         #[cfg(any(target_os = "linux", all(test, unix)))]
         if let (Some(admission), Some(memory)) = (admission, memory) {

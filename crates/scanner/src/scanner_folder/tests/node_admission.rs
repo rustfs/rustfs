@@ -898,7 +898,10 @@ async fn scanner_node_admission_usage_updates_preserve_totals_across_mid_walk_ha
                                 completed_units: None,
                             }),
                         );
-                        request.respond.send(permit.await).unwrap_or_else(|_| panic!("original walk still waits"));
+                        request
+                            .respond
+                            .send(Ok(crate::workload_admission::ScannerNodePermit::Node(permit.await)))
+                            .unwrap_or_else(|_| panic!("original walk still waits"));
                     }
                 }
             }

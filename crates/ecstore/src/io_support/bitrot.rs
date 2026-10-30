@@ -1718,7 +1718,7 @@ mod tests {
         let inline_data = writer.into_inline_data().expect("inline buffer");
 
         let (mut reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
-            Some(inline_data.into()),
+            Some(inline_data),
             None,
             "test-bucket",
             "test-path",

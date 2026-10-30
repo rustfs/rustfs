@@ -78,8 +78,10 @@ pub async fn shutdown_ahm_services() -> Result<()> {
 // The runtime retains the shared future that owns the actual consumer handle.
 // Each waiter only clones the completion receipt; dropping one cannot detach
 // the worker, and completed success/failure remains available to later waiters.
+type ConsumerCompletion = Shared<BoxFuture<'static, std::result::Result<(), Arc<Error>>>>;
+
 struct ConsumerJoin {
-    completion: Option<Shared<BoxFuture<'static, std::result::Result<(), Arc<Error>>>>>,
+    completion: Option<ConsumerCompletion>,
 }
 
 impl ConsumerJoin {
