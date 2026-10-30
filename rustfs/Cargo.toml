@@ -79,6 +79,8 @@ pyroscope = ["rustfs-obs/pyroscope", "dep:pyroscope", "dep:object", "dep:symboli
 dial9 = ["rustfs-obs/dial9"]
 # Diagnostic-only Rust GlobalAlloc live-byte accounting; adds per-allocation atomic updates.
 diagnostic-allocator-live = []
+# Default-off sampled local batch wall/CPU and request correlation diagnostics.
+diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
 # Diagnostic-only fixed-prefix attribution for actual Scanner metadata visits.
@@ -331,7 +333,7 @@ zstd.workspace = true
 ed25519-dalek.workspace = true
 rustls = { workspace = true, default-features = false, features = ["aws-lc-rs", "logging", "tls12", "prefer-post-quantum", "std"] }
 rustls-pki-types = { workspace = true }
-rustix.workspace = true
+rustix = { workspace = true, features = ["param"] }
 x509-parser = { workspace = true }
 subtle = { workspace = true }
 jiff = { workspace = true, features = ["serde"] }

@@ -149,7 +149,7 @@ async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
 async-compression = { version = "0.4.51" }
 async-trait = "0.1.92"
-async-nats = { version = "0.50.0", default-features = false }
+async-nats = { version = "0.51.0", default-features = false }
 axum = "0.8.9"
 futures = "0.3.34"
 futures-core = "0.3.34"
@@ -175,9 +175,9 @@ tokio-rustls = { default-features = false, version = "0.26.6" }
 tokio-stream = { version = "0.1.19" }
 tokio-test = "0.4.6"
 tokio-util = { version = "0.7.20" }
-tonic = { version = "0.14.6" }
-tonic-prost = { version = "0.14.6" }
-tonic-prost-build = { version = "0.14.6" }
+tonic = { version = "0.14.8" }
+tonic-prost = { version = "0.14.8" }
+tonic-prost-build = { version = "0.14.8" }
 tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
 h3 = "0.0.8"
@@ -253,15 +253,15 @@ atoi = "3.1.1"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.13.0" }
 aws-credential-types = { version = "1.3.1" }
-aws-sdk-kms = { default-features = false, version = "1.126.0" }
-aws-sdk-s3 = { default-features = false, version = "1.155.0" }
-aws-sdk-sts = { default-features = false, version = "1.122.0" }
+aws-sdk-kms = { default-features = false, version = "1.128.0" }
+aws-sdk-s3 = { default-features = false, version = "1.156.0" }
+aws-sdk-sts = { default-features = false, version = "1.123.0" }
 aws-smithy-async = { version = "1.3.1" }
-aws-smithy-http-client = { default-features = false, version = "1.5.1" }
-aws-smithy-runtime-api = { version = "1.19.1" }
-aws-smithy-types = { version = "1.9.0" }
+aws-smithy-http-client = { default-features = false, version = "1.5.2" }
+aws-smithy-runtime-api = { version = "1.19.2" }
+aws-smithy-types = { version = "1.9.1" }
 base64-simd = "0.8.0"
-brotli = "9.1.0"
+brotli = "9.1.1"
 clap = { version = "4.6.7" }
 const-str = { version = "1.1.0" }
 convert_case = "0.12.0"
@@ -321,7 +321,7 @@ regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
 redis = { version = "1.8.0" }
 rustify = { version = "0.7", default-features = false }
-rustix = { version = "1.1.5" }
+rustix = { version = "1.1.6" }
 rust-embed = { version = "8.13.0" }
 rustc-hash = { version = "2.1.3" }
 s3s = { git = "https://github.com/s3s-project/s3s", rev = "5761ddfe4c509fcac87e3b99fd5bd9e176b442c0", features = ["minio"] }
@@ -334,7 +334,7 @@ compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
 strum = { version = "0.28.0" }
-sysinfo = "0.39.6"
+sysinfo = "0.40.0"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.4.0"
@@ -356,13 +356,13 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.1.2"
+zip = "9.1.3"
 zstd = "0.14.3"
 
 # Observability and Metrics
 metrics = "0.24.6"
 metrics-util = "0.20"
-dial9 = { version = "0.5.5", default-features = false }
+dial9 = { version = "0.5.6", default-features = false }
 opentelemetry = { version = "0.33.1" }
 opentelemetry-appender-tracing = { version = "0.33.1" }
 opentelemetry-otlp = { version = "0.33.1" }
@@ -373,7 +373,7 @@ opentelemetry-stdout = { version = "0.33.1" }
 pyroscope = { version = "2.1.5" }
 
 # FTP and SFTP
-libunftp = { version = "0.23.1" }
+libunftp = { version = "0.24.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "12.2.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
@@ -386,7 +386,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.29.2", default-features = false }
+hotpath = { version = "0.30.1", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
@@ -431,12 +431,3 @@ zstd = { path = "crates/zstd-compat" }
 # Upstream: openidconnect-rs#244 and oauth2-rs#352.
 openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }
 oauth2 = { git = "https://github.com/ramosbugs/oauth2-rs", rev = "89585f4a280afd7b285eaf1c9be0068874e03d22" }
-aws-sigv4 = { git = "https://github.com/smithy-lang/smithy-rs", rev = "5c1c4bca2ea7af97496e077c9f1a718eaac64bf8" }
-
-# Keep the signer's path dependencies on the SDK's existing registry types.
-[patch."https://github.com/smithy-lang/smithy-rs"]
-aws-credential-types = { version = "=1.3.1" }
-aws-smithy-eventstream = { version = "=0.61.6" }
-aws-smithy-http = { version = "=0.64.2" }
-aws-smithy-runtime-api = { version = "=1.19.1" }
-aws-smithy-types = { version = "=1.9.0" }
