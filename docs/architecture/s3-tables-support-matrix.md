@@ -69,7 +69,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | Iceberg views | Supported | Create, list, load, replace, exists, drop with view-scoped authorization; only view format version 1. |
 | LoadTable and table credentials endpoint | Supported | Vending only on negotiated `vended-credentials`; one temporary session scoped to the warehouse prefix and current metadata location; missing credential permission falls back to metadata-only with an explicit reason; responses carry `Cache-Control: no-store, private`. |
 | Catalog diagnostics and export | Supported | Object catalog state exposes recovery, consistency, commit-log, idempotency, maintenance, single-active-writer policy, and scale validation information. |
-| Durable catalog backup and restore | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/backup` records the catalog pointer and referenced Iceberg metadata/manifest/data/delete object watermarks. `POST /iceberg/v1/{warehouse}/catalog/restore` validates UUID, warehouse, target pointer, generation, and the complete referenced-object graph before object-backed CAS publication; repeated requests are idempotent or return a retryable conflict. |
+| Catalog backup and restore | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/backup` captures catalog objects and current table metadata and validates snapshot references against the backend. Manifest/data/delete payloads and their independent content watermarks are not included. Restore applies objects conditionally; keep the target closed to clients until restore and recovery verification finish. Per-object CAS does not establish bucket-wide atomic publication or crash isolation. |
 | Catalog import and rollback | Supported | Import/register and online rollback go through validation and commit paths. Online rollback accepts only forward-safe targets; restoring an older target that lowers watermarks is an offline disaster-recovery operation with all writers stopped. |
 | External catalog bridge | Supported operator path | Operator-supplied metadata pointer sync/import. Vendor SDK polling and policy mirroring not claimed. |
 | Multi-table transactions | Not claimed | Single-table commit atomicity only. |
@@ -111,7 +111,7 @@ metadata or warehouse directory, including a recreated source name after rename.
 Such tables require disjoint cleanup roots before maintenance can run; enabling
 deletion does not override this ownership check.
 
-Rename and maintenance sidecars use the object catalog publication fences and are recoverable across interruption. Backup, restore, register, drop, and subsequent rename operations reconcile pending object-backed intents before proceeding.
+Object catalog rename uses a persisted intent and publication fences. Recovery of an interrupted rename and recovery of a partially applied catalog restore are separate contracts; a successful rename test does not establish restore crash isolation.
 
 | Capability | Status | Claim |
 |---|---|---|

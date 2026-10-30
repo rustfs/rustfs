@@ -93,8 +93,7 @@ The smoke test covers:
 - round-trip an encoded multi-level namespace and reject double-encoded aliases
 - check LoadTable does not vend credentials for missing or unknown delegation
   tokens; when vending is required, check exact-token negotiation and scope
-- check the object catalog maintenance dry-run and export against the current
-  pointer, token, and generation, including the complete referenced-object graph
+- check the object catalog maintenance dry-run and export against the current pointer, token, and generation
 - optionally drop the table and namespace
 
 The default profile uses the canonical RustFS catalog URI:
@@ -168,7 +167,7 @@ temporary credentials:
   rejected.
 
 The direct REST catalog probes run by default after the PyIceberg append and
-scan. The object catalog runs maintenance control, diagnostics, export, and backup/restore contract probes.
+scan. The smoke runs maintenance control, diagnostics, and catalog export probes. Backup and restore require a separate recovery rehearsal.
 For deployments that intentionally expose only the core Iceberg REST
 Catalog table path, skip those probes explicitly:
 
@@ -337,10 +336,7 @@ The smoke test also probes catalog-backed advanced Iceberg surfaces:
   entries, and snapshot references remain protected while maintenance plans are
   evaluated. Orphan candidates are read-only observations until a controlled
   maintenance operation authorizes deletion.
-- catalog backup and restore are controlled object-backed recovery operations.
-  Backup artifacts record the catalog pointer and referenced Iceberg object graph;
-  restore verifies UUID, warehouse, metadata, manifest-list, manifest, data, and
-  delete-file references, and can be retried after an interrupted finalization.
+- catalog backup captures catalog objects and current table metadata. It validates the referenced Iceberg snapshot graph against the object backend; the artifact does not copy manifest, data, or delete files. Restore uses conditional object writes and requires those referenced objects to remain available. Keep the target closed to clients during restore and after any interrupted restore until recovery is verified; per-object CAS is not a bucket-wide atomic publication guarantee.
 
 ## Client Matrix
 

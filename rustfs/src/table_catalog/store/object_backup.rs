@@ -13,7 +13,10 @@
 // limitations under the License.
 
 use super::backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
-use super::object::ObjectTableCatalogStore;
+use super::object::{
+    ObjectTableCatalogStore, validate_namespace_entry_object, validate_table_bucket_entry_object, validate_table_entry_object,
+    validate_view_entry_object,
+};
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
@@ -56,10 +59,153 @@ fn safe_object_key(object: &str) -> bool {
         && !object.bytes().any(|byte| byte.is_ascii_control())
 }
 
+fn catalog_backup_fingerprint(objects: &[ObjectCatalogBackupObject]) -> TableCatalogStoreResult<String> {
+    let identity = serde_json::to_vec(
+        &objects
+            .iter()
+            .map(|object| (&object.bucket, &object.object, &object.sha256))
+            .collect::<Vec<_>>(),
+    )
+    .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog backup identity: {error}")))?;
+    Ok(backup_sha256(&identity))
+}
+
+fn catalog_backup_identity(
+    table_bucket: &str,
+    fingerprint: &str,
+    objects: &[ObjectCatalogBackupObject],
+) -> TableCatalogStoreResult<String> {
+    let data = serde_json::to_vec(&(OBJECT_CATALOG_BACKUP_VERSION, table_bucket, fingerprint, objects))
+        .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog backup: {error}")))?;
+    Ok(backup_sha256(&data))
+}
+
 impl<B> ObjectTableCatalogStore<B>
 where
     B: TableCatalogObjectBackend,
 {
+    fn decode_object_catalog_backup(&self, table_bucket: &str, data: &[u8]) -> TableCatalogStoreResult<ObjectCatalogBackup> {
+        if data.len() > OBJECT_CATALOG_BACKUP_MAX_SIZE {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog backup exceeds the encoded size limit".to_string(),
+            ));
+        }
+        let backup: ObjectCatalogBackup = serde_json::from_slice(data).map_err(|error| {
+            TableCatalogStoreError::Invalid(format!("invalid catalog backup at line {} column {}", error.line(), error.column()))
+        })?;
+        if backup.version != OBJECT_CATALOG_BACKUP_VERSION || backup.table_bucket != table_bucket {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog backup identity or version does not match its request".to_string(),
+            ));
+        }
+        self.validate_object_catalog_backup_objects(table_bucket, &backup.objects)?;
+        if catalog_backup_fingerprint(&backup.objects)? != backup.source_catalog_etag
+            || catalog_backup_identity(table_bucket, &backup.source_catalog_etag, &backup.objects)? != backup.backup_id
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog backup content does not match its identity".to_string(),
+            ));
+        }
+        Ok(backup)
+    }
+
+    fn validate_object_catalog_backup_objects(
+        &self,
+        table_bucket: &str,
+        objects: &[ObjectCatalogBackupObject],
+    ) -> TableCatalogStoreResult<()> {
+        if objects.is_empty()
+            || objects
+                .windows(2)
+                .any(|pair| (&pair[0].bucket, &pair[0].object) >= (&pair[1].bucket, &pair[1].object))
+        {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog backup objects must be sorted, unique, and nonempty".to_string(),
+            ));
+        }
+        let prefix = self.paths.table_bucket_root_prefix(table_bucket);
+        let bucket_path = self.paths.table_bucket_entry_path(table_bucket);
+        let mut has_bucket = false;
+        let mut metadata_paths = BTreeSet::new();
+        // Validate every byte and destination before any restore mutation. A late
+        // corrupt object must not leave earlier catalog objects installed.
+        for object in objects {
+            if !safe_object_key(&object.object)
+                || object.data.len() > OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE
+                || u64::try_from(object.data.len()).ok() != Some(object.size_bytes)
+                || backup_sha256(&object.data) != object.sha256
+            {
+                return Err(TableCatalogStoreError::Invalid("catalog backup object verification failed".to_string()));
+            }
+            if object.bucket != self.catalog_bucket() {
+                if object.bucket != table_bucket {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "catalog backup object belongs to another bucket".to_string(),
+                    ));
+                }
+                continue;
+            }
+            if !object.object.starts_with(&prefix) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup object is outside its catalog prefix".to_string(),
+                ));
+            }
+            if object.object == bucket_path {
+                let entry: TableBucketEntry = serde_json::from_slice(&object.data)
+                    .map_err(|_| TableCatalogStoreError::Invalid("invalid table bucket in catalog backup".to_string()))?;
+                validate_table_bucket_entry_object(&self.paths, &object.object, &entry)?;
+                if entry.state != TableCatalogEntryState::Active || entry.active_rename_id.is_some() {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "catalog backup requires a stable active table bucket".to_string(),
+                    ));
+                }
+                has_bucket = true;
+            } else if object.object.ends_with(NAMESPACE_ENTRY_FILE) {
+                let entry: NamespaceEntry = serde_json::from_slice(&object.data)
+                    .map_err(|_| TableCatalogStoreError::Invalid("invalid namespace in catalog backup".to_string()))?;
+                validate_namespace_entry_object(&self.paths, &object.object, &entry)?;
+            } else if object.object.ends_with(TABLE_ENTRY_FILE) {
+                let entry: TableEntry = serde_json::from_slice(&object.data)
+                    .map_err(|_| TableCatalogStoreError::Invalid("invalid table in catalog backup".to_string()))?;
+                validate_table_entry_object(&self.paths, &object.object, &entry)?;
+                if matches!(entry.state, TableCatalogEntryState::Renaming | TableCatalogEntryState::Deleting) {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "catalog backup contains a pending table operation".to_string(),
+                    ));
+                }
+                if entry.state == TableCatalogEntryState::Active {
+                    let path =
+                        table_catalog_object_key_from_location(table_bucket, &entry.metadata_location).ok_or_else(|| {
+                            TableCatalogStoreError::Invalid("invalid table metadata location in catalog backup".to_string())
+                        })?;
+                    metadata_paths.insert(path);
+                }
+            } else if object.object.ends_with(VIEW_ENTRY_FILE) {
+                let entry: ViewEntry = serde_json::from_slice(&object.data)
+                    .map_err(|_| TableCatalogStoreError::Invalid("invalid view in catalog backup".to_string()))?;
+                validate_view_entry_object(&self.paths, &object.object, &entry)?;
+                if matches!(entry.state, TableCatalogEntryState::Renaming | TableCatalogEntryState::Deleting) {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "catalog backup contains a pending view operation".to_string(),
+                    ));
+                }
+            }
+        }
+        if !has_bucket {
+            return Err(TableCatalogStoreError::Invalid(
+                "catalog backup is missing its table bucket entry".to_string(),
+            ));
+        }
+        for object in objects.iter().filter(|object| object.bucket != self.catalog_bucket()) {
+            if !metadata_paths.contains(&object.object) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup payload is not current table metadata".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     async fn acquire_object_backup_fence(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
         let paths = TableCatalogObjectPaths::default();
         let global = self
@@ -172,6 +318,18 @@ where
                     ))
                 })?;
             let metadata = decode_table_metadata_json(&entry.metadata_location, &metadata.data)?;
+            validate_supported_table_metadata(&metadata)?;
+            if metadata.get("table-uuid").and_then(serde_json::Value::as_str) != Some(entry.table_uuid.as_str())
+                || metadata.get("location").and_then(serde_json::Value::as_str) != Some(entry.warehouse_location.as_str())
+                || metadata
+                    .get("format-version")
+                    .and_then(serde_json::Value::as_u64)
+                    .is_none_or(|version| version < u64::from(entry.format_version))
+            {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup metadata does not match its table identity".to_string(),
+                ));
+            }
             let context = TableSnapshotGraphValidationContext::new(&self.backend, table_bucket, &entry);
             validate_table_snapshot_changes(&context, None, &metadata).await?;
         }
@@ -187,29 +345,20 @@ where
         let mutation_fence = Self::object_backup_mutation_fence(&guards);
         mutation_fence.ensure_held()?;
         let objects = self.capture_object_catalog_backup_objects(table_bucket).await?;
+        self.validate_object_catalog_backup_objects(table_bucket, &objects)?;
         mutation_fence.ensure_held()?;
         self.validate_catalog_backup_snapshot_graph(table_bucket, &objects).await?;
         mutation_fence.ensure_held()?;
-        let identity = serde_json::to_vec(
-            &objects
-                .iter()
-                .map(|object| (&object.bucket, &object.object, &object.sha256))
-                .collect::<Vec<_>>(),
-        )
-        .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog backup identity: {error}")))?;
-        let source_catalog_etag = backup_sha256(&identity);
+        let source_catalog_etag = catalog_backup_fingerprint(&objects)?;
         if expected_catalog_etag.is_some_and(|expected| expected != source_catalog_etag) {
             return Err(TableCatalogStoreError::Conflict(
                 "catalog changed before object backup capture".to_string(),
             ));
         }
-        let created_at = OffsetDateTime::now_utc()
+        let mut created_at = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|error| TableCatalogStoreError::Internal(format!("failed to format backup timestamp: {error}")))?;
-        let backup_id = backup_sha256(
-            &serde_json::to_vec(&(OBJECT_CATALOG_BACKUP_VERSION, table_bucket, &source_catalog_etag, &objects))
-                .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog backup: {error}")))?,
-        );
+        let backup_id = catalog_backup_identity(table_bucket, &source_catalog_etag, &objects)?;
         let backup = ObjectCatalogBackup {
             version: OBJECT_CATALOG_BACKUP_VERSION,
             backup_id: backup_id.clone(),
@@ -238,8 +387,7 @@ where
                     .read_object_limited(RUSTFS_META_BUCKET, &path, OBJECT_CATALOG_BACKUP_MAX_SIZE)
                     .await?
                     .ok_or_else(|| TableCatalogStoreError::Conflict("catalog backup disappeared after conflict".to_string()))?;
-                let existing: ObjectCatalogBackup = serde_json::from_slice(&existing.data)
-                    .map_err(|error| TableCatalogStoreError::Invalid(format!("existing catalog backup is invalid: {error}")))?;
+                let existing = self.decode_object_catalog_backup(table_bucket, &existing.data)?;
                 let same_identity = existing.version == backup.version
                     && existing.backup_id == backup.backup_id
                     && existing.table_bucket == backup.table_bucket
@@ -250,6 +398,7 @@ where
                         "catalog backup identity is already occupied by different content".to_string(),
                     ));
                 }
+                created_at = existing.created_at;
                 TableCatalogBackupStatus::AlreadyPresent
             }
             Err(error) => return Err(error),
@@ -288,10 +437,8 @@ where
             .read_object_limited(RUSTFS_META_BUCKET, &path, OBJECT_CATALOG_BACKUP_MAX_SIZE)
             .await?
             .ok_or_else(|| TableCatalogStoreError::NotFound(format!("catalog backup {backup_id}")))?;
-        let backup: ObjectCatalogBackup = serde_json::from_slice(&stored.data)
-            .map_err(|error| TableCatalogStoreError::Invalid(format!("catalog backup is invalid: {error}")))?;
-        if backup.version != OBJECT_CATALOG_BACKUP_VERSION || backup.table_bucket != table_bucket || backup.backup_id != backup_id
-        {
+        let backup = self.decode_object_catalog_backup(table_bucket, &stored.data)?;
+        if backup.backup_id != backup_id {
             return Err(TableCatalogStoreError::Invalid(
                 "catalog backup identity does not match its request".to_string(),
             ));
@@ -309,6 +456,7 @@ where
         let target_paths = backup
             .objects
             .iter()
+            .filter(|object| object.bucket == self.catalog_bucket())
             .map(|object| object.object.as_str())
             .collect::<BTreeSet<_>>();
         if !allow_replace && current.iter().any(|object| !target_paths.contains(object.as_str())) {
@@ -316,60 +464,75 @@ where
                 "catalog restore would replace existing catalog objects; set allow-replace".to_string(),
             ));
         }
-        if !allow_replace {
-            for object in &backup.objects {
-                let Some(existing) = self
-                    .backend
-                    .read_object_limited(&object.bucket, &object.object, OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE)
-                    .await?
-                else {
-                    continue;
-                };
-                if existing.data.len() as u64 != object.size_bytes || backup_sha256(&existing.data) != object.sha256 {
-                    return Err(TableCatalogStoreError::Conflict(format!(
-                        "catalog restore target object changed: {}/{}",
-                        object.bucket, object.object
-                    )));
+        let mut writes = Vec::new();
+        for object in &backup.objects {
+            let precondition = match self
+                .backend
+                .read_object_limited(&object.bucket, &object.object, OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE)
+                .await?
+            {
+                None => TableCatalogPutPrecondition::IfAbsent,
+                Some(existing) if existing.data == object.data => continue,
+                Some(existing) => {
+                    // Replacement applies only to internal catalog state. Iceberg
+                    // metadata is immutable, including during disaster recovery.
+                    if !allow_replace || object.bucket != self.catalog_bucket() {
+                        return Err(TableCatalogStoreError::Conflict(format!(
+                            "catalog restore target object changed: {}/{}",
+                            object.bucket, object.object
+                        )));
+                    }
+                    let etag = existing.etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                        TableCatalogStoreError::Unavailable("catalog restore target has no usable ETag".to_string())
+                    })?;
+                    TableCatalogPutPrecondition::IfMatch(etag)
                 }
+            };
+            writes.push((object, precondition));
+        }
+        let mut deletes = Vec::new();
+        if allow_replace {
+            for object in current {
+                if target_paths.contains(object.as_str()) {
+                    continue;
+                }
+                let metadata = self
+                    .backend
+                    .object_metadata(self.catalog_bucket(), &object)
+                    .await?
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Conflict("catalog restore target disappeared during preflight".to_string())
+                    })?;
+                let etag = metadata.etag.filter(|value| !value.is_empty()).ok_or_else(|| {
+                    TableCatalogStoreError::Unavailable("catalog restore deletion target has no usable ETag".to_string())
+                })?;
+                deletes.push((object, etag));
             }
         }
-        for object in &backup.objects {
-            if backup_sha256(&object.data) != object.sha256 || object.data.len() as u64 != object.size_bytes {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "catalog backup object verification failed: {}",
-                    object.object
-                )));
-            }
+        let status = if writes.is_empty() && deletes.is_empty() {
+            TableCatalogRestoreStatus::AlreadyRestored
+        } else {
+            TableCatalogRestoreStatus::Restored
+        };
+        // Bind each mutation to its preflight observation. Re-reading a fresh
+        // ETag here would authorize overwriting a concurrent replacement.
+        for (object, precondition) in writes {
             mutation_fence.ensure_held()?;
-            let precondition = self
-                .backend
-                .object_metadata(&object.bucket, &object.object)
-                .await?
-                .and_then(|metadata| metadata.etag)
-                .map_or(TableCatalogPutPrecondition::IfAbsent, TableCatalogPutPrecondition::IfMatch);
             self.backend
                 .put_object_fenced(&object.bucket, &object.object, object.data.clone(), precondition, &mutation_fence)
                 .await?;
         }
-        if allow_replace {
-            for object in current {
-                if !target_paths.contains(object.as_str()) {
-                    mutation_fence.ensure_held()?;
-                    if let Some(metadata) = self.backend.object_metadata(self.catalog_bucket(), &object).await? {
-                        if let Some(etag) = metadata.etag {
-                            self.backend
-                                .delete_object_if_match_fenced(self.catalog_bucket(), &object, &etag, &mutation_fence)
-                                .await?;
-                        }
-                    }
-                }
-            }
+        for (object, etag) in deletes {
+            mutation_fence.ensure_held()?;
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &object, &etag, &mutation_fence)
+                .await?;
         }
         mutation_fence.ensure_held()?;
         Ok(TableCatalogRestoreReport {
             table_bucket: table_bucket.to_string(),
             backup_id: backup_id.to_string(),
-            status: TableCatalogRestoreStatus::Restored,
+            status,
             previous_snapshot_etag: stored.etag,
             restored_snapshot_etag: backup.source_catalog_etag,
             object_count: backup.objects.len(),

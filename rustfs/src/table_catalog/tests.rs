@@ -18,6 +18,9 @@ use std::sync::Arc;
 
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
+#[path = "tests/object_backup_validation.rs"]
+mod object_backup_validation;
+
 #[tokio::test]
 async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     let object_backend = TestCatalogObjectBackend::default();
@@ -5056,7 +5059,7 @@ async fn object_catalog_backup_restores_into_an_isolated_backend() {
         .restore_object_catalog_backup(bucket, &backup.backup_id, None, false)
         .await
         .unwrap();
-    assert_eq!(repeated.status, TableCatalogRestoreStatus::Restored);
+    assert_eq!(repeated.status, TableCatalogRestoreStatus::AlreadyRestored);
 
     let target_entry_path = TableCatalogObjectPaths::default().table_bucket_entry_path(bucket);
     target_backend
