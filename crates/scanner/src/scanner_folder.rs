@@ -807,6 +807,8 @@ pub struct FolderScanner {
     checkpoint_depth: usize,
     checkpoint_objects: u64,
     object_metadata_visits: metrics::Counter,
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    prefix_attribution: Option<prefix_attribution::VisitAttribution>,
     last_checkpoint_objects: u64,
     last_checkpoint_at: Instant,
     last_checkpoint_build_time: Duration,
@@ -2314,9 +2316,21 @@ impl FolderScanner {
 
                 let size_result = run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
                     self.object_metadata_visits.increment(1);
-                    self.local_disk
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if let Some(attribution) = &self.prefix_attribution {
+                        attribution.record(&item.bucket, &item.prefix);
+                    }
+                    let result = self
+                        .local_disk
                         .get_size_with_tier_names(item.clone(), &self.tier_registry.names)
-                        .await
+                        .await;
+                    #[cfg(feature = "diagnostic-prefix-attribution")]
+                    if result.is_ok()
+                        && let Some(attribution) = &self.prefix_attribution
+                    {
+                        attribution.record_success(&item.bucket, &item.prefix);
+                    }
+                    result
                 })
                 .await?;
                 if self.node_admission.is_some() && ctx.is_cancelled() {
@@ -3249,6 +3263,12 @@ pub(crate) async fn scan_data_folder_scoped(
         "bucket" => bucket_name.clone(),
         "disk" => base_path.clone()
     );
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    let prefix_attribution = prefix_attribution::configured_for(&bucket_name, &base_path);
+    #[cfg(feature = "diagnostic-prefix-attribution")]
+    if prefix_attribution.is_some() {
+        object_metadata_visits.increment(0);
+    }
     let next_cycle = cache.info.next_cycle;
     let resume_position_on_entry = cache.has_scan_position();
     let had_scan_checkpoint = cache.info.scan_checkpoint.is_some();
@@ -3286,6 +3306,8 @@ pub(crate) async fn scan_data_folder_scoped(
         checkpoint_depth: 0,
         checkpoint_objects: 0,
         object_metadata_visits,
+        #[cfg(feature = "diagnostic-prefix-attribution")]
+        prefix_attribution,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
@@ -3497,6 +3519,8 @@ pub(crate) async fn scan_data_folder_scoped(
 
 mod item_actions;
 mod ledger;
+#[cfg(feature = "diagnostic-prefix-attribution")]
+mod prefix_attribution;
 
 pub(crate) use item_actions::scanner_disk_heal_scope;
 use item_actions::*;

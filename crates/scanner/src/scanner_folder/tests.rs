@@ -33,6 +33,8 @@ mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
 mod node_admission;
+#[cfg(feature = "diagnostic-prefix-attribution")]
+mod prefix_attribution_tests;
 mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
@@ -378,6 +380,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         checkpoint_depth: 0,
         checkpoint_objects: 0,
         object_metadata_visits: metrics::Counter::noop(),
+        #[cfg(feature = "diagnostic-prefix-attribution")]
+        prefix_attribution: None,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
