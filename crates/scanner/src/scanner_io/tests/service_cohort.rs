@@ -469,10 +469,10 @@ async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
 }
 
 /// A one-object share stops inside its first child, so the frontier never
-/// moves. Requeueing that bucket would spin until the cycle deadline.
+/// moves. Requeuing that bucket would spin until the cycle deadline.
 #[tokio::test]
 #[serial]
-async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeueing() {
+async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing() {
     let (_dir, store) = setup_local_scanner_store(1, 4).await;
     clear_dirty_usage_buckets_for_tests();
     create_cohort_bucket_objects(&store, "a-flat", 3).await;
