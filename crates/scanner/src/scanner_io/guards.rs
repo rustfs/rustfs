@@ -307,6 +307,33 @@ impl ScannerServiceCohort {
     }
 }
 
+/// Publishes one aggregate per set: each failure is already logged where it
+/// happened, and this keeps the unpaid total visible after a restart.
+pub(super) fn record_bucket_failure_debt(source: DataUsageCacheSource, cycle: u64, ledger: &DataUsageBucketServiceLedger) {
+    let (debtors, first_bucket) = ledger.failure_debt();
+    metrics::gauge!(
+        "rustfs_scanner_bucket_failure_debt",
+        "pool" => source.pool_index.to_string(),
+        "set" => source.set_index.to_string()
+    )
+    .set(debtors as f64);
+    if debtors > 0 {
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_SET_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "bucket_failure_debt",
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle,
+            debtors,
+            first_bucket,
+            "Scanner buckets still owe a successful sweep"
+        );
+    }
+}
+
 pub(super) async fn wait_for_bucket_scan_permit(
     semaphore: &Arc<Semaphore>,
     ctx: &CancellationToken,
@@ -408,10 +435,92 @@ pub(super) struct DiskBucketScanActiveGuard {
     set: String,
 }
 
+#[derive(Default)]
+struct ScannerBucketServiceRoundState {
+    ledger: DataUsageBucketServiceLedger,
+    claimed: HashMap<String, u64>,
+    interrupted: HashSet<String>,
+}
+
+/// One cycle's view of a set's durable service order. Lock order: taken alone,
+/// and never held across an await.
+pub(super) struct ScannerBucketServiceRound(StdMutex<ScannerBucketServiceRoundState>);
+
+impl ScannerBucketServiceRound {
+    pub(super) fn new(ledger: DataUsageBucketServiceLedger) -> Self {
+        Self(StdMutex::new(ScannerBucketServiceRoundState {
+            ledger,
+            ..Default::default()
+        }))
+    }
+
+    fn state(&self) -> std::sync::MutexGuard<'_, ScannerBucketServiceRoundState> {
+        self.0.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(super) fn order_buckets(&self, buckets: &mut [BucketInfo]) {
+        // The stable sort keeps the caller's order for equal positions.
+        let state = self.state();
+        buckets.sort_by_key(|bucket| state.ledger.wait_position(&bucket.name));
+    }
+
+    fn claim(&self, bucket: &str) {
+        let mut state = self.state();
+        if let Some(previous) = state.ledger.record_service(bucket) {
+            // A second claim in one cycle keeps the position before the first.
+            state.claimed.entry(bucket.to_owned()).or_insert(previous);
+        }
+    }
+
+    fn release(&self, bucket: &str) {
+        let mut state = self.state();
+        if let Some(previous) = state.claimed.remove(bucket) {
+            state.ledger.return_service(bucket, previous);
+        }
+    }
+
+    fn interrupt(&self, bucket: &str) {
+        self.state().interrupted.insert(bucket.to_owned());
+    }
+
+    /// Closes the cycle. Only a real worker completion clears debt; a claimed
+    /// bucket that failed or stayed partial adds debt unless a budget stopped
+    /// it. `None` means no bucket was served, so nothing needs persisting.
+    pub(super) fn settle(
+        &self,
+        completed: &HashSet<String>,
+        failed: &HashSet<String>,
+        partial: &HashSet<String>,
+    ) -> Option<DataUsageBucketServiceLedger> {
+        let mut state = self.state();
+        let state = &mut *state;
+        if state.claimed.is_empty() {
+            return None;
+        }
+        for bucket in state.claimed.keys() {
+            if completed.contains(bucket) {
+                state.ledger.record_certified(bucket);
+            } else if (failed.contains(bucket) || partial.contains(bucket)) && !state.interrupted.contains(bucket) {
+                state.ledger.record_failure(bucket);
+            }
+        }
+        state.claimed.clear();
+        Some(std::mem::take(&mut state.ledger).bounded())
+    }
+}
+
+struct BucketServiceClaim {
+    round: Arc<ScannerBucketServiceRound>,
+    bucket: String,
+    ctx: CancellationToken,
+    budget: Arc<ScannerCycleBudget>,
+}
+
 pub(super) struct BucketWorkGuard {
     remaining: Arc<AtomicUsize>,
     complete: CancellationToken,
     requeued: bool,
+    service: Option<BucketServiceClaim>,
 }
 
 impl BucketWorkGuard {
@@ -420,16 +529,42 @@ impl BucketWorkGuard {
             remaining,
             complete,
             requeued: false,
+            service: None,
         }
     }
 
     pub(super) fn mark_requeued(&mut self) {
         self.requeued = true;
     }
+
+    /// Spends this bucket's service turn. The guard settles it at the end of
+    /// the admission: a requeue without a spent budget hands the turn back.
+    pub(super) fn claim_service(
+        &mut self,
+        round: Arc<ScannerBucketServiceRound>,
+        bucket: &str,
+        ctx: CancellationToken,
+        budget: Arc<ScannerCycleBudget>,
+    ) {
+        round.claim(bucket);
+        self.service = Some(BucketServiceClaim {
+            round,
+            bucket: bucket.to_owned(),
+            ctx,
+            budget,
+        });
+    }
 }
 
 impl Drop for BucketWorkGuard {
     fn drop(&mut self) {
+        if let Some(claim) = self.service.take() {
+            if claim.budget.budget_elapsed() || claim.ctx.is_cancelled() {
+                claim.round.interrupt(&claim.bucket);
+            } else if self.requeued {
+                claim.round.release(&claim.bucket);
+            }
+        }
         if !self.requeued && self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.complete.cancel();
         }

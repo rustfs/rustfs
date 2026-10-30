@@ -337,3 +337,52 @@ async fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_perm
     assert_eq!(usage.expect("retry aggregate").objects_total_count, 2);
     clear_dirty_usage_buckets_for_tests();
 }
+
+/// N=17, q=4: every bucket reaches a worker within ceil(17/4)=5 rounds while
+/// one bucket stays hot and another fails forever, with leader-local state
+/// discarded after each round as a restart would.
+#[tokio::test]
+#[serial]
+async fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket() {
+    const BUCKETS: usize = 17;
+    const QUANTA: u64 = 4;
+    const ROUND_BOUND: usize = 5;
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    let names = (0..BUCKETS).map(|index| format!("cold-{index:02}")).collect::<Vec<_>>();
+    for name in &names {
+        create_cohort_bucket(&store, name).await;
+    }
+    let hot = names[0].clone();
+    let _failing = fail_coordinator_bucket_scan(&names[1]);
+    let mut waited = vec![0_usize; BUCKETS];
+    for round in 1..=(ROUND_BOUND * 3) {
+        record_dirty_usage_bucket(&hot);
+        let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &ctx,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(QUANTA),
+                ..Default::default()
+            },
+        );
+        run_cohort_cycle(&store, cohort.clone(), u64::try_from(round).expect("round"), budget).await;
+        let admitted = cohort
+            .lock()
+            .expect("cohort lock")
+            .admitted_members()
+            .into_iter()
+            .map(|(_, bucket)| bucket)
+            .collect::<HashSet<_>>();
+        for (index, name) in names.iter().enumerate() {
+            waited[index] = if admitted.contains(name) { 0 } else { waited[index] + 1 };
+            assert!(
+                waited[index] < ROUND_BOUND,
+                "{name} waited {} rounds at round {round}; admitted {admitted:?}",
+                waited[index]
+            );
+        }
+    }
+    clear_dirty_usage_buckets_for_tests();
+}

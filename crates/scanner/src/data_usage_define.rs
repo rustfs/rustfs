@@ -77,6 +77,8 @@ static CACHE_SAVE_METRICS_ONCE: Once = Once::new();
 pub const DATA_USAGE_SCAN_CHECKPOINT_VERSION: u16 = 1;
 pub const DATA_USAGE_RAW_ENUMERATION_CURSOR_VERSION: u16 = 1;
 const DATA_USAGE_SCAN_CURSOR_MAX_BYTES: usize = 16 * 1024;
+const DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS: usize = 4096;
+const DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES: usize = 128 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum DataUsageCacheRevision {
@@ -596,6 +598,205 @@ pub struct PendingScannerHeal {
     pub last_admission_reason: String,
 }
 
+/// One bucket's standing in its set's service order. The wait position, the
+/// quanta granted and the last certification are separate quantities: a bucket
+/// that keeps failing moves to the tail like any other and only adds debt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketService {
+    #[serde(default)]
+    pub waiting_since: u64,
+    #[serde(default)]
+    pub service_quanta: u64,
+    #[serde(default)]
+    pub last_certified: Option<u64>,
+    #[serde(default)]
+    pub failure_debt: u64,
+    #[serde(default)]
+    pub incarnation: Option<uuid::Uuid>,
+}
+
+// Nested derives encode positionally; a map lets later fields stay optional.
+impl Serialize for DataUsageBucketService {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let field_count = 2
+            + usize::from(self.last_certified.is_some())
+            + usize::from(self.failure_debt != 0)
+            + usize::from(self.incarnation.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry("waiting_since", &self.waiting_since)?;
+        map.serialize_entry("service_quanta", &self.service_quanta)?;
+        if let Some(last_certified) = self.last_certified {
+            map.serialize_entry("last_certified", &last_certified)?;
+        }
+        if self.failure_debt != 0 {
+            map.serialize_entry("failure_debt", &self.failure_debt)?;
+        }
+        if let Some(incarnation) = self.incarnation {
+            map.serialize_entry("incarnation", &incarnation)?;
+        }
+        map.end()
+    }
+}
+
+/// Durable first-in-first-out service order of one set. It only orders work:
+/// no entry proves coverage, authorizes a skip or releases a responsibility,
+/// so losing it restarts fairness and nothing else.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketServiceLedger {
+    /// Movement epoch the order was built under; another epoch invalidates it.
+    #[serde(default)]
+    pub publication_epoch: u64,
+    #[serde(default)]
+    pub next_sequence: u64,
+    #[serde(default)]
+    pub buckets: HashMap<String, DataUsageBucketService>,
+}
+
+impl Serialize for DataUsageBucketServiceLedger {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(3))?;
+        map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("next_sequence", &self.next_sequence)?;
+        map.serialize_entry("buckets", &self.buckets)?;
+        map.end()
+    }
+}
+
+impl DataUsageBucketServiceLedger {
+    /// Rebuilds the order for this cycle's inventory. Decoded state that fails
+    /// validation or belongs to another movement epoch starts a new order;
+    /// a bucket whose incarnation changed is a new arrival behind all waiters.
+    pub(crate) fn restore<'a>(
+        persisted: Option<Self>,
+        publication_epoch: u64,
+        inventory: impl Iterator<Item = &'a str>,
+        incarnations: Option<&HashMap<String, uuid::Uuid>>,
+    ) -> Self {
+        let mut ledger = persisted
+            .filter(|ledger| ledger.publication_epoch == publication_epoch && ledger.is_valid())
+            .unwrap_or_else(|| Self {
+                publication_epoch,
+                ..Default::default()
+            });
+        let previous = std::mem::take(&mut ledger.buckets);
+        let mut arrivals = Vec::new();
+        for bucket in inventory {
+            let incarnation = incarnations.and_then(|current| current.get(bucket)).copied();
+            match previous.get(bucket) {
+                Some(service) if service.incarnation.is_none() || incarnation.is_none() || service.incarnation == incarnation => {
+                    ledger.buckets.insert(
+                        bucket.to_owned(),
+                        DataUsageBucketService {
+                            incarnation: incarnation.or(service.incarnation),
+                            ..*service
+                        },
+                    );
+                }
+                _ => arrivals.push((bucket, incarnation)),
+            }
+        }
+        if !arrivals.is_empty() {
+            ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        }
+        for (bucket, incarnation) in arrivals {
+            ledger.buckets.insert(
+                bucket.to_owned(),
+                DataUsageBucketService {
+                    waiting_since: ledger.next_sequence,
+                    incarnation,
+                    ..Default::default()
+                },
+            );
+        }
+        ledger
+    }
+
+    fn is_valid(&self) -> bool {
+        self.buckets.len() <= DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS
+            && self.buckets.keys().map(String::len).sum::<usize>() <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES
+            && self
+                .buckets
+                .iter()
+                .all(|(bucket, service)| !bucket.is_empty() && service.waiting_since <= self.next_sequence)
+    }
+
+    /// Smaller positions have waited longer; an untracked bucket queues last.
+    pub(crate) fn wait_position(&self, bucket: &str) -> u64 {
+        self.buckets.get(bucket).map_or(u64::MAX, |service| service.waiting_since)
+    }
+
+    /// Moves a bucket to the tail and returns its previous wait position.
+    pub(crate) fn record_service(&mut self, bucket: &str) -> Option<u64> {
+        let service = self.buckets.get_mut(bucket)?;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let previous = std::mem::replace(&mut service.waiting_since, self.next_sequence);
+        service.service_quanta = service.service_quanta.saturating_add(1);
+        Some(previous)
+    }
+
+    /// Undoes `record_service` for an admission a resource veto turned back.
+    pub(crate) fn return_service(&mut self, bucket: &str, waiting_since: u64) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.waiting_since = waiting_since;
+            service.service_quanta = service.service_quanta.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn record_certified(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.last_certified = Some(service.waiting_since);
+            service.failure_debt = 0;
+        }
+    }
+
+    pub(crate) fn record_failure(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.failure_debt = service.failure_debt.saturating_add(1);
+        }
+    }
+
+    /// Keeps the persisted set cache bounded. The longest waiters are dropped:
+    /// an untracked bucket joins as a new arrival on the next restore.
+    pub(crate) fn bounded(mut self) -> Self {
+        let name_bytes = self.buckets.keys().map(String::len).sum::<usize>();
+        if self.buckets.len() <= DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS && name_bytes <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES {
+            return self;
+        }
+        let mut newest = self.buckets.into_iter().collect::<Vec<_>>();
+        newest.sort_by(|left, right| {
+            right
+                .1
+                .waiting_since
+                .cmp(&left.1.waiting_since)
+                .then_with(|| left.0.cmp(&right.0))
+        });
+        let mut retained_bytes = 0_usize;
+        self.buckets = newest
+            .into_iter()
+            .take(DATA_USAGE_SERVICE_LEDGER_MAX_BUCKETS)
+            .take_while(|(bucket, _)| {
+                retained_bytes = retained_bytes.saturating_add(bucket.len());
+                retained_bytes <= DATA_USAGE_SERVICE_LEDGER_MAX_NAME_BYTES
+            })
+            .collect();
+        self
+    }
+
+    /// Buckets holding unpaid failures and the first of them by name.
+    pub(crate) fn failure_debt(&self) -> (usize, Option<&str>) {
+        let mut debtors = self
+            .buckets
+            .iter()
+            .filter(|(_, service)| service.failure_debt > 0)
+            .map(|(bucket, _)| bucket.as_str());
+        let first = debtors.next();
+        let (count, first) = debtors.fold((usize::from(first.is_some()), first), |(count, first), bucket| {
+            (count + 1, first.min(Some(bucket)))
+        });
+        (count, first)
+    }
+}
+
 /// Data usage cache info
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
@@ -679,6 +880,9 @@ pub struct DataUsageCacheInfo {
     /// skipping an unselected bucket in a later scoped set scan.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub scan_bucket_incarnations: HashMap<String, uuid::Uuid>,
+    /// Bucket service order of a set cache; absent from bucket caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_bucket_service: Option<DataUsageBucketServiceLedger>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -705,7 +909,8 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_scan_plan_digest.is_some())
             + usize::from(self.scan_execution_digest.is_some())
             + usize::from(self.segment_invalidation_proof.is_some())
-            + usize::from(!self.scan_bucket_incarnations.is_empty());
+            + usize::from(!self.scan_bucket_incarnations.is_empty())
+            + usize::from(self.scan_bucket_service.is_some());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -773,6 +978,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if !self.scan_bucket_incarnations.is_empty() {
             state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;
+        }
+        if let Some(ledger) = &self.scan_bucket_service {
+            state.serialize_entry("scan_bucket_service", ledger)?;
         }
         state.end()
     }
@@ -909,6 +1117,30 @@ impl DataUsageCache {
         } else {
             DataUsageCachePrepareOutcome::Reset
         }
+    }
+
+    /// Identifies how far durable resume state has advanced. Discovery alone
+    /// does not change it; only committed raw pages or coverage frontier do.
+    pub(crate) fn durable_scan_position(&self) -> (Option<String>, Option<String>, u64) {
+        let raw_entries = self
+            .info
+            .scan_raw_enumeration_page_index
+            .iter()
+            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+            .map(|index| match index.status() {
+                RawEnumerationPageOwnerStatus::Unsupported => 0,
+                RawEnumerationPageOwnerStatus::Building { indexed_entries, .. }
+                | RawEnumerationPageOwnerStatus::Ready { indexed_entries, .. } => indexed_entries,
+            })
+            .fold(0, u64::saturating_add);
+        (
+            self.info.scan_resume_after.clone(),
+            self.info
+                .scan_coverage_receipt
+                .as_ref()
+                .map(|receipt| receipt.through.clone()),
+            raw_entries,
+        )
     }
 
     pub(crate) fn has_scan_position(&self) -> bool {
