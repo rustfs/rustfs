@@ -970,10 +970,10 @@ threads-required = "num-test-threads"
 filter = 'package(e2e_test) & (test(/^kms::kms_vault_test::/) | test(/^kms::kms_rekey_sweep_test::/) | test(/^kms::configured_roundtrip_test::test_configured_vault_kms_admin_and_versioned_cleanup$/))'
 test-group = 'e2e-vault'
 
-# Keep the storage-heavy smoke cases isolated in the full suite too. They
-# start multiple server fixtures and issue many sequential S3 operations.
+# Keep storage-heavy cases isolated in the full suite too. The large pagination
+# fixture alone seeds 2,000 objects and can otherwise starve other servers.
 [[profile.e2e-full.overrides]]
-filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter|test_list_objects_v2_raw_exceeds_maxkeys_but_visible_below)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
 threads-required = "num-test-threads"
 
 # Fixed, small contract for every executable server change. These existing
