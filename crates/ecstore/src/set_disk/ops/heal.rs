@@ -1939,6 +1939,13 @@ impl SetDisks {
                             }
                         }
                         let _read_repair_write_lock_guard = if let Some(expected_fingerprint) = read_repair_commit_fingerprint {
+                            if _read_repair_read_lock_guard
+                                .as_ref()
+                                .is_some_and(|guard| guard.is_lock_lost())
+                            {
+                                let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                return Err(DiskError::DiskOngoingReq);
+                            }
                             drop(_read_repair_read_lock_guard.take());
                             match self
                                 .acquire_revalidated_read_repair_commit_lock(
@@ -1981,7 +1988,12 @@ impl SetDisks {
                                 if let Some(scope) = &bucket_heal_scope {
                                     scope.check()?;
                                 }
-                                if commit_fence.is_some_and(|check| !check()) {
+                                if commit_fence.is_some_and(|check| !check())
+                                    || _write_lock_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                                    || _read_repair_write_lock_guard
+                                        .as_ref()
+                                        .is_some_and(|guard| guard.is_lock_lost())
+                                {
                                     let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
                                     return Err(DiskError::DiskOngoingReq);
                                 }
@@ -2119,6 +2131,12 @@ impl SetDisks {
                         self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id)
                             .await
                             .map_err(DiskError::other)?;
+                        if _read_repair_write_lock_guard
+                            .as_ref()
+                            .is_some_and(|guard| guard.is_lock_lost())
+                        {
+                            return Err(DiskError::DiskOngoingReq);
+                        }
 
                         self.record_healed_capacity_scope(&healed_disks);
 
@@ -3629,6 +3647,46 @@ impl SetDisks {
         proof: AbsenceProofRequest<'_>,
     ) -> Result<(HealResultItem, Option<Error>)> {
         *absence = None;
+        if opts.read_repair
+            && !opts.no_lock
+            && !opts.dry_run
+            && !opts.remove
+            && !has_suffix(object, SLASH_SEPARATOR)
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+        {
+            // Read repair may stage under a shared lock, but must not perform
+            // destructive cleanup or produce an authoritative absence proof.
+            let can_commit = || proof.retirement.is_none_or(|context| !context.lifecycle_guard.is_lock_lost());
+            let mut read_opts = *opts;
+            loop {
+                let (result, error) = pin_object_heal_future(|| {
+                    self.heal_object_with_explicit_version_regen(
+                        bucket,
+                        object,
+                        version_id,
+                        ExplicitVersionHeal {
+                            opts: &read_opts,
+                            allow_regeneration: false,
+                            preserve_unrepairable: true,
+                            commit_fence: Some(&can_commit),
+                            namespace_owner: None,
+                            retirement: None,
+                        },
+                        absence,
+                    )
+                })
+                .await
+                .map_err(|error| to_object_err(error.into(), vec![bucket, object]))?;
+                if !can_commit() {
+                    return Err(DiskError::DiskOngoingReq.into());
+                }
+                if matches!(error, Some(DiskError::FileCorrupt)) && read_opts.scan_mode != HealScanMode::Deep {
+                    read_opts.scan_mode = HealScanMode::Deep;
+                    continue;
+                }
+                return Ok((result, error.map(Into::into)));
+            }
+        }
         let _write_lock_guard = if !opts.no_lock {
             let ns_lock = self
                 .new_ns_lock(bucket, object)
@@ -8654,7 +8712,7 @@ mod heal_result_report_tests {
             let heal_bucket = bucket.clone();
             let heal = tokio::spawn(async move {
                 heal_set
-                    .heal_object(
+                    .heal_object_with_retirement(
                         &heal_bucket,
                         object,
                         &selected_version.to_string(),
@@ -8662,6 +8720,11 @@ mod heal_result_report_tests {
                             scan_mode: HealScanMode::Deep,
                             read_repair: true,
                             ..Default::default()
+                        },
+                        &mut None,
+                        AbsenceProofRequest {
+                            retirement: None,
+                            allow_unversioned: false,
                         },
                     )
                     .await
@@ -8754,7 +8817,7 @@ mod heal_result_report_tests {
                 assert!(outcome.expect("historical version remains healable").1.is_none());
             } else {
                 assert!(
-                    matches!(outcome, Err(DiskError::FileVersionNotFound)),
+                    matches!(outcome, Err(Error::VersionNotFound(..))),
                     "deleted version must remain typed absent: {outcome:?}"
                 );
             }
@@ -10348,6 +10411,123 @@ mod heal_result_report_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn read_repair_storage_entry_keeps_readers_available_during_reconstruction() {
+        use crate::object_api::WriteCompletion;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "read-repair-storage-entry";
+        let object = "object.bin";
+        let expected = vec![0x37; 1024 * 1024];
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected.clone()),
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let metadata = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("read metadata");
+        let missing = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(metadata.data_dir.expect("external object data").to_string())
+            .join("part.1");
+        tokio::fs::remove_file(&missing).await.expect("remove shard");
+
+        let (_pause, arrived, release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+        let heal_set = set.clone();
+        let heal = tokio::spawn(async move {
+            let mut absence = None;
+            let result = heal_set
+                .heal_object_with_retirement(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair: true,
+                        ..Default::default()
+                    },
+                    &mut absence,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await;
+            (result, absence)
+        });
+        tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+            .await
+            .expect("read-repair reached shard reconstruction");
+        let namespace = set.new_ns_lock(bucket, object).await.expect("object namespace");
+        let reader = namespace
+            .get_read_lock(Duration::from_millis(200))
+            .await
+            .expect("read-repair reconstruction should allow concurrent readers");
+        drop(reader);
+        release.notify_one();
+        let (result, absence) = tokio::time::timeout(Duration::from_secs(20), heal)
+            .await
+            .expect("repair finishes")
+            .expect("repair task joins");
+        let (_, error) = result.expect("repair operation succeeds");
+        assert!(error.is_none(), "repair failed: {error:?}");
+        assert!(absence.is_none());
+        assert!(missing.exists(), "missing shard was not restored");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read repaired object");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read full object");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    async fn read_repair_storage_entry_does_not_prove_missing_versions_absent() {
+        let (_dirs, _disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "read-repair-no-absence-proof";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let mut absence = None;
+        let (_, error) = set
+            .heal_object_with_retirement(
+                bucket,
+                "missing.bin",
+                &Uuid::new_v4().to_string(),
+                &HealOpts {
+                    read_repair: true,
+                    ..Default::default()
+                },
+                &mut absence,
+                AbsenceProofRequest {
+                    retirement: None,
+                    allow_unversioned: false,
+                },
+            )
+            .await
+            .expect("missing version report");
+        assert!(matches!(error, Some(Error::FileVersionNotFound)));
+        assert!(absence.is_none(), "read repair must not publish an absence proof");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn read_repair_commit_aborts_when_object_changes_before_final_rename() {
         let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
         let bucket = "read-repair-stale-commit";
@@ -10391,7 +10571,7 @@ mod heal_result_report_tests {
         let heal_set = set.clone();
         let heal_task = tokio::spawn(async move {
             heal_set
-                .heal_object(
+                .heal_object_with_retirement(
                     bucket,
                     object,
                     "",
@@ -10399,6 +10579,11 @@ mod heal_result_report_tests {
                         scan_mode: HealScanMode::Deep,
                         read_repair: true,
                         ..Default::default()
+                    },
+                    &mut None,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
                     },
                 )
                 .await
@@ -10420,7 +10605,7 @@ mod heal_result_report_tests {
             .expect("read-repair should finish after release")
             .expect("read-repair task should join")
             .expect("stale read-repair should report a typed retryable error");
-        assert_eq!(err, Some(DiskError::Timeout));
+        assert!(matches!(err, Some(Error::Timeout)), "stale repair must retry: {err:?}");
 
         let final_info = set
             .get_object_info(bucket, object, &ObjectOptions::default())
