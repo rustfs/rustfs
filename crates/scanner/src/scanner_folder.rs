@@ -3536,6 +3536,7 @@ pub(crate) async fn scan_data_folder_scoped(
                             global_metrics().record_scanner_checkpoint_cleared();
                         }
                     }
+                    new_cache.info.scan_resource_deferred = matches!(&e, ScannerError::ResourceDeferred);
                     close_disk_guard.close().await;
                     return Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))));
                 }
@@ -3565,6 +3566,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
                 }
                 partial_cache.info.snapshot_complete = false;
+                partial_cache.info.scan_resource_deferred = true;
                 close_disk_guard.close().await;
                 return Err(ScannerError::PartialCache(Box::new(partial_cache)));
             }

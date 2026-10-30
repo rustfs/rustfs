@@ -510,6 +510,7 @@ async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners
     let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
     let mut ledger = certified.info.scan_bucket_service.clone().expect("saved order");
     ledger.next_sequence += 1;
+    ledger.leader_epoch = 11;
 
     assert!(persist_scanner_service_ledger(set.clone(), source, ledger.clone(), 3, 11, epoch).await);
     let saved = load_set_cache(&store).await;
@@ -532,5 +533,25 @@ async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners
         "a late write from an older cycle must not replace the order"
     );
     assert_eq!(load_set_cache(&store).await.info.scan_bucket_service.as_ref(), Some(&ledger));
+
+    // An incomplete save leaves the cache stamps at epoch 11, so only the order
+    // itself can reject the leader it replaced.
+    let mut newer = ledger.clone();
+    newer.next_sequence += 1;
+    assert!(persist_scanner_service_ledger(set.clone(), source, newer.clone(), 3, 12, epoch).await);
+    let saved = load_set_cache(&store).await;
+    assert_eq!(saved.info.leader_epoch, certified.info.leader_epoch);
+    assert!(
+        !persist_scanner_service_ledger(set.clone(), source, ledger.clone(), 3, 11, epoch).await,
+        "a late write must not replace an order saved by a newer leader"
+    );
+    assert_eq!(
+        load_set_cache(&store)
+            .await
+            .info
+            .scan_bucket_service
+            .map(|saved| saved.next_sequence),
+        Some(newer.next_sequence)
+    );
     clear_dirty_usage_buckets_for_tests();
 }

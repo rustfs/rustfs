@@ -1206,7 +1206,7 @@ fn log_missing_set_snapshot_metadata(store: &SetDisks, info: &DataUsageCacheInfo
 pub(super) async fn persist_scanner_service_ledger(
     store: Arc<SetDisks>,
     source: DataUsageCacheSource,
-    ledger: DataUsageBucketServiceLedger,
+    mut ledger: DataUsageBucketServiceLedger,
     cycle: u64,
     leader_epoch: u64,
     expected_publication_epoch: u64,
@@ -1242,7 +1242,14 @@ pub(super) async fn persist_scanner_service_ledger(
             return false;
         }
     };
-    if persisted.info.next_cycle > cycle || persisted.info.leader_epoch > leader_epoch {
+    if persisted.info.next_cycle > cycle
+        || persisted.info.leader_epoch > leader_epoch
+        || persisted
+            .info
+            .scan_bucket_service
+            .as_ref()
+            .is_some_and(|saved| saved.leader_epoch > leader_epoch)
+    {
         log_skipped("service_order_stale", &"a newer scanner owns the set cache");
         return false;
     }
@@ -1257,6 +1264,7 @@ pub(super) async fn persist_scanner_service_ledger(
         persisted.info.leader_epoch = leader_epoch;
         persisted.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
     }
+    ledger.leader_epoch = leader_epoch;
     persisted.info.scan_bucket_service = Some(ledger);
     match persisted
         .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)

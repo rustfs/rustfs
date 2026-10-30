@@ -268,6 +268,70 @@ fn cold_bucket_service_budget_stop_and_resource_veto_add_no_debt() {
     assert_eq!(ledger.failure_debt(), (0, None), "budget-cancelled work is progress-only");
 }
 
+#[tokio::test]
+async fn cold_bucket_service_requeue_cannot_undo_the_next_workers_claim() {
+    let buckets = inventory();
+    let ledger = restore(None, &buckets);
+    let before = ledger.buckets["bucket-02"].waiting_since;
+    let round = Arc::new(ScannerBucketServiceRound::new(ledger));
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let work = || BucketWorkGuard::new(Arc::new(AtomicUsize::new(2)), CancellationToken::new());
+    let (bucket_tx, mut bucket_rx) = tokio::sync::mpsc::channel(1);
+
+    let mut first = work();
+    first.claim_service(round.clone(), "bucket-02", ctx.clone(), budget.clone());
+    assert!(requeue_bucket_work(&bucket_tx, &buckets[2], &mut first).await);
+
+    // The next worker takes the bucket while the first guard is still alive.
+    bucket_rx.recv().await.expect("requeued bucket");
+    let mut second = work();
+    second.claim_service(round.clone(), "bucket-02", ctx, budget);
+    drop(first);
+    drop(second);
+
+    let completed = HashSet::from(["bucket-02".to_string()]);
+    let ledger = round
+        .settle(&completed, &HashSet::new(), &HashSet::new())
+        .expect("the second claim served the bucket");
+    let service = &ledger.buckets["bucket-02"];
+    assert!(service.waiting_since > before, "the completed bucket returns to the tail");
+    assert_eq!(service.service_quanta, 1, "only the completed turn counts");
+}
+
+#[test]
+fn cold_bucket_service_partial_resource_veto_adds_no_debt() {
+    let buckets = inventory();
+    let round = Arc::new(ScannerBucketServiceRound::new(restore(None, &buckets)));
+    let ctx = CancellationToken::new();
+    let budget = ScannerCycleBudget::new(&ctx, Default::default());
+    let work = || BucketWorkGuard::new(Arc::new(AtomicUsize::new(2)), CancellationToken::new());
+
+    let mut vetoed = work();
+    vetoed.claim_service(round.clone(), "bucket-02", ctx.clone(), budget.clone());
+    vetoed.mark_service_interrupted();
+    drop(vetoed);
+    let mut failed = work();
+    failed.claim_service(round.clone(), "bucket-03", ctx, budget);
+    drop(failed);
+
+    let partial = HashSet::from(["bucket-02".to_string(), "bucket-03".to_string()]);
+    let ledger = round
+        .settle(&HashSet::new(), &HashSet::new(), &partial)
+        .expect("two buckets were served");
+    assert_eq!(ledger.buckets["bucket-02"].failure_debt, 0, "a resource block is not a failure");
+    assert_eq!(ledger.buckets["bucket-03"].failure_debt, 1, "an uninterrupted partial stays visible");
+}
+
+#[test]
+fn cold_bucket_service_resource_deferral_marker_is_never_persisted() {
+    let mut cache = DataUsageCache::default();
+    cache.info.name = DATA_USAGE_ROOT.to_string();
+    cache.info.scan_resource_deferred = true;
+    let decoded = DataUsageCache::unmarshal(&cache.marshal_msg().expect("encode")).expect("decode");
+    assert!(!decoded.info.scan_resource_deferred);
+}
+
 #[test]
 fn cold_bucket_service_order_is_an_optional_map_field_for_old_readers() {
     #[derive(serde::Deserialize)]

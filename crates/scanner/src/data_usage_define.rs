@@ -648,6 +648,9 @@ pub struct DataUsageBucketServiceLedger {
     /// Movement epoch the order was built under; another epoch invalidates it.
     #[serde(default)]
     pub publication_epoch: u64,
+    /// Leader that saved the order; an incomplete save stamps nothing else.
+    #[serde(default)]
+    pub leader_epoch: u64,
     #[serde(default)]
     pub next_sequence: u64,
     #[serde(default)]
@@ -658,8 +661,9 @@ pub struct DataUsageBucketServiceLedger {
 
 impl Serialize for DataUsageBucketServiceLedger {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let mut map = serializer.serialize_map(Some(4))?;
+        let mut map = serializer.serialize_map(Some(5))?;
         map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("leader_epoch", &self.leader_epoch)?;
         map.serialize_entry("next_sequence", &self.next_sequence)?;
         map.serialize_entry("generation_floor", &self.generation_floor)?;
         map.serialize_entry("buckets", &self.buckets)?;
@@ -788,6 +792,9 @@ impl DataUsageBucketServiceLedger {
 /// Data usage cache info
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
+    /// In-memory only: this partial stopped on admission pressure, not a failure.
+    #[serde(skip)]
+    pub scan_resource_deferred: bool,
     pub name: String,
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,

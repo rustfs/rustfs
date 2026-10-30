@@ -516,6 +516,16 @@ struct BucketServiceClaim {
     budget: Arc<ScannerCycleBudget>,
 }
 
+impl BucketServiceClaim {
+    fn settle(self, requeued: bool) {
+        if self.budget.budget_elapsed() || self.ctx.is_cancelled() {
+            self.round.interrupt(&self.bucket);
+        } else if requeued {
+            self.round.release(&self.bucket);
+        }
+    }
+}
+
 pub(super) struct BucketWorkGuard {
     remaining: Arc<AtomicUsize>,
     complete: CancellationToken,
@@ -535,6 +545,21 @@ impl BucketWorkGuard {
 
     pub(super) fn mark_requeued(&mut self) {
         self.requeued = true;
+    }
+
+    /// Settles the claim before the bucket is visible to another worker, whose
+    /// own claim a later release would otherwise undo.
+    pub(super) fn settle_service_for_requeue(&mut self) {
+        if let Some(claim) = self.service.take() {
+            claim.settle(true);
+        }
+    }
+
+    /// Records a stop that is neither service nor failure, such as a resource veto.
+    pub(super) fn mark_service_interrupted(&self) {
+        if let Some(claim) = &self.service {
+            claim.round.interrupt(&claim.bucket);
+        }
     }
 
     /// Spends this bucket's service turn. The guard settles it at the end of
@@ -559,11 +584,7 @@ impl BucketWorkGuard {
 impl Drop for BucketWorkGuard {
     fn drop(&mut self) {
         if let Some(claim) = self.service.take() {
-            if claim.budget.budget_elapsed() || claim.ctx.is_cancelled() {
-                claim.round.interrupt(&claim.bucket);
-            } else if self.requeued {
-                claim.round.release(&claim.bucket);
-            }
+            claim.settle(self.requeued);
         }
         if !self.requeued && self.remaining.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.complete.cancel();

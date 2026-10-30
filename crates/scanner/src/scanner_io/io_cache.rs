@@ -982,6 +982,11 @@ impl ScannerIOCache for SetDisks {
                                 }
                             }
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Partial) => {
+                                // A remote count budget stops on entries it does
+                                // not report back, so the partial proves no failure.
+                                if bucket_budget.max_objects().is_some() || bucket_budget.max_directories().is_some() {
+                                    work_guard.mark_service_interrupted();
+                                }
                                 record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
                                 debug!(
                                     target: "rustfs::scanner::io",
@@ -1584,7 +1589,12 @@ impl ScannerIOCache for SetDisks {
                             }
                             (completed_cache, false)
                         }
-                        ScannerDiskScanOutcome::Partial(partial_cache) => (partial_cache, true),
+                        ScannerDiskScanOutcome::Partial(partial_cache) => {
+                            if partial_cache.info.scan_resource_deferred {
+                                work_guard.mark_service_interrupted();
+                            }
+                            (partial_cache, true)
+                        }
                         ScannerDiskScanOutcome::NamespaceNotFound(_) => {
                             if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
                                 increment_disk_bucket_scans_queued(
