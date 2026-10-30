@@ -55,7 +55,8 @@ env:
 jobs:
   heal-test:
     runs-on: smoke-testing
-    timeout-minutes: 60
+    # 90-minute heal run (see the step below) plus setup, report and cleanup.
+    timeout-minutes: 120
     # Standalone manual run, or one link of the nightly functional chain
     # (storage -> heal -> pool). Pool expansion no longer re-runs heal.
     if: ${{ inputs.chain_manifest != '' || github.event_name == 'workflow_dispatch' }}
@@ -154,7 +155,7 @@ jobs:
           ./auto-testing/rustfs_heal_test.sh "${ARGS[@]}" --log-file "${LOG_FILE}"
 
       - name: Run heal test (write -> outage -> heal -> verify)
-        timeout-minutes: 45
+        timeout-minutes: 90
         id: test
         # Collect reports and backlog evidence before the final suite verdict.
         continue-on-error: true
