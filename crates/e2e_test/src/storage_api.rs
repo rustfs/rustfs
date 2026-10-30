@@ -70,6 +70,9 @@ pub(crate) mod multipart_rpc_delay {
 #[cfg(test)]
 pub(crate) mod multipart_fence_acceptance {
     pub(crate) use super::RUSTFS_META_MULTIPART_BUCKET;
+
+    /// Targeted lock diagnostics for the metadata-delay quorum case.
+    pub(crate) const LOCK_DIAGNOSTICS_FILTER: &str = "warn,rustfs_lock::distributed_lock=debug,rustfs_ecstore::object_lock_diag=trace,rustfs_ecstore::cluster::rpc::remote_locker=info";
 }
 
 #[cfg(test)]
@@ -79,4 +82,15 @@ pub(crate) mod multipart_source_rpc {
         MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceSnapshot,
         PublicationIdentity, SourceGeneration, SourceGeometry, SourceLineage,
     };
+}
+
+#[cfg(test)]
+pub(crate) mod scanner_peer_bucket {
+    use rustfs_ecstore::api::disk as ecstore_disk;
+    use rustfs_ecstore::api::erasure as ecstore_erasure;
+    use rustfs_ecstore::api::rpc as ecstore_rpc;
+
+    pub(crate) use ecstore_disk::{BUCKET_META_PREFIX, RUSTFS_META_BUCKET};
+    pub(crate) use ecstore_erasure::{ReedSolomonEncoder, calc_shard_size};
+    pub(crate) use ecstore_rpc::PeerRestClient;
 }

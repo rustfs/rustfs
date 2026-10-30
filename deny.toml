@@ -44,9 +44,9 @@ allow-git = [
     # owner: rustfs-maintainers  review: 2026-10
     "https://github.com/ramosbugs/openidconnect-rs",
     "https://github.com/ramosbugs/oauth2-rs",
-    # RustFS io_uring backend is now consumed from crates.io at 0.3.0.
-    # owner: rustfs-maintainers  review: 2026-10
-    # "https://github.com/rustfs/uring",
+    # Completion ownership patch fixed to rustfs/uring#20.
+    # owner: overtrue  review: 2026-10
+    "https://github.com/rustfs/uring.git",
 ]
 
 [bans]

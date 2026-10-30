@@ -80,7 +80,7 @@ use crate::erasure::codec::bridge::{
 use crate::erasure::coding;
 use crate::error::{Error, Result, is_err_version_not_found};
 use crate::error::{GenericError, ObjectApiError, is_err_object_not_found};
-use crate::io_support::bitrot::{create_bitrot_reader, create_bitrot_reader_from_bytes, create_bitrot_writer};
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, create_bitrot_writer};
 use crate::object_api::ObjectOptions;
 use crate::object_api::get_object_body_cache_hook;
 use crate::object_api::object_api_utils::get_raw_etag;
@@ -4537,6 +4537,7 @@ fn resolve_tiered_decommission_write_quorum_result(
 pub struct SetDisks {
     pub locker_owner: String,
     pub disks: Arc<RwLock<Vec<Option<DiskStore>>>>,
+    pub(crate) physical_heal_admission: Arc<crate::disk::PhysicalHealBinding>,
     pub set_endpoints: Vec<Endpoint>,
     pub set_drive_count: usize,
     pub default_parity_count: usize,
@@ -5154,6 +5155,12 @@ impl SetDisks {
         if request.expected_bucket_incarnation_id.is_none() {
             return Ok(());
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        if let Some(object) = request.object_prefix.as_deref()
+            && skip_e2e_mrf_fallback(&request.bucket, object).await
+        {
+            return Ok(());
+        }
         request.source = rustfs_heal_contracts::heal_channel::HealRequestSource::Mrf;
         #[cfg(test)]
         {
@@ -5473,6 +5480,7 @@ impl SetDisks {
         Arc::new(SetDisks {
             locker_owner,
             disks,
+            physical_heal_admission: Arc::default(),
             set_drive_count,
             default_parity_count,
             set_index,
@@ -5859,6 +5867,25 @@ impl SetDisks {
 
     //     Ok(())
     // }
+}
+
+// The isolated root-heal test suppresses only the direct best-effort fallback.
+// Persisted MRF responsibilities and their replay keep their normal behavior.
+#[cfg(feature = "e2e-test-hooks")]
+pub(in crate::set_disk) async fn skip_e2e_mrf_fallback(bucket: &str, object: &str) -> bool {
+    let Some(path) = std::env::var_os("RUSTFS_E2E_SKIP_MRF_FALLBACK_PATH") else {
+        return false;
+    };
+    let path = std::path::PathBuf::from(path);
+    let Ok(prefix) = tokio::fs::read_to_string(&path).await else {
+        return false;
+    };
+    let key = format!("{bucket}/{object}");
+    if prefix.is_empty() || !key.starts_with(&prefix) {
+        return false;
+    }
+    let _ = tokio::fs::write(path.with_extension("observed"), key).await;
+    true
 }
 
 fn is_explicit_null_version(version_id: Option<Uuid>) -> bool {
@@ -14761,7 +14788,7 @@ mod tests {
             file.erasure.index = files.len() + 1;
             file.erasure.block_size = erasure.block_size;
             file.uses_legacy_checksum = uses_legacy;
-            file.data = Some(Bytes::from(data));
+            file.data = Some(data);
             files.push(file);
         }
 
@@ -15222,7 +15249,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15306,7 +15333,7 @@ mod tests {
         }
 
         let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-        disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+        disk.write_all(bucket, &shard_path, encoded)
             .await
             .expect("encoded shard should be stored");
 
@@ -15419,7 +15446,7 @@ mod tests {
             }
 
             let encoded = bitrot_writer.into_inline_data().expect("bitrot encoded data should exist");
-            disk.write_all(bucket, &shard_path, Bytes::from(encoded))
+            disk.write_all(bucket, &shard_path, encoded)
                 .await
                 .expect("encoded shard should be stored");
         }

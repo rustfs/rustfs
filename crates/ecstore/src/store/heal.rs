@@ -599,6 +599,33 @@ impl ECStore {
         Ok((write_state, pool_guard, rebalance_guard, pool_meta, rebalance_meta))
     }
 
+    /// Snapshot only the object sets participating in this request. The sampler
+    /// resolves their physical leaves before Heal enters namespace/cache locks.
+    pub fn physical_heal_plan(&self, object: &str, opts: &HealOpts) -> Result<Option<crate::disk::PhysicalResourcePlan>> {
+        if let Some(index) = opts.pool
+            && index >= self.pools.len()
+        {
+            return Err(invalid_heal_pool_index(index, self.pools.len()));
+        }
+        let object = rustfs_utils::path::encode_dir_object_ref(object);
+        let mut selected: Option<crate::disk::PhysicalResourcePlan> = None;
+        for (index, pool) in self.pools.iter().enumerate() {
+            if opts.pool.is_some_and(|requested| requested != index) {
+                continue;
+            }
+            let set = pool.get_disks_for_heal_object(&object, opts)?;
+            let Some(plan) = set.physical_heal_admission.plan() else { return Ok(None) };
+            if let Some(selected) = &mut selected {
+                if selected.union_with(&plan).is_err() {
+                    return Ok(None);
+                }
+            } else {
+                selected = Some(plan);
+            }
+        }
+        Ok(selected)
+    }
+
     fn get_pools_for_heal_object(&self, opts: &HealOpts) -> Result<Vec<Arc<Sets>>> {
         match opts.pool {
             Some(pool_idx) => Ok(vec![
@@ -1609,21 +1636,25 @@ mod tests {
         }
     }
 
-    async fn minimal_heal_pool(pool_idx: usize) -> Arc<Sets> {
-        let format = FormatV3::new(1, 1);
-        let endpoint_url = format!("http://127.0.0.1:{}/data", 19000 + pool_idx);
-        let mut endpoint = Endpoint::try_from(endpoint_url.as_str()).expect("endpoint should parse");
-        endpoint.set_pool_index(pool_idx);
-        endpoint.set_set_index(0);
-        endpoint.set_disk_index(0);
-
+    async fn minimal_heal_pool(pool_idx: usize, set_count: usize) -> Arc<Sets> {
+        let format = FormatV3::new(set_count, 1);
+        let endpoints = (0..set_count)
+            .map(|set_idx| {
+                let endpoint_url = format!("http://127.0.0.1:{}/data", 19000 + pool_idx + set_idx * 2);
+                let mut endpoint = Endpoint::try_from(endpoint_url.as_str()).expect("endpoint should parse");
+                endpoint.set_pool_index(pool_idx);
+                endpoint.set_set_index(set_idx);
+                endpoint.set_disk_index(0);
+                endpoint
+            })
+            .collect::<Vec<_>>();
         Sets::new(
-            vec![None],
+            vec![None; set_count],
             &PoolEndpoints {
                 legacy: false,
-                set_count: 1,
+                set_count,
                 drives_per_set: 1,
-                endpoints: Endpoints::from(vec![endpoint]),
+                endpoints: Endpoints::from(endpoints),
                 cmd_line: String::new(),
                 platform: String::new(),
             },
@@ -2451,7 +2482,7 @@ mod tests {
         ECStore {
             id: Uuid::new_v4(),
             disk_map: HashMap::new(),
-            pools: vec![minimal_heal_pool(0).await, minimal_heal_pool(1).await],
+            pools: vec![minimal_heal_pool(0, 1).await, minimal_heal_pool(1, 1).await],
             peer_sys: S3PeerSys {
                 clients: Vec::new(),
                 pools_count: 2,
@@ -2463,6 +2494,88 @@ mod tests {
             pool_meta_save_gate: Mutex::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn physical_heal_plan_uses_the_real_pool_set_and_directory_placement() {
+        use crate::disk::PhysicalDiskBinding;
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+
+        let mut store = minimal_heal_store().await;
+        store.pools[0] = minimal_heal_pool(0, 2).await;
+        let pool = &store.pools[0];
+        let a = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let b = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        for (set, gate) in pool.disk_set.iter().zip([&a, &b]) {
+            let binding = PhysicalDiskBinding::default();
+            binding.set_test_capacity(vec![gate.clone()]).expect("physical fixture");
+            set.physical_heal_admission
+                .set_test_plan(binding.plan().expect("live").resource_plan());
+        }
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let directory = (0..100)
+            .map(|n| format!("dir{n}/"))
+            .find(|name| {
+                store.pools[0].get_disks_by_key(name).set_index
+                    != store.pools[0].get_disks_by_key(&encode_dir_object(name)).set_index
+            })
+            .expect("different directory placement");
+        for object in ["plain-object", directory.as_str()] {
+            for set in [None, Some(0), Some(1)] {
+                let opts = HealOpts {
+                    pool: Some(0),
+                    set,
+                    ..Default::default()
+                };
+                let expected = store.pools[0]
+                    .get_disks_for_heal_object(&encode_dir_object(object), &opts)
+                    .expect("placement")
+                    .set_index;
+                let permit = store
+                    .physical_heal_plan(object, &opts)
+                    .expect("valid selection")
+                    .expect("known set")
+                    .try_acquire(&node)
+                    .expect("physical admission");
+                assert_eq!((a.snapshot().active, b.snapshot().active), if expected == 0 { (1, 0) } else { (0, 1) });
+                drop(permit);
+            }
+        }
+        assert!(
+            store
+                .physical_heal_plan("object", &HealOpts::default())
+                .expect("valid all pools")
+                .is_none(),
+            "an undiscovered participating pool cannot be skipped"
+        );
+        for opts in [
+            HealOpts {
+                pool: Some(2),
+                ..Default::default()
+            },
+            HealOpts {
+                pool: Some(0),
+                set: Some(2),
+                ..Default::default()
+            },
+        ] {
+            assert!(matches!(
+                store.physical_heal_plan("object", &opts),
+                Err(StorageError::InvalidArgument(..))
+            ));
         }
     }
 
@@ -2845,9 +2958,18 @@ mod tests {
         let (configuration, _) = read_config_no_lock_preserve_empty_with_metadata(store.clone(), &object)
             .await
             .expect("read the current bucket configuration");
-        save_config(store.clone(), &object, configuration)
-            .await
-            .expect("publish a newer config revision in the same bucket incarnation");
+        crate::config::com::save_config_with_opts(
+            store.clone(),
+            &object,
+            configuration,
+            &ObjectOptions {
+                max_parity: true,
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("publish a newer config revision on the target disk");
         let committed =
             std::fs::read(target_path.join(RUSTFS_META_BUCKET).join(&object).join("xl.meta")).expect("new target configuration");
         assert!(

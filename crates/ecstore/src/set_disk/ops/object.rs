@@ -4762,7 +4762,7 @@ impl SetDisks {
                                 .ok_or_else(|| Error::other(format!("inline encoder omitted disk shard {i}")))?,
                         );
                     } else if let Some(writer) = writers[i].take() {
-                        pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                        pfi.data = Some(writer.into_inline_data().unwrap_or_default());
                     }
 
                     pfi.set_inline_data();
@@ -9295,6 +9295,10 @@ impl SetDisks {
             // cannot safely target the object name after bucket recreation.
             return Ok(());
         };
+        #[cfg(feature = "e2e-test-hooks")]
+        if crate::set_disk::skip_e2e_mrf_fallback(bucket, object).await {
+            return Ok(());
+        }
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),

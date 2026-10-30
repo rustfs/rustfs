@@ -186,7 +186,7 @@ pub(crate) enum HealErrorClass {
     /// Offline disk, missing volume, unmet quorum, transport failure,
     /// slow-down or cancelled RPC: the same request can succeed later.
     Transient,
-    /// Lock contention or a lock/RPC timeout (non-fatal `LockError`).
+    /// Nonblocking admission/lock contention or a lock/RPC timeout.
     LockContention,
     /// A storage grace window; `retry_not_before` is the absolute UNIX
     /// deadline when storage reported one.
@@ -281,8 +281,7 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
     }
 }
 
-/// Classify a disk error. Nonblocking local CAS and replacement leases report
-/// lock contention as `WouldBlock`.
+/// Classify a disk error without losing the underlying I/O deferral kind.
 pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
     if error.is_dangling_delete_grace() {
         return HealErrorClass::DanglingGrace {
@@ -293,7 +292,6 @@ pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
         DiskError::FileNotFound | DiskError::FileVersionNotFound => HealErrorClass::Absent,
         DiskError::NoHealRequired => HealErrorClass::NoHealRequired,
         DiskError::Timeout => HealErrorClass::LockContention,
-        DiskError::Io(error) if error.kind() == std::io::ErrorKind::WouldBlock => HealErrorClass::LockContention,
         DiskError::DiskNotFound
         | DiskError::VolumeNotFound
         | DiskError::ErasureReadQuorum
@@ -310,6 +308,14 @@ pub(crate) fn classify_disk_error(error: &DiskError) -> HealErrorClass {
 }
 
 fn classify_io_error(error: &std::io::Error) -> HealErrorClass {
+    // Native memory admission and nonblocking CAS keep this kind when their
+    // errors cross disk, storage and direct I/O wrappers.
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        return HealErrorClass::LockContention;
+    }
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        return HealErrorClass::Transient;
+    }
     if DiskError::io_error_is_dangling_delete_grace(error) {
         return HealErrorClass::DanglingGrace {
             retry_not_before: dangling_deadline(DiskError::io_error_dangling_delete_retry_after(error)),
@@ -878,6 +884,29 @@ mod tests {
     fn classify_disk_volume_not_found_is_recoverable_like_storage() {
         assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_heal());
         assert!(Error::Disk(DiskError::VolumeNotFound).is_recoverable_object_heal());
+    }
+
+    #[test]
+    fn resource_pressure_stays_retryable_across_error_wrappers() {
+        for (kind, expected) in [
+            (std::io::ErrorKind::WouldBlock, super::HealErrorClass::LockContention),
+            (std::io::ErrorKind::OutOfMemory, super::HealErrorClass::Transient),
+        ] {
+            let pressure = || DiskError::Io(std::io::Error::new(kind, "background buffer memory budget exhausted"));
+            for error in [
+                Error::Disk(pressure()),
+                Error::Storage(EcstoreError::from(pressure())),
+                Error::Io(EcstoreError::from(pressure()).into()),
+            ] {
+                assert_eq!(super::classify_heal_error(&error), expected);
+                assert!(error.is_recoverable_heal(), "resource pressure must preserve retry responsibility");
+                assert!(!error.is_object_absent());
+            }
+        }
+        for kind in [std::io::ErrorKind::Other, std::io::ErrorKind::PermissionDenied] {
+            let error = Error::Io(std::io::Error::new(kind, "background buffer memory budget exhausted"));
+            assert!(!error.is_recoverable_heal(), "display text must not override the typed error kind");
+        }
     }
 
     #[test]

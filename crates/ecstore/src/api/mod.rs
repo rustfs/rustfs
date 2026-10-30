@@ -449,6 +449,9 @@ pub mod data_usage {
 }
 
 pub mod disk {
+    pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
+    pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
+    pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(feature = "test-util")]
@@ -476,6 +479,10 @@ pub mod disk {
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
         validate_batch_read_version_item_count,
+    };
+    pub use crate::disk::{
+        BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler,
+        PhysicalResourcePlan, RemoteBackgroundIo, with_background_resource_unit, with_remote_background_io,
     };
     pub use bytes::Bytes;
     pub use endpoint::Endpoint;
@@ -617,6 +624,7 @@ pub mod rio {
 }
 
 pub mod rpc {
+    pub use crate::cluster::rpc::http_auth::with_rpc_background_request;
     pub use crate::cluster::rpc::{
         AuthenticatedChannel, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION,
         NetworkPeerProbeClient, NetworkPeerProbeError, NetworkPeerProbeMeasurement, NetworkPeerTarget, PEER_RESTDRY_RUN,
@@ -626,8 +634,8 @@ pub mod rpc {
         TONIC_RPC_PREFIX, TonicInterceptor, build_put_file_auth_trailer, check_and_record_signed_rpc_nonce,
         decode_heal_bucket_rpc_options, encode_heal_bucket_rpc_options, gen_signature_headers, gen_tonic_replay_scope_headers,
         gen_tonic_signature_headers, gen_tonic_signature_interceptor, node_service_time_out_client,
-        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, set_tonic_canonical_body_digest,
-        sign_ns_scanner_capability, sign_ns_scanner_capability_with_checkpoint_coverage,
+        node_service_time_out_client_no_auth, normalize_tonic_rpc_audience, rpc_background_admission,
+        set_tonic_canonical_body_digest, sign_ns_scanner_capability, sign_ns_scanner_capability_with_checkpoint_coverage,
         sign_ns_scanner_capability_with_tier_registry_generation, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_ns_scanner_capability, verify_ns_scanner_capability_with_checkpoint_coverage,
@@ -677,8 +685,9 @@ pub mod storage {
     pub use crate::store::HealWalkVersion;
     pub use crate::store::{
         BootstrapLocalTarget, ECStore, SCANNER_PUBLICATION_LEASE_TTL_MS, ScannerDataMovementPauseStatus, all_local_disk,
-        all_local_disk_path, find_local_disk_by_ref, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients,
-        prewarm_local_disk_id_map, prewarm_local_disk_id_map_with_instance_ctx,
+        all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc, init_local_disks,
+        init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+        prewarm_local_disk_id_map_with_instance_ctx,
     };
     pub use crate::store::{HealObjectAbsenceProof, HealObjectStorageResult};
 }

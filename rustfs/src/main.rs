@@ -61,10 +61,10 @@ static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::Countin
 #[global_allocator]
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
-fn main() {
+fn main() -> std::process::ExitCode {
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
 
-    rustfs::startup_entrypoint::run_process();
+    rustfs::startup_entrypoint::run_process()
 }
 
 #[cfg(all(test, feature = "hotpath", feature = "hotpath-alloc", not(target_os = "windows")))]

@@ -28,7 +28,7 @@ use super::{
     should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
 #[cfg(test)]
-use super::{run_inline_before_file_sync_admission, run_owned_file_write_before_open, run_rename_data_after_first_publication};
+use super::{run_inline_before_file_sync_admission, run_owned_file_before_open, run_rename_data_after_first_publication};
 use crate::crash_inject::{self, CrashPoint};
 use crate::disk::{
     QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RenameDataResp, STORAGE_FORMAT_FILE, STORAGE_FORMAT_FILE_BACKUP, SnapshotLeaseToken,
@@ -1097,7 +1097,7 @@ impl LocalDisk {
                 async move {
                     os::run_blocking_namespace_operation(owned_mutation_lease, move || {
                         #[cfg(test)]
-                        run_owned_file_write_before_open(&src_file_path);
+                        run_owned_file_before_open(&src_file_path);
                         let mut prepared_metadata_source = os::create_prepared_rename_source_with_commit_guard(
                             &src_file_path,
                             &dst_file_path,
@@ -1283,7 +1283,7 @@ impl LocalDisk {
                 // deterministic rollback backup.
                 let write_result = os::run_blocking_namespace_operation(commit.mutation_lease.clone(), move || {
                     #[cfg(test)]
-                    run_owned_file_write_before_open(&backup_path);
+                    run_owned_file_before_open(&backup_path);
                     backup_path_guard.write_file_for_path_access(
                         &backup_path,
                         backup_bytes.as_ref(),

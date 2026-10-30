@@ -9623,11 +9623,11 @@ mod tests {
             writer.shutdown().await.expect("inline writer should shutdown");
             let mut fi = base.clone();
             fi.erasure.index = index + 1;
-            fi.data = Some(Bytes::from(
+            fi.data = Some(
                 writer
                     .into_inline_data()
                     .expect("inline bitrot writer should retain encoded data"),
-            ));
+            );
             files.push(fi);
         }
         files

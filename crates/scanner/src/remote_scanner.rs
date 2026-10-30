@@ -59,7 +59,9 @@ mod stream;
 #[cfg(test)]
 pub(crate) use stream::checkpoint_fixture_partial_return;
 
-pub use stream::{RemoteScannerAdmission, RemoteScannerRequest, serve_remote_scanner_request};
+pub use stream::{
+    RemoteScannerAdmission, RemoteScannerRequest, serve_remote_scanner_request, serve_remote_scanner_request_with_memory,
+};
 pub(crate) use stream::{RemoteScannerOutcome, RemoteScannerScanSpec, scan_remote_bucket};
 use stream::{RemoteScannerReplayCache, RemoteScannerRequestWire, RemoteScannerValidatedCycle};
 

@@ -74,6 +74,7 @@ async fn run_cohort_cycle(
                 service_cohort: Some(cohort),
                 resolved_scope_observer: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )

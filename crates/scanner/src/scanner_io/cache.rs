@@ -11,8 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+/// scanner cache locks and the cache snapshot persist/publish path.
+use crate::data_usage_define::clone_cache_value;
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 use rustfs_scanner_metrics::usage_candidate::{
     ScannerUsageCandidateKind as CandidateKind, ScannerUsageCandidateOutcome as CandidateOutcome,
@@ -181,7 +182,7 @@ impl ScannerCacheLockGuards {
     }
 
     /// Suspend the same traversal while yielding its cache lease. Lock order on
-    /// resumption is node admission -> cache lease -> cache revision reads.
+    /// resumption is physical/node admission -> cache lease -> revision reads.
     pub(crate) async fn resume_node_operation(
         &mut self,
         store: Arc<SetDisks>,
@@ -196,10 +197,23 @@ impl ScannerCacheLockGuards {
         if request.respond.is_closed() {
             return Ok(());
         }
-        let crate::workload_admission::ScannerNodeRequest { owner, respond, cancel } = request;
+        let crate::workload_admission::ScannerNodeRequest {
+            owner,
+            physical,
+            respond,
+            cancel,
+        } = request;
         drop(self.scoped.take());
         let resume = async {
-            let permit = owner.acquire().await;
+            use crate::workload_admission::ScannerNodePermit;
+            let permit = match physical {
+                Some(plan) => plan
+                    .acquire(&owner)
+                    .await
+                    .map(|permit| ScannerNodePermit::Physical { permit, plan })
+                    .ok_or(crate::ScannerError::ResourceDeferred),
+                None => Ok(ScannerNodePermit::Node(owner.acquire().await)),
+            };
             *self = acquire_scanner_cache_locks(store.as_ref(), cache_name, source)
                 .await
                 .map_err(Error::other)?;
@@ -641,6 +655,11 @@ impl ScannerPublicationExpectation {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(crate) fn e2e_digests(&self) -> (String, String) {
+        (crate::e2e_barrier::hex(&self.candidate.0), crate::e2e_barrier::hex(&self.candidate.1.0))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
         Self {
@@ -823,7 +842,7 @@ pub(super) fn completed_usage_candidate(
                     scan_plan_digest: Some(result.info.scan_plan_digest.ok_or(CandidateOutcome::SetState)?.0),
                     complete: true,
                     tombstone: false,
-                    segment_invalidation_proof: result.info.segment_invalidation_proof.clone(),
+                    segment_invalidation_proof: clone_cache_value(&result.info.segment_invalidation_proof),
                 })
             })
             .collect::<std::result::Result<Vec<_>, CandidateOutcome>>()?;
@@ -1019,7 +1038,7 @@ pub(super) fn observational_data_usage_info(
                         selected.info.scan_plan_digest.map(|digest| digest.0),
                         selected.info.last_update,
                         true,
-                        selected.info.segment_invalidation_proof.clone(),
+                        clone_cache_value(&selected.info.segment_invalidation_proof),
                     )
                 } else {
                     (

@@ -1317,7 +1317,7 @@ impl LocalDisk {
                     continue;
                 };
                 #[cfg(test)]
-                run_owned_file_write_before_open(&record_destination.join(name));
+                run_owned_file_before_open(&record_destination.join(name));
                 let mut file = std::fs::File::create(staged.path().join(name))?;
                 std::io::Write::write_all(&mut file, bytes)?;
                 if sync && !bytes.is_empty() {
@@ -1795,7 +1795,7 @@ impl LocalDisk {
                         self.write_all_meta_with_namespace_owner(
                             volume,
                             &format!("{object}/{STORAGE_FORMAT_FILE}"),
-                            &target,
+                            target,
                             true,
                             owner.clone(),
                         )
@@ -3508,12 +3508,12 @@ mod tests {
         let exit = native.exit_signal.as_ref().expect("fixture cleanup lifecycle");
         exit.send(()).expect("stop the existing idle cleanup task");
         tokio::time::timeout(Duration::from_secs(5), async {
-            while exit.receiver_count() != 0 || root_file.strong_count() != 2 {
+            while exit.receiver_count() != 0 || root_file.strong_count() != 3 {
                 tokio::task::yield_now().await;
             }
         })
         .await
-        .expect("only LocalDisk's publication and mount fields may retain the initial root FD");
+        .expect("only LocalDisk's publication, mount and I/O backend fields may retain the initial root FD");
         let transaction = Uuid::new_v4();
         let applied = apply(&native, transaction).await;
         let committed = native

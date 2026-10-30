@@ -10684,6 +10684,9 @@ dependencies = [
  "hotpath",
  "http 1.5.0",
  "metrics",
+ "opentelemetry-proto",
+ "opentelemetry_sdk",
+ "prost 0.14.4",
  "rand 0.10.3",
  "rmp-serde",
  "rustfs-common",
@@ -10698,6 +10701,7 @@ dependencies = [
  "rustfs-heal-contracts",
  "rustfs-lifecycle",
  "rustfs-lock",
+ "rustfs-obs",
  "rustfs-s3-types",
  "rustfs-scanner-metrics",
  "rustfs-storage-api",
@@ -10912,8 +10916,7 @@ dependencies = [
 [[package]]
 name = "rustfs-uring"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f7deda770b7981ee3bfaa202ecd18625fc794c962b8d58cd4f436952b7e66dcf"
+source = "git+https://github.com/rustfs/uring.git?rev=eb8fc160e71d804427de1e905f5c226d580f71bf#eb8fc160e71d804427de1e905f5c226d580f71bf"
 dependencies = [
  "io-uring",
  "libc",

@@ -28,7 +28,8 @@ use hyper_util::{
 use prost::Message as _;
 use rustfs_protos::proto_gen::node_service::{
     BatchGenerallyLockRequest, DeleteRequest, GenerallyLockRequest, PreparePartTransactionResponse, ReadVersionRequest,
-    RecoverMultipartSourceRequest, RenameDataResponse, SettlePartTransactionRequest, SettlePartTransactionResponse,
+    RecoverMultipartSourceRequest, RenameDataResponse, ScannerScopedDirtyUsageAckRequest, SettlePartTransactionRequest,
+    SettlePartTransactionResponse,
 };
 use std::{
     collections::HashSet,
@@ -48,6 +49,9 @@ use tokio::{
 
 type ProxyBody = BoxBody<Bytes, io::Error>;
 type ProxyClient = Client<HttpConnector, ProxyBody>;
+
+mod scoped_ack;
+pub(crate) use scoped_ack::{ScopedAckFault, ScopedAckQueue, ScopedAckScope};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Disposition {
@@ -121,7 +125,8 @@ impl RpcPause {
         self.state.blocked.load(Ordering::SeqCst)
     }
 
-    /// Selected RPCs with successful HTTP/gRPC headers, excluding discarded packets.
+    /// Selected RPCs with successful HTTP/gRPC response headers, excluding
+    /// discarded packets. This does not prove a successful gRPC trailer or ACK apply.
     pub(crate) fn forwarded(&self) -> usize {
         self.state.forwarded.load(Ordering::SeqCst)
     }
@@ -233,6 +238,7 @@ pub(crate) struct RpcFaultProxy {
     address: SocketAddr,
     slot: PauseSlot,
     lock_slot: PauseSlot,
+    scoped_ack: scoped_ack::QueueSlot,
     task: JoinHandle<()>,
     late_requests: LateRequests,
 }
@@ -245,6 +251,8 @@ impl RpcFaultProxy {
         let active = slot.clone();
         let lock_slot: PauseSlot = Arc::new(Mutex::new(None));
         let active_lock = lock_slot.clone();
+        let scoped_ack = scoped_ack::empty_slot();
+        let active_ack = scoped_ack.clone();
         let late_requests: LateRequests = Arc::new(Mutex::new(Some(Vec::new())));
         let late = late_requests.clone();
         let task = tokio::spawn(async move {
@@ -259,6 +267,7 @@ impl RpcFaultProxy {
                         let h2 = h2.clone();
                         let active = active.clone();
                         let active_lock = active_lock.clone();
+                        let active_ack = active_ack.clone();
                         let late = late.clone();
                         connections.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
@@ -272,6 +281,7 @@ impl RpcFaultProxy {
                                     None
                                 };
                                 let pause = owner_pause.or_else(|| active.lock().expect("RPC pause slot").clone());
+                                let ack = active_ack.lock().expect("scoped ACK queue slot").clone();
                                 let retain = pause.as_ref().is_some_and(|pause| {
                                     pause.retain_after_disconnect
                                         && request.uri().path().strip_prefix("/node_service.NodeService/")
@@ -280,11 +290,11 @@ impl RpcFaultProxy {
                                 let late = late.clone();
                                 async move {
                                     if !retain {
-                                        return forward_request(request, client, target, pause).await;
+                                        return forward_request(request, client, target, pause, ack).await;
                                     }
                                     // This opt-in fault owns the packet after client cancellation.
                                     // Proxy teardown still aborts every retained request.
-                                    let task = tokio::spawn(forward_request(request, client, target, pause));
+                                    let task = tokio::spawn(forward_request(request, client, target, pause, ack));
                                     {
                                         let mut requests = late.lock().expect("late RPC ownership");
                                         if let Some(requests) = requests.as_mut() {
@@ -309,6 +319,7 @@ impl RpcFaultProxy {
             address,
             slot,
             lock_slot,
+            scoped_ack,
             task,
             late_requests,
         })
@@ -316,6 +327,11 @@ impl RpcFaultProxy {
 
     pub(crate) fn local_addr(&self) -> SocketAddr {
         self.address
+    }
+
+    /// Retain only genuine scoped ACKs for one receiver/session and bucket set.
+    pub(crate) fn scoped_ack_queue(&self, scope: ScopedAckScope, capacity: usize) -> io::Result<ScopedAckQueue> {
+        ScopedAckQueue::arm(self.scoped_ack.clone(), scope, capacity)
     }
 
     /// Pause at most limit requests to the named unary methods; other streams
@@ -469,6 +485,9 @@ fn unary_payload(body: &[u8]) -> io::Result<&[u8]> {
 }
 
 fn scope_matches(method: &str, body: &[u8], scope: &[u8]) -> io::Result<bool> {
+    if method == "ScannerScopedDirtyUsageAck" {
+        return scoped_ack_matches(body, Some(scope));
+    }
     if method == "RecoverMultipartSource" {
         let request = RecoverMultipartSourceRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
         if request.protocol_version != u32::from(MULTIPART_SOURCE_PROTOCOL_VERSION) || request.path.as_bytes() != scope {
@@ -525,7 +544,9 @@ fn scoped_lock_owners(method: &str, body: &[u8], scope: &[u8]) -> io::Result<Vec
     let args = match method {
         "Lock" => vec![GenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args],
         "LockBatch" => BatchGenerallyLockRequest::decode(payload).map_err(io::Error::other)?.args,
-        _ => return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock observer requires a lock method")),
+        _ => {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "lock observer requires a lock method"));
+        }
     };
     args.into_iter()
         .filter(|args| args.as_bytes().windows(scope.len()).any(|window| window == scope))
@@ -540,18 +561,39 @@ fn scoped_lock_owners(method: &str, body: &[u8], scope: &[u8]) -> io::Result<Vec
         .collect()
 }
 
+fn scoped_ack_matches(body: &[u8], scope: Option<&[u8]>) -> io::Result<bool> {
+    let request = ScannerScopedDirtyUsageAckRequest::decode(unary_payload(body)?).map_err(io::Error::other)?;
+    Ok(!request.probe_only && scope.is_none_or(|scope| request.entries.iter().any(|entry| entry.bucket.as_bytes() == scope)))
+}
+
 async fn forward_request(
     request: Request<Incoming>,
     client: ProxyClient,
     target: SocketAddr,
     pause: Option<Arc<PauseState>>,
+    ack: Option<Arc<scoped_ack::QueueState>>,
 ) -> io::Result<hyper::Response<ProxyBody>> {
-    let (mut parts, body) = request.into_parts();
-    let mut body = body.map_err(io::Error::other).boxed();
+    let request = request.map(|body| body.map_err(io::Error::other).boxed());
+    let request = if let Some(ack) = ack
+        && request.uri().path() == "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck"
+    {
+        match scoped_ack::intercept(request, client.clone(), target, ack).await? {
+            scoped_ack::Interception::Pass(request) => request,
+            scoped_ack::Interception::Handled(response) => return Ok(response),
+        }
+    } else {
+        request
+    };
+    let (parts, body) = request.into_parts();
+    let mut body = body;
     let mut observed = None;
     let mut inspection = None;
     if let Some(pause) = pause {
-        let method = parts.uri.path().strip_prefix("/node_service.NodeService/");
+        let method = parts
+            .uri
+            .path()
+            .strip_prefix("/node_service.NodeService/")
+            .or_else(|| parts.uri.path().strip_prefix("/node_service.ScannerControlService/"));
         if let Some(method) = method.filter(|name| pause.methods.contains(name)) {
             let mut route = None;
             let mut lock_owners = Vec::new();
@@ -594,6 +636,16 @@ async fn forward_request(
                         route = Some(disk);
                     }
                 }
+                body = Full::new(bytes)
+                    .map_err(|never| match never {})
+                    .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
+                    .boxed();
+                matches
+            } else if method == "ScannerScopedDirtyUsageAck" {
+                let collected = Limited::new(body, 1024 * 1024).collect().await.map_err(io::Error::other)?;
+                let trailers = collected.trailers().cloned();
+                let bytes = collected.to_bytes();
+                let matches = scoped_ack_matches(&bytes, None)?;
                 body = Full::new(bytes)
                     .map_err(|never| match never {})
                     .with_trailers(async move { trailers.map(Ok::<_, io::Error>) })
@@ -642,24 +694,7 @@ async fn forward_request(
             }
         }
     }
-    if !parts.headers.contains_key(http::header::HOST)
-        && let Some(authority) = parts.uri.authority()
-    {
-        parts.headers.insert(
-            http::header::HOST,
-            http::HeaderValue::from_str(authority.as_str()).map_err(io::Error::other)?,
-        );
-    }
-    parts.uri = http::Uri::builder()
-        .scheme("http")
-        .authority(target.to_string())
-        .path_and_query(parts.uri.path_and_query().map_or("/", |value| value.as_str()))
-        .build()
-        .map_err(io::Error::other)?;
-    let response = client
-        .request(Request::from_parts(parts, body))
-        .await
-        .map_err(io::Error::other)?;
+    let response = forward_to_backend(Request::from_parts(parts, body), client, target).await?;
     if let Some((pause, disk)) = inspection
         && response.status().is_success()
         && response.headers().get("grpc-status").is_some_and(|status| status == "12")
@@ -712,6 +747,32 @@ async fn forward_request(
     Ok(response.map(|body| body.map_err(io::Error::other).boxed()))
 }
 
+async fn forward_to_backend(
+    request: Request<ProxyBody>,
+    client: ProxyClient,
+    target: SocketAddr,
+) -> io::Result<hyper::Response<Incoming>> {
+    let (mut parts, body) = request.into_parts();
+    if !parts.headers.contains_key(http::header::HOST)
+        && let Some(authority) = parts.uri.authority()
+    {
+        parts.headers.insert(
+            http::header::HOST,
+            http::HeaderValue::from_str(authority.as_str()).map_err(io::Error::other)?,
+        );
+    }
+    parts.uri = http::Uri::builder()
+        .scheme("http")
+        .authority(target.to_string())
+        .path_and_query(parts.uri.path_and_query().map_or("/", |value| value.as_str()))
+        .build()
+        .map_err(io::Error::other)?;
+    client
+        .request(Request::from_parts(parts, body))
+        .await
+        .map_err(io::Error::other)
+}
+
 impl Drop for RpcFaultProxy {
     fn drop(&mut self) {
         if let Some(requests) = self.late_requests.lock().expect("late RPC ownership").take() {
@@ -731,6 +792,7 @@ mod tests {
 
     struct Backend {
         received: Arc<AtomicUsize>,
+        auth_headers: Arc<Mutex<Vec<(String, String)>>>,
         address: SocketAddr,
         task: JoinHandle<()>,
     }
@@ -754,6 +816,8 @@ mod tests {
         let address = listener.local_addr()?;
         let received = Arc::new(AtomicUsize::new(0));
         let received_task = received.clone();
+        let auth_headers = Arc::new(Mutex::new(Vec::new()));
+        let backend_auth = auth_headers.clone();
         let task = tokio::spawn(async move {
             let mut children = JoinSet::new();
             loop {
@@ -761,10 +825,12 @@ mod tests {
                     accepted = listener.accept() => {
                         let Ok((socket, _)) = accepted else { break };
                         let received = received_task.clone();
+                        let backend_auth = backend_auth.clone();
                         let reply = reply.clone();
                         children.spawn(async move {
                             let service = service_fn(move |request: Request<Incoming>| {
                                 let received = received.clone();
+                                let backend_auth = backend_auth.clone();
                                 let reply = reply.clone();
                                 async move {
                                 received.fetch_add(1, Ordering::SeqCst);
@@ -773,6 +839,10 @@ mod tests {
                                         http::HeaderValue::from_str(authority.as_str()).expect("valid HTTP authority")
                                     })
                                 });
+                                if let (Some(nonce), Some(signature)) = (request.headers().get("x-rustfs-rpc-nonce"), request.headers().get("x-rustfs-rpc-signature-v2")) {
+                                    backend_auth.lock().expect("backend auth header observations").push((
+                                        nonce.to_str().expect("test nonce").to_string(), signature.to_str().expect("test signature").to_string()));
+                                }
                                 let body = request.into_body().collect().await?.to_bytes();
                                 let body = reply.unwrap_or(body);
                                 let mut trailers = http::HeaderMap::new();
@@ -795,7 +865,12 @@ mod tests {
                 }
             }
         });
-        Ok(Backend { received, address, task })
+        Ok(Backend {
+            received,
+            auth_headers,
+            address,
+            task,
+        })
     }
 
     async fn call(client: &ProxyClient, address: SocketAddr, method: &str) -> io::Result<hyper::Response<Incoming>> {
@@ -809,9 +884,14 @@ mod tests {
         bytes: Bytes,
     ) -> io::Result<hyper::Response<Incoming>> {
         let body: ProxyBody = Full::new(bytes).map_err(|never| match never {}).boxed();
+        let service = if method == "ScannerScopedDirtyUsageAck" {
+            "ScannerControlService"
+        } else {
+            "NodeService"
+        };
         let request = Request::builder()
             .method("POST")
-            .uri(format!("http://{address}/node_service.NodeService/{method}"))
+            .uri(format!("http://{address}/node_service.{service}/{method}"))
             .header(http::header::TE, "trailers")
             .body(body)
             .map_err(io::Error::other)?;
@@ -824,6 +904,353 @@ mod tests {
         frame.extend_from_slice(&u32::try_from(payload.len()).expect("small test packet").to_be_bytes());
         frame.extend_from_slice(&payload);
         frame.into()
+    }
+
+    const ACK_OWNER: &str = "11111111-1111-1111-1111-111111111111";
+    const ACK_INSTANCE: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+
+    fn ack_scope() -> ScopedAckScope {
+        ScopedAckScope {
+            nonce: uuid::Uuid::new_v4().to_string(),
+            owner_id: ACK_OWNER.to_string(),
+            instance_id: ACK_INSTANCE.to_string(),
+            buckets: std::collections::BTreeSet::from(["cold-bucket".to_string()]),
+        }
+    }
+
+    fn ack_request(bucket: &str, generation: u64) -> ScannerScopedDirtyUsageAckRequest {
+        ScannerScopedDirtyUsageAckRequest {
+            challenge: vec![7; 16].into(),
+            protocol_version: 1,
+            owner_id: ACK_OWNER.to_string(),
+            instance_id: ACK_INSTANCE.to_string(),
+            scope: 1,
+            probe_only: false,
+            entries: vec![rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry {
+                bucket: bucket.to_string(),
+                bucket_incarnation: vec![4; 16].into(),
+                generation,
+            }],
+        }
+    }
+
+    fn ack_frame(request: &ScannerScopedDirtyUsageAckRequest) -> Bytes {
+        let payload = request.encode_to_vec();
+        let mut frame = vec![0];
+        frame.extend_from_slice(&u32::try_from(payload.len()).expect("bounded test frame").to_be_bytes());
+        frame.extend_from_slice(&payload);
+        Bytes::from(frame)
+    }
+
+    fn ack_hash(bytes: &[u8]) -> String {
+        use sha2::Digest as _;
+        hex_simd::encode_to_string(&sha2::Sha256::digest(bytes)[..], hex_simd::AsciiCase::Lower)
+    }
+
+    // Transport-only fixtures: the distributed tests supply production signatures.
+    async fn call_ack_frame(
+        client: &ProxyClient,
+        address: SocketAddr,
+        frame: Bytes,
+        nonce: &str,
+    ) -> io::Result<hyper::Response<Incoming>> {
+        let request = Request::builder()
+            .method("POST")
+            .uri(format!("http://{address}/node_service.ScannerControlService/ScannerScopedDirtyUsageAck"))
+            .header(http::header::TE, "trailers")
+            .header("x-rustfs-rpc-nonce", nonce)
+            .header("x-rustfs-rpc-signature-v2", format!("opaque-signature-{nonce}"))
+            .body(Full::new(frame).map_err(|never| match never {}).boxed())
+            .map_err(io::Error::other)?;
+        client.request(request).await.map_err(io::Error::other)
+    }
+
+    #[tokio::test]
+    async fn scoped_ack_queue_loss_preserves_backend_boundary() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            for fault in [ScopedAckFault::RequestLoss, ScopedAckFault::ResponseLoss] {
+                let backend = backend().await.expect("backend");
+                let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                    .await
+                    .expect("proxy");
+                let queue = proxy.scoped_ack_queue(ack_scope(), 1).expect("ACK queue");
+                let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+                let frame = ack_frame(&ack_request("cold-bucket", 7));
+                let address = proxy.local_addr();
+                let body = frame.clone();
+                let caller = tokio::spawn(async move { call_ack_frame(&client, address, body, "loss").await });
+                queue.wait_for_packets(1).await.expect("captured ACK");
+                assert_eq!(backend.received.load(Ordering::SeqCst), 0, "retention must precede backend dispatch");
+                queue.settle(0, fault).expect("settle actual retained packet");
+                assert!(
+                    caller.await.expect("caller task").is_err(),
+                    "the caller must observe the injected transport failure"
+                );
+                let receipt = queue.wait_for_completion(0).await.expect("complete fault receipt");
+                let response_loss = fault == ScopedAckFault::ResponseLoss;
+                assert_eq!(receipt["forwarded"], response_loss);
+                assert_eq!(receipt["backend_complete"], response_loss);
+                assert_eq!(backend.received.load(Ordering::SeqCst), usize::from(response_loss));
+                if response_loss {
+                    assert_eq!(receipt["outcome"], "response_lost");
+                    assert_eq!(receipt["response"]["grpc_status"], "0", "status exists only in real backend trailers");
+                    assert_eq!(receipt["response"]["bytes"], frame.len());
+                    assert_eq!(receipt["response"]["sha256"], ack_hash(&frame));
+                    assert!(
+                        receipt["response"]["trailers_sha256"]
+                            .as_str()
+                            .is_some_and(|value| value.len() == 64)
+                    );
+                } else {
+                    assert_eq!(receipt["outcome"], "request_lost");
+                }
+            }
+        })
+        .await
+        .expect("bounded ACK loss checks");
+    }
+
+    #[tokio::test]
+    async fn scoped_ack_queue_keeps_cancelled_packets_and_releases_out_of_order() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("proxy");
+            let queue = proxy.scoped_ack_queue(ack_scope(), 2).expect("two-packet ACK queue");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let first = ack_frame(&ack_request("cold-bucket", 7));
+            let second = ack_frame(&ack_request("cold-bucket", 9));
+            let address = proxy.local_addr();
+            let old_client = client.clone();
+            let old_body = first.clone();
+            let old_caller = tokio::spawn(async move { call_ack_frame(&old_client, address, old_body, "first").await });
+            queue.wait_for_packets(1).await.expect("first retained packet");
+            old_caller.abort();
+            assert!(old_caller.await.expect_err("cancel original caller").is_cancelled());
+            let new_body = second.clone();
+            let new_caller = tokio::spawn(async move { call_ack_frame(&client, address, new_body, "second").await });
+            queue.wait_for_packets(2).await.expect("second retained packet");
+            assert_eq!(backend.received.load(Ordering::SeqCst), 0);
+            queue.settle(1, ScopedAckFault::Forward).expect("release newer packet first");
+            let response = new_caller
+                .await
+                .expect("new caller task")
+                .expect("new response")
+                .into_body()
+                .collect()
+                .await
+                .expect("complete body");
+            assert_eq!(response.trailers().expect("response trailers")["x-proof"], "unchanged-proof");
+            assert_eq!(response.to_bytes(), second);
+            queue.wait_for_completion(1).await.expect("new packet complete");
+            queue
+                .settle(0, ScopedAckFault::Forward)
+                .expect("release old packet after its caller disappeared");
+            let old = queue.wait_for_completion(0).await.expect("detached old packet complete");
+            assert_eq!(old["backend_complete"], true);
+            assert_eq!(old["request_sha256"], ack_hash(&first));
+            assert_eq!(old["response"]["sha256"], ack_hash(&first));
+            assert_eq!(backend.received.load(Ordering::SeqCst), 2);
+            assert_eq!(
+                *backend.auth_headers.lock().expect("backend header observations"),
+                vec![
+                    ("second".to_string(), "opaque-signature-second".to_string()),
+                    ("first".to_string(), "opaque-signature-first".to_string())
+                ]
+            );
+            assert!(
+                queue.settle(0, ScopedAckFault::Forward).is_err(),
+                "one original packet may only be forwarded once"
+            );
+        })
+        .await
+        .expect("bounded detached retention check");
+    }
+
+    #[tokio::test]
+    async fn scoped_ack_queue_bounds_capacity_and_excludes_other_scopes() {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("proxy");
+            assert!(proxy.scoped_ack_queue(ack_scope(), 0).is_err());
+            assert!(proxy.scoped_ack_queue(ack_scope(), 5).is_err());
+            let mut invalid = ack_scope();
+            invalid.nonce.clear();
+            assert!(proxy.scoped_ack_queue(invalid, 1).is_err());
+            let mut scope = ack_scope();
+            scope.buckets.insert("cold-bucket-z".to_string());
+            let queue = proxy.scoped_ack_queue(scope, 1).expect("bounded ACK queue");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let mut probe = ack_request("cold-bucket", 7);
+            probe.probe_only = true;
+            let mut other_peer = ack_request("cold-bucket", 7);
+            other_peer.owner_id = uuid::Uuid::new_v4().to_string();
+            let mut other_instance = ack_request("cold-bucket", 7);
+            other_instance.instance_id = "b".repeat(32);
+            let mut invalid_challenge = ack_request("cold-bucket", 7);
+            invalid_challenge.challenge = vec![7; 15].into();
+            let mut noncanonical_entries = ack_request("cold-bucket-z", 7);
+            noncanonical_entries.entries.extend(ack_request("cold-bucket", 7).entries);
+            let unselected = [
+                probe,
+                other_peer,
+                other_instance,
+                ack_request("cold-bucket-other", 7),
+                ack_request("cold-bucket", u64::MAX),
+                invalid_challenge,
+                noncanonical_entries,
+            ];
+            let unselected_count = unselected.len();
+            for (index, request) in unselected.into_iter().enumerate() {
+                let body = ack_frame(&request);
+                let response = call_ack_frame(&client, proxy.local_addr(), body.clone(), "unselected")
+                    .await
+                    .expect("unselected ACK progresses");
+                assert_eq!(response.into_body().collect().await.expect("unselected body").to_bytes(), body);
+                assert!(queue.receipts().is_empty(), "unselected or protocol-invalid ACK must not consume a slot");
+                assert_eq!(backend.received.load(Ordering::SeqCst), index + 1);
+            }
+            assert!(queue.receipts().is_empty());
+            let address = proxy.local_addr();
+            let held_client = client.clone();
+            let valid_frame = ack_frame(&ack_request("cold-bucket", 7));
+            let held_body = valid_frame.clone();
+            let held = tokio::spawn(async move { call_ack_frame(&held_client, address, held_body, "held").await });
+            queue.wait_for_packets(1).await.expect("one matching packet");
+            assert!(!held.is_finished(), "the subsequent valid ACK must be retained");
+            assert_eq!(queue.receipts()[0]["request_sha256"], ack_hash(&valid_frame));
+            assert_eq!(backend.received.load(Ordering::SeqCst), unselected_count);
+            let extra = call_ack_frame(&client, address, ack_frame(&ack_request("cold-bucket", 8)), "beyond-capacity")
+                .await
+                .expect("capacity overflow passes without retention");
+            extra.into_body().collect().await.expect("overflow response");
+            assert_eq!(queue.receipts().len(), 1);
+            assert_eq!(backend.received.load(Ordering::SeqCst), unselected_count + 1);
+            drop(queue);
+            assert!(
+                held.await.expect("held caller").is_err(),
+                "dropping the session must cancel its retained packet"
+            );
+            assert_eq!(
+                backend.received.load(Ordering::SeqCst),
+                unselected_count + 1,
+                "session drop must never forward the held packet"
+            );
+        })
+        .await
+        .expect("bounded scope and lifecycle checks");
+    }
+
+    #[tokio::test]
+    async fn scoped_ack_queue_expiry_never_forwards_retained_packet() {
+        let (backend, _proxy, queue, caller) = tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("proxy");
+            let queue = proxy.scoped_ack_queue(ack_scope(), 1).expect("ACK queue");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let address = proxy.local_addr();
+            let caller = tokio::spawn(async move {
+                call_ack_frame(&client, address, ack_frame(&ack_request("cold-bucket", 7)), "expires").await
+            });
+            queue.wait_for_packets(1).await.expect("retained packet");
+            (backend, proxy, queue, caller)
+        })
+        .await
+        .expect("bounded queue setup");
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(120)).await;
+        tokio::time::resume();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(10), caller)
+                .await
+                .expect("expiry completes caller")
+                .expect("caller task")
+                .is_err()
+        );
+        let receipt = queue.receipts().into_iter().next().expect("expired receipt");
+        assert_eq!(receipt["completed"], true);
+        assert_eq!(receipt["forwarded"], false);
+        assert_eq!(receipt["backend_complete"], false);
+        assert_eq!(backend.received.load(Ordering::SeqCst), 0);
+        assert_eq!(
+            queue
+                .settle(0, ScopedAckFault::Forward)
+                .expect_err("expired packet cannot be released")
+                .kind(),
+            io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_ack_fault_matches_exact_bucket_and_excludes_probes() {
+        use rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageEntry;
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            let backend = backend().await.expect("backend listener");
+            let proxy = RpcFaultProxy::start_on("127.0.0.1:0".parse().expect("loopback"), backend.address)
+                .await
+                .expect("proxy listener");
+            let client: ProxyClient = Client::builder(TokioExecutor::new()).http2_only(true).build_http();
+            let pause = proxy
+                .pause(&["ScannerScopedDirtyUsageAck"], 1, Some("cold-bucket"))
+                .expect("scoped ACK fault");
+            let frame = |bucket: &str, probe_only: bool| {
+                let payload = ScannerScopedDirtyUsageAckRequest {
+                    challenge: vec![3; 16].into(),
+                    protocol_version: 1,
+                    owner_id: "11111111-1111-1111-1111-111111111111".to_string(),
+                    instance_id: "a".repeat(32),
+                    scope: 1,
+                    probe_only,
+                    entries: vec![ScannerScopedDirtyUsageEntry {
+                        bucket: bucket.to_string(),
+                        bucket_incarnation: vec![4; 16].into(),
+                        generation: 17,
+                    }],
+                }
+                .encode_to_vec();
+                let mut frame = vec![0];
+                frame.extend_from_slice(&u32::try_from(payload.len()).expect("small ACK frame").to_be_bytes());
+                frame.extend_from_slice(&payload);
+                Bytes::from(frame)
+            };
+            for bytes in [frame("cold-bucket", true), frame("cold-bucket-other", false)] {
+                let response = call_body(&client, proxy.local_addr(), "ScannerScopedDirtyUsageAck", bytes.clone())
+                    .await
+                    .expect("probe and other bucket must progress");
+                assert_eq!(response.into_body().collect().await.expect("unselected response").to_bytes(), bytes);
+            }
+            assert_eq!(pause.hits(), 0);
+            let signed_bytes = frame("cold-bucket", false);
+            let task_bytes = signed_bytes.clone();
+            let address = proxy.local_addr();
+            let blocked =
+                tokio::spawn(async move { call_body(&client, address, "ScannerScopedDirtyUsageAck", task_bytes).await });
+            pause
+                .wait_for_hits(1)
+                .await
+                .expect("real ScannerControlService method must reach the fault");
+            assert!(!blocked.is_finished());
+            assert_eq!(backend.received.load(Ordering::SeqCst), 2, "held ACK must not apply at the backend");
+            pause.release();
+            let collected = blocked
+                .await
+                .expect("ACK task")
+                .expect("released ACK")
+                .into_body()
+                .collect()
+                .await
+                .expect("ACK body and trailers");
+            assert_eq!(collected.trailers().expect("ACK trailers")["x-proof"], "unchanged-proof");
+            assert_eq!(collected.to_bytes(), signed_bytes, "proxy must preserve the complete signed ACK frame");
+        })
+        .await
+        .expect("scanner ACK fault deadline");
     }
 
     fn native_abort_request(path: &str) -> RecoverMultipartSourceRequest {

@@ -604,7 +604,7 @@ impl LocalDisk {
                 let publication = os::acquire_namespace_mutation_lease_with_owner(&destination, Some(owner)).await;
                 let tmp_volume = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
                 let temporary = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, &Uuid::new_v4().to_string())?;
-                self.write_all_internal(&temporary, InternalBuf::Ref(&replacement), SyncMode::FileOnly, &tmp_volume)
+                self.write_all_internal(&temporary, replacement, SyncMode::FileOnly, &tmp_volume)
                     .await?;
                 os::rename_metadata_and_sync_with_lease(
                     temporary,

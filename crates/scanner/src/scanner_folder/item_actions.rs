@@ -483,6 +483,7 @@ pub(crate) fn scanner_disk_heal_scope(disk: &Disk) -> Option<DataUsageCacheSourc
 pub(super) async fn send_scanner_heal_request(
     candidate_type: &'static str,
     mut request: HealChannelRequest,
+    data_dir: Option<uuid::Uuid>,
     scope: Option<DataUsageCacheSource>,
 ) -> Result<HealAdmissionResult, ScannerError> {
     if request.object_prefix.as_deref().is_some_and(|object| !object.is_empty()) {
@@ -493,7 +494,7 @@ pub(super) async fn send_scanner_heal_request(
     }
     let priority = request.priority;
     let trace_context = scanner_heal_candidate_trace_context(&request);
-    let candidate = crate::heal_completion::prepare(&request);
+    let candidate = crate::heal_completion::prepare(&request, data_dir);
     match send_heal_request_with_receipt(request).await {
         Ok(receipt) => {
             crate::heal_completion::observe(candidate, Ok(&receipt));
@@ -1222,6 +1223,7 @@ impl ScannerItem {
                 scan_mode,
                 HealChannelPriority::Low,
             ),
+            oi.data_dir,
             self.heal_scope,
         )
         .await;

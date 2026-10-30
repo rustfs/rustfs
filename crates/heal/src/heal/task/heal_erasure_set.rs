@@ -22,7 +22,17 @@ pub(super) async fn load_verified_replacement_resume(disk: &DiskStore, task_id: 
 }
 
 impl HealTask {
+    #[cfg(test)]
     pub(super) async fn heal_erasure_set(&self, buckets: Vec<String>, set_disk_id: String) -> Result<()> {
+        self.heal_erasure_set_owned(buckets, set_disk_id, None).await
+    }
+
+    pub(super) async fn heal_erasure_set_owned(
+        &self,
+        buckets: Vec<String>,
+        set_disk_id: String,
+        parent: Option<&super::super::manager::HealWork>,
+    ) -> Result<()> {
         debug!(
             target: "rustfs::heal::task",
             event = EVENT_HEAL_ERASURE_SET_STAGE,
@@ -532,6 +542,7 @@ impl HealTask {
         })
         .with_replacement_identity_fence(replacement_target_identities.clone())
         .with_replacement_execution(replacement_execution)
+        .with_work_parent(parent.cloned())
         .with_mainline_pacer(self.mainline_pacer.clone())
         .with_admin_task((self.source == HealRequestSource::Admin).then(|| self.clone()));
 

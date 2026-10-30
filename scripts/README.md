@@ -91,7 +91,12 @@ their issue closes.
 | `test_scanner_heal_w16_recovery_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W16 recovery evidence runner | — |
 | `test_scanner_heal_w13_mrf_evidence.sh` | dev-tool | Shell self-test for the Scanner/Heal W13 MRF evidence runner | — |
 | `scanner_abba.py` | dev-tool | Scanner/heal ABBA orchestration and evidence gates via `run_scanner_validation_harness.sh --abba` | `docs/operations/scanner-benchmark-runbook.md` |
+| `scanner_client_trace.py` | dev-tool | Reconcile client request ledgers and calculate per-window exact sample percentiles | `scanner_abba.py` |
 | `test_scanner_abba.py` | dev-tool | Synthetic ABBA adapter and failure-path tests | `test_scanner_validation_harness.sh` |
+| `test_scanner_client_trace.py` | dev-tool | Client ledger reconciliation and fail-closed tests | `test_scanner_validation_harness.sh` |
+| `test_summarize_scanner_heal_perf.py` | dev-tool | Scanner/heal summary and provenance tests | `test_scanner_validation_harness.sh` |
+| `test_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Scheduler-pressure evidence fail-closed tests | `test_scanner_heal_scheduler_pressure_evidence.sh` |
+| `test_scanner_heal_linux_evidence_plan.py` | dev-tool | Linux evidence plan coverage tests | `test_scanner_heal_linux_evidence_plan.sh` |
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
 | `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
