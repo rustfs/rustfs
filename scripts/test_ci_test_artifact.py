@@ -196,7 +196,7 @@ class ArtifactIdentityTests(unittest.TestCase):
         source.write_text('pub fn answer() -> u8 { let unused = 1; 2 }\n#[test] fn value() { assert_eq!(answer(), 2); }\n')
         archive = self.root / 'lint-probe.tar.zst'
         for arguments in (['archive', '--offline', '--archive-file', str(archive)],
-                          ['run', '--archive-file', str(archive)]):
+                          ['run', '--color', 'never', '--archive-file', str(archive)]):
             result = subprocess.run(['cargo', 'nextest', *arguments], cwd=self.root, text=True, capture_output=True)
             self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn('1 passed', result.stderr)

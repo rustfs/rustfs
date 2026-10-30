@@ -63,7 +63,7 @@ class QueueTests(unittest.TestCase):
             repo.write('core/src/b.rs', 'pub const VALUE: u8 = 1;\n')
             baseline = repo.commit()
             def check():
-                return subprocess.run(['cargo', 'nextest', 'run', '--offline', '-p', 'core'],
+                return subprocess.run(['cargo', 'nextest', 'run', '--offline', '--color', 'never', '-p', 'core'],
                                       cwd=repo.root, capture_output=True, text=True)
             repo.git('checkout', '-b', 'first')
             repo.write('core/src/a.rs', 'pub const VALUE: u8 = 2;\n')

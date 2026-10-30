@@ -129,7 +129,7 @@ class PlannerTests(unittest.TestCase):
         baseline = self.repo.commit()
         self.repo.write('leaf/src/lib.rs', 'pub fn answer() -> u8 { 2 }\n')
         plan = self.repo.plan(self.repo.commit(), base=baseline)
-        arguments = ['cargo', 'nextest', 'run', '--offline']
+        arguments = ['cargo', 'nextest', 'run', '--offline', '--color', 'never', '--no-fail-fast']
         for package in plan['packages']:
             arguments.extend(['-p', package])
         result = subprocess.run(arguments, cwd=self.repo.root, capture_output=True, text=True)
