@@ -5622,6 +5622,7 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
                 }
                 let mut rename_guard_release = None;
+                let mut committed_tail_guard = None;
                 let mut needs_immediate_heal = false;
                 let mut tail_owns_tmp_cleanup = false;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -5651,7 +5652,10 @@ impl SetDisks {
                             .or_else(|| commit_version_suspended.then(Uuid::nil))
                             .map(|version_id| version_id.to_string());
                         request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                        let object_lock_guard = _object_lock_guard.take();
+                        let object_lock_guard = _object_lock_guard
+                            .take()
+                            .map(|guard| Arc::new(tokio::sync::Mutex::new(guard)));
+                        committed_tail_guard = object_lock_guard.clone();
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
@@ -5957,6 +5961,13 @@ impl SetDisks {
                     lock_held_post_rename_started,
                 );
                 let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
+                if let Some(guard) = committed_tail_guard.take() {
+                    // The committed tail still owns every physical rename. Convert
+                    // only after metadata invalidation and before acknowledging PUT.
+                    // Unsupported peers keep their exclusive leases and the tail
+                    // retains ownership until its physical work has drained.
+                    let _ = guard.lock().await.downgrade_committed_tail().await;
+                }
                 if let Some(release) = rename_guard_release.take() {
                     let _ = release.send(true);
                 }
@@ -22157,6 +22168,52 @@ mod put_object_tmp_cleanup_tests {
             reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
             assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
         })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_tail_drain_allows_read_after_acknowledged_put() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
+            ],
+            async {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "put-early-ack-tail-read";
+                let object = "early-ack-tail-read-object";
+                for disk in &disk_stores {
+                    disk.make_volume(bucket).await.expect("bucket volume should be created");
+                }
+                let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let put_set = Arc::clone(&set_disks);
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                    put_set
+                        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                    .await
+                    .expect("tail disk should pause during rename");
+                put.await
+                    .expect("PUT task should join")
+                    .expect("PUT should be acknowledged at quorum");
+                let result = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await;
+                let mut reader = result.expect("acknowledged object should remain readable while tail drains");
+                let mut body = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut body))
+                    .await
+                    .expect("object body should not wait for the tail")
+                    .expect("object body should drain");
+                assert_eq!(body, vec![b'1'; TEST_OBJECT_SIZE]);
+                rename_barrier.release();
+                drop(rename_barrier);
+            },
+        )
         .await;
     }
 

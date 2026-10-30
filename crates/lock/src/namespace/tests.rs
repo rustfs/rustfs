@@ -155,6 +155,43 @@ impl crate::client::LockClient for DelayedClient {
 }
 
 #[derive(Debug)]
+struct PendingTailClient(LocalClient);
+
+#[async_trait::async_trait]
+impl crate::client::LockClient for PendingTailClient {
+    async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+        self.0.acquire_lock(request).await
+    }
+    async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.0.release(lock_id).await
+    }
+    async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.0.refresh(lock_id).await
+    }
+    async fn downgrade_committed_tail(&self, _: &LockId) -> crate::Result<bool> {
+        std::future::pending().await
+    }
+    async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+        self.0.force_release(lock_id).await
+    }
+    async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+        self.0.check_status(lock_id).await
+    }
+    async fn get_stats(&self) -> crate::Result<LockStats> {
+        self.0.get_stats().await
+    }
+    async fn close(&self) -> crate::Result<()> {
+        self.0.close().await
+    }
+    async fn is_online(&self) -> bool {
+        self.0.is_online().await
+    }
+    async fn is_local(&self) -> bool {
+        self.0.is_local().await
+    }
+}
+
+#[derive(Debug)]
 struct FlakyAcquireClient {
     inner: LocalClient,
     failed_acquires_remaining: AtomicUsize,
@@ -577,6 +614,168 @@ async fn test_namespace_lock_guard_lock_id() {
         let lock_id = guard.lock_id();
         assert!(!lock_id.uuid.is_empty());
     }
+}
+
+#[tokio::test]
+async fn tail_conversion_rejects_non_intersecting_quorums() {
+    let clients: Vec<Arc<dyn crate::client::LockClient>> = (0..4)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn crate::client::LockClient>)
+        .collect();
+    let lock = NamespaceLock::with_clients_and_quorum("non-intersecting".to_owned(), clients, 2);
+    let resource = ObjectKey::new("bucket", "non-intersecting-tail");
+    let mut tail = lock
+        .get_write_lock(resource, "writer", Duration::from_secs(2))
+        .await
+        .expect("write lease");
+    assert!(
+        !tail.downgrade_committed_tail().await,
+        "conversion requires intersecting read and write quorums"
+    );
+    assert!(tail.release());
+}
+
+#[tokio::test]
+async fn partial_tail_conversion_keeps_writers_excluded() {
+    let mut clients: Vec<Arc<dyn crate::client::LockClient>> = Vec::new();
+    for index in 0..4 {
+        let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        if index < 2 {
+            clients.push(inner);
+        } else {
+            clients.push(Arc::new(DelayedClient {
+                inner,
+                delay: Duration::ZERO,
+            }));
+        }
+    }
+    let lock = NamespaceLock::with_clients("mixed-peers".to_owned(), clients);
+    let resource = ObjectKey::new("bucket", "partial-tail");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "first", Duration::from_secs(2))
+        .await
+        .expect("first writer");
+    assert!(!tail.downgrade_committed_tail().await, "mixed peers cannot all confirm conversion");
+    assert!(
+        lock.get_write_lock(resource.clone(), "second", Duration::from_millis(150))
+            .await
+            .is_err(),
+        "mixed leases still exclude writers"
+    );
+    assert!(tail.release());
+    let mut writer = lock
+        .get_write_lock(resource, "second", Duration::from_secs(3))
+        .await
+        .expect("writer after release");
+    assert!(writer.release());
+}
+
+#[tokio::test]
+async fn cancelled_tail_conversion_keeps_writers_excluded() {
+    let mut clients: Vec<Arc<dyn crate::client::LockClient>> = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn crate::client::LockClient>)
+        .collect();
+    clients.push(Arc::new(PendingTailClient(LocalClient::with_manager(Arc::new(GlobalLockManager::new())))));
+    let lock = NamespaceLock::with_clients_and_quorum("cancel-tail".to_owned(), clients, 4);
+    let resource = ObjectKey::new("bucket", "cancel-tail");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "first", Duration::from_secs(2))
+        .await
+        .expect("first writer");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), tail.downgrade_committed_tail())
+            .await
+            .is_err()
+    );
+    let mut reader = lock
+        .get_read_lock(resource.clone(), "reader", Duration::from_secs(2))
+        .await
+        .expect("other peers converted before cancellation");
+    assert!(reader.release());
+    assert!(
+        lock.get_write_lock(resource.clone(), "second", Duration::from_millis(150))
+            .await
+            .is_err(),
+        "cancelled conversion must still exclude writers"
+    );
+    assert!(tail.release());
+    let mut writer = lock
+        .get_write_lock(resource, "second", Duration::from_secs(3))
+        .await
+        .expect("writer after release");
+    assert!(writer.release());
+}
+
+#[tokio::test]
+async fn unsupported_peer_keeps_exclusive_tail_lease() {
+    let clients: Vec<Arc<dyn crate::client::LockClient>> = (0..3)
+        .map(|_| {
+            let inner = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+            Arc::new(DelayedClient {
+                inner,
+                delay: Duration::ZERO,
+            }) as Arc<dyn crate::client::LockClient>
+        })
+        .collect();
+    let lock = NamespaceLock::with_clients("old-peers".to_owned(), clients);
+    let resource = ObjectKey::new("bucket", "old-tail");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "first", Duration::from_secs(2))
+        .await
+        .expect("first writer");
+    assert!(!tail.downgrade_committed_tail().await, "old peers must not claim conversion");
+    assert!(
+        lock.get_read_lock(resource.clone(), "reader", Duration::from_millis(150))
+            .await
+            .is_err()
+    );
+    assert!(
+        lock.get_write_lock(resource.clone(), "writer", Duration::from_millis(150))
+            .await
+            .is_err()
+    );
+    assert!(tail.release());
+    let mut writer = lock
+        .get_write_lock(resource, "writer", Duration::from_secs(3))
+        .await
+        .expect("writer after tail");
+    assert!(writer.release());
+}
+
+#[tokio::test]
+async fn distributed_committed_tail_allows_reader_and_excludes_writer() {
+    let clients: Vec<Arc<dyn crate::client::LockClient>> = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn crate::client::LockClient>)
+        .collect();
+    let lock = NamespaceLock::with_clients("tail-test".to_owned(), clients);
+    let resource = ObjectKey::new("bucket", "committed-tail");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "first", Duration::from_secs(2))
+        .await
+        .expect("first writer");
+    assert!(tail.downgrade_committed_tail().await, "all held peer leases should convert");
+    let mut reader = lock
+        .get_read_lock(resource.clone(), "reader", Duration::from_secs(2))
+        .await
+        .expect("committed reader");
+    assert!(
+        lock.get_write_lock(resource.clone(), "second", Duration::from_millis(150))
+            .await
+            .is_err(),
+        "tail and reader must exclude writer"
+    );
+    assert!(tail.release());
+    assert!(
+        lock.get_write_lock(resource.clone(), "second", Duration::from_millis(150))
+            .await
+            .is_err(),
+        "reader still excludes writer"
+    );
+    assert!(reader.release());
+    let mut writer = lock
+        .get_write_lock(resource, "second", Duration::from_secs(3))
+        .await
+        .expect("writer after drain");
+    assert!(writer.release());
 }
 
 #[tokio::test]

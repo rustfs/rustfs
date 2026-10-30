@@ -382,6 +382,18 @@ impl LockClient for LocalClient {
         }
     }
 
+    async fn downgrade_committed_tail(&self, lock_id: &LockId) -> Result<bool> {
+        let shard = self.get_shard(lock_id);
+        let mut guards = shard.write().await;
+        let Some(entry) = guards.get_mut(lock_id) else {
+            return Ok(false);
+        };
+        if entry.is_expired() {
+            return Ok(false);
+        }
+        Ok(entry.guard.downgrade_committed_tail())
+    }
+
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         self.release(lock_id).await
     }
@@ -545,6 +557,32 @@ mod tests {
             .expect("acquire should return after its reclaim budget expires")
             .expect("local acquire should return a response");
         assert!(!response.success);
+    }
+
+    #[tokio::test]
+    async fn downgrade_tail_is_idempotent_and_release_preserves_readers() {
+        let client = LocalClient::with_manager(Arc::new(GlobalLockManager::new()));
+        let resource = crate::ObjectKey::new("bucket", "tail-downgrade");
+        let first = request(resource.clone(), "owner-a", Duration::from_secs(30));
+        assert!(client.acquire_lock(&first).await.expect("initial lock").success);
+        assert!(client.downgrade_committed_tail(&first.lock_id).await.expect("downgrade"));
+        assert!(
+            client
+                .downgrade_committed_tail(&first.lock_id)
+                .await
+                .expect("retry downgrade")
+        );
+        let reader = crate::LockRequest::new(resource.clone(), LockType::Shared, "reader")
+            .with_acquire_timeout(Duration::from_millis(500));
+        assert!(client.acquire_lock(&reader).await.expect("reader").success);
+        let writer = request(resource, "writer", Duration::from_secs(30)).with_acquire_timeout(Duration::from_millis(10));
+        assert!(!client.acquire_lock(&writer).await.expect("writer blocked").success);
+        assert!(client.release(&first.lock_id).await.expect("release tail"));
+        assert!(!client.acquire_lock(&writer).await.expect("reader excludes writer").success);
+        assert!(client.release(&reader.lock_id).await.expect("release reader"));
+        assert!(client.acquire_lock(&writer).await.expect("writer after drain").success);
+        assert!(client.release(&writer.lock_id).await.expect("release writer"));
+        assert!(!client.downgrade_committed_tail(&first.lock_id).await.expect("released lease"));
     }
 
     #[tokio::test]

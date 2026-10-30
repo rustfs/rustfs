@@ -30,6 +30,7 @@ struct ActiveGuardInfo {
     key: ObjectKey,
     mode: LockMode,
     owner: Arc<str>,
+    committed_tail: bool,
 }
 
 #[derive(Debug, PartialEq, Eq, Hash)]
@@ -430,6 +431,47 @@ impl LockShard {
         result
     }
 
+    /// Convert an active exclusive guard without opening a writer gap.
+    pub(crate) fn downgrade_committed_tail(&self, key: &ObjectKey, owner: &Arc<str>, guard_id: u64) -> bool {
+        let mut guards = self.active_guards.lock();
+        let Some(Some(info)) = guards.get_mut(&guard_id) else { return false };
+        if info.key != *key || info.owner.as_ref() != owner.as_ref() || info.mode != LockMode::Exclusive {
+            return false;
+        }
+        let objects = self.objects.read();
+        let Some(state) = objects.get(key) else { return false };
+        if !state.downgrade_committed_tail(owner) {
+            return false;
+        }
+        info.mode = LockMode::Shared;
+        info.committed_tail = true;
+        true
+    }
+
+    /// Release a converted guard and its special reader-admission state.
+    pub(crate) fn release_committed_tail_with_guard(&self, key: &ObjectKey, owner: &Arc<str>, guard_id: u64) -> bool {
+        let mut guards = self.active_guards.lock();
+        let Some(Some(info)) = guards.get(&guard_id) else { return false };
+        if info.key != *key || info.owner.as_ref() != owner.as_ref() || info.mode != LockMode::Shared || !info.committed_tail {
+            return false;
+        }
+        let (success, should_cleanup) = {
+            let objects = self.objects.read();
+            let Some(state) = objects.get(key) else { return false };
+            let success = state.release_committed_tail(owner);
+            (success, success && !state.is_locked() && !state.atomic_state.has_waiters())
+        };
+        if success {
+            guards.remove(&guard_id);
+            self.metrics.record_release();
+        }
+        drop(guards);
+        if should_cleanup {
+            self.schedule_cleanup(key.clone());
+        }
+        success
+    }
+
     /// Register a guard to prevent premature cleanup
     pub fn register_guard(&self, guard_id: u64) {
         self.active_guards.lock().insert(guard_id, None);
@@ -443,6 +485,7 @@ impl LockShard {
                 key: key.clone(),
                 mode,
                 owner: owner.clone(),
+                committed_tail: false,
             }),
         );
     }
@@ -719,11 +762,18 @@ impl LockShard {
     /// Returns the number of owners that were released. Used by the admin
     /// force-unlock path to clear a stuck resource.
     pub fn force_release_all(&self, key: &ObjectKey) -> usize {
+        let tail = {
+            let guards = self.active_guards.lock();
+            guards.iter().find_map(|(&id, info)| {
+                info.as_ref()
+                    .filter(|info| info.committed_tail && info.key == *key)
+                    .map(|info| (id, info.owner.clone()))
+            })
+        };
+        let mut released = usize::from(tail.is_some_and(|(id, owner)| self.release_committed_tail_with_guard(key, &owner, id)));
         let owners_modes: Vec<(Arc<str>, LockMode)> = {
             let objects = self.objects.read();
-            let Some(state) = objects.get(key) else {
-                return 0;
-            };
+            let Some(state) = objects.get(key) else { return released };
             let mut pairs = Vec::new();
             if let Some(info) = state.current_owner.read().clone() {
                 pairs.push((info.owner, LockMode::Exclusive));
@@ -733,8 +783,6 @@ impl LockShard {
             }
             pairs
         };
-
-        let mut released = 0;
         for (owner, mode) in owners_modes {
             if self.release_lock(key, &owner, mode) {
                 released += 1;

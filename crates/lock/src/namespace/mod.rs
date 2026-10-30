@@ -107,6 +107,14 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Permit reads while continuing to exclude competing writers.
+    pub async fn downgrade_committed_tail(&mut self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.downgrade_committed_tail().await,
+            Self::Fast(guard) => guard.downgrade_committed_tail(),
+        }
+    }
+
     /// Manually release the lock early
     pub fn release(&mut self) -> bool {
         match self {

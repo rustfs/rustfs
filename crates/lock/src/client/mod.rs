@@ -20,6 +20,9 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 
+/// Marker exchanged in a refresh request and response for a committed-tail conversion.
+pub const COMMITTED_TAIL_CONVERSION_MARKER: &str = "rustfs-committed-tail-v1";
+
 /// Lock client trait
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
@@ -47,6 +50,12 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
 
     /// Refresh lock
     async fn refresh(&self, lock_id: &LockId) -> Result<bool>;
+
+    /// Convert an exclusive lease to a reader-compatible committed-tail lease.
+    /// Unsupported peers retain their original lease and report `false`.
+    async fn downgrade_committed_tail(&self, _lock_id: &LockId) -> Result<bool> {
+        Ok(false)
+    }
 
     /// Force release lock
     async fn force_release(&self, lock_id: &LockId) -> Result<bool>;

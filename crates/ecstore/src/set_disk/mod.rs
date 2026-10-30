@@ -411,6 +411,10 @@ impl ObjectLockDiagGuard {
         self
     }
 
+    async fn downgrade_committed_tail(&mut self) -> bool {
+        self.guard.downgrade_committed_tail().await
+    }
+
     /// Whether the underlying namespace lock's heartbeat has observed a
     /// refresh-quorum loss (backlog#899 Phase 2). Callers fence their commit
     /// point on this so a stale lock holder does not race a double-write.

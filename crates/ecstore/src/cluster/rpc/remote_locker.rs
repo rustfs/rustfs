@@ -1315,6 +1315,34 @@ impl LockClient for RemoteClient {
         Ok(resp.success)
     }
 
+    async fn downgrade_committed_tail(&self, lock_id: &LockId) -> Result<bool> {
+        let marker = rustfs_lock::client::COMMITTED_TAIL_CONVERSION_MARKER;
+        let mut request = Self::create_unlock_request(lock_id);
+        request.metadata.tags.insert(marker.to_owned(), marker.to_owned());
+        let mut client = self.get_client().await?;
+        let resource_summary = request.resource.to_string();
+        let mut req = Request::new(GenerallyLockRequest {
+            args: serde_json::to_string(&request)
+                .map_err(|error| LockError::internal(format!("Failed to serialize request: {error}")))?,
+        });
+        attach_lock_mutation_body_digest(&mut req)?;
+        let response = self
+            .execute_rpc(
+                "refresh",
+                &resource_summary,
+                Self::rpc_timeout(),
+                async move { client.refresh(req).await },
+                RpcCleanup::new(None, None, None),
+            )
+            .await?
+            .into_inner();
+        if let Some(error) = response.error_info {
+            return Err(LockError::internal(error));
+        }
+        // Older nodes refresh normally but return no conversion marker.
+        Ok(response.success && response.lock_info.as_deref() == Some(marker))
+    }
+
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         info!("remote force_release for {}", lock_id);
         let force_request = Self::create_unlock_request(lock_id);

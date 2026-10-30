@@ -39,6 +39,7 @@ pub struct FastLockGuard {
     shard: Option<Arc<LockShard>>, // None when locks are disabled
     released: bool,
     disabled: bool, // True when locks are disabled globally
+    committed_tail: bool,
     /// Unique ID for this guard instance to prevent double-release
     guard_id: u64,
 }
@@ -54,6 +55,7 @@ impl FastLockGuard {
             shard: Some(shard),
             released: false,
             disabled: false,
+            committed_tail: false,
             guard_id,
         }
     }
@@ -68,6 +70,7 @@ impl FastLockGuard {
             shard: None,
             released: false,
             disabled: true,
+            committed_tail: false,
             guard_id,
         }
     }
@@ -85,6 +88,41 @@ impl FastLockGuard {
     /// Get the lock owner
     pub fn owner(&self) -> &Arc<str> {
         &self.owner
+    }
+
+    /// Keep excluding writers while permitting reads of the committed version.
+    pub fn downgrade_committed_tail(&mut self) -> bool {
+        if self.released {
+            return false;
+        }
+        if self.committed_tail {
+            return true;
+        }
+        if self.mode != LockMode::Exclusive {
+            return false;
+        }
+        if self.disabled {
+            self.mode = LockMode::Shared;
+            self.committed_tail = true;
+            return true;
+        }
+        let Some(shard) = &self.shard else { return false };
+        if !shard.downgrade_committed_tail(&self.key, &self.owner, self.guard_id) {
+            return false;
+        }
+        record_lock_held_release(LockMode::Exclusive);
+        record_lock_held_acquire(LockMode::Shared);
+        self.mode = LockMode::Shared;
+        self.committed_tail = true;
+        true
+    }
+
+    fn release_physical(&self, shard: &LockShard) -> bool {
+        if self.committed_tail {
+            shard.release_committed_tail_with_guard(&self.key, &self.owner, self.guard_id)
+        } else {
+            shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id)
+        }
     }
 
     /// Manually release the lock early
@@ -106,7 +144,7 @@ impl FastLockGuard {
         }
 
         if let Some(shard) = &self.shard {
-            let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
+            let success = self.release_physical(shard);
             if success {
                 self.released = true;
                 record_lock_held_release(self.mode);
@@ -169,7 +207,7 @@ impl Drop for FastLockGuard {
     fn drop(&mut self) {
         if let Some(shard) = &self.shard {
             if !self.released && !self.disabled {
-                let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
+                let success = self.release_physical(shard);
                 if !success {
                     // For high-concurrency scenarios, this is likely due to:
                     // 1. Lock was already released by another thread

@@ -49,6 +49,26 @@ async fn refresh_lock(
     lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
     args: &LockRequest,
 ) -> GenerallyLockResponse {
+    let marker = rustfs_lock::client::COMMITTED_TAIL_CONVERSION_MARKER;
+    if args.metadata.tags.get(marker).is_some_and(|value| value == marker) {
+        return match lock_client.downgrade_committed_tail(&args.lock_id).await {
+            Ok(true) => GenerallyLockResponse {
+                success: true,
+                error_info: None,
+                lock_info: Some(marker.to_owned()),
+            },
+            Ok(false) => GenerallyLockResponse {
+                success: false,
+                error_info: None,
+                lock_info: None,
+            },
+            Err(error) => GenerallyLockResponse {
+                success: false,
+                error_info: Some(error.to_string()),
+                lock_info: None,
+            },
+        };
+    }
     match lock_client.refresh(&args.lock_id).await {
         Ok(true) => GenerallyLockResponse {
             success: true,
@@ -345,6 +365,30 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
         assert!(result.lock_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_can_convert_committed_tail_and_acknowledges_protocol_version() {
+        use super::refresh_lock;
+        use rustfs_lock::client::{COMMITTED_TAIL_CONVERSION_MARKER, LockClient};
+        use rustfs_lock::{LocalClient, LockRequest, LockType, ObjectKey};
+        use std::{sync::Arc, time::Duration};
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let resource = ObjectKey::new("bucket", "tail-conversion-rpc");
+        let mut request = LockRequest::new(resource.clone(), LockType::Exclusive, "owner");
+        assert!(client.acquire_lock(&request).await.expect("acquire write lease").success);
+        request
+            .metadata
+            .tags
+            .insert(COMMITTED_TAIL_CONVERSION_MARKER.into(), COMMITTED_TAIL_CONVERSION_MARKER.into());
+        let response = refresh_lock(&client, &request).await;
+        assert!(response.success);
+        assert_eq!(response.lock_info.as_deref(), Some(COMMITTED_TAIL_CONVERSION_MARKER));
+        let read = LockRequest::new(resource, LockType::Shared, "reader").with_acquire_timeout(Duration::from_secs(1));
+        assert!(client.acquire_lock(&read).await.expect("read committed tail").success);
+        assert!(client.release(&read.lock_id).await.expect("release reader"));
+        assert!(client.release(&request.lock_id).await.expect("release tail"));
     }
 
     // B1 -- refresh_lock delegates to LocalClient::refresh for a held lock, returns
