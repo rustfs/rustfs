@@ -899,3 +899,13 @@ config:
 ```
 
 Use `extraEnv` for environment variables that are not represented by chart values, including every heal knob above.
+
+## Diagnostic same-bucket prefix attribution
+
+Build with `diagnostic-prefix-attribution` to enable bounded diagnostic counters. The feature is disabled in ordinary builds. Set `RUSTFS_SCANNER_PREFIX_ATTRIBUTION` before starting RustFS to a JSON object with one bucket and two disjoint prefixes, for example `{"bucket":"bench","hot_prefix":"hot/","cold_prefix":"cold/"}`. Prefixes must end in `/` and have no empty, `.` or `..` path component. A missing, malformed or overlapping scope disables attribution; it does not emit zero. Restart to change the scope.
+
+`rustfs_scanner_object_metadata_prefix_visits_total` classifies stored Scanner paths by disk into the fixed classes `hot`, `cold`, `other` and `ambiguous`. Its scope digest uses the `scanner-prefix-attribution-v2` domain; raw bucket and prefix text are not labels, but the digest is not a secrecy guarantee. A path containing a component ending in the encoded directory suffix is `ambiguous`, because a directory marker and a literal key can share that representation. Never count it as hot or cold. Other path normalization and filesystem aliases can also prevent recovery of the original S3 key, so this is not general raw-key attribution.
+
+An attempt is recorded immediately before calling `get_size_with_tier_names` after node admission. A concurrent cancellation can still prevent its internal metadata read. Attempts include failures and repeated visits, and are not unique objects, native I/O or durable progress. A separate `rustfs_scanner_object_metadata_prefix_successes_total` increments only when that call returns success; it does not certify publication. An operation crossing a measurement boundary can produce a success in one window and an attempt in another. The class handles are registered for a valid matching bucket so an observed zero can be distinguished from a missing series.
+
+Use a controlled canonical dataset and independently verify its inventory and per-disk scope before interpreting these counts. Require complete per-disk series for all four classes, unchanged scope, no resets and genuinely matching source windows; missing data or nonzero ambiguous counts cannot establish cold attribution. A zero ambiguous count does not prove a complete scan or rule out other path aliases. Build both comparison legs with the same feature and configuration, and separately measure its overhead. This diagnostic alone does not establish clone-byte attribution, physical cold cache, foreground latency or SSD acceptance.
