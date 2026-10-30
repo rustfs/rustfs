@@ -568,6 +568,8 @@ impl DefaultObjectUsecase {
         // warn and demote the rest to debug, so a denied 1000-key DeleteObjects
         // cannot flood the log.
         let mut bulk_denial_logged = false;
+        // Per-key denials are audited once per denied action, in aggregate, after the loop.
+        let mut bulk_denials = crate::storage::access::BulkDenialAudit::start(&mut req)?;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
             if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
                 delete_results[idx].error = Some(s3s::dto::Error {
@@ -606,15 +608,18 @@ impl DefaultObjectUsecase {
                 req_info.version_id = version_id.clone();
             }
 
-            let mut auth_res = authorize_request(&mut req, delete_object_authorize_action(version_id.as_deref())).await;
+            let mut denied_action = delete_object_authorize_action(version_id.as_deref());
+            let mut auth_res = authorize_request(&mut req, denied_action).await;
             if auth_res.is_ok()
                 && delete_condition
                     .as_ref()
                     .is_some_and(DeleteObjectCondition::requires_read_permission)
             {
-                auth_res = authorize_request(&mut req, Action::S3Action(S3Action::GetObjectAction)).await;
+                denied_action = Action::S3Action(S3Action::GetObjectAction);
+                auth_res = authorize_request(&mut req, denied_action).await;
             }
             if auth_res.is_err() {
+                bulk_denials.denied(denied_action);
                 if !bulk_denial_logged {
                     bulk_denial_logged = true;
                     req_info_mut(&mut req)?.suppress_denial_log = true;
@@ -631,6 +636,7 @@ impl DefaultObjectUsecase {
             if bypass_governance {
                 let auth_res = authorize_request(&mut req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await;
                 if auth_res.is_err() {
+                    bulk_denials.denied(Action::S3Action(S3Action::BypassGovernanceRetentionAction));
                     if !bulk_denial_logged {
                         bulk_denial_logged = true;
                         req_info_mut(&mut req)?.suppress_denial_log = true;
@@ -668,6 +674,8 @@ impl DefaultObjectUsecase {
 
             authorized_deletes.push(AuthorizedDelete { idx, object });
         }
+
+        bulk_denials.finish(&mut req)?;
 
         if authorized_deletes.is_empty() {
             let output = DeleteObjectsOutput {
@@ -3684,5 +3692,31 @@ mod tests {
                 limit: 4096
             }
         ));
+    }
+}
+
+/// DeleteObjects refusals are audited once per denied action by `BulkDenialAudit`. The handler needs a
+/// live store to run, so this source-level guard fails if the wiring is removed; it does not execute it.
+#[cfg(test)]
+mod bulk_denial_audit_wiring_tests {
+    #[test]
+    fn delete_objects_audits_refused_keys_in_aggregate() {
+        // Only the code above this module counts; the guard's own text must not satisfy it.
+        let source = include_str!("delete.rs")
+            .split("\n#[cfg(test)]\nmod bulk_denial_audit_wiring_tests")
+            .next()
+            .unwrap();
+        let started = source
+            .find("BulkDenialAudit::start(&mut req)")
+            .expect("per-key denial audit is not suppressed");
+        let finished = source
+            .find("bulk_denials.finish(&mut req)")
+            .expect("the aggregate entry is not emitted");
+        assert!(started < finished, "the aggregate must be emitted after the per-key checks");
+        assert_eq!(
+            source.matches("bulk_denials.denied(").count(),
+            2,
+            "both authorization checks must count their denials"
+        );
     }
 }

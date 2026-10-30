@@ -25,6 +25,8 @@ use crate::auth::{
 use crate::error::{ApiError, normalize_read_quorum_error};
 use crate::license::license_check;
 use crate::shared_types::RemoteAddr;
+use crate::storage::denial_audit::DenialAuditor;
+use crate::storage::helper::DenialScope;
 use crate::storage::request_context::RequestContext;
 use crate::storage::storage_api::contract::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT;
 use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
@@ -91,6 +93,9 @@ pub(crate) struct ReqInfo {
     /// collection) so `authorize_request` logs those routine denials at `debug`
     /// instead of `warn` (issue #5740).
     pub suppress_denial_log: bool,
+    /// Set by callers that audit their denials in aggregate (DeleteObjects), so each per-key
+    /// denial is not audited on its own. The denial is still logged.
+    pub suppress_denial_audit: bool,
 }
 
 pub(crate) fn replication_request_authorized<T>(req: &S3Request<T>) -> bool {
@@ -1191,6 +1196,8 @@ pub(crate) fn log_list_buckets_iam_implicit_deny<T>(req: &S3Request<T>) -> S3Res
     let req_info = req_info_ref(req)?;
     let denial = DenialContext {
         quiet: true,
+        suppress_audit: true,
+        auditor: DenialAuditor::global(),
         bucket: req_info.bucket.as_deref().unwrap_or_default(),
         object: req_info.object.as_deref().unwrap_or_default(),
         version_id: req_info.version_id.as_deref(),
@@ -1306,6 +1313,8 @@ pub(crate) fn owner_can_bypass_policy_deny(is_owner: bool, action: &Action) -> b
 /// instead of `warn`.
 struct DenialContext<'a> {
     quiet: bool,
+    suppress_audit: bool,
+    auditor: &'a DenialAuditor,
     bucket: &'a str,
     object: &'a str,
     version_id: Option<&'a str>,
@@ -1342,11 +1351,65 @@ impl DenialContext<'_> {
         );
     }
 
-    /// Build the generic AccessDenied response after recording the structured
-    /// denial event.
-    fn deny(&self, reason: &'static str, action: Action) -> S3Error {
+    /// Log the denial and, unless it is a quiet probe denial or audited in aggregate by the
+    /// caller, audit it.
+    fn record<T>(&self, req: &S3Request<T>, reason: &'static str, action: Action) {
         self.log(reason, action);
+        if !self.quiet && !self.suppress_audit {
+            self.auditor.audit(req, &action, reason, DenialScope::Request);
+        }
+    }
+
+    /// Build the generic AccessDenied response after recording the structured
+    /// denial event and, unless this is a quiet probe denial, an audit entry.
+    fn deny<T>(&self, req: &S3Request<T>, reason: &'static str, action: Action) -> S3Error {
+        self.record(req, reason, action);
         s3_error!(AccessDenied, "Access Denied")
+    }
+}
+
+/// Audits a denial at an exit that has no [`DenialContext`] of its own. It only audits: those exits
+/// keep their existing logging. The request's own probe flags are honored.
+fn audit_request_denial<T>(req: &S3Request<T>, auditor: &DenialAuditor, reason: &'static str, action: Action) {
+    let info = req.extensions.get::<ReqInfo>();
+    if info.is_some_and(|info| info.suppress_denial_log || info.suppress_denial_audit) {
+        return;
+    }
+    auditor.audit(req, &action, reason, DenialScope::Request);
+}
+
+/// Audits the refused keys of a bulk request (DeleteObjects) in aggregate instead of once per key.
+///
+/// `start` marks the request so per-key denials are logged but not audited; `finish` clears the
+/// mark and emits one entry per denied action with the number of keys refused for it.
+pub(crate) struct BulkDenialAudit {
+    denied: Vec<(Action, u64)>,
+}
+
+impl BulkDenialAudit {
+    pub(crate) fn start<T>(req: &mut S3Request<T>) -> S3Result<Self> {
+        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = true;
+        Ok(Self { denied: Vec::new() })
+    }
+
+    /// Counts one refused key for `action`.
+    pub(crate) fn denied(&mut self, action: Action) {
+        match self.denied.iter_mut().find(|(denied_action, _)| *denied_action == action) {
+            Some((_, count)) => *count += 1,
+            None => self.denied.push((action, 1)),
+        }
+    }
+
+    pub(crate) fn finish<T>(self, req: &mut S3Request<T>) -> S3Result<()> {
+        self.finish_with(req, DenialAuditor::global())
+    }
+
+    fn finish_with<T>(self, req: &mut S3Request<T>, auditor: &DenialAuditor) -> S3Result<()> {
+        ext_req_info_mut(&mut req.extensions)?.suppress_denial_audit = false;
+        for (action, keys) in self.denied {
+            auditor.audit(req, &action, "bulk_request_keys_denied", DenialScope::Keys(keys));
+        }
+        Ok(())
     }
 }
 
@@ -1369,9 +1432,12 @@ async fn authorize_request_with_location_constraint<T>(
     let object = req_info.object.clone().unwrap_or_default();
     let version_id = req_info.version_id.clone();
     let quiet_denial = req_info.suppress_denial_log;
+    let suppress_denial_audit = req_info.suppress_denial_audit;
     let store = request_object_store(req)?;
     let denial = DenialContext {
         quiet: quiet_denial,
+        suppress_audit: suppress_denial_audit,
+        auditor: DenialAuditor::global(),
         bucket: bucket.as_str(),
         object: object.as_str(),
         version_id: version_id.as_deref(),
@@ -1472,7 +1538,7 @@ async fn authorize_request_with_location_constraint<T>(
             .await
             .map_err(ApiError::from)?
         {
-            return Err(denial.deny("bucket_policy_explicit_deny", action));
+            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
         }
 
         let iam_allowed = {
@@ -1514,7 +1580,7 @@ async fn authorize_request_with_location_constraint<T>(
                     .await
                     .map_err(iam_authorization_error)?
                 {
-                    return Err(denial.deny("iam_explicit_deny", action));
+                    return Err(denial.deny(req, "iam_explicit_deny", action));
                 }
             }
             allowed
@@ -1628,7 +1694,7 @@ async fn authorize_request_with_location_constraint<T>(
             .await
             .map_err(ApiError::from)?
         {
-            return Err(denial.deny("bucket_policy_explicit_deny", action));
+            return Err(denial.deny(req, "bucket_policy_explicit_deny", action));
         }
 
         if action != Action::S3Action(S3Action::ListAllMyBucketsAction) {
@@ -1670,11 +1736,11 @@ async fn authorize_request_with_location_constraint<T>(
                 deny_anonymous_table_data_plane_if_needed(req, action, bucket.as_str(), object.as_str()).await?;
                 // RestrictPublicBuckets: when true, deny public access even if bucket policy allows it.
                 match store.restricts_public_bucket_access(bucket_name).await {
-                    Ok(true) => return Err(denial.deny("restrict_public_buckets", action)),
+                    Ok(true) => return Err(denial.deny(req, "restrict_public_buckets", action)),
                     Ok(false) => {}
                     Err(StorageError::ConfigNotFound) => {}
                     Err(_) => {
-                        return Err(denial.deny("public_access_block_unavailable", action));
+                        return Err(denial.deny(req, "public_access_block_unavailable", action));
                     }
                 }
                 return Ok(());
@@ -1682,7 +1748,7 @@ async fn authorize_request_with_location_constraint<T>(
         }
     }
 
-    Err(denial.deny("no_policy_allows_action", action))
+    Err(denial.deny(req, "no_policy_allows_action", action))
 }
 
 // Multipart parts are staged and become visible only after CompleteMultipartUpload,
@@ -2178,6 +2244,7 @@ async fn authorize_table_data_plane_if_needed<T>(
         ?admin_action,
         "table data-plane access denied by table resource policy"
     );
+    audit_request_denial(req, DenialAuditor::global(), "table_resource_policy_denied", action);
     Err(s3_error!(AccessDenied, "Access Denied"))
 }
 
@@ -2206,6 +2273,7 @@ async fn deny_anonymous_table_data_plane_if_needed<T>(
         .await?
         .is_some()
     {
+        audit_request_denial(req, DenialAuditor::global(), "anonymous_table_data_plane_access", action);
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
     Ok(())
@@ -2642,6 +2710,12 @@ impl S3Access for FS {
             authorize_request(req, Action::S3Action(S3Action::ForceDeleteObjectAction)).await?;
         }
         if !recursive_force_delete_has_authenticated_caller(&req.headers, authenticated, replica_request) {
+            audit_request_denial(
+                req,
+                DenialAuditor::global(),
+                "recursive_force_delete_requires_authenticated_caller",
+                Action::S3Action(S3Action::ForceDeleteObjectAction),
+            );
             return Err(s3_error!(AccessDenied, "Recursive force-delete requires an authenticated caller"));
         }
 
@@ -3605,12 +3679,14 @@ mod tests {
         table_data_plane_content_mutation, table_data_plane_resource_for_request, table_publication_guard_error,
         validate_post_object_success_controls, versioned_read_action, versioned_tagging_action,
     };
+    use super::{BulkDenialAudit, audit_request_denial};
     use super::{
         remaining_retention_days, requested_bucket_location_constraint, set_requested_object_lock_retain_until,
         set_requested_object_lock_retention,
     };
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
+    use crate::storage::denial_audit::{DenialAuditor, DenialRateLimiter};
     use crate::storage::storage_api::contract::bucket::{BucketOperations as _, DeleteBucketOptions, MakeBucketOptions};
     use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
     use crate::storage::storage_api::contract::object::{ObjectIO as _, ObjectOperations as _};
@@ -5107,21 +5183,268 @@ mod tests {
         ));
     }
 
+    type CapturedAudit = Arc<std::sync::Mutex<Vec<rustfs_audit::AuditEntry>>>;
+
+    /// An auditor wired like the global one except that entries land in the returned vector.
+    fn test_auditor(enabled: bool, authenticated_rate: u64, anonymous_rate: u64) -> (DenialAuditor, CapturedAudit) {
+        let captured: CapturedAudit = Arc::default();
+        let sink = Arc::clone(&captured);
+        // A frozen clock: no wall-clock refill can change what the limiter admits.
+        let t0 = std::time::Instant::now();
+        let limiter = DenialRateLimiter::new(authenticated_rate, anonymous_rate, t0);
+        let auditor =
+            DenialAuditor::new(limiter, move || enabled, move |_, entry| sink.lock().unwrap().push(entry)).with_clock(move || t0);
+        (auditor, captured)
+    }
+
+    fn denial_request(request_id: &str, authenticated: bool) -> S3Request<()> {
+        let mut req = build_request((), Method::GET);
+        req.uri = Uri::from_static("/audit-bucket/audit-object");
+        req.extensions.insert(crate::storage::request_context::RequestContext {
+            request_id: request_id.to_string(),
+            x_amz_request_id: request_id.to_string(),
+            trace_id: None,
+            span_id: None,
+            start_time: std::time::Instant::now(),
+        });
+        req.extensions.insert(ReqInfo {
+            cred: authenticated.then(|| rustfs_credentials::Credentials {
+                access_key: "denied-user".to_string(),
+                ..Default::default()
+            }),
+            bucket: Some("audit-bucket".to_string()),
+            object: Some("audit-object".to_string()),
+            ..Default::default()
+        });
+        req
+    }
+
+    fn denial_context(auditor: &DenialAuditor, quiet: bool) -> DenialContext<'_> {
+        DenialContext {
+            quiet,
+            suppress_audit: false,
+            auditor,
+            bucket: "audit-bucket",
+            object: "audit-object",
+            version_id: Some("version"),
+            account: Some("denied-user"),
+            is_owner: false,
+        }
+    }
+
+    const GET_OBJECT: Action = Action::S3Action(S3Action::GetObjectAction);
+
     /// Issue #5740: the denial helper must keep the client-facing error identical
     /// to the historical bare response — the added diagnostics are log-only.
     #[test]
     fn test_access_denied_helper_keeps_generic_wire_response() {
-        let denial = DenialContext {
-            quiet: false,
-            bucket: "bucket",
-            object: "object",
-            version_id: Some("version"),
-            account: Some("account"),
-            is_owner: false,
-        };
-        let err = denial.deny("bucket_policy_explicit_deny", Action::S3Action(S3Action::GetObjectAction));
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-wire-response", true);
+        let err = denial_context(&auditor, false).deny(&req, "bucket_policy_explicit_deny", GET_OBJECT);
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
         assert_eq!(err.message(), Some("Access Denied"));
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// A real denial yields exactly one audit entry naming the account, bucket, object,
+    /// denied action and internal reason.
+    #[test]
+    fn denial_is_audited_once_with_account_resource_action_and_reason() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-audited-once", true);
+        let _ = denial_context(&auditor, false).deny(&req, "iam_explicit_deny", Action::S3Action(S3Action::PutObjectAction));
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.request_id.as_deref(), Some("denial-audited-once"));
+        assert_eq!(entry.access_key.as_deref(), Some("denied-user"));
+        assert_eq!(entry.api.name.as_deref(), Some("s3:PutObject"));
+        assert_eq!(entry.api.bucket.as_deref(), Some("audit-bucket"));
+        assert_eq!(entry.api.object.as_deref(), Some("audit-object"));
+        assert_eq!(entry.api.status.as_deref(), Some("failure"));
+        assert_eq!(entry.api.status_code, Some(403));
+        assert_eq!(entry.error.as_deref(), Some("Access Denied"));
+        let tags = entry.tags.as_ref().expect("denial entry carries its reason");
+        assert_eq!(tags.get("denialReason").and_then(|value| value.as_str()), Some("iam_explicit_deny"));
+        assert!(!tags.contains_key("suppressedDenials"));
+    }
+
+    /// Probe denials (per-bucket ListBuckets fallback, per-object metadata collection) are
+    /// expected filter outcomes and must not flood the audit stream.
+    #[test]
+    fn quiet_probe_denial_is_not_audited() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-quiet-probe", true);
+        let err =
+            denial_context(&auditor, true).deny(&req, "no_policy_allows_action", Action::S3Action(S3Action::ListBucketAction));
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denial_is_not_audited_when_the_audit_module_is_off() {
+        let (auditor, captured) = test_auditor(false, 10, 10);
+        let req = denial_request("denial-audit-off", true);
+        let _ = denial_context(&auditor, false).deny(&req, "no_policy_allows_action", GET_OBJECT);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn denial_audited_in_aggregate_by_the_caller_is_not_audited_per_key() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let req = denial_request("denial-per-key", true);
+        let mut denial = denial_context(&auditor, false);
+        denial.suppress_audit = true;
+        let _ = denial.deny(&req, "iam_explicit_deny", GET_OBJECT);
+        assert!(captured.lock().unwrap().is_empty());
+    }
+
+    /// A flood of denials emits a bounded number of entries; the rest are only counted.
+    #[test]
+    fn denial_flood_emits_bounded_entries() {
+        let (auditor, captured) = test_auditor(true, 3, 3);
+        let req = denial_request("denial-flood", true);
+        for _ in 0..20 {
+            let _ = denial_context(&auditor, false).deny(&req, "no_policy_allows_action", GET_OBJECT);
+        }
+        assert_eq!(captured.lock().unwrap().len(), 3);
+    }
+
+    /// The entry that follows a suppressed run reports how many denials were dropped.
+    #[test]
+    fn entry_after_a_flood_reports_the_suppressed_count() {
+        use crate::storage::helper::DenialScope;
+        let (auditor, captured) = test_auditor(true, 1, 1);
+        let req = denial_request("denial-suppressed-count", true);
+        let t0 = std::time::Instant::now();
+        for _ in 0..5 {
+            auditor.audit_at(&req, &GET_OBJECT, "no_policy_allows_action", DenialScope::Request, t0);
+        }
+        auditor.audit_at(
+            &req,
+            &GET_OBJECT,
+            "no_policy_allows_action",
+            DenialScope::Request,
+            t0 + std::time::Duration::from_secs(2),
+        );
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        let tag = |index: usize| {
+            entries[index]
+                .tags
+                .as_ref()
+                .unwrap()
+                .get("suppressedDenials")
+                .and_then(|v| v.as_u64())
+        };
+        assert_eq!(tag(0), None);
+        assert_eq!(tag(1), Some(4));
+    }
+
+    /// Anonymous callers have their own, lower limit, so an unauthenticated scanner cannot
+    /// use up the budget for authenticated callers.
+    #[test]
+    fn anonymous_denials_are_limited_separately_from_authenticated_ones() {
+        let (auditor, captured) = test_auditor(true, 10, 1);
+        let anonymous = denial_request("denial-anonymous", false);
+        let authenticated = denial_request("denial-authenticated", true);
+        for _ in 0..5 {
+            let _ = denial_context(&auditor, false).deny(&anonymous, "no_policy_allows_action", GET_OBJECT);
+        }
+        for _ in 0..5 {
+            let _ = denial_context(&auditor, false).deny(&authenticated, "no_policy_allows_action", GET_OBJECT);
+        }
+        let entries = captured.lock().unwrap();
+        let count = |id: &str| entries.iter().filter(|entry| entry.request_id.as_deref() == Some(id)).count();
+        assert_eq!(count("denial-anonymous"), 1);
+        assert_eq!(count("denial-authenticated"), 5);
+    }
+
+    /// Exits that have no `DenialContext` of their own audit through the request's own state
+    /// and honor the same probe flags.
+    #[test]
+    fn request_denial_exit_is_audited_and_honors_the_probe_flags() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let mut req = denial_request("denial-exit", true);
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_log = true;
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_log = false;
+        req.extensions.get_mut::<ReqInfo>().unwrap().suppress_denial_audit = true;
+        audit_request_denial(&req, &auditor, "table_resource_policy_denied", GET_OBJECT);
+        assert_eq!(captured.lock().unwrap().len(), 1);
+    }
+
+    /// The table-policy, anonymous table and force-delete exits live deep in the authorization
+    /// flow and need a table catalog to reach. This source-level guard fails if one stops
+    /// auditing; it does not execute them.
+    #[test]
+    fn denial_exits_without_a_context_call_the_audit_function() {
+        // Only the production code counts; the tests' own calls must not satisfy the guard.
+        let source = include_str!("access.rs").split("\nmod tests {").next().unwrap();
+        for reason in [
+            "\"table_resource_policy_denied\"",
+            "\"anonymous_table_data_plane_access\"",
+            "\"recursive_force_delete_requires_authenticated_caller\"",
+        ] {
+            let call = source
+                .match_indices("audit_request_denial(")
+                .any(|(at, _)| source[at..].chars().take(260).collect::<String>().contains(reason));
+            assert!(call, "{reason} exit does not call audit_request_denial");
+        }
+    }
+
+    /// DeleteObjects audits its refused keys as one entry per denied action, carrying the count and
+    /// no single object, and the per-key mark is cleared afterwards.
+    #[test]
+    fn bulk_denial_is_one_entry_per_denied_action_with_the_key_count() {
+        let (auditor, captured) = test_auditor(true, 10, 10);
+        let mut req = denial_request("denial-bulk", true);
+
+        let nothing_denied = BulkDenialAudit::start(&mut req).unwrap();
+        assert!(req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        nothing_denied.finish_with(&mut req, &auditor).unwrap();
+        assert!(!req.extensions.get::<ReqInfo>().unwrap().suppress_denial_audit);
+        assert!(captured.lock().unwrap().is_empty());
+
+        let mut bulk = BulkDenialAudit::start(&mut req).unwrap();
+        let delete = Action::S3Action(S3Action::DeleteObjectAction);
+        let bypass = Action::S3Action(S3Action::BypassGovernanceRetentionAction);
+        for action in [delete, delete, bypass, delete] {
+            bulk.denied(action);
+        }
+        bulk.finish_with(&mut req, &auditor).unwrap();
+
+        let entries = captured.lock().unwrap();
+        assert_eq!(entries.len(), 2);
+        let summary: Vec<_> = entries
+            .iter()
+            .map(|entry| {
+                assert_eq!(entry.api.object, None);
+                (
+                    entry.api.name.clone().unwrap(),
+                    entry
+                        .tags
+                        .as_ref()
+                        .unwrap()
+                        .get("deniedKeys")
+                        .and_then(|value| value.as_u64())
+                        .unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("s3:DeleteObject".to_string(), 3),
+                ("s3:BypassGovernanceRetention".to_string(), 1)
+            ]
+        );
     }
 
     #[test]
