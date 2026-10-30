@@ -83,6 +83,8 @@ diagnostic-allocator-live = []
 diagnostic-local-batch = ["rustfs-ecstore/diagnostic-local-batch", "rustfs-obs/diagnostic-local-batch"]
 # Diagnostic-only S3-operation attribution for internode ReadVersion and list-walker metrics.
 diagnostic-read-version-caller = ["rustfs-ecstore/diagnostic-read-version-caller", "rustfs-io-metrics/diagnostic-read-version-caller", "rustfs-scanner/diagnostic-read-version-caller"]
+# Diagnostic-only fixed-prefix attribution for actual Scanner metadata visits.
+diagnostic-prefix-attribution = ["rustfs-scanner/diagnostic-prefix-attribution"]
 http3 = ["dep:h3", "dep:h3-quinn", "dep:quinn"]
 hotpath = [
     "hotpath/hotpath",

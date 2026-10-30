@@ -1000,6 +1000,8 @@ mod tests {
                     HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)
                 };
                 outcome.record(HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Object,
                         bucket: "bucket".into(),
@@ -1084,6 +1086,8 @@ mod tests {
         outcome.start();
         for index in 0..256 {
             outcome.record(HealObjectOutcome {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity: HealObjectIdentity {
                     kind: HealObjectKind::Object,
                     bucket: "bucket".into(),

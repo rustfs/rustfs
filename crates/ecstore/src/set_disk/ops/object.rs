@@ -158,13 +158,15 @@ fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
 }
 
 fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
-    })
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true))
+    }
 }
 
 fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
@@ -5523,8 +5525,10 @@ impl SetDisks {
                 );
 
                 let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                let all_commit_disks_local = commit_disks.iter().flatten().all(|disk| disk.is_local());
                 let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
+                    && (all_commit_disks_local
+                        || commit_set.tier_free_version_rename_data_source_capable()
                         || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
                 let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
                     && commit_tier_free_version_receipt_sink.is_some()
@@ -5630,9 +5634,11 @@ impl SetDisks {
                 );
                 let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Ok(rename_commit) = rename_result.as_mut() {
-                    commit_set.observe_tier_free_version_rename_data_source_capability(
-                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
-                    );
+                    if rename_commit.tail_drain.is_none() || !rename_commit.old_current_source_all_successful_checked {
+                        commit_set.observe_tier_free_version_rename_data_source_capability(
+                            rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                        );
+                    }
                     commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
@@ -5700,7 +5706,12 @@ impl SetDisks {
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
-                                  targets| {
+                                  targets,
+                                  old_current_source_all_successful_checked,
+                                  all_online_local_succeeded| {
+                                cleanup_set.observe_tier_free_version_rename_data_source_capability(
+                                    old_current_source_all_successful_checked,
+                                );
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
@@ -5727,7 +5738,10 @@ impl SetDisks {
                                         )
                                         .await;
                                     let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
-                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                    if zero_target_cleanup
+                                        && (all_online_local_succeeded
+                                            || rename_tail_cleanup_zero_target_tmp_delete_skip_enabled())
+                                    {
                                         rustfs_io_metrics::record_put_object_stage_duration(
                                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
                                             1.0,
@@ -9262,6 +9276,10 @@ impl SetDisks {
             // cannot safely target the object name after bucket recreation.
             return Ok(());
         };
+        #[cfg(feature = "e2e-test-hooks")]
+        if crate::set_disk::skip_e2e_mrf_fallback(bucket, object).await {
+            return Ok(());
+        }
         let mut request = rustfs_heal_contracts::heal_channel::create_heal_request_with_options(
             bucket.to_string(),
             Some(object.to_string()),

@@ -135,6 +135,10 @@ fn verified_object_receipt(
     } else {
         Some(resolved_version.to_string())
     };
+    let quorum_selected_data_dir = item
+        .quorum_selected_data_dir
+        .map(Uuid::from_bytes)
+        .filter(|generation| !generation.is_nil());
     Some(HealObjectReceipt {
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
@@ -154,6 +158,8 @@ fn verified_object_receipt(
         } else {
             return None;
         },
+        quorum_selected_data_dir,
+        deep_check_observed: item.integrity_verified && quorum_selected_data_dir.is_some(),
     })
 }
 
@@ -880,6 +886,8 @@ impl ECStoreHealStorage {
                 })
             {
                 Some(HealObjectReceipt {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Object,
                         bucket: proof.bucket,
@@ -1033,6 +1041,8 @@ impl HealStorageAPI for ECStoreHealStorage {
             item: HealResultItem::default(),
             error: None,
             receipt: Some(HealObjectReceipt {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity: HealObjectIdentity {
                     kind: HealObjectKind::DeleteMarkerPurge,
                     bucket: bucket.to_owned(),
@@ -2508,6 +2518,42 @@ mod tests {
     }
 
     #[test]
+    fn receipt_retains_only_the_storage_selected_generation() {
+        use super::{HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let generation = Uuid::new_v4();
+        let mut item = HealResultItem {
+            integrity_verified: true,
+            resolved_version_id: Some([0; 16]),
+            quorum_selected_data_dir: Some(*generation.as_bytes()),
+            ..Default::default()
+        };
+        let healthy = HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        };
+        item.before.drives.push(healthy.clone());
+        item.after.drives.push(healthy);
+        let incarnation = Uuid::new_v4();
+        let options = HealOpts::default();
+        let receipt =
+            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).expect("healthy storage result");
+        assert_eq!(receipt.quorum_selected_data_dir, Some(generation));
+
+        for unresolved in [None, Some([0; 16])] {
+            item.quorum_selected_data_dir = unresolved;
+            let receipt = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+                .expect("missing generation must not alter repair authorization");
+            assert_eq!(receipt.quorum_selected_data_dir, None);
+            assert!(
+                !receipt.deep_check_observed,
+                "a missing or nil selection cannot carry the Deep observation"
+            );
+        }
+    }
+
+    #[test]
     fn metadata_health_and_marker_repair_have_distinct_receipts() {
         use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
         use rustfs_madmin::heal_commands::HealDriveInfo;
@@ -2523,6 +2569,7 @@ mod tests {
             metadata_verified: true,
             version_id: version.clone(),
             resolved_version_id: Some(*Uuid::parse_str(&version).expect("version UUID").as_bytes()),
+            quorum_selected_data_dir: Some(*Uuid::new_v4().as_bytes()),
             ..Default::default()
         };
         item.before.drives.push(healthy.clone());
@@ -2531,11 +2578,13 @@ mod tests {
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("metadata quorum should certify metadata health");
         assert_eq!(receipt.disposition, HealObjectDisposition::MetadataHealthy);
+        assert!(!receipt.deep_check_observed);
 
         item.integrity_verified = true;
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("stronger integrity proof should remain available");
         assert_eq!(receipt.disposition, HealObjectDisposition::VerifiedHealthy);
+        assert!(receipt.deep_check_observed);
 
         item.integrity_verified = false;
         item.metadata_verified = false;
@@ -2544,11 +2593,59 @@ mod tests {
         let receipt = verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation)
             .expect("a committed metadata repair should certify the marker/version");
         assert_eq!(receipt.disposition, HealObjectDisposition::Repaired);
+        assert!(!receipt.deep_check_observed);
 
         item.before.drives[0].state = "ok".to_string();
         assert!(
             verified_object_receipt("bucket", "object", Some(&version), &options, &item, incarnation).is_none(),
             "repair proof without a repaired drive must fail closed"
+        );
+    }
+
+    #[test]
+    fn repaired_disposition_does_not_imply_a_deep_check_observation() {
+        use super::{HealObjectDisposition, HealOpts, HealResultItem, Uuid, verified_object_receipt};
+        use rustfs_madmin::heal_commands::HealDriveInfo;
+
+        let mut item = HealResultItem {
+            repair_verified: true,
+            resolved_version_id: Some([0; 16]),
+            quorum_selected_data_dir: Some(*Uuid::new_v4().as_bytes()),
+            ..Default::default()
+        };
+        item.before.drives.push(HealDriveInfo {
+            state: "missing".to_string(),
+            ..Default::default()
+        });
+        item.after.drives.push(HealDriveInfo {
+            state: "ok".to_string(),
+            ..Default::default()
+        });
+        let options = HealOpts::default();
+        let incarnation = Uuid::new_v4();
+        let normal = verified_object_receipt("bucket", "object", None, &options, &item, incarnation)
+            .expect("repair without a Deep observation still has a receipt");
+        assert_eq!(normal.disposition, HealObjectDisposition::Repaired);
+        assert!(!normal.deep_check_observed);
+
+        item.integrity_verified = true;
+        let deep =
+            verified_object_receipt("bucket", "object", None, &options, &item, incarnation).expect("storage Deep observation");
+        assert_eq!(deep.disposition, HealObjectDisposition::Repaired);
+        assert!(deep.deep_check_observed);
+        assert!(
+            verified_object_receipt(
+                "bucket",
+                "object",
+                None,
+                &HealOpts {
+                    dry_run: true,
+                    ..options
+                },
+                &item,
+                incarnation,
+            )
+            .is_none()
         );
     }
 

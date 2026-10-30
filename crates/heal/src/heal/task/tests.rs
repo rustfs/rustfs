@@ -1798,6 +1798,8 @@ fn object_receipt(
     bucket_incarnation_id: Uuid,
 ) -> HealObjectReceipt {
     HealObjectReceipt {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket-a".to_string(),
@@ -1814,16 +1816,12 @@ fn object_receipt(
 #[tokio::test]
 async fn object_heal_records_matching_positive_storage_receipt() {
     let incarnation = Uuid::new_v4();
+    let generation = Uuid::new_v4();
+    let mut receipt = object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired, incarnation);
+    receipt.quorum_selected_data_dir = Some(generation);
+    receipt.deep_check_observed = true;
     let storage = Arc::new(MockStorage {
-        heal_object_receipts: Mutex::new(HashMap::from([(
-            "object-a".to_string(),
-            VecDeque::from([object_receipt(
-                "object-a",
-                Some("version-a"),
-                HealObjectDisposition::Repaired,
-                incarnation,
-            )]),
-        )])),
+        heal_object_receipts: Mutex::new(HashMap::from([("object-a".to_string(), VecDeque::from([receipt]))])),
         bucket_incarnation_id: Mutex::new(Some(incarnation)),
         ..Default::default()
     });
@@ -1842,6 +1840,52 @@ async fn object_heal_records_matching_positive_storage_receipt() {
     assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
     assert!(object.identity.bucket_incarnation_id.is_some());
     assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+    assert_eq!(object.quorum_selected_data_dir, Some(generation));
+    assert!(object.deep_check_observed);
+}
+
+#[tokio::test]
+async fn metadata_or_absence_receipts_do_not_carry_deep_observation() {
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    for disposition in [
+        HealObjectDisposition::MetadataHealthy,
+        HealObjectDisposition::AuthoritativelyAbsent,
+    ] {
+        let mut receipt = object_receipt("object-a", None, disposition, Uuid::new_v4());
+        receipt.deep_check_observed = true;
+        let expected = receipt.identity.clone();
+        assert!(task.record_verified_storage_receipt(&expected, Some(receipt)).await);
+        let outcome = task.get_outcome().await;
+        assert!(
+            !outcome
+                .objects
+                .back()
+                .expect("receipt should be recorded")
+                .deep_check_observed
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_or_nil_storage_generation_stays_unknown_in_recorded_outcome() {
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    for generation in [None, Some(Uuid::nil())] {
+        let mut receipt = object_receipt("object-a", None, HealObjectDisposition::VerifiedHealthy, Uuid::new_v4());
+        receipt.quorum_selected_data_dir = generation;
+        receipt.deep_check_observed = true;
+        let expected = receipt.identity.clone();
+        assert!(task.record_verified_storage_receipt(&expected, Some(receipt)).await);
+        let outcome = task.get_outcome().await;
+        let object = outcome.objects.back().expect("receipt should be recorded");
+        assert_eq!(object.quorum_selected_data_dir, None);
+        assert!(!object.deep_check_observed);
+    }
 }
 
 #[tokio::test]
@@ -1892,17 +1936,9 @@ async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
         pool_index: None,
         set_index: None,
     };
-    let accepted = task
-        .record_verified_storage_receipt(
-            &expected,
-            Some(object_receipt(
-                "object-a",
-                Some("version-a"),
-                HealObjectDisposition::Repaired,
-                incarnation,
-            )),
-        )
-        .await;
+    let mut receipt = object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired, incarnation);
+    receipt.deep_check_observed = true;
+    let accepted = task.record_verified_storage_receipt(&expected, Some(receipt)).await;
 
     let outcome = task.get_outcome().await;
     assert!(!accepted);
@@ -4710,6 +4746,8 @@ async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() 
         heal_object_receipts: Mutex::new(HashMap::from([(
             "deleted.bin".to_string(),
             VecDeque::from([HealObjectReceipt {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity: HealObjectIdentity {
                     kind: HealObjectKind::Object,
                     bucket: "bucket-a".to_string(),

@@ -77,6 +77,7 @@ class RealNextestTests(unittest.TestCase):
             (root / 'rust-toolchain.toml').write_text((shards.ROOT / 'rust-toolchain.toml').read_text())
             (root / 'Cargo.toml').write_text('[package]\nname="probe"\nversion="0.1.0"\nedition="2021"\n')
             (root / 'src/lib.rs').write_text('#[test] fn first() { assert!(std::env::var_os("SHARD_FAIL").is_none()); }\n')
+            (root / 'src/main.rs').write_text('fn main() {}\n#[test] fn binary_case() {}\n')
             (root / 'tests/second.rs').write_text('#[test] fn second() {}\n#[test] #[ignore] fn omitted() {}\n')
             (root / 'tests/third.rs').write_text('#[test] fn third() {}\n')
             (root / '.config/nextest.toml').write_text('''experimental = ["setup-scripts"]
@@ -103,6 +104,7 @@ setup = ['fixture']
                 return result
             cargo('archive', '--offline', '--archive-file', str(archive))
             full = shards.list_tests(root, ['--archive-file', str(archive), '--extract-to', str(root), '--extract-overwrite'])
+            self.assertIn('probe::bin/probe', full['rust-suites'])
             full_path = root / 'listing.json'
             shards.write_json(full_path, full)
             cargo('run', '--profile', 'ci', *shards.metadata_arguments(root))
@@ -118,7 +120,7 @@ setup = ['fixture']
                 evidence = root / 'evidence'
                 for shard in plan['shards']:
                     shards.execute(root, plan_dir, archive, shard['index'], evidence / str(shard['index']))
-                self.assertEqual(shards.verify(plan_dir, evidence), 3)
+                self.assertEqual(shards.verify(plan_dir, evidence), 4)
                 floor = root / 'migration-floor.txt'
                 floor.write_text('1\n')
                 # Older local nextest versions omit the test kind; all fixture

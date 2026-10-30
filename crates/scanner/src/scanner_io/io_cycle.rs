@@ -14,6 +14,102 @@
 /// ScannerIO/ScannerIOCycle implementations for ECStore: bucket planning and per-set fan-out.
 use super::*;
 
+#[derive(Clone, Copy)]
+struct CollectorSlotSample<'a> {
+    index: usize,
+    expected: DataUsageCacheSource,
+    observed: bool,
+    snapshot: &'a DataUsageCache,
+}
+
+#[derive(Default)]
+struct CollectorSlotSummary<'a> {
+    observed: usize,
+    unobserved: usize,
+    incomplete: usize,
+    missing_last_update: usize,
+    missing_source: usize,
+    source_mismatch: usize,
+    cycle_mismatch: usize,
+    epoch_mismatch: usize,
+    missing_plan: usize,
+    plan_mismatch: usize,
+    anomalous: usize,
+    sample: Option<CollectorSlotSample<'a>>,
+    source_difference_sample: Option<CollectorSlotSample<'a>>,
+}
+
+fn summarize_collector_slots<'a>(
+    slots: impl IntoIterator<Item = (usize, DataUsageCacheSource, bool, &'a DataUsageCache)>,
+    cycle: u64,
+    leader_epoch: u64,
+    plan: DataUsageScanPlanDigest,
+) -> CollectorSlotSummary<'a> {
+    let mut summary = CollectorSlotSummary::default();
+    for (index, expected, observed, snapshot) in slots {
+        let mut anomalous = !observed;
+        if observed {
+            summary.observed += 1;
+            let info = &snapshot.info;
+            let incomplete = !info.snapshot_complete;
+            let missing_last_update = info.last_update.is_none();
+            let missing_source = info.source.is_none();
+            let source_mismatch = info.source.is_some_and(|source| source != expected);
+            let cycle_mismatch = info.next_cycle != cycle;
+            let epoch_mismatch = info.leader_epoch != leader_epoch;
+            let missing_plan = info.scan_plan_digest.is_none();
+            let plan_mismatch = info.scan_plan_digest.is_some_and(|actual| actual != plan);
+            summary.incomplete += usize::from(incomplete);
+            summary.missing_last_update += usize::from(missing_last_update);
+            summary.missing_source += usize::from(missing_source);
+            summary.source_mismatch += usize::from(source_mismatch);
+            summary.cycle_mismatch += usize::from(cycle_mismatch);
+            summary.epoch_mismatch += usize::from(epoch_mismatch);
+            summary.missing_plan += usize::from(missing_plan);
+            summary.plan_mismatch += usize::from(plan_mismatch);
+            if source_mismatch {
+                let sample_key = (expected.pool_index, expected.set_index, index);
+                if summary
+                    .source_difference_sample
+                    .is_none_or(|sample| sample_key < (sample.expected.pool_index, sample.expected.set_index, sample.index))
+                {
+                    summary.source_difference_sample = Some(CollectorSlotSample {
+                        index,
+                        expected,
+                        observed,
+                        snapshot,
+                    });
+                }
+            }
+            anomalous = incomplete
+                || missing_last_update
+                || missing_source
+                || cycle_mismatch
+                || epoch_mismatch
+                || missing_plan
+                || plan_mismatch;
+        } else {
+            summary.unobserved += 1;
+        }
+        if anomalous {
+            summary.anomalous += 1;
+            let sample_key = (expected.pool_index, expected.set_index, index);
+            if summary
+                .sample
+                .is_none_or(|sample| sample_key < (sample.expected.pool_index, sample.expected.set_index, sample.index))
+            {
+                summary.sample = Some(CollectorSlotSample {
+                    index,
+                    expected,
+                    observed,
+                    snapshot,
+                });
+            }
+        }
+    }
+    summary
+}
+
 #[async_trait::async_trait]
 impl ScannerIO for ECStore {
     async fn nsscanner(
@@ -816,7 +912,8 @@ where
     record_set_scans_active(0);
 
     let results = vec![DataUsageCache::default(); total_results];
-    let results_mutex: Arc<Mutex<Vec<DataUsageCache>>> = Arc::new(Mutex::new(results));
+    let observed_slots = vec![false; total_results];
+    let results_mutex = Arc::new(Mutex::new((results, observed_slots)));
     let first_err_mutex: Arc<Mutex<Option<Error>>> = Arc::new(Mutex::new(None));
     let mut wait_futs = Vec::new();
 
@@ -870,7 +967,8 @@ where
         let receiver_fut = tokio::spawn(async move {
             while let Some(result) = rx.recv().await {
                 let mut results = results_mutex_clone.lock().await;
-                results[results_index_clone] = result;
+                results.0[results_index_clone] = result;
+                results.1[results_index_clone] = true;
             }
         });
         wait_futs.push(AbortOnDropHandle::new(receiver_fut));
@@ -992,7 +1090,7 @@ where
     let first_err = first_err_mutex.lock().await.take();
     let has_set_failure = first_err.is_some();
     // Every collector has joined; transfer the caches without duplicating their trees.
-    let results = std::mem::take(&mut *results_mutex.lock().await);
+    let (results, observed_slots) = std::mem::take(&mut *results_mutex.lock().await);
     let completed_all_sets = bucket_plan_complete && scanner_results_form_complete_snapshot(&results, &expected_sources);
     let result = finalize_nsscanner_result(&results, first_err);
     let failed_buckets = bucket_failures.hard.lock().await.clone();
@@ -1118,6 +1216,72 @@ where
         dirty_usage_status,
         activity_status,
     );
+    if cycle_status == ScannerCycleStatus::Incomplete && result.is_ok() && !budget_elapsed && !ctx.is_cancelled() {
+        let slots =
+            set_disks
+                .iter()
+                .zip(&results)
+                .zip(&observed_slots)
+                .enumerate()
+                .map(|(index, ((set, snapshot), observed))| {
+                    (index, DataUsageCacheSource::new(set.pool_index, set.set_index), *observed, snapshot)
+                });
+        let summary = summarize_collector_slots(slots, want_cycle, leader_epoch, scan_plan_digest);
+        let sample = summary.sample;
+        let source_difference = summary.source_difference_sample;
+        let sample_snapshot = sample.filter(|sample| sample.observed).map(|sample| sample.snapshot);
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_SET_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state = "incomplete_cycle_collector_summary",
+            cycle = want_cycle,
+            leader_epoch,
+            configured_sets = set_disks.len(),
+            expected_sources = expected_sources.len(),
+            collector_slots = results.len(),
+            bucket_plan_complete,
+            scan_scope_matches,
+            completed_candidate_present = completed_usage.is_some(),
+            structurally_complete_snapshot,
+            bucket_scan_status = ?bucket_scan_status,
+            dirty_usage_status = ?dirty_usage_status,
+            activity_status = ?activity_status,
+            has_set_failure,
+            observed_slots = summary.observed,
+            unobserved_slots = summary.unobserved,
+            observed_incomplete_slots = summary.incomplete,
+            observed_missing_last_update_slots = summary.missing_last_update,
+            observed_missing_source_slots = summary.missing_source,
+            observed_slot_source_differs = summary.source_mismatch,
+            slot_source_difference_omitted = summary.source_mismatch.saturating_sub(usize::from(source_difference.is_some())),
+            slot_source_difference_index = source_difference.map(|sample| sample.index),
+            slot_source_difference_expected_pool = source_difference.map(|sample| sample.expected.pool_index),
+            slot_source_difference_expected_set = source_difference.map(|sample| sample.expected.set_index),
+            slot_source_difference_snapshot_pool = source_difference.and_then(|sample| sample.snapshot.info.source.map(|source| source.pool_index)),
+            slot_source_difference_snapshot_set = source_difference.and_then(|sample| sample.snapshot.info.source.map(|source| source.set_index)),
+            observed_cycle_mismatch_slots = summary.cycle_mismatch,
+            observed_epoch_mismatch_slots = summary.epoch_mismatch,
+            observed_missing_plan_slots = summary.missing_plan,
+            observed_plan_mismatch_slots = summary.plan_mismatch,
+            anomalous_slots = summary.anomalous,
+            sample_omitted_slots = summary.anomalous.saturating_sub(usize::from(sample.is_some())),
+            sample_slot = sample.map(|sample| sample.index),
+            sample_expected_pool = sample.map(|sample| sample.expected.pool_index),
+            sample_expected_set = sample.map(|sample| sample.expected.set_index),
+            sample_observed = sample.map(|sample| sample.observed),
+            sample_snapshot_source_pool = sample_snapshot.and_then(|snapshot| snapshot.info.source.map(|source| source.pool_index)),
+            sample_snapshot_source_set = sample_snapshot.and_then(|snapshot| snapshot.info.source.map(|source| source.set_index)),
+            sample_snapshot_complete = sample_snapshot.map(|snapshot| snapshot.info.snapshot_complete),
+            sample_snapshot_has_last_update = sample_snapshot.map(|snapshot| snapshot.info.last_update.is_some()),
+            sample_snapshot_cycle = sample_snapshot.map(|snapshot| snapshot.info.next_cycle),
+            sample_snapshot_leader_epoch = sample_snapshot.map(|snapshot| snapshot.info.leader_epoch),
+            sample_snapshot_has_plan = sample_snapshot.map(|snapshot| snapshot.info.scan_plan_digest.is_some()),
+            sample_snapshot_plan_matches = sample_snapshot.and_then(|snapshot| snapshot.info.scan_plan_digest.map(|plan| plan == scan_plan_digest)),
+            "Scanner recorded collector observations for an incomplete cycle"
+        );
+    }
     // Certification is per bucket: the pending set is read after the
     // guardrail verdict so a bucket written during the walk is reported in
     // the same publication that certifies the others. A bucket whose walk
@@ -1262,5 +1426,143 @@ fn e2e_scope_observation(scope: &ScannerBucketScanScope) -> serde_json::Value {
     match &scope.selected_buckets {
         Some(buckets) => serde_json::json!({"kind": "buckets", "buckets": buckets.iter().collect::<BTreeSet<_>>()}),
         None => serde_json::json!({"kind": "all"}),
+    }
+}
+
+#[cfg(test)]
+mod collector_summary_tests {
+    use super::*;
+
+    const PLAN: DataUsageScanPlanDigest = DataUsageScanPlanDigest([4; 32]);
+
+    fn complete(source: DataUsageCacheSource) -> DataUsageCache {
+        DataUsageCache {
+            info: DataUsageCacheInfo {
+                source: Some(source),
+                next_cycle: 7,
+                leader_epoch: 11,
+                scan_plan_digest: Some(PLAN),
+                last_update: Some(SystemTime::now()),
+                snapshot_complete: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn collector_distinguishes_an_unobserved_slot_from_an_observed_default() {
+        let default = DataUsageCache::default();
+        let first = DataUsageCacheSource::new(0, 0);
+        let second = DataUsageCacheSource::new(0, 1);
+        let summary = summarize_collector_slots([(0, first, true, &default), (1, second, false, &default)], 7, 11, PLAN);
+
+        assert_eq!((summary.observed, summary.unobserved), (1, 1));
+        assert_eq!((summary.incomplete, summary.missing_source), (1, 1));
+        assert_eq!(summary.anomalous, 2);
+        let sample = summary.sample.expect("a sample should be selected");
+        assert_eq!(sample.expected, first);
+        assert!(sample.observed, "an observed default is not an unobserved slot");
+        assert!(sample.snapshot.info.source.is_none());
+    }
+
+    #[test]
+    fn collector_reports_source_positions_without_inventing_a_slot_failure() {
+        let first = DataUsageCacheSource::new(0, 0);
+        let second = DataUsageCacheSource::new(0, 1);
+        let first_cache = complete(first);
+        let second_cache = complete(second);
+        let expected_sources = HashSet::from([first, second]);
+
+        let swapped = [second_cache, first_cache.clone()];
+        assert!(scanner_results_match_scan_scope(&swapped, &expected_sources));
+        let summary = summarize_collector_slots([(0, first, true, &swapped[0]), (1, second, true, &swapped[1])], 7, 11, PLAN);
+        assert_eq!(summary.source_mismatch, 2);
+        assert!(summary.sample.is_none(), "different positions alone do not identify a failed slot");
+        let difference = summary.source_difference_sample.expect("one bounded position difference");
+        assert_eq!(difference.expected, first);
+        assert_eq!(difference.snapshot.info.source, Some(second));
+
+        let duplicate = [first_cache.clone(), first_cache];
+        assert!(!scanner_results_match_scan_scope(&duplicate, &expected_sources));
+        let summary = summarize_collector_slots([(0, first, true, &duplicate[0]), (1, second, true, &duplicate[1])], 7, 11, PLAN);
+        assert_eq!(summary.source_mismatch, 1);
+        assert!(summary.sample.is_none(), "a duplicate source does not identify which slot caused it");
+        let difference = summary.source_difference_sample.expect("one bounded position difference");
+        assert_eq!(difference.expected, second);
+        assert_eq!(difference.snapshot.info.source, Some(first));
+    }
+
+    #[test]
+    fn collector_counts_generation_and_plan_differences_without_assigning_a_cause() {
+        let first = DataUsageCacheSource::new(0, 0);
+        let second = DataUsageCacheSource::new(0, 1);
+        let mut older = complete(first);
+        older.info.next_cycle = 6;
+        older.info.leader_epoch = 10;
+        older.info.scan_plan_digest = Some(DataUsageScanPlanDigest([9; 32]));
+        let mut missing_plan = complete(second);
+        missing_plan.info.scan_plan_digest = None;
+
+        let slots = [(1, second, true, &missing_plan), (0, first, true, &older)];
+        let summary = summarize_collector_slots(slots, 7, 11, PLAN);
+        assert_eq!((summary.cycle_mismatch, summary.epoch_mismatch), (1, 1));
+        assert_eq!((summary.plan_mismatch, summary.missing_plan), (1, 1));
+        assert_eq!(summary.anomalous, 2);
+        let sample = summary.sample.expect("one deterministic sample");
+        assert_eq!(sample.expected, first);
+        assert_eq!(sample.snapshot.info.next_cycle, 6);
+        assert_eq!(sample.snapshot.info.leader_epoch, 10);
+        assert_eq!(sample.snapshot.info.scan_plan_digest, Some(DataUsageScanPlanDigest([9; 32])));
+
+        let missing = summarize_collector_slots([(1, second, true, &missing_plan)], 7, 11, PLAN);
+        assert!(
+            missing
+                .sample
+                .expect("missing plan sample")
+                .snapshot
+                .info
+                .scan_plan_digest
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn collector_sample_is_bounded_and_complete_slots_do_not_explain_other_incomplete_states() {
+        let first = DataUsageCacheSource::new(0, 0);
+        let second = DataUsageCacheSource::new(0, 1);
+        let first_cache = complete(first);
+        let second_cache = complete(second);
+        let complete_slots = [(0, first, true, &first_cache), (1, second, true, &second_cache)];
+
+        for (sets_complete, bucket_status, dirty_status) in [
+            (false, ScannerBucketScanStatus::PartialCarried, DirtyUsageSnapshotStatus::Current),
+            (true, ScannerBucketScanStatus::Partial, DirtyUsageSnapshotStatus::Current),
+            (true, ScannerBucketScanStatus::Complete, DirtyUsageSnapshotStatus::Unverified),
+        ] {
+            assert_eq!(
+                classify_nsscanner_cycle(
+                    sets_complete,
+                    false,
+                    false,
+                    bucket_status,
+                    dirty_status,
+                    ScannerCycleActivityStatus::Unchanged,
+                ),
+                ScannerCycleStatus::Incomplete
+            );
+            let summary = summarize_collector_slots(complete_slots, 7, 11, PLAN);
+            assert_eq!(summary.anomalous, 0);
+            assert!(summary.sample.is_none(), "complete slot observations do not explain another gate");
+        }
+
+        let default = DataUsageCache::default();
+        let slots = (0..12)
+            .rev()
+            .map(|index| (index, DataUsageCacheSource::new(0, index), false, &default));
+        let summary = summarize_collector_slots(slots, 7, 11, PLAN);
+        assert_eq!(summary.unobserved, 12);
+        assert_eq!(summary.anomalous, 12);
+        assert_eq!(summary.sample.expect("one bounded sample").expected, first);
     }
 }
