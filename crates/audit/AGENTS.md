@@ -2,10 +2,7 @@
 
 Applies to `crates/audit/`.
 
-`rustfs-audit` is the domain layer for audit event fan-out and observability.
-It composes shared plugin/runtime abstractions from `rustfs-targets` and keeps
-audit-specific dispatch semantics, state transitions, and metrics in this
-crate.
+`rustfs-audit` is the domain layer for audit event fan-out and observability. It composes shared plugin/runtime abstractions from `rustfs-targets` and keeps audit-specific dispatch semantics, state transitions, and metrics in this crate.
 
 ## Domain Boundaries
 
@@ -24,19 +21,14 @@ crate.
   - `AuditPipeline` (dispatch and snapshot access)
   - `AuditRuntimeFacade` (runtime mutation path)
   - `AuditRuntimeView` (runtime read path)
-- `registry.rs` should remain the single owner of runtime target container and
-  plugin registry composition for audit.
-- `system.rs` should coordinate lifecycle by calling facade/view/registry
-  boundaries rather than embedding low-level runtime logic.
+- `registry.rs` should remain the single owner of runtime target container and plugin registry composition for audit.
+- `system.rs` should coordinate lifecycle by calling facade/view/registry boundaries rather than embedding low-level runtime logic.
 
 ## Change Style
 
-- Preserve audit delivery semantics and error handling behavior unless the task
-  explicitly changes them.
-- Prefer extending shared abstractions in `rustfs-targets` over patching
-  one-off audit-only runtime flows.
-- Keep logging and observability machine-meaningful; avoid noisy churn in hot
-  dispatch paths.
+- Preserve audit delivery semantics and error handling behavior unless the task explicitly changes them.
+- Prefer extending shared abstractions in `rustfs-targets` over patching one-off audit-only runtime flows.
+- Keep logging and observability machine-meaningful; avoid noisy churn in hot dispatch paths.
 
 ## Testing
 
@@ -47,6 +39,6 @@ crate.
   - runtime view target/snapshot access
   - system reload and runtime commit/clear boundaries
 - Suggested validation:
-  - `cargo test -p rustfs-audit`
-  - Focused: `cargo test -p rustfs-audit --test pipeline_layer_test`
-  - Focused: `cargo test -p rustfs-audit pipeline`
+  - `cargo nextest run -p rustfs-audit --no-tests fail`
+  - Focused: `cargo nextest run -p rustfs-audit --test pipeline_layer_test --no-tests fail`
+  - Focused: `cargo nextest run -p rustfs-audit --no-tests fail -E 'test(pipeline)'`

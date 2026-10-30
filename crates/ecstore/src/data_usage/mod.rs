@@ -28,7 +28,7 @@ use crate::{
     error::{Error, classify_system_path_failure_reason},
     object_api::{ObjectInfo, ObjectOptions, PutObjReader},
     runtime::sources as runtime_sources,
-    store::{ECStore, list_objects::list_marker_key},
+    store::ECStore,
 };
 pub use local_snapshot::{LocalUsageSnapshot, read_snapshot as read_local_snapshot, snapshot_path};
 use rustfs_data_usage::{
@@ -1493,6 +1493,48 @@ pub async fn load_data_usage_from_backend_cached(store: Arc<ECStore>) -> Result<
     project_data_usage_from_backend_cached(store, DataUsageInfo::clone).await
 }
 
+/// Read one bucket's persisted usage without cloning the complete snapshot.
+pub async fn load_bucket_usage_from_backend_cached(
+    store: Arc<ECStore>,
+    bucket: &str,
+    incarnation: uuid::Uuid,
+) -> Result<Option<u64>, Error> {
+    project_data_usage_from_backend_cached(store, |info| certified_bucket_usage(info, bucket, incarnation)).await
+}
+
+fn certified_bucket_usage(info: &DataUsageInfo, bucket: &str, incarnation: uuid::Uuid) -> Option<u64> {
+    if incarnation.is_nil()
+        || !info.is_complete_bucket_usage_snapshot()
+        || info.usage_snapshot_observational
+        || info.scanner_cycle.is_none()
+        || info.scanner_epoch.is_none()
+    {
+        return None;
+    }
+    let pending_count = u64::try_from(info.usage_snapshot_pending_buckets.len()).ok()?;
+    if pending_count != info.usage_snapshot_pending_bucket_count {
+        return None;
+    }
+    match info.usage_snapshot_converged {
+        Some(true) if pending_count == 0 => {}
+        Some(false)
+            if pending_count > 0
+                && info.usage_snapshot_pending_buckets.windows(2).all(|pair| pair[0] < pair[1])
+                && info
+                    .usage_snapshot_pending_buckets
+                    .binary_search_by(|pending| pending.as_str().cmp(bucket))
+                    .is_err() => {}
+        _ => return None,
+    }
+    let usage = info.buckets_usage.get(bucket)?;
+    let certified = usage
+        .bucket_incarnation
+        .as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .filter(|id| !id.is_nil())?;
+    (certified == incarnation).then_some(usage.size)
+}
+
 // Project under the cache guard so scalar readers never copy the snapshot's
 // bucket maps. The owned API shares the same TTL, refresh and invalidation path.
 async fn project_data_usage_from_backend_cached<T>(
@@ -1966,8 +2008,8 @@ fn advance_version_listing_cursor(
     let next_version_marker = next_version_marker
         .filter(|next_version_marker| !next_version_marker.is_empty())
         .ok_or_else(|| Error::other(format!("bucket {bucket} version listing was truncated without a version marker")))?;
-    let current_key_marker = marker.as_deref().map(list_marker_key);
-    let next_key_marker = list_marker_key(&next_marker);
+    let current_key_marker = marker.as_deref();
+    let next_key_marker = next_marker.as_str();
     if current_key_marker == Some(next_key_marker) && version_marker.as_deref() == Some(next_version_marker.as_str()) {
         return Err(Error::other(format!(
             "bucket {bucket} version listing returned a repeated continuation marker"
@@ -5167,20 +5209,20 @@ mod tests {
         );
         assert!(ensure_truncated_version_page_has_entries("bucket-a", 0).is_err());
         ensure_truncated_version_page_has_entries("bucket-a", 1).expect("a truncated page with an entry can advance");
+    }
 
-        let mut tagged_marker = Some("object-a[rustfs_cache:v2,id:old]".to_string());
-        let mut tagged_version_marker = Some("version-a".to_string());
-        assert!(
-            advance_version_listing_cursor(
-                "bucket-a",
-                &mut tagged_marker,
-                &mut tagged_version_marker,
-                Some("object-a[rustfs_cache:v2,id:new]".to_string()),
-                Some("version-a".to_string()),
-            )
-            .is_err(),
-            "different cache tags for the same logical marker must not count as progress"
-        );
+    #[test]
+    fn version_listing_cursor_compares_literal_cache_shaped_keys() {
+        let mut marker = Some("object-a".to_string());
+        let mut version_marker = Some("version-a".to_string());
+        advance_version_listing_cursor(
+            "bucket-a",
+            &mut marker,
+            &mut version_marker,
+            Some("object-a[rustfs_cache:v2,id:old]".to_string()),
+            Some("version-a".to_string()),
+        )
+        .expect("a distinct literal key advances the cursor");
     }
 
     #[test]

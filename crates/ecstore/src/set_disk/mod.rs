@@ -283,6 +283,23 @@ fn ensure_decommission_tier_free_version_commit_fence(bucket: &str, object: &str
     Ok(())
 }
 
+/// Names a `bucket/object` key prefix whose best-effort rename-tail repairs
+/// are not submitted. A root-heal fixture arms it so the explicit admin heal
+/// remains the only owner of objects written while their target was offline.
+#[cfg(feature = "e2e-test-hooks")]
+const RENAME_TAIL_HEAL_SUPPRESS_PREFIX_ENV: &str = "RUSTFS_E2E_SUPPRESS_RENAME_TAIL_HEAL_PREFIX";
+
+#[cfg(feature = "e2e-test-hooks")]
+fn rename_tail_heal_suppressed_for_e2e(bucket: &str, object: Option<&str>) -> bool {
+    let Some(prefix) = std::env::var(RENAME_TAIL_HEAL_SUPPRESS_PREFIX_ENV)
+        .ok()
+        .filter(|prefix| !prefix.is_empty())
+    else {
+        return false;
+    };
+    object.is_some_and(|object| format!("{bucket}/{object}").starts_with(&prefix))
+}
+
 impl SetDisks {
     pub(super) async fn require_current_restore_operation_id(
         &self,
@@ -486,8 +503,14 @@ pub(crate) fn strip_internal_multipart_metadata(metadata: &mut HashMap<String, S
     rustfs_utils::http::metadata_compat::remove_str(metadata, SUFFIX_BUCKET_INCARNATION_ID);
 }
 
-fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn should_persist_encryption_original_size(metadata: &HashMap<String, String>) -> bool {
     metadata.keys().any(|key| is_object_encryption_marker(key))
+}
+
+/// Reject ambiguous part sizes unless the upload records a transformation.
+pub(crate) fn multipart_part_logical_size(stored_size: usize, actual_size: i64, transformed: bool) -> Option<usize> {
+    let actual_size = usize::try_from(actual_size).ok()?;
+    (transformed || actual_size == stored_size).then_some(actual_size)
 }
 
 /// Per-set memoized capacity dirty scope.
@@ -889,6 +912,8 @@ pub(crate) use ops::heal::AbsenceProofRequest;
 #[cfg(test)]
 pub(crate) use ops::heal::DanglingDeleteFailure;
 pub(crate) use ops::heal::HealedObjectAbsence;
+#[cfg(test)]
+pub(crate) use ops::heal::ReadRepairPauseScope;
 
 #[cfg(test)]
 pub(crate) use ops::hermetic_set_disks_isolated;
@@ -1022,6 +1047,19 @@ impl GetObjectFileInfo {
 
     fn fi(&self) -> &FileInfo {
         self.as_parts().0
+    }
+
+    /// Marks an exact-version selection as the object's latest version after
+    /// the versions above it were skipped as dangling.
+    fn mark_selected_as_latest(&mut self) {
+        if let Some(OwnedGetObjectFileInfo {
+            payload: OwnedGetObjectFileInfoPayload::Direct { fi, .. },
+            ..
+        }) = self.owned.as_mut()
+        {
+            fi.is_latest = true;
+            fi.successor_mod_time = None;
+        }
     }
 
     fn parts_metadata(&self) -> &[FileInfo] {
@@ -4232,14 +4270,23 @@ pub(super) struct MultipartWriteQuorumContext<'a> {
     part_number: Option<usize>,
 }
 
+fn record_multipart_write_quorum_failure(
+    stage: &'static str,
+    errs: &[Option<DiskError>],
+    write_quorum: usize,
+) -> crate::disk::error_reduce::WriteQuorumFailureSummary {
+    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
+    runtime_sources::record_erasure_write_quorum_failure(stage, summary.dominant_error_label);
+    summary
+}
+
 fn log_multipart_write_quorum_failure(
     context: MultipartWriteQuorumContext<'_>,
     errs: &[Option<DiskError>],
     write_quorum: usize,
     returned_error: &DiskError,
 ) {
-    let summary = build_write_quorum_failure_summary(errs, OBJECT_OP_IGNORED_ERRS, write_quorum);
-    runtime_sources::record_erasure_write_quorum_failure(context.stage, summary.dominant_error_label);
+    let summary = record_multipart_write_quorum_failure(context.stage, errs, write_quorum);
     warn!(
         target: "rustfs_ecstore::set_disk",
         event = EVENT_SET_DISK_MULTIPART,
@@ -5119,6 +5166,11 @@ impl SetDisks {
                 let _ = capture.send(request);
                 return Ok(());
             }
+        }
+
+        #[cfg(feature = "e2e-test-hooks")]
+        if rename_tail_heal_suppressed_for_e2e(&request.bucket, request.object_prefix.as_deref()) {
+            return Ok(());
         }
 
         let _ = rustfs_heal_contracts::heal_channel::send_heal_request(request).await;
@@ -6839,6 +6891,17 @@ impl SetDisks {
             ));
         }
         Ok(())
+    }
+
+    /// Whether any drive holds `version_id` of the key, including a copy on
+    /// fewer drives than read quorum that object reads report as absent.
+    pub(crate) async fn holds_version_on_any_drive(&self, bucket: &str, object: &str, version_id: Uuid) -> bool {
+        let disks = self.disk_inventory().await;
+        let (copies, _) = Self::read_all_raw_file_info(&disks, bucket, object, false).await;
+        copies
+            .iter()
+            .flatten()
+            .any(|copy| FileMeta::load(&copy.buf).is_ok_and(|meta| meta.find_version(Some(version_id)).is_ok()))
     }
 
     /// Publish an internal tier free-version record without changing its

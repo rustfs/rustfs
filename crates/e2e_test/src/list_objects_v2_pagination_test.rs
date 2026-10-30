@@ -38,6 +38,8 @@ mod tests {
     use tracing::info;
 
     const PAGINATION_TIMEOUT: Duration = Duration::from_secs(120);
+    // Bound queued durable commits on the single fixture disk under CI I/O pressure.
+    const FIXTURE_PUT_CONCURRENCY: usize = 4;
 
     // Fixture population can require thousands of durable PUTs. Bound the
     // listing traversal itself with one deadline shared by every page.
@@ -564,7 +566,7 @@ mod tests {
         let object_count = 1002;
         // Finish every durable PUT before listing, with the same bounded fanout as the delimiter fixtures.
         stream::iter(0..object_count)
-            .for_each_concurrent(16, |i| {
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |i| {
                 let client = &client;
                 async move {
                     let key = format!("object{i:04}.txt");
@@ -575,7 +577,7 @@ mod tests {
                         .body(ByteStream::from_static(b"test content"))
                         .send()
                         .await
-                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
                 }
             })
             .await;
@@ -822,7 +824,7 @@ mod tests {
             .flat_map(|dir| (0..10).map(move |file| format!("dir-{dir:03}/file{file:02}.txt")))
             .collect();
         stream::iter(&all_keys)
-            .for_each_concurrent(16, |key| {
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |key| {
                 let client = &client;
                 async move {
                     client
@@ -832,7 +834,7 @@ mod tests {
                         .body(ByteStream::from_static(b"x"))
                         .send()
                         .await
-                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
                 }
             })
             .await;
@@ -1055,7 +1057,7 @@ mod tests {
         let files_per_dir = 100;
         let fixture_started = std::time::Instant::now();
         stream::iter((0..dir_count).flat_map(|d| (0..files_per_dir).map(move |f| (d, f))))
-            .for_each_concurrent(16, |(d, f)| {
+            .for_each_concurrent(FIXTURE_PUT_CONCURRENCY, |(d, f)| {
                 let client = &client;
                 async move {
                     let key = format!("dir-{d:02}/file{f:03}.txt");
@@ -1066,7 +1068,7 @@ mod tests {
                         .body(ByteStream::from_static(b"x"))
                         .send()
                         .await
-                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err}"));
+                        .unwrap_or_else(|err| panic!("Failed to put fixture object {key}: {err:?}"));
                 }
             })
             .await;
