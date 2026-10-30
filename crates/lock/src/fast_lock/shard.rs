@@ -54,6 +54,7 @@ enum TestPausePoint {
     FastWriteExisting,
     SlowLookup,
     ForceAfterTailRelease,
+    ReleaseAfterUnregister,
 }
 
 #[cfg(test)]
@@ -398,14 +399,10 @@ impl LockShard {
 
     /// Release lock with guard ID tracking for double-release prevention
     pub fn release_lock_with_guard(&self, key: &ObjectKey, owner: &Arc<str>, mode: LockMode, guard_id: u64) -> bool {
-        // First, try to remove the guard from active set
-        let guard_was_active = {
-            let mut guards = self.active_guards.lock();
-            guards.remove(&guard_id).is_some()
-        };
-
-        // If guard was not active, this is a double-release attempt
-        if !guard_was_active {
+        // Keep force-unlock from releasing this holder and admitting a new
+        // same-owner holder between guard removal and physical release.
+        let mut guards = self.active_guards.lock();
+        if guards.remove(&guard_id).is_none() {
             tracing::debug!(
                 "Double-release attempt blocked: key={}, owner={}, mode={:?}, guard_id={}",
                 key,
@@ -415,6 +412,9 @@ impl LockShard {
             );
             return false;
         }
+
+        #[cfg(test)]
+        test_pause(TestPausePoint::ReleaseAfterUnregister, key);
 
         // Proceed with normal release
         let should_cleanup;
@@ -439,6 +439,8 @@ impl LockShard {
                 should_cleanup = false;
             }
         }
+
+        drop(guards);
 
         if should_cleanup {
             self.schedule_cleanup(key.clone());
@@ -1080,6 +1082,63 @@ mod tests {
             .join()
             .expect("manager construction"),
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn force_unlock_cannot_interleave_an_old_release_with_a_new_holder() {
+        for reader in [false, true] {
+            let manager = test_manager();
+            let key = ObjectKey::new("bucket", "force-release-gap");
+            let old = if reader {
+                manager.acquire_read_lock(key.clone(), "same-owner").await
+            } else {
+                manager.acquire_write_lock(key.clone(), "same-owner").await
+            }
+            .expect("old holder");
+            let shard = manager.get_shard(&key).clone();
+            let (entered, resume) = install_pause(TestPausePoint::ReleaseAfterUnregister, &key);
+            let old_drop = tokio::task::spawn_blocking(move || drop(old));
+            entered.recv_timeout(Duration::from_secs(5)).expect("old release paused");
+
+            let can_force = shard.active_guards.try_lock().is_some();
+            let mut force = {
+                let manager = manager.clone();
+                let key = key.clone();
+                tokio::task::spawn_blocking(move || manager.force_unlock(&key))
+            };
+            let mut new_guard = if can_force {
+                assert_eq!(force.await.expect("force join"), 1);
+                let mut guard = manager
+                    .acquire_write_lock(key.clone(), "same-owner")
+                    .await
+                    .expect("new writer");
+                if reader {
+                    assert!(guard.downgrade_committed_tail());
+                }
+                resume.send(()).expect("resume old release");
+                old_drop.await.expect("old release join");
+                guard
+            } else {
+                assert!(tokio::time::timeout(Duration::from_millis(100), &mut force).await.is_err());
+                resume.send(()).expect("resume old release");
+                old_drop.await.expect("old release join");
+                assert_eq!(force.await.expect("force join"), 0);
+                manager
+                    .acquire_write_lock(key.clone(), "same-owner")
+                    .await
+                    .expect("new writer")
+            };
+            if reader && !can_force {
+                assert!(new_guard.downgrade_committed_tail());
+            }
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, "competitor"))
+                    .await
+                    .is_err(),
+                "an old release must not unlock the new writer"
+            );
+            drop(new_guard);
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
