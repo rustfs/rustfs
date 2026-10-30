@@ -168,6 +168,7 @@ enum ReadRepairPausePhase {
     Data,
     PartStaging(usize),
     Commit,
+    IncarnationCommit,
 }
 
 #[cfg(test)]
@@ -183,7 +184,7 @@ struct ReadRepairPause {
 static READ_REPAIR_PAUSES: std::sync::Mutex<Vec<ReadRepairPause>> = std::sync::Mutex::new(Vec::new());
 
 #[cfg(test)]
-struct ReadRepairPauseScope {
+pub(crate) struct ReadRepairPauseScope {
     bucket: String,
     object: String,
     phase: ReadRepairPausePhase,
@@ -193,6 +194,13 @@ struct ReadRepairPauseScope {
 impl ReadRepairPauseScope {
     fn install(bucket: &str, object: &str) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
         Self::install_at(bucket, object, ReadRepairPausePhase::Commit)
+    }
+
+    pub(crate) fn install_incarnation_commit(
+        bucket: &str,
+        object: &str,
+    ) -> (Self, std::sync::Arc<tokio::sync::Notify>, std::sync::Arc<tokio::sync::Notify>) {
+        Self::install_at(bucket, object, ReadRepairPausePhase::IncarnationCommit)
     }
 
     fn install_at(
@@ -1415,6 +1423,8 @@ impl SetDisks {
                                 );
                             }
 
+                            // A no-remove request cannot turn surviving data into dangling
+                            // cleanup or its grace deferral.
                             if read_repair_uses_shared_lock || preserve_unrepairable || !opts.remove {
                                 return Ok((result, Some(cannot_heal_err)));
                             }
@@ -1958,6 +1968,10 @@ impl SetDisks {
                         // MinIO stops on the first RenameData error. RustFS intentionally
                         // continues per target, but reports any residue after all attempts
                         // so successful repairs survive and failed targets remain retryable.
+                        #[cfg(test)]
+                        if bucket_heal_scope.is_some() {
+                            pause_read_repair(bucket, object, ReadRepairPausePhase::IncarnationCommit).await;
+                        }
                         let mut rename_attempts = 0usize;
                         let mut rename_successes = 0usize;
                         let mut healed_disks = vec![None; out_dated_disks.len()];
@@ -4142,6 +4156,151 @@ mod heal_result_report_tests {
 
     #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
+    async fn deep_heal_preserves_below_quorum_external_parts_without_remove() {
+        use tokio::io::AsyncReadExt;
+
+        for grace in ["3600", "0"] {
+            let scenario = async {
+                for versioned in [false, true] {
+                    let (temp_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+                    let bucket = "heal-below-read-quorum";
+                    let object = "external.bin";
+                    for disk in &disks {
+                        disk.make_volume(bucket).await.expect("create each bucket volume");
+                    }
+                    let body = vec![0x5a; 1024 * 1024];
+                    let version = versioned.then(|| Uuid::new_v4().to_string());
+                    let put_options = ObjectOptions {
+                        no_lock: true,
+                        versioned,
+                        version_id: version.clone(),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    };
+                    let mut reader = PutObjReader::from_vec(body.clone());
+                    set.put_object(bucket, object, &mut reader, &put_options)
+                        .await
+                        .expect("commit every original external shard");
+                    if versioned {
+                        let mut newer = PutObjReader::from_vec(vec![0xa5; body.len()]);
+                        set.put_object(
+                            bucket,
+                            object,
+                            &mut newer,
+                            &ObjectOptions {
+                                version_id: Some(Uuid::new_v4().to_string()),
+                                ..put_options.clone()
+                            },
+                        )
+                        .await
+                        .expect("commit a distinct current version above the historical target");
+                    }
+                    let version_id = version.as_deref().unwrap_or("");
+                    let source = disks[3]
+                        .read_version("", bucket, object, version_id, &ReadOptions::default())
+                        .await
+                        .expect("read the exact source version");
+                    assert_eq!(source.erasure.data_blocks, 2, "fixture must have R=2");
+                    let part_path = format!("{object}/{}/part.1", source.data_dir.expect("external data directory"));
+                    let mut metadata = Vec::new();
+                    let mut original_parts = Vec::new();
+                    for disk in &disks {
+                        metadata.push(
+                            disk.read_all(bucket, &format!("{object}/xl.meta"))
+                                .await
+                                .expect("original metadata"),
+                        );
+                        original_parts.push(disk.read_all(bucket, &part_path).await.expect("original external part"));
+                    }
+                    for dir in temp_dirs.iter().take(3) {
+                        tokio::fs::remove_file(dir.path().join(bucket).join(&part_path))
+                            .await
+                            .expect("leave exactly R-1 external shards");
+                    }
+                    let opts = HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        remove: false,
+                        ..Default::default()
+                    };
+                    let (result, error) = set
+                        .heal_object(bucket, object, version_id, &opts)
+                        .await
+                        .expect("negative deep heal");
+                    assert!(
+                        matches!(error, Some(DiskError::ErasureReadQuorum)),
+                        "a no-remove heal with surviving same-version data must retain the quorum failure, not classify cleanup grace: {error:?}"
+                    );
+                    assert!(!result.integrity_verified, "below-R data cannot carry a positive integrity proof");
+                    for (index, disk) in disks.iter().enumerate() {
+                        assert_eq!(
+                            disk.read_all(bucket, &format!("{object}/xl.meta"))
+                                .await
+                                .expect("retained metadata"),
+                            metadata[index],
+                            "negative heal must preserve every original metadata byte"
+                        );
+                        if index < 3 {
+                            assert!(
+                                disk.read_all(bucket, &part_path).await.is_err(),
+                                "below-R heal cannot invent a missing shard"
+                            );
+                        } else {
+                            assert_eq!(disk.read_all(bucket, &part_path).await.expect("surviving shard"), original_parts[index]);
+                        }
+                    }
+                    disks[0]
+                        .write_all(bucket, &part_path, original_parts[0].clone())
+                        .await
+                        .expect("restore one original source");
+                    let (_, error) = set
+                        .heal_object(bucket, object, version_id, &opts)
+                        .await
+                        .expect("fresh heal at exactly R");
+                    assert!(error.is_none(), "exactly R original sources must repair independently: {error:?}");
+                    let mut restored = set
+                        .get_object_reader(bucket, object, None, Default::default(), &put_options)
+                        .await
+                        .expect("read the repaired exact version");
+                    let mut actual = Vec::new();
+                    restored
+                        .stream
+                        .read_to_end(&mut actual)
+                        .await
+                        .expect("read every repaired payload byte");
+                    assert_eq!(actual, body, "later successful repair cannot hide data loss");
+                    if grace == "0" {
+                        drop(restored);
+                        for dir in temp_dirs.iter().take(3) {
+                            tokio::fs::remove_file(dir.path().join(bucket).join(&part_path))
+                                .await
+                                .expect("prepare the explicit removal control");
+                        }
+                        let (_, error) = set
+                            .heal_object(bucket, object, version_id, &HealOpts { remove: true, ..opts })
+                            .await
+                            .expect("explicit dangling cleanup control");
+                        assert!(
+                            error.is_none(),
+                            "explicit removal with zero grace must still clean dangling data: {error:?}"
+                        );
+                        for disk in &disks {
+                            assert!(
+                                disk.read_version("", bucket, object, version_id, &ReadOptions::default())
+                                    .await
+                                    .is_err(),
+                                "explicit cleanup must remove the target version"
+                            );
+                        }
+                    }
+                }
+            };
+            temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some(grace))], scenario).await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    #[serial_test::serial]
     async fn heal_writer_failures_emit_one_aggregate_warning_per_object() {
         for (case, target_count, failed_target_count, injected_error) in [
             ("partial", 2usize, 1usize, DiskError::DiskFull),
@@ -6098,6 +6257,105 @@ mod heal_result_report_tests {
                 assert_eq!(healthy.drives_healed(), Some(0));
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn deep_heal_rebuilds_half_truncated_inline_metadata() {
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-half-truncated-inline-metadata";
+        let object = "object.bin";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create fixture volume");
+        }
+        let payload: Vec<u8> = (0..4095)
+            .map(|index| u8::try_from(index % 251).expect("payload byte"))
+            .collect();
+        let options = ObjectOptions {
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            ..Default::default()
+        };
+        set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &options)
+            .await
+            .expect("persist every inline shard before physical injection");
+        let read_options = ReadOptions {
+            read_data: true,
+            ..Default::default()
+        };
+        let mut before = Vec::new();
+        let mut metadata = Vec::new();
+        for (dir, disk) in dirs.iter().zip(&disks) {
+            before.push(
+                tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("read original physical metadata"),
+            );
+            let info = disk
+                .read_version("", bucket, object, "", &read_options)
+                .await
+                .expect("read original inline shard");
+            assert!(info.data.as_ref().is_some_and(|bytes| !bytes.is_empty()));
+            metadata.push(info);
+        }
+        let target = dirs[0].path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+        let truncated = &before[0][..before[0].len() / 2];
+        tokio::fs::write(&target, truncated)
+            .await
+            .expect("truncate exact original metadata at half length");
+
+        let (result, error) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("heal one truncated metadata replica with three healthy sources");
+        assert!(error.is_none(), "truncated inline metadata must be repairable: {error:?}");
+        assert_eq!(result.before.drives[0].state, DriveState::Corrupt.to_string());
+        assert_eq!(result.drives_healed(), Some(1), "the damaged replica must actually be rebuilt");
+        assert!(
+            result
+                .after
+                .drives
+                .iter()
+                .all(|drive| drive.state == DriveState::Ok.to_string())
+        );
+        let repaired = disks[0]
+            .read_version("", bucket, object, "", &read_options)
+            .await
+            .expect("repaired target metadata must parse");
+        assert!(repaired.equals(&metadata[0]), "restore the original logical metadata");
+        assert_eq!(repaired.erasure.index, metadata[0].erasure.index);
+        assert_eq!(repaired.data, metadata[0].data, "restore the original encoded inline shard");
+        assert_eq!(repaired.version_id, metadata[0].version_id);
+        assert_eq!(repaired.data_dir, metadata[0].data_dir);
+        for (dir, original) in dirs.iter().zip(&before).skip(1) {
+            assert_eq!(
+                tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                    .await
+                    .expect("read healthy metadata after heal"),
+                *original,
+                "healthy metadata must remain byte-identical"
+            );
+        }
+        let mut reader = set
+            .get_object_reader(bucket, object, None, Default::default(), &options)
+            .await
+            .expect("read reconstructed object");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read complete reconstructed payload");
+        assert_eq!(body, payload);
     }
 
     #[tokio::test]
@@ -8288,6 +8546,1804 @@ mod heal_result_report_tests {
             .await
             .expect("surviving version must remain readable after the race");
         assert_eq!(survivor.size, 1024 * 1024, "survivor size must be intact");
+    }
+
+    #[derive(Clone, Copy)]
+    enum VersionCommitMutation {
+        Append,
+        DeleteHistorical,
+        DeleteCurrent,
+    }
+
+    struct VersionCommitFixture {
+        version: Uuid,
+        data_dir: Uuid,
+        body: Vec<u8>,
+        parts: Vec<Vec<u8>>,
+    }
+
+    async fn explicit_version_commit_fence(mutation: VersionCommitMutation) {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+            let label = match mutation {
+                VersionCommitMutation::Append => "append",
+                VersionCommitMutation::DeleteHistorical => "delete-historical",
+                VersionCommitMutation::DeleteCurrent => "delete-current",
+            };
+            let prefix = if matches!(mutation, VersionCommitMutation::Append) {
+                "native_g02"
+            } else {
+                "native_g03"
+            };
+            let bucket = format!("version-commit-{label}-{disk_count}");
+            let object = "object.bin";
+            set.make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    versioning_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create isolated versioned bucket");
+            let options = ObjectOptions {
+                versioned: true,
+                write_completion: WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            let mut versions = Vec::new();
+            for byte in [0x11, 0x22, 0x33] {
+                let body = vec![byte; 1024 * 1024 + 123];
+                let info = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                    .await
+                    .expect("ACK original version after its full rename tail");
+                let version = info.version_id.expect("independent version id");
+                let meta = disks[0]
+                    .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("read original version metadata");
+                assert!(meta.data.is_none(), "native version fence must reconstruct external data");
+                assert_eq!(meta.erasure.data_blocks, disk_count - parity);
+                assert_eq!(meta.erasure.parity_blocks, parity);
+                let data_dir = meta.data_dir.expect("actual external generation");
+                let mut parts = Vec::new();
+                for dir in &dirs {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(data_dir.to_string())
+                                .join("part.1"),
+                        )
+                        .await
+                        .expect("every original encoded shard after ACK"),
+                    );
+                }
+                versions.push(VersionCommitFixture {
+                    version,
+                    data_dir,
+                    body,
+                    parts,
+                });
+            }
+            let selected = if matches!(mutation, VersionCommitMutation::DeleteCurrent) {
+                2
+            } else {
+                0
+            };
+            let selected_version = versions[selected].version;
+            let selected_dir = versions[selected].data_dir;
+            let missing = dirs[0]
+                .path()
+                .join(&bucket)
+                .join(object)
+                .join(selected_dir.to_string())
+                .join("part.1");
+            tokio::fs::remove_file(&missing)
+                .await
+                .expect("remove exact selected-version shard");
+            let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+            let heal_set = set.clone();
+            let heal_bucket = bucket.clone();
+            let heal = tokio::spawn(async move {
+                heal_set
+                    .heal_object(
+                        &heal_bucket,
+                        object,
+                        &selected_version.to_string(),
+                        &HealOpts {
+                            scan_mode: HealScanMode::Deep,
+                            read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                .await
+                .expect("actual selected-version reconstruction reaches final commit fence");
+            assert!(!heal.is_finished() && !missing.exists());
+            println!("{prefix}: geometry={disk_count}/{parity} mutation={label} reconstruction_paused_before_final_rename");
+
+            if matches!(mutation, VersionCommitMutation::Append) {
+                let body = vec![0x44; 1024 * 1024 + 123];
+                let info = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                    .await
+                    .expect("new version ACK while historical reconstruction is paused");
+                let version = info.version_id.expect("new acknowledged version id");
+                assert!(versions.iter().all(|v| v.version != version));
+                let meta = disks[0]
+                    .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                    .await
+                    .expect("new physical version metadata");
+                let data_dir = meta.data_dir.expect("new external generation");
+                let mut parts = Vec::new();
+                for dir in &dirs {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(data_dir.to_string())
+                                .join("part.1"),
+                        )
+                        .await
+                        .expect("new version ACK has every physical shard"),
+                    );
+                }
+                versions.push(VersionCommitFixture {
+                    version,
+                    data_dir,
+                    body,
+                    parts,
+                });
+            } else {
+                set.delete_object(
+                    &bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(selected_version.to_string()),
+                        object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                            crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                        ))),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("exact version delete ACK before releasing stale reconstruction");
+            }
+            // Commit pause has dropped the Heal read guard. Acquire this key's
+            // write fence only after the foreground ACK, draining its physical
+            // cleanup before snapshots; release it before resuming the Heal.
+            let namespace = set.new_ns_lock(&bucket, object).await.expect("foreground drain fence");
+            let drained = namespace
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("foreground physical tail drains");
+            let mut committed_metadata = Vec::new();
+            for dir in &dirs {
+                committed_metadata.push(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("foreground committed metadata on every drive"),
+                );
+                if !matches!(mutation, VersionCommitMutation::Append) {
+                    assert!(!dir.path().join(&bucket).join(object).join(selected_dir.to_string()).exists());
+                }
+            }
+            drop(drained);
+            assert!(!heal.is_finished());
+            println!(
+                "{prefix}: geometry={disk_count}/{parity} mutation={label} foreground_ack_and_physical_tail_verified_before_release"
+            );
+            release.notify_one();
+            let outcome = tokio::time::timeout(Duration::from_secs(30), heal)
+                .await
+                .expect("Heal leaves its released final fence")
+                .expect("Heal task joins");
+            if matches!(mutation, VersionCommitMutation::Append) {
+                assert!(outcome.expect("historical version remains healable").1.is_none());
+            } else {
+                assert!(
+                    matches!(outcome, Err(DiskError::FileVersionNotFound)),
+                    "deleted version must remain typed absent: {outcome:?}"
+                );
+            }
+            for (slot, dir) in dirs.iter().enumerate() {
+                if slot != 0 || !matches!(mutation, VersionCommitMutation::Append) {
+                    assert_eq!(
+                        tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("metadata after Heal"),
+                        committed_metadata[slot],
+                        "Heal must preserve every committed successor metadata byte outside its repaired target"
+                    );
+                }
+                if !matches!(mutation, VersionCommitMutation::Append) {
+                    assert!(!dir.path().join(&bucket).join(object).join(selected_dir.to_string()).exists());
+                }
+                for version in &versions {
+                    if !matches!(mutation, VersionCommitMutation::Append) && version.version == selected_version {
+                        assert!(matches!(
+                            disks[slot]
+                                .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                                .await,
+                            Err(DiskError::FileVersionNotFound)
+                        ));
+                        continue;
+                    }
+                    let meta = disks[slot]
+                        .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                        .await
+                        .expect("every acknowledged surviving version metadata");
+                    assert_eq!(meta.data_dir, Some(version.data_dir));
+                    assert_eq!(meta.size, version.body.len() as i64);
+                    assert_eq!(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(version.data_dir.to_string())
+                                .join("part.1")
+                        )
+                        .await
+                        .expect("physical shard before any GET"),
+                        version.parts[slot],
+                        "every surviving version must retain its exact original encoded shard"
+                    );
+                }
+            }
+            for version in &versions {
+                if !matches!(mutation, VersionCommitMutation::Append) && version.version == selected_version {
+                    continue;
+                }
+                let mut reader = set
+                    .get_object_reader(
+                        &bucket,
+                        object,
+                        None,
+                        Default::default(),
+                        &ObjectOptions {
+                            versioned: true,
+                            version_id: Some(version.version.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("read exact surviving version after physical proof");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("read complete surviving version");
+                assert_eq!(actual, version.body);
+            }
+            let current = if matches!(mutation, VersionCommitMutation::DeleteCurrent) {
+                &versions[1]
+            } else {
+                versions.last().unwrap()
+            };
+            let mut reader = set
+                .get_object_reader(
+                    &bucket,
+                    object,
+                    None,
+                    Default::default(),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read exact last surviving current generation");
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("read full current generation");
+            assert_eq!(actual, current.body);
+            println!(
+                "{prefix}: geometry={disk_count}/{parity} mutation={label} exact_version_outcome_physical_generations_and_full_bodies_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_explicit_version_commit_preserves_acknowledged_new_version() {
+        explicit_version_commit_fence(VersionCommitMutation::Append).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_explicit_version_commit_refuses_deleted_historical_and_current_versions() {
+        explicit_version_commit_fence(VersionCommitMutation::DeleteHistorical).await;
+        explicit_version_commit_fence(VersionCommitMutation::DeleteCurrent).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_marker_and_batch_delete_fence_preserves_acknowledged_version_set() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::object::ObjectToDelete;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["create-marker", "delete-marker", "batch-version-delete", "unversioned-delete"] {
+                let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+                let bucket = format!("marker-fence-{mutation}-{disk_count}");
+                let object = "object.bin";
+                let versioned = mutation != "unversioned-delete";
+                set.make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: versioned,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create isolated marker fence bucket");
+                let options = ObjectOptions {
+                    versioned,
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                };
+                let mut versions = Vec::new();
+                for byte in if versioned { vec![0x51, 0x62, 0x73] } else { vec![0x51] } {
+                    let body = vec![byte; 1024 * 1024 + 123];
+                    let info = set
+                        .put_object(&bucket, object, &mut PutObjReader::from_vec(body.clone()), &options)
+                        .await
+                        .expect("ACK complete original external version");
+                    let version = info.version_id.unwrap_or(Uuid::nil());
+                    assert_eq!(!version.is_nil(), versioned);
+                    let meta = disks[0]
+                        .read_version("", &bucket, object, &version.to_string(), &ReadOptions::default())
+                        .await
+                        .expect("read independent acknowledged metadata");
+                    assert!(meta.data.is_none());
+                    let data_dir = meta.data_dir.expect("external data generation");
+                    let mut parts = Vec::new();
+                    for dir in &dirs {
+                        parts.push(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(data_dir.to_string())
+                                    .join("part.1"),
+                            )
+                            .await
+                            .expect("full encoded original shard after ACK"),
+                        );
+                    }
+                    versions.push(VersionCommitFixture {
+                        version,
+                        data_dir,
+                        body,
+                        parts,
+                    });
+                }
+                let mut marker = None;
+                if mutation == "delete-marker" {
+                    marker = Some(
+                        set.delete_object(&bucket, object, options.clone())
+                            .await
+                            .expect("ACK original current marker")
+                            .version_id
+                            .expect("real marker identity"),
+                    );
+                }
+                let selected = versions[0].version;
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(object)
+                    .join(versions[0].data_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("remove selected original data shard");
+                let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            object,
+                            &selected.to_string(),
+                            &HealOpts {
+                                scan_mode: HealScanMode::Deep,
+                                read_repair: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("real original reconstruction pauses before final metadata rename");
+                assert!(!heal.is_finished() && !missing.exists());
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} reconstruction_paused_before_final_rename"
+                );
+                let mut removed = Vec::new();
+                match mutation {
+                    "create-marker" => {
+                        marker = Some(
+                            set.delete_object(&bucket, object, options.clone())
+                                .await
+                                .expect("ACK marker creation before stale Heal resumes")
+                                .version_id
+                                .expect("new marker identity"),
+                        );
+                    }
+                    "delete-marker" => {
+                        let version = marker.expect("fixture marker identity");
+                        let ack = set
+                            .delete_object(
+                                &bucket,
+                                object,
+                                ObjectOptions {
+                                    version_id: Some(version.to_string()),
+                                    ..options.clone()
+                                },
+                            )
+                            .await
+                            .expect("ACK exact current marker removal before stale Heal resumes");
+                        assert_eq!(ack.version_id, Some(version));
+                    }
+                    "batch-version-delete" => {
+                        removed.extend([versions[0].version, versions[1].version]);
+                        let requests = removed
+                            .iter()
+                            .map(|version| ObjectToDelete {
+                                object_name: object.to_owned(),
+                                version_id: Some(*version),
+                                ..Default::default()
+                            })
+                            .collect();
+                        let (deleted, errors) = set.delete_objects(&bucket, requests, options.clone()).await;
+                        assert_eq!(deleted.len(), removed.len());
+                        assert_eq!(errors.len(), removed.len());
+                        for ((ack, error), version) in deleted.iter().zip(&errors).zip(&removed) {
+                            assert!(error.is_none(), "every batch item must ACK separately: {error:?}");
+                            assert_eq!(ack.object_name, object);
+                            assert_eq!(ack.version_id, Some(*version));
+                            assert!(!ack.delete_marker);
+                        }
+                    }
+                    "unversioned-delete" => {
+                        set.delete_object(&bucket, object, options.clone())
+                            .await
+                            .expect("ACK unversioned delete");
+                        removed.push(selected);
+                    }
+                    _ => unreachable!(),
+                }
+                if let Some(marker) = marker {
+                    assert!(
+                        !marker.is_nil() && versions.iter().all(|version| version.version != marker),
+                        "marker ACK must have its own real version identity"
+                    );
+                }
+                // Drain the actual foreground metadata/cleanup tail under this
+                // key's write fence before releasing the older reconstruction.
+                let namespace = set.new_ns_lock(&bucket, object).await.expect("foreground drain fence");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("foreground tail drains");
+                let mut committed = Vec::new();
+                for dir in &dirs {
+                    let metadata = dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+                    committed.push(match tokio::fs::read(metadata).await {
+                        Ok(bytes) => Some(bytes),
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound && !versioned => None,
+                        Err(error) => panic!("foreground metadata cannot be read: {error}"),
+                    });
+                    for version in &versions {
+                        if removed.contains(&version.version) {
+                            assert!(
+                                !dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(version.data_dir.to_string())
+                                    .exists()
+                            );
+                        }
+                    }
+                }
+                drop(drained);
+                assert!(!heal.is_finished());
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} exact_foreground_acks_and_physical_tail_verified_before_release"
+                );
+                release.notify_one();
+                let outcome = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("stale Heal leaves the released fence")
+                    .expect("Heal task joins");
+                if removed.contains(&selected) {
+                    assert!(
+                        matches!(outcome, Err(DiskError::FileVersionNotFound)),
+                        "deleted target must remain typed absent: {outcome:?}"
+                    );
+                } else {
+                    assert!(outcome.expect("surviving explicit data version remains healable").1.is_none());
+                }
+                let mut expected_versions: std::collections::HashSet<_> = versions
+                    .iter()
+                    .filter(|version| !removed.contains(&version.version))
+                    .map(|version| Some(version.version))
+                    .collect();
+                if mutation == "create-marker" {
+                    expected_versions.insert(marker);
+                }
+                for (slot, dir) in dirs.iter().enumerate() {
+                    let metadata = dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE);
+                    if !expected_versions.is_empty() {
+                        let mut decoded = rustfs_filemeta::FileMeta::default();
+                        decoded
+                            .unmarshal_msg(&tokio::fs::read(&metadata).await.expect("complete physical metadata"))
+                            .expect("decode final version inventory independently");
+                        assert_eq!(
+                            decoded.versions.len(),
+                            expected_versions.len(),
+                            "no duplicate or invented physical versions"
+                        );
+                        let actual: std::collections::HashSet<_> =
+                            decoded.versions.iter().map(|version| version.header.version_id).collect();
+                        assert_eq!(actual, expected_versions, "exact data and marker version set on every member");
+                    }
+                    if removed.contains(&selected) || slot != 0 {
+                        let after = tokio::fs::read(&metadata).await;
+                        if let Some(expected) = &committed[slot] {
+                            assert_eq!(&after.expect("committed metadata survives"), expected);
+                        } else {
+                            assert_eq!(
+                                after.expect_err("deleted unversioned metadata must not resurrect").kind(),
+                                std::io::ErrorKind::NotFound
+                            );
+                        }
+                    }
+                    if let Some(marker) = marker {
+                        let observed = disks[slot]
+                            .read_version("", &bucket, object, &marker.to_string(), &ReadOptions::default())
+                            .await;
+                        if mutation == "create-marker" {
+                            let info = observed.expect("new marker survives on every disk");
+                            assert!(info.deleted);
+                            assert_eq!(info.version_id, Some(marker));
+                            let current = disks[slot]
+                                .read_version("", &bucket, object, "", &ReadOptions::default())
+                                .await
+                                .expect("read current marker");
+                            assert!(current.deleted);
+                            assert_eq!(current.version_id, Some(marker));
+                        } else {
+                            assert!(matches!(observed, Err(DiskError::FileVersionNotFound)));
+                        }
+                    }
+                    for version in &versions {
+                        let observed = disks[slot]
+                            .read_version("", &bucket, object, &version.version.to_string(), &ReadOptions::default())
+                            .await;
+                        let part = dir
+                            .path()
+                            .join(&bucket)
+                            .join(object)
+                            .join(version.data_dir.to_string())
+                            .join("part.1");
+                        if removed.contains(&version.version) {
+                            assert!(observed.is_err());
+                            assert!(!part.parent().unwrap().exists(), "deleted data directory must not resurrect");
+                        } else {
+                            assert_eq!(observed.expect("surviving exact version").data_dir, Some(version.data_dir));
+                            assert_eq!(tokio::fs::read(part).await.expect("surviving part before any GET"), version.parts[slot]);
+                        }
+                    }
+                }
+                for version in &versions {
+                    if removed.contains(&version.version) {
+                        continue;
+                    }
+                    let mut reader = set
+                        .get_object_reader(
+                            &bucket,
+                            object,
+                            None,
+                            Default::default(),
+                            &ObjectOptions {
+                                versioned,
+                                version_id: Some(version.version.to_string()),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("read exact surviving original version");
+                    let mut body = Vec::new();
+                    reader.read_to_end(&mut body).await.expect("complete surviving body");
+                    assert_eq!(body, version.body);
+                }
+                if mutation == "create-marker" {
+                    // The storage info API exposes marker identity to its S3
+                    // caller; it must not substitute the previous live data.
+                    let current = set
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("current storage info retains marker identity");
+                    assert!(current.delete_marker && current.is_latest);
+                    assert_eq!(current.version_id, marker);
+                } else if !versioned {
+                    let absent = set
+                        .get_object_info(
+                            &bucket,
+                            object,
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(absent, Err(Error::ObjectNotFound(_, _))),
+                        "current deleted object must remain typed absent: {absent:?}"
+                    );
+                } else {
+                    let expected = versions.last().expect("surviving current version");
+                    let mut reader = set
+                        .get_object_reader(
+                            &bucket,
+                            object,
+                            None,
+                            Default::default(),
+                            &ObjectOptions {
+                                versioned,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("current read after marker or batch deletion");
+                    assert_eq!(reader.object_info.version_id, Some(expected.version));
+                    let mut body = Vec::new();
+                    reader.read_to_end(&mut body).await.expect("full current body");
+                    assert_eq!(body, expected.body);
+                }
+                println!(
+                    "native_g04: geometry={disk_count}/{parity} mutation={mutation} marker_set_deleted_directories_surviving_shards_and_full_bodies_verified"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_multipart_continue_complete_abort_fences_stale_heal() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations as _};
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+            let bucket = format!("multipart-heal-fence-{disk_count}");
+            let object = "object.bin";
+            set.make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create isolated MPU fence bucket");
+            let options = ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            let first_size = 5 * 1024 * 1024 + 17;
+            let middle_size = 5 * 1024 * 1024 + 93;
+            let last_size = 1024 * 1024 + 47;
+            let original = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("original multipart upload");
+            let mut original_parts = Vec::new();
+            for (number, byte, size) in [(1, 0x21, first_size), (2, 0x32, middle_size), (3, 0x43, last_size)] {
+                let part = set
+                    .put_object_part(
+                        &bucket,
+                        object,
+                        &original.upload_id,
+                        number,
+                        &mut PutObjReader::from_vec(vec![byte; size]),
+                        &options,
+                    )
+                    .await
+                    .expect("ACK original multipart part");
+                assert!(part.etag.as_ref().is_some_and(|value| !value.is_empty()));
+                original_parts.push(CompletePart {
+                    part_num: part.part_num,
+                    etag: part.etag,
+                    ..Default::default()
+                });
+            }
+            let original_ack = set
+                .clone()
+                .complete_multipart_upload(&bucket, object, &original.upload_id, original_parts, &options)
+                .await
+                .expect("ACK original completed multipart object");
+            let old = disks[0]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("original external metadata");
+            assert_eq!(old.parts.len(), 3);
+            let old_dir = old.data_dir.expect("original external generation");
+            let mut original_reader = set
+                .get_object_reader(&bucket, object, None, Default::default(), &options)
+                .await
+                .expect("read complete committed multipart baseline before fault");
+            let mut original_body = Vec::new();
+            original_reader
+                .read_to_end(&mut original_body)
+                .await
+                .expect("full original multipart body");
+            assert_eq!(
+                original_body,
+                [vec![0x21; first_size], vec![0x32; middle_size], vec![0x43; last_size]].concat()
+            );
+            drop(original_reader);
+            let mut old_metadata = Vec::new();
+            let mut old_shards = Vec::new();
+            for dir in &dirs {
+                let mut parts = Vec::new();
+                for number in [1, 2, 3] {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(&bucket)
+                                .join(object)
+                                .join(old_dir.to_string())
+                                .join(format!("part.{number}")),
+                        )
+                        .await
+                        .expect("original complete encoded multipart part"),
+                    );
+                }
+                old_shards.push(parts);
+                old_metadata.push(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("original metadata after full-tail completion"),
+                );
+            }
+            let active = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("pending upload A");
+            let cancelled = set
+                .new_multipart_upload(&bucket, object, &options)
+                .await
+                .expect("pending upload B");
+            assert_ne!(active.upload_id, cancelled.upload_id);
+            assert_ne!(active.upload_id, original.upload_id);
+            let first_body = vec![0x63; first_size];
+            let middle_body = vec![0x69; middle_size];
+            let last_body = vec![0x74; last_size];
+            let first = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    1,
+                    &mut PutObjReader::from_vec(first_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK A first part");
+            let middle = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    2,
+                    &mut PutObjReader::from_vec(middle_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK A second initial part");
+            let mut other_parts = Vec::new();
+            for (number, byte, size) in [(1, 0x85, first_size), (2, 0x96, middle_size), (3, 0xa7, last_size)] {
+                other_parts.push(
+                    set.put_object_part(
+                        &bucket,
+                        object,
+                        &cancelled.upload_id,
+                        number,
+                        &mut PutObjReader::from_vec(vec![byte; size]),
+                        &options,
+                    )
+                    .await
+                    .expect("ACK B independent pending part"),
+                );
+            }
+            assert_ne!(first.etag, other_parts[0].etag);
+            let (active_meta, _) = set
+                .check_upload_id_exists(&bucket, object, &active.upload_id, false)
+                .await
+                .expect("independent active upload metadata");
+            let active_dir = active_meta.data_dir.expect("A physical staging generation");
+            let active_path = SetDisks::get_multipart_upload_dir(&bucket, object, &active.upload_id, false);
+            let cancelled_path = SetDisks::get_multipart_upload_dir(&bucket, object, &cancelled.upload_id, false);
+            let mut active_original_shards = Vec::new();
+            for dir in &dirs {
+                let mut parts = Vec::new();
+                for number in [1, 2] {
+                    parts.push(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                                .join(&active_path)
+                                .join(active_dir.to_string())
+                                .join(format!("part.{number}")),
+                        )
+                        .await
+                        .expect("A original acknowledged staging shard"),
+                    );
+                }
+                active_original_shards.push(parts);
+            }
+            println!("native_g05: geometry={disk_count}/{parity} committed_multipart_and_two_distinct_pending_uploads_seeded");
+            let missing = dirs[0]
+                .path()
+                .join(&bucket)
+                .join(object)
+                .join(old_dir.to_string())
+                .join("part.1");
+            tokio::fs::remove_file(&missing)
+                .await
+                .expect("remove original committed multipart shard");
+            let (_pause, arrived, release) = ReadRepairPauseScope::install(&bucket, object);
+            let heal_set = set.clone();
+            let heal_bucket = bucket.clone();
+            let heal = tokio::spawn(async move {
+                heal_set
+                    .heal_object(
+                        &heal_bucket,
+                        object,
+                        "",
+                        &HealOpts {
+                            read_repair: true,
+                            scan_mode: HealScanMode::Deep,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                .await
+                .expect("real MPU reconstruction reaches final rename pause");
+            assert!(!heal.is_finished() && !missing.exists());
+            println!("native_g05: geometry={disk_count}/{parity} real_committed_object_heal_paused_before_final_rename");
+            let last = set
+                .put_object_part(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    3,
+                    &mut PutObjReader::from_vec(last_body.clone()),
+                    &options,
+                )
+                .await
+                .expect("ACK continued A part during paused Heal");
+            set.abort_multipart_upload(&bucket, object, &cancelled.upload_id, &options)
+                .await
+                .expect("ACK B abort during paused Heal");
+            let gone = set
+                .list_object_parts(&bucket, object, &cancelled.upload_id, None, 1000, &options)
+                .await;
+            assert!(
+                matches!(gone, Err(Error::InvalidUploadID(ref b, ref o, ref id)) if b==&bucket && o==object && id==&cancelled.upload_id)
+            );
+            let pending = set
+                .list_object_parts(&bucket, object, &active.upload_id, None, 1000, &options)
+                .await
+                .expect("B abort cannot remove A");
+            assert!(!pending.is_truncated);
+            assert_eq!(pending.upload_id, active.upload_id);
+            assert_eq!(pending.parts.len(), 3);
+            for (actual, expected) in pending.parts.iter().zip([&first, &middle, &last]) {
+                assert_eq!(actual.part_num, expected.part_num);
+                assert_eq!(actual.etag, expected.etag);
+                assert_eq!(actual.size, expected.size);
+            }
+            for (slot, dir) in dirs.iter().enumerate() {
+                assert_eq!(
+                    tokio::fs::read(dir.path().join(&bucket).join(object).join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("pending parts cannot publish an object"),
+                    old_metadata[slot]
+                );
+                for number in [1, 2, 3] {
+                    let path = dir
+                        .path()
+                        .join(&bucket)
+                        .join(object)
+                        .join(old_dir.to_string())
+                        .join(format!("part.{number}"));
+                    if slot == 0 && number == 1 {
+                        assert!(!path.exists(), "paused Heal cannot have published its missing old shard");
+                    } else {
+                        assert_eq!(
+                            tokio::fs::read(path)
+                                .await
+                                .expect("Abort preserves committed data before Complete"),
+                            old_shards[slot][number - 1]
+                        );
+                    }
+                }
+                for number in [1, 2] {
+                    assert_eq!(
+                        tokio::fs::read(
+                            dir.path()
+                                .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                                .join(&active_path)
+                                .join(active_dir.to_string())
+                                .join(format!("part.{number}"))
+                        )
+                        .await
+                        .expect("B abort preserves each original A shard"),
+                        active_original_shards[slot][number - 1]
+                    );
+                }
+                assert!(
+                    !dir.path()
+                        .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&cancelled_path)
+                        .exists()
+                );
+            }
+            assert!(!heal.is_finished() && !missing.exists());
+            println!(
+                "native_g05: geometry={disk_count}/{parity} continue_ack_and_other_abort_preserve_pending_parts_and_original_commit"
+            );
+            let completed = set
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    object,
+                    &active.upload_id,
+                    vec![
+                        CompletePart {
+                            part_num: first.part_num,
+                            etag: first.etag.clone(),
+                            ..Default::default()
+                        },
+                        CompletePart {
+                            part_num: middle.part_num,
+                            etag: middle.etag.clone(),
+                            ..Default::default()
+                        },
+                        CompletePart {
+                            part_num: last.part_num,
+                            etag: last.etag.clone(),
+                            ..Default::default()
+                        },
+                    ],
+                    &options,
+                )
+                .await
+                .expect("ACK A completion before releasing obsolete Heal");
+            assert!(completed.etag.as_ref().is_some_and(|value| !value.is_empty()));
+            assert_ne!(completed.etag, original_ack.etag);
+            let namespace = set
+                .new_ns_lock(&bucket, object)
+                .await
+                .expect("completed MPU physical drain fence");
+            let drained = namespace
+                .get_write_lock(Duration::from_secs(30))
+                .await
+                .expect("completed MPU tail drains");
+            let current = disks[0]
+                .read_version("", &bucket, object, "", &ReadOptions::default())
+                .await
+                .expect("new completion metadata");
+            let new_dir = current.data_dir.expect("new multipart physical generation");
+            assert_ne!(new_dir, old_dir);
+            assert_eq!(current.parts.len(), 3);
+            let mut committed = Vec::new();
+            let mut new_shards = Vec::new();
+            for dir in &dirs {
+                let root = dir.path().join(&bucket).join(object);
+                committed.push(
+                    tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("ACK completion metadata"),
+                );
+                let mut parts = Vec::new();
+                for number in [1, 2, 3] {
+                    parts.push(
+                        tokio::fs::read(root.join(new_dir.to_string()).join(format!("part.{number}")))
+                            .await
+                            .expect("ACK completion publishes every encoded part"),
+                    );
+                }
+                new_shards.push(parts);
+                assert!(
+                    !root.join(old_dir.to_string()).exists(),
+                    "completion reclaims the old multipart generation"
+                );
+                assert!(
+                    !dir.path()
+                        .join(crate::disk::RUSTFS_META_MULTIPART_BUCKET)
+                        .join(&active_path)
+                        .exists()
+                );
+            }
+            drop(drained);
+            assert!(!heal.is_finished());
+            println!("native_g05: geometry={disk_count}/{parity} complete_ack_and_all_physical_tails_verified_before_release");
+            release.notify_one();
+            let (_, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                .await
+                .expect("stale MPU Heal exits its fence")
+                .expect("Heal task joins")
+                .expect("stale reconstruction returns its typed retry disposition");
+            assert_eq!(error, Some(DiskError::Timeout));
+            for (slot, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(&bucket).join(object);
+                assert_eq!(
+                    tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("completion metadata after stale Heal"),
+                    committed[slot]
+                );
+                let mut decoded = rustfs_filemeta::FileMeta::default();
+                decoded
+                    .unmarshal_msg(&committed[slot])
+                    .expect("decode final generation independently");
+                assert_eq!(decoded.versions.len(), 1, "completion must not publish another object version");
+                for number in [1, 2, 3] {
+                    assert_eq!(
+                        tokio::fs::read(root.join(new_dir.to_string()).join(format!("part.{number}")))
+                            .await
+                            .expect("new parts before any GET"),
+                        new_shards[slot][number - 1]
+                    );
+                }
+                assert!(!root.join(old_dir.to_string()).exists(), "stale Heal cannot resurrect the old generation");
+                for path in [&active_path, &cancelled_path] {
+                    assert!(!dir.path().join(crate::disk::RUSTFS_META_MULTIPART_BUCKET).join(path).exists());
+                }
+            }
+            for id in [&active.upload_id, &cancelled.upload_id] {
+                let gone = set.list_object_parts(&bucket, object, id, None, 1000, &options).await;
+                assert!(
+                    matches!(gone, Err(Error::InvalidUploadID(ref b, ref o, ref upload)) if b==&bucket && o==object && upload==id)
+                );
+            }
+            let mut reader = set
+                .get_object_reader(&bucket, object, None, Default::default(), &options)
+                .await
+                .expect("read exact completed current object");
+            assert_eq!(reader.object_info.etag, completed.etag);
+            let mut actual = Vec::new();
+            reader.read_to_end(&mut actual).await.expect("full completed multipart body");
+            assert_eq!(actual, [first_body, middle_body, last_body].concat());
+            println!(
+                "native_g05: geometry={disk_count}/{parity} stale_heal_rejected_exact_completed_parts_full_body_and_upload_retirement_verified"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_default_heal_owner_fences_queued_put_and_version_delete() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use crate::set_disk::ops::object::{DeleteObjectCommitBarrier, PutObjectCommitBarrier, PutObjectCommitPause};
+        use std::collections::HashMap;
+        use std::task::Poll;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["put", "version-delete"] {
+                let (dirs, disks, set) = hermetic_set_disks_for_pool_with_default_parity_isolated(disk_count, 0, parity).await;
+                let bucket = format!("default-heal-owner-{disk_count}-{mutation}");
+                let object = "locked/key.bin";
+                let reference = "independent/reference.bin";
+                set.make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("isolated owner bucket");
+                let options = ObjectOptions {
+                    versioned: mutation == "version-delete",
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    ..Default::default()
+                };
+                let original_body = vec![0x18; 1024 * 1024 + 113];
+                let successor_body = vec![0x29; 1024 * 1024 + 157];
+                let original = set
+                    .put_object(&bucket, object, &mut PutObjReader::from_vec(original_body.clone()), &options)
+                    .await
+                    .expect("original acknowledged version");
+                let selected_version = original.version_id.map(|v| v.to_string()).unwrap_or_default();
+                let current = if mutation == "version-delete" {
+                    Some(
+                        set.put_object(&bucket, object, &mut PutObjReader::from_vec(successor_body.clone()), &options)
+                            .await
+                            .expect("distinct current version remains protected"),
+                    )
+                } else {
+                    None
+                };
+                let mut current_parts = Vec::new();
+                let current_data_dir = if let Some(current) = &current {
+                    let info = disks[0]
+                        .read_version(
+                            "",
+                            &bucket,
+                            object,
+                            &current.version_id.expect("retained current version").to_string(),
+                            &ReadOptions::default(),
+                        )
+                        .await
+                        .expect("independent retained-current physical generation");
+                    let data_dir = info.data_dir.expect("retained current external generation");
+                    for dir in &dirs {
+                        current_parts.push(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(object)
+                                    .join(data_dir.to_string())
+                                    .join("part.1"),
+                            )
+                            .await
+                            .expect("independent retained-current shard oracle"),
+                        );
+                    }
+                    Some(data_dir)
+                } else {
+                    None
+                };
+                let mut reference_parts = HashMap::new();
+                if mutation == "put" {
+                    set.put_object(&bucket, reference, &mut PutObjReader::from_vec(successor_body.clone()), &options)
+                        .await
+                        .expect("independent successor payload coding oracle");
+                    for (slot, disk) in disks.iter().enumerate() {
+                        let info = disk
+                            .read_version("", &bucket, reference, "", &ReadOptions::default())
+                            .await
+                            .expect("reference coding index");
+                        let path = dirs[slot]
+                            .path()
+                            .join(&bucket)
+                            .join(reference)
+                            .join(info.data_dir.expect("reference external data").to_string())
+                            .join("part.1");
+                        assert!(
+                            reference_parts
+                                .insert(info.erasure.index, tokio::fs::read(path).await.expect("reference encoded part"))
+                                .is_none()
+                        );
+                    }
+                }
+                let old = disks[0]
+                    .read_version("", &bucket, object, &selected_version, &ReadOptions::default())
+                    .await
+                    .expect("selected original generation");
+                assert_eq!((old.erasure.data_blocks, old.erasure.parity_blocks), (disk_count - parity, parity));
+                let old_dir = old.data_dir.expect("original external generation");
+                let mut original_parts = Vec::new();
+                let mut original_metadata = Vec::new();
+                for dir in &dirs {
+                    let root = dir.path().join(&bucket).join(object);
+                    original_parts.push(
+                        tokio::fs::read(root.join(old_dir.to_string()).join("part.1"))
+                            .await
+                            .expect("original encoded part"),
+                    );
+                    original_metadata.push(
+                        tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("original complete version metadata"),
+                    );
+                }
+                let namespace = set.new_ns_lock(&bucket, object).await.expect("same actual object namespace");
+                let mut available_reader = Box::pin(namespace.get_read_lock(Duration::from_secs(30)));
+                assert!(
+                    matches!(futures::poll!(available_reader.as_mut()), Poll::Ready(Ok(_))),
+                    "positive control: an unowned local namespace admits a reader immediately"
+                );
+                drop(available_reader);
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(object)
+                    .join(old_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("one original external shard missing");
+                let (pause, arrived, release) =
+                    ReadRepairPauseScope::install_at(&bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal_version = selected_version.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            object,
+                            &heal_version,
+                            &HealOpts {
+                                no_lock: false,
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("default Deep Heal owns namespace during actual staging");
+                let mut blocked_reader = Box::pin(namespace.get_read_lock(Duration::from_secs(30)));
+                assert!(
+                    matches!(futures::poll!(blocked_reader.as_mut()), Poll::Pending),
+                    "default Heal must own an exclusive namespace before any queued writer exists"
+                );
+                drop(blocked_reader);
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} default_deep_heal_staged_exclusive_owner_read_blocked"
+                );
+                let put_before = (mutation == "put")
+                    .then(|| PutObjectCommitBarrier::install(&bucket, object, PutObjectCommitPause::BeforeNamespace));
+                let put_commit = (mutation == "put")
+                    .then(|| PutObjectCommitBarrier::install(&bucket, object, PutObjectCommitPause::AfterNamespace));
+                let mut delete_before =
+                    (mutation == "version-delete").then(|| DeleteObjectCommitBarrier::install_before_namespace(&bucket, object));
+                let foreground_set = set.clone();
+                let foreground_bucket = bucket.clone();
+                let foreground_options = options.clone();
+                let body = successor_body.clone();
+                let version = selected_version.clone();
+                let mut foreground = tokio::spawn(async move {
+                    if mutation == "put" {
+                        foreground_set
+                            .put_object(&foreground_bucket, object, &mut PutObjReader::from_vec(body), &foreground_options)
+                            .await
+                    } else {
+                        foreground_set
+                            .delete_object(
+                                &foreground_bucket,
+                                object,
+                                ObjectOptions {
+                                    version_id: Some(version),
+                                    object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                                    ))),
+                                    ..foreground_options
+                                },
+                            )
+                            .await
+                    }
+                });
+                let delete_commit;
+                if let Some(before) = &put_before {
+                    before.wait_until_paused().await;
+                    before.release_and_wait_until_namespace_pending().await;
+                    assert!(!before.namespace_acquired());
+                    delete_commit = None;
+                } else {
+                    let before = delete_before.take().expect("actual DELETE before-namespace observer");
+                    before.wait_until_paused().await;
+                    before.release_and_wait_until_namespace_pending().await;
+                    assert!(!before.namespace_acquired());
+                    drop(before);
+                    delete_commit = Some(DeleteObjectCommitBarrier::install(&bucket, object));
+                }
+                assert!(!foreground.is_finished() && !heal.is_finished() && !missing.exists());
+                for (slot, dir) in dirs.iter().enumerate() {
+                    let root = dir.path().join(&bucket).join(object);
+                    assert_eq!(
+                        tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("queued writer cannot change original metadata"),
+                        original_metadata[slot]
+                    );
+                    if slot != 0 {
+                        assert_eq!(
+                            tokio::fs::read(root.join(old_dir.to_string()).join("part.1"))
+                                .await
+                                .expect("surviving original part"),
+                            original_parts[slot]
+                        );
+                    }
+                }
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} actual_foreground_namespace_future_pending_original_bytes_unchanged"
+                );
+                release.notify_one();
+                let (result, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("default Heal completes before queued foreground publishes")
+                    .expect("Heal joins")
+                    .expect("actual default Heal result");
+                assert_eq!(error, None);
+                assert!(result.integrity_verified);
+                drop(pause);
+                if let Some(commit) = &put_commit {
+                    tokio::select! {
+                        _ = commit.wait_until_paused() => {},
+                        early = &mut foreground => panic!("PUT must reach its real post-lock barrier before publishing: {early:?}"),
+                    }
+                }
+                if let Some(commit) = &delete_commit {
+                    tokio::select! {
+                        _ = commit.wait_until_paused() => {},
+                        early = &mut foreground => panic!("DELETE must reach its real pre-commit barrier after the Heal owner drains: {early:?}"),
+                    }
+                }
+                assert!(!foreground.is_finished());
+                for (slot, dir) in dirs.iter().enumerate() {
+                    assert_eq!(
+                        tokio::fs::read(dir.path().join(&bucket).join(object).join(old_dir.to_string()).join("part.1"))
+                            .await
+                            .expect("Heal physically reconstructs before foreground commit"),
+                        original_parts[slot]
+                    );
+                }
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} heal_reconstructed_before_foreground_commit"
+                );
+                if let Some(commit) = &put_commit {
+                    commit.release();
+                }
+                if let Some(commit) = &delete_commit {
+                    commit.release();
+                }
+                let ack = tokio::time::timeout(Duration::from_secs(30), foreground)
+                    .await
+                    .expect("queued foreground ACK after Heal releases ownership")
+                    .expect("foreground joins")
+                    .expect("real foreground ACK");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("ACK physical tail drain");
+                for (slot, disk) in disks.iter().enumerate() {
+                    let root = dirs[slot].path().join(&bucket).join(object);
+                    assert!(
+                        !root.join(old_dir.to_string()).exists(),
+                        "overwritten/deleted original generation cannot remain"
+                    );
+                    let raw = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                        .await
+                        .expect("final single acknowledged version metadata");
+                    let mut decoded = rustfs_filemeta::FileMeta::default();
+                    decoded.unmarshal_msg(&raw).expect("decode actual final version population");
+                    assert_eq!(decoded.versions.len(), 1);
+                    let final_info = disk
+                        .read_version("", &bucket, object, "", &ReadOptions::default())
+                        .await
+                        .expect("final current generation");
+                    let data_dir = final_info.data_dir.expect("external successor generation");
+                    let part = tokio::fs::read(root.join(data_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("final part before any GET");
+                    if mutation == "put" {
+                        assert_ne!(data_dir, old_dir);
+                        assert_eq!(part, reference_parts[&final_info.erasure.index]);
+                    } else {
+                        assert_eq!(Some(data_dir), current_data_dir);
+                        assert_eq!(
+                            part, current_parts[slot],
+                            "exact version DELETE must preserve every retained-current shard"
+                        );
+                        assert_eq!(ack.version_id, original.version_id);
+                        assert_eq!(final_info.version_id, current.as_ref().expect("retained current ACK").version_id);
+                        assert!(matches!(
+                            disk.read_version("", &bucket, object, &selected_version, &ReadOptions::default())
+                                .await,
+                            Err(DiskError::FileVersionNotFound)
+                        ));
+                    }
+                }
+                drop(drained);
+                let final_options = if let Some(current) = &current {
+                    ObjectOptions {
+                        versioned: true,
+                        version_id: Some(current.version_id.expect("current version").to_string()),
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    }
+                } else {
+                    ObjectOptions {
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    }
+                };
+                let mut reader = set
+                    .get_object_reader(&bucket, object, None, Default::default(), &final_options)
+                    .await
+                    .expect("full acknowledged successor/current body");
+                let mut actual = Vec::new();
+                reader
+                    .read_to_end(&mut actual)
+                    .await
+                    .expect("full body with incidental repair suppressed");
+                assert_eq!(actual, successor_body);
+                assert_eq!(
+                    reader.object_info.etag,
+                    if let Some(current) = &current {
+                        current.etag.clone()
+                    } else {
+                        ack.etag.clone()
+                    }
+                );
+                println!(
+                    "native_a09: geometry={disk_count}/{parity} mutation={mutation} foreground_ack_final_versions_parts_and_full_body_verified"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn native_copy_and_metadata_mutations_preserve_acknowledged_state_during_heal() {
+        use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks_with_count};
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use std::collections::HashMap;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        for (disk_count, parity) in [(4, 2), (16, 4)] {
+            for mutation in ["copy-source", "copy-destination", "replace-metadata", "update-tags"] {
+                let (dirs, store) = isolated_store_over_temp_disks_with_count(disk_count).await;
+                init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+                let bucket = format!("copy-heal-fence-{disk_count}-{mutation}");
+                let source = "source/actual key.bin";
+                let destination = "destination/actual key.bin";
+                let control = "unrelated/control.bin";
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("isolated copy bucket");
+                let options = ObjectOptions {
+                    write_completion: WriteCompletion::TailDrained,
+                    shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Protected),
+                    ..Default::default()
+                };
+                let source_body = vec![0x31; 1024 * 1024 + 113];
+                let destination_body = vec![0x42; 1024 * 1024 + 137];
+                let control_body = vec![0x53; 1024 * 1024 + 157];
+                let mut seed_acks = HashMap::new();
+                for (key, body, role) in [
+                    (source, &source_body, "source"),
+                    (destination, &destination_body, "destination"),
+                    (control, &control_body, "control"),
+                ] {
+                    let mut opts = options.clone();
+                    opts.user_defined = HashMap::from([
+                        ("content-type".to_owned(), format!("application/{role}")),
+                        ("x-amz-meta-role".to_owned(), role.to_owned()),
+                    ]);
+                    let ack = store
+                        .put_object(&bucket, key, &mut PutObjReader::from_vec(body.clone()), &opts)
+                        .await
+                        .expect("ACK complete external fixture");
+                    seed_acks.insert(key, ack);
+                }
+                let set = store.pools[0].disk_set[0].clone();
+                let disks = set.disk_inventory().await;
+                let first_disk = disks[0].as_ref().expect("online first physical member");
+                let original_destination = first_disk
+                    .read_version("", &bucket, destination, "", &ReadOptions::default())
+                    .await
+                    .expect("independent original COPY destination generation");
+                let original_destination_dir = original_destination
+                    .data_dir
+                    .expect("original destination external generation");
+                let heal_key = if mutation == "copy-source" { source } else { destination };
+                let old = first_disk
+                    .read_version("", &bucket, heal_key, "", &ReadOptions::default())
+                    .await
+                    .expect("old healed generation metadata");
+                assert_eq!((old.erasure.data_blocks, old.erasure.parity_blocks), (disk_count - parity, parity));
+                assert!(!old.inline_data());
+                let old_dir = old.data_dir.expect("external healed generation");
+                let original_parts = futures::future::join_all(dirs.iter().map(|dir| {
+                    tokio::fs::read(
+                        dir.path()
+                            .join(&bucket)
+                            .join(heal_key)
+                            .join(old_dir.to_string())
+                            .join("part.1"),
+                    )
+                }))
+                .await
+                .into_iter()
+                .map(|v| v.expect("original same-role part"))
+                .collect::<Vec<_>>();
+                let missing = dirs[0]
+                    .path()
+                    .join(&bucket)
+                    .join(heal_key)
+                    .join(old_dir.to_string())
+                    .join("part.1");
+                tokio::fs::remove_file(&missing)
+                    .await
+                    .expect("inject one real missing external shard");
+                let (pause, arrived, release) = ReadRepairPauseScope::install(&bucket, heal_key);
+                let heal_set = set.clone();
+                let heal_bucket = bucket.clone();
+                let heal = tokio::spawn(async move {
+                    heal_set
+                        .heal_object(
+                            &heal_bucket,
+                            heal_key,
+                            "",
+                            &HealOpts {
+                                read_repair: true,
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), arrived.notified())
+                    .await
+                    .expect("actual copy/metadata Heal reconstruction reaches final rename");
+                assert!(!heal.is_finished() && !missing.exists());
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} real_reconstruction_paused_before_final_rename"
+                );
+                let ack = if matches!(mutation, "copy-source" | "copy-destination") {
+                    // Keep the COPY source read from supplying a second repair;
+                    // the separately paused production Heal owns this oracle.
+                    let read_options = ObjectOptions {
+                        suppress_read_repair: true,
+                        ..options.clone()
+                    };
+                    let reader = store
+                        .get_object_reader(&bucket, source, None, Default::default(), &read_options)
+                        .await
+                        .expect("actual COPY source reader");
+                    let mut info = reader.object_info.clone();
+                    let size = info.get_actual_size().expect("COPY source logical size");
+                    assert_eq!(size, source_body.len() as i64);
+                    let hash = rustfs_rio::HashReader::from_stream(reader.stream, size, size, None, None, false)
+                        .expect("actual streamed COPY source");
+                    info.put_object_reader = Some(PutObjReader::new(hash));
+                    let ack = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.copy_object(&bucket, source, &bucket, destination, &mut info, &read_options, &options),
+                    )
+                    .await
+                    .expect("COPY ACK before paused Heal release")
+                    .expect("production cross-key COPY ACK");
+                    assert_eq!(ack.etag, seed_acks[source].etag);
+                    ack
+                } else if mutation == "replace-metadata" {
+                    let mut info = store
+                        .get_object_info(&bucket, destination, &options)
+                        .await
+                        .expect("self-COPY source metadata");
+                    info.metadata_only = true;
+                    info.user_defined = Arc::new(HashMap::from([
+                        ("content-type".to_owned(), "application/replaced".to_owned()),
+                        ("x-amz-meta-race".to_owned(), "metadata-replaced".to_owned()),
+                    ]));
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.copy_object(&bucket, destination, &bucket, destination, &mut info, &options, &options),
+                    )
+                    .await
+                    .expect("self metadata COPY ACK before Heal release")
+                    .expect("production self-COPY metadata ACK")
+                } else {
+                    tokio::time::timeout(
+                        Duration::from_secs(30),
+                        store.put_object_tags(&bucket, destination, "race=updated&nonce=g06", &options),
+                    )
+                    .await
+                    .expect("tag update ACK before Heal release")
+                    .expect("production tag update ACK")
+                };
+                assert!(ack.etag.as_ref().is_some_and(|v| !v.is_empty()));
+                let namespace = set.new_ns_lock(&bucket, destination).await.expect("COPY/mutation namespace");
+                let drained = namespace
+                    .get_write_lock(Duration::from_secs(30))
+                    .await
+                    .expect("foreground physical tails drain");
+                let mut acknowledged = Vec::new();
+                for key in [source, destination, control] {
+                    let current = first_disk
+                        .read_version("", &bucket, key, "", &ReadOptions::default())
+                        .await
+                        .expect("foreground committed metadata");
+                    let data_dir = current.data_dir.expect("external foreground generation");
+                    let mut members = Vec::new();
+                    for dir in &dirs {
+                        let root = dir.path().join(&bucket).join(key);
+                        let meta = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("foreground metadata bytes");
+                        let part_path = root.join(data_dir.to_string()).join("part.1");
+                        let part = if part_path.exists() {
+                            Some(tokio::fs::read(part_path).await.expect("foreground part bytes"))
+                        } else {
+                            None
+                        };
+                        members.push((meta, part));
+                    }
+                    acknowledged.push((key, data_dir, members));
+                }
+                if matches!(mutation, "copy-source" | "copy-destination") {
+                    assert_ne!(acknowledged[1].1, original_destination_dir);
+                    assert!(dirs.iter().all(|dir| {
+                        !dir.path()
+                            .join(&bucket)
+                            .join(destination)
+                            .join(original_destination_dir.to_string())
+                            .exists()
+                    }));
+                }
+                if mutation != "copy-destination" {
+                    assert_eq!(acknowledged.iter().find(|row| row.0 == heal_key).expect("healed key").1, old_dir);
+                    assert!(!missing.exists(), "foreground metadata/source read must not supply the missing repair");
+                }
+                drop(drained);
+                assert!(!heal.is_finished());
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} foreground_ack_and_all_physical_tails_verified_before_release"
+                );
+                release.notify_one();
+                let (_, error) = tokio::time::timeout(Duration::from_secs(30), heal)
+                    .await
+                    .expect("copy/metadata Heal exits its fence")
+                    .expect("Heal joins")
+                    .expect("actual Heal result");
+                assert_eq!(
+                    error,
+                    if mutation == "copy-source" {
+                        None
+                    } else {
+                        Some(DiskError::Timeout)
+                    }
+                );
+                drop(pause);
+                for (key, data_dir, members) in &acknowledged {
+                    for (slot, dir) in dirs.iter().enumerate() {
+                        let root = dir.path().join(&bucket).join(key);
+                        let metadata = tokio::fs::read(root.join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("metadata after Heal release");
+                        if *key != heal_key || mutation != "copy-source" {
+                            assert_eq!(metadata, members[slot].0, "stale Heal must preserve foreground metadata exactly");
+                        }
+                        let part_path = root.join(data_dir.to_string()).join("part.1");
+                        match &members[slot].1 {
+                            Some(expected) => {
+                                assert_eq!(tokio::fs::read(part_path).await.expect("acknowledged part survives Heal"), *expected)
+                            }
+                            None if mutation == "copy-source" => assert_eq!(
+                                tokio::fs::read(part_path)
+                                    .await
+                                    .expect("real source Heal rebuilds before any GET"),
+                                original_parts[slot]
+                            ),
+                            None => assert!(!part_path.exists(), "stale Heal cannot publish its obsolete staged part"),
+                        }
+                    }
+                }
+                if matches!(mutation, "replace-metadata" | "update-tags") {
+                    let (_, error) = set
+                        .heal_object(
+                            &bucket,
+                            destination,
+                            "",
+                            &HealOpts {
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect("independent current-metadata Heal after stale refusal");
+                    assert_eq!(error, None);
+                    for (slot, dir) in dirs.iter().enumerate() {
+                        assert_eq!(
+                            tokio::fs::read(
+                                dir.path()
+                                    .join(&bucket)
+                                    .join(destination)
+                                    .join(old_dir.to_string())
+                                    .join("part.1")
+                            )
+                            .await
+                            .expect("fresh Heal rebuilds original data with acknowledged new metadata"),
+                            original_parts[slot]
+                        );
+                    }
+                }
+                for (key, expected) in [
+                    (source, &source_body),
+                    (
+                        destination,
+                        if matches!(mutation, "copy-source" | "copy-destination") {
+                            &source_body
+                        } else {
+                            &destination_body
+                        },
+                    ),
+                    (control, &control_body),
+                ] {
+                    let mut reader = store
+                        .get_object_reader(&bucket, key, None, Default::default(), &options)
+                        .await
+                        .expect("full final COPY/mutation/control read");
+                    let mut body = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut body)
+                        .await
+                        .expect("read complete acknowledged body");
+                    assert_eq!(&body, expected);
+                    if !(key == destination && mutation == "replace-metadata") {
+                        let role =
+                            if key == source || key == destination && matches!(mutation, "copy-source" | "copy-destination") {
+                                "source"
+                            } else if key == destination {
+                                "destination"
+                            } else {
+                                "control"
+                            };
+                        assert_eq!(reader.object_info.user_defined.get("x-amz-meta-role").map(String::as_str), Some(role));
+                        assert_eq!(reader.object_info.user_defined.get("content-type"), Some(&format!("application/{role}")));
+                    }
+                    if key == destination && mutation == "replace-metadata" {
+                        let metadata = reader.object_info.user_defined.as_ref();
+                        assert_eq!(metadata.get("x-amz-meta-race").map(String::as_str), Some("metadata-replaced"));
+                        assert_eq!(metadata.get("content-type").map(String::as_str), Some("application/replaced"));
+                        assert!(!metadata.contains_key("x-amz-meta-role"));
+                    }
+                }
+                for key in [source, destination, control] {
+                    let expected = if key == destination && mutation == "update-tags" {
+                        "race=updated&nonce=g06"
+                    } else {
+                        ""
+                    };
+                    assert_eq!(
+                        store
+                            .get_object_tags(&bucket, key, &options)
+                            .await
+                            .expect("exact acknowledged and control tags after Heal"),
+                        expected
+                    );
+                }
+                println!(
+                    "native_g06: geometry={disk_count}/{parity} mutation={mutation} exact_copy_metadata_tags_generations_and_full_bodies_verified"
+                );
+            }
+        }
     }
 
     #[tokio::test]

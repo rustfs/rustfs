@@ -23,4 +23,4 @@ Applies to `crates/iam/`.
 
 ## Suggested Validation
 
-- `cargo test -p rustfs-iam`
+- `cargo nextest run -p rustfs-iam --no-tests fail`, narrowed to the affected tests.

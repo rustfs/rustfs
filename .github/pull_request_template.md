@@ -24,8 +24,7 @@ List relevant checks not run and the remaining risk. Use the validation tier in 
 
 ## Impact
 <!--
-Describe user-facing, compatibility, API, deployment, configuration, or
-documentation impact. Use N/A when there is no expected impact.
+Describe user-facing, compatibility, API, deployment, configuration, or documentation impact. Use N/A when there is no expected impact.
 -->
 
 ## Additional Notes

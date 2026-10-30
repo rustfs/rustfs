@@ -158,13 +158,15 @@ fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
 }
 
 fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
-    })
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true))
+    }
 }
 
 fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
@@ -3625,7 +3627,7 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
         let read_policy = crate::set_disk::get_object_read_policy();
         let erasure_cache = Arc::clone(&self.erasure_cache);
         let (fi, files, disks) = snapshot.into_owned();
-        tokio::spawn(async move {
+        let producer = async move {
             let _guard = read_lock_guard;
             let mut writer = GetObjectDownstreamWriter::new(wd);
             // Do not wrap the entire read+write pipeline in `disk_read_timeout`.
@@ -3708,7 +3710,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                 }
             };
             let _ = producer_terminal_tx.send(producer_result.map(|_| ()));
-        });
+        };
+        #[cfg(feature = "diagnostic-local-batch")]
+        let producer = crate::diagnostics::batch_read_diagnostics::with_captured_request_context(producer);
+        tokio::spawn(producer);
 
         Ok(reader)
     }
@@ -5520,8 +5525,10 @@ impl SetDisks {
                 );
 
                 let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                let all_commit_disks_local = commit_disks.iter().flatten().all(|disk| disk.is_local());
                 let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
+                    && (all_commit_disks_local
+                        || commit_set.tier_free_version_rename_data_source_capable()
                         || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
                 let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
                     && commit_tier_free_version_receipt_sink.is_some()
@@ -5627,9 +5634,11 @@ impl SetDisks {
                 );
                 let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Ok(rename_commit) = rename_result.as_mut() {
-                    commit_set.observe_tier_free_version_rename_data_source_capability(
-                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
-                    );
+                    if rename_commit.tail_drain.is_none() || !rename_commit.old_current_source_all_successful_checked {
+                        commit_set.observe_tier_free_version_rename_data_source_capability(
+                            rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                        );
+                    }
                     commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
@@ -5697,7 +5706,12 @@ impl SetDisks {
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
-                                  targets| {
+                                  targets,
+                                  old_current_source_all_successful_checked,
+                                  all_online_local_succeeded| {
+                                cleanup_set.observe_tier_free_version_rename_data_source_capability(
+                                    old_current_source_all_successful_checked,
+                                );
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
@@ -5724,7 +5738,10 @@ impl SetDisks {
                                         )
                                         .await;
                                     let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
-                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                    if zero_target_cleanup
+                                        && (all_online_local_succeeded
+                                            || rename_tail_cleanup_zero_target_tmp_delete_skip_enabled())
+                                    {
                                         rustfs_io_metrics::record_put_object_stage_duration(
                                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
                                             1.0,
@@ -8201,12 +8218,22 @@ fn notify_put_object_commit_namespace_acquired(bucket: &str, object: &str) {
 }
 
 #[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DeleteObjectCommitPause {
+    BeforeNamespace,
+    BeforeCommit,
+    AfterPublish,
+}
+
+#[cfg(test)]
 struct DeleteObjectCommitBarrierState {
     bucket: String,
     object: String,
-    pause_after_publish: bool,
+    pause: DeleteObjectCommitPause,
     arrived: tokio::sync::Notify,
     release: tokio::sync::Notify,
+    namespace_pending: tokio::sync::Notify,
+    namespace_acquired: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(test)]
@@ -8221,21 +8248,27 @@ static DELETE_OBJECT_COMMIT_BARRIER: std::sync::OnceLock<std::sync::Mutex<Option
 #[cfg(test)]
 impl DeleteObjectCommitBarrier {
     pub(crate) fn install(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, false)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeCommit)
+    }
+
+    pub(crate) fn install_before_namespace(bucket: &str, object: &str) -> Self {
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::BeforeNamespace)
     }
 
     #[cfg(feature = "test-util")]
     pub(crate) fn install_after_publish(bucket: &str, object: &str) -> Self {
-        Self::install_with_mode(bucket, object, true)
+        Self::install_with_mode(bucket, object, DeleteObjectCommitPause::AfterPublish)
     }
 
-    fn install_with_mode(bucket: &str, object: &str, pause_after_publish: bool) -> Self {
+    fn install_with_mode(bucket: &str, object: &str, pause: DeleteObjectCommitPause) -> Self {
         let state = Arc::new(DeleteObjectCommitBarrierState {
             bucket: bucket.to_string(),
             object: object.to_string(),
-            pause_after_publish,
+            pause,
             arrived: tokio::sync::Notify::new(),
             release: tokio::sync::Notify::new(),
+            namespace_pending: tokio::sync::Notify::new(),
+            namespace_acquired: std::sync::atomic::AtomicBool::new(false),
         });
         let mut slot = DELETE_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(None))
@@ -8255,6 +8288,19 @@ impl DeleteObjectCommitBarrier {
     pub(crate) fn release(&self) {
         self.state.release.notify_one();
     }
+
+    pub(crate) async fn release_and_wait_until_namespace_pending(&self) {
+        assert_eq!(self.state.pause, DeleteObjectCommitPause::BeforeNamespace);
+        let pending = self.state.namespace_pending.notified();
+        self.release();
+        tokio::time::timeout(Duration::from_secs(5), pending)
+            .await
+            .expect("delete object must poll its actual namespace acquisition to Pending");
+    }
+
+    pub(crate) fn namespace_acquired(&self) -> bool {
+        self.state.namespace_acquired.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 #[cfg(test)]
@@ -8272,13 +8318,52 @@ impl Drop for DeleteObjectCommitBarrier {
 }
 
 #[cfg(test)]
+async fn pause_delete_object_before_namespace(bucket: &str, object: &str) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.arrived.notify_one();
+        barrier.release.notified().await;
+    }
+}
+
+#[cfg(test)]
+fn notify_delete_object_namespace(bucket: &str, object: &str, acquired: bool) {
+    let barrier = DELETE_OBJECT_COMMIT_BARRIER
+        .get_or_init(|| std::sync::Mutex::new(None))
+        .lock()
+        .expect("delete object commit barrier mutex should not poison")
+        .as_ref()
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeNamespace
+        })
+        .cloned();
+    if let Some(barrier) = barrier {
+        if acquired {
+            barrier.namespace_acquired.store(true, std::sync::atomic::Ordering::Release);
+        } else {
+            barrier.namespace_pending.notify_one();
+        }
+    }
+}
+
+#[cfg(test)]
 async fn pause_delete_object_commit(bucket: &str, object: &str) {
     let barrier = DELETE_OBJECT_COMMIT_BARRIER
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && !barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::BeforeCommit
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -8293,7 +8378,9 @@ async fn pause_delete_object_commit_after_publish(bucket: &str, object: &str) {
         .lock()
         .expect("delete object commit barrier mutex should not poison")
         .as_ref()
-        .filter(|barrier| barrier.bucket == bucket && barrier.object == object && barrier.pause_after_publish)
+        .filter(|barrier| {
+            barrier.bucket == bucket && barrier.object == object && barrier.pause == DeleteObjectCommitPause::AfterPublish
+        })
         .cloned();
     if let Some(barrier) = barrier {
         barrier.arrived.notify_one();
@@ -10665,7 +10752,20 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
         // Guard lock for single object delete
         let _lock_guard = if (!opts.delete_prefix || opts.delete_prefix_object) && !opts.no_lock {
-            Some(Arc::new(self.acquire_write_lock_diag("delete_object", bucket, object).await?))
+            #[cfg(test)]
+            let guard = {
+                pause_delete_object_before_namespace(bucket, object).await;
+                let guard = self
+                    .acquire_write_lock_diag_with_pending_hook("delete_object", bucket, object, || {
+                        notify_delete_object_namespace(bucket, object, false);
+                    })
+                    .await?;
+                notify_delete_object_namespace(bucket, object, true);
+                guard
+            };
+            #[cfg(not(test))]
+            let guard = self.acquire_write_lock_diag("delete_object", bucket, object).await?;
+            Some(Arc::new(guard))
         } else {
             None
         };
@@ -21601,6 +21701,206 @@ mod put_object_tmp_cleanup_tests {
             }
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn deep_heal_preserves_committed_generation_during_old_data_cleanup() {
+        use rustfs_heal_contracts::heal_channel::{HealOpts, HealScanMode};
+
+        for (disk_count, parity, read_repair) in [(4, 2, false), (4, 2, true), (16, 4, false), (16, 4, true)] {
+            let (dirs, disks, set) = super::hermetic_set_disks_support::hermetic_set_disks_for_pool_with_default_parity_isolated(
+                disk_count, 0, parity,
+            )
+            .await;
+            let bucket = "native-heal-commit-cleanup";
+            let object = format!("generation-{disk_count}-{parity}-{read_repair}.bin");
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create actual fixture volume");
+            }
+            let options = ObjectOptions {
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                shard_integrity_write_mode: Some(crate::object_api::ShardIntegrityWriteMode::Protected),
+                ..Default::default()
+            };
+            set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x17; TEST_OBJECT_SIZE]), &options)
+                .await
+                .expect("acknowledge original generation on every disk");
+            let old = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual original generation");
+            let old_dir = old.data_dir.expect("original external data directory");
+            let old_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(old_dir.to_string())
+                .join("part.1");
+            assert!(tokio::fs::try_exists(&old_part).await.expect("original part exists"));
+
+            // Cleanup slots follow the writer's shuffled erasure distribution,
+            // not the physical fixture order. Pause every real cleanup slot so
+            // no physical old shard can disappear before the proof below.
+            let barriers: Vec<_> = (0..disk_count)
+                .map(|slot| rename_fanout_barrier::arm(&object, slot, rename_fanout_barrier::PHASE_CLEANUP))
+                .collect();
+            let writer_set = Arc::clone(&set);
+            let writer_object = object.clone();
+            let writer_options = options.clone();
+            let payload = vec![0xa3; TEST_OBJECT_SIZE];
+            let writer_payload = payload.clone();
+            let writer = tokio::spawn(async move {
+                writer_set
+                    .put_object(bucket, &writer_object, &mut PutObjReader::from_vec(writer_payload), &writer_options)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), async {
+                for barrier in &barriers {
+                    barrier.wait_until_paused().await;
+                }
+            })
+            .await
+            .expect("overwrite commits before its real old-data cleanup pause");
+            assert!(!writer.is_finished(), "tail-drained ACK must remain pending at cleanup");
+            assert!(
+                tokio::fs::try_exists(&old_part)
+                    .await
+                    .expect("old source still present at pause")
+            );
+
+            let mut committed = Vec::new();
+            let mut healthy_metadata = Vec::new();
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read independently committed physical generation without GET");
+                assert_eq!((info.erasure.data_blocks, info.erasure.parity_blocks), (disk_count - parity, parity));
+                assert!(info.data.is_none(), "use actual external parts");
+                assert_ne!(info.data_dir, Some(old_dir));
+                committed.push(info);
+                healthy_metadata.push(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("committed raw metadata"),
+                );
+            }
+            let new_dir = committed[0].data_dir.expect("new committed data directory");
+            assert!(committed.iter().all(|info| info.data_dir == Some(new_dir)));
+            let new_part = dirs[0]
+                .path()
+                .join(bucket)
+                .join(&object)
+                .join(new_dir.to_string())
+                .join("part.1");
+            let expected_part = tokio::fs::read(&new_part).await.expect("exact new source bytes");
+            let mut committed_parts = Vec::new();
+            for dir in &dirs {
+                let original = dir.path().join(bucket).join(&object).join(old_dir.to_string()).join("part.1");
+                assert!(
+                    tokio::fs::try_exists(original)
+                        .await
+                        .expect("every old cleanup slot is paused")
+                );
+                committed_parts.push(
+                    tokio::fs::read(dir.path().join(bucket).join(&object).join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("every new encoded shard before fault"),
+                );
+            }
+            tokio::fs::remove_file(&new_part)
+                .await
+                .expect("remove only the newly committed target shard");
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} old_cleanup_paused new_generation_committed target_part_missing"
+            );
+
+            let (result, error) = tokio::time::timeout(
+                Duration::from_secs(30),
+                set.heal_object(
+                    bucket,
+                    &object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await
+            .expect("real locked Heal must progress during old cleanup")
+            .expect("complete actual deep Heal");
+            assert!(error.is_none(), "new generation must remain repairable: {error:?}");
+            assert_eq!(result.drives_healed(), Some(1));
+            // Shared data-phase repair deliberately does not certify full integrity.
+            assert_eq!(result.integrity_verified, !read_repair);
+            assert_eq!(tokio::fs::read(&new_part).await.expect("rebuilt part before any GET"), expected_part);
+            let repaired = disks[0]
+                .read_version("", bucket, &object, "", &ReadOptions::default())
+                .await
+                .expect("read actual repaired generation");
+            assert_eq!(repaired.data_dir, Some(new_dir));
+            assert_eq!(repaired.mod_time, committed[0].mod_time);
+            for (disk, expected) in disks.iter().zip(&healthy_metadata).skip(1) {
+                assert_eq!(
+                    disk.read_all(bucket, &format!("{object}/xl.meta"))
+                        .await
+                        .expect("healthy raw metadata after Heal"),
+                    *expected
+                );
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} locked_heal_completed new_generation_part_rebuilt_before_get"
+            );
+
+            for barrier in &barriers {
+                barrier.release();
+            }
+            let acknowledged = tokio::time::timeout(Duration::from_secs(30), writer)
+                .await
+                .expect("cleanup drains")
+                .expect("writer joins")
+                .expect("overwrite ACK remains successful");
+            assert_eq!(acknowledged.size, i64::try_from(payload.len()).expect("fixture size fits i64"));
+            drop(barriers);
+            for (slot, dir) in dirs.iter().enumerate() {
+                let root = dir.path().join(bucket).join(&object);
+                assert!(
+                    !tokio::fs::try_exists(root.join(old_dir.to_string()))
+                        .await
+                        .expect("old cleanup completed")
+                );
+                assert_eq!(
+                    tokio::fs::read(root.join(new_dir.to_string()).join("part.1"))
+                        .await
+                        .expect("new shard survives cleanup before GET"),
+                    committed_parts[slot],
+                    "old cleanup must preserve every exact committed encoded shard"
+                );
+            }
+            let mut reader = set
+                .get_object_reader(bucket, &object, None, HeaderMap::new(), &options)
+                .await
+                .expect("read final acknowledged generation");
+            let mut body = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut body)
+                .await
+                .expect("read complete final payload");
+            assert_eq!(body, payload);
+            for disk in &disks {
+                let final_info = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("final physical generation");
+                assert_eq!(final_info.data_dir, Some(new_dir), "old cleanup must not revert the healed generation");
+            }
+            println!(
+                "native_g01: geometry={disk_count}/{parity} read_repair={read_repair} overwrite_ack_preserved final_physical_generation_and_full_body_verified"
+            );
+        }
     }
 
     #[tokio::test]

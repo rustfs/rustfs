@@ -26,7 +26,7 @@ use serde::Serialize;
 use std::fmt;
 
 /// CPU information
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct CpuInfo {
     /// Number of logical CPU cores
     core_count: usize,
@@ -50,7 +50,7 @@ impl CpuInfo {
 
         // Calculate average CPU usage
         let usage_percent = if core_count > 0 {
-            sys.cpus().iter().map(|c| c.cpu_usage() as f64).sum::<f64>() / core_count as f64
+            sys.cpus().iter().map(|c| c.usage() as f64).sum::<f64>() / core_count as f64
         } else {
             0.0
         };
@@ -65,7 +65,7 @@ impl CpuInfo {
 }
 
 /// Memory information
-#[derive(Serialize)]
+#[derive(Default, Serialize)]
 struct MemoryInfo {
     /// Total system memory in bytes
     total_bytes: u64,
@@ -148,7 +148,9 @@ struct DiskInfo {
 
 impl DiskInfo {
     fn collect_all() -> Vec<Self> {
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let Ok(disks) = sysinfo::Disks::new_with_refreshed_list() else {
+            return Vec::new();
+        };
         disks
             .iter()
             .map(|disk| {
@@ -204,7 +206,7 @@ impl ServiceDiskInfo {
         let volume_path = std::path::Path::new(first_volume);
 
         // Find the disk that contains this volume
-        let disks = sysinfo::Disks::new_with_refreshed_list();
+        let disks = sysinfo::Disks::new_with_refreshed_list().ok()?;
         for disk in disks.iter() {
             let mount_point = disk.mount_point();
             if volume_path.starts_with(mount_point) {
@@ -289,18 +291,23 @@ struct SystemInfo {
 impl SystemInfo {
     fn collect() -> Self {
         // Create system info collector
-        let mut sys = sysinfo::System::new_all();
-        sys.refresh_all();
-        sys.refresh_cpu_all();
+        let mut sys = sysinfo::System::new_all().ok();
+        if let Some(sys) = sys.as_mut() {
+            sys.refresh_all();
+            sys.refresh_cpu_all();
+        }
 
         Self {
             os_type: sysinfo::System::distribution_id(),
-            os_version: sysinfo::System::long_os_version().unwrap_or_else(|| "Unknown".to_string()),
+            os_version: sysinfo::System::long_os_version().unwrap_or_else(|_| "Unknown".to_string()),
             architecture: std::env::consts::ARCH.to_string(),
-            hostname: sysinfo::System::host_name().unwrap_or_else(|| "Unknown".to_string()),
-            kernel_version: sysinfo::System::kernel_long_version(),
-            cpu: CpuInfo::collect(&sys),
-            memory: MemoryInfo::collect(&sys),
+            hostname: sysinfo::System::host_name().unwrap_or_else(|_| "Unknown".to_string()),
+            kernel_version: sysinfo::System::kernel_long_version().unwrap_or_default(),
+            cpu: sys.as_ref().map(CpuInfo::collect).unwrap_or_else(|| CpuInfo {
+                brand: "Unknown".to_owned(),
+                ..Default::default()
+            }),
+            memory: sys.as_ref().map(MemoryInfo::collect).unwrap_or_default(),
             disks: DiskInfo::collect_all(),
         }
     }
@@ -383,29 +390,29 @@ struct RuntimeInfo {
 
 impl RuntimeInfo {
     fn collect() -> Self {
-        let (process_id, memory_usage_mb, cpu_usage_percent) = if let Ok(pid) = sysinfo::get_current_pid() {
-            let mut sys = sysinfo::System::new();
-            sys.refresh_processes_specifics(
-                sysinfo::ProcessesToUpdate::Some(&[pid]),
-                true,
-                sysinfo::ProcessRefreshKind::everything(),
-            );
+        let (process_id, memory_usage_mb, cpu_usage_percent) =
+            if let (Ok(pid), Ok(mut sys)) = (sysinfo::get_current_pid(), sysinfo::System::new()) {
+                sys.refresh_processes_specifics(
+                    sysinfo::ProcessesToUpdate::Some(&[pid]),
+                    true,
+                    sysinfo::ProcessRefreshKind::everything(),
+                );
 
-            let process = sys.process(pid);
-            let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
-                let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
-                let cpu = p.cpu_usage() as f64;
-                (memory, cpu)
+                let process = sys.process(pid);
+                let (memory_usage_mb, cpu_usage_percent) = if let Some(p) = process {
+                    let memory = p.memory() as f64 / 1024.0 / 1024.0; // Convert to MB
+                    let cpu = p.cpu_usage() as f64;
+                    (memory, cpu)
+                } else {
+                    (0.0, 0.0)
+                };
+
+                (pid.as_u32(), memory_usage_mb, cpu_usage_percent)
             } else {
-                (0.0, 0.0)
+                // Failed to retrieve current PID; degrade gracefully by
+                // skipping per-process stats and using sentinel values.
+                (0, 0.0, 0.0)
             };
-
-            (pid.as_u32(), memory_usage_mb, cpu_usage_percent)
-        } else {
-            // Failed to retrieve current PID; degrade gracefully by
-            // skipping per-process stats and using sentinel values.
-            (0, 0.0, 0.0)
-        };
 
         // // Get available CPU parallelism (roughly, logical cores available to the process)
         let cpu_parallelism = std::thread::available_parallelism().map(|p| p.get()).unwrap_or(1);

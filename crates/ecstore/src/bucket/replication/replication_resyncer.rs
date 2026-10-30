@@ -3282,10 +3282,18 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
 
     let mut join_set = JoinSet::new();
     let mut all_succeeded = true;
+    let mut target_infos = Vec::with_capacity(tgt_arns.len());
 
     for arn in tgt_arns {
         let Some(tgt_client) = ReplicationTargetStore::remote_target_client(bucket, &arn).await else {
             all_succeeded = false;
+            target_infos.push(force_delete_target_info(
+                dobj.op_type,
+                &arn,
+                "",
+                false,
+                Err(TARGET_CLIENT_UNAVAILABLE_ERROR.to_string()),
+            ));
             debug!(
                 event = EVENT_REPLICATION_FORCE_DELETE_SKIPPED,
                 component = LOG_COMPONENT_ECSTORE,
@@ -3311,6 +3319,7 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
 
         let bucket = bucket.clone();
         let object_name = object_name.clone();
+        let op_type = dobj.op_type;
 
         join_set.spawn(async move {
             if ReplicationTargetStore::target_is_offline(&tgt_client).await {
@@ -3335,9 +3344,16 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
-                return false;
+                return force_delete_target_info(
+                    op_type,
+                    &tgt_client.arn,
+                    &tgt_client.endpoint,
+                    tgt_client.secure,
+                    Err(FORCE_DELETE_TARGET_OFFLINE_ERROR.to_string()),
+                );
             }
 
+            let started = Instant::now();
             if let Err(e) = tgt_client
                 .remove_object(&tgt_client.bucket, &object_name, None, replication_force_delete_remove_options())
                 .await
@@ -3364,16 +3380,25 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
                     user_agent: "Internal: [Replication]".to_string(),
                     ..Default::default()
                 });
-                return false;
+                return force_delete_target_info(
+                    op_type,
+                    &tgt_client.arn,
+                    &tgt_client.endpoint,
+                    tgt_client.secure,
+                    Err(e.to_string()),
+                );
             }
 
-            true
+            force_delete_target_info(op_type, &tgt_client.arn, &tgt_client.endpoint, tgt_client.secure, Ok(started.elapsed()))
         });
     }
 
     while let Some(result) = join_set.join_next().await {
         match result {
-            Ok(success) => all_succeeded &= success,
+            Ok(info) => {
+                all_succeeded &= info.replication_status == ReplicationStatusType::Completed;
+                target_infos.push(info);
+            }
             Err(error) => {
                 all_succeeded = false;
                 error!(
@@ -3389,6 +3414,8 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
             }
         }
     }
+
+    record_force_delete_target_stats(bucket, &target_infos).await;
 
     if all_succeeded
         && let Some(operation_id) = dobj.delete_object.force_delete_id
@@ -3407,6 +3434,53 @@ async fn replicate_force_delete_to_targets<S: ReplicationStorage>(dobj: &Deleted
     }
 
     all_succeeded
+}
+
+const FORCE_DELETE_TARGET_OFFLINE_ERROR: &str = "replication target is offline";
+
+/// One target's outcome of a replicated force-delete in the shape the
+/// replication statistics consume. A force-delete carries no per-version
+/// replication state, so the previous status is always `Pending`: that is
+/// the transition `ReplicationStats::update` counts as a failure, whereas an
+/// `Empty` previous status would drop the outcome and leave `replication
+/// status` reporting zero failures while the peer still holds the objects.
+fn force_delete_target_info(
+    op_type: ReplicationType,
+    arn: &str,
+    endpoint: &str,
+    secure: bool,
+    outcome: std::result::Result<std::time::Duration, String>,
+) -> ReplicatedTargetInfo {
+    let mut rinfo = ReplicatedTargetInfo {
+        arn: arn.to_string(),
+        op_type,
+        endpoint: endpoint.to_string(),
+        secure,
+        prev_replication_status: ReplicationStatusType::Pending,
+        ..Default::default()
+    };
+    match outcome {
+        Ok(duration) => {
+            rinfo.replication_status = ReplicationStatusType::Completed;
+            rinfo.duration = duration;
+        }
+        Err(error) => {
+            rinfo.replication_status = ReplicationStatusType::Failed;
+            rinfo.error = Some(error);
+        }
+    }
+    rinfo
+}
+
+async fn record_force_delete_target_stats(bucket: &str, targets: &[ReplicatedTargetInfo]) {
+    let Some(stats) = runtime_sources::replication_stats() else {
+        return;
+    };
+    for target in targets {
+        stats
+            .update(bucket, target, target.replication_status.clone(), target.prev_replication_status.clone())
+            .await;
+    }
 }
 
 fn unavailable_delete_target_info(dobj: &DeletedObjectReplicationInfo, arn: &str) -> ReplicatedTargetInfo {
@@ -7442,6 +7516,51 @@ mod tests {
         assert!(err.is_some(), "a 503 must not count as a propagated delete marker");
         assert_eq!((size, st.replicated_count, st.failed_count), (0, 0, 1));
         server.join().expect("test HTTP server should finish");
+    }
+
+    /// A force-delete the peer rejects must reach the replication failure
+    /// counters. A replicated force-delete used to only log the rejection, so
+    /// `replication status` reported zero failures while the sites diverged.
+    #[tokio::test]
+    async fn force_delete_target_outcomes_reach_replication_stats() {
+        let stats = super::super::replication_state::ReplicationStats::new();
+        let denied = force_delete_target_info(
+            ReplicationType::Delete,
+            "arn:rustfs:replication::denied:bucket",
+            "http://peer-a:9000",
+            false,
+            Err("remove_object failed: AccessDenied".to_string()),
+        );
+        assert_eq!(denied.replication_status, ReplicationStatusType::Failed);
+        assert_eq!(denied.prev_replication_status, ReplicationStatusType::Pending);
+        assert_eq!(denied.error.as_deref(), Some("remove_object failed: AccessDenied"));
+
+        let accepted = force_delete_target_info(
+            ReplicationType::Heal,
+            "arn:rustfs:replication::accepted:bucket",
+            "https://peer-b:9000",
+            true,
+            Ok(std::time::Duration::from_millis(3)),
+        );
+        assert_eq!(accepted.replication_status, ReplicationStatusType::Completed);
+        assert!(accepted.error.is_none());
+
+        for target in [&denied, &accepted] {
+            stats
+                .update(
+                    "bucket",
+                    target,
+                    target.replication_status.clone(),
+                    target.prev_replication_status.clone(),
+                )
+                .await;
+        }
+
+        let bucket_stats = stats.get("bucket").await;
+        let denied_stat = bucket_stats.stats.get(&denied.arn).expect("denied target: stats entry");
+        assert_eq!((denied_stat.failed.count, denied_stat.replicated_count), (1, 0));
+        let accepted_stat = bucket_stats.stats.get(&accepted.arn).expect("accepted target: stats entry");
+        assert_eq!((accepted_stat.failed.count, accepted_stat.replicated_count), (0, 1));
     }
 
     /// AWS answers `HEAD ?versionId=<source marker id>` with a bodiless 400.

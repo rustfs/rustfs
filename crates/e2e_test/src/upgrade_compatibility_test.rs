@@ -1066,7 +1066,7 @@ pub(crate) async fn wait_for_upgrade_write_readiness(
 /// reduced-redundancy class then fails with 503 `ServiceUnavailable` until the
 /// serving node writes through every drive, on the previous release and on
 /// the current build alike.
-async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
+pub(crate) async fn wait_for_drive_readmission(clients: &[Client], bucket: &str, context: &str, budget: Duration) -> TestResult {
     wait_for_upgrade_writes(
         clients,
         bucket,
