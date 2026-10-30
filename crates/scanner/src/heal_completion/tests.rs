@@ -99,6 +99,91 @@ fn replacement_bucket_version_or_location_cannot_match_an_old_result() {
 }
 
 #[test]
+fn missing_identity_fields_are_unknown_on_either_side() {
+    type IdentityChange = fn(&mut HealObjectIdentity);
+    let changes: [(&str, IdentityChange); 6] = [
+        ("version", |identity| identity.version_id = None),
+        ("empty version", |identity| identity.version_id = Some(String::new())),
+        ("incarnation", |identity| identity.bucket_incarnation_id = None),
+        ("nil incarnation", |identity| identity.bucket_incarnation_id = Some(Uuid::nil())),
+        ("pool", |identity| identity.pool_index = None),
+        ("set", |identity| identity.set_index = None),
+    ];
+    for (label, change) in changes {
+        for candidate_missing in [true, false] {
+            let mut observed = candidate();
+            let mut terminal = (*completion("partial", HealObjectDisposition::VerifiedHealthy)).clone();
+            if candidate_missing {
+                change(observed.identity.as_mut().expect("candidate identity"));
+            } else {
+                change(&mut terminal.object.as_mut().expect("receipt").identity);
+            }
+            let mut recent = Recent {
+                completion: Arc::new(terminal),
+                counted: false,
+            };
+            assert_eq!(
+                Settlement::new(observed, &mut recent).scope,
+                "identity_unknown",
+                "{label}, candidate missing: {candidate_missing}"
+            );
+        }
+    }
+}
+
+#[test]
+fn known_identity_conflicts_are_not_hidden_by_other_missing_fields() {
+    for change in 0..3 {
+        let mut observed = candidate();
+        let mut terminal = (*completion("conflict", HealObjectDisposition::VerifiedHealthy)).clone();
+        let expected = observed.identity.as_mut().expect("candidate identity");
+        let actual = &mut terminal.object.as_mut().expect("receipt").identity;
+        match change {
+            0 => {
+                expected.version_id = None;
+                actual.bucket = "replacement".into();
+            }
+            1 => {
+                expected.pool_index = None;
+                actual.version_id = Some(Uuid::from_u128(12).to_string());
+            }
+            _ => {
+                expected.bucket_incarnation_id = None;
+                actual.set_index = Some(2);
+            }
+        }
+        let mut recent = Recent {
+            completion: Arc::new(terminal),
+            counted: false,
+        };
+        assert_eq!(Settlement::new(observed, &mut recent).scope, "identity_mismatch", "case {change}");
+    }
+}
+
+#[test]
+fn scanner_candidate_without_location_records_identity_unknown() {
+    let mut scanner_request = request();
+    scanner_request.expected_bucket_incarnation_id = None;
+    scanner_request.pool_index = None;
+    scanner_request.set_index = None;
+    let mut observations = Observations::default();
+    assert!(
+        observations
+            .admit(
+                "scanner".into(),
+                Candidate::from_request(&scanner_request).expect("bounded scanner candidate"),
+            )
+            .is_none()
+    );
+    let settlement = observations
+        .complete(completion("scanner", HealObjectDisposition::VerifiedHealthy), Instant::now())
+        .expect("terminal candidate observed");
+    assert_eq!(settlement.scope, "identity_unknown");
+    assert_eq!(observations.unknown_counts.get("identity_unknown"), Some(&1));
+    assert_eq!(observations.unknown_counts.get("identity_mismatch"), None);
+}
+
+#[test]
 fn unversioned_overwrite_and_unknown_leader_never_certify_payload() {
     let mut observed = candidate();
     observed.identity.as_mut().expect("identity").version_id = None;
