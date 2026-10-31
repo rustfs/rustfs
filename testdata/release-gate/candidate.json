@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "product_commit": "3333333333333333333333333333333333333333",
+  "version": "9.9.9-fixture",
+  "release_profile": "stable",
+  "features": [
+    "pyroscope"
+  ],
+  "plan_sha256": "578bb57e65df8ba7a63e40aafc254fa644163270b7ec288fe3368bcd7c10ff86",
+  "validation_batch": {
+    "run_id": "fixture-batch-1",
+    "run_attempt": 2
+  },
+  "deliverables": [
+    {
+      "kind": "zip",
+      "name": "rustfs-linux-x86_64-gnu-v9.9.9-fixture.zip",
+      "location": "https://example.invalid/artifacts/runs/fixture-batch-1/2/rustfs-linux-x86_64-gnu-v9.9.9-fixture.zip",
+      "sha256": "ea3ac1fb0ec4aa8fbec650f64ccdbc2543843c8d5734c3915d1b57d7cbb92ec8",
+      "size": 36,
+      "binary_sha256": "7b77e78cc7b8f63a60f8a7101bebed6502f82e03016f4d4e11450f927e0a52fa"
+    }
+  ],
+  "image": {
+    "ref": "example.invalid/rustfs:9.9.9-fixture",
+    "digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+    "binary_sha256": "7b77e78cc7b8f63a60f8a7101bebed6502f82e03016f4d4e11450f927e0a52fa"
+  }
+}

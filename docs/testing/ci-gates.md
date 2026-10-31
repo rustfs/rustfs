@@ -117,18 +117,40 @@ Functional-chain health runs on a hosted runner independently of the lab fleet. 
 
 ## Release validation
 
-Post-merge and tag-driven; not a substitute for a PR gate.
+Post-merge and tag-driven; not a substitute for a PR gate. Every public publication exit consumes the release certification described here; this certification path is separate from the reusable CI artifact contract in [verification plans](ci-verification-pipeline.md), whose archives expire after one day and are never used as release certification.
+
+The versioned plan is `.config/release-validation-plan.json` (`schema_version=1`): release types, target OS/arch/ABI, supported features, a fixed harness SHA per lane, required case IDs, environment capabilities, timeouts, applicability conditions, and an explicit `upgrade_sources` list carrying the real artifact digests of the supported N-1/N-2 sources plus a stated rollback basis — compatibility and rollback are never invented or defaulted. `scripts/release/release_gate.py validate` expands and freezes `plan_sha256` and the required case set before reading results, then binds that plan, a `candidate.json` (product 40-character SHA, version, release profile, features, immutable deliverable locations with SHA256 and wrapped-binary SHA256, image digest) and the shared G01 evidence-envelope set (rustfs/backlog#2658) of one parent candidate batch, and writes machine JSON, JUnit and a summary. Within a batch the unique key is `(lane, platform{os,arch,abi}, case_id)`; the top-level run/attempt is the parent batch and the nested workflow run/attempt is the child workflow identity, and both are validated separately (workflow SHA and product build SHA are bound independently and need not be equal). Missing, duplicate or extra cases, stale attempts, wrong digests, wrong platforms, wrong harness SHAs, zero tests, cancellation, timeout, untrusted sources and any non-PASS required item block with classified errors; only a complete legal success returns 0. `verify-promotion` re-checks the exact bytes about to be published against the passed list and fails on a swapped package or an edited plan after verification. preview, prerelease and stable all require an explicit plan; preview may use the plan's smaller pre-declared set but never bypasses artifact identity and startup checks. development artifacts are explicitly uncertified and never touch official or latest channels.
 
 | Trigger | Workflow / job | Result |
 |---|---|---|
-| Nightly schedule, dispatch | `build.yml` `build-rustfs` (development build over the full platform matrix) | build artifacts and the dev download channel; no release publication |
-| Valid release or preview tag | `build.yml` `build-rustfs`, `create-release`, `upload-release-assets`, `publish-release` | draft release, checksummed assets, publish |
-| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `build-docker`, `scan-docker-image` | multi-architecture images and vulnerability report |
-| Successful release-tag build (`workflow_run`) | `package.yml` `package` | DEB/RPM packages and checksums uploaded to the release |
-| Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `build-helm-package`, `publish-helm-package` | versioned chart and repository index |
+| Nightly schedule, dispatch | `build.yml` `build-rustfs` (development build over the full platform matrix) | build artifacts and the uncertified dev download channel; no release publication |
+| Valid release or preview tag | `build.yml` `build-rustfs`, `release-certification`, `create-release`, `upload-release-assets`, `publish-release`, `promote-release-artifacts` | staged binaries, draft release, checksummed assets, then certified publish and promotion of the same bytes |
+| Successful non-preview release-tag build (`workflow_run`) | `docker.yml` `release-certification`, `build-docker`, `scan-docker-image` | multi-architecture images staged, verified against the certification and promoted, plus vulnerability report |
+| Successful release-tag build (`workflow_run`) | `package.yml` `release-certification`, `package`, `promote-packages` | DEB/RPM packages with wrapped-binary verification, staged then promoted with checksums |
+| Successful non-preview release-tag build (`workflow_run`) | `helm-package.yml` `release-certification`, `build-helm-package`, `publish-helm-package` | versioned chart and repository index, only over a certified image promotion record |
 | Final tag's release published | `build.yml` `cleanup-preview-releases` | deletes every `<target>-preview.<N>` Release for that target; the tags are kept |
 
-Use an exact preview tag for an end-to-end release rehearsal. Manual dispatches are backfill/debug paths and do not prove the automatic `workflow_run` chain.
+Publication exits and their gate:
+
+| Exit | Writer | Certification consumed |
+|---|---|---|
+| GitHub Release draft → public | `build.yml` `publish-release` | `release-certification` success and per-asset `verify-promotion` |
+| Official R2 binary path `artifacts/rustfs/release/` | `build.yml` `promote-release-artifacts` | `release-certification` plus `verify-promotion`; the build job itself only writes `artifacts/rustfs/staging/<run>/<attempt>/` |
+| `latest.json` version pointer | `build.yml` `update-latest-version` | transitively through `publish-release` |
+| Image channels (Docker Hub, GHCR, Quay tags) | `docker.yml` `build-docker` promotion step | certified input digests, staged image binary identity and `verify-promotion`, then promotion of the same digest with `imagetools create` |
+| Official R2 package paths `packages/release` and `packages/latest` | `package.yml` `promote-packages` | `release-certification` and wrapped-binary `verify-promotion`; the package job only stages |
+| GitHub release package assets | `package.yml` `package` | `release-certification` and wrapped-binary `verify-promotion` before upload |
+| Helm chart repository (`rustfs/helm` push) | `helm-package.yml` `publish-helm-package` | `release-certification` plus the Docker workflow's image-promotion record bound to the same candidate |
+
+Downstream workflows fail closed when the trusted certification is absent: a manual dispatch without certification fails and pushes no official tag. Only results from the trusted verification sources listed in the plan (currently the `rustfs/s3chaos` `release-gate.yml` envelope runs) carry release authority; a PR-uploaded JSON set cannot certify a release. Retries reuse the same candidate, only the staged bytes are promoted (no rebuild-after-verify), and no downstream step re-resolves a mutable `latest`.
+
+Use an exact preview tag for an end-to-end release rehearsal. Manual dispatches are backfill/debug paths and do not prove the automatic `workflow_run` chain. The committed fixtures under `testdata/release-gate/` and the commands below are contract rehearsals of this orchestration; they are explicitly not product release evidence and not live verifier results.
+
+```bash
+python3 -m unittest discover -s scripts/release -p 'test_release_gate.py'
+python3 scripts/release/release_gate.py validate --plan testdata/release-gate/plan.json --candidate testdata/release-gate/candidate.json --results testdata/release-gate/pass --output target/release-gate-check
+bash scripts/security/check_preview_release_workflow.sh
+```
 
 ## Change checklist
 
