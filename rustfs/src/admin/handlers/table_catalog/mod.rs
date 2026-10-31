@@ -2425,9 +2425,10 @@ fn table_catalog_backend_from_extensions(
 ) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
     let context = runtime_sources::app_context_from_extensions(extensions)
         .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_runtimes(
         context.object_store(),
         context.table_catalog_strong_runtime(),
+        context.table_catalog_registration_cache(),
     ))
 }
 

@@ -131,8 +131,6 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let bucket_path = self.paths.table_bucket_entry_path(bucket);
         let index_state_path = self.paths.warehouse_index_state_path(bucket);
         let index_prefix = self.paths.warehouse_index_entries_prefix(bucket);
-        let registration_prefix = format!("{}registration-index/", self.paths.table_bucket_root_prefix(bucket));
-        let registration_root = format!("{registration_prefix}root.json");
         let mut indexes = Vec::new();
         for object in catalog_objects {
             if object.delete_marker
@@ -146,19 +144,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             if object.key == bucket_path {
                 continue;
             }
-            let etag = if object.key.starts_with(&registration_prefix) {
-                let value = self
-                    .backend
-                    .read_object_limited(self.catalog_bucket(), &object.key, 1024 * 1024)
-                    .await?
-                    .ok_or_else(|| cleanup_conflict("registration index changed during cleanup"))?;
-                if object.key == registration_root {
-                    super::registration_index::validate_registration_index_root(bucket, &value.data)?;
-                } else if !super::registration_tree::validate_cleanup_object(&registration_prefix, &object.key, &value.data)? {
-                    return Err(cleanup_conflict("catalog contains an unknown registration index record"));
-                }
-                value.etag
-            } else if object.key == index_state_path {
+            let etag = if object.key == index_state_path {
                 let (state, etag) = self
                     .read_entry::<TableWarehouseIndexStateEntry>(self.catalog_bucket(), &object.key)
                     .await?
@@ -193,9 +179,6 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             let etag = etag.ok_or_else(|| cleanup_conflict("catalog cleanup object has no etag"))?;
             indexes.push((object.key, etag));
         }
-        // Remove the root before its referenced nodes so an interrupted cleanup
-        // cannot leave a ready index pointing at objects already removed.
-        indexes.sort_by_key(|(key, _)| key != &registration_root);
         self.backend.ensure_no_multipart_uploads(bucket).await?;
         let mut metadata = Vec::new();
         for object in self.backend.list_objects_for_cleanup(bucket, "").await? {

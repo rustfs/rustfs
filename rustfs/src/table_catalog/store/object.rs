@@ -15,7 +15,7 @@
 use super::*;
 use futures::{StreamExt, TryStreamExt, stream};
 
-const TABLE_REGISTRATION_READ_CONCURRENCY: usize = 8;
+pub(super) const TABLE_REGISTRATION_READ_CONCURRENCY: usize = 8;
 const TABLE_MAINTENANCE_RENAME_MAX_OBJECTS: usize = 4096;
 const TABLE_MAINTENANCE_SCHEDULER_HISTORY_MAX_OBJECTS: usize = 4096;
 
@@ -1191,8 +1191,6 @@ where
     {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
-        self.invalidate_registration_index_for_write(bucket, object, &data, &TableCatalogObjectMutationFence::default())
-            .await?;
         self.backend.put_object(bucket, object, data, precondition).await
     }
 
@@ -1253,9 +1251,6 @@ where
     {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
-        let unfenced = TableCatalogObjectMutationFence::default();
-        self.invalidate_registration_index_for_write(bucket, object, &data, fence.unwrap_or(&unfenced))
-            .await?;
         match fence {
             Some(fence) => {
                 self.backend
@@ -1880,8 +1875,6 @@ where
         index: &TableWarehouseIndexEntry,
         reason: &'static str,
     ) -> TableCatalogStoreResult<()> {
-        self.invalidate_registration_index(&index.table_bucket, &TableCatalogObjectMutationFence::default())
-            .await?;
         self.backend.delete_object_unlocked(self.catalog_bucket(), object).await?;
         tracing::warn!(
             table_bucket = %index.table_bucket,
@@ -2847,13 +2840,7 @@ where
                 "table registration requires a table publication fence".to_string(),
             ));
         }
-        let registration_update = self
-            .prepare_registration_index_update(&entry, &table_path, publication)
-            .await?;
-        if registration_update.is_none() {
-            self.ensure_table_warehouse_prefix_available(&entry, Some(&table_path))
-                .await?;
-        }
+        self.check_registration_ownership(&entry, &table_path, publication).await?;
         let reservation = self.reserve_table_warehouse_index(&entry, true, &table_path).await?;
         if !publication.holds_table_bucket(&entry.table_bucket)
             || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
@@ -2880,13 +2867,6 @@ where
                 .await;
         }
         result?;
-        // The primary table is committed. An incomplete derived index remains
-        // dirty and is rebuilt before the next indexed registration.
-        if let Some(update) = registration_update
-            && self.finish_registration_index_update(update, &entry).await.is_err()
-        {
-            super::registration_index::log_registration_index_maintenance_failure(&entry.table_bucket, "publication_failed");
-        }
         Ok(())
     }
 
@@ -7464,7 +7444,6 @@ where
             )));
         };
         let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
-        self.invalidate_registration_index(table_bucket, &mutation_fence).await?;
         self.tombstone_table_warehouse_index_for_drop(&entry, false).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())

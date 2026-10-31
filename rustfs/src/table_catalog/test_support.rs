@@ -411,7 +411,7 @@ pub(crate) struct TestCatalogObjectBackend {
     pub(crate) state: Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
     pub(crate) locks: TestCatalogObjectLocks,
     pub(crate) strong_runtime: Option<StrongTableCatalogRuntime>,
-    pub(crate) registration_index_epoch: Option<Uuid>,
+    pub(crate) registration_cache: TableCatalogRegistrationCache,
     // One-shot, path-keyed injection knobs from the admin handler tests'
     // former TestTableCatalogObjectBackend (backlog#1837 PR2): each fires
     // once for the named object and clears itself, mirroring the original
@@ -547,6 +547,8 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) read_bytes: usize,
     pub(crate) metadata_calls: usize,
     pub(crate) list_calls: usize,
+    pub(crate) failed_inventory_prefixes: BTreeSet<String>,
+    pub(crate) inventory_overrides: BTreeMap<String, Vec<TableCatalogCleanupObject>>,
     pub(crate) next_etag: u64,
 }
 
@@ -958,8 +960,8 @@ impl TestCatalogObjectState {
 
 #[async_trait::async_trait]
 impl TableCatalogObjectBackend for TestCatalogObjectBackend {
-    fn registration_index_epoch(&self) -> TableCatalogStoreResult<Option<Uuid>> {
-        Ok(self.registration_index_epoch)
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        Some(self.registration_cache.clone())
     }
 
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
@@ -1179,6 +1181,14 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     ) -> TableCatalogStoreResult<Vec<TableCatalogCleanupObject>> {
         let mut state = self.state.lock().await;
         state.list_calls += 1;
+        if state.failed_inventory_prefixes.contains(prefix) {
+            return Err(TableCatalogStoreError::Unavailable(
+                "injected authoritative inventory failure".to_string(),
+            ));
+        }
+        if let Some(objects) = state.inventory_overrides.get(prefix) {
+            return Ok(objects.clone());
+        }
         Ok(state
             .objects
             .iter()

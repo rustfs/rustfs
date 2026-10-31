@@ -16374,6 +16374,107 @@ where
 
 #[tokio::test]
 #[serial_test::serial]
+async fn object_catalog_registration_cache_checks_real_records_without_additional_objects() {
+    use crate::admin::storage_api::RUSTFS_META_BUCKET;
+    use crate::table_catalog::{
+        ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, TableCatalogBackingMode,
+        TableCatalogObjectPaths, TableCatalogStoreError,
+    };
+
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("registration-cache-{}", Uuid::new_v4().simple());
+    let backend =
+        EcStoreTableCatalogObjectBackend::new_with_strong_runtime(object_store.clone(), StrongTableCatalogRuntime::default());
+    let catalog = ConfiguredTableCatalogStore::new_for_test(backend.clone(), TableCatalogBackingMode::ObjectBacked);
+    object_store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .unwrap();
+    enable_table_bucket_response(&catalog, &TableCommitObjectBackend::trusted(backend.clone()), &object_store, &bucket)
+        .await
+        .unwrap();
+    let namespace = crate::table_catalog::Namespace::parse("analytics").unwrap();
+    create_namespace_response(
+        &catalog,
+        &bucket,
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::new(),
+        },
+        true,
+    )
+    .await
+    .unwrap();
+    let paths = TableCatalogObjectPaths::default();
+    let bucket_entry = paths.table_bucket_entry_path(&bucket);
+    let catalog_prefix = format!("{}/", bucket_entry.rsplit_once('/').unwrap().0);
+    let mut create_micros = Vec::new();
+    for number in 0..100 {
+        let store = ConfiguredTableCatalogStore::new_for_test(backend.clone(), TableCatalogBackingMode::ObjectBacked);
+        let request = serde_json::from_value(serde_json::json!({
+            "name": format!("events_{number:03}"),
+            "schema": {
+                "type": "struct",
+                "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }
+        }))
+        .unwrap();
+        let started = std::time::Instant::now();
+        create_table_response(
+            &store,
+            &TableCommitObjectBackend::trusted(backend.clone()),
+            &bucket,
+            &namespace,
+            request,
+            true,
+        )
+        .await
+        .expect("fresh store instances share the runtime cache and create independent tables");
+        create_micros.push(started.elapsed().as_micros());
+        if matches!(number + 1, 20 | 100) {
+            let before = backend.list_objects(RUSTFS_META_BUCKET, &catalog_prefix).await.unwrap();
+            let cold_backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+                object_store.clone(),
+                StrongTableCatalogRuntime::default(),
+            );
+            let probe = ConfiguredTableCatalogStore::new_for_test(cold_backend, TableCatalogBackingMode::ObjectBacked);
+            let mut duplicate = catalog
+                .load_table(&bucket, "analytics", &format!("events_{number:03}"))
+                .await
+                .unwrap()
+                .unwrap();
+            duplicate.table = "duplicate_probe".to_string();
+            for cache_state in ["cold", "warm"] {
+                let started = std::time::Instant::now();
+                assert!(matches!(
+                    probe.create_table(duplicate.clone()).await,
+                    Err(TableCatalogStoreError::Conflict(_))
+                ));
+                eprintln!(
+                    "registration_check tables={} cache={} elapsed_us={}",
+                    number + 1,
+                    cache_state,
+                    started.elapsed().as_micros()
+                );
+            }
+            assert_eq!(before, backend.list_objects(RUSTFS_META_BUCKET, &catalog_prefix).await.unwrap());
+            let mut recent = create_micros[create_micros.len() - 5..].to_vec();
+            recent.sort_unstable();
+            eprintln!("create_table_response tables={} last_five_median_us={}", number + 1, recent[2]);
+        }
+    }
+    assert_eq!(catalog.list_all_tables(&bucket).await.unwrap().len(), 100);
+    let namespace_entry = paths.namespace_entry_path(&bucket, &namespace);
+    let index_prefix = paths.warehouse_index_entries_prefix(&bucket);
+    let objects = backend.list_objects(RUSTFS_META_BUCKET, &catalog_prefix).await.unwrap();
+    assert!(objects.iter().all(|key| {
+        key == &bucket_entry || key == &namespace_entry || key.starts_with(&index_prefix) || key.ends_with("/table-entry.json")
+    }));
+}
+
+#[tokio::test]
+#[serial_test::serial]
 async fn cleanup_empty_table_bucket_reclaims_twenty_dropped_tables_and_allows_bucket_deletion() {
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("cleanup-{}", Uuid::new_v4().simple());
@@ -16899,109 +17000,6 @@ async fn cleanup_empty_table_bucket_retries_partial_warehouse_index_deletion() {
             .table_bucket_enabled()
     );
     object_store.delete_bucket(&bucket, &Default::default()).await.unwrap();
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn cleanup_empty_table_bucket_retries_after_registration_root_is_deleted() {
-    use crate::admin::storage_api::RUSTFS_META_BUCKET;
-    use crate::table_catalog::{TableCatalogEntryState, TableCatalogObjectPaths};
-
-    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-    let bucket = format!("cleanup-tree-retry-{}", Uuid::new_v4().simple());
-    let backend = TestTableCatalogObjectBackend {
-        registration_index_epoch: Some(Uuid::new_v4()),
-        ..TestTableCatalogObjectBackend::content_addressed()
-    };
-    let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
-        backend.clone(),
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-    );
-    create_dropped_empty_tables_for_cleanup(&catalog, &backend, object_store.as_ref(), &bucket, 20).await;
-    let paths = TableCatalogObjectPaths::default();
-    let bucket_entry = paths.table_bucket_entry_path(&bucket);
-    let bucket_root = bucket_entry.rsplit_once('/').expect("bucket entry has a parent prefix").0;
-    let registration_prefix = format!("{bucket_root}/registration-index/");
-    let root = format!("{registration_prefix}root.json");
-    let nodes_prefix = format!("{registration_prefix}nodes/");
-    assert!(
-        backend
-            .object_exists(RUSTFS_META_BUCKET, &root)
-            .await
-            .expect("registration root exists")
-    );
-    let nodes = backend
-        .list_objects(RUSTFS_META_BUCKET, &nodes_prefix)
-        .await
-        .expect("registration nodes can be listed");
-    assert!(nodes.len() >= 3, "the fixture must exercise a tree with multiple nodes");
-    let failed_node = nodes.first().expect("registration tree contains a node");
-    backend.fail_delete_attempt(RUSTFS_META_BUCKET, failed_node, 1).await;
-
-    let publication = TableCommitObjectBackend::trusted(backend.clone());
-    let error = cleanup_empty_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-        .await
-        .expect_err("the injected node deletion failure interrupts cleanup");
-    assert!(error.to_string().contains("injected"));
-    assert!(
-        !backend
-            .object_exists(RUSTFS_META_BUCKET, &root)
-            .await
-            .expect("registration root absence can be checked"),
-        "the registration root must be removed before any referenced node"
-    );
-    assert!(
-        backend
-            .object_exists(RUSTFS_META_BUCKET, failed_node)
-            .await
-            .expect("the failed node remains available for retry")
-    );
-    assert_eq!(
-        catalog
-            .get_table_bucket(&bucket)
-            .await
-            .expect("catalog bucket can be read")
-            .expect("catalog bucket exists")
-            .state,
-        TableCatalogEntryState::Active
-    );
-    assert!(
-        object_store
-            .get_bucket_metadata(&bucket)
-            .await
-            .expect("bucket metadata can be read after partial cleanup")
-            .table_bucket_enabled()
-    );
-
-    let restarted = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
-        backend.clone(),
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-    );
-    let publication = TableCommitObjectBackend::trusted(backend.clone());
-    assert!(
-        !cleanup_empty_table_bucket_response(&restarted, &publication, object_store.as_ref(), &bucket)
-            .await
-            .expect("cleanup retries the remaining nodes without a registration root")
-            .enabled
-    );
-    assert!(
-        backend
-            .list_objects(RUSTFS_META_BUCKET, &registration_prefix)
-            .await
-            .expect("registration metadata can be listed after retry")
-            .is_empty()
-    );
-    assert!(
-        !object_store
-            .get_bucket_metadata(&bucket)
-            .await
-            .expect("bucket metadata can be read after cleanup")
-            .table_bucket_enabled()
-    );
-    object_store
-        .delete_bucket(&bucket, &Default::default())
-        .await
-        .expect("the cleaned bucket can be deleted");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

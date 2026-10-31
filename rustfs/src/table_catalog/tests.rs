@@ -7145,10 +7145,9 @@ async fn table_data_plane_resource_does_not_match_sibling_prefix() {
     assert_eq!(backend.list_call_count().await, 1);
 }
 
-async fn indexed_registration_fixture() -> (TestCatalogObjectBackend, ObjectTableCatalogStore<TestCatalogObjectBackend>, Namespace)
+async fn cached_registration_fixture() -> (TestCatalogObjectBackend, ObjectTableCatalogStore<TestCatalogObjectBackend>, Namespace)
 {
     let backend = TestCatalogObjectBackend {
-        registration_index_epoch: Some(Uuid::new_v4()),
         reject_reads_while_write_locked: true,
         ..Default::default()
     };
@@ -7165,7 +7164,7 @@ async fn indexed_registration_fixture() -> (TestCatalogObjectBackend, ObjectTabl
     (backend, store, namespace)
 }
 
-fn indexed_registration_entry(namespace: &Namespace, name: &str) -> TableEntry {
+fn cached_registration_entry(namespace: &Namespace, name: &str) -> TableEntry {
     let table = IdentifierSegment::parse(name).expect("test table name is valid");
     let mut entry = test_table_entry(
         "analytics",
@@ -7179,20 +7178,20 @@ fn indexed_registration_entry(namespace: &Namespace, name: &str) -> TableEntry {
 }
 
 #[tokio::test]
-async fn object_catalog_registration_index_bounds_reads_across_store_instances() {
-    let (backend, _, namespace) = indexed_registration_fixture().await;
+async fn object_catalog_registration_cache_bounds_reads_across_store_instances() {
+    let (backend, _, namespace) = cached_registration_fixture().await;
     for number in 0..256 {
         let store = ObjectTableCatalogStore::new(backend.clone());
         backend.reset_call_counts().await;
         store
-            .create_table(indexed_registration_entry(&namespace, &format!("table_{number:04}")))
+            .create_table(cached_registration_entry(&namespace, &format!("table_{number:04}")))
             .await
-            .expect("each new store instance uses the persisted registration index");
+            .expect("each new store instance shares validated registration projections");
         if number >= 32 {
             let state = backend.state.lock().await;
-            assert_eq!(state.list_calls, 0, "warm registration must not enumerate the catalog");
+            assert_eq!(state.list_calls, 2, "each registration inventories both catalog ranges");
             assert!(
-                state.read_calls < 100,
+                state.read_calls < 24,
                 "registration used {} object reads at table {number}",
                 state.read_calls
             );
@@ -7206,9 +7205,9 @@ async fn object_catalog_registration_index_bounds_reads_across_store_instances()
 }
 
 #[tokio::test]
-async fn object_catalog_registration_index_preserves_identity_and_overlap_checks() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
-    let mut existing = indexed_registration_entry(&namespace, "orders");
+async fn object_catalog_registration_cache_preserves_identity_and_overlap_checks() {
+    let (backend, store, namespace) = cached_registration_fixture().await;
+    let mut existing = cached_registration_entry(&namespace, "orders");
     existing.warehouse_location = "s3://analytics/shared/orders".to_string();
     store.create_table(existing.clone()).await.expect("initial table is created");
     backend
@@ -7216,7 +7215,7 @@ async fn object_catalog_registration_index_preserves_identity_and_overlap_checks
         .await
         .expect("simulate a missing materialized warehouse index");
 
-    let mut duplicate = indexed_registration_entry(&namespace, "duplicate");
+    let mut duplicate = cached_registration_entry(&namespace, "duplicate");
     duplicate.table_id = existing.table_id.clone();
     assert_matches!(store.create_table(duplicate).await, Err(TableCatalogStoreError::Conflict(_)));
     for location in [
@@ -7224,11 +7223,11 @@ async fn object_catalog_registration_index_preserves_identity_and_overlap_checks
         "s3://analytics/shared/orders",
         "s3://analytics/shared/orders/child",
     ] {
-        let mut conflicting = indexed_registration_entry(&namespace, "conflicting");
+        let mut conflicting = cached_registration_entry(&namespace, "conflicting");
         conflicting.warehouse_location = location.to_string();
         assert_matches!(store.create_table(conflicting).await, Err(TableCatalogStoreError::Conflict(_)));
     }
-    let mut adjacent = indexed_registration_entry(&namespace, "adjacent");
+    let mut adjacent = cached_registration_entry(&namespace, "adjacent");
     adjacent.warehouse_location = "s3://analytics/shared/orders2".to_string();
     store
         .create_table(adjacent)
@@ -7237,10 +7236,10 @@ async fn object_catalog_registration_index_preserves_identity_and_overlap_checks
 }
 
 #[tokio::test]
-async fn object_catalog_registration_index_rebuilds_after_failed_write_and_drop() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
+async fn object_catalog_registration_cache_rechecks_after_failed_write_and_drop() {
+    let (backend, store, namespace) = cached_registration_fixture().await;
     store
-        .create_table(indexed_registration_entry(&namespace, "orders"))
+        .create_table(cached_registration_entry(&namespace, "orders"))
         .await
         .expect("initial table is created");
     let returns = IdentifierSegment::parse("returns").expect("test name is valid");
@@ -7248,7 +7247,7 @@ async fn object_catalog_registration_index_rebuilds_after_failed_write_and_drop(
     backend.fail_next_put(RUSTFS_META_BUCKET, &table_path).await;
     assert!(
         store
-            .create_table(indexed_registration_entry(&namespace, "returns"))
+            .create_table(cached_registration_entry(&namespace, "returns"))
             .await
             .is_err()
     );
@@ -7260,14 +7259,14 @@ async fn object_catalog_registration_index_rebuilds_after_failed_write_and_drop(
             .is_none()
     );
     store
-        .create_table(indexed_registration_entry(&namespace, "returns"))
+        .create_table(cached_registration_entry(&namespace, "returns"))
         .await
-        .expect("retry rebuilds an invalidated index");
+        .expect("retry reads the authoritative records");
     store
         .drop_table("analytics", "sales", "orders")
         .await
-        .expect("drop invalidates the index");
-    let mut replacement = indexed_registration_entry(&namespace, "replacement");
+        .expect("drop removes the active owner");
+    let mut replacement = cached_registration_entry(&namespace, "replacement");
     replacement.table_id = "id-orders".to_string();
     replacement.warehouse_location = "s3://analytics/tables/id-orders".to_string();
     store
@@ -7277,71 +7276,9 @@ async fn object_catalog_registration_index_rebuilds_after_failed_write_and_drop(
 }
 
 #[tokio::test]
-async fn object_catalog_registration_index_epoch_revalidates_legacy_writes() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
-    store
-        .create_table(indexed_registration_entry(&namespace, "orders"))
-        .await
-        .expect("initial table is created");
-    let legacy_table = IdentifierSegment::parse("legacy").expect("test name is valid");
-    let mut legacy = indexed_registration_entry(&namespace, "legacy");
-    legacy.warehouse_location = "s3://analytics/legacy".to_string();
-    backend
-        .seed_object(
-            RUSTFS_META_BUCKET,
-            &store.paths.table_entry_path("analytics", &namespace, &legacy_table),
-            serde_json::to_vec(&legacy).expect("table entry serializes"),
-        )
-        .await;
-    let upgraded_backend = TestCatalogObjectBackend {
-        registration_index_epoch: Some(Uuid::new_v4()),
-        ..backend
-    };
-    let upgraded = ObjectTableCatalogStore::new(upgraded_backend);
-    let mut candidate = indexed_registration_entry(&namespace, "candidate");
-    candidate.warehouse_location = "s3://analytics/legacy/child".to_string();
-    assert_matches!(upgraded.create_table(candidate).await, Err(TableCatalogStoreError::Conflict(_)));
-}
-
-#[tokio::test]
-async fn object_catalog_registration_index_missing_node_blocks_publication() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
-    store
-        .create_table(indexed_registration_entry(&namespace, "orders"))
-        .await
-        .expect("initial table is created");
-    let node = backend
-        .state
-        .lock()
-        .await
-        .objects
-        .keys()
-        .find(|(_, object)| object.contains("/registration-index/nodes/"))
-        .cloned()
-        .expect("a ready index has a referenced node");
-    backend
-        .delete_object(&node.0, &node.1)
-        .await
-        .expect("simulate storage corruption");
-    assert!(
-        store
-            .create_table(indexed_registration_entry(&namespace, "returns"))
-            .await
-            .is_err()
-    );
-    assert!(
-        store
-            .load_table("analytics", "sales", "returns")
-            .await
-            .expect("lookup succeeds")
-            .is_none()
-    );
-}
-
-#[tokio::test]
-async fn object_catalog_registration_index_keeps_pointer_commits_and_rebuilds_after_rename() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
-    let entry = indexed_registration_entry(&namespace, "orders");
+async fn object_catalog_registration_cache_observes_pointer_commits_and_rename() {
+    let (backend, store, namespace) = cached_registration_fixture().await;
+    let entry = cached_registration_entry(&namespace, "orders");
     store.create_table(entry.clone()).await.expect("initial table is created");
     let metadata_directory = entry
         .metadata_location
@@ -7374,10 +7311,14 @@ async fn object_catalog_registration_index_keeps_pointer_commits_and_rebuilds_af
         .expect("metadata pointer commit succeeds");
     backend.reset_call_counts().await;
     store
-        .create_table(indexed_registration_entry(&namespace, "returns"))
+        .create_table(cached_registration_entry(&namespace, "returns"))
         .await
         .unwrap();
-    assert_eq!(backend.list_call_count().await, 0, "pointer changes retain the registration index");
+    assert_eq!(
+        backend.list_call_count().await,
+        2,
+        "pointer changes are checked through fresh inventories"
+    );
 
     store
         .rename_table("analytics", "sales", "orders", "sales", "renamed")
@@ -7385,73 +7326,45 @@ async fn object_catalog_registration_index_keeps_pointer_commits_and_rebuilds_af
         .unwrap();
     backend.reset_call_counts().await;
     store
-        .create_table(indexed_registration_entry(&namespace, "shipments"))
+        .create_table(cached_registration_entry(&namespace, "shipments"))
         .await
         .unwrap();
-    assert!(backend.list_call_count().await > 0, "rename requires an authoritative rebuild");
-    let mut duplicate = indexed_registration_entry(&namespace, "duplicate");
+    assert!(
+        backend.list_call_count().await > 0,
+        "rename is visible in the next authoritative inventory"
+    );
+    let mut duplicate = cached_registration_entry(&namespace, "duplicate");
     duplicate.table_id = "id-orders".to_string();
     assert_matches!(store.create_table(duplicate).await, Err(TableCatalogStoreError::Conflict(_)));
 }
 
 #[tokio::test]
-async fn object_catalog_registration_index_disabled_writer_invalidates_ready_index() {
-    let (backend, store, namespace) = indexed_registration_fixture().await;
+async fn object_catalog_registration_cache_observes_an_independent_writer() {
+    let (backend, store, namespace) = cached_registration_fixture().await;
     store
-        .create_table(indexed_registration_entry(&namespace, "orders"))
+        .create_table(cached_registration_entry(&namespace, "orders"))
         .await
         .unwrap();
     let scan_store = ObjectTableCatalogStore::new(TestCatalogObjectBackend {
-        registration_index_epoch: None,
+        registration_cache: TableCatalogRegistrationCache::default(),
         ..backend.clone()
     });
     scan_store
-        .create_table(indexed_registration_entry(&namespace, "returns"))
+        .create_table(cached_registration_entry(&namespace, "returns"))
         .await
         .unwrap();
     backend.reset_call_counts().await;
     store
-        .create_table(indexed_registration_entry(&namespace, "shipments"))
+        .create_table(cached_registration_entry(&namespace, "shipments"))
         .await
         .unwrap();
-    assert!(backend.list_call_count().await > 0, "a scan-mode writer invalidates the persisted index");
-    let mut duplicate = indexed_registration_entry(&namespace, "duplicate");
+    assert!(
+        backend.list_call_count().await > 0,
+        "an independent writer is visible in the next authoritative inventory"
+    );
+    let mut duplicate = cached_registration_entry(&namespace, "duplicate");
     duplicate.table_id = "id-returns".to_string();
     assert_matches!(store.create_table(duplicate).await, Err(TableCatalogStoreError::Conflict(_)));
-}
-
-#[tokio::test]
-async fn object_catalog_registration_index_root_write_failure_preserves_uniqueness() {
-    for failed_phase in [1, 2] {
-        let (backend, store, namespace) = indexed_registration_fixture().await;
-        store
-            .create_table(indexed_registration_entry(&namespace, "orders"))
-            .await
-            .unwrap();
-        let bucket_entry = store.paths.table_bucket_entry_path("analytics");
-        let bucket_root = bucket_entry.rsplit_once('/').expect("bucket entry has a parent prefix").0;
-        let root = format!("{bucket_root}/registration-index/root.json");
-        let attempts = backend.put_attempt_count(RUSTFS_META_BUCKET, &root).await;
-        backend
-            .fail_put_attempt(RUSTFS_META_BUCKET, &root, attempts + failed_phase)
-            .await;
-        let creation = store.create_table(indexed_registration_entry(&namespace, "returns")).await;
-        assert_eq!(creation.is_ok(), failed_phase == 2, "cache publication does not undo a committed table");
-        let committed = store.load_table("analytics", "sales", "returns").await.unwrap();
-        assert_eq!(
-            committed.is_some(),
-            failed_phase == 2,
-            "a ready-root error can follow successful table publication"
-        );
-        let mut candidate = indexed_registration_entry(&namespace, "candidate");
-        candidate.table_id = "id-returns".to_string();
-        let result = store.create_table(candidate).await;
-        if committed.is_some() {
-            assert_matches!(result, Err(TableCatalogStoreError::Conflict(_)));
-        } else {
-            result.expect("failed dirty-root publication does not reserve a new identity");
-        }
-    }
 }
 
 #[tokio::test]
@@ -7482,7 +7395,7 @@ async fn object_catalog_registration_scans_warehouse_prefixes_once() {
         reads.push(backend.read_call_count().await);
         assert_eq!(backend.list_call_count().await, 2, "one table scan and one warehouse index scan");
     }
-    assert_eq!(reads[2] - reads[1], 2, "each existing table and its index should be read once");
+    assert_eq!(reads[2], reads[1], "unchanged validated objects should not require another GET");
     assert_eq!(store.list_tables(bucket, &namespace.public_name()).await.unwrap().len(), 3);
 }
 
@@ -7521,6 +7434,7 @@ async fn object_catalog_registration_bounds_concurrent_catalog_reads() {
         index_objects.push(store.paths.warehouse_index_entry_path(bucket, &format!("tables/{name}/")));
     }
 
+    backend.registration_cache.clear();
     let mut scans = Vec::new();
     for mut objects in [table_objects, index_objects] {
         objects.sort();

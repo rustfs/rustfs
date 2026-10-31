@@ -2555,7 +2555,8 @@ impl SetDisks {
     /// Version scan for set-scoped callers that act on absence: set walks
     /// (tier reference proofs, tier-delete journals, pool maintenance) and the
     /// recursive prefix-delete scan. Every online drive is read and each
-    /// version is resolved at the read quorum of its own erasure layout; a
+    /// version uses the read quorum of its own erasure layout. Null versions
+    /// in the system bucket also retain GET's commit-proof selection. A
     /// version that cannot be ruled out fails the scan instead of being
     /// omitted. Merged `ListObjectVersions` pages go through `list_path`.
     async fn list_versions_authoritatively(
@@ -5753,6 +5754,126 @@ mod test {
             SetDisks::resolve_listed_versions("bucket", entries, &vec![None; 4], 16, 4),
             Err(DiskError::ErasureReadQuorum)
         ));
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_rejects_uncommitted_null_version_split() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        for new_etag in ["new", "old"] {
+            let new =
+                test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), new_etag, Uuid::from_u128(2));
+            let entries = MetaCacheEntries(vec![Some(old.clone()), Some(old.clone()), Some(new.clone()), Some(new)]);
+
+            assert!(matches!(
+                SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &[None, None, None, None], 4, 2),
+                Err(DiskError::ErasureReadQuorum)
+            ));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_selects_committed_null_version() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for (new_copies, expected) in [(1, "old"), (3, "new"), (4, "new")] {
+            let entries = MetaCacheEntries(
+                (0..4)
+                    .map(|slot| Some(if slot < new_copies { new.clone() } else { old.clone() }))
+                    .collect(),
+            );
+            let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &[None, None, None, None], 4, 2)
+                .expect("committed generation should resolve")
+                .expect("committed record should be present");
+            let info = resolved
+                .to_fileinfo(RUSTFS_META_BUCKET)
+                .expect("resolved metadata should decode");
+
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some(expected));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_matches_degraded_null_version_reads() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for (old_copies, new_copies, expected) in [
+            (2, 1, Some("old")),
+            (1, 2, None),
+            (0, 3, Some("new")),
+            (0, 2, Some("new")),
+            (0, 1, None),
+        ] {
+            let entries = MetaCacheEntries(
+                (0..4)
+                    .map(|slot| {
+                        if slot < old_copies {
+                            Some(old.clone())
+                        } else if slot < old_copies + new_copies {
+                            Some(new.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            );
+            let errors = (0..4)
+                .map(|slot| (slot >= old_copies + new_copies).then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &errors, 4, 2);
+
+            if let Some(expected) = expected {
+                let info = resolved
+                    .expect("degraded committed record should resolve")
+                    .expect("degraded committed record should be present")
+                    .to_fileinfo(RUSTFS_META_BUCKET)
+                    .expect("resolved metadata should decode");
+                assert_eq!(info.metadata.get("etag").map(String::as_str), Some(expected));
+            } else {
+                assert!(matches!(resolved, Err(DiskError::ErasureReadQuorum)));
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_user_bucket_scan_keeps_null_version_read_quorum_selection() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for old_copies in [1, 2] {
+            let entries = MetaCacheEntries(vec![
+                Some(new.clone()),
+                Some(new.clone()),
+                Some(old.clone()),
+                (old_copies == 2).then(|| old.clone()),
+            ]);
+            let errors = [None, None, None, (old_copies == 1).then_some(DiskError::DiskNotFound)];
+            let resolved = SetDisks::resolve_listed_versions("bucket", entries, &errors, 4, 2)
+                .expect("user bucket read quorum should resolve")
+                .expect("user bucket record should be present");
+            let info = resolved.to_fileinfo("bucket").expect("resolved metadata should decode");
+
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new"));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_keeps_explicit_version_read_quorum() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let entry = test_object_meta_entry_with_erasure_versions("entry.json", &[(time, "version", 2, 2)]);
+        let entries = MetaCacheEntries(vec![Some(entry.clone()), Some(entry), None, None]);
+        let errors = [None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+        let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &errors, 4, 2)
+            .expect("explicit version read quorum should resolve")
+            .expect("explicit version should be present");
+        let info = resolved
+            .to_fileinfo(RUSTFS_META_BUCKET)
+            .expect("resolved metadata should decode");
+
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("version"));
     }
 
     #[test]

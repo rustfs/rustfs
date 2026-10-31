@@ -20,10 +20,10 @@ mod backup;
 mod cleanup;
 mod migration;
 mod object;
-mod registration_index;
+mod registration_cache;
 #[cfg(test)]
-mod registration_index_tests;
-mod registration_tree;
+mod registration_cache_tests;
+pub(crate) use registration_cache::TableCatalogRegistrationCache;
 mod strong;
 
 pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
@@ -816,8 +816,8 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
-    fn registration_index_epoch(&self) -> TableCatalogStoreResult<Option<Uuid>> {
-        Ok(None)
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        None
     }
 
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
@@ -2274,6 +2274,7 @@ where
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
     strong_runtime: StrongTableCatalogRuntime,
+    registration_cache: TableCatalogRegistrationCache,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
@@ -2281,6 +2282,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
         Self {
             store: self.store.clone(),
             strong_runtime: self.strong_runtime.clone(),
+            registration_cache: self.registration_cache.clone(),
         }
     }
 }
@@ -2290,7 +2292,19 @@ where
     S: TableCatalogStorage,
 {
     pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
-        Self { store, strong_runtime }
+        Self::new_with_runtimes(store, strong_runtime, TableCatalogRegistrationCache::default())
+    }
+
+    pub fn new_with_runtimes(
+        store: Arc<S>,
+        strong_runtime: StrongTableCatalogRuntime,
+        registration_cache: TableCatalogRegistrationCache,
+    ) -> Self {
+        Self {
+            store,
+            strong_runtime,
+            registration_cache,
+        }
     }
 }
 
@@ -2301,17 +2315,8 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    fn registration_index_epoch(&self) -> TableCatalogStoreResult<Option<Uuid>> {
-        const ENV: &str = ENV_TABLE_CATALOG_REGISTRATION_INDEX_EPOCH;
-        match std::env::var(ENV) {
-            Err(std::env::VarError::NotPresent) => Ok(None),
-            Ok(value) => Uuid::parse_str(&value)
-                .ok()
-                .filter(|epoch| !epoch.is_nil())
-                .map(Some)
-                .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{ENV} must be a non-nil UUID"))),
-            Err(_) => Err(TableCatalogStoreError::Invalid(format!("{ENV} must contain a valid UUID"))),
-        }
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        Some(self.registration_cache.clone())
     }
 
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
