@@ -30,6 +30,7 @@ use std::sync::Mutex;
 
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
+mod fair_prefix_quantum;
 mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;

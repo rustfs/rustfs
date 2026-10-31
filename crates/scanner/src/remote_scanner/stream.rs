@@ -80,6 +80,7 @@ impl RemoteScannerBudget {
             max_duration: self.max_duration_ms.map(Duration::from_millis),
             max_objects: self.max_objects,
             max_directories: self.max_directories,
+            ..Default::default()
         }
     }
 }
