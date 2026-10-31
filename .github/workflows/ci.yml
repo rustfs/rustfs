@@ -113,7 +113,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^rehearse_shards=' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=2$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
