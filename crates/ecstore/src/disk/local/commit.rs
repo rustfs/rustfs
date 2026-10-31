@@ -551,7 +551,9 @@ impl LocalDisk {
             None
         };
         let multipart_publication = if let Some(staging) = multipart_staging.as_ref() {
-            Some(pin_multipart_future(|| self.prepare_native_multipart_publication(src_path, &mut fi, staging)).await?)
+            Some(Arc::new(
+                pin_multipart_future(|| self.prepare_native_multipart_publication_deferred(src_path, &mut fi, staging)).await?,
+            ))
         } else {
             None
         };
@@ -967,6 +969,228 @@ impl LocalDisk {
                     (guard, dst_buf)
                 }
             }
+        } else if let Some(publication) = multipart_publication.as_ref()
+            && no_inline
+            && !preserve_upload_metadata
+            && !publication.legacy
+            && !fi_healing
+            && !os::dst_dir_fsync_group_commit_enabled()
+            && !super::has_rename_data_test_failpoints(dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterDataRename, dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
+            && !crash_inject::is_armed(CrashPoint::RenameAfterMetaCommit, dst_path)
+            && !{
+                #[cfg(test)]
+                {
+                    os::file_sync_probe::is_active()
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            }
+        {
+            enum MultipartFusedCommitOutcome {
+                Committed(RenameDataResp),
+                AbortBeforeDataRename(DiskError),
+                RestoreDataSource(os::RenameCommitGuard, DiskError),
+                RestoreTargetAfterError(DiskError, bool),
+            }
+            let publication_owned = Arc::clone(publication);
+            let src_parent_owned = src_file_parent.to_path_buf();
+            let dst_parent_owned = dst_file_parent.to_path_buf();
+            let dst_file_path_owned = dst_file_path.clone();
+            let src_file_path_owned = src_file_path.clone();
+            let dst_volume_dir_owned = dst_volume_dir.clone();
+            let publication_root_owned = self.publication_root.clone();
+            let has_data_dir_path_owned = has_data_dir_path.clone();
+            let sync_data_shards = durability.syncs_data_shards();
+            let sync_commit_metadata = durability.syncs_commit_metadata();
+            let staging_cleanup = multipart_staging.as_ref().map(|s| s.cleanup_handle());
+            let dst_volume_str = dst_volume.to_string();
+            let dst_path_str = dst_path.to_string();
+            let fi_moved = fi;
+            #[cfg(test)]
+            let root_owned = self.root.clone();
+
+            let outcome = os::run_blocking_namespace_operation_with_sync(
+                mutation_lease.clone(),
+                true,
+                move || -> std::io::Result<MultipartFusedCommitOutcome> {
+                    let (directory_guard_owned, has_dst_buf_owned) = match prepare_rename_commit_and_destination_metadata_std(
+                        false,
+                        &src_parent_owned,
+                        &dst_parent_owned,
+                        &dst_file_path_owned,
+                        &dst_volume_dir_owned,
+                        &publication_root_owned,
+                    ) {
+                        Ok(res) => res,
+                        Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(to_file_error(err).into())),
+                    };
+                    let mut xlmeta = FileMeta::new();
+                    let mut dst_meta_unparsable = false;
+                    if let Some(dst_buf) = has_dst_buf_owned.as_ref() {
+                        if FileMeta::is_xl2_v1_format(dst_buf)
+                            && let Ok(nmeta) = FileMeta::load(dst_buf)
+                        {
+                            xlmeta = nmeta;
+                        } else {
+                            dst_meta_unparsable = true;
+                        }
+                    }
+                    let skip_parent_owned = if has_dst_buf_owned.is_some() {
+                        dst_parent_owned.clone()
+                    } else {
+                        dst_volume_dir_owned.clone()
+                    };
+                    let version_id = fi_moved.version_id.unwrap_or_default();
+                    let (old_current_size, old_current_source_checked, old_current_source) = observe_old_current(
+                        has_dst_buf_owned.is_some(),
+                        dst_meta_unparsable,
+                        &xlmeta,
+                        &dst_volume_str,
+                        &dst_path_str,
+                        version_id,
+                    );
+                    let has_old_data_dir = xlmeta.find_unshared_data_dir_for_version(Some(version_id));
+                    if let Some(old_data_dir) = has_old_data_dir.as_ref() {
+                        let _ = xlmeta.data.remove_two(version_id, *old_data_dir);
+                    }
+                    if let Err(err) = xlmeta.add_version(fi_moved) {
+                        return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(err.into()));
+                    }
+                    let version_signature = rename_data_versions_signature(&xlmeta);
+                    let new_dst_buf_owned = match xlmeta.marshal_msg() {
+                        Ok(buf) => buf,
+                        Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(err.into())),
+                    };
+
+                    let prepared_metadata_source = match publication_owned.prepare_and_install_head_on_thread(
+                        &new_dst_buf_owned,
+                        has_dst_buf_owned.as_deref(),
+                        &dst_file_path_owned,
+                        &directory_guard_owned,
+                    ) {
+                        Ok(source) => source,
+                        Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(err)),
+                    };
+                    // When presynced, shard payloads were synced during UploadPart and
+                    // prepare_and_install_head_on_thread just fsynced src_data_path after
+                    // writing RETIREMENT_ANCHOR.
+                    if sync_data_shards
+                        && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
+                        && !super::take_presynced_tmp_data_dir(src_data_path)
+                        && let Err(err) = os::sync_dir_files_std(src_data_path)
+                        && err.kind() != ErrorKind::NotFound
+                    {
+                        return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(to_file_error(err).into()));
+                    }
+                    if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
+                        let Some(src_parent) = src_data_path.parent() else {
+                            return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::InvalidPath));
+                        };
+                        let payload_guard = match os::multipart_payload_commit_guard_std(&directory_guard_owned, src_parent) {
+                            Ok(guard) => guard,
+                            Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(to_file_error(err).into())),
+                        };
+                        if let Err(err) = os::rename_all_with_commit_guard_on_thread(src_data_path, dst_data_path, &payload_guard)
+                        {
+                            return Ok(MultipartFusedCommitOutcome::RestoreDataSource(directory_guard_owned, err));
+                        }
+                        #[cfg(test)]
+                        run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                    }
+                    if let Err(err) = os::rename_prepared_source_on_thread(
+                        prepared_metadata_source,
+                        &src_file_path_owned,
+                        &dst_file_path_owned,
+                        &skip_parent_owned,
+                        &publication_root_owned,
+                        &directory_guard_owned,
+                    ) {
+                        return Ok(MultipartFusedCommitOutcome::RestoreDataSource(directory_guard_owned, err));
+                    }
+                    if sync_commit_metadata {
+                        if let Some(parent) = dst_file_path_owned.parent()
+                            && let Err(err) = os::fsync_commit_directory_limited_std(parent, &directory_guard_owned)
+                        {
+                            return Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(to_file_error(err).into(), true));
+                        }
+                        if has_dst_buf_owned.is_none() {
+                            let mut ancestor = dst_file_path_owned.parent().and_then(|object_dir| object_dir.parent());
+                            while let Some(dir) = ancestor {
+                                if !dir.starts_with(&dst_volume_dir_owned) {
+                                    break;
+                                }
+                                if let Err(err) = os::fsync_dir_limited_std(dir) {
+                                    return Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(
+                                        to_file_error(err).into(),
+                                        true,
+                                    ));
+                                }
+                                if dir == dst_volume_dir_owned.as_path() {
+                                    break;
+                                }
+                                ancestor = dir.parent();
+                            }
+                        }
+                    }
+                    match publication_owned.finish_on_thread(sync_commit_metadata, staging_cleanup) {
+                        Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(RenameDataResp {
+                            multipart_source: Some(Box::new(result)),
+                            old_data_dir: has_old_data_dir,
+                            rollback_data_dir: None,
+                            cleanup_data_dir: has_old_data_dir,
+                            sign: version_signature,
+                            old_current_size,
+                            old_current_source_checked,
+                            old_current_source,
+                        })),
+                        Err(err) => Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(err, false)),
+                    }
+                },
+            )
+            .await
+            .map_err(to_file_error)
+            .map_err(DiskError::from)?;
+
+            match outcome {
+                MultipartFusedCommitOutcome::Committed(resp) => {
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Ok(resp);
+                }
+                MultipartFusedCommitOutcome::AbortBeforeDataRename(err) => return Err(err),
+                MultipartFusedCommitOutcome::RestoreDataSource(directory_guard, err) => {
+                    let commit = RenameCommitContext {
+                        directory_guard,
+                        publication_root: &self.publication_root,
+                        mutation_lease,
+                        source_metadata: &src_file_path,
+                        destination_metadata: &dst_file_path,
+                        source_volume_dir: &src_volume_dir,
+                        data_paths: has_data_dir_path.as_ref(),
+                    };
+                    commit.restore_published_data_source().await?;
+                    return Err(err);
+                }
+                MultipartFusedCommitOutcome::RestoreTargetAfterError(err, invalidate_before_return) => {
+                    if !invalidate_before_return {
+                        for part_path in &invalidate_part_paths {
+                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                        }
+                    }
+                    pin_multipart_future(|| publication.restore_target_after_error(mutation_lease.clone())).await?;
+                    if invalidate_before_return {
+                        for part_path in &invalidate_part_paths {
+                            self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                        }
+                    }
+                    return Err(err);
+                }
+            }
         } else {
             prepare_rename_commit_and_destination_metadata(
                 !no_inline && !preserve_upload_metadata,
@@ -1090,13 +1314,29 @@ impl LocalDisk {
             // after the commit rename, and a crash before the rename means the
             // PUT was never acknowledged. A metadata commit: relaxed tiers
             // leave it to the page cache.
+            #[cfg(all(test, target_os = "linux"))]
+            let probe_active = os::file_sync_probe::is_active();
+            #[cfg(all(not(test), target_os = "linux"))]
+            let probe_active = false;
             let shard_sync = async {
                 if durability.syncs_data_shards()
                     && let Some((src_data_path, _)) = has_data_dir_path.as_ref()
-                    && let Err(err) = os::sync_dir_files_with_limiter(src_data_path, self.file_sync_permits.clone()).await
-                    && err.kind() != ErrorKind::NotFound
                 {
-                    return Err::<(), DiskError>(to_file_error(err).into());
+                    #[cfg(target_os = "linux")]
+                    if !probe_active && super::take_presynced_tmp_data_dir(src_data_path) {
+                        if multipart_publication.is_none()
+                            && let Err(err) = os::fsync_dir_with_owner(src_data_path, Some(commit.mutation_lease.clone())).await
+                            && err.kind() != ErrorKind::NotFound
+                        {
+                            return Err::<(), DiskError>(to_file_error(err).into());
+                        }
+                        return Ok(());
+                    }
+                    if let Err(err) = os::sync_dir_files_with_limiter(src_data_path, self.file_sync_permits.clone()).await
+                        && err.kind() != ErrorKind::NotFound
+                    {
+                        return Err::<(), DiskError>(to_file_error(err).into());
+                    }
                 }
                 Ok(())
             };
@@ -1488,13 +1728,22 @@ impl LocalDisk {
             }
 
             let multipart_source = match multipart_publication.as_ref() {
-                Some(publication) => match pin_multipart_future(|| publication.finish(commit.mutation_lease.clone())).await {
-                    Ok(result) => Some(Box::new(result)),
-                    Err(error) => {
-                        pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone())).await?;
-                        return Err(error);
+                Some(publication) => {
+                    let target_already_synced = durability.syncs_commit_metadata();
+                    let staging_cleanup = multipart_staging.as_ref().map(|s| s.cleanup_handle());
+                    match pin_multipart_future(|| {
+                        publication.finish(commit.mutation_lease.clone(), target_already_synced, staging_cleanup)
+                    })
+                    .await
+                    {
+                        Ok(result) => Some(Box::new(result)),
+                        Err(error) => {
+                            pin_multipart_future(|| publication.restore_target_after_error(commit.mutation_lease.clone()))
+                                .await?;
+                            return Err(error);
+                        }
                     }
-                },
+                }
                 None => None,
             };
             Ok(RenameDataResp {

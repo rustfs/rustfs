@@ -5413,6 +5413,34 @@ impl RenameCommitGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn multipart_payload_commit_guard_std(
+    metadata_guard: &RenameCommitGuard,
+    source_parent: &Path,
+) -> io::Result<RenameCommitGuard> {
+    let original = &metadata_guard.directories;
+    original.validate()?;
+    let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
+    let destination = original.prepare_destination()?;
+    // Clone the pinned file identity, never recapture the target pathname
+    // between payload and canonical-head publication.
+    let destination = LinuxCommitDirectory {
+        file: Arc::clone(&destination.file),
+        device: destination.device,
+        inode: destination.inode,
+    };
+    Ok(RenameCommitGuard {
+        directories: Arc::new(LinuxCommitDirectories {
+            root: original.root.clone(),
+            source_path: source_parent.to_path_buf(),
+            destination_path: original.destination_path.clone(),
+            source,
+            destination: std::sync::OnceLock::from(destination),
+            destination_base: original.destination_base.clone(),
+        }),
+    })
+}
+
 /// Native MPU metadata and payload have distinct source parents. Reuse the
 /// exact target identity already held by the metadata transaction, while
 /// independently pinning the private payload source under the same root.
@@ -5424,30 +5452,7 @@ pub(crate) async fn multipart_payload_commit_guard(
 ) -> io::Result<RenameCommitGuard> {
     let metadata_guard = metadata_guard.clone();
     let source_parent = source_parent.to_path_buf();
-    run_blocking_namespace_operation(lease, move || {
-        let original = &metadata_guard.directories;
-        original.validate()?;
-        let source = LinuxCommitDirectory::new(original.root.open_directory(&source_parent)?)?;
-        let destination = original.prepare_destination()?;
-        // Clone the pinned file identity, never recapture the target pathname
-        // between payload and canonical-head publication.
-        let destination = LinuxCommitDirectory {
-            file: Arc::clone(&destination.file),
-            device: destination.device,
-            inode: destination.inode,
-        };
-        Ok(RenameCommitGuard {
-            directories: Arc::new(LinuxCommitDirectories {
-                root: original.root.clone(),
-                source_path: source_parent,
-                destination_path: original.destination_path.clone(),
-                source,
-                destination: std::sync::OnceLock::from(destination),
-                destination_base: original.destination_base.clone(),
-            }),
-        })
-    })
-    .await
+    run_blocking_namespace_operation(lease, move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent)).await
 }
 
 pub(crate) fn prepare_rename_commit_guard(
@@ -6630,6 +6635,17 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+}
+
+pub(crate) fn sync_multipart_owned_record_parents_options(
+    source: &Path,
+    record_parent: &Path,
+    include_leaf: bool,
+    sync_source_root: bool,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "native record escaped source"))?;
@@ -6651,6 +6667,9 @@ pub(crate) fn sync_multipart_owned_record_parents(
     for _ in 0..=2 {
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
+        }
+        if directory == source && !sync_source_root {
+            return Ok(());
         }
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;

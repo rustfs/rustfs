@@ -691,6 +691,36 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
+        // A lost Complete response retries the same upload id after staging is
+        // gone. `get_multipart_info` is NoSuchUpload in that case; completion
+        // below replays the committed object instead of failing the retry.
+        let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) if is_err_invalid_upload_id(&err) => None,
+            Err(err) => return Err(ApiError::from(err).into()),
+        };
+        // A ciphertext-passthrough session stores encrypted parts verbatim and
+        // completes without the customer key (the replication client has none),
+        // so the SSE-C completion check must be skipped for it.
+        if let Some(info) = multipart_info.as_ref() {
+            if !contains_key_str(&info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
+                EncryptionRequest {
+                    bucket: &bucket,
+                    key: &key,
+                    server_side_encryption: None,
+                    ssekms_key_id: None,
+                    ssekms_context: None,
+                    sse_customer_algorithm: sse_customer_algorithm.clone(),
+                    sse_customer_key: sse_customer_key.clone(),
+                    sse_customer_key_md5: sse_customer_key_md5.clone(),
+                    content_size: 0,
+                    principal: None,
+                }
+                .validate_complete_multipart_ssec(&info.user_defined)?;
+            }
+            validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
+        }
+
         let quota_metadata_sys = self.bucket_metadata_sys();
         let quota_tracking = quota_metadata_sys.is_some();
         let mut quota_enabled = false;
@@ -732,35 +762,6 @@ impl DefaultMultipartUsecase {
             None
         };
 
-        // A lost Complete response retries the same upload id after staging is
-        // gone. `get_multipart_info` is NoSuchUpload in that case; completion
-        // below replays the committed object instead of failing the retry.
-        let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
-            Ok(info) => Some(info),
-            Err(err) if is_err_invalid_upload_id(&err) => None,
-            Err(err) => return Err(ApiError::from(err).into()),
-        };
-        // A ciphertext-passthrough session stores encrypted parts verbatim and
-        // completes without the customer key (the replication client has none),
-        // so the SSE-C completion check must be skipped for it.
-        if let Some(info) = multipart_info.as_ref() {
-            if !contains_key_str(&info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
-                EncryptionRequest {
-                    bucket: &bucket,
-                    key: &key,
-                    server_side_encryption: None,
-                    ssekms_key_id: None,
-                    ssekms_context: None,
-                    sse_customer_algorithm: sse_customer_algorithm.clone(),
-                    sse_customer_key: sse_customer_key.clone(),
-                    sse_customer_key_md5: sse_customer_key_md5.clone(),
-                    content_size: 0,
-                    principal: None,
-                }
-                .validate_complete_multipart_ssec(&info.user_defined)?;
-            }
-            validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
-        }
         let cache_adapter = self.object_data_cache();
         let _ = invalidate_object_data_cache_before_mutation(&cache_adapter, &bucket, &key).await;
 
@@ -1171,18 +1172,22 @@ impl DefaultMultipartUsecase {
             );
         }
 
-        let current_opts: ObjectOptions = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
-        match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        if !super::object::shared::put_like_write_creates_new_version(&opts)
+            && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state)
+        {
+            let current_opts: ObjectOptions = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, opts.version_id.clone(), None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &opts)?
+                }
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
                 }
             }
         }
