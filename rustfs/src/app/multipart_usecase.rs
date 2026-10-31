@@ -39,6 +39,7 @@ use super::storage_api::multipart_usecase::contract::object::ObjectOperations as
 use super::storage_api::multipart_usecase::contract::range::HTTPRangeSpec;
 use super::storage_api::multipart_usecase::data_usage::{
     quota_object_size, record_bucket_object_version_write_memory, record_bucket_object_write_memory,
+    record_bucket_object_write_unknown_previous_memory,
 };
 use super::storage_api::multipart_usecase::error::{
     StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
@@ -845,12 +846,7 @@ impl DefaultMultipartUsecase {
                                 }
                             }
                             None => {
-                                crate::app::storage_api::data_usage::record_bucket_object_write_unknown_previous_memory(
-                                    &bucket,
-                                    committed_size,
-                                    versioned,
-                                )
-                                .await;
+                                record_bucket_object_write_unknown_previous_memory(&bucket, committed_size, versioned).await;
                             }
                         }
                     }
