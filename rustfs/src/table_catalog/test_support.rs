@@ -477,7 +477,7 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) next_etag: u64,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct TestCatalogObjectRecord {
     pub(crate) data: Vec<u8>,
     pub(crate) etag: String,
