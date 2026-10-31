@@ -5342,6 +5342,11 @@ impl LocalIoBackend for StdBackend {
                 // The writer opens on first use, outside the fs helpers that record.
                 os::record_native_publication(&file_path);
                 if let Some(resources) = current_resource_unit() {
+                    if let Some(parent) = file_path.parent()
+                        && parent != volume_dir
+                    {
+                        os::make_dir_all(parent, &volume_dir).await?;
+                    }
                     return self.open_resource_writer(file_path, mode, resources).await;
                 }
 
