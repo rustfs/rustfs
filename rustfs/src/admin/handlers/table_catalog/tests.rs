@@ -1,3 +1,6 @@
+#[path = "tests/catalog_migration_scope.rs"]
+mod catalog_migration_scope;
+
 use super::*;
 use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -1936,6 +1939,29 @@ fn table_catalog_handlers_require_table_admin_actions() {
     );
     assert_eq!(rename_block.matches("AdminAction::SetTableAction").count(), 2);
 
+    let handler = "BackfillTableWarehouseIndexHandler";
+    let block = operation_block(&src, handler);
+    let warehouse = block.find("warehouse_from_params(&params)?;").expect("warehouse parsing");
+    let resource = block
+        .find("TableCatalogResource::warehouse(&warehouse)")
+        .expect("warehouse resource");
+    let authorize = block
+        .find("authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;")
+        .expect("warehouse-aware backfill authorization");
+    let marker = block
+        .find("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
+        .expect("table bucket marker check");
+    let store = block
+        .find("table_catalog_object_store_from_extensions(&req.extensions)?;")
+        .expect("request catalog store");
+    assert!(
+        warehouse < resource && resource < authorize && authorize < marker && marker < store,
+        "{handler} must authorize its warehouse before checking the marker or resolving the store"
+    );
+    assert!(
+        !block.contains("authorize_table_catalog_request(&req,"),
+        "{handler} must not use unscoped catalog authorization"
+    );
     for (handler, action) in [
         ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
         ("RestTableExistsHandler", "AdminAction::GetTableAction"),

@@ -624,6 +624,7 @@ impl AdminAction {
             self,
             AdminAction::GetTableBucketAction
                 | AdminAction::SetTableBucketAction
+                | AdminAction::MigrateTableCatalogAction
                 | AdminAction::GetTableNamespaceAction
                 | AdminAction::SetTableNamespaceAction
                 | AdminAction::UpdateTableNamespacePropertiesAction

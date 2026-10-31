@@ -230,7 +230,8 @@ pub struct BackfillTableWarehouseIndexHandler {}
 impl Operation for BackfillTableWarehouseIndexHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
