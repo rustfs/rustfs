@@ -14,6 +14,296 @@
 
 use super::*;
 
+#[tokio::test]
+async fn completed_restore_sealed_publication_response_loss_replays_the_original_receipt() {
+    let (backend, backup) = isolated_restore_fixture().await;
+    let paths = TableCatalogObjectPaths::default();
+    let restore_id = "sealed-completion-response-loss";
+    let table_path = paths.table_entry_path(
+        "analytics",
+        &Namespace::parse("sales").expect("namespace"),
+        &IdentifierSegment::parse("orders").expect("table"),
+    );
+    let intent_path = paths.catalog_restore_intent_path("analytics", restore_id);
+    let barrier_path = paths.catalog_restore_state_path("analytics");
+    let table_pause = backend.pause_next_put(RUSTFS_META_BUCKET, &table_path).await;
+    let worker_backend = backend.clone();
+    let backup_id = backup.backup_id.clone();
+    let worker = tokio::spawn(async move {
+        ObjectTableCatalogStore::new(worker_backend)
+            .restore_object_catalog_backup_with_id("analytics", &backup_id, None, false, Some(restore_id))
+            .await
+    });
+
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, table_pause.wait_started())
+        .await
+        .expect("restore reached table publication");
+    let applied_intent_pause = backend.pause_next_put(RUSTFS_META_BUCKET, &intent_path).await;
+    table_pause.release();
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, applied_intent_pause.wait_started())
+        .await
+        .expect("restore reached catalog-applied intent");
+    let applied_barrier_pause = backend.pause_next_put(RUSTFS_META_BUCKET, &barrier_path).await;
+    applied_intent_pause.release();
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, applied_barrier_pause.wait_started())
+        .await
+        .expect("restore reached catalog-applied barrier");
+    let completed_intent_pause = backend.pause_next_put(RUSTFS_META_BUCKET, &intent_path).await;
+    applied_barrier_pause.release();
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, completed_intent_pause.wait_started())
+        .await
+        .expect("restore reached completion receipt");
+    assert_eq!(restore_control_json(&backend, &barrier_path).await["state"], "CATALOG_APPLIED");
+    backend.fail_after_next_put(RUSTFS_META_BUCKET, &barrier_path).await;
+    completed_intent_pause.release();
+    let failed = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, worker)
+        .await
+        .expect("restore returned after the final response was lost")
+        .expect("restore worker joined");
+    assert!(
+        matches!(failed, Err(TableCatalogStoreError::Internal(message)) if message.contains("injected post-commit put failure"))
+    );
+
+    let barrier = restore_control_json(&backend, &barrier_path).await;
+    assert_eq!(barrier["state"], "COMPLETED");
+    assert!(barrier["completed_intent_etag"].as_str().is_some());
+    assert!(barrier["backup_etag"].as_str().is_some());
+    let before = maintenance_test_object_versions(&backend).await;
+    let restarted = ObjectTableCatalogStore::new(backend.clone());
+    let receipt = restarted
+        .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some(restore_id))
+        .await
+        .expect("retry reads the completed receipt after losing its publication response");
+    assert_eq!(receipt.status, TableCatalogRestoreStatus::AlreadyRestored);
+    assert_eq!(receipt.backup_id, backup.backup_id);
+    assert_eq!(receipt.restored_snapshot_etag, backup.source_snapshot_etag);
+    assert_eq!(receipt.object_count, backup.object_count);
+    assert_eq!(receipt.previous_snapshot_etag, None);
+    assert_eq!(
+        restarted
+            .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some(restore_id))
+            .await
+            .expect("subsequent retry returns the same receipt"),
+        receipt
+    );
+    assert!(
+        restarted
+            .load_table("analytics", "sales", "orders")
+            .await
+            .expect("published table read")
+            .is_some()
+    );
+    assert_eq!(
+        maintenance_test_object_versions(&backend).await,
+        before,
+        "receipt replay rewrote persisted state"
+    );
+}
+
+fn restore_path_read_count(attempts: &BTreeMap<(String, String), usize>, path: &str) -> usize {
+    attempts
+        .get(&(RUSTFS_META_BUCKET.to_string(), path.to_string()))
+        .copied()
+        .unwrap_or_default()
+}
+
+#[tokio::test]
+async fn completed_restore_reads_validate_sealed_control_versions_without_loading_large_payloads() {
+    let (backend, backup) = isolated_restore_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let restore_id = "sealed-control-read-budget";
+    store
+        .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some(restore_id))
+        .await
+        .expect("restore publishes a completed barrier");
+    let paths = TableCatalogObjectPaths::default();
+    let barrier_path = paths.catalog_restore_state_path("analytics");
+    let intent_path = paths.catalog_restore_intent_path("analytics", restore_id);
+    let barrier = restore_control_json(&backend, &barrier_path).await;
+    assert!(barrier["completed_intent_etag"].as_str().is_some_and(|etag| !etag.is_empty()));
+    assert!(barrier["backup_etag"].as_str().is_some_and(|etag| !etag.is_empty()));
+    let before_versions = maintenance_test_object_versions(&backend).await;
+    let (before_reads, before_metadata_calls) = {
+        let state = backend.state.lock().await;
+        (state.read_attempts.clone(), state.metadata_calls)
+    };
+
+    let table = store
+        .load_table("analytics", "sales", "orders")
+        .await
+        .expect("table load")
+        .expect("table");
+    assert_eq!(table.table_uuid, "table-uuid");
+    assert!(
+        store
+            .get_namespace("analytics", "sales")
+            .await
+            .expect("namespace load")
+            .is_some()
+    );
+
+    let state = backend.state.lock().await;
+    for path in [&intent_path, &backup.backup_path] {
+        assert_eq!(
+            restore_path_read_count(&state.read_attempts, path) - restore_path_read_count(&before_reads, path),
+            0,
+            "ordinary catalog reads loaded a sealed control payload: {path}"
+        );
+    }
+    assert_eq!(
+        restore_path_read_count(&state.read_attempts, &barrier_path) - restore_path_read_count(&before_reads, &barrier_path),
+        4,
+        "table and namespace reads must observe the small barrier before and after access"
+    );
+    // Each of the four barrier observations checks both sealed object versions.
+    // The table read also checks its existing rename-publication bucket version.
+    assert_eq!(state.metadata_calls - before_metadata_calls, 9);
+    drop(state);
+    assert_eq!(
+        backend.last_read_limit(RUSTFS_META_BUCKET, &barrier_path).await,
+        Some(16 * 1024),
+        "ordinary catalog reads must keep the restore control payload bounded"
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before_versions);
+}
+
+#[tokio::test]
+async fn completed_restore_rejects_missing_or_replaced_sealed_controls_without_writing() {
+    for control in ["intent", "artifact"] {
+        for missing in [false, true] {
+            let (backend, backup) = isolated_restore_fixture().await;
+            let store = ObjectTableCatalogStore::new(backend.clone());
+            let restore_id = "sealed-control-corruption";
+            store
+                .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some(restore_id))
+                .await
+                .expect("complete restore before control loss");
+            let path = if control == "intent" {
+                TableCatalogObjectPaths::default().catalog_restore_intent_path("analytics", restore_id)
+            } else {
+                backup.backup_path.clone()
+            };
+            if missing {
+                backend
+                    .state
+                    .lock()
+                    .await
+                    .objects
+                    .remove(&(RUSTFS_META_BUCKET.to_string(), path.clone()));
+            } else {
+                backend
+                    .seed_object(RUSTFS_META_BUCKET, &path, b"tampered-control-payload".to_vec())
+                    .await;
+            }
+            let before = maintenance_test_object_versions(&backend).await;
+            assert_restore_unavailable(store.load_table("analytics", "sales", "orders").await, control);
+            assert_restore_unavailable(store.get_namespace("analytics", "sales").await, control);
+            assert_restore_unavailable(
+                store
+                    .create_namespace(test_namespace_entry("analytics", &Namespace::parse("forbidden").expect("namespace")))
+                    .await,
+                control,
+            );
+            assert_eq!(
+                maintenance_test_object_versions(&backend).await,
+                before,
+                "rejected {control} access wrote state"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn completed_restore_legacy_barrier_reads_still_validate_full_intent_and_artifact() {
+    let (backend, backup) = isolated_restore_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let restore_id = "legacy-completed-barrier";
+    store
+        .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some(restore_id))
+        .await
+        .expect("complete restore");
+    let paths = TableCatalogObjectPaths::default();
+    let barrier_path = paths.catalog_restore_state_path("analytics");
+    let intent_path = paths.catalog_restore_intent_path("analytics", restore_id);
+    let mut barrier = restore_control_json(&backend, &barrier_path).await;
+    let fields = barrier.as_object_mut().expect("barrier object");
+    assert!(fields.remove("completed_intent_etag").is_some());
+    assert!(fields.remove("backup_etag").is_some());
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &barrier_path, serde_json::to_vec(&barrier).expect("legacy barrier"))
+        .await;
+    let before_versions = maintenance_test_object_versions(&backend).await;
+    let before_reads = backend.state.lock().await.read_attempts.clone();
+
+    assert!(
+        store
+            .load_table("analytics", "sales", "orders")
+            .await
+            .expect("legacy barrier table load")
+            .is_some()
+    );
+    {
+        let state = backend.state.lock().await;
+        for path in [&intent_path, &backup.backup_path, &barrier_path] {
+            assert_eq!(
+                restore_path_read_count(&state.read_attempts, path) - restore_path_read_count(&before_reads, path),
+                2,
+                "legacy barrier must fully verify controls before and after a table read: {path}"
+            );
+        }
+    }
+    assert_eq!(
+        maintenance_test_object_versions(&backend).await,
+        before_versions,
+        "legacy read rewrote control format"
+    );
+
+    backend.seed_object(RUSTFS_META_BUCKET, &intent_path, b"{}".to_vec()).await;
+    let before_corrupt_read = maintenance_test_object_versions(&backend).await;
+    assert!(store.load_table("analytics", "sales", "orders").await.is_err());
+    assert!(store.get_namespace("analytics", "sales").await.is_err());
+    assert!(
+        store
+            .create_namespace(test_namespace_entry("analytics", &Namespace::parse("forbidden").expect("namespace")))
+            .await
+            .is_err()
+    );
+    assert_eq!(maintenance_test_object_versions(&backend).await, before_corrupt_read);
+}
+
+#[tokio::test]
+async fn completed_restore_rejects_incomplete_sealed_version_pairs() {
+    for absent_field in ["completed_intent_etag", "backup_etag"] {
+        let (backend, backup) = isolated_restore_fixture().await;
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        store
+            .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some("partial-control-seal"))
+            .await
+            .expect("complete restore");
+        let barrier_path = TableCatalogObjectPaths::default().catalog_restore_state_path("analytics");
+        let mut barrier = restore_control_json(&backend, &barrier_path).await;
+        assert!(
+            barrier
+                .as_object_mut()
+                .expect("barrier object")
+                .remove(absent_field)
+                .is_some()
+        );
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &barrier_path, serde_json::to_vec(&barrier).expect("partial barrier"))
+            .await;
+        let before = maintenance_test_object_versions(&backend).await;
+        assert!(store.load_table("analytics", "sales", "orders").await.is_err());
+        assert!(
+            store
+                .create_namespace(test_namespace_entry("analytics", &Namespace::parse("forbidden").expect("namespace")))
+                .await
+                .is_err()
+        );
+        assert_eq!(maintenance_test_object_versions(&backend).await, before);
+    }
+}
+
 async fn backup_fixture() -> (TestCatalogObjectBackend, TableCatalogBackupReport, String) {
     backup_fixture_with_backend(TestCatalogObjectBackend::default()).await
 }

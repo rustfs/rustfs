@@ -65,6 +65,8 @@ pub(crate) struct TableBucketEntry {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableRenameIntentState {
     Prepared,
+    /// The maintenance plan is durable before any destination sidecar is written.
+    MaintenancePrepared,
     SourceFenced,
     DestinationWritten,
     SourceTombstoned,

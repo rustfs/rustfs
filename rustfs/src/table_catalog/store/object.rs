@@ -483,6 +483,32 @@ where
         Ok(result)
     }
 
+    async fn with_table_maintenance_read<T>(
+        &self,
+        table_bucket: &str,
+        read: impl std::future::Future<Output = TableCatalogStoreResult<T>>,
+    ) -> TableCatalogStoreResult<T> {
+        self.with_catalog_restore_read(table_bucket, async {
+            let version = self.table_rename_read_version(table_bucket).await?;
+            let result = read.await?;
+            self.finish_table_rename_read(table_bucket, version.as_deref()).await?;
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn acquire_table_maintenance_publication_permit(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogLockGuard> {
+        let guard = self
+            .backend
+            .acquire_read_lock(table_bucket, &default_table_bucket_publication_lock_path())
+            .await?;
+        self.ensure_no_active_table_rename(table_bucket).await?;
+        Ok(guard)
+    }
+
     async fn list_entry_page<T, P, V>(
         &self,
         prefix: &str,
@@ -954,6 +980,7 @@ where
         let mut expected_destination = intent.source.clone();
         expected_destination.namespace.clone_from(&intent.destination.namespace);
         expected_destination.table.clone_from(&intent.destination.table);
+        expected_destination.updated_at.clone_from(&intent.destination.updated_at);
         if intent.version != 1
             || intent.source_snapshot_etag.is_empty()
             || intent.source.table_bucket != table_bucket
@@ -1005,103 +1032,170 @@ where
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<Option<(TableMaintenanceRenameIntent, String)>> {
         fence.ensure_held()?;
-        let source_objects = self.collect_table_maintenance_rename_objects(source).await?;
-        let destination_objects = self.collect_table_maintenance_rename_objects(destination).await?;
-        if source_objects.is_empty() && destination_objects.is_empty() {
-            return Ok(None);
-        }
-        let intent = TableMaintenanceRenameIntent {
-            version: 1,
-            source: source.clone(),
-            destination: destination.clone(),
-            source_snapshot_etag: source_snapshot_etag.to_string(),
-            source_objects,
-            destination_etags: destination_objects
-                .into_iter()
-                .map(|(key, value)| (key, value.etag))
-                .collect(),
+        let saved = self.read_table_maintenance_rename_intent(&source.table_bucket).await?;
+        let (intent, intent_etag) = if let Some((intent, etag)) = saved {
+            if intent.source != *source
+                || intent.destination != *destination
+                || intent.source_snapshot_etag != source_snapshot_etag
+            {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename intent belongs to a different catalog rename".to_string(),
+                ));
+            }
+            (intent, etag)
+        } else {
+            let source_objects = self.collect_table_maintenance_rename_objects(source).await?;
+            let destination_objects = self.collect_table_maintenance_rename_objects(destination).await?;
+            // Persist even an empty plan so a missing intent cannot be mistaken
+            // for a rename whose source never had maintenance state.
+            let intent = TableMaintenanceRenameIntent {
+                version: 1,
+                source: source.clone(),
+                destination: destination.clone(),
+                source_snapshot_etag: source_snapshot_etag.to_string(),
+                source_objects,
+                destination_etags: destination_objects
+                    .into_iter()
+                    .map(|(key, value)| (key, value.etag))
+                    .collect(),
+            };
+            let object = maintenance_rename_intent_path(&source.table_bucket);
+            let data = serde_json::to_vec(&intent).map_err(|err| {
+                TableCatalogStoreError::Internal(format!("failed to serialize maintenance rename intent: {err}"))
+            })?;
+            if data.len() > TABLE_CATALOG_BACKUP_MAX_SIZE {
+                return Err(TableCatalogStoreError::Invalid(
+                    "maintenance rename intent exceeds its byte limit".to_string(),
+                ));
+            }
+            self.backend
+                .put_object_fenced(self.catalog_bucket(), &object, data, TableCatalogPutPrecondition::IfAbsent, fence)
+                .await?;
+            let (persisted, etag) = self
+                .read_table_maintenance_rename_intent(&source.table_bucket)
+                .await?
+                .ok_or_else(|| TableCatalogStoreError::Conflict("maintenance rename intent disappeared".to_string()))?;
+            if persisted != intent {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename intent changed during preparation".to_string(),
+                ));
+            }
+            (intent, etag)
         };
-        let object = maintenance_rename_intent_path(&source.table_bucket);
-        let data = serde_json::to_vec(&intent)
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize maintenance rename intent: {err}")))?;
-        if data.len() > TABLE_CATALOG_BACKUP_MAX_SIZE {
-            return Err(TableCatalogStoreError::Invalid(
-                "maintenance rename intent exceeds its byte limit".to_string(),
-            ));
-        }
-        self.backend
-            .put_object_fenced(self.catalog_bucket(), &object, data, TableCatalogPutPrecondition::IfAbsent, fence)
-            .await?;
-        let (persisted_intent, intent_etag) = self
-            .read_table_maintenance_rename_intent(&source.table_bucket)
-            .await?
-            .ok_or_else(|| TableCatalogStoreError::Conflict("maintenance rename intent disappeared".to_string()))?;
-        if persisted_intent != intent {
+        Ok(Some((intent, intent_etag)))
+    }
+
+    async fn copy_table_maintenance_rename(
+        &self,
+        intent: &TableMaintenanceRenameIntent,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        let source = &intent.source;
+        let destination = &intent.destination;
+        let current_source = self.collect_table_maintenance_rename_objects(source).await?;
+        if current_source != intent.source_objects {
             return Err(TableCatalogStoreError::Conflict(
-                "maintenance rename intent changed during preparation".to_string(),
+                "maintenance rename source changed before catalog publication".to_string(),
             ));
         }
         let destination_prefix = maintenance_rename_prefix(destination)?;
         for (suffix, value) in &intent.source_objects {
             let renamed = maintenance_rename_data(source, destination, suffix, &value.data)?;
+            let object = format!("{destination_prefix}{suffix}");
+            let current = self
+                .backend
+                .read_object_limited(self.catalog_bucket(), &object, TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE)
+                .await?;
+            let precondition = match current {
+                Some(current) => {
+                    let data: serde_json::Value = serde_json::from_slice(&current.data).map_err(|_| {
+                        TableCatalogStoreError::Conflict("maintenance rename destination changed before publication".to_string())
+                    })?;
+                    if data == renamed {
+                        continue;
+                    }
+                    let expected = intent.destination_etags.get(suffix).ok_or_else(|| {
+                        TableCatalogStoreError::Conflict("maintenance rename destination appeared after preparation".to_string())
+                    })?;
+                    if current.etag.as_deref() != Some(expected.as_str()) {
+                        return Err(TableCatalogStoreError::Conflict(
+                            "maintenance rename destination watermark changed".to_string(),
+                        ));
+                    }
+                    TableCatalogPutPrecondition::IfMatch(expected.clone())
+                }
+                None if !intent.destination_etags.contains_key(suffix) => TableCatalogPutPrecondition::IfAbsent,
+                None => {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "maintenance rename destination disappeared after preparation".to_string(),
+                    ));
+                }
+            };
             let data = serde_json::to_vec(&renamed).map_err(|err| {
                 TableCatalogStoreError::Internal(format!("failed to serialize renamed maintenance object: {err}"))
             })?;
-            let precondition = intent
-                .destination_etags
-                .get(suffix)
-                .map_or(TableCatalogPutPrecondition::IfAbsent, |etag| {
-                    TableCatalogPutPrecondition::IfMatch(etag.clone())
-                });
             self.backend
-                .put_object_fenced(self.catalog_bucket(), &format!("{destination_prefix}{suffix}"), data, precondition, fence)
+                .put_object_fenced(self.catalog_bucket(), &object, data, precondition, fence)
                 .await?;
         }
-        // Inactive leftovers from a former visit to this name must not resurrect jobs or overrides.
-        for (suffix, etag) in &intent.destination_etags {
-            if !intent.source_objects.contains_key(suffix) {
-                self.backend
-                    .delete_object_if_match_fenced(self.catalog_bucket(), &format!("{destination_prefix}{suffix}"), etag, fence)
-                    .await?;
+        for (suffix, expected) in &intent.destination_etags {
+            if intent.source_objects.contains_key(suffix) {
+                continue;
             }
+            let object = format!("{destination_prefix}{suffix}");
+            let Some(current) = self.backend.object_metadata(self.catalog_bucket(), &object).await? else {
+                continue;
+            };
+            if current.etag.as_deref() != Some(expected.as_str()) {
+                return Err(TableCatalogStoreError::Conflict(
+                    "maintenance rename stale destination watermark changed".to_string(),
+                ));
+            }
+            self.backend
+                .delete_object_if_match_fenced(self.catalog_bucket(), &object, expected, fence)
+                .await?;
         }
-        let current_source = self.collect_table_maintenance_rename_objects(source).await?;
-        if current_source.len() != intent.source_objects.len()
-            || current_source
-                .iter()
-                .any(|(suffix, value)| intent.source_objects.get(suffix).is_none_or(|saved| saved.etag != value.etag))
-        {
+        if self.collect_table_maintenance_rename_objects(source).await? != intent.source_objects {
             return Err(TableCatalogStoreError::Conflict(
                 "maintenance rename source changed before catalog publication".to_string(),
             ));
         }
-        let current_destination = self.collect_table_maintenance_rename_objects(destination).await?;
-        if current_destination.len() != intent.source_objects.len() {
+        self.verify_table_maintenance_rename_destination(intent).await?;
+        fence.ensure_held()
+    }
+
+    async fn verify_table_maintenance_rename_destination(
+        &self,
+        intent: &TableMaintenanceRenameIntent,
+    ) -> TableCatalogStoreResult<()> {
+        let current = self.collect_table_maintenance_rename_objects(&intent.destination).await?;
+        if current.len() != intent.source_objects.len() {
             return Err(TableCatalogStoreError::Conflict(
                 "maintenance rename destination is not a complete mirror".to_string(),
             ));
         }
-        for (suffix, value) in &intent.source_objects {
-            if current_destination.get(suffix).map(|value| &value.data)
-                != Some(&maintenance_rename_data(source, destination, suffix, &value.data)?)
+        for (suffix, saved) in &intent.source_objects {
+            if current.get(suffix).map(|value| &value.data)
+                != Some(&maintenance_rename_data(&intent.source, &intent.destination, suffix, &saved.data)?)
             {
                 return Err(TableCatalogStoreError::Conflict(
                     "maintenance rename destination changed before publication".to_string(),
                 ));
             }
         }
-        fence.ensure_held()?;
-        Ok(Some((intent, intent_etag)))
+        Ok(())
     }
 
     pub(super) async fn finish_table_maintenance_rename(
         &self,
         intent: &TableMaintenanceRenameIntent,
-        intent_etag: &str,
         committed: bool,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<()> {
         fence.ensure_held()?;
+        if committed {
+            self.verify_table_maintenance_rename_destination(intent).await?;
+        }
         let authoritative = if committed { &intent.destination } else { &intent.source };
         let authoritative_objects = self.collect_table_maintenance_rename_objects(authoritative).await?;
         if intent
@@ -1143,6 +1237,15 @@ where
                 .delete_object_if_match_fenced(self.catalog_bucket(), &format!("{prefix}{suffix}"), &value.etag, fence)
                 .await?;
         }
+        fence.ensure_held()
+    }
+
+    async fn delete_table_maintenance_rename_intent(
+        &self,
+        intent: &TableMaintenanceRenameIntent,
+        intent_etag: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
         let object = maintenance_rename_intent_path(&intent.source.table_bucket);
         match self
             .backend
@@ -1150,13 +1253,12 @@ where
             .await
         {
             Ok(()) => Ok(()),
-            Err(err) => {
+            Err(error) => {
                 fence.ensure_held()?;
-                // A lost delete response after removal must not strand a committed rename.
-                if self.backend.object_metadata(self.catalog_bucket(), &object).await?.is_none() {
+                if !self.backend.object_exists(self.catalog_bucket(), &object).await? {
                     Ok(())
                 } else {
-                    Err(err)
+                    Err(error)
                 }
             }
         }
@@ -1540,6 +1642,55 @@ where
             ));
         }
 
+        let mutation_fence = publication
+            .object_mutation_fence()
+            .ok_or_else(|| TableCatalogStoreError::Internal("table rename requires a storage mutation fence".to_string()))?;
+        let maintenance = if intent.state == TableRenameIntentState::Prepared {
+            self.prepare_table_maintenance_rename(&intent.source, &intent.destination, &intent.source_etag, &mutation_fence)
+                .await
+                .map_err(maintenance_rename_recovery_error)?
+        } else {
+            let saved = self
+                .read_table_maintenance_rename_intent(table_bucket)
+                .await
+                .map_err(maintenance_rename_recovery_error)?;
+            if let Some((saved, _)) = saved.as_ref() {
+                if saved.source != intent.source
+                    || saved.destination != intent.destination
+                    || saved.source_snapshot_etag != intent.source_etag
+                {
+                    return Err(maintenance_rename_recovery_error(TableCatalogStoreError::Conflict(
+                        "maintenance rename intent does not match the active catalog rename".to_string(),
+                    )));
+                }
+            } else if intent.state != TableRenameIntentState::Completed {
+                return Err(maintenance_rename_recovery_error(TableCatalogStoreError::Unavailable(
+                    "active catalog rename is missing its maintenance intent".to_string(),
+                )));
+            }
+            saved
+        };
+        if intent.state == TableRenameIntentState::Prepared {
+            // This phase distinguishes a never-prepared rename from a lost
+            // sidecar intent after copying has become authorized.
+            intent_etag = self
+                .advance_table_rename_intent_unlocked(
+                    &intent_object,
+                    &mut intent,
+                    intent_etag,
+                    TableRenameIntentState::MaintenancePrepared,
+                    _intent_guard.write_commit_guards(),
+                )
+                .await?;
+        }
+        if intent.state < TableRenameIntentState::DestinationPublished
+            && let Some((maintenance, _)) = maintenance.as_ref()
+        {
+            self.copy_table_maintenance_rename(maintenance, &mutation_fence)
+                .await
+                .map_err(maintenance_rename_recovery_error)?;
+        }
+
         let mut source_fence = intent.source.clone();
         source_fence.state = TableCatalogEntryState::Renaming;
         // Keep the source object as a conditional-replacement tombstone instead of relying on an unconditional delete.
@@ -1744,6 +1895,11 @@ where
                 _intent_guard.write_commit_guards(),
             )
             .await?;
+        if let Some((maintenance, _)) = maintenance.as_ref() {
+            self.finish_table_maintenance_rename(maintenance, true, &mutation_fence)
+                .await
+                .map_err(maintenance_rename_recovery_error)?;
+        }
         self.advance_table_rename_intent_unlocked(
             &intent_object,
             &mut intent,
@@ -1752,6 +1908,13 @@ where
             _intent_guard.write_commit_guards(),
         )
         .await?;
+        // The completed record makes an interrupted intent deletion recognizable.
+        // Readers remain fenced until sidecar cleanup and finalization are durable.
+        if let Some((maintenance, etag)) = maintenance.as_ref() {
+            self.delete_table_maintenance_rename_intent(maintenance, etag, &mutation_fence)
+                .await
+                .map_err(maintenance_rename_recovery_error)?;
+        }
 
         let Some((mut bucket_entry, bucket_etag)) = self.read_table_bucket_with_etag_unlocked(table_bucket).await? else {
             return Err(TableCatalogStoreError::NotFound(format!("table bucket {table_bucket}")));
@@ -2354,51 +2517,6 @@ where
                 self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await
             }
         }
-    }
-
-    pub(in crate::table_catalog) async fn resolve_deleted_table_data_plane_resource_from_index(
-        &self,
-        table_bucket: &str,
-        object: &str,
-    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
-        let mut matched: Option<TableDataPlaneResource> = None;
-        for warehouse_object_prefix in warehouse_index_candidate_prefixes(object) {
-            let index_object = self.paths.warehouse_index_entry_path(table_bucket, warehouse_object_prefix);
-            let Some((index, _)) = self
-                .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &index_object)
-                .await?
-            else {
-                continue;
-            };
-            validate_table_warehouse_index_entry_object(&self.paths, &index_object, &index)?;
-            if index.table_bucket != table_bucket || index.warehouse_object_prefix != warehouse_object_prefix {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "warehouse index entry does not match indexed prefix: {index_object}"
-                )));
-            }
-            match &index.state {
-                TableCatalogEntryState::Active => {
-                    return Err(TableCatalogStoreError::Internal(format!(
-                        "active warehouse index {index_object} is absent from the authoritative strong catalog"
-                    )));
-                }
-                TableCatalogEntryState::Deleted => {}
-                TableCatalogEntryState::Renaming | TableCatalogEntryState::Deleting => {
-                    return Err(TableCatalogStoreError::Internal(format!(
-                        "warehouse index {index_object} has an incomplete transient state"
-                    )));
-                }
-            }
-            let resource = table_data_plane_resource_from_warehouse_index(&index)?;
-            if let Some(current) = matched.as_ref() {
-                return Err(TableCatalogStoreError::Invalid(format!(
-                    "object {object} matches overlapping deleted table warehouse indexes {} and {}",
-                    current.warehouse_object_prefix, resource.warehouse_object_prefix
-                )));
-            }
-            matched = Some(resource);
-        }
-        Ok(matched)
     }
 
     async fn scan_table_data_plane_resource_for_index_miss(
@@ -3175,7 +3293,7 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
             let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -3235,7 +3353,7 @@ where
         namespace: &str,
         table: &str,
     ) -> TableCatalogStoreResult<TableMaintenanceEffectiveConfig> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
             let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -3301,6 +3419,7 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
         validate_table_maintenance_config(&config)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -3349,6 +3468,9 @@ where
     ) -> TableCatalogStoreResult<()> {
         let _migration_guard = self
             .acquire_object_backed_catalog_write_permit(&report.job.table_bucket)
+            .await?;
+        let _publication_guard = self
+            .acquire_table_maintenance_publication_permit(&report.job.table_bucket)
             .await?;
         self.put_table_metadata_maintenance_report_unfenced(report).await
     }
@@ -3421,7 +3543,7 @@ where
         table: &str,
         job_id: &str,
     ) -> TableCatalogStoreResult<Option<TableMetadataMaintenanceReport>> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
             let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -3504,7 +3626,7 @@ where
         table: &str,
         now: OffsetDateTime,
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
             let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -3651,6 +3773,7 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let namespace_name = namespace.public_name();
         let table_name = table.as_str().to_string();
@@ -3837,6 +3960,7 @@ where
                 })?
         } else {
             let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+            let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
             let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
                 return Err(TableCatalogStoreError::NotFound(format!(
@@ -4372,6 +4496,7 @@ where
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let namespace_name = namespace.public_name();
         let table_name = table.as_str().to_string();
@@ -4647,6 +4772,9 @@ where
         let table = parse_table_for_store(heartbeat.table)?;
         let _migration_guard = self
             .acquire_object_backed_catalog_write_permit(heartbeat.table_bucket)
+            .await?;
+        let _publication_guard = self
+            .acquire_table_maintenance_publication_permit(heartbeat.table_bucket)
             .await?;
         let table_path = self.paths.table_entry_path(heartbeat.table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
@@ -4941,7 +5069,7 @@ where
     where
         P: TableCatalogObjectBackend,
     {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             validate_table_snapshot_expiration_config(&config)?;
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
@@ -5010,7 +5138,7 @@ where
         table: &str,
         config: TableCompactionPlanningConfig,
     ) -> TableCatalogStoreResult<TableCompactionPlanningReport> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             validate_table_compaction_planning_config(&config)?;
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
@@ -5352,7 +5480,7 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        self.with_catalog_restore_read(table_bucket, async {
+        self.with_table_maintenance_read(table_bucket, async {
             let namespace = parse_namespace_for_store(namespace)?;
             let table = parse_table_for_store(table)?;
             let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
@@ -5363,25 +5491,10 @@ where
                     table.as_str()
                 )));
             };
-            self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, true)
+            self.plan_table_metadata_maintenance_for_entry(&entry, retain_recent_metadata_files)
                 .await
         })
         .await
-    }
-
-    pub(crate) async fn run_table_metadata_maintenance_planning(
-        &self,
-        table_bucket: &str,
-        namespace: &str,
-        table: &str,
-        retain_recent_metadata_files: usize,
-        _snapshot_expiration: Option<TableSnapshotExpirationConfig>,
-        _compaction: Option<TableCompactionPlanningConfig>,
-    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let report = self
-            .plan_table_metadata_maintenance(table_bucket, namespace, table, retain_recent_metadata_files)
-            .await?;
-        Ok(report)
     }
 
     pub(super) async fn plan_table_metadata_maintenance_for_entry(
@@ -5391,6 +5504,61 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         self.plan_table_metadata_maintenance_for_entry_with_scope(entry, retain_recent_metadata_files, true)
             .await
+    }
+
+    async fn ensure_exclusive_metadata_cleanup_scope(
+        &self,
+        entry: &TableEntry,
+        publication_fenced: bool,
+    ) -> TableCatalogStoreResult<()> {
+        let directory = table_metadata_dir_path_for_entry(entry)?;
+        let owners = if publication_fenced {
+            // Cleanup already holds the bucket publication permit. Every table
+            // entry mutation needs its write side, so these entries are stable.
+            // Acquiring other entry locks while holding this table's write lock
+            // would deadlock two concurrent cleanups in opposite scan order.
+            let objects = self
+                .list_table_entry_objects_for_data_plane_scan(
+                    &entry.table_bucket,
+                    TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS,
+                )
+                .await?;
+            let mut owners = Vec::with_capacity(objects.len());
+            for object in objects {
+                let Some((owner, _)) = self.read_entry_unlocked::<TableEntry>(self.catalog_bucket(), &object).await? else {
+                    return Err(TableCatalogStoreError::Conflict(
+                        "metadata ownership entry disappeared during the publication-fenced scan".to_string(),
+                    ));
+                };
+                validate_table_entry_object(&self.paths, &object, &owner)?;
+                owners.push(owner);
+            }
+            owners
+        } else {
+            self.list_all_table_entries_with_limit(
+                &entry.table_bucket,
+                Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS),
+                None,
+            )
+            .await?
+        };
+        for owner in owners {
+            if owner.state != TableCatalogEntryState::Active
+                || (owner.namespace == entry.namespace && owner.table == entry.table && owner.table_id == entry.table_id)
+            {
+                continue;
+            }
+            let other_directory = table_metadata_dir_path_for_entry(&owner)?;
+            if directory == other_directory
+                || directory.starts_with(&format!("{other_directory}/"))
+                || other_directory.starts_with(&format!("{directory}/"))
+            {
+                return Err(TableCatalogStoreError::Conflict(
+                    "metadata cleanup directory overlaps another active table owner".to_string(),
+                ));
+            }
+        }
+        Ok(())
     }
 
     async fn plan_table_metadata_maintenance_for_entry_with_scope(
@@ -5415,8 +5583,11 @@ where
             ));
         }
 
-        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
-        else {
+        self.ensure_exclusive_metadata_cleanup_scope(entry, false).await?;
+        let current_object = table_catalog_object_key_from_location(table_bucket, &entry.metadata_location).ok_or_else(|| {
+            TableCatalogStoreError::Invalid("current metadata location is not a same-bucket object".to_string())
+        })?;
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &current_object).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
@@ -5433,10 +5604,10 @@ where
                 TableMetadataMaintenanceReason::MetadataLog,
             );
         }
-        retained.insert(entry.metadata_location.clone());
+        retained.insert(current_object.clone());
         insert_metadata_maintenance_reason(
             &mut maintenance_reasons,
-            entry.metadata_location.clone(),
+            current_object.clone(),
             TableMetadataMaintenanceReason::CurrentMetadata,
         );
 
@@ -5463,7 +5634,7 @@ where
 
         for metadata_location in metadata_locations.iter().rev().take(retain_recent_metadata_files) {
             retained.insert(metadata_location.clone());
-            if metadata_location != &entry.metadata_location {
+            if metadata_location != &current_object {
                 insert_metadata_maintenance_reason(
                     &mut maintenance_reasons,
                     metadata_location.clone(),
@@ -5719,6 +5890,7 @@ where
         effective: TableMaintenanceEffectiveConfig,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
         let mut report = self
             .plan_table_metadata_maintenance(table_bucket, namespace, table, effective.config.retain_recent_metadata_files)
             .await?;
@@ -5858,25 +6030,6 @@ where
         Ok(report)
     }
 
-    pub(super) async fn finish_table_metadata_maintenance_run_for_entry_with_publication(
-        &self,
-        entry: &TableEntry,
-        delete: bool,
-        effective: &TableMaintenanceEffectiveConfig,
-        report: TableMetadataMaintenanceReport,
-        publication: &(dyn TableCommitPublication + Sync),
-    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        self.finish_table_metadata_maintenance_run_for_entry_with_optional_publication(
-            entry,
-            delete,
-            effective,
-            report,
-            Some(publication),
-            false,
-        )
-        .await
-    }
-
     async fn finish_table_metadata_maintenance_run_for_entry_with_optional_publication(
         &self,
         entry: &TableEntry,
@@ -5998,6 +6151,7 @@ where
         report: TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
+        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
         self.delete_table_metadata_maintenance_report_unfenced(table_bucket, namespace, table, report)
             .await
     }
@@ -6011,11 +6165,6 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-        if !is_valid_table_metadata_location(&namespace, &table, &report.current_metadata_location) {
-            return Err(TableCatalogStoreError::Invalid(
-                "maintenance report current metadata location must be inside the table metadata directory".to_string(),
-            ));
-        }
 
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
@@ -6051,13 +6200,7 @@ where
         let table_bucket = &entry.table_bucket;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
-        let is_valid_location = |location: &str| {
-            if publication.is_some() {
-                is_valid_table_metadata_location_for_entry(entry, location)
-            } else {
-                is_valid_table_metadata_location(&namespace, &table, location)
-            }
-        };
+        let is_valid_location = |location: &str| is_valid_table_metadata_location_for_entry(entry, location);
         if !is_valid_location(&report.current_metadata_location) {
             return Err(TableCatalogStoreError::Invalid(
                 "maintenance report current metadata location must be inside the table metadata directory".to_string(),
@@ -6071,8 +6214,11 @@ where
         }
         let warehouse_object_prefix = table_warehouse_object_prefix(entry).ok();
 
-        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &entry.metadata_location).await?
-        else {
+        self.ensure_exclusive_metadata_cleanup_scope(entry, true).await?;
+        let current_object = table_catalog_object_key_from_location(table_bucket, &entry.metadata_location).ok_or_else(|| {
+            TableCatalogStoreError::Invalid("current metadata location is not a same-bucket object".to_string())
+        })?;
+        let Some(current_metadata) = read_table_metadata_value(&self.backend, table_bucket, &current_object).await? else {
             return Err(TableCatalogStoreError::NotFound(format!(
                 "current metadata object {}",
                 entry.metadata_location
@@ -6080,7 +6226,7 @@ where
         };
 
         let mut protected = metadata_log_locations_matching(&current_metadata, table_bucket, is_valid_location);
-        protected.insert(entry.metadata_location.clone());
+        protected.insert(current_object);
         protected.extend(report.retained_metadata_locations.iter().cloned());
         protected.extend(
             metadata_locations_for_protected_snapshot_refs_matching(
@@ -6801,7 +6947,30 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let interrupted_request = if let Some((bucket, _)) = self
+            .read_entry::<TableBucketEntry>(self.catalog_bucket(), &self.paths.table_bucket_entry_path(table_bucket))
+            .await?
+            && let Some(rename_id) = bucket.active_rename_id.as_deref()
+        {
+            self.read_entry::<TableRenameIntent>(
+                self.catalog_bucket(),
+                &self.paths.table_rename_intent_path(table_bucket, rename_id),
+            )
+            .await?
+            .map(|(intent, _)| {
+                intent.source.namespace == source_namespace.public_name()
+                    && intent.source.table == source_table.as_str()
+                    && intent.destination.namespace == destination_namespace.public_name()
+                    && intent.destination.table == destination_table.as_str()
+            })
+            .unwrap_or(false)
+        } else {
+            false
+        };
         self.recover_active_table_rename(table_bucket, &publication).await?;
+        if interrupted_request {
+            return Ok(());
+        }
 
         {
             let bucket_object = self.paths.table_bucket_entry_path(table_bucket);
@@ -6815,6 +6984,15 @@ where
             if bucket_entry.active_rename_id.is_some() {
                 return Err(TableCatalogStoreError::Unavailable(format!(
                     "table bucket {table_bucket} has an active table rename"
+                )));
+            }
+            if self
+                .backend
+                .object_exists(self.catalog_bucket(), &maintenance_rename_intent_path(table_bucket))
+                .await?
+            {
+                return Err(maintenance_rename_recovery_error(TableCatalogStoreError::Unavailable(
+                    "maintenance rename intent has no owning bucket fence".to_string(),
                 )));
             }
 

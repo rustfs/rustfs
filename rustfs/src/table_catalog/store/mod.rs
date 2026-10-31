@@ -460,11 +460,6 @@ pub(crate) trait TableCommitPublication: Send + Sync {
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
-    /// Whether bucket publication acquires its own migration read permits.
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        false
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -542,15 +537,6 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
         }
         state.guards.push(guard);
         Ok(())
-    }
-
-    fn release_publication_locks(&self) {
-        // Read-only planning may proceed without excluding unrelated tables' commits.
-        // The migration permit remains attached until the whole operation completes.
-        let mut state = self.state.lock();
-        state.table = None;
-        state.table_bucket = None;
-        state.guards.clear();
     }
 }
 
@@ -982,11 +968,6 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         false
     }
 
-    /// Whether bucket publication acquires its own migration read permits.
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        false
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -1113,10 +1094,6 @@ where
         self.table_commit_publication_is_held(table_bucket, namespace, table)
     }
 
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        TableCatalogObjectBackend::acquires_catalog_migration_read_permit(self)
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         TableCatalogObjectBackend::catalog_migration_read_permit_status(self)
     }
@@ -1144,10 +1121,6 @@ impl Default for TableCatalogObjectPaths {
 }
 
 impl TableCatalogObjectPaths {
-    pub fn table_bucket_entries_prefix(&self) -> String {
-        format!("{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT)
-    }
-
     pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
         format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
@@ -2038,6 +2011,22 @@ where
         }
     }
 
+    pub(crate) async fn export_catalog_backup(&self, table_bucket: &str, backup_id: &str) -> TableCatalogStoreResult<Vec<u8>> {
+        match self {
+            Self::ObjectBacked(store) => store.export_object_catalog_backup(table_bucket, backup_id).await,
+        }
+    }
+
+    pub(crate) async fn import_catalog_backup(
+        &self,
+        table_bucket: &str,
+        data: Vec<u8>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
+        match self {
+            Self::ObjectBacked(store) => store.import_object_catalog_backup(table_bucket, data).await,
+        }
+    }
+
     pub(crate) async fn restore_catalog_backup_with_id(
         &self,
         table_bucket: &str,
@@ -2090,10 +2079,6 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        true
-    }
-
     async fn acquire_catalog_migration_read_guards(
         &self,
         table_bucket: &str,

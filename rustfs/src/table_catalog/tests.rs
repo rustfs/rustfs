@@ -21,6 +21,12 @@ const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 #[path = "tests/object_backup_validation.rs"]
 mod object_backup_validation;
 
+#[path = "tests/object_maintenance_equivalence.rs"]
+mod object_maintenance_equivalence;
+
+#[path = "tests/object_backup_transfer.rs"]
+mod object_backup_transfer;
+
 #[tokio::test]
 async fn catalog_backings_fence_direct_commits_with_publication_lock() {
     let object_backend = TestCatalogObjectBackend::default();
@@ -1533,10 +1539,10 @@ async fn object_catalog_table_rename_recovers_after_destination_publish_and_fenc
         store.load_table(bucket, "curated", "orders_v2").await,
         Err(TableCatalogStoreError::Unavailable(_))
     );
-    assert_matches!(
-        store.rename_table(bucket, "sales", "orders", "curated", "orders_v2").await,
-        Err(TableCatalogStoreError::TableNotFound(_))
-    );
+    store
+        .rename_table(bucket, "sales", "orders", "curated", "orders_v2")
+        .await
+        .expect("retrying the interrupted rename must return its recovered success");
 
     assert!(store.load_table(bucket, "sales", "orders").await.unwrap().is_none());
     let destination = store

@@ -97,6 +97,30 @@ async fn call_catalog_restore_handler(request: S3Request<Body>) -> S3Result<S3Re
     RestoreTableCatalogBackupHandler {}.call(request, matched.params).await
 }
 
+async fn call_catalog_backup_export_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/export"), ())
+            .expect("backup export test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup export test route should match");
+    ExportTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
+async fn call_catalog_backup_import_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/import"), ())
+            .expect("backup import test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup import test route should match");
+    ImportTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
 async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router
@@ -105,16 +129,6 @@ async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S
     let path = request.uri.path().to_string();
     let matched = router.at(&path).expect("worker test route should match");
     RunTableMaintenanceWorkerHandler {}.call(request, matched.params).await
-}
-
-async fn call_metadata_maintenance_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut router = matchit::Router::new();
-    router
-        .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata", ())
-        .expect("maintenance test route should insert");
-    let path = request.uri.path().to_string();
-    let matched = router.at(&path).expect("maintenance test route should match");
-    RestTableMetadataMaintenanceHandler {}.call(request, matched.params).await
 }
 
 #[tokio::test]
@@ -1456,12 +1470,14 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
         .await
         .expect("vended credential policy should be attached");
 
-    let action_credentials = rustfs_credentials::Credentials {
-        access_key: "load-table-root-access-key".to_string(),
-        secret_key: "load-table-root-secret-key".to_string(),
-        status: "on".to_string(),
-        ..Default::default()
-    };
+    // IAM's persistence reader verifies STS tokens with the process-wide root
+    // key, so this context must use the same signer when another test ran first.
+    let _ = rustfs_credentials::init_global_action_credentials(
+        Some("load-table-root-access-key".to_string()),
+        Some("load-table-root-secret-key".to_string()),
+    );
+    let action_credentials =
+        rustfs_credentials::get_global_action_cred().expect("a process-wide root signer should be initialized before vending");
     let context = Arc::new(AppContext::new(
         object_store.clone(),
         Arc::new(RequestIam { handle: iam }),
@@ -1822,6 +1838,8 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("DisableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
         ("CreateTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("ExportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("ImportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestoreTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
         ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
@@ -2043,6 +2061,8 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     let src = table_catalog_handler_source();
 
     for handler in [
+        "ExportTableCatalogBackupHandler",
+        "ImportTableCatalogBackupHandler",
         "BackfillTableWarehouseIndexHandler",
         "RestListNamespacesHandler",
         "RestCreateNamespaceHandler",
@@ -2550,6 +2570,446 @@ fn table_maintenance_worker_condition_rejects_null_malformed_duplicate_and_unkno
         r#"{"expected-job-id":"job-a","expected-attempt":0,"force":true}"#,
     ] {
         assert!(serde_json::from_str::<TableMaintenanceWorkerRunRequest>(body).is_err(), "{body}");
+    }
+}
+
+struct BackupTransferHandlerFixture {
+    context: Arc<AppContext>,
+    backend: crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>,
+    catalog: crate::table_catalog::EcStoreTableCatalogStore<ECStore>,
+    bucket: String,
+    root: rustfs_credentials::Credentials,
+    _data_root: tempfile::TempDir,
+}
+
+impl BackupTransferHandlerFixture {
+    async fn new(bucket: &str) -> Self {
+        let (data_root, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        object_store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("transfer bucket should be created");
+        enable_table_bucket_marker(&object_store, bucket)
+            .await
+            .expect("transfer bucket marker should be enabled");
+        rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("transfer request IAM format");
+        let iam = rustfs_iam::build_iam_sys(object_store.clone())
+            .await
+            .expect("transfer request IAM");
+        for (access_key, secret_key) in [
+            ("backup-transfer-reader", "backup-transfer-reader-secret"),
+            ("backup-transfer-operator", "backup-transfer-operator-secret"),
+        ] {
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: secret_key.to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("transfer request user");
+        }
+        iam.set_policy(
+            "backup-transfer-policy",
+            Policy::parse_config(
+                &serde_json::to_vec(&serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": "admin:MigrateTableCatalog",
+                        "Resource": format!("arn:aws:s3:::{bucket}")
+                    }]
+                }))
+                .expect("transfer policy JSON"),
+            )
+            .expect("transfer policy"),
+        )
+        .await
+        .expect("transfer policy should be stored");
+        iam.policy_db_set("backup-transfer-operator", UserType::Reg, false, "backup-transfer-policy")
+            .await
+            .expect("transfer policy should be warehouse-scoped");
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("backup-transfer-root".to_string()),
+            Some("backup-transfer-root-secret".to_string()),
+        );
+        let mut root = rustfs_credentials::get_global_action_cred().expect("transfer test root signer");
+        root.status = "on".to_string();
+        let context = Arc::new(AppContext::new(
+            object_store.clone(),
+            Arc::new(RequestIam { handle: iam }),
+            Arc::new(RequestKms),
+        ));
+        assert!(context.publish_action_credentials(root.clone()));
+        let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store);
+        let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+            backend.clone(),
+            crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        );
+        Self {
+            _data_root: data_root,
+            context,
+            backend,
+            catalog,
+            bucket: bucket.to_string(),
+            root,
+        }
+    }
+
+    fn request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
+        let mut request = table_catalog_handler_request(self.context.clone(), &self.root.access_key, &self.root.secret_key);
+        request.method = Method::POST;
+        request.uri = format!("{prefix}/{}/catalog/backup/{operation}", self.bucket)
+            .parse()
+            .expect("transfer request URI");
+        request.input = Body::from(data);
+        request
+    }
+
+    fn operator_request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
+        let mut request = self.request(prefix, operation, data);
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: "backup-transfer-operator".to_string(),
+            secret_key: s3s::auth::SecretKey::from("backup-transfer-operator-secret".to_string()),
+        });
+        request
+    }
+
+    async fn inventory(&self) -> BTreeMap<(String, String), (Vec<u8>, Option<String>)> {
+        let mut objects = BTreeMap::new();
+        for bucket in [crate::admin::storage_api::RUSTFS_META_BUCKET, self.bucket.as_str()] {
+            for path in self
+                .backend
+                .list_objects(bucket, "")
+                .await
+                .expect("transfer inventory should list")
+            {
+                let object = self
+                    .backend
+                    .read_object(bucket, &path)
+                    .await
+                    .expect("transfer inventory object should read")
+                    .expect("listed transfer object should exist");
+                objects.insert((bucket.to_string(), path), (object.data, object.etag));
+            }
+        }
+        objects
+    }
+}
+
+fn assert_backup_transfer_response_is_private(response: &S3Response<(StatusCode, Body)>) {
+    assert_eq!(response.output.0, StatusCode::OK);
+    assert_eq!(response.headers.get(CONTENT_TYPE), Some(&HeaderValue::from_static(JSON_CONTENT_TYPE)));
+    assert_eq!(
+        response.headers.get(http::header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store, private"))
+    );
+    assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+}
+
+#[test]
+fn catalog_backup_export_request_is_strict() {
+    let request: CatalogBackupExportRequest = serde_json::from_str(r#"{"backup-id":"backup-a"}"#).expect("export request");
+    assert_eq!(request.backup_id, "backup-a");
+    for body in [
+        r#"{}"#,
+        r#"{"backup-id":false}"#,
+        r#"{"backup-id":"backup-a","backup-id":"backup-b"}"#,
+        r#"{"backup-id":"backup-a","metadata-location":"arbitrary-object"}"#,
+        r#"{"backupId":"backup-a"}"#,
+    ] {
+        assert!(serde_json::from_str::<CatalogBackupExportRequest>(body).is_err(), "{body}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_publish_catalogs() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-transfer-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            source
+                .catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("source catalog should exist before capture");
+            let backup = source
+                .catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("source backup");
+            let artifact = source
+                .backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+                .await
+                .expect("read saved artifact")
+                .expect("saved artifact");
+            let export_body = serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id})).unwrap();
+            let source_before = source.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let exported = call_catalog_backup_export_handler(source.operator_request(prefix, "export", export_body.clone()))
+                    .await
+                    .expect("warehouse-authorized operator can export");
+                assert_backup_transfer_response_is_private(&exported);
+                assert_eq!(exported.output.1.bytes().expect("raw export body").as_ref(), artifact.data.as_slice());
+                assert_eq!(source.inventory().await, source_before, "export modified the saved artifact or catalog");
+            }
+
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            let target_before = target.inventory().await;
+            assert!(
+                target
+                    .catalog
+                    .get_table_bucket(&bucket)
+                    .await
+                    .expect("target catalog lookup")
+                    .is_none()
+            );
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                for operation in ["export", "import"] {
+                    let data = if operation == "export" {
+                        export_body.clone()
+                    } else {
+                        artifact.data.clone()
+                    };
+                    let mut request = target.request(prefix, operation, data);
+                    request.credentials = Some(s3s::auth::Credentials {
+                        access_key: "backup-transfer-reader".to_string(),
+                        secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
+                    });
+                    let error = if operation == "export" {
+                        call_catalog_backup_export_handler(request).await
+                    } else {
+                        call_catalog_backup_import_handler(request).await
+                    }
+                    .expect_err("a reader without migrate permission cannot transfer an artifact");
+                    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                    assert_eq!(target.inventory().await, target_before, "permission denial modified target objects");
+                }
+            }
+
+            let imported = call_catalog_backup_import_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                artifact.data.clone(),
+            ))
+            .await
+            .expect("import should only save the candidate artifact");
+            assert_backup_transfer_response_is_private(&imported);
+            let imported: serde_json::Value = serde_json::from_slice(&imported.output.1.bytes().expect("import body")).unwrap();
+            assert_eq!(imported["status"], "CREATED");
+            assert_eq!(imported["backup_id"], backup.backup_id);
+            assert_eq!(imported["created_at"], backup.created_at);
+            let mut after_import = target.inventory().await;
+            let saved = after_import
+                .remove(&(crate::admin::storage_api::RUSTFS_META_BUCKET.to_string(), backup.backup_path.clone()))
+                .expect("only the artifact path should have been added");
+            assert_eq!(saved.0, artifact.data);
+            assert!(saved.1.is_some());
+            assert_eq!(after_import, target_before, "import published catalog, metadata, or recovery objects");
+            assert!(
+                target
+                    .catalog
+                    .get_table_bucket(&bucket)
+                    .await
+                    .expect("target remains unpublished")
+                    .is_none()
+            );
+
+            let target_after = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let repeated =
+                    call_catalog_backup_import_handler(target.operator_request(prefix, "import", artifact.data.clone()))
+                        .await
+                        .expect("identical import should be idempotent");
+                assert_backup_transfer_response_is_private(&repeated);
+                let mut repeated: serde_json::Value =
+                    serde_json::from_slice(&repeated.output.1.bytes().expect("repeat body")).unwrap();
+                assert_eq!(repeated["status"], "ALREADY_PRESENT");
+                repeated["status"] = imported["status"].clone();
+                assert_eq!(repeated, imported, "retry changed the saved timestamp or report");
+                let exported = call_catalog_backup_export_handler(target.operator_request(prefix, "export", export_body.clone()))
+                    .await
+                    .expect("a saved candidate is exportable before restore");
+                assert_backup_transfer_response_is_private(&exported);
+                assert_eq!(exported.output.1.bytes().expect("target export").as_ref(), artifact.data.as_slice());
+                assert_eq!(target.inventory().await, target_after, "retry or export rewrote object bytes or ETags");
+            }
+
+            let foreign_bucket = format!("foreign-transfer-{}", Uuid::new_v4().simple());
+            let target_store = target.context.object_store();
+            target_store
+                .make_bucket(&foreign_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            enable_table_bucket_marker(&target_store, &foreign_bucket).await.unwrap();
+            let before = target.inventory().await;
+            for operation in ["export", "import"] {
+                let data = if operation == "export" {
+                    export_body.clone()
+                } else {
+                    artifact.data.clone()
+                };
+                let mut request = target.operator_request(TABLE_CATALOG_PREFIX, operation, data);
+                request.uri = format!("{TABLE_CATALOG_PREFIX}/{foreign_bucket}/catalog/backup/{operation}")
+                    .parse()
+                    .unwrap();
+                let error = if operation == "export" {
+                    call_catalog_backup_export_handler(request).await
+                } else {
+                    call_catalog_backup_import_handler(request).await
+                }
+                .expect_err("warehouse-scoped permission cannot transfer another warehouse");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before);
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_transfer_handlers_reject_invalid_bodies_and_disabled_buckets_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-import-limits-{}", Uuid::new_v4().simple());
+            let fixture = BackupTransferHandlerFixture::new(&bucket).await;
+            fixture
+                .catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("source catalog for validation fixture");
+            let backup = fixture
+                .catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("validation artifact");
+            let stored = fixture
+                .backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+                .await
+                .unwrap()
+                .unwrap();
+            let before = fixture.inventory().await;
+            for modification in ["malformed", "unknown-field", "foreign-warehouse", "identity"] {
+                let data = if modification == "malformed" {
+                    b"not-json".to_vec()
+                } else {
+                    let mut candidate: serde_json::Value = serde_json::from_slice(&stored.data).unwrap();
+                    match modification {
+                        "unknown-field" => candidate["allow-replace"] = serde_json::Value::Bool(true),
+                        "foreign-warehouse" => candidate["table_bucket"] = serde_json::json!("unrelated-warehouse"),
+                        "identity" => candidate["backup_id"] = serde_json::json!("wrong-backup-identity"),
+                        _ => unreachable!(),
+                    }
+                    serde_json::to_vec(&candidate).unwrap()
+                };
+                let error = call_catalog_backup_import_handler(fixture.request(TABLE_CATALOG_PREFIX, "import", data))
+                    .await
+                    .expect_err("invalid artifact must not enter persistent storage");
+                assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST), "{modification}");
+                assert_eq!(fixture.inventory().await, before, "invalid {modification} mutated persistent state");
+            }
+
+            let error = call_catalog_backup_export_handler(fixture.request(
+                TABLE_CATALOG_PREFIX,
+                "export",
+                serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id, "unknown": true})).unwrap(),
+            ))
+            .await
+            .expect_err("export JSON must reject unknown fields");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(fixture.inventory().await, before);
+
+            let error = call_catalog_backup_import_handler(fixture.request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                vec![b' '; CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE + 1],
+            ))
+            .await
+            .expect_err("import body limit must apply before artifact decoding or persistence");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(fixture.inventory().await, before);
+
+            let disabled_bucket = format!("backup-disabled-{}", Uuid::new_v4().simple());
+            fixture
+                .context
+                .object_store()
+                .make_bucket(&disabled_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            let before = fixture.inventory().await;
+            for operation in ["export", "import"] {
+                let data = if operation == "export" {
+                    serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id})).unwrap()
+                } else {
+                    stored.data.clone()
+                };
+                let mut request = fixture.request(TABLE_CATALOG_PREFIX, operation, data);
+                request.uri = format!("{TABLE_CATALOG_PREFIX}/{disabled_bucket}/catalog/backup/{operation}")
+                    .parse()
+                    .unwrap();
+                let error = if operation == "export" {
+                    call_catalog_backup_export_handler(request).await
+                } else {
+                    call_catalog_backup_import_handler(request).await
+                }
+                .expect_err("a bucket without the table marker must reject artifact transfer");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(error.message().unwrap_or_default().contains("not table-enabled"));
+                assert_eq!(fixture.inventory().await, before);
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_backup_transfer_handlers_authenticate_before_store_access() {
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        for operation in ["export", "import"] {
+            let request = S3Request {
+                input: Body::from(b"not-an-artifact".to_vec()),
+                method: Method::POST,
+                uri: format!("{prefix}/warehouse/catalog/backup/{operation}")
+                    .parse()
+                    .expect("transfer URI"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let error = if operation == "export" {
+                call_catalog_backup_export_handler(request).await
+            } else {
+                call_catalog_backup_import_handler(request).await
+            }
+            .expect_err("transfer must authenticate before resolving its object store or body");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("authentication required"));
+        }
     }
 }
 

@@ -21,6 +21,9 @@ use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 
+#[path = "object_backup_transfer.rs"]
+mod transfer;
+
 const OBJECT_CATALOG_BACKUP_VERSION: u16 = 1;
 const OBJECT_CATALOG_BACKUP_MAX_SIZE: usize = 64 * 1024 * 1024;
 const OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE: usize = 16 * 1024 * 1024;
@@ -85,6 +88,10 @@ struct ObjectCatalogRestoreState {
     backup_id: String,
     request_fingerprint: String,
     state: ObjectCatalogRestoreStateKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completed_intent_etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    backup_etag: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -305,6 +312,9 @@ where
             || state.restore_id.len() > 256
             || state.backup_id.is_empty()
             || state.request_fingerprint.len() != 64
+            || state.completed_intent_etag.as_deref().is_some_and(str::is_empty)
+            || state.backup_etag.as_deref().is_some_and(str::is_empty)
+            || state.completed_intent_etag.is_some() != state.backup_etag.is_some()
         {
             return Err(TableCatalogStoreError::Invalid(
                 "catalog restore state identity or version is invalid".to_string(),
@@ -397,7 +407,9 @@ where
             .read_object_limited(self.catalog_bucket(), &path, OBJECT_CATALOG_RESTORE_STATE_MAX_SIZE)
             .await?
         else {
-            return Ok(None);
+            return Err(TableCatalogStoreError::Unavailable(
+                "catalog restore state disappeared during observation".to_string(),
+            ));
         };
         let etag = stored
             .etag
@@ -476,6 +488,26 @@ where
         match self.read_object_catalog_restore_state(table_bucket).await? {
             None => Ok(None),
             Some((state, etag)) if state.state == ObjectCatalogRestoreStateKind::Completed => {
+                // These immutable object versions were fully validated before
+                // publication. Avoid decoding a large backup on every table read.
+                if let (Some(intent_etag), Some(backup_etag)) =
+                    (state.completed_intent_etag.as_deref(), state.backup_etag.as_deref())
+                {
+                    for (path, expected) in [
+                        (self.paths.catalog_restore_intent_path(table_bucket, &state.restore_id), intent_etag),
+                        (self.paths.catalog_backup_path(table_bucket, &state.backup_id), backup_etag),
+                    ] {
+                        let metadata = self.backend.object_metadata(self.catalog_bucket(), &path).await?;
+                        if metadata.as_ref().and_then(|metadata| metadata.etag.as_deref()) != Some(expected) {
+                            return Err(TableCatalogStoreError::Unavailable(
+                                "completed catalog restore control object changed or disappeared".to_string(),
+                            ));
+                        }
+                    }
+                    return Ok(Some(etag));
+                }
+                // Earlier restore barriers have no sealed object versions; keep
+                // their full validation path so no state migration is required.
                 let Some((intent, _)) = self
                     .read_object_catalog_restore_intent(table_bucket, &state.restore_id)
                     .await?
@@ -623,11 +655,12 @@ where
         Ok(objects)
     }
 
-    async fn validate_catalog_backup_snapshot_graph(
+    fn validate_catalog_backup_metadata_identities(
         &self,
         table_bucket: &str,
         objects: &[ObjectCatalogBackupObject],
-    ) -> TableCatalogStoreResult<()> {
+    ) -> TableCatalogStoreResult<Vec<(TableEntry, serde_json::Value)>> {
+        let mut tables = Vec::new();
         for object in objects
             .iter()
             .filter(|object| object.bucket == RUSTFS_META_BUCKET && object.object.ends_with(TABLE_ENTRY_FILE))
@@ -666,6 +699,17 @@ where
                     "catalog backup metadata does not match its table identity".to_string(),
                 ));
             }
+            tables.push((entry, metadata));
+        }
+        Ok(tables)
+    }
+
+    async fn validate_catalog_backup_snapshot_graph(
+        &self,
+        table_bucket: &str,
+        objects: &[ObjectCatalogBackupObject],
+    ) -> TableCatalogStoreResult<()> {
+        for (entry, metadata) in self.validate_catalog_backup_metadata_identities(table_bucket, objects)? {
             let context = TableSnapshotGraphValidationContext::new(&self.backend, table_bucket, &entry);
             validate_table_snapshot_changes(&context, None, &metadata).await?;
         }
@@ -1040,6 +1084,10 @@ where
             .await?
             .ok_or_else(|| TableCatalogStoreError::NotFound(format!("catalog backup {backup_id}")))?;
         let backup = self.decode_object_catalog_backup(table_bucket, &stored.data)?;
+        let backup_etag = stored
+            .etag
+            .filter(|etag| !etag.is_empty())
+            .ok_or_else(|| TableCatalogStoreError::Unavailable("catalog backup has no usable ETag".to_string()))?;
         if backup.backup_id != backup_id {
             return Err(TableCatalogStoreError::Invalid(
                 "catalog backup identity does not match its request".to_string(),
@@ -1153,6 +1201,8 @@ where
                     backup_id: backup_id.to_string(),
                     request_fingerprint,
                     state: ObjectCatalogRestoreStateKind::Prepared,
+                    completed_intent_etag: None,
+                    backup_etag: None,
                 };
                 let precondition = previous.map_or(TableCatalogPutPrecondition::IfAbsent, |(_, etag)| {
                     TableCatalogPutPrecondition::IfMatch(etag)
@@ -1203,12 +1253,15 @@ where
         if intent.state != ObjectCatalogRestoreStateKind::Completed {
             intent.state = ObjectCatalogRestoreStateKind::Completed;
             intent.updated_at = OffsetDateTime::now_utc().to_string();
-            self.write_object_catalog_restore_intent(&intent, TableCatalogPutPrecondition::IfMatch(intent_etag), &fence)
+            intent_etag = self
+                .write_object_catalog_restore_intent(&intent, TableCatalogPutPrecondition::IfMatch(intent_etag), &fence)
                 .await?;
         }
         // Publication is the final durable write. Until it succeeds all readers
         // and writers reject the bucket, even if every catalog object was applied.
         state.state = ObjectCatalogRestoreStateKind::Completed;
+        state.completed_intent_etag = Some(intent_etag);
+        state.backup_etag = Some(backup_etag);
         self.write_object_catalog_restore_state(table_bucket, &state, TableCatalogPutPrecondition::IfMatch(state_etag), &fence)
             .await?;
         fence.ensure_held()?;

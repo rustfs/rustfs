@@ -79,6 +79,7 @@ const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const TABLE_CATALOG_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE: usize = 64 * 1024 * 1024;
 const TABLE_CATALOG_COMMIT_REQUIREMENT_MAX_COUNT: usize = 1_024;
 const TABLE_CATALOG_COMMIT_UPDATE_MAX_COUNT: usize = 1_024;
 const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -182,6 +183,8 @@ static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucket
 static DISABLE_TABLE_BUCKET_HANDLER: DisableTableBucketHandler = DisableTableBucketHandler {};
 static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
 static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
+static EXPORT_TABLE_CATALOG_BACKUP_HANDLER: ExportTableCatalogBackupHandler = ExportTableCatalogBackupHandler {};
+static IMPORT_TABLE_CATALOG_BACKUP_HANDLER: ImportTableCatalogBackupHandler = ImportTableCatalogBackupHandler {};
 static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
@@ -504,6 +507,13 @@ struct CatalogImportRequest {
 struct CatalogBackupRequest {
     #[serde(default, rename = "expected-snapshot-etag")]
     expected_snapshot_etag: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBackupExportRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1929,10 +1939,6 @@ where
             .as_ref()
             .is_some_and(|held| held.0 == table_bucket && held.1 == namespace && held.2 == table)
             && publication.guards.iter().all(|guard| !guard.is_lock_lost())
-    }
-
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        self.backend.acquires_catalog_migration_read_permit()
     }
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
