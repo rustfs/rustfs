@@ -829,12 +829,26 @@ pub async fn create_bitrot_writer(
     shard_size: usize,
     checksum_algo: HashAlgorithm,
 ) -> disk::error::Result<BitrotWriterWrapper> {
+    create_bitrot_writer_with_orig_volume(is_inline_buffer, disk, "", volume, path, length, shard_size, checksum_algo).await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn create_bitrot_writer_with_orig_volume(
+    is_inline_buffer: bool,
+    disk: Option<&DiskStore>,
+    origvolume: &str,
+    volume: &str,
+    path: &str,
+    length: i64,
+    shard_size: usize,
+    checksum_algo: HashAlgorithm,
+) -> disk::error::Result<BitrotWriterWrapper> {
     let writer = if is_inline_buffer {
         CustomWriter::new_inline_buffer()
     } else if let Some(disk) = disk {
         let length = bitrot_create_file_size(length, shard_size, &checksum_algo);
 
-        let file = disk.create_file("", volume, path, length).await?;
+        let file = disk.create_file(origvolume, volume, path, length).await?;
         #[cfg(feature = "hotpath")]
         let file = instrument_raw_shard_writer(file, disk.is_local());
         CustomWriter::new_tokio_writer(file)
