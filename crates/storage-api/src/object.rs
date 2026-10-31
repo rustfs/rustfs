@@ -366,8 +366,6 @@ pub struct WalkOptions<Filter> {
     pub filter: Option<Filter>,
     pub marker: Option<String>,
     pub latest_only: bool,
-    /// Resolve every set at its version read quorum and fail on incomplete scans.
-    pub authoritative: bool,
     pub ask_disks: String,
     pub versions_sort: WalkVersionsSortOrder,
     pub limit: usize,
@@ -382,7 +380,6 @@ impl<Filter> Default for WalkOptions<Filter> {
             filter: None,
             marker: None,
             latest_only: false,
-            authoritative: false,
             ask_disks: String::new(),
             versions_sort: WalkVersionsSortOrder::default(),
             limit: 0,
@@ -560,6 +557,29 @@ pub trait ListOperations: Send + Sync + fmt::Debug {
     ) -> Result<Self::ListObjectVersionsInfo, Self::Error>;
 
     async fn walk(
+        self: Arc<Self>,
+        rx: Self::WalkCancellation,
+        bucket: &str,
+        prefix: &str,
+        result: Self::WalkResultSender,
+        opts: Self::WalkOptions,
+    ) -> Result<(), Self::Error>;
+}
+
+/// Quorum-backed enumeration for decisions that require proving object absence.
+///
+/// Consumers must drain the result stream and await successful completion before
+/// trusting the scan. An error or cancellation can follow partial results and
+/// leaves absence unproven. Callers coordinate concurrent mutations separately;
+/// this capability does not provide a snapshot or retain a mutation lock.
+#[async_trait::async_trait]
+pub trait AuthoritativeListOperations: ListOperations {
+    /// Resolves every set at its version read quorum, including reserved prefixes.
+    ///
+    /// # Errors
+    /// Returns an error when a set cannot establish quorum, metadata cannot be
+    /// resolved, or enumeration is interrupted. Retry starts a new scan.
+    async fn walk_authoritative(
         self: Arc<Self>,
         rx: Self::WalkCancellation,
         bucket: &str,
@@ -1002,7 +1022,6 @@ mod tests {
         assert!(opts.filter.is_none());
         assert!(opts.marker.is_none());
         assert!(!opts.latest_only);
-        assert!(!opts.authoritative);
         assert!(opts.ask_disks.is_empty());
         assert!(matches!(opts.versions_sort, WalkVersionsSortOrder::Ascending));
         assert_eq!(opts.limit, 0);

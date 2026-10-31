@@ -44,9 +44,9 @@ pub(crate) mod lifecycle {
 
 pub(crate) mod list {
     pub(crate) use rustfs_storage_api::{
-        ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-        ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, VersionMarker, WalkOptions as StorageWalkOptions,
-        WalkVersionsSortOrder,
+        AuthoritativeListOperations, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo,
+        ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, VersionMarker,
+        WalkOptions as StorageWalkOptions, WalkVersionsSortOrder,
     };
 }
 

@@ -92,6 +92,7 @@ pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus}
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::MultipartUploadInspection;
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use object::AuthoritativeListOperations;
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
 pub use object::ObjectToDeleteIdentity;

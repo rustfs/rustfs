@@ -20,6 +20,10 @@ mod backup;
 mod cleanup;
 mod migration;
 mod object;
+mod registration_index;
+#[cfg(test)]
+mod registration_index_tests;
+mod registration_tree;
 mod strong;
 
 pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
@@ -812,6 +816,10 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
+    fn registration_index_epoch(&self) -> TableCatalogStoreResult<Option<Uuid>> {
+        Ok(None)
+    }
+
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         None
     }
@@ -924,6 +932,30 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     ) -> TableCatalogStoreResult<()> {
         fence.ensure_held()?;
         self.put_object(bucket, object, data, precondition).await?;
+        fence.ensure_held()
+    }
+
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        _write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object_fenced(bucket, object, data, precondition, fence).await
+    }
+
+    async fn delete_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        _write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.delete_object_unlocked(bucket, object).await?;
         fence.ensure_held()
     }
 
@@ -2269,6 +2301,19 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    fn registration_index_epoch(&self) -> TableCatalogStoreResult<Option<Uuid>> {
+        const ENV: &str = ENV_TABLE_CATALOG_REGISTRATION_INDEX_EPOCH;
+        match std::env::var(ENV) {
+            Err(std::env::VarError::NotPresent) => Ok(None),
+            Ok(value) => Uuid::parse_str(&value)
+                .ok()
+                .filter(|epoch| !epoch.is_nil())
+                .map(Some)
+                .ok_or_else(|| TableCatalogStoreError::Invalid(format!("{ENV} must be a non-nil UUID"))),
+            Err(_) => Err(TableCatalogStoreError::Invalid(format!("{ENV} must contain a valid UUID"))),
+        }
+    }
+
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         Some(self.strong_runtime.clone())
     }
@@ -2428,6 +2473,46 @@ where
             .await
     }
 
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards), Some(fence))
+            .await
+    }
+
+    async fn delete_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        if write_guards.is_empty() {
+            return Err(TableCatalogStoreError::Internal("catalog delete has no namespace owner".to_string()));
+        }
+        let mut options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        fence.add_to_object_options(&mut options);
+        for guard in &write_guards {
+            options.add_write_commit_guard(guard);
+        }
+        match self.store.delete_object(bucket, object, options).await {
+            Ok(_) => fence.ensure_held(),
+            Err(err) if is_missing_storage_error(&err) => fence.ensure_held(),
+            Err(err) => Err(storage_error_to_catalog("delete fenced catalog object", err)),
+        }
+    }
+
     async fn put_object_fenced(
         &self,
         bucket: &str,
@@ -2562,13 +2647,12 @@ where
         let cancel = tokio_util::sync::CancellationToken::new();
         let _cancel_on_drop = cancel.clone().drop_guard();
         let (sender, mut receiver) = tokio::sync::mpsc::channel::<CatalogObjectInfoOrErr>(100);
-        let walk = self.store.clone().walk(
+        let walk = self.store.clone().walk_authoritative(
             cancel,
             bucket,
             prefix,
             sender,
             CatalogWalkOptions {
-                authoritative: true,
                 include_free_versions: true,
                 ..Default::default()
             },

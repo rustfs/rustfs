@@ -1191,6 +1191,8 @@ where
     {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
+        self.invalidate_registration_index_for_write(bucket, object, &data, &TableCatalogObjectMutationFence::default())
+            .await?;
         self.backend.put_object(bucket, object, data, precondition).await
     }
 
@@ -1233,11 +1235,39 @@ where
     where
         T: Serialize,
     {
+        self.write_entry_unlocked_with_fence(bucket, object, entry, precondition, write_guards, None)
+            .await
+    }
+
+    async fn write_entry_unlocked_with_fence<T>(
+        &self,
+        bucket: &str,
+        object: &str,
+        entry: &T,
+        precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<()>
+    where
+        T: Serialize,
+    {
         let data = serde_json::to_vec(entry)
             .map_err(|err| TableCatalogStoreError::Internal(format!("failed to serialize catalog entry {object}: {err}")))?;
-        self.backend
-            .put_object_unlocked(bucket, object, data, precondition, write_guards)
-            .await
+        let unfenced = TableCatalogObjectMutationFence::default();
+        self.invalidate_registration_index_for_write(bucket, object, &data, fence.unwrap_or(&unfenced))
+            .await?;
+        match fence {
+            Some(fence) => {
+                self.backend
+                    .put_object_unlocked_fenced(bucket, object, data, precondition, write_guards, fence)
+                    .await
+            }
+            None => {
+                self.backend
+                    .put_object_unlocked(bucket, object, data, precondition, write_guards)
+                    .await
+            }
+        }
     }
 
     async fn write_exact_entry_unlocked<T>(
@@ -1251,8 +1281,24 @@ where
     where
         T: DeserializeOwned + PartialEq + Serialize,
     {
+        self.write_exact_entry_unlocked_with_fence(bucket, object, entry, precondition, write_guards, None)
+            .await
+    }
+
+    async fn write_exact_entry_unlocked_with_fence<T>(
+        &self,
+        bucket: &str,
+        object: &str,
+        entry: &T,
+        precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: Option<&TableCatalogObjectMutationFence>,
+    ) -> TableCatalogStoreResult<String>
+    where
+        T: DeserializeOwned + PartialEq + Serialize,
+    {
         let write_result = self
-            .write_entry_unlocked(bucket, object, entry, precondition, write_guards)
+            .write_entry_unlocked_with_fence(bucket, object, entry, precondition, write_guards, fence)
             .await;
         let current = self.read_entry_unlocked::<T>(bucket, object).await?;
         match current {
@@ -1392,6 +1438,7 @@ where
                 "table rename recovery requires a table-bucket publication fence".to_string(),
             ));
         }
+        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
         let bucket_object = self.paths.table_bucket_entry_path(table_bucket);
         let Some((observed_bucket, _)) = self
             .read_entry::<TableBucketEntry>(self.catalog_bucket(), &bucket_object)
@@ -1516,7 +1563,7 @@ where
         {
             Some((current, _)) if current == source_fence || current == source_tombstone => {}
             Some((current, current_etag)) if current == intent.source && current_etag == intent.source_etag => {
-                self.write_exact_entry_unlocked(
+                self.write_exact_entry_unlocked_with_fence(
                     self.catalog_bucket(),
                     &source_object,
                     &source_fence,
@@ -1525,6 +1572,7 @@ where
                         .iter()
                         .flat_map(TableCatalogLockGuard::write_commit_guards)
                         .collect(),
+                    Some(&mutation_fence),
                 )
                 .await?;
             }
@@ -1554,7 +1602,7 @@ where
         {
             Some((current, _)) if current == destination_fence || current == intent.destination => {}
             None if intent.destination_etag.is_none() => {
-                self.write_exact_entry_unlocked(
+                self.write_exact_entry_unlocked_with_fence(
                     self.catalog_bucket(),
                     &destination_object,
                     &destination_fence,
@@ -1563,6 +1611,7 @@ where
                         .iter()
                         .flat_map(TableCatalogLockGuard::write_commit_guards)
                         .collect(),
+                    Some(&mutation_fence),
                 )
                 .await?;
             }
@@ -1570,7 +1619,7 @@ where
                 if current.state == TableCatalogEntryState::Deleted
                     && Some(current_etag.as_str()) == intent.destination_etag.as_deref() =>
             {
-                self.write_exact_entry_unlocked(
+                self.write_exact_entry_unlocked_with_fence(
                     self.catalog_bucket(),
                     &destination_object,
                     &destination_fence,
@@ -1579,6 +1628,7 @@ where
                         .iter()
                         .flat_map(TableCatalogLockGuard::write_commit_guards)
                         .collect(),
+                    Some(&mutation_fence),
                 )
                 .await?;
             }
@@ -1606,7 +1656,7 @@ where
         {
             Some((current, _)) if current == source_tombstone => {}
             Some((current, current_etag)) if current == source_fence => {
-                self.write_exact_entry_unlocked(
+                self.write_exact_entry_unlocked_with_fence(
                     self.catalog_bucket(),
                     &source_object,
                     &source_tombstone,
@@ -1615,6 +1665,7 @@ where
                         .iter()
                         .flat_map(TableCatalogLockGuard::write_commit_guards)
                         .collect(),
+                    Some(&mutation_fence),
                 )
                 .await?;
             }
@@ -1652,7 +1703,7 @@ where
                     "table rename warehouse index changed during recovery".to_string(),
                 ));
             }
-            self.write_exact_entry_unlocked(
+            self.write_exact_entry_unlocked_with_fence(
                 self.catalog_bucket(),
                 &index_object,
                 &destination_index,
@@ -1661,6 +1712,7 @@ where
                     .iter()
                     .flat_map(TableCatalogLockGuard::write_commit_guards)
                     .collect(),
+                Some(&mutation_fence),
             )
             .await?;
         }
@@ -1679,7 +1731,7 @@ where
         {
             Some((current, _)) if current == intent.destination => {}
             Some((current, current_etag)) if current == destination_fence => {
-                self.write_exact_entry_unlocked(
+                self.write_exact_entry_unlocked_with_fence(
                     self.catalog_bucket(),
                     &destination_object,
                     &intent.destination,
@@ -1688,6 +1740,7 @@ where
                         .iter()
                         .flat_map(TableCatalogLockGuard::write_commit_guards)
                         .collect(),
+                    Some(&mutation_fence),
                 )
                 .await?;
             }
@@ -1725,12 +1778,13 @@ where
         }
         bucket_entry.active_rename_id = None;
         bucket_entry.updated_at = Some(next_table_catalog_update_time(bucket_entry.updated_at.as_deref()));
-        self.write_exact_entry_unlocked(
+        self.write_exact_entry_unlocked_with_fence(
             self.catalog_bucket(),
             &bucket_object,
             &bucket_entry,
             TableCatalogPutPrecondition::IfMatch(bucket_etag),
             _bucket_guard.write_commit_guards(),
+            Some(&mutation_fence),
         )
         .await?;
         Ok(())
@@ -1826,6 +1880,8 @@ where
         index: &TableWarehouseIndexEntry,
         reason: &'static str,
     ) -> TableCatalogStoreResult<()> {
+        self.invalidate_registration_index(&index.table_bucket, &TableCatalogObjectMutationFence::default())
+            .await?;
         self.backend.delete_object_unlocked(self.catalog_bucket(), object).await?;
         tracing::warn!(
             table_bucket = %index.table_bucket,
@@ -1910,32 +1966,34 @@ where
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.warehouse_index_entries_prefix(&candidate.table_bucket))
             .await?;
-        let mut indexes = stream::iter(index_objects.into_iter().filter(|object| object != &state_object))
-            .map(|object| async move {
-                let entry = self
-                    .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
-                    .await?;
-                Ok::<_, TableCatalogStoreError>((object, entry))
+        stream::iter(index_objects.into_iter().filter(|object| object != &state_object))
+            .map(|object| {
+                let candidate = &candidate;
+                async move {
+                    let Some((existing, _)) = self
+                        .read_entry::<TableWarehouseIndexEntry>(self.catalog_bucket(), &object)
+                        .await?
+                    else {
+                        return Ok(());
+                    };
+                    validate_table_warehouse_index_entry_object(&self.paths, &object, &existing)?;
+                    if existing.table_id == candidate.table_id || existing.state != TableCatalogEntryState::Active {
+                        return Ok(());
+                    }
+                    if warehouse_object_prefixes_overlap(&existing.warehouse_object_prefix, &candidate.warehouse_object_prefix)
+                        && self.warehouse_index_entry_has_active_owner(&existing).await?
+                    {
+                        return Err(TableCatalogStoreError::Conflict(format!(
+                            "table warehouse location overlaps an active table: {}",
+                            candidate.warehouse_object_prefix
+                        )));
+                    }
+                    Ok::<_, TableCatalogStoreError>(())
+                }
             })
-            .buffered(TABLE_REGISTRATION_READ_CONCURRENCY);
-        while let Some((object, entry)) = indexes.try_next().await? {
-            let Some((existing, _)) = entry else {
-                continue;
-            };
-            validate_table_warehouse_index_entry_object(&self.paths, &object, &existing)?;
-            if existing.table_id == candidate.table_id || existing.state != TableCatalogEntryState::Active {
-                continue;
-            }
-            if warehouse_object_prefixes_overlap(&existing.warehouse_object_prefix, &candidate.warehouse_object_prefix)
-                && self.warehouse_index_entry_has_active_owner(&existing).await?
-            {
-                return Err(TableCatalogStoreError::Conflict(format!(
-                    "table warehouse location overlaps an active table: {}",
-                    candidate.warehouse_object_prefix
-                )));
-            }
-        }
-        Ok(())
+            .buffered(TABLE_REGISTRATION_READ_CONCURRENCY)
+            .try_for_each(|()| async { Ok(()) })
+            .await
     }
 
     async fn reserve_table_warehouse_index(
@@ -2789,8 +2847,13 @@ where
                 "table registration requires a table publication fence".to_string(),
             ));
         }
-        self.ensure_table_warehouse_prefix_available(&entry, Some(&table_path))
+        let registration_update = self
+            .prepare_registration_index_update(&entry, &table_path, publication)
             .await?;
+        if registration_update.is_none() {
+            self.ensure_table_warehouse_prefix_available(&entry, Some(&table_path))
+                .await?;
+        }
         let reservation = self.reserve_table_warehouse_index(&entry, true, &table_path).await?;
         if !publication.holds_table_bucket(&entry.table_bucket)
             || !publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table)
@@ -2801,20 +2864,30 @@ where
                 "table registration publication fence was lost before catalog update".to_string(),
             ));
         }
+        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
         let result = self
-            .write_entry_unlocked(
+            .write_entry_unlocked_with_fence(
                 self.catalog_bucket(),
                 &table_path,
                 &entry,
                 precondition,
                 _table_guard.write_commit_guards(),
+                Some(&mutation_fence),
             )
             .await;
         if result.is_err() {
             self.rollback_table_warehouse_index_reservation(&entry, reservation, "table entry write failed")
                 .await;
         }
-        result
+        result?;
+        // The primary table is committed. An incomplete derived index remains
+        // dirty and is rebuilt before the next indexed registration.
+        if let Some(update) = registration_update
+            && self.finish_registration_index_update(update, &entry).await.is_err()
+        {
+            super::registration_index::log_registration_index_maintenance_failure(&entry.table_bucket, "publication_failed");
+        }
+        Ok(())
     }
 
     async fn write_view_entry(&self, entry: ViewEntry, precondition: TableCatalogPutPrecondition) -> TableCatalogStoreResult<()> {
@@ -6677,6 +6750,7 @@ where
             ));
         }
         let _publication_completion = TableCommitPublicationCompletion::new(&publication);
+        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
         self.recover_active_table_rename(table_bucket, &publication).await?;
 
         {
@@ -6816,12 +6890,13 @@ where
                     ));
                 }
                 None => {
-                    self.write_exact_entry_unlocked(
+                    self.write_exact_entry_unlocked_with_fence(
                         self.catalog_bucket(),
                         &index_object,
                         &source_index,
                         TableCatalogPutPrecondition::IfAbsent,
                         _index_guard.write_commit_guards(),
+                        Some(&mutation_fence),
                     )
                     .await?
                 }
@@ -6842,22 +6917,24 @@ where
             validate_table_rename_intent_object(&self.paths, &intent_object, &intent)?;
 
             // An orphan intent has no catalog effect; a published bucket fence without its intent cannot be recovered safely.
-            self.write_exact_entry_unlocked(
+            self.write_exact_entry_unlocked_with_fence(
                 self.catalog_bucket(),
                 &intent_object,
                 &intent,
                 TableCatalogPutPrecondition::IfAbsent,
                 _intent_guard.write_commit_guards(),
+                Some(&mutation_fence),
             )
             .await?;
             bucket_entry.active_rename_id = Some(rename_id);
             bucket_entry.updated_at = Some(now);
-            self.write_exact_entry_unlocked(
+            self.write_exact_entry_unlocked_with_fence(
                 self.catalog_bucket(),
                 &bucket_object,
                 &bucket_entry,
                 TableCatalogPutPrecondition::IfMatch(bucket_etag),
                 _bucket_guard.write_commit_guards(),
+                Some(&mutation_fence),
             )
             .await?;
         }
@@ -7307,13 +7384,15 @@ where
         }
 
         let cas_started = Instant::now();
+        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
         let cas_result = self
-            .write_entry_unlocked(
+            .write_entry_unlocked_with_fence(
                 self.catalog_bucket(),
                 &table_path,
                 &next,
                 TableCatalogPutPrecondition::IfMatch(current_etag),
                 _guard.write_commit_guards(),
+                Some(&mutation_fence),
             )
             .await;
         record_table_commit_cas_result(&request.operation, cas_started, &cas_result);
@@ -7384,6 +7463,8 @@ where
                 table.as_str()
             )));
         };
+        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
+        self.invalidate_registration_index(table_bucket, &mutation_fence).await?;
         self.tombstone_table_warehouse_index_for_drop(&entry, false).await?;
         if !publication.holds_table_bucket(table_bucket)
             || !publication.holds_table(table_bucket, &namespace.public_name(), table.as_str())
@@ -7394,7 +7475,11 @@ where
                 "table drop publication fence was lost before catalog update".to_string(),
             ));
         }
-        if let Err(err) = self.backend.delete_object_unlocked(self.catalog_bucket(), &object).await {
+        if let Err(err) = self
+            .backend
+            .delete_object_unlocked_fenced(self.catalog_bucket(), &object, _guard.write_commit_guards(), &mutation_fence)
+            .await
+        {
             match self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await {
                 Ok(None) => return Ok(()),
                 Ok(Some((current, _))) if current == entry => {

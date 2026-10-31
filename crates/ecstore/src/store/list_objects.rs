@@ -37,8 +37,8 @@ use crate::error::{
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::list::{
-    ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr,
-    StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
+    AuthoritativeListOperations, ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo,
+    StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
@@ -79,6 +79,21 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
+
+#[async_trait::async_trait]
+impl AuthoritativeListOperations for ECStore {
+    async fn walk_authoritative(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        check_list_objs_args(bucket, prefix, &None)?;
+        self.walk_authoritatively(rx, bucket, prefix, result, opts).await
+    }
+}
 
 /// Build the versioned listing options used by recursive object walks.
 ///
@@ -1363,10 +1378,6 @@ impl ECStore {
         opts: WalkOptions,
     ) -> Result<()> {
         check_list_objs_args(bucket, prefix, &None)?;
-
-        if opts.authoritative {
-            return self.walk_authoritatively(rx, bucket, prefix, result, opts).await;
-        }
 
         let rx = rx.child_token();
         let mut futures = Vec::new();
@@ -2883,7 +2894,7 @@ mod test {
     use crate::error::{Result, StorageError};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::{SetDisks, hermetic_set_disks_isolated};
-    use crate::storage_api_contracts::list::ListOperations as _;
+    use crate::storage_api_contracts::list::AuthoritativeListOperations as _;
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use bytes::Bytes;
@@ -6103,16 +6114,9 @@ mod test {
             .expect("persist reserved metadata versions");
         }
         let (sender, mut receiver) = mpsc::channel(1);
-        let walk = store.clone().walk(
-            CancellationToken::new(),
-            bucket,
-            "",
-            sender,
-            super::WalkOptions {
-                authoritative: true,
-                ..Default::default()
-            },
-        );
+        let walk = store
+            .clone()
+            .walk_authoritative(CancellationToken::new(), bucket, "", sender, super::WalkOptions::default());
         let collect = async {
             let mut versions = Vec::new();
             while let Some(item) = receiver.recv().await {
@@ -6206,16 +6210,10 @@ mod test {
                 .expect("set walk must terminate");
             assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
             let (sender, mut receiver) = mpsc::channel(16);
-            let walk = store.clone().walk(
-                CancellationToken::new(),
-                bucket,
-                "",
-                sender,
-                super::WalkOptions {
-                    authoritative: true,
-                    ..Default::default()
-                },
-            );
+            let walk =
+                store
+                    .clone()
+                    .walk_authoritative(CancellationToken::new(), bucket, "", sender, super::WalkOptions::default());
             let drain = async { while receiver.recv().await.is_some() {} };
             let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
                 .await

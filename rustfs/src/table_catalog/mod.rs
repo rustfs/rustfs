@@ -28,8 +28,9 @@ use std::{
 
 use crate::storage_api::table::contract::http::HTTPPreconditions;
 use crate::storage_api::table::contract::list::{
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-    ListOperations as StorageListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
+    AuthoritativeListOperations as StorageAuthoritativeListOperations, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as StorageListOperations,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
 };
 use crate::storage_api::table::contract::multipart::MultipartUploadInspection as StorageMultipartUploadInspection;
 use crate::storage_api::table::contract::namespace::NamespaceLocking as StorageNamespaceLocking;
@@ -109,6 +110,7 @@ pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+pub(crate) const ENV_TABLE_CATALOG_REGISTRATION_INDEX_EPOCH: &str = "RUSTFS_TABLE_CATALOG_REGISTRATION_INDEX_EPOCH";
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2: &str = "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2";
@@ -248,7 +250,8 @@ pub(crate) trait TableCatalogStorage:
         WalkOptions = CatalogWalkOptions,
         WalkCancellation = tokio_util::sync::CancellationToken,
         WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
-    > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+    > + StorageAuthoritativeListOperations
+    + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
     + StorageMultipartUploadInspection<Error = EcstoreError>
 {
 }
@@ -277,7 +280,8 @@ impl<T> TableCatalogStorage for T where
             WalkOptions = CatalogWalkOptions,
             WalkCancellation = tokio_util::sync::CancellationToken,
             WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
-        > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+        > + StorageAuthoritativeListOperations
+        + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
         + StorageMultipartUploadInspection<Error = EcstoreError>
 {
 }
