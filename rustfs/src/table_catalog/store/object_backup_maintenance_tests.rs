@@ -146,9 +146,11 @@ fn stable_authority_keeps_historical_running_jobs_configs_and_quarantine_bytes()
     let paths = TableCatalogObjectPaths::default();
     let namespace = Namespace::parse(&entry.namespace).unwrap();
     let table = IdentifierSegment::parse(&entry.table).unwrap();
-    let mut config = TableMaintenanceConfig::default();
-    config.quarantine_enabled = true;
-    config.quarantine_retention_seconds = 86400;
+    let config = TableMaintenanceConfig {
+        quarantine_enabled: true,
+        quarantine_retention_seconds: 86_400,
+        ..Default::default()
+    };
     for path in [
         paths.table_bucket_maintenance_config_path("analytics"),
         paths.table_maintenance_config_path("analytics", &namespace, &table, &entry.table_id),

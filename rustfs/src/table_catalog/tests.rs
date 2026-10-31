@@ -4895,13 +4895,13 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     assert!(first.object_count >= 3);
 
     store
-        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
         .await
         .unwrap();
     store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
     assert!(
         store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_none()
@@ -4917,7 +4917,7 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
         matches!(interrupted_visibility, TableCatalogStoreError::Internal(message) if message.contains("injected put failure"))
     );
     assert!(matches!(
-        store.load_table(bucket, &namespace.public_name(), &table.as_str()).await,
+        store.load_table(bucket, &namespace.public_name(), table.as_str()).await,
         Err(TableCatalogStoreError::Unavailable(_))
     ));
     store
@@ -4926,13 +4926,13 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
         .expect("retrying after a pre-publication interruption should converge");
     assert!(
         store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_some()
     );
     store
-        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
         .await
         .unwrap();
     store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
@@ -4954,14 +4954,14 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
     assert!(store.get_namespace(bucket, &namespace.public_name()).await.unwrap().is_some());
     assert!(
         store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_some()
     );
 
     store
-        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
         .await
         .unwrap();
     store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
@@ -4986,7 +4986,7 @@ async fn object_catalog_backup_is_idempotent_and_restorable() {
         .expect("retrying after interrupted replacement cleanup should converge");
     assert!(
         store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_some()
@@ -5052,7 +5052,7 @@ async fn object_catalog_backup_restores_into_an_isolated_backend() {
     );
     assert!(
         target_store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_some()
@@ -5199,7 +5199,7 @@ async fn object_catalog_restore_rejects_missing_snapshot_data_before_catalog_wri
     let backup = store.create_object_catalog_backup(bucket, None).await.unwrap();
     backend.delete_object(bucket, data_location).await.unwrap();
     store
-        .drop_table(bucket, &namespace.public_name(), &table.as_str())
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
         .await
         .unwrap();
     store.drop_namespace(bucket, &namespace.public_name()).await.unwrap();
@@ -5213,7 +5213,7 @@ async fn object_catalog_restore_rejects_missing_snapshot_data_before_catalog_wri
     );
     assert!(
         store
-            .load_table(bucket, &namespace.public_name(), &table.as_str())
+            .load_table(bucket, &namespace.public_name(), table.as_str())
             .await
             .unwrap()
             .is_none()
@@ -8867,9 +8867,7 @@ impl ConditionalMaintenanceFixture {
             expected_job_id: self.queued.job.job_id.clone(),
             expected_attempt: attempt,
         };
-        let store = match &self.store {
-            ConfiguredTableCatalogStore::ObjectBacked(store) => store,
-        };
+        let ConfiguredTableCatalogStore::ObjectBacked(store) = &self.store;
         store
             .run_table_metadata_maintenance_worker_once_conditionally_with_clock(
                 "analytics",

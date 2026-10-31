@@ -140,8 +140,8 @@ fn backup_commit_policy_rejects_staging_before_the_table_pointer_advanced() {
     let (store, mut objects, entry) = fixture();
     let mut staged = current_commit(&entry);
     staged.status = CommitLogStatus::Staged;
-    staged.expected_version_token = entry.version_token.clone();
-    staged.previous_metadata_location = entry.metadata_location.clone();
+    staged.expected_version_token = entry.version_token;
+    staged.previous_metadata_location = entry.metadata_location;
     staged.new_version_token = "next-token".to_string();
     staged.new_metadata_location = "tables/table-id/metadata/00002.metadata.json".to_string();
     publish(&mut objects, &staged);
