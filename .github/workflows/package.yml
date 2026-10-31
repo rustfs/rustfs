@@ -225,10 +225,57 @@ jobs:
           echo "  Build run ID: $BUILD_RUN_ID"
           echo "  Build run number: $RUN_NUMBER"
 
+  # Consume the trusted release certification of the resolved build run and
+  # verify the certified input digests before any package is wrapped. A run
+  # without that certification fails closed here; packages built later must
+  # complete their own verification and cannot inherit an unverified
+  # conclusion.
+  release-certification:
+    name: Release Certification
+    needs: resolve
+    if: needs.resolve.result == 'success'
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download and verify release certification
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          BUILD_RUN_ID: ${{ needs.resolve.outputs.build_run_id }}
+          BUILD_TYPE: ${{ needs.resolve.outputs.build_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certification
+          if [[ "$BUILD_TYPE" == "development" ]]; then
+            # Development artifacts are explicitly uncertified and never touch
+            # official or latest channels; only the staging/dev paths remain.
+            jq -n '{schema_version: 1, certified: false, reason: "development artifacts are explicitly uncertified"}' \
+              > certification/development-uncertified.json
+            exit 0
+          fi
+          if ! gh run download "$BUILD_RUN_ID" -n release-certification -D certification; then
+            echo "Build run ${BUILD_RUN_ID} published no release-certification artifact; failing closed" >&2
+            exit 1
+          fi
+          python3 scripts/release/release_gate.py verify-promotion \
+            --plan .config/release-validation-plan.json \
+            --candidate certification/candidate.json \
+            --summary certification/release-gate-output \
+            --artifact-sha256 "$(jq -r '.deliverables[0].sha256' certification/candidate.json)" \
+            --artifact-name "$(jq -r '.deliverables[0].name' certification/candidate.json)"
+
   # Build DEB and RPM packages for each architecture and libc variant
   package:
     name: Package (${{ matrix.arch }}-${{ matrix.libc }})
-    needs: resolve
+    needs: [ resolve, release-certification ]
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     strategy:
@@ -494,6 +541,55 @@ jobs:
           echo "rpm_file=$RPM_FILE" >> "$GITHUB_OUTPUT"
           echo "✅ RPM built: $RPM_FILE"
 
+      - name: Download certification evidence
+        if: needs.resolve.outputs.build_type != 'development'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-certification
+          path: ./certification
+
+      # Later-built wrapper verification: the binary inside each package must
+      # match the certified binary digest for this platform before anything is
+      # uploaded, and the package itself stays on staging until promotion.
+      - name: Verify wrapped binary against certification
+        if: needs.resolve.outputs.build_type != 'development'
+        shell: bash
+        env:
+          DEB_FILE: ${{ steps.deb.outputs.deb_file }}
+          RPM_FILE: ${{ steps.rpm.outputs.rpm_file }}
+          ARTIFACT_NAME: ${{ matrix.artifact_name }}
+        run: |
+          set -euo pipefail
+          expected="$(jq -r --arg needle "$ARTIFACT_NAME" \
+            '[.deliverables[] | select(.name | contains($needle)) | .binary_sha256][0] // empty' \
+            certification/candidate.json)"
+          if [[ -z "$expected" ]]; then
+            echo "No certified binary digest recorded for ${ARTIFACT_NAME}" >&2
+            exit 1
+          fi
+          if ! command -v rpm2cpio >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y rpm2cpio
+          fi
+          if ! command -v cpio >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y cpio
+          fi
+          for package_file in "$DEB_FILE" "$RPM_FILE"; do
+            case "$package_file" in
+              *.deb)
+                dpkg-deb --fsys-tarfile "$package_file" | tar -xOf - ./usr/bin/rustfs > "$RUNNER_TEMP/wrapped-rustfs"
+                ;;
+              *.rpm)
+                rpm2cpio "$package_file" | cpio -i --to-stdout ./usr/bin/rustfs > "$RUNNER_TEMP/wrapped-rustfs"
+                ;;
+            esac
+            python3 scripts/release/release_gate.py verify-promotion \
+              --plan .config/release-validation-plan.json \
+              --candidate certification/candidate.json \
+              --summary certification/release-gate-output \
+              --artifact "$RUNNER_TEMP/wrapped-rustfs" \
+              --artifact-role binary
+          done
+
       - name: Upload packages to artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -531,10 +627,14 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
+          # Build-phase writes stay on staging for release types: the official
+          # packages/release and packages/latest paths are written only by the
+          # certification-gated promote-packages job, from these same staged
+          # objects. Development packages keep the uncertified dev channel.
           if [[ "$BUILD_TYPE" == "development" ]]; then
             R2_PREFIX="artifacts/rustfs/packages/dev"
           else
-            R2_PREFIX="artifacts/rustfs/packages/release"
+            R2_PREFIX="artifacts/rustfs/packages/staging/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}"
           fi
           R2_PATH="s3://${R2_BUCKET}/${R2_PREFIX}/"
 
@@ -548,18 +648,6 @@ jobs:
           done
 
           echo "✅ Upload complete"
-
-          # Also upload as latest for release/prerelease
-          if [[ "$BUILD_TYPE" == "release" || "$BUILD_TYPE" == "prerelease" ]]; then
-            LATEST_PATH="s3://${R2_BUCKET}/artifacts/rustfs/packages/latest/"
-            for f in "$DEB_FILE" "$RPM_FILE"; do
-              if [[ -n "$f" && -f "$f" ]]; then
-                echo "Uploading latest: $(basename "$f")"
-                aws s3 cp "$f" "$LATEST_PATH" --endpoint-url "$R2_ENDPOINT" --only-show-errors
-              fi
-            done
-            echo "✅ Latest packages updated"
-          fi
 
       - name: Upload packages to GitHub Release
         if: needs.resolve.outputs.tag != ''
@@ -613,6 +701,114 @@ jobs:
           done
 
           echo "✅ GitHub release assets updated"
+
+  # The only writer of the official packages/release and packages/latest R2
+  # paths. Promotion re-checks each package's wrapped binary against the
+  # passed certification list and copies the staged objects byte-for-byte:
+  # no rebuild-after-verify, no mutable latest resolution downstream.
+  promote-packages:
+    name: Promote Packages
+    needs: [ resolve, package, release-certification ]
+    # Target-channel lock for the official package paths.
+    concurrency:
+      group: release-channel-r2-packages
+      cancel-in-progress: false
+    if: needs.resolve.outputs.tag != '' && (needs.resolve.outputs.build_type == 'release' || needs.resolve.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_EC2_METADATA_DISABLED: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download packages and certification
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ./packages
+          pattern: packages-*
+          merge-multiple: true
+
+      - name: Download certification evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-certification
+          path: ./certification
+
+      - name: Verify and promote staged packages
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "❌ R2 credentials missing; refusing to promote to the official channel" >&2
+            exit 1
+          fi
+
+          STAGING_PREFIX="s3://${R2_BUCKET}/artifacts/rustfs/packages/staging/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/"
+          RELEASE_PATH="s3://${R2_BUCKET}/artifacts/rustfs/packages/release/"
+          LATEST_PATH="s3://${R2_BUCKET}/artifacts/rustfs/packages/latest/"
+
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y awscli
+          fi
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
+
+          if ! command -v rpm2cpio >/dev/null 2>&1; then
+            sudo apt-get install -y rpm2cpio
+          fi
+          if ! command -v cpio >/dev/null 2>&1; then
+            sudo apt-get install -y cpio
+          fi
+
+          promoted=0
+          for package_file in packages/*.deb packages/*.rpm; do
+            [[ -f "$package_file" ]] || continue
+            name="$(basename "$package_file")"
+            case "$package_file" in
+              *.deb)
+                dpkg-deb --fsys-tarfile "$package_file" | tar -xOf - ./usr/bin/rustfs > "$RUNNER_TEMP/wrapped-rustfs"
+                ;;
+              *.rpm)
+                rpm2cpio "$package_file" | cpio -i --to-stdout ./usr/bin/rustfs > "$RUNNER_TEMP/wrapped-rustfs"
+                ;;
+            esac
+            python3 scripts/release/release_gate.py verify-promotion \
+              --plan .config/release-validation-plan.json \
+              --candidate certification/candidate.json \
+              --summary certification/release-gate-output \
+              --artifact "$RUNNER_TEMP/wrapped-rustfs" \
+              --artifact-role binary
+
+            staged="$(mktemp)"
+            aws s3 cp "${STAGING_PREFIX}${name}" "$staged" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            staged_sha="$(sha256sum "$staged" | awk '{print $1}')"
+            built_sha="$(sha256sum "$package_file" | awk '{print $1}')"
+            if [[ "$staged_sha" != "$built_sha" ]]; then
+              echo "❌ Staged package ${name} does not match the verified bytes" >&2
+              exit 1
+            fi
+            aws s3 cp "$staged" "${RELEASE_PATH}${name}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            aws s3 cp "$staged" "${LATEST_PATH}${name}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            rm -f "$staged"
+            promoted=$((promoted + 1))
+            echo "✅ Promoted ${name} (${built_sha})"
+          done
+          if [[ "$promoted" -eq 0 ]]; then
+            echo "No staged packages found to promote" >&2
+            exit 1
+          fi
 
   # Summary
   summary:
