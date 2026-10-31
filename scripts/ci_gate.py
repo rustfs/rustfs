@@ -29,6 +29,11 @@ CODE_JOBS = (
 # E2E smoke and the S3 lanes stay on the pull-request path because they cover
 # the product's core correctness and S3 compatibility surface.
 NIGHTLY_JOBS = ("connect-feature-boundaries", "uring-integration", "test-and-lint-rio-v2", "test-and-lint-protocols")
+# Bump when a plan produced by an older `select` can no longer be checked
+# against this revision's expected job contract. The workflow refuses a plan
+# that does not carry the current marker and falls back to the full matrix, so
+# a base planner predating the contract cannot authorize a narrower selection.
+PLAN_CONTRACT = "2"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
@@ -623,7 +628,8 @@ def main() -> int:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
-                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower())):
+                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))
             if os.environ.get("GITHUB_STEP_SUMMARY"):

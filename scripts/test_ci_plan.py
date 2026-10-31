@@ -233,7 +233,8 @@ class PlannerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', str(script), 'select'], cwd=self.repo.root, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards'})
+        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards', 'plan_contract'})
+        self.assertEqual(values['plan_contract'], '2')
         plan = json.loads(values['plan'])
         self.assertEqual(plan['policy']['revision'], self.repo.base)
         self.assertEqual(plan['policy']['rollout'], 'shadow')
@@ -293,6 +294,25 @@ class GateTests(unittest.TestCase):
         needs['classify-changes']['outputs']['mode'] = 'docs'
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
         needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': '{'}
+        self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
+
+    def test_plan_from_a_previous_contract_cannot_authorize_the_new_job_set(self):
+        # A base planner predating the NIGHTLY_JOBS contract still emits
+        # connect-feature-boundaries as required success on a pull request. The
+        # current verifier must reject that plan instead of accepting the old
+        # responsibility, so the workflow's contract-marker fallback is the only
+        # path that can widen or narrow the required set.
+        stale = self.plan()
+        stale['jobs'] = dict(stale['jobs'], **{'connect-feature-boundaries': 'success',
+                                              'uring-integration': 'success',
+                                              'test-and-lint-rio-v2': 'success',
+                                              'test-and-lint-protocols': 'success'})
+        stale['not_applicable'] = {job: 'fixture' for job, state in stale['jobs'].items() if state == 'skipped'}
+        expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
+        self.assertEqual(expected['connect-feature-boundaries'], 'skipped')
+        needs = {job: {'result': result} for job, result in expected.items()}
+        needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': json.dumps(stale, separators=(',', ':')),
+                                                'connect': 'true', 'full_validation': 'true', 'rehearse_shards': 'false'}
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
 
     def workflow(self):
