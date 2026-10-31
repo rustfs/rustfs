@@ -32,7 +32,7 @@ Periodic and manual suites use the responsibility registry and retain the existi
 
 ## Merge-queue preparation and rollback
 
-The merge-group event plans and validates its actual combined SHA/tree with the full Linux and feature configuration matrix. Main pushes keep complete validation; no reuse is inferred from tree equality because commit identity and build inputs can matter. CLA remains an independent queue-entry requirement.
+The merge-group event plans and validates its actual combined SHA/tree with the default workspace matrix: workspace lint and tests, the short core contract, the debug build, E2E smoke, both S3 lanes and the full merge-gate E2E. The specialized boundary, hardware and alternate-feature lanes (Connect Feature Boundaries, real io_uring, rio-v2, Swift, SFTP, HTTP/3) run only in the scheduled and manual full-validation runs and are required to be skipped here. Main pushes keep complete validation; no reuse is inferred from tree equality because commit identity and build inputs can matter. CLA remains an independent queue-entry requirement.
 
 `scripts/ci_merge_queue.py` prepares a bounded queue proposal from a live ruleset snapshot without calling a mutation API. It preserves all existing checks, reviews, bypass actors and branch conditions, adds an `ALLGREEN` squash queue with at most two concurrent builds/two merged entries, and produces the original rollback payload. Its timeout accommodates the existing full gate while measurements are collected. API fields follow [GitHub's ruleset contract](https://docs.github.com/en/rest/repos/rules).
 

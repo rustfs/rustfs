@@ -1323,41 +1323,6 @@ impl LocalDisk {
 }
 
 impl SourceStore {
-    /// Only native source validation may create provenance. Ordinary TMP/heal
-    /// publication can retain a valid old local anchor, never issue/rebind one.
-    pub async fn write_retirement_anchor(
-        &self,
-        state: &SourceState,
-        publication: &PublicationIdentity,
-        directory: &Path,
-        lease: Arc<os::NamespaceMutationLease>,
-    ) -> Result<()> {
-        if state.lineage != publication.lineage
-            || state.generation != publication.source_generation
-            || state.disk_id != self.disk_id
-            || state.physical_slot != self.physical_slot
-        {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
-        let record = NativeRetirementAnchor {
-            protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
-            disk_id: self.disk_id,
-            physical_slot: self.physical_slot,
-            publication: publication.clone(),
-            source_original_sha256: state.original_sha256,
-            source_validation_receipt_id: state.backup_owner,
-        };
-        let bytes = encode(&record)?;
-        let directory = directory.to_path_buf();
-        let base = self.base.clone();
-        let root = self.publication_root.clone();
-        os::run_blocking_namespace_operation(lease, move || {
-            let _parent = os::mkdir_all_below_existing_base_std(&directory, &base, &root)?;
-            os::replace_multipart_source_metadata(&directory.join(RETIREMENT_ANCHOR), &bytes, &base, &root)
-        })
-        .await
-        .map_err(DiskError::from)
-    }
     /// This caller already owns SourceRW and destination metadata ownership.
     /// An Aborting survivor can confirm a historical target only with its
     /// independent, same-disk publication anchor. Closure never creates one.
@@ -1569,7 +1534,31 @@ impl LocalDisk {
         };
         // Copy the small source FI to an independent immutable inode. Its
         // canonical inode is never truncated to build the destination proxy.
-        store.write_owned_backup_and_persist(owner, false, original, &state).await?;
+        let directory = staging.private_directory(publication.final_data_dir);
+        let anchor_record = NativeRetirementAnchor {
+            protocol_version: MULTIPART_SOURCE_PROTOCOL_VERSION,
+            disk_id: store.disk_id,
+            physical_slot: store.physical_slot,
+            publication: publication.clone(),
+            source_original_sha256: state.original_sha256,
+            source_validation_receipt_id: state.backup_owner,
+        };
+        let anchor_bytes = encode(&anchor_record)?;
+        state.validate(store.disk_id, &store.path)?;
+        let state_raw = encode(&state)?;
+        let source_dir = store.source.clone();
+        let base_dir = store.base.clone();
+        let pub_root = store.publication_root.clone();
+        let terminal = terminal_record_path(&source_dir, &state);
+        let original_bytes = original.to_vec();
+        os::run_blocking_namespace_operation_with_sync(staging.lease.clone(), true, move || {
+            SourceStore::write_owned_backup_std(&source_dir, &base_dir, &pub_root, owner, false, &original_bytes)?;
+            SourceStore::persist_state_std(&source_dir, &base_dir, &pub_root, &state_raw, terminal.as_deref(), false)?;
+            let _parent = os::mkdir_all_below_existing_base_std(&directory, &base_dir, &pub_root)?;
+            os::replace_multipart_source_metadata(&directory.join(RETIREMENT_ANCHOR), &anchor_bytes, &base_dir, &pub_root)
+        })
+        .await
+        .map_err(DiskError::from)?;
         let prepared_path = store.source.join(format!(".mpu-prepared-{owner}"));
         let context = NativeMultipartPublication {
             store,
@@ -1580,12 +1569,6 @@ impl LocalDisk {
             validated_prepared: parking_lot::Mutex::new(None),
             legacy,
         };
-        let directory = staging.private_directory(context.publication.final_data_dir);
-        let reserved = context.state.lock().clone();
-        context
-            .store
-            .write_retirement_anchor(&reserved, &context.publication, &directory, staging.lease.clone())
-            .await?;
         Ok(context)
     }
 }
@@ -1594,18 +1577,15 @@ impl NativeMultipartPublication {
     pub fn canonical_head(&self) -> PathBuf {
         self.store.source.join(STORAGE_FORMAT_FILE)
     }
+    #[cfg(test)]
     pub async fn prepare_metadata(&self, new_metadata: &[u8], old_metadata: Option<&[u8]>) -> Result<()> {
         let mut state = self.state.lock().clone();
-        let current = self.store.load().await?;
-        let current_state = current.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
-        if encode(current_state)? != encode(&state)? || !current.head_matches_state {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
         // Validate the actual persisted representation once, after FileMeta's
         // canonicalization. No unvalidated input can install a source proxy.
         if !self.store.target_matches(&self.publication, new_metadata)? {
             return Err(DiskError::ConditionalDeleteConflict);
         }
+        let expected_state_raw = encode(&state)?;
         let validated = ValidatedPreparedPublication {
             publication: self.publication.clone(),
             sha256: raw_sha(new_metadata),
@@ -1618,17 +1598,109 @@ impl NativeMultipartPublication {
         state.prepared_sha256 = Some(validated.sha256);
         state.prepared_length = Some(validated.length);
         state.advance(MultipartSourcePhase::Prepared)?;
-        if let Some(previous) = old_metadata {
-            self.store
-                .write_owned_backup_and_persist(state.backup_owner, true, previous, &state)
-                .await?;
-        } else {
-            self.store.persist(&state).await?;
-        }
+        state.validate(self.store.disk_id, &self.store.path)?;
+        let next_state_raw = encode(&state)?;
+        let source = self.store.source.clone();
+        let base = self.store.base.clone();
+        let root = self.store.publication_root.clone();
+        let path = self.store.path.clone();
+        let disk_id = self.store.disk_id;
+        let physical_slot = self.store.physical_slot;
+        let disk_ids = self.store.disk_ids.clone();
+        let backup_owner = state.backup_owner;
+        let old_bytes = old_metadata.map(|b| b.to_vec());
+        let terminal = terminal_record_path(&source, &state);
+        os::run_blocking_namespace_operation_with_sync(self.store.lease.clone(), true, move || {
+            let current = load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids).map_err(IoError::other)?;
+            let current_state = current
+                .state
+                .as_ref()
+                .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+            let current_raw = encode(current_state).map_err(IoError::other)?;
+            if current_raw != expected_state_raw || !current.head_matches_state {
+                return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+            }
+            if let Some(previous) = old_bytes.as_deref() {
+                SourceStore::write_owned_backup_std(&source, &base, &root, backup_owner, true, previous)?;
+            }
+            SourceStore::persist_state_std(&source, &base, &root, &next_state_raw, terminal.as_deref(), false)
+        })
+        .await
+        .map_err(DiskError::from)?;
         *self.state.lock() = state;
         *self.validated_prepared.lock() = Some(validated);
         Ok(())
     }
+    pub async fn prepare_and_install_head(
+        &self,
+        new_metadata: &[u8],
+        old_metadata: Option<&[u8]>,
+        dst_file_path: &Path,
+        directory_guard: &os::RenameCommitGuard,
+        mutation_lease: Arc<os::NamespaceMutationLease>,
+    ) -> Result<os::PreparedRenameSource> {
+        let mut state = self.state.lock().clone();
+        if !self.store.target_matches(&self.publication, new_metadata)? {
+            return Err(DiskError::ConditionalDeleteConflict);
+        }
+        let expected_state_raw = encode(&state)?;
+        let validated = ValidatedPreparedPublication {
+            publication: self.publication.clone(),
+            sha256: raw_sha(new_metadata),
+            length: new_metadata.len() as u64,
+        };
+        if let Some(previous) = old_metadata {
+            state.previous_target_sha256 = Some(raw_sha(previous));
+            state.previous_target_length = Some(previous.len() as u64);
+        }
+        state.prepared_sha256 = Some(validated.sha256);
+        state.prepared_length = Some(validated.length);
+        state.advance(MultipartSourcePhase::Prepared)?;
+        state.validate(self.store.disk_id, &self.store.path)?;
+        let next_state_raw = encode(&state)?;
+        let source = self.store.source.clone();
+        let base = self.store.base.clone();
+        let root = self.store.publication_root.clone();
+        let path = self.store.path.clone();
+        let disk_id = self.store.disk_id;
+        let physical_slot = self.store.physical_slot;
+        let disk_ids = self.store.disk_ids.clone();
+        let backup_owner = state.backup_owner;
+        let old_bytes = old_metadata.map(|b| b.to_vec());
+        let new_bytes = new_metadata.to_vec();
+        let terminal = terminal_record_path(&source, &state);
+        let prepared_path = self.prepared_path.clone();
+        let canonical = self.canonical_head();
+        let dst_file_path = dst_file_path.to_path_buf();
+        let owned_directory_guard = directory_guard.clone();
+        let prepared = os::run_blocking_namespace_operation_with_sync(mutation_lease, true, move || {
+            let current = load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids).map_err(IoError::other)?;
+            let current_state = current
+                .state
+                .as_ref()
+                .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+            let current_raw = encode(current_state).map_err(IoError::other)?;
+            if current_raw != expected_state_raw || !current.head_matches_state {
+                return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+            }
+            if let Some(previous) = old_bytes.as_deref() {
+                SourceStore::write_owned_backup_std(&source, &base, &root, backup_owner, true, previous)?;
+            }
+            SourceStore::persist_state_std(&source, &base, &root, &next_state_raw, terminal.as_deref(), false)?;
+            #[cfg(test)]
+            super::run_owned_file_before_open(&prepared_path);
+            let mut prepared_metadata_source =
+                os::create_prepared_rename_source_with_commit_guard(&prepared_path, &dst_file_path, &owned_directory_guard)?;
+            prepared_metadata_source.write_all(&new_bytes, true)?;
+            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, &base, &root)
+        })
+        .await
+        .map_err(DiskError::from)?;
+        *self.state.lock() = state;
+        *self.validated_prepared.lock() = Some(validated);
+        Ok(prepared)
+    }
+    #[cfg(test)]
     pub async fn install_head(&self, prepared: os::PreparedRenameSource) -> Result<os::PreparedRenameSource> {
         {
             let guard = self.validated_prepared.lock();
@@ -1701,11 +1773,7 @@ impl NativeMultipartPublication {
     }
     pub async fn finish(&self, target_lease: Arc<os::NamespaceMutationLease>) -> Result<MultipartPublicationResult> {
         let mut state = self.state.lock().clone();
-        let current = self.store.load().await?;
-        let current_state = current.state.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
-        if current.head.is_some() || encode(current_state)? != encode(&state)? {
-            return Err(DiskError::ConditionalDeleteConflict);
-        }
+        let expected_state_raw = encode(&state)?;
         let (expected_sha256, expected_length) = {
             let guard = self.validated_prepared.lock();
             let validated = guard.as_ref().ok_or(DiskError::ConditionalDeleteConflict)?;
@@ -1717,16 +1785,52 @@ impl NativeMultipartPublication {
             }
             (validated.sha256, validated.length)
         };
-        self.store
-            .read_and_sync_target_with_lease(&self.publication, target_lease, move |target| {
-                if target.len() as u64 != expected_length || raw_sha(target) != expected_sha256 {
-                    return Err(DiskError::ConditionalDeleteConflict);
-                }
-                Ok(())
-            })
-            .await?;
+        let target_dir = self.store.target_path(&self.publication)?;
         state.advance(MultipartSourcePhase::ConsumedUnsealed)?;
-        let snapshot = self.store.persist_with_source_sync(&state, true).await?;
+        state.validate(self.store.disk_id, &self.store.path)?;
+        let next_state_raw = encode(&state)?;
+        let snapshot = snapshot_for_state(self.store.disk_id, &state, &next_state_raw, None)?;
+        let source = self.store.source.clone();
+        let base = self.store.base.clone();
+        let root = self.store.publication_root.clone();
+        let path = self.store.path.clone();
+        let disk_id = self.store.disk_id;
+        let physical_slot = self.store.physical_slot;
+        let disk_ids = self.store.disk_ids.clone();
+        let terminal = terminal_record_path(&source, &state);
+        os::run_blocking_namespace_operation_with_sync(target_lease, true, move || {
+            let current = load_source(&source, &base, &root, &path, disk_id, physical_slot, &disk_ids).map_err(IoError::other)?;
+            let current_state = current
+                .state
+                .as_ref()
+                .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+            let current_raw = encode(current_state).map_err(IoError::other)?;
+            if current.head.is_some() || current_raw != expected_state_raw {
+                return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+            }
+            os::read_and_sync_multipart_target_metadata(
+                &target_dir,
+                std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
+                &base,
+                &root,
+                |target| {
+                    if target.len() as u64 != expected_length || raw_sha(target) != expected_sha256 {
+                        return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+                    }
+                    Ok(())
+                },
+            )
+            .map_err(|error| {
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    IoError::other(DiskError::ConditionalDeleteConflict)
+                } else {
+                    error
+                }
+            })?;
+            SourceStore::persist_state_std(&source, &base, &root, &next_state_raw, terminal.as_deref(), true)
+        })
+        .await
+        .map_err(DiskError::from)?;
         *self.state.lock() = state;
         let proof = self
             .store

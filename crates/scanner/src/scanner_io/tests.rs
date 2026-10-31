@@ -45,6 +45,7 @@ use time::OffsetDateTime;
 use uuid::Uuid;
 
 mod checkpoint_coverage_identity;
+mod cold_bucket_service;
 mod collector_lifecycle;
 mod cycle_collector_diagnostics;
 mod expiry_lock;
@@ -5174,6 +5175,35 @@ pub(super) async fn observe_coordinator_bucket_scan_admitted(worker_index: usize
     probe.peak.fetch_max(active, Ordering::SeqCst);
     tokio::time::sleep(probe.hold).await;
     probe.active.fetch_sub(1, Ordering::SeqCst);
+}
+
+static FAILING_COORDINATOR_BUCKETS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+pub(super) fn coordinator_bucket_scan_fails(bucket: &str) -> bool {
+    FAILING_COORDINATOR_BUCKETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .contains(bucket)
+}
+
+struct FailingCoordinatorBucket(String);
+
+impl Drop for FailingCoordinatorBucket {
+    fn drop(&mut self) {
+        FAILING_COORDINATOR_BUCKETS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
+    }
+}
+
+fn fail_coordinator_bucket_scan(bucket: &str) -> FailingCoordinatorBucket {
+    FAILING_COORDINATOR_BUCKETS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(bucket.to_string());
+    FailingCoordinatorBucket(bucket.to_string())
 }
 
 pub(super) async fn observe_coordinator_bucket_worker_started(worker_index: usize) {

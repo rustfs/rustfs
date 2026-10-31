@@ -175,9 +175,9 @@ tokio-rustls = { default-features = false, version = "0.26.6" }
 tokio-stream = { version = "0.1.19" }
 tokio-test = "0.4.6"
 tokio-util = { version = "0.7.20" }
-tonic = { version = "0.14.8" }
-tonic-prost = { version = "0.14.8" }
-tonic-prost-build = { version = "0.14.8" }
+tonic = { version = "0.14.9" }
+tonic-prost = { version = "0.14.9" }
+tonic-prost-build = { version = "0.14.9" }
 tower = { version = "0.5.3" }
 tower-http = { version = "0.7.1" }
 h3 = "0.0.8"
@@ -319,7 +319,7 @@ rustfs-erasure-codec = { version = "9.0.0" }
 reed-solomon-simd = "3.1.0"
 regex = { version = "1.13.1" }
 rumqttc = { package = "rumqttc-next", version = "0.34.0" }
-redis = { version = "1.8.0" }
+redis = { version = "1.8.1" }
 rustify = { version = "0.7", default-features = false }
 rustix = { version = "1.1.6" }
 rust-embed = { version = "8.13.0" }
@@ -334,7 +334,7 @@ compact_str = "0.10.0"
 snap = "1.1.2"
 starshard = { version = "2.4.0" }
 strum = { version = "0.28.0" }
-sysinfo = "0.40.0"
+sysinfo = "0.40.1"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
 test-case = "3.4.0"
@@ -386,7 +386,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.30.1", default-features = false }
+hotpath = { version = "0.30.2", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 

@@ -18,9 +18,9 @@ use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerBucketPrefixScanScope, ScannerItem, scan_data_folder_scoped};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
-    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
-    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
-    ScannerError, SizeSummary, TierStats,
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageBucketServiceLedger, DataUsageCache, DataUsageCacheInfo,
+    DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo,
+    DataUsageScanPlanDigest, DataUsageSnapshotSetState, ScannerError, SizeSummary, TierStats,
 };
 use bytes::Bytes;
 use futures::future::join_all;

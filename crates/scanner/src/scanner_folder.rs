@@ -498,7 +498,10 @@ fn checkpoint_reason_from_budget(reason: Option<ScannerCycleBudgetReason>) -> Da
     match reason {
         Some(ScannerCycleBudgetReason::Runtime) => DataUsageScanCheckpointReason::Runtime,
         Some(ScannerCycleBudgetReason::Objects) => DataUsageScanCheckpointReason::Objects,
-        Some(ScannerCycleBudgetReason::Directories) => DataUsageScanCheckpointReason::Directories,
+        // This enum is persisted and older readers reject unknown variants.
+        Some(ScannerCycleBudgetReason::Directories | ScannerCycleBudgetReason::Entries) => {
+            DataUsageScanCheckpointReason::Directories
+        }
         None => DataUsageScanCheckpointReason::Unknown,
     }
 }
@@ -1302,9 +1305,11 @@ impl FolderScanner {
         }
     }
 
-    fn record_raw_enumeration_entry(&mut self, parent: &str, entry: &str) {
+    /// Records one raw entry. Returns whether a durable index holds it, which
+    /// is what makes stopping at this entry recoverable.
+    fn record_raw_enumeration_entry(&mut self, parent: &str, entry: &str) -> bool {
         if self.old_cache.info.scan_progress.is_none() {
-            return;
+            return false;
         }
         if let Some(position) = self
             .raw_enumeration_progress
@@ -1317,18 +1322,14 @@ impl FolderScanner {
             self.raw_enumeration_progress
                 .push(RawEnumerationProgress::new(parent, page_index));
         }
-        if let Some(progress) = self.raw_enumeration_progress.last_mut() {
+        self.raw_enumeration_progress.last_mut().is_some_and(|progress| {
             progress.record_entry(entry);
-        }
+            progress.page_index.is_some()
+        })
     }
 
     fn raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
-        self.old_cache
-            .info
-            .scan_raw_enumeration_page_index
-            .as_ref()
-            .filter(|index| index.parent() == Some(parent))?;
-        self.old_cache.validated_raw_enumeration_page_index()
+        self.old_cache.validated_raw_enumeration_page_index_for_parent(parent)
     }
 
     fn raw_enumeration_committed_entry_oracle(&self, parent: &str) -> HashSet<String> {
@@ -1372,23 +1373,36 @@ impl FolderScanner {
         if self.raw_enumeration_progress.is_empty() {
             return (None, None);
         }
-        let progress_index = self
-            .raw_enumeration_progress
-            .iter()
-            .enumerate()
-            .max_by_key(|(index, progress)| (progress.checkpointable_entry_count(), std::cmp::Reverse(*index)))
-            .map(|(index, _)| index)
-            .unwrap_or(0);
+        let progress_index = self.selected_raw_enumeration_progress().unwrap_or(0);
         let progress = self.raw_enumeration_progress.swap_remove(progress_index);
         self.raw_enumeration_progress.clear();
         (progress.cursor(), progress.page_index())
     }
 
-    fn peek_raw_enumeration_resume_state(&self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
+    fn selected_raw_enumeration_progress(&self) -> Option<usize> {
         self.raw_enumeration_progress
             .iter()
-            .max_by_key(|progress| progress.checkpointable_entry_count())
-            .map_or((None, None), |progress| (progress.cursor(), progress.page_index()))
+            .enumerate()
+            .max_by_key(|(index, progress)| (progress.checkpointable_entry_count(), std::cmp::Reverse(*index)))
+            .map(|(index, _)| index)
+    }
+
+    /// The walk path except the directory the resume state selects.
+    fn raw_enumeration_path_page_indexes(&self) -> Vec<RawEnumerationPageIndex> {
+        let selected = self.selected_raw_enumeration_progress();
+        self.raw_enumeration_progress
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| Some(*index) != selected)
+            .filter_map(|(_, progress)| progress.page_index())
+            .collect()
+    }
+
+    fn peek_raw_enumeration_resume_state(&self) -> (Option<DataUsageRawEnumerationCursor>, Option<RawEnumerationPageIndex>) {
+        self.selected_raw_enumeration_progress().map_or((None, None), |index| {
+            let progress = &self.raw_enumeration_progress[index];
+            (progress.cursor(), progress.page_index())
+        })
     }
 
     async fn scan_child_folder(
@@ -1480,6 +1494,7 @@ impl FolderScanner {
         snapshot.info.last_update = Some(SystemTime::now());
         snapshot.info.snapshot_complete = false;
         let (cursor, page_index) = self.peek_raw_enumeration_resume_state();
+        snapshot.info.scan_raw_enumeration_path_page_indexes = self.raw_enumeration_path_page_indexes();
         snapshot.info.scan_raw_enumeration_cursor = cursor;
         snapshot.info.scan_raw_enumeration_page_index = page_index;
         snapshot.seal_scan_frontier(self.coverage_frontier.as_deref()).ok()?;
@@ -1976,6 +1991,9 @@ impl FolderScanner {
             let mut last_entry_progress = Instant::now();
             let mut raw_enumeration_complete = false;
             let raw_enumeration_committed_entries = self.raw_enumeration_committed_entry_oracle(&folder.name);
+            let raw_replay_floor = u64::try_from(raw_enumeration_committed_entries.len()).unwrap_or(u64::MAX);
+            let mut raw_entries_observed = 0_u64;
+            let mut raw_entries_charged = 0_u64;
 
             let mut candidate_unclassified = mode != FolderScanMode::Namespace;
             let mut deferred_metadata = None;
@@ -2061,8 +2079,13 @@ impl FolderScanner {
                     continue;
                 }
                 if !replayed_metadata {
-                    let raw_entry_consumed_by_owner_index = raw_enumeration_committed_entries.contains(&file_name);
-                    if !raw_entry_consumed_by_owner_index {
+                    // A restored index appends one pending name per entry past
+                    // its old size, so charging only that tail keeps each
+                    // budget unit durable even if the listing order changed.
+                    raw_entries_observed = raw_entries_observed.saturating_add(1);
+                    let raw_entry_is_new =
+                        raw_entries_observed > raw_replay_floor && !raw_enumeration_committed_entries.contains(&file_name);
+                    if raw_entry_is_new {
                         #[cfg(test)]
                         tests::enumeration_restart::observe_raw_entry(&dir_path, &entry.file_name(), &self.budget);
                         pending_entry_progress = pending_entry_progress.saturating_add(1);
@@ -2074,7 +2097,18 @@ impl FolderScanner {
                             last_entry_progress = Instant::now();
                         }
                     }
-                    self.record_raw_enumeration_entry(&folder.name, &file_name);
+                    let raw_entry_is_durable = self.record_raw_enumeration_entry(&folder.name, &file_name);
+                    // Object metadata and the entries behind it are charged to
+                    // the object budget; this one covers listing work.
+                    let object_entry = file_name == STORAGE_FORMAT_FILE || deferred_metadata.is_some();
+                    if raw_entry_is_new && raw_entry_is_durable && !object_entry {
+                        raw_entries_charged = raw_entries_charged.saturating_add(1);
+                        let name_bytes = u64::try_from(file_name.len()).unwrap_or(u64::MAX);
+                        if !self.budget.try_charge_raw_entry(name_bytes, raw_entries_charged) {
+                            self.budget.record_entries_visited(pending_entry_progress);
+                            return Err(ScannerError::Other("Operation cancelled".to_string()));
+                        }
+                    }
                     self.maybe_send_checkpoint(&folder, &this_hash, into);
                 }
                 let is_storage_format_entry = file_name == STORAGE_FORMAT_FILE;
@@ -2474,7 +2508,9 @@ impl FolderScanner {
                 }
             }
             self.budget.record_entries_visited(pending_entry_progress);
-            if raw_enumeration_complete {
+            // A directory with queued children keeps its index until they end:
+            // a restart replays this listing to reach the unfinished child.
+            if raw_enumeration_complete && queued_folders.is_empty() {
                 self.finish_raw_enumeration_parent(&folder.name);
             }
 
@@ -2683,10 +2719,12 @@ impl FolderScanner {
                                 "Scanner child folder scan failed"
                             );
                             self.coverage_gap |= forward_sweep;
+                            self.finish_raw_enumeration_parent(&folder_item.name);
                             continue;
                         }
                     }
                 };
+                self.finish_raw_enumeration_parent(&folder_item.name);
                 if outcome == FolderScanOutcome::Vanished {
                     self.new_cache.delete_recursive(&h);
                     if let Some(updates) = &mut self.usage_updates {
@@ -3405,6 +3443,7 @@ pub(crate) async fn scan_data_folder_scoped(
             new_cache.info.scan_checkpoint = None;
             new_cache.info.scan_raw_enumeration_cursor = None;
             new_cache.info.scan_raw_enumeration_page_index = None;
+            new_cache.info.scan_raw_enumeration_path_page_indexes.clear();
             new_cache.info.scan_coverage_receipt = None;
             if had_scan_checkpoint {
                 global_metrics().record_scanner_checkpoint_cleared();
@@ -3443,6 +3482,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 let root_hash = hash_path(&bucket_name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
+                let raw_enumeration_path_page_indexes = scanner.raw_enumeration_path_page_indexes();
                 let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
                 let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
                     && !root_has_progress)
@@ -3465,6 +3505,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 }
                 if raw_enumeration_page_index.is_some() {
                     new_cache.info.scan_raw_enumeration_page_index = raw_enumeration_page_index;
+                    new_cache.info.scan_raw_enumeration_path_page_indexes = raw_enumeration_path_page_indexes;
                     new_cache.info.scan_checkpoint = None;
                     new_cache.info.scan_resume_after = None;
                     new_cache.info.scan_coverage_receipt = None;
@@ -3495,6 +3536,7 @@ pub(crate) async fn scan_data_folder_scoped(
                             global_metrics().record_scanner_checkpoint_cleared();
                         }
                     }
+                    new_cache.info.scan_resource_deferred = matches!(&e, ScannerError::ResourceDeferred);
                     close_disk_guard.close().await;
                     return Err(ScannerError::PartialCache(Box::new(std::mem::take(new_cache))));
                 }
@@ -3524,6 +3566,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         .insert(hash_path(&bucket_name).0, DataUsageEntry::default());
                 }
                 partial_cache.info.snapshot_complete = false;
+                partial_cache.info.scan_resource_deferred = true;
                 close_disk_guard.close().await;
                 return Err(ScannerError::PartialCache(Box::new(partial_cache)));
             }

@@ -94,15 +94,15 @@ async fn checkpoint_resumes_across_a_maintenance_publication() {
     assert!(result.clear_verified_usage().is_empty());
     assert!(dirty_usage_buckets_for_tests().is_empty());
 
-    // Cycle 2: the written bucket is the only dirty one, so it is walked
-    // first and the object budget stops its sweep with a checkpoint; the
-    // cycle itself is incomplete.
+    // Cycle 2: the object budget stops the written bucket's sweep with a
+    // checkpoint; the cycle itself is incomplete. Service order follows the
+    // wait, so the budget leaves it two objects even behind the idle bucket.
     for object in ["p6/g", "p7/h"] {
         put_fixture_object(&store, "hot-bucket", object).await;
     }
     record_dirty_usage_bucket("hot-bucket");
     wait_for_namespace_commit_tails(store.as_ref()).await;
-    let (result, _, budget) = run_full_cycle(&store, 2, Some(2)).await;
+    let (result, _, budget) = run_full_cycle(&store, 2, Some(3)).await;
     assert_eq!(result.status, ScannerCycleStatus::Incomplete);
     assert!(budget.budget_elapsed());
     let set = Arc::clone(&store.pools[0].disk_set[0]);

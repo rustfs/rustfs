@@ -57,6 +57,66 @@ fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
     assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
 }
 
+#[test]
+fn raw_enumeration_path_indexes_preserve_map_compatibility_and_validation() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    }
+    let index_for = |parent: &str| RawEnumerationPageIndex::new(parent, 8).expect("fixture index");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_identity: Some(DataUsageScanIdentity {
+                version: 1,
+                bucket_incarnation: uuid::Uuid::from_u128(1),
+                set_layout: DataUsageScanPlanDigest([2; 32]),
+                publication_epoch: 1,
+                tier_registry_generation: 0,
+                scan_mode: HealScanMode::Normal,
+            }),
+            source: Some(DataUsageCacheSource::new(0, 0)),
+            scan_raw_enumeration_page_index: Some(index_for("bucket/wide")),
+            scan_raw_enumeration_path_page_indexes: vec![index_for("bucket"), index_for("other-bucket/wide")],
+            ..Default::default()
+        },
+        cache: HashMap::new(),
+    };
+    assert!(cache.validated_raw_enumeration_page_index_for_parent("bucket").is_some());
+    assert!(
+        cache
+            .validated_raw_enumeration_page_index_for_parent("other-bucket/wide")
+            .is_none(),
+        "a saved path index must stay inside its bucket"
+    );
+
+    let encoded = rmp_serde::to_vec(&cache.info).expect("path indexes should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore the path indexes");
+    assert_eq!(legacy.name, "bucket");
+    assert_eq!(
+        legacy
+            .scan_raw_enumeration_page_index
+            .and_then(|index| index.parent().map(str::to_owned)),
+        Some("bucket/wide".to_string())
+    );
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the path indexes");
+    assert_eq!(decoded.scan_raw_enumeration_path_page_indexes.len(), 2);
+
+    cache.info.scan_raw_enumeration_path_page_indexes.clear();
+    let encoded = rmp_serde::to_vec(&cache.info).expect("empty path indexes should encode");
+    assert!(
+        !encoded
+            .windows(b"scan_raw_enumeration_path_page_indexes".len())
+            .any(|window| window == b"scan_raw_enumeration_path_page_indexes"),
+        "the default must stay absent from the map"
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CachePutRecord {
     object: String,

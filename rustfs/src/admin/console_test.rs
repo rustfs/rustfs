@@ -43,6 +43,163 @@ mod tests {
             .map(|value| value.to_str().expect("allow-origin header must be valid UTF-8").to_string())
     }
 
+    /// Sends a brotli-encoded response through `buffer_brotli_responses` and returns
+    /// the `Content-Length` header value and body bytes.
+    async fn run_brotli_middleware(body: &'static str, has_content_length: bool) -> (Option<String>, bytes::Bytes) {
+        use crate::admin::console::buffer_brotli_responses;
+        use axum::middleware;
+        use axum::{Router, body::Body, routing::get};
+        use tower::ServiceExt;
+
+        let app = Router::new()
+            .route(
+                "/",
+                get(move || async move {
+                    let mut builder = http::Response::builder().header(http::header::CONTENT_ENCODING, "br");
+                    if has_content_length {
+                        builder = builder.header(http::header::CONTENT_LENGTH, body.len().to_string());
+                    }
+                    builder.body(Body::from(body)).expect("response must build")
+                }),
+            )
+            .layer(middleware::from_fn(buffer_brotli_responses));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("request must not fail");
+
+        let content_length = response
+            .headers()
+            .get(http::header::CONTENT_LENGTH)
+            .map(|value| value.to_str().expect("content-length header must be valid UTF-8").to_string());
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body must be readable");
+        (content_length, body_bytes)
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_buffer_brotli_responses() {
+        // Brotli response without Content-Length must have Content-Length added with correct value.
+        let (content_length, body) = run_brotli_middleware("fake-brotli-data", false).await;
+        assert_eq!(
+            content_length.as_deref(),
+            Some("16"),
+            "brotli response without Content-Length must have Content-Length set to the body length"
+        );
+        assert_eq!(
+            body.as_ref(),
+            b"fake-brotli-data",
+            "body bytes must be preserved through the buffer round-trip"
+        );
+
+        // Brotli response that already carries Content-Length must pass through unchanged.
+        let (content_length, body) = run_brotli_middleware("data", true).await;
+        assert_eq!(
+            content_length.as_deref(),
+            Some("4"),
+            "brotli response that already has Content-Length must not be re-buffered"
+        );
+        assert_eq!(body.as_ref(), b"data", "body bytes must be preserved when passing through unchanged");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_buffer_brotli_responses_non_brotli_passthrough() {
+        use crate::admin::console::buffer_brotli_responses;
+        use axum::middleware;
+        use axum::{Router, body::Body, routing::get};
+        use tower::ServiceExt;
+
+        // Non-brotli response must pass through with no modification.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    http::Response::builder()
+                        .header(http::header::CONTENT_ENCODING, "gzip")
+                        .body(Body::from("gzip-data"))
+                        .expect("response must build")
+                }),
+            )
+            .layer(middleware::from_fn(buffer_brotli_responses));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("request must not fail");
+
+        assert_eq!(
+            response
+                .headers()
+                .get(http::header::CONTENT_ENCODING)
+                .and_then(|v| v.to_str().ok()),
+            Some("gzip"),
+            "non-brotli Content-Encoding must pass through unchanged"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body must be readable");
+        assert_eq!(body_bytes.as_ref(), b"gzip-data", "body bytes must pass through unchanged");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn test_buffer_brotli_responses_body_stream_error() {
+        use crate::admin::console::buffer_brotli_responses;
+        use axum::middleware;
+        use axum::{Router, body::Body, routing::get};
+        use tower::ServiceExt;
+
+        // A brotli response whose body stream errors must have Content-Encoding stripped
+        // so the client does not attempt to decode an empty body as brotli.
+        let app = Router::new()
+            .route(
+                "/",
+                get(|| async {
+                    let broken = futures::stream::once(async {
+                        Err::<bytes::Bytes, std::io::Error>(std::io::Error::other("simulated stream error"))
+                    });
+                    http::Response::builder()
+                        .header(http::header::CONTENT_ENCODING, "br")
+                        .body(Body::from_stream(broken))
+                        .expect("response must build")
+                }),
+            )
+            .layer(middleware::from_fn(buffer_brotli_responses));
+
+        let response = app
+            .oneshot(
+                http::Request::builder()
+                    .uri("/")
+                    .body(Body::empty())
+                    .expect("request must build"),
+            )
+            .await
+            .expect("request must not fail");
+
+        assert!(
+            response.headers().get(http::header::CONTENT_ENCODING).is_none(),
+            "Content-Encoding must be stripped when body buffering fails so the client does not decode an empty body as brotli"
+        );
+        let body_bytes = axum::body::to_bytes(response.into_body(), 1024 * 1024)
+            .await
+            .expect("body must be readable");
+        assert!(body_bytes.is_empty(), "body must be empty after buffering failure");
+    }
+
     #[tokio::test]
     #[serial]
     async fn test_console_cors_configuration() {
