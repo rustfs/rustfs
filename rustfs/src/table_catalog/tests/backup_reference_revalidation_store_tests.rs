@@ -22,6 +22,8 @@ const REFERENCE_DATA: &str = "tables/table-id/data/revalidation.parquet";
 const REFERENCE_MANIFEST: &str = "tables/table-id/metadata/revalidation.avro";
 const REFERENCE_LIST: &str = "tables/table-id/metadata/revalidation-list.avro";
 const REFERENCE_STATISTICS: &str = "tables/table-id/metadata/revalidation-statistics.puffin";
+const REFERENCE_STATISTICS_BYTES: &[u8] = b"PFA1aaaaPFA1";
+const CHANGED_REFERENCE_STATISTICS_BYTES: &[u8] = b"PFA1bbbbPFA1";
 
 struct ReferenceRestoreMutation {
     object: String,
@@ -84,7 +86,7 @@ async fn reference_restore_fixture() -> ReferenceRestoreFixture {
     }]);
     metadata["statistics"] = serde_json::json!([{
         "snapshot-id": 42, "statistics-path": format!("s3://analytics/{REFERENCE_STATISTICS}"),
-        "file-size-in-bytes": 8, "file-footer-size-in-bytes": 4, "blob-metadata": []
+        "file-size-in-bytes": REFERENCE_STATISTICS_BYTES.len(), "file-footer-size-in-bytes": 4, "blob-metadata": []
     }]);
     validate_supported_table_metadata(&metadata).expect("reference fixture must contain valid nonempty metadata");
     let data_location = format!("s3://analytics/{REFERENCE_DATA}");
@@ -92,7 +94,7 @@ async fn reference_restore_fixture() -> ReferenceRestoreFixture {
     let manifest_location = format!("s3://analytics/{REFERENCE_MANIFEST}");
     source.seed_object("analytics", REFERENCE_DATA, b"x".to_vec()).await;
     source
-        .seed_object("analytics", REFERENCE_STATISTICS, b"PFA1PFA1".to_vec())
+        .seed_object("analytics", REFERENCE_STATISTICS, REFERENCE_STATISTICS_BYTES.to_vec())
         .await;
     source.seed_object("analytics", &history_path, history_bytes.clone()).await;
     source
@@ -196,8 +198,8 @@ async fn reference_restore_fixture() -> ReferenceRestoreFixture {
         },
         ReferenceRestoreMutation {
             object: REFERENCE_STATISTICS.to_string(),
-            original: b"PFA1PFA1".to_vec(),
-            changed: b"PFA1PFA2".to_vec(),
+            original: REFERENCE_STATISTICS_BYTES.to_vec(),
+            changed: CHANGED_REFERENCE_STATISTICS_BYTES.to_vec(),
         },
     ];
     for mutation in &mutations {

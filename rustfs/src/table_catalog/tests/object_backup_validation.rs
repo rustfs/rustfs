@@ -1129,15 +1129,34 @@ async fn namespace_table_and_view_reads_cannot_cross_a_restore_with_identical_bu
         let table = IdentifierSegment::parse("orders").expect("table");
         let view = IdentifierSegment::parse("recent_orders").expect("view");
         let store = ObjectTableCatalogStore::new(backend.clone());
-        store
-            .create_view(test_view_entry(
+        let view_path = default_view_metadata_file_path(&namespace, &view, "00001.metadata.json");
+        let view_entry = test_view_entry("analytics", &namespace, &view, view_path.clone());
+        let view_metadata = serde_json::json!({
+            "format-version": 1,
+            "view-uuid": view_entry.view_uuid,
+            "location": view_entry.warehouse_location,
+            "schemas": [{
+                "type": "struct", "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }],
+            "current-schema-id": 0,
+            "current-version-id": 1,
+            "versions": [{
+                "version-id": 1, "timestamp-ms": 1, "schema-id": 0, "summary": {},
+                "representations": [{"type": "sql", "sql": "SELECT 1", "dialect": "spark"}],
+                "default-namespace": ["sales"]
+            }],
+            "version-log": [{"timestamp-ms": 1, "version-id": 1}],
+            "properties": {}
+        });
+        backend
+            .seed_object(
                 "analytics",
-                &namespace,
-                &view,
-                default_view_metadata_file_path(&namespace, &view, "00001.metadata.json"),
-            ))
-            .await
-            .expect("seed view before backup");
+                &view_path,
+                serde_json::to_vec(&view_metadata).expect("valid fixture view metadata"),
+            )
+            .await;
+        store.create_view(view_entry).await.expect("seed view before backup");
         let backup = store
             .create_object_catalog_backup("analytics", None)
             .await

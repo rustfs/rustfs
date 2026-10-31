@@ -173,7 +173,10 @@ async fn a_self_consistent_candidate_with_an_extra_reference_cannot_publish_a_ca
         .import_object_catalog_backup(&backup.table_bucket, serde_json::to_vec(&backup).expect("candidate"))
         .await
         .expect("raw transfer may preserve a candidate before its external graph is prepared");
-    backend.reset_call_counts().await;
+    let (before_objects, before_puts, before_deletes) = {
+        let state = backend.state.lock().await;
+        (state.objects.clone(), state.put_attempts.clone(), state.delete_attempts.clone())
+    };
     let error = store
         .restore_object_catalog_backup_with_id(&backup.table_bucket, &backup.backup_id, None, false, Some("extra-reference"))
         .await
@@ -181,8 +184,9 @@ async fn a_self_consistent_candidate_with_an_extra_reference_cannot_publish_a_ca
     assert!(matches!(error, TableCatalogStoreError::Conflict(message) if message.contains("reference graph")));
     let state = backend.state.lock().await;
     assert_eq!(state.objects.len(), 1, "only the previously imported artifact may exist");
-    assert!(state.put_attempts.is_empty());
-    assert!(state.delete_attempts.is_empty());
+    assert_eq!(state.objects, before_objects, "rejected restore changed persisted objects");
+    assert_eq!(state.put_attempts, before_puts, "rejected restore attempted a write");
+    assert_eq!(state.delete_attempts, before_deletes, "rejected restore attempted a deletion");
 }
 
 #[tokio::test]
