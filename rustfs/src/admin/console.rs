@@ -463,7 +463,14 @@ pub(crate) async fn buffer_brotli_responses(request: Request, next: middleware::
             }
             Response::from_parts(parts, Body::from(bytes))
         }
-        Err(_) => Response::from_parts(parts, Body::empty()),
+        Err(err) => {
+            warn!(
+                error = %err,
+                "Failed to buffer brotli console response; sending empty body without Content-Encoding"
+            );
+            parts.headers.remove(http::header::CONTENT_ENCODING);
+            Response::from_parts(parts, Body::empty())
+        }
     }
 }
 
