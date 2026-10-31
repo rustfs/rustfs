@@ -1653,7 +1653,6 @@ impl SetDisks {
                 disks.as_ref(),
                 &erasure,
                 frame_size,
-                offset,
                 length,
                 part_index,
                 last_part_index,
@@ -2113,7 +2112,6 @@ impl SetDisks {
         disks: &[Option<DiskStore>],
         erasure: &coding::Erasure,
         frame_size: usize,
-        offset: usize,
         length: usize,
         part_index: usize,
         last_part_index: usize,
@@ -2272,10 +2270,7 @@ impl SetDisks {
 
                 let available_shards = reader_setup.available_shards();
                 if available_shards < erasure.data_shards {
-                    return Err(Error::other(format!(
-                        "not enough disks to read quantized range: available {available_shards}, required {}",
-                        erasure.data_shards
-                    )));
+                    return Err(DiskError::ErasureReadQuorum.into());
                 }
 
                 let quorum_window_bytes = read_shard_size
@@ -2376,9 +2371,7 @@ impl SetDisks {
         }
 
         if total_read != length {
-            return Err(Error::other(format!(
-                "quantized range returned {total_read} bytes, expected {length} at offset {offset}"
-            )));
+            return Err(StorageError::LessData);
         }
         Ok(())
     }
@@ -6426,6 +6419,48 @@ mod tests {
     fn quantized_part_remaining_rejects_offsets_past_part_end() {
         assert_eq!(quantized_part_remaining(1024, 768).expect("valid part offset"), 256);
         assert!(quantized_part_remaining(1024, 1025).is_err());
+    }
+
+    #[tokio::test]
+    async fn quantized_range_preserves_typed_quorum_and_short_read_errors() {
+        let erasure = coding::Erasure::new(2, 2, 64 * 1024);
+        let disks = vec![None; erasure.total_shard_count()];
+        for (part_size, expected) in [(1, StorageError::ErasureReadQuorum), (0, StorageError::LessData)] {
+            let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+            fi.size = 1;
+            fi.erasure.block_size = erasure.block_size;
+            fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+            fi.add_object_part(1, "fixture-etag".to_string(), part_size, None, 1, None, None);
+            let files = vec![fi.clone(); erasure.total_shard_count()];
+            let mut output = Vec::new();
+            let error = SetDisks::read_quantized_range(
+                CODEC_STREAMING_TEST_BUCKET,
+                CODEC_STREAMING_TEST_OBJECT,
+                &mut output,
+                &fi,
+                &files,
+                &disks,
+                &erasure,
+                16 * 1024,
+                1,
+                0,
+                0,
+                0,
+                false,
+                true,
+                true,
+                false,
+                0,
+                0,
+                GET_OBJECT_PATH_SET_DISK,
+                "plain",
+                "small",
+            )
+            .await
+            .expect_err("unreadable quantized range must fail");
+            assert_eq!(error, expected);
+            assert!(output.is_empty());
+        }
     }
 
     fn capture_read_repair_submitter(
