@@ -976,6 +976,12 @@ test-group = 'e2e-vault'
 filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
 threads-required = "num-test-threads"
 
+# The mc fixture uploads hundreds of objects concurrently before measuring listing.
+# Reserve the runner so other server fixtures do not starve its disk operations.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(=mc_mirror_small_bucket_test::test_mc_mirror_small_bucket_completes_without_list_timeout)'
+threads-required = "num-test-threads"
+
 # Fixed, small contract for every executable server change. These existing
 # scenarios exercise write/read, anonymous denial and retained bytes on restart.
 [profile.core-contract]
