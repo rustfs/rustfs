@@ -2324,7 +2324,7 @@ impl DefaultObjectUsecase {
 /// `previous_current_size` value the usage-accounting helpers expect. Outer
 /// `None` = unknown (no quorum agreement, or a peer predates the field) — the
 /// caller must fall back to the degraded accounting path.
-pub(super) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Option<Option<u64>> {
+pub(crate) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Option<Option<u64>> {
     backfill.map(|observation| match observation {
         OldCurrentSize::Present(size) => Some(size.max(0) as u64),
         OldCurrentSize::Absent => None,

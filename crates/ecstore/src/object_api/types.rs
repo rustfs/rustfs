@@ -1543,6 +1543,8 @@ pub struct ObjectInfo {
     /// published by the same upload. Callers must not repeat quota, replication,
     /// lifecycle, or object-created side effects for that response.
     pub multipart_completion_replayed: bool,
+    /// Previous current version's size observed during `rename_data` commit.
+    pub backfilled_old_current_size: Option<crate::disk::OldCurrentSize>,
 }
 
 impl Default for ObjectInfo {
@@ -1585,6 +1587,7 @@ impl Default for ObjectInfo {
             replication_decision: String::new(),
             checksum: None,
             multipart_completion_replayed: false,
+            backfilled_old_current_size: None,
         }
     }
 }
@@ -1628,6 +1631,7 @@ impl Clone for ObjectInfo {
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
             multipart_completion_replayed: self.multipart_completion_replayed,
+            backfilled_old_current_size: self.backfilled_old_current_size,
             expires: self.expires,
         }
     }
