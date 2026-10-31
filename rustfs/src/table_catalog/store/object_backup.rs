@@ -867,6 +867,16 @@ where
         Ok(())
     }
 
+    async fn validate_catalog_backup_reference_graph(&self, backup: &ObjectCatalogBackup) -> TableCatalogStoreResult<()> {
+        if let Some(references) = &backup.references {
+            self.validate_object_catalog_backup_references(&backup.table_bucket, &backup.objects, references)
+                .await
+        } else {
+            self.validate_catalog_backup_snapshot_graph(&backup.table_bucket, &backup.objects)
+                .await
+        }
+    }
+
     pub(crate) async fn create_object_catalog_backup(
         &self,
         table_bucket: &str,
@@ -964,13 +974,7 @@ where
         allow_replace: bool,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<(Vec<ObjectCatalogRestoreWrite>, Vec<ObjectCatalogRestoreDelete>)> {
-        if let Some(references) = &backup.references {
-            self.validate_object_catalog_backup_references(table_bucket, &backup.objects, references)
-                .await?;
-        } else {
-            self.validate_catalog_backup_snapshot_graph(table_bucket, &backup.objects)
-                .await?;
-        }
+        self.validate_catalog_backup_reference_graph(backup).await?;
         fence.ensure_held()?;
         let target_prefix = self.paths.table_bucket_root_prefix(table_bucket);
         let current = self.backend.list_objects(self.catalog_bucket(), &target_prefix).await?;
@@ -1112,8 +1116,7 @@ where
         if actual != expected {
             return Err(TableCatalogStoreError::Conflict("catalog restore target inventory changed".to_string()));
         }
-        self.validate_catalog_backup_snapshot_graph(&backup.table_bucket, &backup.objects)
-            .await
+        self.validate_catalog_backup_reference_graph(backup).await
     }
 
     async fn apply_object_catalog_restore_plan(
@@ -1401,8 +1404,7 @@ where
         if intent.state == ObjectCatalogRestoreStateKind::Prepared {
             // Recheck immutable Iceberg references before resuming, including after
             // a process restart. Every mutation retains its first observed ETag.
-            self.validate_catalog_backup_snapshot_graph(table_bucket, &backup.objects)
-                .await?;
+            self.validate_catalog_backup_reference_graph(&backup).await?;
             self.apply_object_catalog_restore_plan(&backup, &intent, &fence).await?;
             self.verify_restored_catalog(&backup).await?;
             intent.state = ObjectCatalogRestoreStateKind::CatalogApplied;

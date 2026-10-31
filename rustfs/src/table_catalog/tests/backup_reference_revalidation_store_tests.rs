@@ -243,8 +243,8 @@ async fn join_reference_restore(mut worker: ReferenceRestoreTask) -> TableCatalo
 
 fn assert_reference_watermark_conflict(result: TableCatalogStoreResult<TableCatalogRestoreReport>) {
     assert!(
-        matches!(result, Err(TableCatalogStoreError::Conflict(message)) if message.contains("watermark")),
-        "changed reference bytes must fail the inventory watermark before restore completion"
+        matches!(&result, Err(TableCatalogStoreError::Conflict(message)) if message.contains("watermark")),
+        "changed reference bytes must fail the inventory watermark before restore completion: {result:?}"
     );
 }
 
