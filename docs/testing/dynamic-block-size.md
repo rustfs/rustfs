@@ -3,6 +3,17 @@
 **Use this when:** validating S3 block hints, multipart layout persistence, or
 reads after disabling the bounded-frame write rollout.
 
+Before performance measurements, verify physical shard checks and recovery:
+
+```bash
+cargo test -p rustfs-ecstore --lib bounded_quantum_ -- --test-threads=1
+```
+
+These regressions cover healthy deep verification, normal/deep repair after a
+missing shard, exact restored frame bytes, and Range reads with the write gates
+disabled. They also retain the legacy framing control and reject invalid or
+conflicting persisted q metadata. HTTP GET success alone does not validate heal.
+
 `scripts/dynamic_block_size_e2e.py` checks S3 PUT and multipart initiation hints
 against a disposable RustFS endpoint. Install `boto3` in a test virtualenv and
 export `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY` for that endpoint. The SDK

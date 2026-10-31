@@ -11525,6 +11525,14 @@ impl DiskAPI for LocalDisk {
         )
         .map_err(DiskError::from)?;
         fi.validate(ValidationMode::RequireErasure)?;
+        let frame_size = crate::object_api::persisted_ec_read_quantum(
+            &fi.metadata,
+            codec_erasure.block_size,
+            codec_erasure.data_shards,
+            codec_erasure.shard_size(),
+        )
+        .map_err(|_| DiskError::FileCorrupt)?
+        .unwrap_or_else(|| codec_erasure.shard_size());
         for (i, part) in fi.parts.iter().enumerate() {
             let checksum_info = erasure.get_checksum_info(part.number);
             let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -11546,7 +11554,7 @@ impl DiskAPI for LocalDisk {
                     &part_path,
                     codec_erasure.shard_file_size(part.size as i64) as usize,
                     checksum_algo,
-                    codec_erasure.shard_size(),
+                    frame_size,
                 )
                 .await
                 .err();

@@ -16,11 +16,11 @@ use super::super::{
     Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
     Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
     LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
-    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
-    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
-    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
-    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
-    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_writer, debug, disk,
+    disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata, formats_match_reference_slots,
+    get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix, heal_bucket_local_on_disks, is_object_dir_dangling,
+    join_all, load_format_erasure_all, path_join_buf, save_format_file, should_heal_object_on_disk, stat_all_dirs, to_object_err,
+    warn,
 };
 use crate::bucket::retirement::MarkerRetirementContext;
 use crate::diagnostics::object_lock::ObjectLockAttempt;
@@ -44,7 +44,7 @@ struct ExplicitVersionHeal<'a> {
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
-use crate::io_support::bitrot::object_mmap_read_enabled;
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics, object_mmap_read_enabled};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -1684,6 +1684,14 @@ impl SetDisks {
                         if !latest_meta.deleted && !latest_meta.is_remote() {
                             let stage_result: disk::error::Result<Option<DiskError>> = async {
                                 let erasure_info = latest_meta.erasure.clone();
+                                let frame_size = crate::object_api::persisted_ec_read_quantum(
+                                    &latest_meta.metadata,
+                                    erasure.block_size,
+                                    erasure.data_shards,
+                                    erasure.shard_size(),
+                                )
+                                .map_err(|_| DiskError::FileCorrupt)?
+                                .unwrap_or_else(|| erasure.shard_size());
                                 let mut writer_failures = HealWriterFailures::new(disks_to_heal_count);
 
                                 for (part_index, part) in latest_meta.parts.iter().enumerate() {
@@ -1726,7 +1734,7 @@ impl SetDisks {
                                                         &format!("part.{}", part.number),
                                                     ]),
                                                     erasure.shard_file_size(part.size as i64),
-                                                    erasure.shard_size(),
+                                                    frame_size,
                                                     HashAlgorithm::HighwayHash256S,
                                                 )
                                                 .await
@@ -1793,17 +1801,19 @@ impl SetDisks {
                                                 checksum_info.algorithm
                                             };
 
-                                            match create_bitrot_reader(
-                                                metadata.data.as_deref(),
+                                            match create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
+                                                metadata.data.clone(),
                                                 Some(disk),
                                                 bucket,
                                                 &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
                                                 0,
                                                 till_offset,
                                                 erasure.shard_size(),
+                                                frame_size,
                                                 checksum_algo.clone(),
                                                 false,
                                                 use_mmap_read,
+                                                None,
                                             )
                                             .await
                                             {
@@ -3856,7 +3866,10 @@ mod heal_result_report_tests {
     use crate::disk::error::DiskError;
     use crate::disk::format::FormatV3;
     use crate::disk::local::RESERVED_DELETE_DATA_DIR_MARKER_PREFIX;
-    use crate::disk::{DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE, new_disk};
+    use crate::disk::{
+        CHECK_PART_SUCCESS, DiskAPI as _, DiskOption, DiskStore, RUSTFS_META_TMP_BUCKET, ReadOptions, STORAGE_FORMAT_FILE,
+        new_disk,
+    };
     use crate::error::Error;
     use crate::object_api::{ObjectOptions, PutObjReader};
     use crate::set_disk::ops::object::hermetic_set_disks_support::{
@@ -5256,6 +5269,231 @@ mod heal_result_report_tests {
             DiskError::FileAccessDenied,
         ] {
             assert_remote_integrity_read_failure(error).await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bounded_quantum_shards_pass_disk_verification_and_deep_heal() {
+        let (_dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "bounded-quantum-healthy";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bounded-quantum test bucket");
+        }
+
+        for (block_size, quantum) in [
+            (64 * 1024, Some(16 * 1024)),
+            (1024 * 1024, None),
+            (4 * 1024 * 1024, Some(1024 * 1024)),
+        ] {
+            let object = format!("block-{block_size}");
+            let mut options = ObjectOptions {
+                no_lock: true,
+                ..Default::default()
+            };
+            options
+                .user_defined
+                .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_owned(), block_size.to_string());
+            temp_env::async_with_vars(
+                [
+                    (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("true")),
+                    (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("true")),
+                    (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some("false")),
+                ],
+                async {
+                    set.put_object(bucket, &object, &mut PutObjReader::from_vec(vec![0x6d; 4 * 1024 * 1024 + 123]), &options)
+                        .await
+                        .expect("write non-inline bounded-quantum fixture");
+                },
+            )
+            .await;
+
+            for (disk_index, disk) in disks.iter().enumerate() {
+                let metadata = disk
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read persisted bounded-quantum layout");
+                assert!(metadata.data.is_none(), "verification must open physical shards");
+                let erasure = &metadata.erasure;
+                assert_eq!(
+                    crate::object_api::persisted_ec_read_quantum(
+                        &metadata.metadata,
+                        erasure.block_size,
+                        erasure.data_blocks,
+                        erasure.shard_size(),
+                    )
+                    .expect("stored frame geometry must be valid"),
+                    quantum,
+                );
+                let verified = disk
+                    .verify_file(bucket, &object, &metadata)
+                    .await
+                    .expect("verify healthy physical shard");
+                assert_eq!(verified.results, vec![CHECK_PART_SUCCESS], "block size {block_size}");
+                if disk_index == 0 && block_size == 64 * 1024 {
+                    let mut invalid = metadata.clone();
+                    crate::object_api::insert_ec_read_quantum(&mut invalid.metadata, 1);
+                    assert_eq!(
+                        disk.verify_file(bucket, &object, &invalid)
+                            .await
+                            .expect_err("unsupported frame geometry must fail closed"),
+                        DiskError::FileCorrupt,
+                    );
+                    invalid = metadata.clone();
+                    invalid
+                        .metadata
+                        .insert("x-minio-internal-ec-read-quantum".to_owned(), "32768".to_owned());
+                    assert_eq!(
+                        disk.verify_file(bucket, &object, &invalid)
+                            .await
+                            .expect_err("conflicting frame markers must not select a plausible layout"),
+                        DiskError::FileCorrupt,
+                    );
+                }
+            }
+
+            let (result, error) = set
+                .heal_object(
+                    bucket,
+                    &object,
+                    "",
+                    &HealOpts {
+                        no_lock: true,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("deep scan should accept persisted bounded-quantum data");
+            assert!(error.is_none(), "healthy bounded-quantum object must not require recovery: {error:?}");
+            assert_eq!(result.drives_healed(), Some(0));
+            assert!(
+                result
+                    .after
+                    .drives
+                    .iter()
+                    .all(|drive| drive.state == DriveState::Ok.to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bounded_quantum_heal_restores_exact_frames_and_range_bytes() {
+        use crate::storage_api_contracts::range::HTTPRangeSpec;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "bounded-quantum-recovery";
+        for disk in &disks {
+            disk.make_volume(bucket)
+                .await
+                .expect("create bounded-quantum recovery bucket");
+        }
+        let payload: Vec<u8> = (0..4 * 1024 * 1024 + 123)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte"))
+            .collect();
+        for (block_size, quantum) in [(64 * 1024, 16 * 1024), (4 * 1024 * 1024, 1024 * 1024)] {
+            for scan_mode in [HealScanMode::Normal, HealScanMode::Deep] {
+                let object = format!("block-{block_size}-{}", scan_mode.as_str());
+                let mut options = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
+                options
+                    .user_defined
+                    .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_owned(), block_size.to_string());
+                temp_env::async_with_vars(
+                    [
+                        (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("true")),
+                        (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("true")),
+                        (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some("false")),
+                    ],
+                    async {
+                        set.put_object(bucket, &object, &mut PutObjReader::from_vec(payload.clone()), &options)
+                            .await
+                            .expect("write bounded-quantum recovery fixture");
+                    },
+                )
+                .await;
+                let original = disks[0]
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read original shard layout");
+                let path = dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(&object)
+                    .join(original.data_dir.expect("external shard data directory").to_string())
+                    .join("part.1");
+                let original_bytes = tokio::fs::read(&path).await.expect("snapshot encoded shard");
+                tokio::fs::remove_file(&path).await.expect("remove task-owned shard");
+
+                let (result, error) = set
+                    .heal_object(
+                        bucket,
+                        &object,
+                        "",
+                        &HealOpts {
+                            no_lock: true,
+                            scan_mode,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("bounded-quantum heal should finish");
+                assert!(error.is_none(), "bounded-quantum recovery must retain a read quorum: {error:?}");
+                assert_eq!(result.drives_healed(), Some(1));
+                let repaired = disks[0]
+                    .read_version("", bucket, &object, "", &ReadOptions::default())
+                    .await
+                    .expect("read repaired shard metadata");
+                assert_eq!(
+                    crate::object_api::persisted_ec_read_quantum(
+                        &repaired.metadata,
+                        repaired.erasure.block_size,
+                        repaired.erasure.data_blocks,
+                        repaired.erasure.shard_size(),
+                    )
+                    .expect("healed frame marker must match its geometry"),
+                    Some(quantum),
+                );
+                let repaired_path = dirs[0]
+                    .path()
+                    .join(bucket)
+                    .join(&object)
+                    .join(repaired.data_dir.expect("repaired shard data directory").to_string())
+                    .join("part.1");
+                assert_eq!(tokio::fs::read(repaired_path).await.expect("read restored frames"), original_bytes);
+                assert_eq!(
+                    disks[0]
+                        .verify_file(bucket, &object, &repaired)
+                        .await
+                        .expect("verify repaired shard")
+                        .results,
+                    vec![CHECK_PART_SUCCESS],
+                );
+
+                for (range, expected) in [
+                    (None, payload.as_slice()),
+                    (
+                        Some(HTTPRangeSpec {
+                            start: 16 * 1024 - 37,
+                            end: 64 * 1024 + 85,
+                            is_suffix_length: false,
+                        }),
+                        &payload[16 * 1024 - 37..64 * 1024 + 86],
+                    ),
+                ] {
+                    let mut reader = set
+                        .get_object_reader(bucket, &object, range, Default::default(), &options)
+                        .await
+                        .expect("healed object must serve full and cross-frame range reads");
+                    let mut body = Vec::new();
+                    reader.stream.read_to_end(&mut body).await.expect("read healed object body");
+                    assert_eq!(body, expected);
+                }
+            }
         }
     }
 
