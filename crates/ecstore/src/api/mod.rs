@@ -579,14 +579,20 @@ pub mod integrity {
 
 pub mod object {
     pub use crate::object_api::{
-        BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
-        GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader,
-        NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions,
-        PutObjReader, QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
+        BLOCK_SIZE_V2, ClientEcBlockSizeHint, DEFAULT_EC_BLOCK_SIZE, EC_BLOCK_SIZE_CANDIDATES, EC_BLOCK_SIZE_HINT_INTERNAL_KEY,
+        EC_BLOCK_SIZE_HINT_INTERNAL_SUFFIX, EC_BLOCK_SIZE_HINT_METADATA_KEY, EC_BLOCK_SIZE_HINT_REASON_HEADER,
+        EC_BLOCK_SIZE_HINT_STATUS_HEADER, EC_BLOCK_SIZE_INFO_INTERNAL_KEY, EC_BLOCK_SIZE_INFO_INTERNAL_SUFFIX,
+        EC_BLOCK_SIZE_RESPONSE_HEADER, EC_READ_QUANTUM_INFO_INTERNAL_KEY, EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX,
+        ERASURE_ALGORITHM, EcBlockSizeHintError, EcBlockSizeHintIgnoreReason, EcBlockSizeHintOutcome, EncryptionResolutionError,
+        EncryptionResolutionErrorKind, GetObjectBodyCacheHook, GetObjectBodyCacheHookLookup, GetObjectBodySource,
+        GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader, NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo,
+        ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions, PutObjReader, QuotaAdmission, RangedDecompressReader,
+        ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest, ResolvedEcBlockSize,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,
         ScannerPublicationCommitState, ShardIntegrityWriteMode, StreamConsumer, WriteCommitGuard, WriteCompletion,
-        get_object_body_cache_plaintext_len, lookup_get_object_body_cache_hook, register_get_object_body_cache_hook,
-        register_object_mutation_hook, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
+        get_object_body_cache_plaintext_len, is_supported_ec_block_size, lookup_get_object_body_cache_hook,
+        parse_ec_block_size_hint, register_get_object_body_cache_hook, register_object_mutation_hook, resolve_ec_block_size_hint,
+        take_ec_block_size_hint, unregister_get_object_body_cache_hook, unregister_object_mutation_hook,
         with_get_object_read_condition,
     };
     pub use crate::store::{

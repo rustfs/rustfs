@@ -121,9 +121,11 @@ use crate::disk::{
 };
 use crate::erasure::coding::BitrotReader;
 use crate::io_support::bitrot::ShardReader;
+#[cfg(test)]
+use crate::io_support::bitrot::create_deferred_bitrot_reader_with_stripe_handle;
 use crate::io_support::bitrot::{
-    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_stage_metrics,
-    create_deferred_bitrot_reader_with_stripe_handle,
+    BitrotReaderStageMetrics, DeferredReaderStripeHandle, create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics,
+    create_deferred_bitrot_reader_with_stripe_handle_and_frame_size,
 };
 #[cfg(unix)]
 use crate::io_support::bitrot::{adjust_shard_read_params, object_mmap_read_max_length};
@@ -969,6 +971,45 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
     use_mmap_read: bool,
     stage_metrics: Option<BitrotReaderStageMetrics>,
 ) {
+    schedule_bitrot_reader_task_with_frame_size(
+        reader_tasks,
+        setup,
+        idx,
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        stage_metrics,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) fn schedule_bitrot_reader_task_with_frame_size<'a>(
+    reader_tasks: &mut FuturesUnordered<BitrotReaderTask<'a>>,
+    setup: &mut BitrotReaderSetup,
+    idx: usize,
+    files: &'a [FileInfo],
+    disks: &'a [Option<DiskStore>],
+    bucket: &'a str,
+    object: &'a str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+) {
     if idx >= disks.len() || !setup.mark_scheduled(idx) {
         return;
     }
@@ -979,7 +1020,7 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
     let path = format!("{object}/{data_dir}/part.{part_number}");
 
     reader_tasks.push(Box::pin(async move {
-        let result = create_bitrot_reader_from_bytes_with_stage_metrics(
+        let result = create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
             inline_data,
             disk,
             bucket,
@@ -987,6 +1028,7 @@ pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1010,6 +1052,7 @@ pub(in crate::set_disk) fn next_unscheduled_reader_index(
 /// Build a cloneable opener for an unopened deferred shard. The returned
 /// reader is aligned to the requested stripe before its first poll, while the
 /// source reader created during setup remains untouched as a reserve.
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 fn deferred_reader_reopener(
     inline_data: Option<Bytes>,
@@ -1023,10 +1066,39 @@ fn deferred_reader_reopener(
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
 ) -> DeferredReaderReopener {
+    deferred_reader_reopener_with_frame_size(
+        inline_data,
+        disk,
+        bucket,
+        path,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn deferred_reader_reopener_with_frame_size(
+    inline_data: Option<Bytes>,
+    disk: Option<DiskStore>,
+    bucket: &str,
+    path: &str,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+) -> DeferredReaderReopener {
     let bucket = bucket.to_owned();
     let path = path.to_owned();
     Arc::new(move |stripe_index| {
-        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data.clone(),
             disk.clone(),
             &bucket,
@@ -1034,6 +1106,7 @@ fn deferred_reader_reopener(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1042,6 +1115,7 @@ fn deferred_reader_reopener(
     })
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     setup: &mut BitrotReaderSetup,
@@ -1053,6 +1127,45 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+) {
+    fill_deferred_bitrot_readers_with_frame_size(
+        setup,
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) fn fill_deferred_bitrot_readers_with_frame_size(
+    setup: &mut BitrotReaderSetup,
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1084,7 +1197,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let reopener = (demand_bound_lockstep || preserve_hedged_readers).then(|| {
-            deferred_reader_reopener(
+            deferred_reader_reopener_with_frame_size(
                 inline_data.clone(),
                 disk.clone(),
                 bucket,
@@ -1092,6 +1205,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1101,7 +1215,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         if setup.attempted[idx] {
             continue;
         }
-        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data,
             disk,
             bucket,
@@ -1109,6 +1223,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1140,7 +1255,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
         let data_dir = files[idx].data_dir.unwrap_or_default();
         let path = format!("{object}/{data_dir}/part.{part_number}");
         let reopener = demand_bound_lockstep.then(|| {
-            deferred_reader_reopener(
+            deferred_reader_reopener_with_frame_size(
                 inline_data.clone(),
                 disk.clone(),
                 bucket,
@@ -1148,12 +1263,13 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
             )
         });
-        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle(
+        let (reader, stripe_handle) = create_deferred_bitrot_reader_with_stripe_handle_and_frame_size(
             inline_data,
             disk,
             bucket,
@@ -1161,6 +1277,7 @@ pub(in crate::set_disk) fn fill_deferred_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1234,6 +1351,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     data_shards: usize,
@@ -1244,6 +1362,13 @@ async fn try_create_bitrot_readers_via_batch_pread(
     use crate::disk::local::batch_shard_pread;
     use rustfs_io_metrics::{LocalBatchReadDecision, record_local_batch_read_decision};
     use std::io::Cursor;
+
+    // Batch pread returns one contiguous encoded logical shard.  Quantized
+    // objects interleave a hash before every frame, so use the normal reader
+    // path until a frame-aware batch implementation is available.
+    if frame_size != shard_size {
+        return None;
+    }
 
     let prepare_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
     let record_decision = |decision| {
@@ -1354,6 +1479,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     _read_offset: usize,
     _read_length: usize,
     _shard_size: usize,
+    _frame_size: usize,
     _checksum_algo: HashAlgorithm,
     _skip_verify_bitrot: bool,
     _data_shards: usize,
@@ -1365,6 +1491,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     None
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     files: &[FileInfo],
@@ -1375,6 +1502,48 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
+) -> BitrotReaderSetup {
+    create_bitrot_readers_until_quorum_all_shards_with_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        stage_metrics,
+        attribution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards_with_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1401,7 +1570,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         let checksum_algo = checksum_algo.clone();
 
         reader_tasks.push(async move {
-            let result = create_bitrot_reader_from_bytes_with_stage_metrics(
+            let result = create_bitrot_reader_from_bytes_with_frame_size_and_stage_metrics(
                 inline_data,
                 disk,
                 bucket,
@@ -1409,6 +1578,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo,
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1434,7 +1604,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
     }
 
-    fill_deferred_bitrot_readers(
+    fill_deferred_bitrot_readers_with_frame_size(
         &mut setup,
         files,
         disks,
@@ -1444,6 +1614,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_all_shards(
         read_offset,
         read_length,
         shard_size,
+        frame_size,
         checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,
@@ -1481,7 +1652,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     stage_metrics: Option<BitrotReaderStageMetrics>,
     attribution: Option<BitrotReaderSetupAttribution>,
 ) -> BitrotReaderSetup {
-    create_bitrot_readers_until_quorum_with_preference(
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size(
         files,
         disks,
         bucket,
@@ -1489,6 +1660,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
         part_number,
         read_offset,
         read_length,
+        shard_size,
         shard_size,
         checksum_algo,
         skip_verify_bitrot,
@@ -1503,6 +1675,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum(
     .await
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_preference(
     files: &[FileInfo],
@@ -1513,6 +1686,50 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+    parity_shards: usize,
+    mode: BitrotReaderSetupMode,
+    prefer_data_blocks_first: bool,
+    stage_metrics: Option<BitrotReaderStageMetrics>,
+    attribution: Option<BitrotReaderSetupAttribution>,
+) -> BitrotReaderSetup {
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+        parity_shards,
+        mode,
+        prefer_data_blocks_first,
+        stage_metrics,
+        attribution,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_preference_and_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1547,6 +1764,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             data_shards,
@@ -1557,7 +1775,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         .await
     {
         record_bitrot_reader_setup_strategy(strategy, mode, attribution);
-        fill_deferred_bitrot_readers(
+        fill_deferred_bitrot_readers_with_frame_size(
             &mut setup,
             files,
             disks,
@@ -1567,6 +1785,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1579,7 +1798,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     }
 
     if strategy == BitrotReaderSetupStrategy::AllShards {
-        return create_bitrot_readers_until_quorum_all_shards(
+        return create_bitrot_readers_until_quorum_all_shards_with_frame_size(
             files,
             disks,
             bucket,
@@ -1588,6 +1807,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -1610,7 +1830,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     let schedule_stage_start = stage_metrics.map(|_| Instant::now());
     let initial_target = setup.setup_target(data_shards, parity_shards, mode);
     for idx in 0..initial_target.min(data_shards).min(total_shards) {
-        schedule_bitrot_reader_task(
+        schedule_bitrot_reader_task_with_frame_size(
             &mut reader_tasks,
             &mut setup,
             idx,
@@ -1622,6 +1842,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,
@@ -1645,7 +1866,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
             let Some(next_idx) = next_unscheduled_reader_index(&setup, total_shards, data_shards) else {
                 break;
             };
-            schedule_bitrot_reader_task(
+            schedule_bitrot_reader_task_with_frame_size(
                 &mut reader_tasks,
                 &mut setup,
                 next_idx,
@@ -1657,6 +1878,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
                 read_offset,
                 read_length,
                 shard_size,
+                frame_size,
                 checksum_algo.clone(),
                 skip_verify_bitrot,
                 use_mmap_read,
@@ -1668,7 +1890,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         record_get_stage_duration_if_enabled(stage_metrics.path, GET_STAGE_READER_SETUP_WAIT_QUORUM, wait_quorum_stage_start);
     }
 
-    fill_deferred_bitrot_readers(
+    fill_deferred_bitrot_readers_with_frame_size(
         &mut setup,
         files,
         disks,
@@ -1678,6 +1900,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
         read_offset,
         read_length,
         shard_size,
+        frame_size,
         checksum_algo,
         skip_verify_bitrot,
         use_mmap_read,
@@ -8391,6 +8614,7 @@ mod tests {
                             0,
                             5,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8410,6 +8634,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::HighwayHash256S,
@@ -8433,6 +8658,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::None,
@@ -8466,6 +8692,7 @@ mod tests {
                             0,
                             4,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8487,6 +8714,7 @@ mod tests {
                             0,
                             4,
                             4,
+                            4,
                             HashAlgorithm::None,
                             false,
                             1,
@@ -8506,6 +8734,7 @@ mod tests {
                             object,
                             1,
                             0,
+                            4,
                             4,
                             4,
                             HashAlgorithm::None,
