@@ -837,7 +837,29 @@ impl ECStore {
         object: &str,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, usize)> {
-        let suspended_pools = if opts.skip_decommissioned {
+        self.get_latest_object_info_with_pool_policy(bucket, object, opts, false)
+            .await
+    }
+
+    /// Observe every pool for a conditional-write preflight. This does not
+    /// hold the namespace locks needed to prove a condition at publication.
+    pub(super) async fn get_latest_object_info_for_conditional_write(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, usize)> {
+        self.get_latest_object_info_with_pool_policy(bucket, object, opts, true).await
+    }
+
+    async fn get_latest_object_info_with_pool_policy(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Result<(ObjectInfo, usize)> {
+        let suspended_pools = if opts.skip_decommissioned && !require_all_pools {
             let pool_meta = self.pool_meta.read().await;
             Some(
                 (0..self.pools.len())
@@ -853,7 +875,7 @@ impl ECStore {
                 continue;
             }
 
-            if opts.skip_rebalancing && self.is_pool_rebalancing(idx).await {
+            if opts.skip_rebalancing && !require_all_pools && self.is_pool_rebalancing(idx).await {
                 continue;
             }
 
@@ -873,6 +895,9 @@ impl ECStore {
                     });
                 }
                 Err(e) => {
+                    if require_all_pools && !is_err_object_not_found(&e) && !is_err_version_not_found(&e) {
+                        return Err(e);
+                    }
                     candidates.push(LatestObjectInfoCandidate {
                         info: None,
                         idx,

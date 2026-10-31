@@ -498,6 +498,17 @@ pub struct ECStore {
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
 }
 
+impl Drop for ECStore {
+    /// Clear the instance context's `BucketMetadataSys` when its backing store
+    /// is dropped. Without this, the shared bootstrap context retains a
+    /// `BucketMetadataSys` whose `Weak<ECStore>` is dangling after the store
+    /// goes away (e.g. between sequential test fixtures that share the
+    /// bootstrap), and the next `object_store()` call panics.
+    fn drop(&mut self) {
+        self.ctx.clear_bucket_metadata_sys_if_stale();
+    }
+}
+
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSE_DURATION_SECONDS: &str = "rustfs_scanner_data_movement_pause_duration_seconds";
 const METRIC_SCANNER_DATA_MOVEMENT_BACKLOG_WORK_ITEMS: &str = "rustfs_scanner_data_movement_backlog_work_items";

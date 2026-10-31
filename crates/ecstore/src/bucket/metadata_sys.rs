@@ -1901,6 +1901,15 @@ impl BucketMetadataSys {
         self.api.upgrade()
     }
 
+    /// Whether the backing `ECStore` has been dropped.
+    ///
+    /// Used by `InstanceContext::clear_bucket_metadata_sys_if_stale` during
+    /// `ECStore::drop` so a shared bootstrap context does not retain a
+    /// `BucketMetadataSys` whose weak handle is dangling.
+    pub(crate) fn is_store_stale(&self) -> bool {
+        self.api.upgrade().is_none()
+    }
+
     fn metadata_publish_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
         Self::bucket_lock_in(&self.metadata_publish_locks, bucket)
     }

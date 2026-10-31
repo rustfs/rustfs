@@ -16,8 +16,193 @@
 mod tests {
     use crate::common::{RustFSTestEnvironment, init_logging};
     use aws_sdk_s3::Client;
+    use aws_sdk_s3::config::http::HttpResponse;
+    use aws_sdk_s3::error::{ProvideErrorMetadata, SdkError};
     use aws_sdk_s3::primitives::ByteStream;
-    use aws_sdk_s3::types::{BucketVersioningStatus, VersioningConfiguration};
+    use aws_sdk_s3::types::{BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, VersioningConfiguration};
+
+    fn assert_not_found<E: ProvideErrorMetadata + std::fmt::Debug>(error: &SdkError<E, HttpResponse>) {
+        assert_eq!(error.raw_response().map(|r| r.status().as_u16()), Some(404), "{error:?}");
+        assert_eq!(
+            error.as_service_error().and_then(ProvideErrorMetadata::code),
+            Some("NoSuchKey"),
+            "{error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn conditional_writes_cannot_replace_delete_marker_with_if_match() {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await.expect("create test environment");
+        env.start_rustfs_server(vec![]).await.expect("start RustFS");
+        let client = env.create_s3_client();
+        let bucket = "conditional-delete-marker-proof";
+        create_versioned_bucket(&client, bucket).await;
+        client
+            .put_object()
+            .bucket(bucket)
+            .key("source")
+            .body(ByteStream::from_static(b"source"))
+            .send()
+            .await
+            .expect("write copy source");
+
+        for operation in ["put", "copy", "multipart"] {
+            let old = client
+                .put_object()
+                .bucket(bucket)
+                .key(operation)
+                .body(ByteStream::from_static(b"old"))
+                .send()
+                .await
+                .expect("write historical version");
+            let old_etag = old.e_tag().expect("historical ETag");
+            let marker = client
+                .delete_object()
+                .bucket(bucket)
+                .key(operation)
+                .send()
+                .await
+                .expect("create delete marker");
+            let marker_id = marker.version_id().expect("delete marker version");
+
+            let (upload_id, completed) = if operation == "multipart" {
+                let upload = client
+                    .create_multipart_upload()
+                    .bucket(bucket)
+                    .key(operation)
+                    .send()
+                    .await
+                    .expect("initiate multipart upload");
+                let upload_id = upload.upload_id().expect("upload ID").to_owned();
+                let part = client
+                    .upload_part()
+                    .bucket(bucket)
+                    .key(operation)
+                    .upload_id(&upload_id)
+                    .part_number(1)
+                    .body(ByteStream::from_static(b"new"))
+                    .send()
+                    .await
+                    .expect("upload part");
+                let completed = CompletedMultipartUpload::builder()
+                    .parts(
+                        CompletedPart::builder()
+                            .part_number(1)
+                            .set_e_tag(part.e_tag().map(str::to_owned))
+                            .build(),
+                    )
+                    .build();
+                (Some(upload_id), Some(completed))
+            } else {
+                (None, None)
+            };
+
+            for etag in [old_etag, "\"00000000000000000000000000000000\""] {
+                match operation {
+                    "put" => {
+                        let err = client
+                            .put_object()
+                            .bucket(bucket)
+                            .key(operation)
+                            .if_match(etag)
+                            .body(ByteStream::from_static(b"new"))
+                            .send()
+                            .await
+                            .expect_err("If-Match must reject marker");
+                        assert_not_found(&err);
+                    }
+                    "copy" => {
+                        let err = client
+                            .copy_object()
+                            .bucket(bucket)
+                            .key(operation)
+                            .copy_source(format!("{bucket}/source"))
+                            .if_match(etag)
+                            .send()
+                            .await
+                            .expect_err("If-Match copy must reject marker");
+                        assert_not_found(&err);
+                    }
+                    _ => {
+                        let err = client
+                            .complete_multipart_upload()
+                            .bucket(bucket)
+                            .key(operation)
+                            .upload_id(upload_id.as_deref().expect("upload ID"))
+                            .multipart_upload(completed.clone().expect("completed parts"))
+                            .if_match(etag)
+                            .send()
+                            .await
+                            .expect_err("If-Match completion must reject marker");
+                        assert_not_found(&err);
+                    }
+                }
+                let versions = client
+                    .list_object_versions()
+                    .bucket(bucket)
+                    .prefix(operation)
+                    .send()
+                    .await
+                    .expect("list versions after rejected write");
+                assert_eq!(versions.versions().len(), 1, "{operation}: failed write created a version");
+                assert_eq!(versions.delete_markers().len(), 1);
+                assert_eq!(versions.delete_markers()[0].version_id(), Some(marker_id));
+                assert_eq!(versions.delete_markers()[0].is_latest(), Some(true));
+            }
+
+            match operation {
+                "put" => {
+                    client
+                        .put_object()
+                        .bucket(bucket)
+                        .key(operation)
+                        .if_none_match("*")
+                        .body(ByteStream::from_static(b"new"))
+                        .send()
+                        .await
+                        .expect("If-None-Match PUT over marker");
+                }
+                "copy" => {
+                    client
+                        .copy_object()
+                        .bucket(bucket)
+                        .key(operation)
+                        .copy_source(format!("{bucket}/source"))
+                        .if_none_match("*")
+                        .send()
+                        .await
+                        .expect("If-None-Match copy over marker");
+                }
+                _ => {
+                    client
+                        .complete_multipart_upload()
+                        .bucket(bucket)
+                        .key(operation)
+                        .upload_id(upload_id.as_deref().expect("upload ID"))
+                        .multipart_upload(completed.expect("completed parts"))
+                        .if_none_match("*")
+                        .send()
+                        .await
+                        .expect("If-None-Match completion over marker");
+                }
+            }
+            let current = client
+                .get_object()
+                .bucket(bucket)
+                .key(operation)
+                .send()
+                .await
+                .expect("read successful conditional write")
+                .body
+                .collect()
+                .await
+                .expect("read object body")
+                .into_bytes();
+            let expected: &[u8] = if operation == "copy" { b"source" } else { b"new" };
+            assert_eq!(current.as_ref(), expected, "{operation}: unexpected current object");
+        }
+    }
 
     async fn create_versioned_bucket(client: &Client, bucket: &str) {
         client
