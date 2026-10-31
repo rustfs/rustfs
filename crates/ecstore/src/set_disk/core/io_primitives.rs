@@ -6737,9 +6737,7 @@ impl SetDisks {
                         object,
                     );
                 }
-                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
-                let if_match = http_preconditions.if_match_value().map(str::to_owned);
-                if should_prevent_write(&oi, if_none_match, if_match)
+                if should_prevent_write(&oi, http_preconditions.if_none_match_value(), http_preconditions.if_match_value())
                     && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
                 {
                     return Some(StorageError::PreconditionFailed);
