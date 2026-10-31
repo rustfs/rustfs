@@ -33,7 +33,7 @@ set -uo pipefail
 # GNU date on the runners; the fallback keeps local smoke tests on macOS quiet.
 now() { date --utc --iso-8601=seconds 2>/dev/null || date -u +%Y-%m-%dT%H:%M:%S+00:00; }
 
-LOG_DIR="artifacts/test-and-lint"
+LOG_DIR="artifacts/workspace"
 LOG_FILE="${LOG_DIR}/sampler.log"
 PID_FILE="${LOG_DIR}/.sampler.pid"
 INTERVAL="${SAMPLER_INTERVAL_SECS:-60}"

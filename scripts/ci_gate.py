@@ -16,7 +16,7 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "workspace-tests", "core-contract", "connect-feature-boundaries", "test-and-lint-rio-v2",
+    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
@@ -38,7 +38,7 @@ PLAN_CONTRACT = "2"
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "test-and-lint", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -200,8 +200,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "test-and-lint", "dev", []),
-        ("workspace-tests", "test-and-lint", "test", []),
+        ("workspace-lint", "workspace-lint-and-build", "dev", []),
+        ("workspace-tests", "workspace-lint-and-build", "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -548,7 +548,7 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
     lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("test-and-lint", {}).get("steps", [])
+    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
               if any(command in step.get("run", "") for command in lint_commands)]
     if not clippy or any("if" in step for step in clippy):
         errors.append("workspace Clippy must run on every code event, pull requests included")
