@@ -16,20 +16,29 @@ import unittest
 ROOT = Path(__file__).resolve().parent.parent
 ALWAYS_JOBS = ("classify-changes", "typos", "quick-checks")
 CODE_JOBS = (
-    "test-and-lint", "workspace-tests", "core-contract", "connect-feature-boundaries", "test-and-lint-rio-v2",
+    "workspace-lint-and-build", "workspace-tests", "core-contract", "connect-feature-boundaries", "test-and-lint-rio-v2",
     "test-and-lint-protocols", "build-rustfs-debug-binary", "uring-integration",
     "e2e-tests", "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
-# Full alternate-feature tests run on merge groups and on scheduled/manual
-# runs. Pull requests and main pushes skip them: the nightly run reports a
-# feature regression within a day, and repeating four builds per PR revision
-# or per merge bought no earlier signal.
-EXTENDED_FEATURE_JOBS = ("test-and-lint-rio-v2", "test-and-lint-protocols")
+# Specialized boundary, hardware and alternate-feature lanes do not gate a
+# merge. They run only in the scheduled (nightly) and manual full-validation
+# runs, which report a regression within a day; repeating them on every PR
+# revision and merge group bought no earlier signal worth the runner occupancy
+# (Connect alone measured 53.5 median minutes per run and occasionally set the
+# wall). Workspace lint and tests, the short core contract, the debug build,
+# E2E smoke and the S3 lanes stay on the pull-request path because they cover
+# the product's core correctness and S3 compatibility surface.
+NIGHTLY_JOBS = ("connect-feature-boundaries", "uring-integration", "test-and-lint-rio-v2", "test-and-lint-protocols")
+# Bump when a plan produced by an older `select` can no longer be checked
+# against this revision's expected job contract. The workflow refuses a plan
+# that does not carry the current marker and falls back to the full matrix, so
+# a base planner predating the contract cannot authorize a narrower selection.
+PLAN_CONTRACT = "2"
 # These jobs still exercise the server and its black-box harness when only E2E
 # Rust sources change. Production code, manifests and shared test configuration
 # always select the full matrix. No production package depends on e2e_test.
 E2E_JOBS = (
-    "test-and-lint", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
+    "workspace-lint-and-build", "workspace-tests", "core-contract", "build-rustfs-debug-binary", "e2e-tests",
     "s3-implemented-tests", "s3-lifecycle-behavior-tests",
 )
 E2E_SELECTION_FILES = {
@@ -167,11 +176,10 @@ def expected_results(mode: str, event: str, ref: str, connect: bool = True, acti
         raise ValueError("shard rehearsal requires an explicit manual event")
     expected = {job: "success" for job in ALWAYS_JOBS}
     expected.update({job: "success" if mode == "full" or (mode == "e2e" and job in E2E_JOBS) else "skipped" for job in CODE_JOBS})
-    expected["connect-feature-boundaries"] = "success" if mode == "full" and connect else "skipped"
-    if event in ("pull_request", "push"):
-        expected.update({job: "skipped" for job in EXTENDED_FEATURE_JOBS})
-    rio = mode == "full" and event in ("schedule", "workflow_dispatch")
-    expected.update({job: "success" if rio else "skipped" for job in OPTIONAL_JOBS[:2]})
+    nightly = mode == "full" and event in ("schedule", "workflow_dispatch")
+    expected.update({job: "success" if nightly else "skipped" for job in NIGHTLY_JOBS})
+    expected["connect-feature-boundaries"] = "success" if nightly and connect else "skipped"
+    expected.update({job: "success" if nightly else "skipped" for job in OPTIONAL_JOBS[:2]})
     full = mode == "full" and (event in ("merge_group", "workflow_dispatch") or (event == "push" and ref == "refs/heads/main"))
     expected["e2e-full"] = "success" if full else "skipped"
     expected.update({job: "success" if rehearse_shards else "skipped" for job in SHARD_JOBS})
@@ -192,8 +200,8 @@ def read_policy(root: Path, revision: str) -> dict:
 
 def configurations(jobs: dict[str, str]) -> list[dict]:
     values = [
-        ("workspace-lint", "test-and-lint", "dev", []),
-        ("workspace-tests", "test-and-lint", "test", []),
+        ("workspace-lint", "workspace-lint-and-build", "dev", []),
+        ("workspace-tests", "workspace-lint-and-build", "test", []),
         ("e2e-harness", "build-rustfs-debug-binary", "test", []),
         ("uring-tests", "uring-integration", "test", []),
         ("server-e2e-hooks", "build-rustfs-debug-binary", "dev", ["e2e-test-hooks"]),
@@ -540,7 +548,7 @@ def check_workflow(root: Path) -> list[str]:
                               or verifiers[0].get("shell") != "bash" or "if" in verifiers[0]):
         errors.append("required-checks must unconditionally verify actual needs and preserve its exit status")
     lint_commands = ("cargo clippy --all-targets -- -D warnings", "python3 scripts/ci_test_artifact.py cargo lint --configuration workspace")
-    clippy = [step for step in jobs.get("test-and-lint", {}).get("steps", [])
+    clippy = [step for step in jobs.get("workspace-lint-and-build", {}).get("steps", [])
               if any(command in step.get("run", "") for command in lint_commands)]
     if not clippy or any("if" in step for step in clippy):
         errors.append("workspace Clippy must run on every code event, pull requests included")
@@ -620,7 +628,8 @@ def main() -> int:
                 for name, value in (("mode", plan["mode"]), ("plan", json.dumps(plan, separators=(",", ":"))),
                                     ("connect", str(plan["connect"]).lower()), ("packages", json.dumps(plan["packages"], separators=(",", ":"))),
                                     ("full_validation", str(plan["full_validation"]).lower()),
-                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower())):
+                                    ("rehearse_shards", str(plan["rehearse_shards"]).lower()),
+                                    ("plan_contract", PLAN_CONTRACT)):
                     output.write(f"{name}={value}\n")
             print(json.dumps(plan, indent=2))
             if os.environ.get("GITHUB_STEP_SUMMARY"):

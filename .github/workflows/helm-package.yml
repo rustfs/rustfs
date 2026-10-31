@@ -30,9 +30,102 @@ permissions:
   contents: read
 
 jobs:
+  # Consume the same trusted release certification as every other publication
+  # exit and verify the image promotion record of the Docker workflow. The
+  # chart wraps no binary of its own, so it may only reference an image whose
+  # platform verification already passed; it must not inherit an unverified
+  # package's conclusion. A run without that evidence fails closed here and
+  # never reaches the chart repository.
+  release-certification:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      version: ${{ steps.version.outputs.raw_tag }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Normalize release version
+        id: version
+        env:
+          RAW_INPUT: ${{ github.event.inputs.version }}
+          RAW_BRANCH: ${{ github.event.workflow_run.head_branch }}
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            RAW="$RAW_INPUT"
+          else
+            RAW="$RAW_BRANCH"
+          fi
+          case "$RAW" in
+            refs/tags/*) RAW_TAG="${RAW#refs/tags/}" ;;
+            *) RAW_TAG="$RAW" ;;
+          esac
+          echo "raw_tag=$RAW_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Download and verify release certification and image record
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          RAW_TAG: ${{ steps.version.outputs.raw_tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certification image-record
+
+          build_run="$TRIGGERING_RUN_ID"
+          if [[ -z "$build_run" ]]; then
+            build_run="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$RAW_TAG" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' || true)"
+          fi
+          if [[ -z "$build_run" ]]; then
+            echo "No certified Build and Release run found for ${RAW_TAG}; failing closed" >&2
+            exit 1
+          fi
+          if ! gh run download "$build_run" -n release-certification -D certification; then
+            echo "Build run ${build_run} published no release-certification artifact; failing closed" >&2
+            exit 1
+          fi
+          python3 scripts/release/release_gate.py verify-promotion \
+            --plan .config/release-validation-plan.json \
+            --candidate certification/candidate.json \
+            --summary certification/release-gate-output \
+            --artifact-sha256 "$(jq -r '.deliverables[0].sha256' certification/candidate.json)" \
+            --artifact-name "$(jq -r '.deliverables[0].name' certification/candidate.json)"
+
+          docker_run="$(gh api --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/docker.yml/runs" \
+            -f branch="$RAW_TAG" -f status=success -F per_page=1 \
+            --jq '.workflow_runs[0].id // empty' || true)"
+          if [[ -z "$docker_run" ]] || ! gh run download "$docker_run" -n image-promotion-record -D image-record; then
+            echo "No image promotion record for ${RAW_TAG}; a chart may not wrap an unverified image" >&2
+            exit 1
+          fi
+          candidate_sha="$(python3 -c "import json,hashlib,sys; sys.path.insert(0,'scripts/release'); import release_gate; print(release_gate.canonical_sha256(json.load(open('certification/candidate.json'))))")"
+          record_sha="$(jq -r '.candidate_sha256 // empty' image-record/image-promotion-record.json)"
+          if [[ "$record_sha" != "$candidate_sha" ]]; then
+            echo "Image promotion record does not belong to this certification" >&2
+            exit 1
+          fi
+          overlap="$(jq -r --slurpfile candidate certification/candidate.json \
+            '[.binary_sha256s[]] - ($candidate[0].deliverables | map(.binary_sha256)) | length' \
+            image-record/image-promotion-record.json)"
+          if [[ "$overlap" -ne 0 ]]; then
+            echo "Image promotion record carries binary digests outside the certification" >&2
+            exit 1
+          fi
+
   build-helm-package:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    needs: [ release-certification ]
     if: |
       (github.event_name == 'workflow_dispatch' && !contains(github.event.inputs.version, '-preview')) ||
       (

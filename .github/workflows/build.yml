@@ -814,13 +814,18 @@ jobs:
           export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
           export AWS_DEFAULT_REGION="auto"
 
-          # Determine upload path based on build type
+          # Determine upload path based on build type. Release and prerelease
+          # builds only stage their bytes here: the official
+          # artifacts/rustfs/release/ path is written solely by the
+          # certification-gated promote-release-artifacts job, from these same
+          # staged objects. Development builds keep the uncertified dev channel
+          # and never touch official or latest channels.
           if [[ "$BUILD_TYPE" == "development" ]]; then
             R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/dev/"
             echo "📤 Uploading development build to R2 dev directory"
           else
-            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"
-            echo "📤 Uploading release build to R2 release directory"
+            R2_PATH="s3://${R2_BUCKET}/artifacts/rustfs/staging/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/"
+            echo "📤 Staging release build for certification-gated promotion"
           fi
 
           # Upload all rustfs zip files to R2 using S3-compatible API
@@ -868,6 +873,221 @@ jobs:
           else
             echo "This run does not trigger Docker publishing."
           fi
+
+  # Aggregate the parent candidate batch. This job always collects results and
+  # retains its evidence, including on failure, and every publication job
+  # below requires its success. Missing, stale, substituted or non-PASS
+  # evidence fails closed here: only the trusted verification sources
+  # (rustfs/s3chaos release-gate envelopes, rustfs/backlog#2658) can satisfy
+  # it, so a PR-uploaded JSON set never gains release authority.
+  release-certification:
+    name: Release Certification
+    needs: [ build-check, build-rustfs ]
+    if: ${{ !cancelled() && needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') }}
+    runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ./artifacts
+          pattern: rustfs-*
+          merge-multiple: true
+
+      - name: Write candidate and collect trusted validation results
+        env:
+          # Cross-repo read of the trusted verification run. Falls back to the
+          # workflow token, which cannot read rustfs/s3chaos; a missing token
+          # therefore fail-closes instead of certifying.
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          PRODUCT_COMMIT: ${{ github.sha }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+          BUILD_TYPE: ${{ needs.build-check.outputs.build_type }}
+          FEATURES: ${{ needs.build-check.outputs.build_type == 'development' && '' || 'pyroscope' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p results release-gate-output
+          PLAN_SHA256=$(python3 -c "import hashlib,json,sys; sys.path.insert(0,'scripts/release'); import release_gate; print(release_gate.canonical_sha256(json.load(open('.config/release-validation-plan.json'))))")
+
+          python3 - "$PLAN_SHA256" > candidate.json <<'PY'
+          import hashlib, json, os, sys, zipfile
+
+          plan_sha256 = sys.argv[1]
+          profile = {"release": "stable", "prerelease": "prerelease", "preview": "preview"}.get(os.environ["BUILD_TYPE"])
+          if profile is None:
+              raise SystemExit("release certification only covers preview, prerelease and stable builds")
+
+          def sha256(path):
+              digest = hashlib.sha256()
+              with open(path, "rb") as handle:
+                  for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          deliverables = []
+          for name in sorted(os.listdir("artifacts")):
+              if not name.startswith("rustfs-") or not name.endswith(".zip"):
+                  continue
+              path = os.path.join("artifacts", name)
+              members = zipfile.ZipFile(path).namelist()
+              binary_name = "rustfs.exe" if "rustfs.exe" in members else "rustfs"
+              with zipfile.ZipFile(path) as archive:
+                  binary_bytes = archive.read(binary_name)
+              import tempfile
+              with tempfile.NamedTemporaryFile() as handle:
+                  handle.write(binary_bytes)
+                  handle.flush()
+                  binary_sha = sha256(handle.name)
+              deliverables.append({
+                  "kind": "zip",
+                  "name": name,
+                  "location": "https://github.com/rustfs/rustfs/releases/download/{}/{}".format(os.environ["VERSION"], name),
+                  "sha256": sha256(path),
+                  "size": os.path.getsize(path),
+                  "binary_sha256": binary_sha,
+              })
+          if not deliverables:
+              raise SystemExit("no built deliverables found to certify")
+          candidate = {
+              "schema_version": 1,
+              "product_commit": os.environ["PRODUCT_COMMIT"],
+              "version": os.environ["VERSION"],
+              "release_profile": profile,
+              "features": [f for f in os.environ.get("FEATURES", "").split(",") if f],
+              "plan_sha256": plan_sha256,
+              "validation_batch": {"run_id": os.environ["GITHUB_RUN_ID"], "run_attempt": int(os.environ["GITHUB_RUN_ATTEMPT"])},
+              "deliverables": deliverables,
+          }
+          json.dump(candidate, sys.stdout, indent=2, sort_keys=True)
+          print()
+          PY
+
+          # Trusted verification evidence only: the release-gate envelopes of
+          # rustfs/s3chaos for this exact product commit. Absence blocks below.
+          TRUSTED_REPO="rustfs/s3chaos"
+          TRUSTED_WORKFLOW="release-gate.yml"
+          TRUSTED_RUN=$(gh api "repos/${TRUSTED_REPO}/actions/workflows/${TRUSTED_WORKFLOW}/runs?head_sha=${PRODUCT_COMMIT}&status=success&per_page=1" --jq '.workflow_runs[0].id // empty' || true)
+          if [[ -z "$TRUSTED_RUN" ]]; then
+            echo "❌ No trusted verification run of ${TRUSTED_REPO}/${TRUSTED_WORKFLOW} for ${PRODUCT_COMMIT}; refusing to certify" >&2
+          else
+            gh run download "$TRUSTED_RUN" -R "$TRUSTED_REPO" -n release-validation-evidence -D results || \
+              echo "❌ Trusted verification run ${TRUSTED_RUN} published no release-validation-evidence artifact" >&2
+          fi
+
+          python3 scripts/release/release_gate.py validate \
+            --plan .config/release-validation-plan.json \
+            --candidate candidate.json \
+            --results results \
+            --output release-gate-output
+
+      - name: Upload certification evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-certification
+          path: |
+            candidate.json
+            results/
+            release-gate-output/
+          if-no-files-found: warn
+          retention-days: 30
+
+  # The only writer of the official R2 release path. Promotion re-checks the
+  # exact bytes about to be published against the passed certification list
+  # and copies the staged objects byte-for-byte: no rebuild-after-verify.
+  promote-release-artifacts:
+    name: Promote Release Artifacts
+    needs: [ build-check, build-rustfs, release-certification ]
+    # Target-channel lock for the official R2 release path.
+    concurrency:
+      group: release-channel-r2-release
+      cancel-in-progress: false
+    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    env:
+      R2_ACCESS_KEY_ID: ${{ secrets.R2_ACCESS_KEY_ID }}
+      R2_SECRET_ACCESS_KEY: ${{ secrets.R2_SECRET_ACCESS_KEY }}
+      R2_ENDPOINT: ${{ secrets.R2_ENDPOINT }}
+      R2_BUCKET: ${{ secrets.R2_BUCKET }}
+      AWS_EC2_METADATA_DISABLED: true
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download build and certification artifacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ./artifacts
+          pattern: rustfs-*
+          merge-multiple: true
+
+      - name: Download certification evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-certification
+          path: ./certification
+
+      - name: Verify and promote staged release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$R2_ACCESS_KEY_ID" || -z "$R2_SECRET_ACCESS_KEY" || -z "$R2_ENDPOINT" || -z "$R2_BUCKET" ]]; then
+            echo "❌ R2 credentials missing; refusing to promote to the official channel" >&2
+            exit 1
+          fi
+
+          for zip_file in artifacts/rustfs-*.zip; do
+            [[ -f "$zip_file" ]] || continue
+            name="$(basename "$zip_file")"
+            python3 scripts/release/release_gate.py verify-promotion \
+              --plan .config/release-validation-plan.json \
+              --candidate certification/candidate.json \
+              --summary certification/release-gate-output \
+              --artifact "$zip_file" \
+              --artifact-name "$name"
+          done
+
+          if ! command -v aws >/dev/null 2>&1; then
+            sudo apt-get update && sudo apt-get install -y awscli
+          fi
+          export AWS_ACCESS_KEY_ID="$R2_ACCESS_KEY_ID"
+          export AWS_SECRET_ACCESS_KEY="$R2_SECRET_ACCESS_KEY"
+          export AWS_DEFAULT_REGION="auto"
+
+          STAGING_PATH="s3://${R2_BUCKET}/artifacts/rustfs/staging/${GITHUB_RUN_ID}/${GITHUB_RUN_ATTEMPT}/"
+          RELEASE_PATH="s3://${R2_BUCKET}/artifacts/rustfs/release/"
+          for zip_file in artifacts/rustfs-*.zip; do
+            [[ -f "$zip_file" ]] || continue
+            name="$(basename "$zip_file")"
+            staged="$(mktemp)"
+            aws s3 cp "${STAGING_PATH}${name}" "$staged" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            staged_sha="$(sha256sum "$staged" | awk '{print $1}')"
+            built_sha="$(sha256sum "$zip_file" | awk '{print $1}')"
+            if [[ "$staged_sha" != "$built_sha" ]]; then
+              echo "❌ Staged object ${name} does not match the verified bytes" >&2
+              exit 1
+            fi
+            aws s3 cp "$staged" "${RELEASE_PATH}${name}" --endpoint-url "$R2_ENDPOINT" --only-show-errors
+            rm -f "$staged"
+            echo "✅ Promoted ${name} (${built_sha})"
+          done
 
   # Create GitHub Release for every valid release tag, including previews
   create-release:
@@ -1028,6 +1248,10 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
+    # Target-channel lock for the latest.json version pointer.
+    concurrency:
+      group: release-channel-oss-latest
+      cancel-in-progress: false
     if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -1068,6 +1292,45 @@ jobs:
           rm -rf "$OSSUTIL_DIR" "$OSSUTIL_ZIP"
           chmod +x "$OSSUTIL_BIN"
 
+          # Candidate/pointer ordering: an older candidate must never overwrite
+          # a newer pointer, even if its promotion job finishes later.
+          CURRENT_LATEST="${RUNNER_TEMP}/current-latest.json"
+          if "$OSSUTIL_BIN" cp oss://rustfs-version/latest.json "$CURRENT_LATEST" 2>/dev/null; then
+            python3 - "$CURRENT_LATEST" "$VERSION" <<'PY'
+          import json
+          import re
+          import sys
+
+          def key(version):
+              match = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$", version)
+              if not match:
+                  raise SystemExit(3)
+              core = tuple(int(part) for part in match.groups()[:3])
+              prerelease = match.group(4)
+              if prerelease is None:
+                  return core + (1,)
+              return core + (0, tuple(int(p) if p.isdigit() else p for p in re.split(r"[.-]", prerelease)))
+
+          try:
+              current = json.load(open(sys.argv[1], encoding="utf-8")).get("version", "")
+              proposed = sys.argv[2]
+              if current and key(current) > key(proposed):
+                  raise SystemExit(1)
+          except SystemExit:
+              raise
+          except (OSError, ValueError, TypeError):
+              raise SystemExit(3)
+          PY
+            guard_status=$?
+            if [[ "$guard_status" -eq 1 ]]; then
+              echo "Current latest.json points at a newer version; refusing to downgrade" >&2
+              exit 0
+            elif [[ "$guard_status" -ne 0 ]]; then
+              echo "Existing latest.json is unparsable; refusing to overwrite it blindly" >&2
+              exit 1
+            fi
+          fi
+
           # Create latest.json
           cat > latest.json << EOF
           {
@@ -1084,16 +1347,59 @@ jobs:
 
           echo "✅ Updated latest.json for ${RELEASE_TYPE} release $VERSION"
 
-  # Publish release (remove draft status)
+  # Publish release (remove draft status). Requires the release-certification
+  # aggregate: without a complete legal success there is no public write.
   publish-release:
     name: Publish Release
-    needs: [ build-check, create-release, upload-release-assets ]
+    needs: [ build-check, create-release, upload-release-assets, release-certification ]
+    # Target-channel lock: concurrent releases serialize on this channel so an
+    # older candidate cannot interleave its publish with a newer one.
+    concurrency:
+      group: release-channel-github-release
+      cancel-in-progress: false
     if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
       contents: write
+      actions: read
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Download certification evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-certification
+          path: ./certification
+
+      - name: Verify release assets against certification
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ needs.build-check.outputs.version }}"
+          mkdir -p "$RUNNER_TEMP/promotion-assets"
+          gh release download "$TAG" --dir "$RUNNER_TEMP/promotion-assets" --pattern '*.zip'
+          found=0
+          for zip_file in "$RUNNER_TEMP"/promotion-assets/*.zip; do
+            [[ -f "$zip_file" ]] || continue
+            found=1
+            python3 scripts/release/release_gate.py verify-promotion \
+              --plan .config/release-validation-plan.json \
+              --candidate certification/candidate.json \
+              --summary certification/release-gate-output \
+              --artifact "$zip_file" \
+              --artifact-name "$(basename "$zip_file")"
+          done
+          if [[ "$found" -ne 1 ]]; then
+            echo "No release zip assets to verify against the certification" >&2
+            exit 1
+          fi
+
       - name: Publish release
         env:
           GH_TOKEN: ${{ github.token }}
