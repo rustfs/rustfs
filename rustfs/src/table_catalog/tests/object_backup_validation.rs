@@ -893,6 +893,36 @@ async fn legacy_catalog_control_state_fails_closed_without_silent_object_fallbac
 }
 
 #[tokio::test]
+async fn maintenance_plan_uses_the_persisted_entry_metadata_directory() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let namespace = Namespace::parse("sales").expect("namespace");
+    let table = IdentifierSegment::parse("orders").expect("table");
+    let current = "tables/table-id/metadata/00003.metadata.json".to_string();
+    let previous = "tables/table-id/metadata/00002.metadata.json".to_string();
+    backend
+        .seed_object("analytics", &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object("analytics", &previous, b"{}".to_vec()).await;
+    store.put_table_bucket(test_bucket_entry("analytics")).await.expect("bucket");
+    store
+        .create_namespace(test_namespace_entry("analytics", &namespace))
+        .await
+        .expect("namespace");
+    store
+        .create_table(test_table_entry("analytics", &namespace, &table, current.clone()))
+        .await
+        .expect("table");
+
+    let report = store
+        .plan_table_metadata_maintenance("analytics", "sales", "orders", 0)
+        .await
+        .expect("entry-aware maintenance planning");
+    assert_eq!(report.current_metadata_location, current);
+    assert_eq!(report.cleanup_candidate_locations, vec![previous]);
+}
+
+#[tokio::test]
 async fn legacy_per_bucket_control_state_does_not_block_an_unrelated_bucket() {
     let (backend, _, _) = backup_fixture().await;
     let paths = TableCatalogObjectPaths::default();

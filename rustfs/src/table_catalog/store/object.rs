@@ -3552,7 +3552,8 @@ where
         let reports = match reports {
             Some(reports) => reports,
             None => {
-                self.list_table_metadata_maintenance_audit_reports(&entry.table_bucket, &namespace, &table, &entry.table_id)
+                let objects = self.list_table_metadata_maintenance_audit_objects_for_entry(entry).await?;
+                self.read_table_metadata_maintenance_audit_reports_for_entry(entry, &objects)
                     .await?
             }
         };
@@ -3922,21 +3923,6 @@ where
             report,
             scheduler,
         })
-    }
-
-    async fn list_table_metadata_maintenance_audit_reports(
-        &self,
-        table_bucket: &str,
-        namespace: &Namespace,
-        table: &IdentifierSegment,
-        table_id: &str,
-    ) -> TableCatalogStoreResult<Vec<TableMetadataMaintenanceReport>> {
-        let jobs_prefix = self
-            .paths
-            .table_maintenance_jobs_prefix(table_bucket, namespace, table, table_id);
-        let objects = self.backend.list_objects(self.catalog_bucket(), &jobs_prefix).await?;
-        self.read_table_metadata_maintenance_audit_reports(table_bucket, namespace, table, table_id, &objects, false)
-            .await
     }
 
     pub(super) async fn list_table_metadata_maintenance_audit_objects_for_entry(
@@ -5377,7 +5363,7 @@ where
                     table.as_str()
                 )));
             };
-            self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, false)
+            self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, true)
                 .await
         })
         .await
