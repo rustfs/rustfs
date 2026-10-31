@@ -26,6 +26,7 @@ see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
 
 - [Architecture guard troubleshooting](operations/architecture-guard-troubleshooting.md) — diagnose repository guard failures.
 - [Logging governance](operations/logging-governance.md) — broad event audits, migrations, and guardrail changes.
+- [Serving RustFS under a URL path prefix](operations/reverse-proxy-path-prefix.md) — `RUSTFS_API_PREFIX`, proxy passthrough rules, and examples.
 
 - [Multipart upload memory diagnosis](operations/multipart-memory.md) — allocator attribution, Docker reproduction and sustained upload checks.
 
