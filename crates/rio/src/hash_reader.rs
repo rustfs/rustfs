@@ -1269,4 +1269,104 @@ mod trailer_tests {
         let err = read_all(&mut outer).await.expect_err("mismatch through a wrapper must fail");
         assert_checksum_mismatch(&err);
     }
+
+    #[tokio::test]
+    async fn wrapping_hash_reader_rejects_already_read_conflicting_checksum_and_size() {
+        let data = b"wrapping validation payload";
+        let size = data.len() as i64;
+
+        // 1. Wrapping a HashReader that has already been partially read must fail.
+        let mut inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let mut one = [0u8; 1];
+        inner.read_exact(&mut one).await.expect("read one byte");
+        assert_eq!(inner.bytes_read(), 1);
+        let err = HashReader::new(Box::new(inner), size, size, None, None, false)
+            .err()
+            .expect("wrapping after read must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("already read"));
+
+        // 2. Wrapping a HashReader with a conflicting MD5 checksum must fail.
+        let inner = HashReader::from_stream(
+            Cursor::new(data.to_vec()),
+            size,
+            size,
+            Some("11111111111111111111111111111111".to_string()),
+            None,
+            false,
+        )
+        .expect("inner with md5");
+        let err = HashReader::new(
+            Box::new(inner),
+            size,
+            size,
+            Some("22222222222222222222222222222222".to_string()),
+            None,
+            false,
+        )
+        .err()
+        .expect("conflicting md5 checksum must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("checksum mismatch"));
+
+        // 3. Wrapping a HashReader with a conflicting positive size must fail.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("inner");
+        let err = HashReader::new(Box::new(inner), size + 10, size, None, None, false)
+            .err()
+            .expect("conflicting positive size must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("size mismatch"));
+
+        // 4. Wrapping an unbounded (-1) HashReader propagates newly discovered positive size and actual_size.
+        let inner = HashReader::from_stream(Cursor::new(data.to_vec()), -1, -1, None, None, false).expect("unbounded inner");
+        let outer = HashReader::new(Box::new(inner), size, size, Some("abcd".to_string()), None, false).expect("outer");
+        assert_eq!(outer.size(), size);
+        assert_eq!(outer.actual_size(), size);
+    }
+
+    #[tokio::test]
+    async fn hash_reader_checksum_helpers_reject_invalid_inputs() {
+        let data = b"checksum helper validation";
+        let size = data.len() as i64;
+        let mut reader = HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("reader");
+
+        // add_calculated_checksum rejects both NONE and INVALID checksum types.
+        let err = reader
+            .add_calculated_checksum(ChecksumType::NONE)
+            .expect_err("NONE checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        let err = reader
+            .add_calculated_checksum(ChecksumType::INVALID)
+            .expect_err("INVALID checksum type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_non_trailing_checksum handles None as a no-op and rejects a Checksum with no hasher.
+        reader.add_non_trailing_checksum(None, false).expect("None is no-op");
+        let invalid_checksum = Checksum {
+            checksum_type: ChecksumType::INVALID,
+            encoded: "AAAA".to_string(),
+            raw: vec![1, 2, 3, 4],
+            want_parts: 0,
+        };
+        let err = reader
+            .add_non_trailing_checksum(Some(invalid_checksum), false)
+            .expect_err("invalid checksum_type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+
+        // add_checksum_no_trailer attaches a direct header checksum without trailer reader.
+        let mut reader =
+            HashReader::from_stream(Cursor::new(data.to_vec()), size, size, None, None, false).expect("fresh reader");
+        assert!(reader.checksum().is_none(), "HashReader::checksum() is None when no content_hash is set");
+        let crc32_val = encoded(ChecksumType::CRC32C, data);
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-checksum-crc32c", HeaderValue::from_str(&crc32_val).expect("header"));
+        reader
+            .add_checksum_no_trailer(&headers, false)
+            .expect("direct header checksum");
+        assert!(
+            reader.checksum().is_some(),
+            "HashReader::checksum() returns Some after add_checksum_no_trailer"
+        );
+        assert_eq!(read_all(&mut reader).await.expect("verified"), data);
+    }
 }

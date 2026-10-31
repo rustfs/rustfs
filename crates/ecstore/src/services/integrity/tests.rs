@@ -385,3 +385,165 @@ async fn pause_and_cancel_are_durable_during_content_read() {
         JobState::Cancelled
     );
 }
+
+#[test]
+fn job_request_validation_and_protection_classification_cover_all_negative_branches() {
+    use crate::object_api::ObjectInfo;
+
+    let valid_digest = rustfs_rio::Checksum::new_from_data(rustfs_rio::ChecksumType::SHA256, b"payload")
+        .expect("sha256")
+        .encoded;
+
+    // 1. Empty items and > MAX_ITEMS (64).
+    let mut empty_req = request(JobMode::Audit, valid_digest.clone());
+    empty_req.items.clear();
+    let err = empty_req.validate().expect_err("empty items must fail");
+    assert!(
+        err.to_string().contains("a job requires 1..=64 explicit source versions"),
+        "unexpected error: {err}"
+    );
+
+    let mut too_many = request(JobMode::Audit, valid_digest.clone());
+    too_many.items = (0..65)
+        .map(|i| ItemRequest {
+            key: format!("key-{i}"),
+            version_id: None,
+            expected_sha256: None,
+            target_key: None,
+        })
+        .collect();
+    let err = too_many.validate().expect_err(">64 items must fail");
+    assert!(
+        err.to_string().contains("a job requires 1..=64 explicit source versions"),
+        "unexpected error: {err}"
+    );
+
+    // 2. bytes_per_second and max_object_bytes bounds.
+    let mut low_bps = request(JobMode::Audit, valid_digest.clone());
+    low_bps.bytes_per_second = 64 * 1024 - 1;
+    let err = low_bps.validate().expect_err("low bytes_per_second must fail");
+    assert!(err.to_string().contains("invalid byte rate or staging limit"), "unexpected error: {err}");
+
+    let mut high_bps = request(JobMode::Audit, valid_digest.clone());
+    high_bps.bytes_per_second = 1024 * 1024 * 1024 + 1;
+    let err = high_bps.validate().expect_err("high bytes_per_second must fail");
+    assert!(err.to_string().contains("invalid byte rate or staging limit"), "unexpected error: {err}");
+
+    let mut zero_max = request(JobMode::Audit, valid_digest.clone());
+    zero_max.max_object_bytes = 0;
+    let err = zero_max.validate().expect_err("zero max_object_bytes must fail");
+    assert!(err.to_string().contains("invalid byte rate or staging limit"), "unexpected error: {err}");
+
+    let mut huge_max = request(JobMode::Audit, valid_digest.clone());
+    huge_max.max_object_bytes = model::MAX_OBJECT_BYTES + 1;
+    let err = huge_max.validate().expect_err("huge max_object_bytes must fail");
+    assert!(err.to_string().contains("invalid byte rate or staging limit"), "unexpected error: {err}");
+
+    // 3. Invalid keys (empty, trailing '/', embedded '\0', > 1024 chars).
+    for bad_key in ["", "trailing/", "null\0byte", &"x".repeat(1025)] {
+        let mut req = request(JobMode::Audit, valid_digest.clone());
+        req.items[0].key = bad_key.to_string();
+        let err = req.validate().expect_err("invalid key must fail");
+        assert!(
+            err.to_string().contains("invalid object key"),
+            "expected 'invalid object key' for {bad_key:?}, got {err}"
+        );
+    }
+
+    // 4. Invalid version_id (nil UUID, malformed UUID, empty string) and valid UUID.
+    for bad_ver in ["", "not-a-uuid", &Uuid::nil().to_string()] {
+        let mut req = request(JobMode::Audit, valid_digest.clone());
+        req.items[0].version_id = Some(bad_ver.to_string());
+        let err = req.validate().expect_err("invalid version_id must fail");
+        assert!(
+            err.to_string().contains("invalid source version"),
+            "expected 'invalid source version' for {bad_ver:?}, got {err}"
+        );
+    }
+    let mut valid_uuid_ver = request(JobMode::Audit, valid_digest.clone());
+    valid_uuid_ver.items[0].version_id = Some(Uuid::new_v4().to_string());
+    assert!(valid_uuid_ver.validate().is_ok());
+
+    // 5. Invalid expected_sha256 (bad base64, wrong byte length).
+    let err = request(JobMode::Audit, "!!!not_base64!!!".to_string())
+        .validate()
+        .expect_err("non-base64 sha256 must fail");
+    assert!(err.to_string().contains("SHA256 must be canonical Base64"), "unexpected error: {err}");
+    let err = request(JobMode::Audit, "AAAA".to_string())
+        .validate()
+        .expect_err("wrong-length sha256 must fail");
+    assert!(
+        err.to_string().contains("SHA256 must be canonical Base64 of 32 bytes"),
+        "unexpected error: {err}"
+    );
+
+    // 6. Mode-specific target_key rules (Audit forbids target_key; Migrate requires unique target_key != key).
+    let mut audit_with_target = request(JobMode::Audit, valid_digest.clone());
+    audit_with_target.items[0].target_key = Some("target".to_string());
+    let err = audit_with_target.validate().expect_err("audit with target_key must fail");
+    assert!(
+        err.to_string().contains("only migrations require an explicit target key"),
+        "unexpected error: {err}"
+    );
+
+    let mut migrate_no_target = request(JobMode::Migrate, valid_digest.clone());
+    migrate_no_target.items[0].target_key = None;
+    let err = migrate_no_target
+        .validate()
+        .expect_err("migrate without target_key must fail");
+    assert!(
+        err.to_string().contains("only migrations require an explicit target key"),
+        "unexpected error: {err}"
+    );
+
+    let mut migrate_same_target = request(JobMode::Migrate, valid_digest.clone());
+    migrate_same_target.items[0].target_key = Some("source".to_string());
+    let err = migrate_same_target
+        .validate()
+        .expect_err("migrate target == source must fail");
+    assert!(
+        err.to_string()
+            .contains("targets must be distinct from every source and target"),
+        "unexpected error: {err}"
+    );
+
+    let mut migrate_dup_target = request(JobMode::Migrate, valid_digest);
+    migrate_dup_target.items.push(ItemRequest {
+        key: "source-2".into(),
+        version_id: None,
+        expected_sha256: None,
+        target_key: Some("target".into()),
+    });
+    let err = migrate_dup_target.validate().expect_err("duplicate migrate target must fail");
+    assert!(
+        err.to_string()
+            .contains("targets must be distinct from every source and target"),
+        "unexpected error: {err}"
+    );
+
+    // 7. model::unsupported and model::protection classifications.
+    let mut delete_marker = ObjectInfo {
+        delete_marker: true,
+        ..Default::default()
+    };
+    assert_eq!(model::unsupported(&delete_marker), Some("delete_marker"));
+    assert_eq!(model::protection(&delete_marker), Protection::NoPayload);
+    delete_marker.delete_marker = false;
+
+    let mut transitioned = ObjectInfo::default();
+    transitioned.transitioned_object.status = "Complete".to_string();
+    assert_eq!(model::unsupported(&transitioned), Some("transitioned_object"));
+
+    let mut encrypted = ObjectInfo::default();
+    Arc::make_mut(&mut encrypted.user_defined).insert("x-amz-server-side-encryption".to_string(), "AES256".to_string());
+    assert_eq!(model::unsupported(&encrypted), Some("transformed_object"));
+
+    let mut invalid_decl = ObjectInfo::default();
+    rustfs_utils::http::insert_str(
+        Arc::make_mut(&mut invalid_decl.user_defined),
+        rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
+        "not-json".to_string(),
+    );
+    assert_eq!(model::unsupported(&invalid_decl), Some("invalid_protection_declaration"));
+    assert_eq!(model::protection(&invalid_decl), Protection::InvalidDeclaration);
+}
