@@ -46,9 +46,9 @@ use super::super::{
     build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
     check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
     classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
-    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer, debug, delete_file_info_version_id,
-    disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker, finish_set_disk_read_lock,
-    get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
+    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer_with_orig_volume, debug,
+    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
+    finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
     get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
     get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
     inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled,
@@ -158,13 +158,15 @@ fn rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() -> bool {
 }
 
 fn tier_free_version_source_reuse_rename_data_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        matches!(
-            std::env::var(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV).ok().as_deref(),
-            Some("1" | "true" | "TRUE" | "yes" | "YES" | "on" | "ON")
-        )
-    })
+    #[cfg(test)]
+    {
+        rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true)
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| rustfs_utils::get_env_bool(TIER_FREE_VERSION_SOURCE_REUSE_RENAME_DATA_ENV, true))
+    }
 }
 
 fn tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled() -> bool {
@@ -4457,9 +4459,10 @@ impl SetDisks {
                             if let Some(disk) = disk_op
                                 && disk.is_online().await
                             {
-                                match create_bitrot_writer(
+                                match create_bitrot_writer_with_orig_volume(
                                     is_inline_buffer,
                                     Some(disk),
+                                    bucket,
                                     RUSTFS_META_TMP_BUCKET,
                                     &tmp_obj,
                                     shard_file_size,
@@ -4741,7 +4744,7 @@ impl SetDisks {
                                 .ok_or_else(|| Error::other(format!("inline encoder omitted disk shard {i}")))?,
                         );
                     } else if let Some(writer) = writers[i].take() {
-                        pfi.data = Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                        pfi.data = Some(writer.into_inline_data().unwrap_or_default());
                     }
 
                     pfi.set_inline_data();
@@ -5523,8 +5526,10 @@ impl SetDisks {
                 );
 
                 let tier_free_version_source_lookup_started = rustfs_io_metrics::put_stage_timer();
+                let all_commit_disks_local = commit_disks.iter().flatten().all(|disk| disk.is_local());
                 let reuse_rename_data_source_for_tier_free_version = tier_free_version_source_reuse_rename_data_enabled()
-                    && (commit_set.tier_free_version_rename_data_source_capable()
+                    && (all_commit_disks_local
+                        || commit_set.tier_free_version_rename_data_source_capable()
                         || tier_free_version_source_reuse_rename_data_assume_homogeneous_enabled());
                 let mut put_tier_free_version_source = if commit_put_tier_free_version_id.is_some()
                     && commit_tier_free_version_receipt_sink.is_some()
@@ -5631,9 +5636,11 @@ impl SetDisks {
                 );
                 let lock_held_tail_handoff_started = rustfs_io_metrics::put_stage_timer();
                 if let Ok(rename_commit) = rename_result.as_mut() {
-                    commit_set.observe_tier_free_version_rename_data_source_capability(
-                        rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
-                    );
+                    if rename_commit.tail_drain.is_none() || !rename_commit.old_current_source_all_successful_checked {
+                        commit_set.observe_tier_free_version_rename_data_source_capability(
+                            rename_commit.tail_drain.is_none() && rename_commit.old_current_source_all_successful_checked,
+                        );
+                    }
                     commit_set.record_capacity_scope_if_needed(commit_capacity_scope_token, &rename_commit.capacity_disks);
                     // Install the tail watcher before any post-commit await. The
                     // latch keeps namespace guards through their prior handoff point.
@@ -5704,7 +5711,12 @@ impl SetDisks {
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
-                                  targets| {
+                                  targets,
+                                  old_current_source_all_successful_checked,
+                                  all_online_local_succeeded| {
+                                cleanup_set.observe_tier_free_version_rename_data_source_capability(
+                                    old_current_source_all_successful_checked,
+                                );
                                 drop(object_lock_guard);
                                 drop(write_context);
                                 drop(publication_guard);
@@ -5731,7 +5743,10 @@ impl SetDisks {
                                         )
                                         .await;
                                     let tmp_delete_started = rustfs_io_metrics::put_stage_timer();
-                                    if zero_target_cleanup && rename_tail_cleanup_zero_target_tmp_delete_skip_enabled() {
+                                    if zero_target_cleanup
+                                        && (all_online_local_succeeded
+                                            || rename_tail_cleanup_zero_target_tmp_delete_skip_enabled())
+                                    {
                                         rustfs_io_metrics::record_put_object_stage_duration(
                                             rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP_TMP_DELETE_COUNTERFACTUAL_SKIP,
                                             1.0,
@@ -11061,7 +11076,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Some(err) = &gerr
             && goi.name.is_empty()
         {
-            if should_force_delete_marker_for_missing_version(&opts) {
+            if (is_err_object_not_found(err) || is_err_version_not_found(err))
+                && should_force_delete_marker_for_missing_version(&opts)
+            {
                 version_found = false;
             } else {
                 if is_err_object_not_found(err) {

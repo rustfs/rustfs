@@ -66,7 +66,7 @@ The manifest has the following JSON contract (all fields are required):
 | `rounds`, `duration_seconds`, `min_free_bytes` | 3..10 groups, 7200..86400 seconds for measured release runs, and the independently estimated free-space reservation in bytes. Synthetic runs may use 1 second. |
 | `baseline`, `candidate` | Each contains executable `binary`, full 40-character `revision`, and verified `sha256`. The runner rehashes binaries before every leg. |
 | `fixed` | `config_sha256`, `dataset_sha256`, `release_flags`, `durability`, `disk_type`, `cache_state`, `load_command`, `resource_isolation`, `topology` (`EC8+4`), and positive `offered_load_ops`. Hashes use 64 lowercase hexadecimal characters. |
-| `release_evidence` | Required for `measured` runs. It binds the 3x4 EC8+4 topology, multi-pool/multi-set coverage, per-node metrics endpoints, same-window distributed sampling, process restart and crash-restart fault modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact requirements. Synthetic runs do not need this field and still cannot approve release evidence. |
+| `release_evidence` | Required for `measured` runs. It declares the 3x4 EC8+4 topology, multi-pool/multi-set coverage, per-node metrics endpoints, same-window distributed sampling, process restart and crash-restart fault modes, mixed-version reader/writer/rollback participation, and allocation/flamegraph/RSS/save-frequency profile artifact requirements. Synthetic runs do not require it and cannot approve release evidence. |
 | `oracles` | A map with all five scenario names. Each value contains positive integer `objects`, `versions`, `bytes`, and `sha256` of the independently prepared canonical object/version/content manifest. |
 | `expected_healed_objects` | A map with all five scenario names and independently seeded repair counts. Running-heal and MRF-replay require a positive count. |
 
@@ -79,11 +79,17 @@ the collector reads `RUSTFS_ACCESS_KEY` and `RUSTFS_SECRET_KEY` from its environ
 The adapter must echo the measured run's `release_evidence` object in every
 measurement response. A mismatch fails the cell because it means the deployment,
 mixed-version set, crash mode, or profiler contract no longer matches the
-operator-reviewed manifest. This echo is provenance binding only; it does not
-replace the independent correctness oracle, distributed metrics samples, profile
-artifacts, or ABBA comparison thresholds. The summary tool revalidates the same
-manifest contract before it can print a measured PASS result, so hand-built or
-trimmed reports without this provenance fail closed.
+operator-reviewed manifest. This echo checks consistency with the declared plan;
+it does not prove that observations share a source window or that the reported
+client percentiles are exact. Until those original observations are independently
+verified, measured results are marked unverified and cannot produce a PASS or a
+release descriptor. The summary command's legacy descriptor option rejects the
+request until a producer can verify each field against its original window.
+
+The existing live collector persists the declared load command, scanner/heal
+configuration snapshots, and adapter/collector output. It is not a verified
+sanitized capture path; use it only after confirming those inputs and outputs do
+not contain credentials, private configuration files, or sensitive commands.
 
 #### Deployment Adapter Contract
 
@@ -218,7 +224,7 @@ retain the failure and reconcile the service before continuing.
 
 The `measure` response echoes the observed `evidence`, `fixed`, `build`,
 `data_dir`, and `background`, plus `sample_count` (1..3600), `elapsed_seconds`,
-and `metrics`. All metrics must be finite nonnegative numbers: `p99_ms`,
+and `metrics`. All metrics must be finite nonnegative numbers: `p95_ms`, `p99_ms`,
 `throughput_ops`, `rss_bytes`, `cpu_seconds`, `iops`, `rpc_count`,
 `cache_clone_bytes`, `encode_bytes`, `save_bytes`, `oldest_age_seconds`,
 `walk_objects`, `cold_walk_objects`, `healed_objects`, `errors`, and `requests`.
@@ -234,6 +240,27 @@ request samples, counter reset checks, profiler captures, and per-node telemetry
 in the cell artifact directory; aggregate values alone do not establish their
 measurement provenance. Missing production instrumentation is a pending gate,
 not permission to report a fabricated zero.
+
+For measured cells, retain the original schedule, start, and completion ledgers
+and their references in `client_request_samples`. The runner reconciles request
+identities, counts, timestamps, errors, and file hashes before calculating
+nearest-rank percentiles from the recorded worker-start-to-completion samples.
+The current adapter timestamps worker start before its ledger flush, so those
+samples also include local logging and do not establish SDK-call latency.
+Missing HTTP status does not prove zero 503s. The current ledger format does not
+prove that the offered load reached the service or that the client and node
+windows coincide, so a measured release result remains unavailable until those
+boundaries are verified.
+The four ABBA legs cover different windows: their per-leg percentiles are
+reported separately, not renamed as a combined p95 or p99. Ledger reduction
+uses a size-limited scratch database and samples free space; those checks do not
+reserve disk space or prevent concurrent writers from crossing the floor.
+
+The live telemetry collector starts its HTTP captures concurrently and records
+their actual transport intervals. These receipts explicitly report
+`synchronized_source_window=false`: concurrent collection does not establish
+that the servers measured the same source window. The adapter must separately
+prove alignment with the client window before claiming same-window acceptance.
 
 For usage-cache saves, `encode_bytes` uses the window delta of
 `rustfs_scanner_cache_serialized_bytes_total`. `save_bytes` uses the sum of

@@ -144,6 +144,8 @@ pub(crate) fn namespace_lock_signal_test_fence_is_lost(signal: &Arc<rustfs_lock:
         .is_some_and(|(_, fence)| fence.is_lock_lost())
 }
 
+type FreshPutQuota = std::result::Result<(Option<crate::bucket::quota::BucketQuota>, Uuid, OffsetDateTime), String>;
+
 #[derive(Debug)]
 pub struct ObjectLockConfigSnapshot {
     store_id: Option<Uuid>,
@@ -154,6 +156,7 @@ pub struct ObjectLockConfigSnapshot {
     lifecycle_fence: NamespaceLockFence,
     _lifecycle_guard: Option<rustfs_lock::NamespaceLockGuard>,
     metadata_transaction_guard: Option<Arc<rustfs_lock::NamespaceLockGuard>>,
+    fresh_put_quota: std::sync::Mutex<Option<FreshPutQuota>>,
 }
 
 impl ObjectLockConfigSnapshot {
@@ -167,6 +170,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -187,6 +191,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence: NamespaceLockFence::new(),
             _lifecycle_guard: None,
             metadata_transaction_guard: None,
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -212,6 +217,7 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence,
             _lifecycle_guard: Some(lifecycle_guard),
             metadata_transaction_guard: Some(Arc::new(metadata_transaction_guard)),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
     }
 
@@ -233,7 +239,21 @@ impl ObjectLockConfigSnapshot {
             lifecycle_fence,
             _lifecycle_guard: None,
             metadata_transaction_guard: Some(metadata_transaction_guard),
+            fresh_put_quota: std::sync::Mutex::new(None),
         }
+    }
+
+    pub(crate) fn set_fresh_put_quota(&self, quota: FreshPutQuota) {
+        if self._lifecycle_guard.is_some() && self.metadata_transaction_guard.is_some() {
+            *self.fresh_put_quota.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(quota);
+        }
+    }
+
+    pub(crate) fn take_fresh_put_quota(&self) -> Option<FreshPutQuota> {
+        self.fresh_put_quota
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 
     #[allow(dead_code, reason = "snapshot-scope predicate asserted by this file's tests (backlog#1823)")]
@@ -1523,6 +1543,8 @@ pub struct ObjectInfo {
     /// published by the same upload. Callers must not repeat quota, replication,
     /// lifecycle, or object-created side effects for that response.
     pub multipart_completion_replayed: bool,
+    /// Previous current version's size observed during `rename_data` commit.
+    pub backfilled_old_current_size: Option<crate::disk::OldCurrentSize>,
 }
 
 impl Default for ObjectInfo {
@@ -1565,6 +1587,7 @@ impl Default for ObjectInfo {
             replication_decision: String::new(),
             checksum: None,
             multipart_completion_replayed: false,
+            backfilled_old_current_size: None,
         }
     }
 }
@@ -1608,6 +1631,7 @@ impl Clone for ObjectInfo {
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
             multipart_completion_replayed: self.multipart_completion_replayed,
+            backfilled_old_current_size: self.backfilled_old_current_size,
             expires: self.expires,
         }
     }

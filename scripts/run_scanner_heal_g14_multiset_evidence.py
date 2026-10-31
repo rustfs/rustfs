@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime, timezone
+import os
 import re
 import shutil
 import subprocess
@@ -18,7 +19,7 @@ import sys
 from pathlib import Path
 from typing import Any
 
-from scanner_abba import digest, read_json, require, write_json
+from scanner_abba import digest, read_json, require, safe_error_message, write_json
 
 ROOT = Path(__file__).resolve().parents[1]
 G14_FIELDS = (
@@ -32,10 +33,6 @@ G14_FIELDS = (
 
 def git_head() -> str:
     return subprocess.check_output(["git", "rev-parse", "HEAD"], cwd=ROOT, text=True).strip()
-
-
-def utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def iso_from_epoch(value: Any, name: str) -> str:
@@ -272,8 +269,10 @@ def proof_from_case_directories(raw_values: list[str], out_dir: Path, source_rev
 
 
 def write_field(out_dir: Path, field: str, proof: dict[str, Any], source_revision: str) -> dict[str, Any]:
-    started_at = proof.get("started_at") or utc_now()
-    finished_at = proof.get("finished_at") or started_at
+    started_at = proof.get("started_at")
+    finished_at = proof.get("finished_at")
+    require(isinstance(started_at, str) and started_at, "missing G14 original window start")
+    require(isinstance(finished_at, str) and finished_at, "missing G14 original window end")
     evidence: dict[str, Any] = {
         "artifact": "",
         "evidence_type": "measured",
@@ -325,11 +324,18 @@ def write_field(out_dir: Path, field: str, proof: dict[str, Any], source_revisio
     return evidence
 
 
+def g14_inputs_verified(_args: argparse.Namespace, _source_revision: str) -> bool:
+    # The original multi-node observation and invalidation window are not yet
+    # independently verified. A self-declared measured proof cannot open G14.
+    return False
+
+
 def build_descriptor(args: argparse.Namespace) -> Path:
     out_dir = args.out_dir.resolve()
     require(not out_dir.exists(), "output directory must be new")
     source_revision = args.source_revision or git_head()
-    out_dir.mkdir(parents=True)
+    require(g14_inputs_verified(args, source_revision), "G14 source windows are not independently verified")
+    out_dir.mkdir(parents=True, mode=0o700)
     if args.proof_json is not None:
         proof_path = args.proof_json.resolve()
         proof = load_proof(proof_path, source_revision)
@@ -344,26 +350,31 @@ def build_descriptor(args: argparse.Namespace) -> Path:
         proof = proof_from_case_directories(args.case_dir, out_dir, source_revision)
     fields = {field: write_field(out_dir, field, proof, source_revision) for field in G14_FIELDS}
     descriptor = out_dir / "release-bundle-g14.json"
-    write_json(descriptor, {
-        "schema": 1,
-        "evidence": "measured",
-        "source_revision": source_revision,
-        "gates": {
-            "G14": {
-                "status": "pass",
-                "lane": "ec8-4-multiset",
-                "evidence_type": "measured",
-                "evidence_fields": fields,
+    pending = out_dir / ".release-bundle-g14.pending.json"
+    try:
+        write_json(pending, {
+            "schema": 1,
+            "evidence": "measured",
+            "source_revision": source_revision,
+            "gates": {
+                "G14": {
+                    "status": "pass",
+                    "lane": "ec8-4-multiset",
+                    "evidence_type": "measured",
+                    "evidence_fields": fields,
+                },
             },
-        },
-    })
-    subprocess.check_call([
-        sys.executable,
-        str(ROOT / "scripts/check_test_wiring.py"),
-        "--check-scanner-heal-release-bundle-gate",
-        str(descriptor),
-        "G14",
-    ], cwd=ROOT)
+        })
+        subprocess.check_call([
+            sys.executable,
+            str(ROOT / "scripts/check_test_wiring.py"),
+            "--check-scanner-heal-release-bundle-gate",
+            str(pending),
+            "G14",
+        ], cwd=ROOT)
+        os.link(pending, descriptor)
+    finally:
+        pending.unlink(missing_ok=True)
     return descriptor
 
 
@@ -452,7 +463,7 @@ def write_self_test_case_dir(root: Path, source_revision: str, case: str, sets: 
     return directory
 
 
-def run_self_test() -> None:
+def _run_packaging_self_test() -> None:
     import tempfile
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -464,6 +475,12 @@ def run_self_test() -> None:
             "--out-dir", str(root / "out"),
         ]))
         require(descriptor.is_file(), "self-test descriptor missing")
+        checked = subprocess.run([
+            sys.executable, str(ROOT / "scripts/check_test_wiring.py"),
+            "--check-scanner-heal-release-bundle-gate", str(descriptor), "G14",
+        ], cwd=ROOT, capture_output=True, text=True, check=False)
+        require(checked.returncode == 1 and "not independently verified" in checked.stdout,
+                "self-test accepted unverified G14 evidence")
 
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -534,6 +551,78 @@ def run_self_test() -> None:
             raise ValueError("self-test accepted fixture-only G14 case oracle")
 
 
+def run_self_test() -> None:
+    import contextlib
+    import io
+    import tempfile
+    from unittest import mock
+
+    import check_test_wiring as wiring
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        for proof in ({}, {"started_at": "2026-09-09T00:00:00Z"}):
+            try:
+                write_field(root, G14_FIELDS[0], proof, "a" * 40)
+            except ValueError as err:
+                require("missing G14 original window" in str(err), "wrong missing-window failure")
+            else:
+                raise ValueError("self-test synthesized a G14 window")
+        require(not (root / "artifacts").exists(), "missing G14 window left artifacts")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stderr = io.StringIO()
+        argv = ["g14", "--proof-json", "unused", "--out-dir", str(Path(tmp) / "out")]
+        error = subprocess.CalledProcessError(1, ["sensitive-command-sentinel"])
+        with mock.patch.object(sys, "argv", argv), mock.patch.object(sys.modules[__name__], "git_head", side_effect=error), \
+             contextlib.redirect_stderr(stderr):
+            require(main() == 1, "self-test accepted a failed source revision")
+        require("sensitive-command-sentinel" not in stderr.getvalue(), "G14 error exposed command arguments")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        proof = write_self_test_proof(root, source_revision)
+        out_dir = root / "out"
+        try:
+            build_descriptor(parse_args(["--proof-json", str(proof), "--out-dir", str(out_dir)]))
+        except ValueError as err:
+            require("not independently verified" in str(err), "wrong unverified G14 failure")
+        else:
+            raise ValueError("self-test accepted unverified G14 inputs")
+        require(not out_dir.exists(), "unverified G14 inputs left an output directory")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        source_revision = git_head()
+        proof = write_self_test_proof(root, source_revision)
+        out_dir = root / "out"
+        with mock.patch.object(sys.modules[__name__], "g14_inputs_verified", return_value=True), \
+             mock.patch.object(subprocess, "check_call", side_effect=subprocess.CalledProcessError(1, "checker")):
+            try:
+                build_descriptor(parse_args(["--proof-json", str(proof), "--out-dir", str(out_dir)]))
+            except subprocess.CalledProcessError:
+                pass
+            else:
+                raise ValueError("self-test accepted a rejected G14 descriptor")
+        require(not (out_dir / "release-bundle-g14.json").exists()
+                and not (out_dir / ".release-bundle-g14.pending.json").exists(),
+                "rejected G14 validation left a descriptor")
+
+    def verify_fixture(command: list[str], cwd: Path) -> None:
+        require(cwd == ROOT and command[2] == "--check-scanner-heal-release-bundle-gate"
+                and command[4] == "G14", "unexpected self-test checker invocation")
+        with mock.patch.object(wiring, "distributed_window_provenance_verified", return_value=True):
+            status = wiring.scanner_heal_release_bundle_gate_status(ROOT, Path(command[3]), "G14")
+        require(status["decision"] == "verified", "fixture gate validation failed")
+
+    # Only synthetic packaging tests simulate the future verifier. Real CLI
+    # invocations and the separate checker retain their fail-closed behavior.
+    with mock.patch.object(sys.modules[__name__], "g14_inputs_verified", return_value=True), \
+         mock.patch.object(subprocess, "check_call", side_effect=verify_fixture):
+        _run_packaging_self_test()
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--proof-json", type=Path)
@@ -561,7 +650,7 @@ def main() -> int:
         print(f"G14 release descriptor verified: {descriptor}")
         return 0
     except (ValueError, KeyError, OSError, subprocess.SubprocessError) as err:
-        print(f"ERROR: {err}", file=sys.stderr)
+        print(f"ERROR: {safe_error_message(err)}", file=sys.stderr)
         return 1
 
 

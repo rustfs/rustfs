@@ -612,7 +612,7 @@ impl ECStore {
         }
         if opts.http_preconditions.is_some()
             && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, &opts).await
+            && let Some(err) = self.check_write_precondition(bucket, object, &opts, false).await
         {
             return Err(err);
         }
@@ -638,6 +638,19 @@ impl ECStore {
                 })
                 .await?;
             return Ok((res, idx, opts.expected_bucket_incarnation_id));
+        }
+
+        if self.single_pool() && !self.is_suspended(0).await && !self.is_pool_rebalancing(0).await {
+            self.apply_decommission_target_mutation_fence(0, object, &mut opts, mutation_fence)
+                .await;
+            let expected_bucket_incarnation_id = opts.expected_bucket_incarnation_id;
+            let lock_object = encode_dir_object(object);
+            let res = self
+                .run_external_decommission_capacity_object_mutation(0, bucket, &lock_object, object, opts, |opts| async move {
+                    self.pools[0].new_multipart_upload(bucket, object, &opts).await
+                })
+                .await?;
+            return Ok((res, 0, expected_bucket_incarnation_id));
         }
 
         for (idx, pool) in self.pools.iter().enumerate() {
@@ -1141,12 +1154,33 @@ impl ECStore {
         Ok(())
     }
 
-    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+    async fn check_write_precondition(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Option<StorageError> {
         let mut lookup_opts = opts.clone();
         let http_preconditions = lookup_opts.http_preconditions?;
         lookup_opts.http_preconditions = None;
         lookup_opts.no_lock = true;
-        let oi = self.get_object_info_for_delete(bucket, object, &lookup_opts).await;
+        let oi = if require_all_pools {
+            lookup_opts.metadata_cache_safe = false;
+            lookup_opts.suppress_read_repair = true;
+            if let Err(err) = check_object_args(bucket, object) {
+                return Some(err);
+            }
+            let encoded_object = encode_dir_object(object);
+            self.get_latest_object_info_for_conditional_write(bucket, &encoded_object, &lookup_opts)
+                .await
+                .and_then(|(info, _)| {
+                    lookup_opts.precondition_check(&info)?;
+                    Ok(info)
+                })
+        } else {
+            self.get_object_info_for_delete(bucket, object, &lookup_opts).await
+        };
         crate::set_disk::SetDisks::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
     }
 
@@ -1167,19 +1201,22 @@ impl ECStore {
         let opts = &opts;
 
         if self.single_pool() {
-            return self.pools[0]
+            let result = self.pools[0]
                 .clone()
                 .complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
                 .await;
+            return enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await;
         }
-        if opts.http_preconditions.is_some()
-            && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
-        {
-            return Err(err);
+        if opts.http_preconditions.is_some() && !opts.data_movement {
+            // Preserve explicitly scoped internal reads and borrowed-lock callers.
+            let require_all_pools =
+                !opts.replication_request && !opts.no_lock && !opts.skip_decommissioned && !opts.skip_rebalancing;
+            if let Some(err) = self.check_write_precondition(bucket, object, opts, require_all_pools).await {
+                return Err(err);
+            }
         }
 
-        match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {
+        let result = match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {
             Ok(pool_idx) => {
                 self.pools[pool_idx]
                     .clone()
@@ -1190,21 +1227,29 @@ impl ECStore {
             // the pool that published it; other pools answer InvalidUploadID.
             Err(err) if is_err_invalid_upload_id(&err) => {
                 let mut missing = err;
+                let mut found = None;
                 for pool_idx in self.existing_multipart_pool_order().await {
                     match self.pools[pool_idx]
                         .clone()
                         .complete_multipart_upload(bucket, object, upload_id, uploaded_parts.clone(), opts)
                         .await
                     {
-                        Ok(info) => return Ok(info),
+                        Ok(info) => {
+                            found = Some(Ok(info));
+                            break;
+                        }
                         Err(err) if is_err_invalid_upload_id(&err) => missing = err,
-                        Err(err) => return Err(err),
+                        Err(err) => {
+                            found = Some(Err(err));
+                            break;
+                        }
                     }
                 }
-                Err(missing)
+                found.unwrap_or(Err(missing))
             }
             Err(err) => Err(err),
-        }
+        };
+        enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await
     }
 
     #[cfg(all(test, feature = "test-util"))]
@@ -1326,6 +1371,7 @@ impl ECStore {
         // Data movement already owns the pool-meta write lease. Forward its
         // loss signal into SetDisks so commit fencing observes the same lease
         // without trying to reacquire the namespace.
+        let mut transition_opts = opts.clone();
         let result = self
             .run_decommission_capacity_admitted_mutation_with_capacity_lease(
                 target_pool_idx,
@@ -1341,8 +1387,9 @@ impl ECStore {
             )
             .await;
         drop(publication_guard);
+        transition_opts.no_lock = request_opts.no_lock;
         let result =
-            enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, request_opts).await;
+            enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, &transition_opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }

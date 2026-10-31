@@ -941,6 +941,32 @@ impl InstanceContext {
             .clone()
     }
 
+    /// Remove the `BucketMetadataSys` when its backing `ECStore` is gone.
+    ///
+    /// Called from `ECStore::drop`. When test fixtures share the bootstrap
+    /// context, the `BucketMetadataSys` stores a `Weak<ECStore>` to prevent a
+    /// reference cycle; once the store drops the weak is dangling and any
+    /// `object_store()` call panics. Clearing the slot here lets the next
+    /// fixture install a fresh `BucketMetadataSys` without hitting the stale one.
+    pub fn clear_bucket_metadata_sys_if_stale(&self) {
+        let mut guard = self.bucket_metadata_sys.lock().expect("bucket_metadata_sys lock poisoned");
+        if let Some(sys) = guard.as_ref() {
+            // `read()` may block briefly; the async RwLock is acceptable here
+            // because Drop is sync and the lock is held only long enough to
+            // check the weak reference.
+            let is_stale = {
+                let s = sys.try_read();
+                match s {
+                    Ok(s) => s.is_store_stale(),
+                    Err(_) => true, // contended: treat as stale-safe to clear
+                }
+            };
+            if is_stale {
+                *guard = None;
+            }
+        }
+    }
+
     /// Set this instance's background-services cancellation token (once).
     pub fn init_background_cancel_token(&self, token: CancellationToken) -> Result<(), CancellationToken> {
         self.background_cancel_token.set(token)

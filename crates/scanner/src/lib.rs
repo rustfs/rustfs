@@ -58,6 +58,9 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 pub mod data_usage_define;
+#[cfg(feature = "e2e-test-hooks")]
+#[doc(hidden)]
+pub mod e2e_barrier;
 pub mod error;
 mod heal_completion;
 pub mod prefix_usage;
@@ -85,7 +88,8 @@ pub use prefix_usage::{BucketPrefixUsageResponse, bucket_prefix_usage, invalidat
 pub use remote_scanner::{
     NS_SCANNER_MAX_REQUEST_BODY_SIZE, RemoteScannerAdmission, RemoteScannerRequest, admit_remote_scanner_request,
     claim_remote_scanner_request, decode_remote_scanner_request, preflight_remote_scanner_request,
-    remote_scanner_request_matches_envelope, serve_remote_scanner_request, validate_remote_scanner_request_fence,
+    remote_scanner_request_matches_envelope, serve_remote_scanner_request, serve_remote_scanner_request_with_memory,
+    validate_remote_scanner_request_fence,
 };
 pub use runtime_config::{apply_scanner_runtime_config, scanner_runtime_config_status, validate_scanner_runtime_config};
 pub use rustfs_scanner_metrics::last_minute;

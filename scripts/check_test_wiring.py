@@ -30,6 +30,7 @@ from scanner_abba import (
     RELEASE_PROFILE_ARTIFACTS,
     SCENARIOS,
     digest,
+    measured_provenance_verified,
     number,
     read_json,
     require,
@@ -704,7 +705,7 @@ def check_ilm_build_budget(root: Path) -> list[str]:
             "--workspace-remap": "$GITHUB_WORKSPACE",
             "--target-dir-remap": "$GITHUB_WORKSPACE/target",
         }
-        if ("test-and-lint" not in job.get("needs", []) or "--archive-file" in tokens
+        if ("workspace-lint-and-build" not in job.get("needs", []) or "--archive-file" in tokens
                 or any(tokens.count(flag) != 1 or tokens[tokens.index(flag) + 1:tokens.index(flag) + 2] != [value]
                        for flag, value in reuse_options.items())):
             return ["ILM integration must consume the workspace producer archive"]
@@ -728,7 +729,7 @@ def check_ilm_build_budget(root: Path) -> list[str]:
             return ["ILM integration must propagate failures"]
         if 'status=${PIPESTATUS[0]}' not in command or 'exit "${status}"' not in command or "|| true" in command.split('status=${PIPESTATUS[0]}')[0]:
             return ["ILM integration must retain the actual test exit status"]
-        producer_steps = jobs.get("test-and-lint", {}).get("steps", [])
+        producer_steps = jobs.get("workspace-lint-and-build", {}).get("steps", [])
         builds = [item for item in producer_steps if "ci_test_artifact.py build --configuration workspace" in item.get("run", "")]
         if len(builds) != 1:
             return ["ILM integration requires one workspace archive producer"]
@@ -2736,6 +2737,16 @@ def validate_release_bundle_domain_evidence(gate: str, field: str, evidence: dic
                                      f"{gate}.{field}.recovered_pending_migration")
 
 
+def segment_oracle_provenance_verified(_bundle_dir: Path, _field: str) -> bool:
+    # Original post-stop and segment/oracle evidence is not verified yet.
+    return False
+
+
+def distributed_window_provenance_verified(_bundle_dir: Path, _field: str) -> bool:
+    # Original multi-node generation and invalidation evidence is not verified yet.
+    return False
+
+
 def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, gate: str, field: str,
                                      evidence: dict[str, object]) -> str:
     require(evidence.get("evidence_type") == "measured", f"{gate}.{field} must be measured evidence")
@@ -2975,6 +2986,18 @@ def validate_release_bundle_artifact(bundle_path: Path, source_revision: str, ga
                 evidence_integer(item.get("resolved_samples"), f"{gate}.{artifact_field}.resolved_samples",
                                  0, 2**63 - 1)
     validate_release_bundle_domain_evidence(gate, field, evidence)
+    if (gate, field) in (("G10", "pressure_recovery_evidence"),
+                         ("P1", "cold_walk_share_measurement"),
+                         ("P1", "foreground_latency_throughput_measurement"),
+                         ("P3", "two_hour_pressure_measurement")):
+        require(measured_provenance_verified(bundle_path.parent),
+                f"{gate}.{field} source windows and client percentiles are not independently verified")
+    if gate == "P2" and field in ("post_stop_convergence_measurement", "cold_segment_reuse_measurement"):
+        require(segment_oracle_provenance_verified(bundle_path.parent, field),
+                f"{gate}.{field} post-stop and segment/oracle provenance is not independently verified")
+    if gate == "G14" and field in ("same_window_field_evidence", "distributed_segment_invalidation_evidence"):
+        require(distributed_window_provenance_verified(bundle_path.parent, field),
+                f"{gate}.{field} multi-node generation and window provenance is not independently verified")
     return window_id
 
 
@@ -3515,6 +3538,19 @@ def validate(root: Path) -> list[str]:
 
 
 class SelfTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # Structural fixtures exercise the other validators with a simulated
+        # source verifier. The real verifier is checked separately below.
+        self.provenance_verifier = mock.patch.object(sys.modules[__name__], "measured_provenance_verified", return_value=True)
+        self.provenance_verifier.start()
+        self.addCleanup(self.provenance_verifier.stop)
+        self.segment_verifier = mock.patch.object(sys.modules[__name__], "segment_oracle_provenance_verified", return_value=True)
+        self.segment_verifier.start()
+        self.addCleanup(self.segment_verifier.stop)
+        self.distributed_verifier = mock.patch.object(sys.modules[__name__], "distributed_window_provenance_verified", return_value=True)
+        self.distributed_verifier.start()
+        self.addCleanup(self.distributed_verifier.stop)
+
     def test_quick_checks_rejects_caller_and_execution_bypasses(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -4192,6 +4228,28 @@ class SelfTests(unittest.TestCase):
         bundle = bundle_dir / "release-evidence.json"
         write_json(bundle, {"schema": 1, "evidence": "measured", "source_revision": source_revision, "gates": gates})
         return root, bundle
+
+    def test_scanner_heal_release_bundle_rejects_unverified_measurements(self) -> None:
+        self.provenance_verifier.stop()
+        self.segment_verifier.stop()
+        self.distributed_verifier.stop()
+        with tempfile.TemporaryDirectory() as tmp:
+            root, bundle = self.scanner_heal_release_bundle_fixture(Path(tmp))
+            payload = read_json(bundle)
+            payload["measurement_provenance"] = "verified"
+            write_json(bundle, payload)
+            with mock.patch("subprocess.check_output", return_value="b" * 40):
+                status = scanner_heal_release_bundle_status(root, bundle)
+                unverified = [scanner_heal_release_bundle_gate_status(root, bundle, gate)
+                              for gate in ("G10", "G14", "P1", "P2", "P3")]
+                g09 = scanner_heal_release_bundle_gate_status(root, bundle, "G09")
+            self.assertFalse(status["release_approved"])
+            for gate in ("G10", "G14", "P1", "P2", "P3"):
+                self.assertIn(gate, status["rejected_gates"])
+            for gate in unverified:
+                self.assertEqual(gate["decision"], "blocked")
+                self.assertTrue(any("not independently verified" in error for error in gate["rejected_errors"]))
+            self.assertEqual(g09["verified_gate"], "G09")
 
     def test_scanner_heal_release_bundle_accepts_complete_measured_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

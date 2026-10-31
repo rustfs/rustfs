@@ -18,6 +18,7 @@ use super::*;
 
 pub(super) mod erasure_probe;
 mod mrf_ownership;
+mod pacing;
 use crate::storage_api::VersionPurgeStatusType;
 use crate::{DiskOption, Endpoint, STORAGE_FORMAT_FILE, TierStats, new_disk, storageclass};
 use rustfs_filemeta::{FileInfo, FileMeta, MetadataResolutionParams};
@@ -29,10 +30,13 @@ use std::sync::Mutex;
 
 pub(super) mod checkpoint_fixture;
 pub(super) mod enumeration_restart;
+mod fair_prefix_quantum;
 mod incremental_enumeration;
 mod listing_completion;
 mod metadata_visits;
 mod node_admission;
+#[cfg(feature = "diagnostic-prefix-attribution")]
+mod prefix_attribution_tests;
 mod usage_updates;
 
 /// Reset the process-global alert cooldown map; test-only.
@@ -369,6 +373,7 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         failed_object_paths_seen: HashSet::new(),
         resolved_failed_object_paths: HashSet::new(),
         sleeper: SCANNER_SLEEPER.clone(),
+        pacing_debt: PacingDebt::default(),
         node_admission: None,
         disks: Vec::new(),
         disks_quorum: 0,
@@ -378,6 +383,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         checkpoint_depth: 0,
         checkpoint_objects: 0,
         object_metadata_visits: metrics::Counter::noop(),
+        #[cfg(feature = "diagnostic-prefix-attribution")]
+        prefix_attribution: None,
         last_checkpoint_objects: 0,
         last_checkpoint_at: Instant::now(),
         last_checkpoint_build_time: Duration::ZERO,
@@ -401,6 +408,8 @@ async fn build_test_scanner() -> (FolderScanner, std::path::PathBuf) {
         pending_size_reconciliation_truncated: false,
         list_path_raw_options_observer: None,
         defer_abandoned_entries_until_finished: false,
+        partial_heal_candidate_limit: None,
+        partial_heal_discovery_observer: None,
     };
 
     (scanner, temp_dir)

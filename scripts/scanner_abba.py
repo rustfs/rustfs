@@ -16,6 +16,8 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from scanner_client_trace import analyze as reconcile_client_ledger
+
 SCENARIOS = ("cold-hot", "fresh-hot", "multi-hot-new", "running-heal", "mrf-replay")
 LEGS = ("A1", "B1", "B2", "A2")
 MAX_JSON_BYTES = 1024 * 1024
@@ -111,10 +113,10 @@ def digest(path):
 
 
 def read_json(path):
-    require(path.stat().st_size <= MAX_JSON_BYTES, f"oversized JSON: {path.name}")
+    require(path.stat().st_size <= MAX_JSON_BYTES, "oversized JSON input")
     with path.open() as stream:
         value = json.load(stream)
-    require(isinstance(value, dict), f"expected JSON object: {path.name}")
+    require(isinstance(value, dict), "expected JSON object")
     return value
 
 
@@ -122,6 +124,52 @@ def write_json(path, value):
     data = json.dumps(value, indent=2, allow_nan=False) + "\n"
     require(len(data.encode()) <= MAX_JSON_BYTES, "oversized result")
     path.write_text(data)
+
+
+def measured_provenance_verified(_output):
+    # Collector snapshots and adapter echoes do not yet establish a common
+    # source window or exact client percentiles. Keep acceptance closed until
+    # the original observations can be independently verified.
+    return False
+
+
+def safe_error_message(error):
+    if isinstance(error, subprocess.TimeoutExpired):
+        timeout = error.timeout
+        return f"command timed out after {timeout} seconds" if type(timeout) in (int, float) else "command timed out"
+    if isinstance(error, subprocess.CalledProcessError):
+        return f"command exited with status {error.returncode}" if type(error.returncode) is int else "command failed"
+    if isinstance(error, subprocess.SubprocessError):
+        return type(error).__name__
+    if isinstance(error, OSError):
+        return f"{type(error).__name__}: {os.strerror(error.errno)}" if type(error.errno) is int else type(error).__name__
+    return str(error) or type(error).__name__
+
+
+def add_safe_error_note(error, note, related):
+    error.add_note(note)
+    error._scanner_safe_notes = [*getattr(error, "_scanner_safe_notes", []), note]
+    error._scanner_related_errors = [*getattr(error, "_scanner_related_errors", []), related]
+
+
+def error_chain(error):
+    messages = []
+    seen = set()
+    pending = [error]
+    while pending and len(seen) < 16:
+        error = pending.pop(0)
+        if id(error) in seen:
+            continue
+        seen.add(id(error))
+        parts = [safe_error_message(error), *getattr(error, "_scanner_safe_notes", [])[:4]]
+        messages.extend(part[:2048] for part in parts if part)
+        related = getattr(error, "_scanner_related_errors", [])
+        if isinstance(related, (list, tuple)):
+            pending.extend(item for item in related[:4] if isinstance(item, BaseException))
+        next_error = error.__cause__ or (None if error.__suppress_context__ else error.__context__)
+        if next_error is not None:
+            pending.append(next_error)
+    return "; ".join(messages)
 
 
 def sha(value):
@@ -191,7 +239,7 @@ def release_evidence_exact_strings(value, expected, name):
     missing = sorted(set(expected) - observed)
     require(not missing, f"missing release_evidence.{name}: {', '.join(missing)}")
     unknown = sorted(observed - set(expected))
-    require(not unknown, f"unknown release_evidence.{name}: {', '.join(unknown)}")
+    require(not unknown, f"unknown release_evidence.{name} entries: {len(unknown)}")
     return value
 
 
@@ -330,10 +378,25 @@ class OwnedCommand:
                 time.sleep(min(0.05, remaining))
 
     def _signal_group(self, sig):
+        if self.process.returncode is not None:
+            return False
         try:
             os.killpg(self.process.pid, sig)
             return True
         except ProcessLookupError:
+            return False
+        except PermissionError:
+            if sys.platform != "darwin":
+                raise
+            # Darwin rejects signals to zombie-only groups. The unreaped
+            # session leader reserves this PGID; require its zombie plus no
+            # live members before treating EPERM as completed cleanup.
+            states = subprocess.check_output(["ps", "-axo", "pid=,pgid=,stat="], text=True, timeout=1)
+            group = [(pid, state) for pid, pgid, state in (line.split() for line in states.splitlines())
+                     if pgid == str(self.process.pid)]
+            if not any(pid == str(self.process.pid) and state.startswith("Z") for pid, state in group) \
+                    or any(not state.startswith("Z") for _, state in group):
+                raise
             return False
 
     def finish(self, terminate=False):
@@ -378,7 +441,22 @@ def invoke(adapter, action, request, timeout):
             return result
 
 
-def validate_result(result, request, expected):
+def validate_client_request_samples(result, request, artifact_dir):
+    reference = result.get("client_request_samples")
+    require(isinstance(reference, dict), "missing client request samples")
+    require(artifact_dir is not None, "client request samples require a cell artifact directory")
+    observed = reconcile_client_ledger(Path(artifact_dir), reference, request, result.get("stats"), result.get("cancelled"))
+    require(observed["sample_complete"] is True and observed["offered_load_complete"] is True
+            and observed["p99_ns"] is not None, "client schedule or percentile evidence is incomplete")
+    require(observed["errors"] == 0 and observed["http_503"] == 0, "client request errors or status unavailable")
+    require(result.get("client_observation") == observed, "client observation differs from original ledgers")
+    require(result.get("elapsed_seconds") == observed["elapsed_seconds"], "client request elapsed time mismatch")
+    for key in ("requests", "errors", "p95_ms", "p99_ms", "throughput_ops"):
+        require(result["metrics"][key] == observed[key], f"client request {key} mismatch")
+    return observed
+
+
+def validate_result(result, request, expected, artifact_dir=None):
     require(result.get("evidence") == request["evidence"], "adapter evidence type mismatch")
     require(result.get("fixed") == request["fixed"], "offered load/config/cache/durability drift")
     require(result.get("build") == request["build"], "deployed build provenance mismatch")
@@ -410,6 +488,8 @@ def validate_result(result, request, expected):
         require(metrics["healed_objects"] == request["expected_healed_objects"], "incomplete repair oracle")
         if request["scenario"] in ("running-heal", "mrf-replay"):
             require(metrics["healed_objects"] > 0, "zero completed repairs")
+    if request["evidence"] == "measured":
+        validate_client_request_samples(result, request, artifact_dir)
     return result
 
 
@@ -539,6 +619,18 @@ def convergence(result):
     return ratio(window["walk_objects"], window["full_walk_objects"], "convergence work")
 
 
+def comparison_metrics(cell):
+    metrics = cell["result"]["metrics"].copy()
+    if cell["evidence"] == "measured":
+        observation = cell["result"].get("client_observation")
+        require(isinstance(observation, dict), "missing measured client observation")
+        for percentile in (95, 99):
+            key = f"p{percentile}_ns"
+            require(type(observation.get(key)) is int and observation[key] >= 0, f"invalid measured {key}")
+            metrics[f"p{percentile}_ms"] = Decimal(observation[key]) / Decimal(1_000_000)
+    return metrics
+
+
 def evaluate(cells):
     comparisons = []
     inconclusive = False
@@ -546,14 +638,13 @@ def evaluate(cells):
     for offset in range(0, len(cells), 4):
         group = cells[offset:offset + 4]
         require([cell["leg"] for cell in group] == list(LEGS), "incomplete ABBA group")
-        a1, b1, b2, a2 = (cell["result"]["metrics"] for cell in group)
+        a1, b1, b2, a2 = (comparison_metrics(cell) for cell in group)
         control = group[0]["comparison"] == "background"
         drift = max(abs(relative_change(a2[k], a1[k], k)) for k in ("p99_ms", "throughput_ops"))
         repeat_drift = max(abs(relative_change(b2[k], b1[k], k)) for k in ("p99_ms", "throughput_ops"))
         noise = max(drift, repeat_drift) > REPEATABILITY_LIMIT
         a = {key: (decimal_number(a1[key], key) + decimal_number(a2[key], key)) / Decimal("2") for key in METRICS}
         b = {key: (decimal_number(b1[key], key) + decimal_number(b2[key], key)) / Decimal("2") for key in METRICS}
-        p95 = max(a["p95_ms"], b["p95_ms"])
         p99 = relative_change(b["p99_ms"], a["p99_ms"], "p99_ms")
         throughput = relative_change(b["throughput_ops"], a["throughput_ops"], "throughput_ops")
         thresholds = {"p99_regression": Decimal("0.10") if control else Decimal("0.05"),
@@ -595,8 +686,12 @@ def evaluate(cells):
         comparisons.append({"scenario": group[0]["scenario"], "comparison": group[0]["comparison"],
                             "round": group[0]["round"], "status": "inconclusive" if noise else ("fail" if not passed else "inconclusive" if p2_pending else "pass"),
                             "a2_a1_drift": report_number(drift), "b2_b1_drift": report_number(repeat_drift),
-                            "foreground_p95_ms": float(p95),
-                            "foreground_p99_ms": float(max(a["p99_ms"], b["p99_ms"])),
+                            # Four disjoint legs do not supply one combined percentile.
+                            "foreground_p95_ms": None, "foreground_p99_ms": None,
+                            "foreground_percentiles_ms_by_leg": {
+                                cell["leg"]: {"p95": float(metrics["p95_ms"]), "p99": float(metrics["p99_ms"])}
+                                for cell, metrics in zip(group, (a1, b1, b2, a2))
+                            },
                             "throughput_ops": float(min(a["throughput_ops"], b["throughput_ops"])),
                             "error_rate": float(max(a["errors"] / a["requests"], b["errors"] / b["requests"])),
                             "p99_regression": float(p99), "throughput_change": float(throughput),
@@ -647,8 +742,9 @@ def evaluate(cells):
 def collect_live(prepared, request, request_path, adapter):
     collector = Path(__file__).with_name("run_scanner_validation_harness.sh")
     # Only allow connection fields here; the runner owns cadence and output paths.
-    connection = prepared["collector"]
-    require(set(connection) == {"alias", "endpoint", "metrics_endpoints"}, "invalid collector connection")
+    connection = prepared.get("collector")
+    require(isinstance(connection, dict) and set(connection) == {"alias", "endpoint", "metrics_endpoints"},
+            "invalid collector connection")
     require(all(isinstance(value, str) and value for value in connection.values()), "missing collector endpoint")
     require(os.environ.get("RUSTFS_ACCESS_KEY"), "collector requires RUSTFS_ACCESS_KEY")
     require(os.environ.get("RUSTFS_SECRET_KEY"), "collector requires RUSTFS_SECRET_KEY")
@@ -728,7 +824,7 @@ def run(manifest, adapter, output, data_root):
                         background = "off" if comparison == "background" and leg.startswith("A") else "on"
                         name = f"{scenario}-{comparison}-{round_id}-{leg}"
                         cell_dir = output / name
-                        cell_dir.mkdir()
+                        cell_dir.mkdir(mode=0o700)
                         data_dir = data_root / name
                         data_dir.mkdir()
                         request = {"schema": 1, "scenario": scenario, "comparison": comparison, "round": round_id,
@@ -745,10 +841,11 @@ def run(manifest, adapter, output, data_root):
                         request_path = cell_dir / "request.json"
                         write_json(request_path, request)
                         print(name, flush=True)
+                        primary_error = None
                         try:
                             prepared = invoke(adapter, "prepare", request_path, 300)
                             require(prepared.get("ready") is True, "deployment not ready")
-                            if manifest["evidence"] == "measured":
+                            if manifest["evidence"] != "synthetic":
                                 result = collect_live(prepared, request, request_path, adapter)
                             else:
                                 result = invoke(adapter, "measure", request_path, 300)
@@ -757,26 +854,65 @@ def run(manifest, adapter, output, data_root):
                             require(oracle.get("complete") is True and oracle.get("errors") == 0, "correctness oracle failed")
                             require(type(oracle.get("errors")) is int, "invalid oracle error count")
                             result["oracle"] = oracle["actual"]
-                            validate_result(result, request, request["expected_oracle"])
+                            validate_result(result, request, request["expected_oracle"], cell_dir)
                             cells.append({**request, "result": result})
+                        except BaseException as error:
+                            primary_error = error
+                            raise
                         finally:
-                            stopped = invoke(adapter, "stop", request_path, 300)
-                            require(stopped.get("stopped") is True, "adapter failed to stop deployment")
+                            try:
+                                stopped = invoke(adapter, "stop", request_path, 300)
+                                require(stopped.get("stopped") is True, "adapter failed to stop deployment")
+                            except BaseException as stop_error:
+                                if primary_error is not None:
+                                    if not isinstance(stop_error, Exception):
+                                        add_safe_error_note(stop_error, "prior operation failed", primary_error)
+                                        raise stop_error from None
+                                    if not isinstance(primary_error, Exception):
+                                        prior = primary_error.__cause__ or (
+                                            None if primary_error.__suppress_context__ else primary_error.__context__
+                                        )
+                                        if prior is not None:
+                                            add_safe_error_note(primary_error, "prior operation failed", prior)
+                                        add_safe_error_note(primary_error, "adapter stop failed", stop_error)
+                                        raise primary_error from None
+                                    combined = ValueError(
+                                        f"{safe_error_message(primary_error)}; adapter stop failed: {safe_error_message(stop_error)}"
+                                    )
+                                    combined._scanner_related_errors = [primary_error, stop_error]
+                                    raise combined from primary_error
+                                raise
         status, comparisons = evaluate(cells)
         synthetic = manifest["evidence"] == "synthetic"
+        verified = manifest["evidence"] == "measured" and measured_provenance_verified(output)
+        if not synthetic and not verified:
+            # The adapter currently echoes the release manifest without proving
+            # source windows or client latency samples. Keep results diagnostic
+            # until those observations can be independently verified.
+            for comparison in comparisons:
+                comparison["measurement_provenance"] = "unverified"
+                if comparison["status"] == "pass":
+                    comparison["status"] = "inconclusive"
+            if status == "pass":
+                status = "inconclusive"
         finished_at = datetime.now(timezone.utc).replace(microsecond=0)
         report = {"status": "synthetic_validated" if synthetic and status == "pass" else status,
-                  "evidence": manifest["evidence"], "performance": "pending" if synthetic else status,
+                  "evidence": manifest["evidence"], "performance": "pending" if synthetic or status == "inconclusive" else status,
                   "cells": len(cells), "comparisons": comparisons,
                   "started_at": manifest["started_at"], "finished_at": finished_at.isoformat().replace("+00:00", "Z")}
+        if not synthetic:
+            report["measurement_provenance"] = "verified" if verified else "unverified"
         write_json(output / "report.json", report)
         return 0 if status == "pass" else 3 if status == "inconclusive" else 1
-    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
+    except BaseException as error:
         finished_at = datetime.now(timezone.utc).replace(microsecond=0)
-        write_json(output / "report.json", {"status": "failed", "performance": "pending",
-                                            "completed_cells": len(cells), "error": str(error),
-                                            "started_at": manifest.get("started_at"),
-                                            "finished_at": finished_at.isoformat().replace("+00:00", "Z")})
+        error_text = error_chain(error)
+        report = {"status": "failed", "performance": "pending", "evidence": manifest["evidence"],
+                  "completed_cells": len(cells), "error": error_text, "started_at": manifest.get("started_at"),
+                  "finished_at": finished_at.isoformat().replace("+00:00", "Z")}
+        if manifest["evidence"] != "synthetic":
+            report["measurement_provenance"] = "unverified"
+        write_json(output / "report.json", report)
         raise
 
 
@@ -789,8 +925,11 @@ def main():
     args = parser.parse_args()
     try:
         return run(read_json(args.manifest), args.adapter.resolve(), args.out_dir.resolve(), args.data_root.resolve())
-    except (ValueError, KeyError, OSError, subprocess.SubprocessError) as error:
-        print(f"ERROR: {error}", file=sys.stderr)
+    except KeyboardInterrupt as error:
+        print(f"ERROR: {error_chain(error)}", file=sys.stderr)
+        return 130
+    except Exception as error:
+        print(f"ERROR: {error_chain(error)}", file=sys.stderr)
         return 1
 
 

@@ -3471,16 +3471,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         bind_multipart_proof_snapshot(&disks, &self.multipart_proof_verification_context())?;
 
         let part_path = format!("{}/{}/", upload_id_path, fi.data_dir.unwrap_or(Uuid::nil()));
-        self.recover_part_transactions(&part_path, read_quorum, write_quorum)
-            .await
-            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
-
         let part_meta_paths = uploaded_parts
             .iter()
             .map(|v| format!("{part_path}part.{0}.meta", v.part_num))
             .collect::<Vec<String>>();
 
         let part_numbers = uploaded_parts.iter().map(|v| v.part_num).collect::<Vec<usize>>();
+
+        self.recover_part_transactions(&part_path, read_quorum, write_quorum)
+            .await
+            .map_err(|err| to_object_err(err.into(), vec![bucket, object]))?;
 
         let object_parts = Self::read_parts(&disks, RUSTFS_META_MULTIPART_BUCKET, &part_meta_paths, &part_numbers, read_quorum)
             .await
@@ -4389,6 +4389,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let needs_immediate_heal = rename_commit.needs_immediate_heal();
             let op_old_dir = rename_commit.data_dir;
             let cleanup_disks = rename_commit.cleanup_disks;
+            let old_current_size = rename_commit.old_current_size;
             let committed_file_info = rename_commit.committed_file_info;
 
             if needs_immediate_heal {
@@ -4503,7 +4504,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             drop(_upload_guard.take());
 
-            Ok(ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned))
+            let mut obj_info = ObjectInfo::from_file_info(&fi, &commit_bucket, &commit_object, commit_is_versioned);
+            obj_info.backfilled_old_current_size = old_current_size;
+            Ok(obj_info)
         };
 
         let result = if detach_commit_owner {

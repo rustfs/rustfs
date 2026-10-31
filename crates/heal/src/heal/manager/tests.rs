@@ -28,6 +28,7 @@ use tempfile::TempDir;
 
 pub(super) mod admin_overlap;
 mod admission_timing;
+mod owned_workers;
 mod root_recovery;
 use uuid::Uuid;
 mod auto_scan;
@@ -1386,6 +1387,8 @@ fn mrf_verified_repair_event_requires_positive_exact_identity() {
         durable_anchor: None,
     };
     let matching = HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket".to_string(),
@@ -1537,6 +1540,8 @@ fn unverified_legacy_fixture(bucket: &str) -> (MrfRepairNoticeTarget, crate::hea
         durable_anchor: Some(anchor.clone()),
     };
     let outcome = HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -1731,6 +1736,8 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
     outcome.execution = HealExecutionOutcome::Completed;
     outcome.coverage = crate::heal::outcome::HealTraversalCoverage::Complete;
     outcome.record(HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -1744,6 +1751,8 @@ fn completed_mrf_notice_publishes_only_verified_positive_events() {
         detail: None,
     });
     outcome.record(HealObjectOutcome {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: bucket.to_string(),
@@ -3113,6 +3122,8 @@ async fn local_automatic_query_preserves_source_path_token_and_state() {
                 },
                 disposition: HealObjectDisposition::VerifiedHealthy,
                 detail: None,
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
             });
             snapshot.outcome = Some(Arc::new(outcome));
             snapshot.seqed_items = vec![(
@@ -6608,6 +6619,7 @@ fn admin_bucket_discovery_retries_keep_the_existing_budget() {
 async fn check_node_admission_task_retry(source: HealRequestSource) {
     use crate::heal::outcome::HealFailureClass;
     use crate::heal::storage::ECStoreHealStorage;
+    use crate::heal::storage_api::owner::{PhysicalDiskSample, PhysicalDiskSampler};
     use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
     use rustfs_heal_contracts::heal_channel::HealScanMode;
     use std::num::NonZeroU16;
@@ -6620,6 +6632,18 @@ async fn check_node_admission_task_retry(source: HealRequestSource) {
     env.make_bucket("admission-retry", false).await;
     env.put_object_bytes("admission-retry", "existing", b"repair me".to_vec())
         .await;
+    let mut physical = PhysicalDiskSampler::default();
+    physical.publish(
+        PhysicalDiskSample::collect(&env.ecstore).with_test_single_device(),
+        ResourcePressure::Unknown,
+    );
+    assert!(
+        env.ecstore
+            .physical_heal_plan("existing", &Default::default())
+            .expect("fixture placement")
+            .is_some(),
+        "physical discovery must be ready before testing node capacity"
+    );
     let gate = NodeAdmission::new(NonZeroU16::new(1).expect("one node unit"));
     let storage: Arc<dyn HealStorageAPI> =
         Arc::new(ECStoreHealStorage::new(env.ecstore.clone()).with_admission(Some(gate.clone())));
@@ -6659,6 +6683,10 @@ async fn check_node_admission_task_retry(source: HealRequestSource) {
             pressure: ResourcePressure::Unknown,
             completed_units: None,
         }),
+    );
+    physical.publish(
+        PhysicalDiskSample::collect(&env.ecstore).with_test_single_device(),
+        ResourcePressure::Unknown,
     );
     let retried = HealTask::from_request(retry, storage);
     retried

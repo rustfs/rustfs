@@ -25,7 +25,15 @@ pub(crate) use rustfs_ecstore::api::disk::{
     DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
     RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::disk::{
+    BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
+};
 pub(crate) use rustfs_ecstore::api::disk::{DiskOption as EcstoreDiskOption, new_disk as ecstore_new_disk};
+#[cfg(all(test, not(windows)))]
+pub(crate) use rustfs_ecstore::api::disk::{
+    LocalPublicationPause as EcstoreLocalPublicationPause, LocalPublicationStage as EcstoreLocalPublicationStage,
+};
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::error::PoolMetadataError as EcstorePoolMetadataError;
 pub(crate) use rustfs_ecstore::api::error::{
@@ -57,6 +65,15 @@ pub(crate) use rustfs_ecstore::api::storage::{
 use rustfs_storage_api as storage_contracts;
 
 pub(crate) mod owner {
+    pub(crate) use rustfs_ecstore::api::disk::PhysicalResourcePlan;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::{PhysicalDiskBinding, PhysicalDiskSample, PhysicalDiskSampler};
+    pub(crate) use rustfs_ecstore::api::rpc::with_rpc_background_request as ecstore_with_rpc_background_request;
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
+    pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
+
     #[cfg(test)]
     pub(crate) use super::EcstorePoolMetadataError;
     pub(crate) use super::EcstorePoolMetadataFailure;

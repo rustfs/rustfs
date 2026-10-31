@@ -1798,6 +1798,8 @@ fn object_receipt(
     bucket_incarnation_id: Uuid,
 ) -> HealObjectReceipt {
     HealObjectReceipt {
+        deep_check_observed: false,
+        quorum_selected_data_dir: None,
         identity: HealObjectIdentity {
             kind: HealObjectKind::Object,
             bucket: "bucket-a".to_string(),
@@ -1814,16 +1816,12 @@ fn object_receipt(
 #[tokio::test]
 async fn object_heal_records_matching_positive_storage_receipt() {
     let incarnation = Uuid::new_v4();
+    let generation = Uuid::new_v4();
+    let mut receipt = object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired, incarnation);
+    receipt.quorum_selected_data_dir = Some(generation);
+    receipt.deep_check_observed = true;
     let storage = Arc::new(MockStorage {
-        heal_object_receipts: Mutex::new(HashMap::from([(
-            "object-a".to_string(),
-            VecDeque::from([object_receipt(
-                "object-a",
-                Some("version-a"),
-                HealObjectDisposition::Repaired,
-                incarnation,
-            )]),
-        )])),
+        heal_object_receipts: Mutex::new(HashMap::from([("object-a".to_string(), VecDeque::from([receipt]))])),
         bucket_incarnation_id: Mutex::new(Some(incarnation)),
         ..Default::default()
     });
@@ -1842,6 +1840,52 @@ async fn object_heal_records_matching_positive_storage_receipt() {
     assert_eq!(object.identity.version_id.as_deref(), Some("version-a"));
     assert!(object.identity.bucket_incarnation_id.is_some());
     assert_eq!(object.disposition, HealObjectDisposition::Repaired);
+    assert_eq!(object.quorum_selected_data_dir, Some(generation));
+    assert!(object.deep_check_observed);
+}
+
+#[tokio::test]
+async fn metadata_or_absence_receipts_do_not_carry_deep_observation() {
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    for disposition in [
+        HealObjectDisposition::MetadataHealthy,
+        HealObjectDisposition::AuthoritativelyAbsent,
+    ] {
+        let mut receipt = object_receipt("object-a", None, disposition, Uuid::new_v4());
+        receipt.deep_check_observed = true;
+        let expected = receipt.identity.clone();
+        assert!(task.record_verified_storage_receipt(&expected, Some(receipt)).await);
+        let outcome = task.get_outcome().await;
+        assert!(
+            !outcome
+                .objects
+                .back()
+                .expect("receipt should be recorded")
+                .deep_check_observed
+        );
+    }
+}
+
+#[tokio::test]
+async fn missing_or_nil_storage_generation_stays_unknown_in_recorded_outcome() {
+    let task = HealTask::from_request(
+        HealRequest::object("bucket-a".to_string(), "object-a".to_string(), None),
+        Arc::new(MockStorage::default()),
+    );
+    for generation in [None, Some(Uuid::nil())] {
+        let mut receipt = object_receipt("object-a", None, HealObjectDisposition::VerifiedHealthy, Uuid::new_v4());
+        receipt.quorum_selected_data_dir = generation;
+        receipt.deep_check_observed = true;
+        let expected = receipt.identity.clone();
+        assert!(task.record_verified_storage_receipt(&expected, Some(receipt)).await);
+        let outcome = task.get_outcome().await;
+        let object = outcome.objects.back().expect("receipt should be recorded");
+        assert_eq!(object.quorum_selected_data_dir, None);
+        assert!(!object.deep_check_observed);
+    }
 }
 
 #[tokio::test]
@@ -1892,17 +1936,9 @@ async fn cancelled_object_heal_rejects_matching_positive_storage_receipt() {
         pool_index: None,
         set_index: None,
     };
-    let accepted = task
-        .record_verified_storage_receipt(
-            &expected,
-            Some(object_receipt(
-                "object-a",
-                Some("version-a"),
-                HealObjectDisposition::Repaired,
-                incarnation,
-            )),
-        )
-        .await;
+    let mut receipt = object_receipt("object-a", Some("version-a"), HealObjectDisposition::Repaired, incarnation);
+    receipt.deep_check_observed = true;
+    let accepted = task.record_verified_storage_receipt(&expected, Some(receipt)).await;
 
     let outcome = task.get_outcome().await;
     assert!(!accepted);
@@ -4710,6 +4746,8 @@ async fn mrf_recreate_missing_object_records_exact_absence_receipt_with_scope() 
         heal_object_receipts: Mutex::new(HashMap::from([(
             "deleted.bin".to_string(),
             VecDeque::from([HealObjectReceipt {
+                deep_check_observed: false,
+                quorum_selected_data_dir: None,
                 identity: HealObjectIdentity {
                     kind: HealObjectKind::Object,
                     bucket: "bucket-a".to_string(),
@@ -5576,4 +5614,141 @@ async fn resumable_erasure_set_execution_is_cancelled_while_object_heal_is_pendi
     assert!(matches!(result, Err(Error::TaskCancelled)));
     assert!(storage.bucket_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
     assert!(storage.object_heal_opts.lock().unwrap().iter().all(|opts| opts.no_lock));
+}
+
+#[tokio::test]
+async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_persistence() {
+    let directory = TempDir::new().expect("survivor root");
+    let disk = make_resume_disk(&directory).await;
+    let identity = replacement_identity("replacement-a", "device-a", "mount-a");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), vec![identity.clone()]);
+    let ownership = Arc::downgrade(&execution);
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let storage = Arc::new(MockStorage {
+        replacement_target_identities_ready: Mutex::new(true),
+        replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
+        replacement_execution_fixture: Mutex::new(Some(execution)),
+        replacement_format_barrier: Some((entered.clone(), release.clone())),
+        resume_disk: Mutex::new(Some(disk.clone())),
+        ..Default::default()
+    });
+    let mut request = directory_backed_replacement_request();
+    request.heal_endpoints = vec!["replacement-a".to_string()];
+    let task = Arc::new(HealTask::from_request(request, storage.clone()));
+    let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(storage.clone(), None));
+    let parent = manager.test_work_parent();
+    let waiter = tokio::spawn({
+        let task = task.clone();
+        async move { task.execute_owned(Some(parent)).await }
+    });
+    entered.notified().await;
+    waiter.abort();
+    assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
+    task.cancel_token.cancel();
+    assert!(ownership.upgrade().is_some(), "issued format I/O still owns execution");
+    let stopping = manager.clone();
+    let mut first_stop = tokio::spawn(async move { stopping.stop().await });
+    let first_pending = tokio::time::timeout(Duration::from_millis(30), &mut first_stop)
+        .await
+        .is_err();
+    first_stop.abort();
+    let first_cancelled = first_stop.await.is_err_and(|error| error.is_cancelled());
+    let stopping = manager.clone();
+    let mut retry = tokio::spawn(async move { stopping.stop().await });
+    let retry_pending = tokio::time::timeout(Duration::from_millis(30), &mut retry).await.is_err();
+    // Release actual owned work before the assertions/temporary disk cleanup.
+    release.notify_one();
+    let drained = tokio::time::timeout(Duration::from_secs(5), retry).await;
+    assert!(first_pending && first_cancelled && retry_pending);
+    drained
+        .expect("same owned executor drains")
+        .expect("stop waiter joins")
+        .expect("normal owned completion");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while ownership.upgrade().is_some() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("executor drains after storage completes");
+    let state = ResumeManager::load_replacement_intent(disk, &task.id)
+        .await
+        .expect("failure state")
+        .get_state()
+        .await;
+    assert!(
+        state.error_message.as_deref().is_some_and(|error| error.contains("cancel")),
+        "{:?}",
+        state.error_message
+    );
+    assert!(!task.replacement_is_running());
+    assert!(storage.bucket_heal_calls.lock().unwrap().is_empty());
+    assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replacement_owned_mutation_registers_after_handoff_and_survives_cancelled_waiters() {
+    let manager = Arc::new(crate::HealManager::new_without_root_recovery_for_test(
+        Arc::new(MockStorage::default()),
+        None,
+    ));
+    let parent = manager.test_work_parent();
+    let stopping = manager.clone();
+    let mut first = tokio::spawn(async move { stopping.stop().await });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !manager.stop_handoff_completed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("manager closed new admission while the accepted parent remains live");
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
+    let ownership = Arc::downgrade(&execution);
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+    let waiter = tokio::spawn(async move {
+        execution
+            .run_owned(&parent, async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = finished_tx.send(());
+            })
+            .await
+    });
+    entered_rx.await.expect("accepted descendant starts after tracker closure");
+    waiter.abort();
+    let waiter_cancelled = waiter.await.is_err_and(|error| error.is_cancelled());
+    let first_pending = tokio::time::timeout(Duration::from_millis(30), &mut first).await.is_err();
+    first.abort();
+    let first_cancelled = first.await.is_err_and(|error| error.is_cancelled());
+    let stopping = manager.clone();
+    let mut retry = tokio::spawn(async move { stopping.stop().await });
+    let retry_pending = tokio::time::timeout(Duration::from_millis(30), &mut retry).await.is_err();
+    let retained = ownership.upgrade().is_some();
+    let _ = release_tx.send(());
+    let drained = tokio::time::timeout(Duration::from_secs(5), retry).await;
+    let finished = finished_rx.await.is_ok();
+    assert!(waiter_cancelled && first_pending && first_cancelled && retry_pending && retained && finished);
+    drained
+        .expect("actual mutation finishes")
+        .expect("repeat waiter joins")
+        .expect("same manager owner drains");
+    assert!(ownership.upgrade().is_none());
+    manager.stop().await.expect("repeat successful receipt remains successful");
+}
+
+#[tokio::test]
+async fn replacement_owned_mutation_panic_keeps_manager_join_failed() {
+    let manager = crate::HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage::default()), None);
+    let parent = manager.test_work_parent();
+    let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
+    let result = execution
+        .run_owned::<()>(&parent, async { panic!("owned replacement mutation panic") })
+        .await;
+    drop(parent);
+    assert!(result.is_err());
+    assert!(manager.stop().await.is_err(), "actual child panic must fail the manager owner");
+    assert!(manager.stop().await.is_err(), "repeat drain cannot erase the child panic");
 }

@@ -230,7 +230,10 @@ pub(crate) use self::on_demand_migration_put::*;
 #[cfg(test)]
 pub(crate) use self::put::PollCountingBody;
 use self::put::*;
-pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout, reject_oversize_single_upload};
+pub(crate) use self::put::{
+    guard_put_object_body_read_timeout, previous_current_size_from_backfill, put_object_body_read_timeout,
+    reject_oversize_single_upload,
+};
 #[cfg(test)]
 pub(crate) use self::restore::RestoreStatusCommitBarrier;
 pub(crate) use self::shared::*;

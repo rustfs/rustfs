@@ -458,8 +458,8 @@ pub(crate) mod utils;
 
 use peer::init_local_peer;
 pub use peer::{
-    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, get_disk_infos, init_local_disks,
-    init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
+    BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,
+    get_disk_infos, init_local_disks, init_local_disks_with_instance_ctx, init_lock_clients, prewarm_local_disk_id_map,
     prewarm_local_disk_id_map_with_instance_ctx,
 };
 
@@ -496,6 +496,17 @@ pub struct ECStore {
     /// Memoizes bucket-incarnation validation under continuous lifecycle
     /// read-lock coverage (see [`bucket_fence`]).
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
+}
+
+impl Drop for ECStore {
+    /// Clear the instance context's `BucketMetadataSys` when its backing store
+    /// is dropped. Without this, the shared bootstrap context retains a
+    /// `BucketMetadataSys` whose `Weak<ECStore>` is dangling after the store
+    /// goes away (e.g. between sequential test fixtures that share the
+    /// bootstrap), and the next `object_store()` call panics.
+    fn drop(&mut self) {
+        self.ctx.clear_bucket_metadata_sys_if_stale();
+    }
 }
 
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
@@ -1388,6 +1399,18 @@ impl crate::storage_api_contracts::object::ObjectIO for ECStore {
 }
 
 impl ECStore {
+    pub(crate) fn all_disks_local_and_online(&self) -> bool {
+        !self.disk_map.is_empty()
+            && self.disk_map.values().all(|disks| {
+                !disks.is_empty()
+                    && disks.iter().all(|disk| {
+                        disk.as_ref().is_some_and(|d| {
+                            d.is_local() && d.runtime_state() == crate::disk::health_state::RuntimeDriveHealthState::Online
+                        })
+                    })
+            })
+    }
+
     /// `put_object` plus the rename_data old-size backfill
     /// (rustfs/backlog#1009); see `SetDisks::put_object_with_old_current_size`.
     /// Post-write hooks (immediate ILM transition enqueue, list-cache
@@ -1400,16 +1423,33 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
-        let result = match self.handle_put_object(bucket, object, data, opts).await {
-            Ok((object_info, old_current_size)) => {
-                enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, opts)
-                    .await
-                    .map(|object_info| (object_info, old_current_size))
-            }
-            Err(err) => Err(err),
-        };
+        let result = self.handle_put_object(bucket, object, data, opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
+        }
+        result
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn copy_object_with_old_current_size(
+        &self,
+        src_bucket: &str,
+        src_object: &str,
+        dst_bucket: &str,
+        dst_object: &str,
+        src_info: &mut ObjectInfo,
+        src_opts: &ObjectOptions,
+        dst_opts: &ObjectOptions,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        let (oi, old_current_size) = box_copy_object_handler(move || {
+            self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+        })
+        .await?;
+        let result = enqueue_transition_after_write(self, Ok(oi), LcEventSrc::S3CopyObject, dst_opts)
+            .await
+            .map(|oi| (oi, old_current_size));
+        if result.is_ok() {
+            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
         }
         result
     }
@@ -1490,20 +1530,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for ECStore {
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self,
-            box_copy_object_handler(move || {
-                self.handle_copy_object(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
-            })
-            .await,
-            LcEventSrc::S3CopyObject,
-            dst_opts,
-        )
-        .await;
-        if result.is_ok() {
-            list_objects::observe_scanner_namespace_mutations(dst_bucket, 1);
-        }
-        result
+        self.copy_object_with_old_current_size(src_bucket, src_object, dst_bucket, dst_object, src_info, src_opts, dst_opts)
+            .await
+            .map(|(oi, _)| oi)
     }
 
     #[instrument(skip(self))]
@@ -1763,15 +1792,10 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for ECStore {
         uploaded_parts: Vec<CompletePart>,
         opts: &ObjectOptions,
     ) -> Result<ObjectInfo> {
-        let result = enqueue_transition_after_write(
-            self.as_ref(),
-            self.clone()
-                .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
-                .await,
-            LcEventSrc::S3CompleteMultipartUpload,
-            opts,
-        )
-        .await;
+        let result = self
+            .clone()
+            .handle_complete_multipart_upload(bucket, object, upload_id, uploaded_parts, opts)
+            .await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }

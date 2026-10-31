@@ -5340,6 +5340,203 @@ mod tests {
         shutdown.cancel();
     }
 
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn conditional_multipart_must_not_commit_against_an_older_readable_pool() {
+        use crate::storage_api_contracts::multipart::CompletePart;
+        use crate::storage_api_contracts::object::HTTPPreconditions;
+
+        let temp_dir = tempfile::tempdir().expect("create conditional multipart test directory");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "conditional-mpu-unreadable", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("conditional-mpu-{}", uuid::Uuid::new_v4().simple());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create conditional multipart test bucket");
+        let mut old_body = PutObjReader::from_vec(b"older-pool".to_vec());
+        let old = store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut old_body,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write old object to staging pool");
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create multipart upload in pool 0");
+        let mut part_body = PutObjReader::from_vec(b"stale-writer".to_vec());
+        let part = store.pools[0]
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut part_body, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part in pool 0");
+        let mut new_body = PutObjReader::from_vec(b"newer-pool".to_vec());
+        let new = store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut new_body,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write newer object to pool 1");
+        let old_etag = old.etag.clone().expect("old object must have an ETag");
+        let before = store.get_object_info(&bucket, object, &ObjectOptions::default()).await;
+
+        let mut metadata = Vec::new();
+        for disk_index in 0..4 {
+            let path = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/xl.meta"));
+            let original = tokio::fs::read(&path)
+                .await
+                .expect("save original object metadata before fault injection");
+            metadata.push((path, original));
+        }
+        let mut fault_error = None;
+        for (path, _) in &metadata {
+            if let Err(err) = tokio::fs::write(path, b"invalid object metadata").await {
+                fault_error = Some(err);
+                break;
+            }
+        }
+        let mut fault_contents = Vec::new();
+        if fault_error.is_none() {
+            for (path, _) in &metadata {
+                fault_contents.push(tokio::fs::read(path).await);
+            }
+            store.pools[1]
+                .get_disks_by_key(object)
+                .invalidate_get_object_metadata_cache(&bucket, object)
+                .await;
+        }
+        let unreadable = if fault_error.is_none() {
+            Some(
+                store.pools[1]
+                    .get_object_info(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            suppress_read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+        let completed = if fault_error.is_none() {
+            let completion_store = Arc::clone(&store);
+            let completion_bucket = bucket.clone();
+            let upload_id = upload.upload_id.clone();
+            let part_etag = part.etag.clone();
+            Some(
+                tokio::spawn(async move {
+                    completion_store
+                        .complete_multipart_upload(
+                            &completion_bucket,
+                            object,
+                            &upload_id,
+                            vec![CompletePart {
+                                part_num: 1,
+                                etag: part_etag,
+                                ..Default::default()
+                            }],
+                            &ObjectOptions {
+                                http_preconditions: Some(HTTPPreconditions {
+                                    if_match: Some(old_etag),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        let mut restore_error = None;
+        for (path, original) in &metadata {
+            if let Err(err) = tokio::fs::write(path, original).await {
+                restore_error = Some(err);
+            }
+        }
+        store.pools[1]
+            .get_disks_by_key(object)
+            .invalidate_get_object_metadata_cache(&bucket, object)
+            .await;
+        let after = store.get_object_info(&bucket, object, &ObjectOptions::default()).await;
+        let recovered_body = match store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(mut reader) => {
+                let mut body = Vec::new();
+                let result = reader
+                    .read_to_end(&mut body)
+                    .await
+                    .map(|_| body)
+                    .map_err(|err| err.to_string());
+                drop(reader);
+                result
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        let parts = store
+            .list_object_parts(&bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+            .await;
+        shutdown.cancel();
+
+        assert!(fault_error.is_none(), "failed to inject metadata fault: {fault_error:?}");
+        assert!(restore_error.is_none(), "failed to restore metadata: {restore_error:?}");
+        assert_eq!(fault_contents.len(), 4, "all four pool 1 metadata files must be inspected");
+        for observed in fault_contents {
+            assert_eq!(
+                observed.expect("read injected metadata"),
+                b"invalid object metadata",
+                "each pool 1 metadata file must contain the injected corruption"
+            );
+        }
+        assert_eq!(before.expect("latest object before fault").etag, new.etag);
+        assert_ne!(old.etag, new.etag, "fixture bodies must produce different ETags");
+        let read_error = unreadable
+            .expect("metadata fault should have been injected")
+            .expect_err("the newer pool must fail its object metadata read during the fault");
+        assert!(
+            !crate::error::is_err_object_not_found(&read_error) && !crate::error::is_err_version_not_found(&read_error),
+            "corrupt metadata must produce a non-not-found read error: {read_error:?}"
+        );
+        let completed = completed
+            .expect("completion should have been attempted")
+            .expect("completion task should not panic");
+        let Err(completion_error) = completed else {
+            panic!("stale If-Match must not commit while the newer object's metadata is unreadable");
+        };
+        assert_eq!(completion_error, read_error, "completion must propagate the unreadable pool's error");
+        assert_eq!(after.expect("newer object after recovery").etag, new.etag);
+        assert_eq!(recovered_body.expect("newer body after recovery"), b"newer-pool");
+        let parts = parts.expect("failed completion must leave the upload retryable");
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag, part.etag);
+    }
+
     async fn migrate_versioned_decommission_test_object(
         store: &Arc<crate::store::ECStore>,
         bucket: &str,

@@ -10362,7 +10362,7 @@ fn post_lease_activity_proof_rejects_a_peer_whose_dirty_usage_moved_before_lease
         (LOCAL_SCANNER_ACTIVITY_NODE.to_string(), scanner_node_activity("local", 5, 2)),
         ("node-2".to_string(), scanner_node_activity("epoch-a", 7, 3)),
     ]);
-    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(before.clone())), None);
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(before.clone()), None), None);
 
     // Local generation movement in the lease window is the next cycle's
     // work: its buckets stay in the dirty map and the walk remains certified.
@@ -10373,7 +10373,7 @@ fn post_lease_activity_proof_rejects_a_peer_whose_dirty_usage_moved_before_lease
     local.namespace_generation += 1;
     local.dirty_usage_generation += 1;
     local.dirty_usage_pending = true;
-    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(local_shaded)), None);
+    assert_eq!(scanner_post_lease_activity_defer_reason(Some(&before), Ok(local_shaded), None), None);
 
     // A peer PUT tail that drained before the lease leaves the movement
     // generation accepted by the lease unchanged, but the peer's dirty state
@@ -10387,14 +10387,14 @@ fn post_lease_activity_proof_rejects_a_peer_whose_dirty_usage_moved_before_lease
         "the existing movement-only lease remains valid after a PUT tail drains"
     );
     assert!(scanner_activity_allows_usage_publication(&after));
-    let reason = scanner_post_lease_activity_defer_reason(Some(&before), Ok(after));
+    let reason = scanner_post_lease_activity_defer_reason(Some(&before), Ok(after), None);
     assert_eq!(reason, Some(ScannerCycleDeferReason::ActivityBaselineUnavailable));
 
     // A guardrail field moving in the window still defers.
     let mut moved = before.clone();
     moved.get_mut("node-2").expect("peer should be present").movement_generation += 1;
     assert_eq!(
-        scanner_post_lease_activity_defer_reason(Some(&before), Ok(moved)),
+        scanner_post_lease_activity_defer_reason(Some(&before), Ok(moved), None),
         Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
     );
 
@@ -10489,7 +10489,7 @@ fn post_lease_activity_proof_requires_a_complete_matching_baseline() {
         (Some(&blocked), Ok(blocked.clone())),
     ] {
         assert_eq!(
-            scanner_post_lease_activity_defer_reason(expected, observed),
+            scanner_post_lease_activity_defer_reason(expected, observed, None),
             Some(ScannerCycleDeferReason::ActivityBaselineUnavailable)
         );
     }

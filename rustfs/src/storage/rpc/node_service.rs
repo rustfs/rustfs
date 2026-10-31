@@ -21,12 +21,13 @@ use crate::server::MODULE_SWITCHES_SIGNAL_SUBSYSTEM;
 use crate::storage::storage_api::ecstore_tier::tier_mutation_peer::{self, TierMutationPeerState as EcTierMutationPeerState};
 use crate::storage::storage_api::rpc_consumer::node_service::STORAGE_CLASS_SUB_SYS;
 #[cfg(test)]
-use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType};
+use crate::storage::storage_api::rpc_consumer::node_service::{CollectMetricsOpts, MetricType, find_local_disk_by_ref};
 use crate::storage::storage_api::rpc_consumer::node_service::{
     DiskStore, ECStore, Error, KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS,
-    SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION,
-    SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _,
-    StorageResult, all_local_disk_path, find_local_disk_by_ref, reload_transition_tier_config,
+    RemoteBackgroundIo, SCANNER_ACTIVITY_LEGACY_PROTOCOL_VERSION, SCANNER_ACTIVITY_PREVIOUS_PROTOCOL_VERSION,
+    SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_PUBLICATION_LEASE_TTL_MS, SERVICE_SIGNAL_REFRESH_CONFIG,
+    SERVICE_SIGNAL_RELOAD_DYNAMIC, StorageDiskRpcExt as _, StorageResult, all_local_disk_path, find_local_disk_by_ref_for_rpc,
+    reload_transition_tier_config, with_remote_background_io,
 };
 use crate::storage::storage_api::runtime_sources_consumer::{EndpointServerPools, ServerContextSlot, runtime_sources};
 use crate::storage::storage_api::{
@@ -1339,8 +1340,10 @@ impl NodeService {
         runtime_sources::current_object_store_handle_for_context(context.as_deref())
     }
 
-    async fn find_disk(&self, disk_path: &str) -> Option<DiskStore> {
-        find_local_disk_by_ref(disk_path).await
+    async fn find_disk(&self, disk_path: &str) -> Result<Option<DiskStore>, Status> {
+        find_local_disk_by_ref_for_rpc(disk_path)
+            .await
+            .map_err(|_| Status::resource_exhausted("background storage admission deferred"))
     }
 
     async fn all_disk(&self) -> Vec<String> {
@@ -1398,8 +1401,13 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
                 .zip(&request.entries)
                 .map(|(guard, entry)| (guard, entry.generation))
                 .collect::<Vec<_>>();
-            rustfs_scanner::acknowledge_scoped_dirty_usage(&request.instance_id, &entries, request.probe_only)
-                .map_err(|err| Status::failed_precondition(err.to_string()))
+            #[cfg(feature = "e2e-test-hooks")]
+            observe_scoped_dirty_usage_ack("ack_before_apply", &request, None).await?;
+            let cleared = rustfs_scanner::acknowledge_scoped_dirty_usage(&request.instance_id, &entries, request.probe_only)
+                .map_err(|err| Status::failed_precondition(err.to_string()))?;
+            #[cfg(feature = "e2e-test-hooks")]
+            observe_scoped_dirty_usage_ack("ack_after_apply", &request, Some(cleared)).await?;
+            Ok::<_, Status>(cleared)
         })
         .await
         .map_err(|_| Status::deadline_exceeded("scoped dirty usage incarnation validation timed out"))??;
@@ -1420,6 +1428,44 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
             .into();
         Ok(Response::new(response))
     }
+}
+
+/// Capture the real compare-and-remove boundary while the production
+/// incarnation fences are still held. Capability probes never pause here.
+#[cfg(feature = "e2e-test-hooks")]
+async fn observe_scoped_dirty_usage_ack(
+    stage: &str,
+    request: &ScannerScopedDirtyUsageAckRequest,
+    cleared: Option<u64>,
+) -> Result<(), Status> {
+    if request.probe_only {
+        return Ok(());
+    }
+    let dirty =
+        rustfs_scanner::scanner_dirty_usage_snapshot(rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_ENTRIES as usize);
+    let detail = serde_json::json!({
+        "owner_id": request.owner_id,
+        "instance_id": request.instance_id,
+        "probe_only": request.probe_only,
+        "entries": request.entries.iter().map(|entry| serde_json::json!({
+            "bucket": entry.bucket,
+            "bucket_incarnation": Uuid::from_slice(entry.bucket_incarnation.as_ref()).ok().map(|value| value.to_string()),
+            "generation": entry.generation,
+        })).collect::<Vec<_>>(),
+        "cleared": cleared,
+        "dirty_snapshot": {
+            "generation": dirty.generation,
+            "pending_bucket_count": dirty.pending_bucket_count,
+            "complete": dirty.complete,
+            "buckets": dirty.buckets.iter().map(|bucket| serde_json::json!({
+                "bucket": bucket.bucket,
+                "generation": bucket.generation,
+            })).collect::<Vec<_>>(),
+        },
+    });
+    rustfs_scanner::e2e_barrier::checkpoint(stage, detail)
+        .await
+        .map_err(|error| Status::internal(format!("scoped dirty usage test barrier failed: {error}")))
 }
 
 #[tonic::async_trait]
@@ -1602,7 +1648,7 @@ impl Node for NodeService {
     async fn walk_dir(&self, request: Request<WalkDirRequest>) -> Result<Response<Self::WalkDirStream>, Status> {
         let request = request.into_inner();
         let (tx, rx) = mpsc::channel(128);
-        if let Some(disk) = self.find_disk(&request.disk).await {
+        if let Some(disk) = self.find_disk(&request.disk).await? {
             let mut buf = Deserializer::new(Cursor::new(request.walk_dir_options));
             let opts = match Deserialize::deserialize(&mut buf) {
                 Ok(options) => options,
@@ -1610,10 +1656,12 @@ impl Node for NodeService {
                     return Err(Status::invalid_argument("invalid WalkDirOptions"));
                 }
             };
-            spawn(async {
+            let resource_context = RemoteBackgroundIo::take_current();
+            spawn(async move {
                 let (rd, mut wr) = tokio::io::duplex(64);
-                let job1 = spawn(async move {
+                let job1 = spawn(with_remote_background_io(resource_context, async move {
                     if let Err(err) = disk.walk_dir(opts, &mut wr).await {
+                        RemoteBackgroundIo::discard_current_progress();
                         error!(
                             component = LOG_COMPONENT_STORAGE,
                             subsystem = LOG_SUBSYSTEM_RPC,
@@ -1622,7 +1670,7 @@ impl Node for NodeService {
                             "walk_dir RPC failed"
                         );
                     }
-                });
+                }));
                 let job2 = spawn(async move {
                     let mut reader = MetacacheReader::new(rd);
 
@@ -7507,6 +7555,7 @@ mod tests {
         let disk = service
             .find_disk(&configured.endpoint().to_string())
             .await
+            .expect("RPC admission")
             .expect("RPC target disk");
         let volume = "evidence-rpc";
         disk.make_volume(volume).await.expect("create evidence bucket");
@@ -7561,6 +7610,7 @@ mod tests {
         let disk = service
             .find_disk(&configured.endpoint().to_string())
             .await
+            .expect("RPC admission")
             .expect("RPC target disk");
         let volume = "orphan-rpc";
         disk.make_volume(volume).await.expect("create orphan bucket");
@@ -7813,6 +7863,7 @@ mod tests {
         let local = service
             .find_disk(&remote_endpoint.to_string())
             .await
+            .expect("RPC admission")
             .expect("registered production local disk");
         let bucket = "guarded-delete-rpc";
         local.make_volume(bucket).await.expect("create guarded fixture volume");
@@ -7998,6 +8049,7 @@ mod tests {
         let survivor = service
             .find_disk(&survivor_endpoint.to_string())
             .await
+            .expect("RPC admission")
             .expect("registered survivor disk");
         if let Err(error) = survivor
             .make_volume(crate::storage::storage_api::ecstore_disk::RUSTFS_META_BUCKET)
@@ -8008,6 +8060,7 @@ mod tests {
         let replacement = service
             .find_disk(&endpoints[1].to_string())
             .await
+            .expect("RPC admission")
             .expect("registered replacement disk");
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -8545,7 +8598,13 @@ mod tests {
         let service = make_server_for_context(Some(fixture.context.clone()));
         let mut local_disks = Vec::new();
         for endpoint in &endpoints {
-            local_disks.push(service.find_disk(&endpoint.to_string()).await.expect("registered disk"));
+            local_disks.push(
+                service
+                    .find_disk(&endpoint.to_string())
+                    .await
+                    .expect("RPC admission")
+                    .expect("registered disk"),
+            );
         }
         let (shutdown, stopped) = tokio::sync::oneshot::channel();
         let server = tokio::spawn(async move {
@@ -11828,7 +11887,7 @@ mod tests {
     #[tokio::test]
     async fn test_find_disk_method() {
         let service = create_test_node_service();
-        let disk = service.find_disk("non-existent-disk").await;
+        let disk = service.find_disk("non-existent-disk").await.expect("RPC admission");
         // Should return None for non-existent disk
         assert!(disk.is_none());
     }

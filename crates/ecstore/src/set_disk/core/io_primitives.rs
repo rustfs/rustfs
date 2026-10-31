@@ -1288,7 +1288,7 @@ async fn try_create_bitrot_readers_via_batch_pread(
     // parity readers unopened; preading them here would discard their bytes
     // when fill_deferred_bitrot_readers installs stripe-aligned reserves.
     let data_first = strategy != BitrotReaderSetupStrategy::AllShards
-        && crate::erasure::coding::decode::get_lockstep_data_shards_only_enabled();
+        && crate::erasure::coding::decode::get_lockstep_data_shards_only_with_deferred_parity_enabled();
     let mut setup = BitrotReaderSetup::new(disks.len());
     for (idx, disk) in disks.iter().enumerate() {
         if disk.is_none() {
@@ -2549,6 +2549,8 @@ pub(in crate::set_disk) struct RenameTailCleanup {
 pub(in crate::set_disk) struct RenameTailOutcome {
     pub(in crate::set_disk) convergence: RenameConvergence,
     pub(in crate::set_disk) cleanup: Vec<RenameTailCleanup>,
+    pub(in crate::set_disk) old_current_source_all_successful_checked: bool,
+    pub(in crate::set_disk) all_online_local_succeeded: bool,
 }
 
 const RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP_ENV: &str = "RUSTFS_PUT_RENAME_TAIL_CLEANUP_COUNTERFACTUAL_SKIP";
@@ -3572,7 +3574,7 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     Guards: Send + 'static,
     Finalize: FnOnce() -> FinalizeFuture + Send,
     FinalizeFuture: Future<Output = ()> + Send,
-    Cleanup: FnOnce(Guards, Vec<RenameTailCleanup>) -> CleanupFuture + Send,
+    Cleanup: FnOnce(Guards, Vec<RenameTailCleanup>, bool, bool) -> CleanupFuture + Send,
     CleanupFuture: Future<Output = ()> + Send,
     Cleanup: 'static,
     CleanupFuture: 'static,
@@ -3580,34 +3582,41 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
     SubmitFuture: Future<Output = ()> + Send,
 {
     let tail_async_started = rustfs_io_metrics::put_stage_timer();
-    let (needs_heal, tail_cleanup, tail_complete) = match tail_drain.await {
-        Ok(Some(outcome)) => (outcome.convergence.needs_heal(), outcome.cleanup, true),
-        Ok(None) => {
-            warn!(
-                event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                state = "missing_convergence",
-                bucket = %request.bucket,
-                object = request.object_prefix.as_deref().unwrap_or_default(),
-                "committed rename tail drain completed without convergence"
-            );
-            (true, Vec::new(), false)
-        }
-        Err(err) => {
-            warn!(
-                event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_SET_DISK,
-                state = "failed",
-                bucket = %request.bucket,
-                object = request.object_prefix.as_deref().unwrap_or_default(),
-                error = %err,
-                "rename tail drain failed"
-            );
-            (true, Vec::new(), false)
-        }
-    };
+    let (needs_heal, tail_cleanup, tail_complete, old_current_source_all_successful_checked, all_online_local_succeeded) =
+        match tail_drain.await {
+            Ok(Some(outcome)) => (
+                outcome.convergence.needs_heal(),
+                outcome.cleanup,
+                true,
+                outcome.old_current_source_all_successful_checked,
+                outcome.all_online_local_succeeded,
+            ),
+            Ok(None) => {
+                warn!(
+                    event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "missing_convergence",
+                    bucket = %request.bucket,
+                    object = request.object_prefix.as_deref().unwrap_or_default(),
+                    "committed rename tail drain completed without convergence"
+                );
+                (true, Vec::new(), false, false, false)
+            }
+            Err(err) => {
+                warn!(
+                    event = EVENT_SET_DISK_RENAME_TAIL_DRAIN_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    state = "failed",
+                    bucket = %request.bucket,
+                    object = request.object_prefix.as_deref().unwrap_or_default(),
+                    error = %err,
+                    "rename tail drain failed"
+                );
+                (true, Vec::new(), false, false, false)
+            }
+        };
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_ASYNC_WAIT,
         tail_async_started,
@@ -3651,7 +3660,12 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
             let job = RenameTailCleanupJob {
                 enqueued_at: Instant::now(),
                 targets,
-                future: Box::pin(cleanup(guards, tail_cleanup)),
+                future: Box::pin(cleanup(
+                    guards,
+                    tail_cleanup,
+                    old_current_source_all_successful_checked,
+                    all_online_local_succeeded,
+                )),
             };
             if let Err(job) = rename_tail_cleanup_queue().try_enqueue(job).await {
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -3676,7 +3690,13 @@ pub(in crate::set_disk) async fn finish_rename_tail_heal<
                 cleanup_submit_started,
             );
             let cleanup_started = rustfs_io_metrics::put_stage_timer();
-            cleanup(guards, tail_cleanup).await;
+            cleanup(
+                guards,
+                tail_cleanup,
+                old_current_source_all_successful_checked,
+                all_online_local_succeeded,
+            )
+            .await;
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_TAIL_CLEANUP,
                 cleanup_started,
@@ -4155,7 +4175,14 @@ impl SetDisks {
                         }
                     }
 
-                    if !sent_commit && success_count >= write_quorum {
+                    let pending_tasks = tasks.len();
+                    let checked_count = old_current_source_checked.iter().filter(|checked| **checked).count();
+                    let max_source_votes = Self::max_common_old_current_source_votes(&old_current_sources);
+                    let can_change_old_current_source = (checked_count < write_quorum
+                        && checked_count + pending_tasks >= write_quorum)
+                        || (max_source_votes < write_quorum && max_source_votes + pending_tasks >= write_quorum);
+
+                    if !sent_commit && success_count >= write_quorum && !can_change_old_current_source {
                         let snapshot_commit = Self::rename_data_commit_from_observations(
                             RenameDataObservations {
                                 disks: &coordinator_disks,
@@ -4174,6 +4201,8 @@ impl SetDisks {
                             cleanup_at_snapshot = commit.cleanup_disks.iter().map(Option::is_some).collect();
                         }
                         if let Some(commit_tx) = commit_tx.take() {
+                            #[cfg(test)]
+                            rename_fanout_barrier::wait_for_armed_rename_before_early_ack(&fanout_dst_object).await;
                             let _ = commit_tx.send(snapshot_commit);
                         }
                         sent_commit = true;
@@ -4296,9 +4325,21 @@ impl SetDisks {
                     }
                 }
 
+                let old_current_source_all_successful_checked = errs
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, err)| err.is_none())
+                    .all(|(idx, _)| old_current_source_checked.get(idx).copied().unwrap_or(false));
+                let all_online_local_succeeded = coordinator_disks.iter().zip(errs.iter()).all(|(disk, err)| match disk {
+                    Some(d) => d.is_local() && err.is_none(),
+                    None => true,
+                });
+
                 Some(RenameTailOutcome {
                     convergence: final_convergence,
                     cleanup: tail_cleanup,
+                    old_current_source_all_successful_checked,
+                    all_online_local_succeeded,
                 })
             }
         });
@@ -4861,6 +4902,14 @@ impl SetDisks {
             committed_file_info,
             tail_drain: None,
         })
+    }
+
+    pub(in crate::set_disk) fn max_common_old_current_source_votes(old_current_sources: &[Option<FileInfo>]) -> usize {
+        let mut counts: HashMap<[u8; 32], usize> = HashMap::new();
+        for source in old_current_sources.iter().flatten() {
+            *counts.entry(Self::file_info_quorum_hash(source)).or_insert(0) += 1;
+        }
+        counts.into_values().max().unwrap_or(0)
     }
 
     pub(in crate::set_disk) fn reduce_common_old_current_source(
@@ -5549,9 +5598,10 @@ impl SetDisks {
         write_quorum: usize,
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
-        self.recover_part_transaction(dst_object, write_quorum).await?;
         let part = ObjectPartInfo::unmarshal(&meta)?;
         let integrity = part.integrity.map(Arc::new);
+
+        self.recover_part_transaction(dst_object, write_quorum).await?;
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5574,7 +5624,9 @@ impl SetDisks {
                 if let Err(error) = prepared {
                     return Some(Err(error));
                 }
-                if let Some(integrity) = integrity {
+                if let Some(integrity) = integrity
+                    && !disk.is_local()
+                {
                     let Some((directory, _)) = dst_object.rsplit_once('/') else {
                         return Some(Err(DiskError::FileCorrupt));
                     };
@@ -5691,7 +5743,36 @@ impl SetDisks {
             return Err(err);
         }
 
-        let committed = self.recover_part_transaction(&dst_object, write_quorum).await?;
+        let all_prepared_succeeded = errs
+            .iter()
+            .zip(prepared_disks.iter())
+            .all(|(err, disk)| disk.is_none() || err.is_none());
+        let committed = if all_prepared_succeeded {
+            let settles = prepared_disks.iter().map(|disk| {
+                let disk = disk.clone();
+                let dst_object = dst_object.clone();
+                async move {
+                    let Some(disk) = disk else {
+                        return Err(DiskError::DiskNotFound);
+                    };
+                    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dst_object, PartTransactionAction::Commit)
+                        .await
+                }
+            });
+            let settle_results = join_all(settles).await;
+            if settle_results.iter().filter(|res| res.is_ok()).count() >= write_quorum
+                && settle_results
+                    .iter()
+                    .zip(prepared_disks.iter())
+                    .all(|(res, disk)| disk.is_none() || res.is_ok())
+            {
+                true
+            } else {
+                self.recover_part_transaction(&dst_object, write_quorum).await?
+            }
+        } else {
+            self.recover_part_transaction(&dst_object, write_quorum).await?
+        };
         if !committed {
             let err = DiskError::ErasureWriteQuorum;
             if let Some(context) = quorum_context {
@@ -6688,9 +6769,7 @@ impl SetDisks {
                         object,
                     );
                 }
-                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
-                let if_match = http_preconditions.if_match_value().map(str::to_owned);
-                if should_prevent_write(&oi, if_none_match, if_match)
+                if should_prevent_write(&oi, http_preconditions.if_none_match_value(), http_preconditions.if_match_value())
                     && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
                 {
                     return Some(StorageError::PreconditionFailed);
@@ -7419,6 +7498,34 @@ pub(crate) mod rename_fanout_barrier {
             paused.store(true, Ordering::SeqCst);
             arrived.notify_one();
             release.notified().await;
+        }
+    }
+
+    pub(in crate::set_disk) async fn wait_for_armed_rename_before_early_ack(object: &str) {
+        loop {
+            let (any_armed, any_unpaused) = {
+                let reg = lock();
+                let mut any_armed = false;
+                let mut any_unpaused = false;
+                for ((obj, _, phase), armed) in &reg.armed {
+                    if obj == object && *phase == Phase::Rename {
+                        any_armed = true;
+                        if !armed.paused.load(Ordering::SeqCst) {
+                            any_unpaused = true;
+                            break;
+                        }
+                    }
+                }
+                (any_armed, any_unpaused)
+            };
+            if !any_armed {
+                return;
+            }
+            if !any_unpaused {
+                tokio::task::yield_now().await;
+                return;
+            }
+            tokio::task::yield_now().await;
         }
     }
 
@@ -8488,9 +8595,9 @@ mod tests {
         }
         assert_eq!(
             recorder.counter_value("rustfs_io_get_object_local_batch_shards_total", &[("outcome", "success")]),
-            4
+            2
         );
-        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 14);
+        assert_eq!(recorder.counter_value("rustfs_io_get_object_local_batch_read_bytes_total", &[]), 7);
         assert_eq!(recorder.histogram_sample_count("rustfs_io_get_object_local_batch_prepare_seconds"), 8);
     }
 
@@ -9546,11 +9653,11 @@ mod tests {
             writer.shutdown().await.expect("inline writer should shutdown");
             let mut fi = base.clone();
             fi.erasure.index = index + 1;
-            fi.data = Some(Bytes::from(
+            fi.data = Some(
                 writer
                     .into_inline_data()
                     .expect("inline bitrot writer should retain encoded data"),
-            ));
+            );
             files.push(fi);
         }
         files
@@ -10915,7 +11022,7 @@ mod tests {
             move || async move {
                 *finalize_captured.lock().expect("finalize recorder should not poison") = true;
             },
-            move |(), _| async move {
+            move |(), _, _, _| async move {
                 *cleanup_captured.lock().expect("cleanup recorder should not poison") = true;
             },
             |request| async move {

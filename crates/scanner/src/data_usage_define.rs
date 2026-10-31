@@ -31,7 +31,8 @@ pub use rustfs_data_usage::{
     DataUsageEntry, DataUsageHash, DataUsageHashMap, DataUsageInfo, DataUsageSegmentInvalidationProof, DataUsageSnapshotSetState,
     LEGACY_DATA_USAGE_OBJECT_NAME, PrefixUsageEntry, PrefixUsageQuery, PrefixUsageSummary, ReplTargetSizeSummary,
     SizeReconciliationEntry, SizeReconciliationScope, SizeSummary, TierAccountingProof, TierStats, UNKNOWN_TIER,
-    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, hash_path, prefix_usage_in_cache,
+    UNKNOWN_TIER_DIAGNOSTIC_BYTE_CAP, UNKNOWN_TIER_DIAGNOSTIC_ENTRY_CAP, UnknownTierStats, clone_cache_value, hash_path,
+    prefix_usage_in_cache,
 };
 use rustfs_heal_contracts::heal_channel::HealScanMode;
 use rustfs_utils::path::{SLASH_SEPARATOR, path_join_buf};
@@ -595,9 +596,205 @@ pub struct PendingScannerHeal {
     pub last_admission_reason: String,
 }
 
+/// One bucket's standing in its set's service order. The wait position, the
+/// quanta granted and the last certification are separate quantities: a bucket
+/// that keeps failing moves to the tail like any other and only adds debt.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketService {
+    #[serde(default)]
+    pub waiting_since: u64,
+    #[serde(default)]
+    pub service_quanta: u64,
+    #[serde(default)]
+    pub last_certified: Option<u64>,
+    #[serde(default)]
+    pub failure_debt: u64,
+    #[serde(default)]
+    pub incarnation: Option<uuid::Uuid>,
+}
+
+// Nested derives encode positionally; a map lets later fields stay optional.
+impl Serialize for DataUsageBucketService {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let field_count = 2
+            + usize::from(self.last_certified.is_some())
+            + usize::from(self.failure_debt != 0)
+            + usize::from(self.incarnation.is_some());
+        let mut map = serializer.serialize_map(Some(field_count))?;
+        map.serialize_entry("waiting_since", &self.waiting_since)?;
+        map.serialize_entry("service_quanta", &self.service_quanta)?;
+        if let Some(last_certified) = self.last_certified {
+            map.serialize_entry("last_certified", &last_certified)?;
+        }
+        if self.failure_debt != 0 {
+            map.serialize_entry("failure_debt", &self.failure_debt)?;
+        }
+        if let Some(incarnation) = self.incarnation {
+            map.serialize_entry("incarnation", &incarnation)?;
+        }
+        map.end()
+    }
+}
+
+/// Durable first-in-first-out service order of one set, in generations: every
+/// bucket at or below `generation_floor` still waits for its turn and everything
+/// above it was served, so a new bucket queues behind waiters but ahead of
+/// buckets that already had a turn. It only orders work:
+/// no entry proves coverage, authorizes a skip or releases a responsibility,
+/// so losing it restarts fairness and nothing else. Like the set cache's bucket
+/// entries and incarnations, it holds one record per bucket of the inventory.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq)]
+pub struct DataUsageBucketServiceLedger {
+    /// Movement epoch the order was built under; another epoch invalidates it.
+    #[serde(default)]
+    pub publication_epoch: u64,
+    /// Leader that saved the order; an incomplete save stamps nothing else.
+    #[serde(default)]
+    pub leader_epoch: u64,
+    #[serde(default)]
+    pub next_sequence: u64,
+    #[serde(default)]
+    pub generation_floor: u64,
+    #[serde(default)]
+    pub buckets: HashMap<String, DataUsageBucketService>,
+}
+
+impl Serialize for DataUsageBucketServiceLedger {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(Some(5))?;
+        map.serialize_entry("publication_epoch", &self.publication_epoch)?;
+        map.serialize_entry("leader_epoch", &self.leader_epoch)?;
+        map.serialize_entry("next_sequence", &self.next_sequence)?;
+        map.serialize_entry("generation_floor", &self.generation_floor)?;
+        map.serialize_entry("buckets", &self.buckets)?;
+        map.end()
+    }
+}
+
+impl DataUsageBucketServiceLedger {
+    /// Rebuilds the order for this cycle's inventory. Decoded state that fails
+    /// validation or belongs to another movement epoch starts a new order;
+    /// a bucket whose incarnation changed is a new arrival behind all waiters.
+    pub(crate) fn restore<'a>(
+        persisted: Option<Self>,
+        publication_epoch: u64,
+        inventory: impl Iterator<Item = &'a str>,
+        incarnations: Option<&HashMap<String, uuid::Uuid>>,
+    ) -> Self {
+        let mut ledger = persisted
+            .filter(|ledger| ledger.publication_epoch == publication_epoch && ledger.is_valid())
+            .unwrap_or_else(|| Self {
+                publication_epoch,
+                ..Default::default()
+            });
+        let previous = std::mem::take(&mut ledger.buckets);
+        let mut arrivals = Vec::new();
+        for bucket in inventory {
+            let incarnation = incarnations.and_then(|current| current.get(bucket)).copied();
+            match previous.get(bucket) {
+                Some(service) if service.incarnation.is_none() || incarnation.is_none() || service.incarnation == incarnation => {
+                    ledger.buckets.insert(
+                        bucket.to_owned(),
+                        DataUsageBucketService {
+                            incarnation: incarnation.or(service.incarnation),
+                            ..*service
+                        },
+                    );
+                }
+                _ => arrivals.push((bucket, incarnation)),
+            }
+        }
+        if arrivals.is_empty() {
+            let floor = ledger.generation_floor;
+            if ledger.buckets.values().all(|service| service.waiting_since > floor) {
+                ledger.generation_floor = ledger.next_sequence;
+            }
+            return ledger;
+        }
+        // Open one position between the waiters and the served buckets.
+        let floor = ledger.generation_floor;
+        ledger.generation_floor = floor.saturating_add(1);
+        ledger.next_sequence = ledger.next_sequence.saturating_add(1);
+        for service in ledger.buckets.values_mut().filter(|service| service.waiting_since > floor) {
+            service.waiting_since = service.waiting_since.saturating_add(1);
+        }
+        for (bucket, incarnation) in arrivals {
+            ledger.buckets.insert(
+                bucket.to_owned(),
+                DataUsageBucketService {
+                    waiting_since: ledger.generation_floor,
+                    incarnation,
+                    ..Default::default()
+                },
+            );
+        }
+        ledger
+    }
+
+    fn is_valid(&self) -> bool {
+        self.generation_floor <= self.next_sequence
+            && self
+                .buckets
+                .iter()
+                .all(|(bucket, service)| !bucket.is_empty() && service.waiting_since <= self.next_sequence)
+    }
+
+    /// Smaller positions have waited longer; an untracked bucket queues last.
+    pub(crate) fn wait_position(&self, bucket: &str) -> u64 {
+        self.buckets.get(bucket).map_or(u64::MAX, |service| service.waiting_since)
+    }
+
+    /// Moves a bucket to the tail and returns its previous wait position.
+    pub(crate) fn record_service(&mut self, bucket: &str) -> Option<u64> {
+        let service = self.buckets.get_mut(bucket)?;
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        let previous = std::mem::replace(&mut service.waiting_since, self.next_sequence);
+        service.service_quanta = service.service_quanta.saturating_add(1);
+        Some(previous)
+    }
+
+    /// Undoes `record_service` for an admission a resource veto turned back.
+    pub(crate) fn return_service(&mut self, bucket: &str, waiting_since: u64) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.waiting_since = waiting_since;
+            service.service_quanta = service.service_quanta.saturating_sub(1);
+        }
+    }
+
+    pub(crate) fn record_certified(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.last_certified = Some(service.waiting_since);
+            service.failure_debt = 0;
+        }
+    }
+
+    pub(crate) fn record_failure(&mut self, bucket: &str) {
+        if let Some(service) = self.buckets.get_mut(bucket) {
+            service.failure_debt = service.failure_debt.saturating_add(1);
+        }
+    }
+
+    /// Buckets holding unpaid failures and the first of them by name.
+    pub(crate) fn failure_debt(&self) -> (usize, Option<&str>) {
+        let mut debtors = self
+            .buckets
+            .iter()
+            .filter(|(_, service)| service.failure_debt > 0)
+            .map(|(bucket, _)| bucket.as_str());
+        let first = debtors.next();
+        let (count, first) = debtors.fold((usize::from(first.is_some()), first), |(count, first), bucket| {
+            (count + 1, first.min(Some(bucket)))
+        });
+        (count, first)
+    }
+}
+
 /// Data usage cache info
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct DataUsageCacheInfo {
+    /// In-memory only: this partial stopped on admission pressure, not a failure.
+    #[serde(skip)]
+    pub scan_resource_deferred: bool,
     pub name: String,
     pub next_cycle: u64,
     pub last_update: Option<SystemTime>,
@@ -614,6 +811,11 @@ pub struct DataUsageCacheInfo {
     pub scan_raw_enumeration_cursor: Option<DataUsageRawEnumerationCursor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    /// Indexes of the other directories on the active walk path. A restart
+    /// must replay every wide ancestor before it reaches the selected one, and
+    /// recharging those replays would stop a fixed budget from ever advancing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scan_raw_enumeration_path_page_indexes: Vec<RawEnumerationPageIndex>,
     #[serde(default)]
     pub scan_identity: Option<DataUsageScanIdentity>,
     #[serde(default)]
@@ -673,6 +875,9 @@ pub struct DataUsageCacheInfo {
     /// skipping an unselected bucket in a later scoped set scan.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub scan_bucket_incarnations: HashMap<String, uuid::Uuid>,
+    /// Bucket service order of a set cache; absent from bucket caches.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scan_bucket_service: Option<DataUsageBucketServiceLedger>,
 }
 
 impl Serialize for DataUsageCacheInfo {
@@ -685,6 +890,7 @@ impl Serialize for DataUsageCacheInfo {
         let field_count = 16
             + usize::from(self.scan_raw_enumeration_cursor.is_some())
             + usize::from(self.scan_raw_enumeration_page_index.is_some())
+            + usize::from(!self.scan_raw_enumeration_path_page_indexes.is_empty())
             + usize::from(self.scan_identity.is_some())
             + usize::from(self.scan_progress.is_some())
             + usize::from(self.scan_coverage_receipt.is_some())
@@ -698,7 +904,8 @@ impl Serialize for DataUsageCacheInfo {
             + usize::from(self.lkg_scan_plan_digest.is_some())
             + usize::from(self.scan_execution_digest.is_some())
             + usize::from(self.segment_invalidation_proof.is_some())
-            + usize::from(!self.scan_bucket_incarnations.is_empty());
+            + usize::from(!self.scan_bucket_incarnations.is_empty())
+            + usize::from(self.scan_bucket_service.is_some());
         let mut state = serializer.serialize_map(Some(field_count))?;
         state.serialize_entry("name", &self.name)?;
         state.serialize_entry("next_cycle", &self.next_cycle)?;
@@ -715,6 +922,9 @@ impl Serialize for DataUsageCacheInfo {
         }
         if let Some(index) = &self.scan_raw_enumeration_page_index {
             state.serialize_entry("scan_raw_enumeration_page_index", index)?;
+        }
+        if !self.scan_raw_enumeration_path_page_indexes.is_empty() {
+            state.serialize_entry("scan_raw_enumeration_path_page_indexes", &self.scan_raw_enumeration_path_page_indexes)?;
         }
         if let Some(identity) = self.scan_identity {
             state.serialize_entry("scan_identity", &identity)?;
@@ -764,6 +974,9 @@ impl Serialize for DataUsageCacheInfo {
         if !self.scan_bucket_incarnations.is_empty() {
             state.serialize_entry("scan_bucket_incarnations", &self.scan_bucket_incarnations)?;
         }
+        if let Some(ledger) = &self.scan_bucket_service {
+            state.serialize_entry("scan_bucket_service", ledger)?;
+        }
         state.end()
     }
 }
@@ -793,7 +1006,7 @@ impl DataUsageCache {
         let known_tiers = tier_names.iter().map(String::as_str).collect::<HashSet<_>>();
         for entry in self.cache.values_mut() {
             let Some(tiers) = entry.all_tier_stats.as_mut() else { continue };
-            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).cloned().unwrap_or_default();
+            let existing_unknown = tiers.tiers.get(UNKNOWN_TIER).map(clone_cache_value).unwrap_or_default();
             let companion_present = entry.unknown_tier_stats.as_ref().is_some_and(|stats| !stats.is_empty());
             let migrate_existing_unknown = !companion_present;
             let mut retired = TierStats::default();
@@ -901,6 +1114,30 @@ impl DataUsageCache {
         }
     }
 
+    /// Identifies how far durable resume state has advanced. Discovery alone
+    /// does not change it; only committed raw pages or coverage frontier do.
+    pub(crate) fn durable_scan_position(&self) -> (Option<String>, Option<String>, u64) {
+        let raw_entries = self
+            .info
+            .scan_raw_enumeration_page_index
+            .iter()
+            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+            .map(|index| match index.status() {
+                RawEnumerationPageOwnerStatus::Unsupported => 0,
+                RawEnumerationPageOwnerStatus::Building { indexed_entries, .. }
+                | RawEnumerationPageOwnerStatus::Ready { indexed_entries, .. } => indexed_entries,
+            })
+            .fold(0, u64::saturating_add);
+        (
+            self.info.scan_resume_after.clone(),
+            self.info
+                .scan_coverage_receipt
+                .as_ref()
+                .map(|receipt| receipt.through.clone()),
+            raw_entries,
+        )
+    }
+
     pub(crate) fn has_scan_position(&self) -> bool {
         self.info.scan_resume_after.is_some()
             || self.info.scan_checkpoint.is_some()
@@ -970,7 +1207,7 @@ impl DataUsageCache {
                 || self.validated_raw_enumeration_cursor().is_some()
                 || self.validated_raw_enumeration_page_index().is_some());
         let handoff_frontier = cross_epoch_checkpoint
-            .then(|| self.validated_scan_frontier().map(str::to_owned))
+            .then(|| self.validated_scan_frontier().map(clone_cache_value))
             .flatten();
         let reusable = identity.is_valid()
             && name != DATA_USAGE_ROOT
@@ -1043,7 +1280,14 @@ impl DataUsageCache {
         }
         if self.validated_raw_enumeration_page_index().is_none() {
             self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
         }
+        let path_indexes = std::mem::take(&mut self.info.scan_raw_enumeration_path_page_indexes);
+        self.info.scan_raw_enumeration_path_page_indexes = path_indexes
+            .into_iter()
+            .take(MAX_DATA_USAGE_CACHE_DEPTH)
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+            .collect();
         let cursor_is_valid = !self.has_scan_position()
             || self.validated_scan_frontier().is_some()
             || self.info.scan_raw_enumeration_cursor.is_some()
@@ -1086,6 +1330,7 @@ impl DataUsageCache {
             self.info.scan_checkpoint = None;
             self.info.scan_raw_enumeration_cursor = None;
             self.info.scan_raw_enumeration_page_index = None;
+            self.info.scan_raw_enumeration_path_page_indexes.clear();
             self.info.scan_coverage_receipt = None;
         }
         // Old readers do not understand coverage sweeps. An absent plan makes
@@ -1229,22 +1474,37 @@ impl DataUsageCache {
     }
 
     pub(crate) fn validated_raw_enumeration_page_index(&self) -> Option<&RawEnumerationPageIndex> {
-        let index = self.info.scan_raw_enumeration_page_index.as_ref()?;
+        self.info
+            .scan_raw_enumeration_page_index
+            .as_ref()
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    /// The durable index of one directory on the saved walk path.
+    pub(crate) fn validated_raw_enumeration_page_index_for_parent(&self, parent: &str) -> Option<&RawEnumerationPageIndex> {
+        self.info
+            .scan_raw_enumeration_page_index
+            .iter()
+            .chain(&self.info.scan_raw_enumeration_path_page_indexes)
+            .find(|index| index.parent() == Some(parent))
+            .filter(|index| self.raw_enumeration_page_index_is_valid(index))
+    }
+
+    fn raw_enumeration_page_index_is_valid(&self, index: &RawEnumerationPageIndex) -> bool {
         if self.info.scan_progress.is_none()
             || !self.info.scan_identity.is_some_and(|identity| identity.is_valid())
             || self.info.source.is_none()
             || index.committed_entries().is_err()
             || index.indexed_entries().is_err()
         {
-            return None;
+            return false;
         }
-        let parent = match index.status() {
-            RawEnumerationPageOwnerStatus::Unsupported => return None,
+        match index.status() {
+            RawEnumerationPageOwnerStatus::Unsupported => false,
             RawEnumerationPageOwnerStatus::Building { parent, .. } | RawEnumerationPageOwnerStatus::Ready { parent, .. } => {
-                parent
+                path_is_in_bucket_scope(&self.info.name, &parent)
             }
-        };
-        path_is_in_bucket_scope(&self.info.name, &parent).then_some(index)
+        }
     }
 
     /// Seal only the frontier supplied by completed traversal, never a restored cursor.
@@ -1256,18 +1516,18 @@ impl DataUsageCache {
         let frontier = frontier.filter(|path| path.len() <= 16 * 1024 && self.find(path).is_some());
         self.info.scan_coverage_receipt = match frontier {
             Some(through) => Some(DataUsageScanCoverageReceipt {
-                through: through.to_owned(),
+                through: clone_cache_value(through),
                 digest: self.coverage_prefix_digest(through)?,
             }),
             None => None,
         };
-        self.info.scan_resume_after = frontier.map(str::to_owned);
+        self.info.scan_resume_after = frontier.map(clone_cache_value);
         let reason = self
             .info
             .scan_checkpoint
             .as_ref()
             .map_or(DataUsageScanCheckpointReason::Unknown, |checkpoint| checkpoint.reason);
-        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(through.to_owned(), reason));
+        self.info.scan_checkpoint = frontier.map(|through| DataUsageScanCheckpoint::new(clone_cache_value(through), reason));
         Ok(())
     }
 
@@ -1303,26 +1563,32 @@ impl DataUsageCache {
 
     pub fn replace(&mut self, path: &str, parent: &str, e: DataUsageEntry) {
         let hash = hash_path(path);
-        self.cache.insert(hash.key(), e);
+        self.cache.insert(clone_cache_value(&hash.0), e);
         if !parent.is_empty() {
             let parent_hash = hash_path(parent);
-            self.cache.entry(parent_hash.key()).or_default().add_child(&hash);
+            self.cache
+                .entry(clone_cache_value(&parent_hash.0))
+                .or_default()
+                .add_child(&hash);
         }
     }
 
     pub fn replace_hashed(&mut self, hash: &DataUsageHash, parent: &Option<DataUsageHash>, e: &DataUsageEntry) {
-        self.cache.insert(hash.key(), e.clone());
+        self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
         if let Some(parent) = parent {
-            self.cache.entry(parent.key()).or_default().add_child(hash);
+            self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
         }
     }
 
     pub fn find(&self, path: &str) -> Option<&DataUsageEntry> {
-        self.cache.get(&hash_path(path).key())
+        self.cache.get(&clone_cache_value(&hash_path(path).0))
     }
 
     pub fn find_children_copy(&self, h: &DataUsageHash) -> DataUsageHashMap {
-        self.cache.get(&h.0).map(|entry| entry.children.clone()).unwrap_or_default()
+        self.cache
+            .get(&h.0)
+            .map(|entry| clone_cache_value(&entry.children))
+            .unwrap_or_default()
     }
 
     pub fn flatten(&self, root: &DataUsageEntry) -> DataUsageEntry {
@@ -1346,7 +1612,7 @@ impl DataUsageCache {
         }
         let (entry, visited) = self.checked_flatten_inner(path)?;
         let root_parent_only = {
-            let path_key = hash_path(path).key();
+            let path_key = clone_cache_value(&hash_path(path).0);
             self.cache
                 .get(DATA_USAGE_ROOT)
                 .is_some_and(|root| root_is_parent_only(root, &path_key))
@@ -1379,7 +1645,7 @@ impl DataUsageCache {
     }
 
     fn checked_flatten_inner(&self, path: &str) -> Option<(DataUsageEntry, usize)> {
-        let root_key = hash_path(path).key();
+        let root_key = clone_cache_value(&hash_path(path).0);
         let (root_key, root) = self.cache.get_key_value(&root_key)?;
         if root.compacted && !root.children.is_empty() {
             return None;
@@ -1465,22 +1731,28 @@ impl DataUsageCache {
         visited: &mut HashSet<String>,
         depth: usize,
     ) {
-        if !visited.insert(hash.key()) {
+        if !visited.insert(clone_cache_value(&hash.0)) {
             return;
         }
 
-        if let Some(e) = src.cache.get(&hash.string()) {
-            self.cache.insert(hash.key(), e.clone());
+        if let Some(e) = src.cache.get(&clone_cache_value(&hash.0)) {
+            self.cache.insert(clone_cache_value(&hash.0), clone_cache_value(e));
             if depth < MAX_DATA_USAGE_CACHE_DEPTH {
                 for ch in e.children.iter() {
-                    if *ch == hash.key() {
+                    if *ch == clone_cache_value(&hash.0) {
                         continue;
                     }
-                    self.copy_with_children_guard(src, &DataUsageHash(ch.to_string()), &Some(hash.clone()), visited, depth + 1);
+                    self.copy_with_children_guard(
+                        src,
+                        &DataUsageHash(clone_cache_value(ch)),
+                        &Some(clone_cache_value(hash)),
+                        visited,
+                        depth + 1,
+                    );
                 }
             }
             if let Some(parent) = parent {
-                self.cache.entry(parent.key()).or_default().add_child(hash);
+                self.cache.entry(clone_cache_value(&parent.0)).or_default().add_child(hash);
             }
         }
     }
@@ -1507,7 +1779,7 @@ impl DataUsageCache {
         match self.cache.get_key_value(&hash_path(path).key()) {
             Some((key, root)) => {
                 if root.children.is_empty() {
-                    return Some(root.clone());
+                    return Some(clone_cache_value(root));
                 }
                 let mut visited = HashSet::new();
                 visited.insert(key.as_str());
@@ -1522,7 +1794,7 @@ impl DataUsageCache {
     }
 
     pub fn search_parent(&self, hash: &DataUsageHash) -> Option<DataUsageHash> {
-        let want = hash.key();
+        let want = clone_cache_value(&hash.0);
         if let Some(last_index) = want.rfind('/')
             && let Some(v) = self.find(&want[0..last_index])
             && v.children.contains(&want)
@@ -1532,22 +1804,22 @@ impl DataUsageCache {
 
         for (k, v) in self.cache.iter() {
             if v.children.contains(&want) {
-                return Some(DataUsageHash(k.clone()));
+                return Some(DataUsageHash(clone_cache_value(k)));
             }
         }
         None
     }
 
     pub fn is_compacted(&self, hash: &DataUsageHash) -> bool {
-        self.cache.get(&hash.key()).is_some_and(|due| due.compacted)
+        self.cache.get(&clone_cache_value(&hash.0)).is_some_and(|due| due.compacted)
     }
 
     pub fn force_compact(&mut self, limit: usize) {
         if self.cache.len() < limit {
             return;
         }
-        let top = hash_path(&self.info.name).key();
-        let Some(top_e) = self.find(&top).cloned() else {
+        let top = clone_cache_value(&hash_path(&self.info.name).0);
+        let Some(top_e) = self.find(&top).map(clone_cache_value) else {
             return;
         };
 
@@ -1574,14 +1846,14 @@ impl DataUsageCache {
         }
 
         if e.children.len() > limit && compact_self {
-            let mut flat = self.size_recursive(&path.key()).unwrap_or_default();
+            let mut flat = self.size_recursive(&clone_cache_value(&path.0)).unwrap_or_default();
             flat.compacted = true;
             self.delete_recursive(path);
             self.replace_hashed(path, &None, &flat);
             return;
         }
 
-        let total = self.total_children_rec(&path.key());
+        let total = self.total_children_rec(&clone_cache_value(&path.0));
         if total < limit {
             return;
         }
@@ -1594,12 +1866,12 @@ impl DataUsageCache {
         let mut candidate_index = 0;
         while remove > 0 && candidate_index < candidates.len() {
             let e = &candidates[candidate_index];
-            let candidate = e.path.clone();
+            let candidate = clone_cache_value(&e.path);
             if candidate == *path && !compact_self {
                 break;
             }
-            let removing = self.total_children_rec(&candidate.key());
-            let mut flat = match self.size_recursive(&candidate.key()) {
+            let removing = self.total_children_rec(&clone_cache_value(&candidate.0));
+            let mut flat = match self.size_recursive(&clone_cache_value(&candidate.0)) {
                 Some(flat) => flat,
                 None => {
                     candidate_index += 1;
@@ -1645,7 +1917,7 @@ impl DataUsageCache {
             if o.root().is_none() {
                 return;
             }
-            *self = o.clone();
+            *self = clone_cache_value(o);
             return;
         };
 
@@ -1658,7 +1930,8 @@ impl DataUsageCache {
         }
 
         existing_root.merge(&other_root);
-        self.cache.insert(hash_path(&self.info.name).key(), existing_root);
+        self.cache
+            .insert(clone_cache_value(&hash_path(&self.info.name).0), existing_root);
 
         let root_hash = self.root_hash();
         for key in other_root.children.iter() {
@@ -1669,7 +1942,7 @@ impl DataUsageCache {
             if let Some(existing) = self.cache.get_mut(key) {
                 existing.merge(&flat);
             } else {
-                self.replace_hashed(&DataUsageHash(key.clone()), &Some(root_hash.clone()), &flat);
+                self.replace_hashed(&DataUsageHash(clone_cache_value(key)), &Some(clone_cache_value(&root_hash)), &flat);
             }
         }
     }
@@ -1679,7 +1952,7 @@ impl DataUsageCache {
     }
 
     pub fn root(&self) -> Option<DataUsageEntry> {
-        self.find(&self.info.name).cloned()
+        self.find(&self.info.name).map(clone_cache_value)
     }
 
     /// Convert cache to DataUsageInfo for a specific path
@@ -1713,7 +1986,7 @@ impl DataUsageCache {
 
                 for (arn, stat) in rs.targets.iter() {
                     bui.replication_info.insert(
-                        arn.clone(),
+                        clone_cache_value(arn),
                         BucketTargetUsageInfo {
                             replication_pending_size: stat.pending_size,
                             replicated_size: stat.replicated_size,
@@ -1726,7 +1999,7 @@ impl DataUsageCache {
                     );
                 }
             }
-            buckets_usage.insert(bucket_name.clone(), bui);
+            buckets_usage.insert(clone_cache_value(bucket_name), bui);
         }
 
         DataUsageInfo {
@@ -1765,7 +2038,7 @@ struct Inner {
 
 fn add(data_usage_cache: &DataUsageCache, path: &DataUsageHash, candidates: &mut Vec<Inner>) -> usize {
     let mut visited = HashSet::new();
-    visited.insert(path.key());
+    visited.insert(clone_cache_value(&path.0));
     add_with_guard(data_usage_cache, path, candidates, &mut visited, 0)
 }
 
@@ -1776,15 +2049,16 @@ fn add_with_guard(
     visited: &mut HashSet<String>,
     depth: usize,
 ) -> usize {
-    let e = match data_usage_cache.cache.get(&path.key()) {
+    let e = match data_usage_cache.cache.get(&clone_cache_value(&path.0)) {
         Some(e) => e,
         None => return 0,
     };
     let mut objects = e.objects;
     if depth < MAX_DATA_USAGE_CACHE_DEPTH {
         for ch in e.children.iter() {
-            if visited.insert(ch.clone()) {
-                objects += add_with_guard(data_usage_cache, &DataUsageHash(ch.clone()), candidates, visited, depth + 1);
+            if visited.insert(clone_cache_value(ch)) {
+                objects +=
+                    add_with_guard(data_usage_cache, &DataUsageHash(clone_cache_value(ch)), candidates, visited, depth + 1);
             }
         }
     }
@@ -1794,7 +2068,7 @@ fn add_with_guard(
     if !e.children.is_empty() {
         candidates.push(Inner {
             objects,
-            path: path.clone(),
+            path: clone_cache_value(path),
         });
     }
     objects
@@ -1810,7 +2084,7 @@ fn mark_with_depth(duc: &DataUsageCache, entry: &DataUsageEntry, found: &mut Has
     }
 
     for k in entry.children.iter() {
-        if !found.insert(k.to_string()) {
+        if !found.insert(clone_cache_value(k)) {
             continue;
         }
         if let Some(ch) = duc.cache.get(k) {

@@ -74,6 +74,7 @@ async fn run_cohort_cycle(
                 service_cohort: Some(cohort),
                 resolved_scope_observer: None,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )
@@ -334,5 +335,223 @@ async fn service_cohort_cancelled_dispatch_does_not_consume_waiters_or_leak_perm
         "cancellation must not block a subsequent scan"
     );
     assert_eq!(usage.expect("retry aggregate").objects_total_count, 2);
+    clear_dirty_usage_buckets_for_tests();
+}
+
+/// N=17, q=4: every bucket reaches a worker within ceil(17/4)=5 rounds while
+/// one bucket stays hot and another fails forever, with leader-local state
+/// discarded after each round as a restart would.
+#[tokio::test]
+#[serial]
+async fn cold_bucket_service_bound_survives_restart_with_hot_and_failing_bucket() {
+    const BUCKETS: usize = 17;
+    const QUANTA: u64 = 4;
+    const ROUND_BOUND: usize = 5;
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    let names = (0..BUCKETS).map(|index| format!("cold-{index:02}")).collect::<Vec<_>>();
+    for name in &names {
+        create_cohort_bucket(&store, name).await;
+    }
+    let hot = names[0].clone();
+    let _failing = fail_coordinator_bucket_scan(&names[1]);
+    let mut waited = [0_usize; BUCKETS];
+    for round in 1..=(ROUND_BOUND * 3) {
+        record_dirty_usage_bucket(&hot);
+        let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+        let ctx = CancellationToken::new();
+        let budget = ScannerCycleBudget::new_with_progress_tracking(
+            &ctx,
+            ScannerCycleBudgetConfig {
+                max_objects: Some(QUANTA),
+                ..Default::default()
+            },
+        );
+        run_cohort_cycle(&store, cohort.clone(), u64::try_from(round).expect("round"), budget).await;
+        let admitted = cohort
+            .lock()
+            .expect("cohort lock")
+            .admitted_members()
+            .into_iter()
+            .map(|(_, bucket)| bucket)
+            .collect::<HashSet<_>>();
+        for (index, name) in names.iter().enumerate() {
+            waited[index] = if admitted.contains(name) { 0 } else { waited[index] + 1 };
+            assert!(
+                waited[index] < ROUND_BOUND,
+                "{name} waited {} rounds at round {round}; admitted {admitted:?}",
+                waited[index]
+            );
+        }
+    }
+    let saved = load_set_cache(&store).await;
+    let ledger = saved
+        .info
+        .scan_bucket_service
+        .expect("incomplete cycles must save the service order");
+    assert!(ledger.buckets[&names[1]].failure_debt > 0, "the failing bucket must keep visible debt");
+    assert_eq!(ledger.buckets[&names[1]].last_certified, None);
+    assert_eq!(ledger.failure_debt().0, 1, "only the failing bucket owes a sweep");
+    assert!(!saved.info.snapshot_complete, "the saved order must not certify the set");
+    clear_dirty_usage_buckets_for_tests();
+}
+
+async fn load_set_cache(store: &Arc<ECStore>) -> DataUsageCache {
+    let mut cache = DataUsageCache::default();
+    cache
+        .load(store.all_set_disks()[0].clone(), DATA_USAGE_CACHE_NAME)
+        .await
+        .expect("load set cache");
+    cache
+}
+
+fn quantum_budget(quantum: crate::scanner_budget::ScannerBucketQuantum) -> Arc<ScannerCycleBudget> {
+    ScannerCycleBudget::new_with_progress_tracking(
+        &CancellationToken::new(),
+        ScannerCycleBudgetConfig {
+            bucket_quantum: Some(quantum),
+            ..Default::default()
+        },
+    )
+}
+
+#[tokio::test]
+#[serial]
+async fn fair_prefix_quantum_spent_bucket_returns_behind_waiting_buckets() {
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    create_cohort_bucket_objects(&store, "a-flat", 6).await;
+    create_cohort_bucket(&store, "z-cold-one").await;
+    create_cohort_bucket(&store, "z-cold-two").await;
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+        max_objects: Some(2),
+        ..Default::default()
+    });
+    let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget.clone()).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete, "shares must add up to one whole sweep");
+    assert_eq!(usage.expect("complete aggregate").objects_total_count, 8);
+    assert!(!budget.budget_elapsed(), "only the bucket shares ended");
+
+    let ledger = load_set_cache(&store).await.info.scan_bucket_service.expect("saved order");
+    assert!(ledger.buckets["a-flat"].service_quanta >= 3, "{ledger:?}");
+    assert_eq!(ledger.buckets["z-cold-one"].service_quanta, 1, "{ledger:?}");
+    assert_eq!(ledger.buckets["z-cold-two"].service_quanta, 1, "{ledger:?}");
+    assert!(
+        ledger.buckets["a-flat"].waiting_since > ledger.buckets["z-cold-two"].waiting_since,
+        "the wide bucket must finish behind the buckets it yielded to: {ledger:?}"
+    );
+    assert_eq!(ledger.failure_debt(), (0, None), "a spent share is not a failure");
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn fair_prefix_quantum_without_durable_motion_ends_the_bucket_turn() {
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    create_cohort_bucket_objects(&store, "a-flat", 6).await;
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+        max_duration: Some(Duration::ZERO),
+        ..Default::default()
+    });
+    let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget).await;
+    assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+    assert!(usage.is_none());
+    let ledger = load_set_cache(&store).await.info.scan_bucket_service.expect("saved order");
+    assert_eq!(
+        ledger.buckets["a-flat"].service_quanta, 1,
+        "a share that saved nothing must not requeue itself: {ledger:?}"
+    );
+    assert_eq!(ledger.failure_debt(), (0, None));
+    clear_dirty_usage_buckets_for_tests();
+}
+
+/// A one-object share stops inside its first child, so the frontier never
+/// moves. Requeuing that bucket would spin until the cycle deadline.
+#[tokio::test]
+#[serial]
+async fn fair_prefix_quantum_repeated_share_without_a_new_frontier_stops_requeuing() {
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    create_cohort_bucket_objects(&store, "a-flat", 3).await;
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let budget = quantum_budget(crate::scanner_budget::ScannerBucketQuantum {
+        max_objects: Some(1),
+        ..Default::default()
+    });
+    let (result, usage) = run_cohort_cycle(&store, cohort, 1, budget).await;
+    assert_eq!(result.status, ScannerCycleStatus::Incomplete);
+    assert!(usage.is_none());
+    let ledger = load_set_cache(&store).await.info.scan_bucket_service.expect("saved order");
+    assert!(
+        ledger.buckets["a-flat"].service_quanta <= 3,
+        "turns without durable motion must end: {ledger:?}"
+    );
+    assert_eq!(ledger.failure_debt(), (0, None));
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn cold_bucket_service_saved_order_keeps_coverage_and_rejects_older_owners() {
+    let (_dir, store) = setup_local_scanner_store(1, 4).await;
+    clear_dirty_usage_buckets_for_tests();
+    create_cohort_bucket(&store, "cold-only").await;
+    let ctx = CancellationToken::new();
+    let cohort = Arc::new(StdMutex::new(ScannerServiceCohort::default()));
+    let (result, _) = run_cohort_cycle(&store, cohort, 3, ScannerCycleBudget::new(&ctx, Default::default())).await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    let certified = load_set_cache(&store).await;
+    assert!(certified.info.snapshot_complete);
+    let set = store.all_set_disks()[0].clone();
+    let epoch = scanner_publication_epoch(set.clone()).await.expect("publication epoch");
+    let source = DataUsageCacheSource::new(set.pool_index, set.set_index);
+    let mut ledger = certified.info.scan_bucket_service.clone().expect("saved order");
+    ledger.next_sequence += 1;
+    ledger.leader_epoch = 11;
+
+    assert!(persist_scanner_service_ledger(set.clone(), source, ledger.clone(), 3, 11, epoch).await);
+    let saved = load_set_cache(&store).await;
+    assert_eq!(saved.info.scan_bucket_service.as_ref(), Some(&ledger));
+    assert_eq!(saved.info.snapshot_complete, certified.info.snapshot_complete);
+    assert_eq!(saved.info.scan_plan_digest, certified.info.scan_plan_digest);
+    assert_eq!(saved.info.scan_execution_digest, certified.info.scan_execution_digest);
+    assert_eq!(saved.info.next_cycle, certified.info.next_cycle);
+    assert_eq!(saved.info.leader_epoch, certified.info.leader_epoch);
+    assert_eq!(saved.cache.len(), certified.cache.len());
+
+    let mut stale = ledger.clone();
+    stale.next_sequence += 1;
+    assert!(
+        !persist_scanner_service_ledger(set.clone(), source, stale.clone(), 3, 10, epoch).await,
+        "a late write from an older leader must not replace the order"
+    );
+    assert!(
+        !persist_scanner_service_ledger(set.clone(), source, stale, 2, 11, epoch).await,
+        "a late write from an older cycle must not replace the order"
+    );
+    assert_eq!(load_set_cache(&store).await.info.scan_bucket_service.as_ref(), Some(&ledger));
+
+    // An incomplete save leaves the cache stamps at epoch 11, so only the order
+    // itself can reject the leader it replaced.
+    let mut newer = ledger.clone();
+    newer.next_sequence += 1;
+    assert!(persist_scanner_service_ledger(set.clone(), source, newer.clone(), 3, 12, epoch).await);
+    let saved = load_set_cache(&store).await;
+    assert_eq!(saved.info.leader_epoch, certified.info.leader_epoch);
+    assert!(
+        !persist_scanner_service_ledger(set.clone(), source, ledger.clone(), 3, 11, epoch).await,
+        "a late write must not replace an order saved by a newer leader"
+    );
+    assert_eq!(
+        load_set_cache(&store)
+            .await
+            .info
+            .scan_bucket_service
+            .map(|saved| saved.next_sequence),
+        Some(newer.next_sequence)
+    );
     clear_dirty_usage_buckets_for_tests();
 }

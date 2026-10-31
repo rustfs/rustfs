@@ -286,6 +286,11 @@ mod dir_fsync_failures {
 
     static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn has_any() -> bool {
+        !FAILURES.lock().is_empty()
+    }
+
     pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
         FAILURES.lock().insert(dir.to_path_buf(), kind);
     }
@@ -323,7 +328,12 @@ pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path:
     Ok(())
 }
 
-/// Pause a real namespace mutation inside its physical executor.
+#[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
+pub(crate) fn has_dir_fsync_test_failures() -> bool {
+    dir_fsync_failures::has_any()
+}
+
+/// Pause a real native filesystem operation inside its physical executor.
 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
 pub(crate) mod prepared_publication_test_hooks {
     use super::*;
@@ -333,6 +343,7 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        NativeReadOpen,
         MetadataReadAfterOpen,
         MetadataReadAfterRead,
         #[cfg(test)]
@@ -370,6 +381,17 @@ pub(crate) mod prepared_publication_test_hooks {
             let _pause = super::enter_blocking_test_hook();
             hook();
         }
+    }
+
+    pub(crate) fn has_any_hooks() -> bool {
+        if !BEFORE_PUBLICATION.lock().is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -459,6 +481,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    /// Pause an accepted native read/open before its original syscall.
+    NativeReadOpen,
     MetadataReadAfterOpen,
     MetadataReadAfterRead,
 }
@@ -473,6 +497,7 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::NativeReadOpen => prepared_publication_test_hooks::Stage::NativeReadOpen,
             LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
             LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
@@ -758,7 +783,7 @@ fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
     file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
 }
 
-fn file_fdatasync_group_commit_enabled() -> bool {
+pub(crate) fn file_fdatasync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = file_fdatasync_group_commit_override::get() {
         return enabled;
@@ -859,13 +884,13 @@ impl OpenedDstDirFsyncGroup {
 
 struct DstDirFsyncWaiter {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
 struct DstDirFsyncOwner {
     _namespace: Option<Arc<dyn Send + Sync>>,
-    _resource: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    _resource: Option<super::io_admission::ResourceIoUnit>,
 }
 
 #[derive(Clone)]
@@ -1307,7 +1332,7 @@ type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     enqueued_at: Option<Instant>,
     wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
@@ -2392,6 +2417,10 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
+    pub(crate) fn is_active() -> bool {
+        !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
+    }
+
     pub(super) fn set_failing(root: &Path) -> ProbeGuard {
         configure(root, Some(1), false)
     }
@@ -2553,18 +2582,25 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
-#[allow(
-    dead_code,
-    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+    )
 )]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir.as_ref())? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            sync_file(&entry.path())?;
-        }
-    }
-    fsync_dir_std(dir)
+    let dir = dir.as_ref();
+    let files = regular_files(dir)?;
+    rustfs_io_metrics::record_put_rename_fdatasync_batch(rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, files.len());
+    sync_files(&files)?;
+    let fsync_started = rustfs_io_metrics::put_stage_timer();
+    let result = fsync_dir_std(dir);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+        fsync_started,
+    );
+    result
 }
 
 /// Async wrapper around [`sync_dir_files_std`]. Large directories flush files
@@ -2716,22 +2752,114 @@ pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::
     })
 }
 
+#[cfg(test)]
 pub(crate) fn has_non_data_dir_entry(path: impl AsRef<Path>, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    match has_non_data_dir_entry_inner(path.as_ref(), data_dirs) {
-        Ok(res) => Ok(res),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
+    has_non_data_dir_entry_lazy(path, || data_dirs.to_vec()).map(|(_, res)| res)
 }
 
-fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    let mut dir = std::fs::read_dir(path)?;
-    let entry_limit = data_dirs.len().saturating_add(2);
+#[cfg(target_os = "linux")]
+pub(crate) fn has_non_data_dir_entry_lazy_from_fd(
+    dir_fd: &std::fs::File,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    use rustix::fs::{AtFlags, FileType, RawDir, statat};
+
+    let mut raw_buf = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+    let mut dir = RawDir::new(dir_fd, &mut raw_buf);
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
     let mut valid_entries = 0usize;
 
     for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
         let Some(entry) = dir.next() else {
-            return Ok(false);
+            return Ok((data_dirs.unwrap_or_default(), false));
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => return Ok((data_dirs.unwrap_or_default(), false)),
+            Err(err) => return Err(io::Error::from(err)),
+        };
+        let c_name = entry.file_name();
+        let name_bytes = c_name.to_bytes();
+        if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            FileType::Unknown => match statat(dir_fd, c_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => FileType::from_raw_mode(st.st_mode),
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(err) => return Err(io::Error::from(err)),
+            },
+            ft => ft,
+        };
+        if file_type == FileType::Directory {
+            let parsed_uuid = if name_bytes.len() == uuid::fmt::Hyphenated::LENGTH {
+                std::str::from_utf8(name_bytes).ok().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
+            }
+            valid_entries += 1;
+        } else if file_type == FileType::RegularFile {
+            valid_entries += 1;
+        } else {
+            continue;
+        }
+
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
+        if valid_entries == entry_limit {
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
+        }
+    }
+
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+pub(crate) fn has_non_data_dir_entry_lazy(
+    path: impl AsRef<Path>,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    match has_non_data_dir_entry_lazy_inner(path.as_ref(), load_data_dirs) {
+        Ok(res) => Ok(res),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn has_non_data_dir_entry_lazy_inner(
+    path: &Path,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    let mut dir = std::fs::read_dir(path)?;
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
+    let mut valid_entries = 0usize;
+
+    for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
+        let Some(entry) = dir.next() else {
+            return Ok((data_dirs.unwrap_or_default(), false));
         };
         let entry = entry?;
         let file_name = entry.file_name();
@@ -2741,18 +2869,24 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            let is_data_dir = file_name.len() == uuid::fmt::Hyphenated::LENGTH
-                && file_name
-                    .to_str()
-                    .and_then(|s| {
-                        let parsed = uuid::Uuid::try_parse(s).ok()?;
-                        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
-                        (parsed.hyphenated().encode_lower(&mut buf) == s && data_dirs.binary_search(&parsed).is_ok())
-                            .then_some(())
-                    })
-                    .is_some();
-            if !is_data_dir {
-                return Ok(true);
+            let parsed_uuid = if file_name.len() == uuid::fmt::Hyphenated::LENGTH {
+                file_name.to_str().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
             }
             valid_entries += 1;
         } else if file_type.is_file() {
@@ -2761,12 +2895,19 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
             continue;
         }
 
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
         if valid_entries == entry_limit {
-            return Ok(true);
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
         }
     }
 
-    Ok(true)
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
@@ -3808,6 +3949,23 @@ pub(crate) async fn rename_all_with_prepared_source(
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
+    guard.directories.prepare_destination().map_err(to_file_error)?;
+    #[cfg(test)]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+    }
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, destination)
+        .map_err(to_file_error)?;
+    guard.directories.rename(source, destination, None).map_err(to_file_error)?;
+    Ok(())
+}
+
 #[cfg(not(windows))]
 pub(crate) async fn rename_all_with_commit_guard(
     src_file_path: impl AsRef<Path>,
@@ -4777,6 +4935,17 @@ impl PublicationRoot {
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_directory_and_readonly_child(
+        &self,
+        dir_path: &Path,
+        child_name: &str,
+    ) -> io::Result<(std::fs::File, std::fs::File)> {
+        let dir = self.open_directory(dir_path)?;
+        let child = open_linux_relative(&dir, Path::new(child_name), rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty())?;
+        Ok((dir, child))
     }
 
     #[cfg(target_os = "linux")]
@@ -6483,6 +6652,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {
@@ -10931,6 +11101,54 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
+    #[test]
+    fn has_non_data_dir_entry_lazy_skips_loader_when_only_xl_meta_exists() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("xl.meta"), b"meta").expect("write xl.meta");
+        let mut called = 0usize;
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![uuid::Uuid::new_v4()]
+        })
+        .expect("lazy check must succeed");
+        assert_eq!(called, 0, "inline object dir without subdirs must not invoke loader");
+        assert!(dirs.is_empty());
+        assert!(!has_child);
+
+        #[cfg(target_os = "linux")]
+        {
+            let pub_root = PublicationRoot::new(temp_dir.path()).expect("open pub root");
+            let (dir_fd, _meta) = pub_root
+                .open_directory_and_readonly_child(temp_dir.path(), "xl.meta")
+                .expect("open dir and child");
+            let mut fd_called = 0usize;
+            let (fd_dirs, fd_has_child) = has_non_data_dir_entry_lazy_from_fd(&dir_fd, || {
+                fd_called += 1;
+                vec![uuid::Uuid::new_v4()]
+            })
+            .expect("fd lazy check must succeed");
+            assert_eq!(fd_called, 0);
+            assert!(fd_dirs.is_empty());
+            assert!(!fd_has_child);
+        }
+
+        let data_dir = uuid::Uuid::new_v4();
+        std::fs::create_dir(temp_dir.path().join(data_dir.to_string())).expect("create data dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![data_dir]
+        })
+        .expect("lazy check with data dir must succeed");
+        assert_eq!(called, 1, "data dir presence must invoke loader once");
+        assert_eq!(dirs, vec![data_dir]);
+        assert!(!has_child);
+
+        std::fs::create_dir(temp_dir.path().join("nested-key")).expect("create nested child dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || vec![data_dir]).expect("lazy check child");
+        assert_eq!(dirs, vec![data_dir], "child presence must still return data_dirs for skip set");
+        assert!(has_child);
+    }
+
     #[tokio::test]
     #[serial_test::serial(file_sync_probe)]
     async fn resource_grouped_fdatasync_retired_limiter_keeps_its_budget_until_worker_cleanup() {
@@ -11100,54 +11318,71 @@ mod tests {
 
     #[tokio::test]
     async fn resource_native_dispatch_retains_each_unit_after_caller_cancellation() {
-        use crate::disk::io_admission::with_background_resource_unit;
-        use rustfs_concurrency::adaptive::AdaptiveAdmission;
-        use std::num::NonZeroU16;
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
 
         let mut retained = Vec::new();
-        for lane in [None, Some(DiskBlockingLane::Foreground), Some(DiskBlockingLane::Fsync)] {
-            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
-            let unit = gate.acquire().await;
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let (finished_tx, finished_rx) = oneshot::channel();
-            let worker = tokio::spawn(with_background_resource_unit(unit, async move {
-                let operation = move || {
-                    started_tx.send(()).expect("native operation entered");
-                    let _ = release_rx.blocking_recv();
-                    let _ = finished_tx.send(());
-                    Ok(())
-                };
-                match lane {
-                    Some(lane) => {
-                        DiskBlockingQueue::new()
-                            .run_on_lane(
-                                lane,
-                                "native operation failed",
-                                DiskBlockingQueue::test_stages_for_lane(lane),
-                                move |_| operation(),
-                            )
-                            .await
+        for physical_count in [1, 2] {
+            for lane in [
+                None,
+                Some(DiskBlockingLane::Foreground),
+                Some(DiskBlockingLane::Isolated),
+                Some(DiskBlockingLane::Fsync),
+            ] {
+                let (unit, gates) = test_resource_units(physical_count);
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let (finished_tx, finished_rx) = oneshot::channel();
+                let worker = tokio::spawn(with_optional_resource_unit(Some(unit), async move {
+                    let operation = move || {
+                        started_tx.send(()).expect("native operation entered");
+                        let _ = release_rx.blocking_recv();
+                        let _ = finished_tx.send(());
+                        Ok(())
+                    };
+                    match lane {
+                        Some(lane) => {
+                            DiskBlockingQueue::new()
+                                .run_on_lane(
+                                    lane,
+                                    "native operation failed",
+                                    DiskBlockingQueue::test_stages_for_lane(lane),
+                                    move |_| operation(),
+                                )
+                                .await
+                        }
+                        None => fsync_spawn_blocking(operation).await.expect("native operation joined"),
                     }
-                    None => fsync_spawn_blocking(operation).await.expect("native operation joined"),
-                }
-            }));
-            started_rx.await.expect("native operation started");
-            worker.abort();
-            assert!(worker.await.expect_err("caller cancelled").is_cancelled());
-            retained.push(gate.snapshot().active);
-            // Drain native work before assertions, including in the negative control.
-            release_tx.send(()).expect("release native operation");
-            finished_rx.await.expect("native operation finished");
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while gate.snapshot().active != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("native completion returns the unit");
+                }));
+                started_rx.await.expect("native operation started");
+                worker.abort();
+                assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+                retained.push(gates.iter().map(|gate| gate.snapshot().active).collect::<Vec<_>>());
+                // Drain native work before assertions, including in the negative control.
+                release_tx.send(()).expect("release native operation");
+                finished_rx.await.expect("native operation finished");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native completion returns the unit");
+            }
         }
-        assert_eq!(retained, [1, 1, 1], "fsync and both queue lanes must retain their own producer's unit");
+        assert_eq!(
+            retained,
+            [
+                vec![1],
+                vec![1],
+                vec![1],
+                vec![1],
+                vec![1, 1],
+                vec![1, 1],
+                vec![1, 1],
+                vec![1, 1]
+            ],
+            "native dispatch and all queue lanes must retain their own producer's units"
+        );
     }
 
     #[tokio::test]

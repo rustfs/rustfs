@@ -474,14 +474,17 @@ fn scan_cycle_partial_reason(reason: Option<ScannerCycleBudgetReason>) -> ScanCy
     match reason {
         Some(ScannerCycleBudgetReason::Runtime) => ScanCyclePartialReason::Runtime,
         Some(ScannerCycleBudgetReason::Objects) => ScanCyclePartialReason::Objects,
-        Some(ScannerCycleBudgetReason::Directories) => ScanCyclePartialReason::Directories,
+        // Raw enumeration is directory work; the reason set is a stable metric label.
+        Some(ScannerCycleBudgetReason::Directories | ScannerCycleBudgetReason::Entries) => ScanCyclePartialReason::Directories,
         None => ScanCyclePartialReason::Unknown,
     }
 }
 
 fn scan_cycle_partial_source(reason: Option<ScannerCycleBudgetReason>) -> Option<ScannerWorkSource> {
     match reason {
-        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories) => Some(ScannerWorkSource::Usage),
+        Some(ScannerCycleBudgetReason::Objects | ScannerCycleBudgetReason::Directories | ScannerCycleBudgetReason::Entries) => {
+            Some(ScannerWorkSource::Usage)
+        }
         Some(ScannerCycleBudgetReason::Runtime) | None => None,
     }
 }
@@ -1059,6 +1062,31 @@ fn prepare_cycle_for_usage_floor_bootstrap(
     }
 }
 
+/// Overwrite an unreadable usage floor with a bootstrap marker using the
+/// file's current revision for CAS. A successful publish leaves a
+/// `BootstrapPending` floor that the normal load path picks up on retry.
+/// Returns `Err` when the floor is not even readable (transient I/O) so the
+/// caller keeps the supervisor-retry behavior instead of rebuilding.
+async fn rebuild_unreadable_usage_floor(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<(), ScannerError> {
+    let Some(expected_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner usage floor rebuild is blocked by data movement".to_string()));
+    };
+    let (_data, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("scanner usage floor revision unreadable for rebuild: {err}")))?;
+    publish_scanner_usage_bootstrap_primary(
+        storeapi,
+        &revision,
+        expected_epoch,
+        None,
+        ScannerUsageBootstrapPublishContext::Recovery,
+        || true,
+    )
+    .await
+}
+
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     init_data_scanner_with_storage(ctx, storeapi, ScannerRuntimeGuard::new()).await;
 }
@@ -1079,15 +1107,17 @@ async fn run_scanner_usage_recovery_intents_for_startup(
     Ok(attempted)
 }
 
-/// Start normal scanning when enabled, or one bounded recovery attempt.
-/// The disabled branch returns a finite task for the startup owner to join;
-/// it never enables ordinary namespace scanning while it replays durable reset
-/// intents and cleanup markers.
+/// Return the normal scanner supervisor or one finite disabled recovery task.
+/// The disabled branch never enables ordinary namespace scanning while it
+/// replays durable reset intents and cleanup markers.
 pub async fn init_scanner_with_recovery(
     ctx: CancellationToken,
     storeapi: Arc<ECStore>,
     enabled: bool,
 ) -> Option<tokio::task::JoinHandle<()>> {
+    #[cfg(feature = "hotpath-alloc")]
+    drop(hotpath::MeasurementGuardSync::new("cache_model.owned_copy", false, false));
+
     if enabled {
         let runtime_guard = ScannerRuntimeGuard::new();
         if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
@@ -1101,8 +1131,7 @@ pub async fn init_scanner_with_recovery(
                 "Scanner recovery intent startup discovery failed"
             );
         }
-        init_data_scanner_with_storage(ctx, storeapi, runtime_guard).await;
-        return None;
+        return Some(init_data_scanner_task_with_storage(ctx, storeapi, runtime_guard).await);
     }
     Some(tokio::spawn(async move {
         if let Err(error) = run_scanner_usage_recovery_intents_for_startup(ctx.clone(), storeapi.clone()).await {
@@ -1130,7 +1159,19 @@ pub async fn init_scanner_with_recovery(
     }))
 }
 
-async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>, mut runtime_guard: ScannerRuntimeGuard)
+async fn init_data_scanner_with_storage<S>(ctx: CancellationToken, storeapi: Arc<S>, runtime_guard: ScannerRuntimeGuard)
+where
+    S: ScannerStorage,
+{
+    // Preserve the existing detached-start contract for legacy callers.
+    drop(init_data_scanner_task_with_storage(ctx, storeapi, runtime_guard).await);
+}
+
+async fn init_data_scanner_task_with_storage<S>(
+    ctx: CancellationToken,
+    storeapi: Arc<S>,
+    mut runtime_guard: ScannerRuntimeGuard,
+) -> tokio::task::JoinHandle<()>
 where
     S: ScannerStorage,
 {
@@ -1241,7 +1282,7 @@ where
                 break;
             }
         }
-    });
+    })
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -2024,6 +2065,8 @@ where
             resolved_scope_observer: None,
             #[cfg(test)]
             post_walk_gate: None,
+            #[cfg(test)]
+            peer_observations: None,
         },
     )
     .await;
@@ -2164,6 +2207,9 @@ where
         scanner_post_lease_activity_defer_reason(
             result.activity_baseline(),
             probe_scanner_activity(storeapi.as_ref(), true).await,
+            result
+                .remote_dirty_usage_certification()
+                .zip(remote_publication_leases.as_ref().map(|(_, grants)| grants.as_slice())),
         )
     } else {
         None
@@ -2515,9 +2561,24 @@ where
     } else {
         "incomplete_coverage"
     };
+    #[cfg(feature = "e2e-test-hooks")]
+    let durable_observation = scan_cycle_result
+        .publication_expectation()
+        .as_ref()
+        .and_then(|expected| usage_publication_result.e2e_durable_observation(leader_epoch, cycle_info.current, expected));
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(observation) = &durable_observation {
+        let _ = crate::e2e_barrier::checkpoint("root_durable", observation.clone()).await;
+    }
     let pending_dirty_usage_buckets = scan_cycle_result.pending_dirty_usage_buckets();
     let (completion_outcome, scanner_pending_maintenance_work, remote_dirty_usage_acknowledgements) =
         finalize_scanner_cycle_result(scan_cycle_result, usage_publication_result);
+    #[cfg(feature = "e2e-test-hooks")]
+    if let Some(mut observation) = durable_observation {
+        observation["acks"] = crate::e2e_barrier::acknowledgement_observations(&remote_dirty_usage_acknowledgements);
+        observation["pending_bucket_count"] = serde_json::json!(pending_dirty_usage_buckets);
+        let _ = crate::e2e_barrier::checkpoint("ack_send", observation).await;
+    }
     let remote_dirty_usage_pending = if remote_dirty_usage_acknowledgements.is_empty() {
         false
     } else if let Some(notification_system) = storeapi.scanner_notification_system() {
@@ -3054,6 +3115,27 @@ where
             Err(err) => usage_floor_result = Err(err),
         }
     }
+    // backlog#2918: after dual-corruption recovery has been attempted an
+    // unreadable floor is no longer a quota proof. Report the failure, then
+    // rebuild through a CAS overwrite before giving up. Transient I/O errors
+    // fail the rebuild and fall through to the supervisor-retry stop below.
+    if usage_floor_result.is_err() {
+        let error = usage_floor_result.as_ref().unwrap_err().to_string();
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            state = "usage_floor_load_failed",
+            error = %error,
+            "Scanner usage floor is unreadable after recovery; attempting rebuild"
+        );
+        record_scanner_usage_floor_failure(error);
+        if rebuild_unreadable_usage_floor(storeapi.clone()).await.is_ok() {
+            usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+        }
+    }
     let (usage_floor, usage_floor_startup) = match usage_floor_result {
         Ok(result) => result,
         Err(err) => {
@@ -3066,7 +3148,7 @@ where
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                 state = "usage_floor_load_failed",
                 error = %err,
-                "Scanner stopped because the persisted usage floor could not be loaded"
+                "Scanner usage floor could not be loaded or rebuilt; stopping leader iteration for supervisor retry"
             );
             record_scanner_usage_floor_failure(error.clone());
             global_metrics().set_cycle(None).await;
@@ -3949,18 +4031,26 @@ impl ScannerCyclePublicationPlan {
 /// Re-prove the guardrail after every peer granted a publication lease. The
 /// comparison uses the guardrail fields (`scanner_activity_guardrail_veto`),
 /// not the full digest: local generation movement in this window is the next
-/// cycle's work and its buckets stay in the dirty map. A peer whose dirty
-/// usage moved keeps deferring in this phase, as it does during the walk.
+/// cycle's work and its buckets stay in the dirty map. A sealed producer
+/// proof may cover peer dirty movement too, but must bind every lease owner
+/// and session without changing its candidate or acknowledged tuples.
 fn scanner_post_lease_activity_defer_reason(
     baseline: Option<&ScannerActivitySnapshot>,
     activity: Result<ScannerActivitySnapshot, String>,
+    certification: Option<(
+        &crate::scanner_io::ScannerRemoteDirtyUsageCertification,
+        &[crate::storage_api::EcstoreScannerPublicationLeaseGrant],
+    )>,
 ) -> Option<ScannerCycleDeferReason> {
     match activity {
         Ok(snapshot)
             if scanner_activity_allows_usage_publication(&snapshot)
                 && baseline.is_some_and(|baseline| {
                     scanner_activity_guardrail_veto(baseline, &snapshot).is_none()
-                        && scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none()
+                        && certification.map_or_else(
+                            || scanner_peer_dirty_usage_moved(baseline, &snapshot).is_none(),
+                            |(proof, grants)| proof.matches_publication_leases(grants) && proof.matches_activity(&snapshot),
+                        )
                 }) =>
         {
             None
@@ -3970,6 +4060,13 @@ fn scanner_post_lease_activity_defer_reason(
                 Err(_) => "probe_failed",
                 Ok(snapshot) if !scanner_activity_allows_usage_publication(snapshot) => "publication_blocked",
                 Ok(_) if baseline.is_none() => "baseline_missing",
+                Ok(snapshot)
+                    if certification.is_some_and(|(proof, grants)| {
+                        !proof.matches_publication_leases(grants) || !proof.matches_activity(snapshot)
+                    }) =>
+                {
+                    "peer_certification"
+                }
                 Ok(snapshot) => baseline
                     .and_then(|baseline| {
                         scanner_activity_guardrail_veto(baseline, snapshot)
@@ -4133,6 +4230,7 @@ fn finalize_scanner_cycle_result(
                 .is_some_and(|proof| proof.verified_version_for(expected).is_some())
         });
     let pending_maintenance_work = scan_cycle_result.has_pending_maintenance_work()
+        || scan_cycle_result.has_remote_dirty_usage_pending()
         || (scan_cycle_result.has_dirty_usage_to_acknowledge() && !durable_complete_snapshot);
     let remote_dirty_usage_acknowledgements = if durable_complete_snapshot {
         match proof {

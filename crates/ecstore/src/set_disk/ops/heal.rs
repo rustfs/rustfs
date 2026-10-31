@@ -13,14 +13,14 @@
 // limitations under the License.
 
 use super::super::{
-    Bytes, CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL,
-    Error, FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
+    CHECK_PART_FILE_CORRUPT, CHECK_PART_SUCCESS, DeleteOptions, DiskError, DiskStore, DriveState, EVENT_SET_DISK_HEAL, Error,
+    FileInfo, HashAlgorithm, HashMap, HealDriveInfo, HealItemType, HealOpts, HealResultItem, HealScanMode, Infos,
     LOG_SUBSYSTEM_SET_DISK, ObjectInfo, ObjectOptions, ObjectPartInfo, Path, RUSTFS_META_TMP_BUCKET, ReadOptions, Result,
-    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_reader,
-    create_bitrot_writer, debug, disk, disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata,
-    formats_match_reference_slots, get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix,
-    heal_bucket_local_on_disks, is_object_dir_dangling, join_all, load_format_erasure_all, path_join_buf, save_format_file,
-    should_heal_object_on_disk, stat_all_dirs, to_object_err, warn,
+    SLASH_SEPARATOR, SetDisks, StorageError, Uuid, coding, count_errs, count_part_not_success, create_bitrot_writer, debug, disk,
+    disks_with_all_parts, encode_dir_object, error, file_info_is_valid_for_metadata, formats_match_reference_slots,
+    get_format_erasure_in_quorum, get_lock_acquire_timeout, has_suffix, heal_bucket_local_on_disks, is_object_dir_dangling,
+    join_all, load_format_erasure_all, path_join_buf, save_format_file, should_heal_object_on_disk, stat_all_dirs, to_object_err,
+    warn,
 };
 use crate::bucket::retirement::MarkerRetirementContext;
 use crate::diagnostics::object_lock::ObjectLockAttempt;
@@ -52,7 +52,7 @@ fn pin_object_heal_future<F: std::future::Future>(build: impl FnOnce() -> F) -> 
 use crate::disk::DataDirDeleteStatus;
 use crate::disk::DiskAPI;
 use crate::disk::local::{DELETE_DATA_DIR_MARKER_PREFIX, metadata_less_part_file};
-use crate::io_support::bitrot::object_mmap_read_enabled;
+use crate::io_support::bitrot::{create_bitrot_reader_from_bytes, object_mmap_read_enabled};
 use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use rustfs_common::mrf_channel::MrfDeleteMarkerPurge;
 use rustfs_common::trace_bus::{TraceEvent, TraceFunc, TraceKind, trace_emit};
@@ -1236,6 +1236,7 @@ impl SetDisks {
                         result.object_size =
                             ObjectInfo::from_file_info(&latest_meta, bucket, object, true).get_actual_size()? as usize;
                         result.resolved_version_id = Some(*latest_meta.version_id.unwrap_or_default().as_bytes());
+                        result.quorum_selected_data_dir = selected_heal_data_dir(&latest_meta, opts);
                         // Loop to find number of disks with valid data, per-drive
                         // data state and a list of outdated disks on which data needs
                         // to be healed.
@@ -1423,13 +1424,9 @@ impl SetDisks {
                                 );
                             }
 
-                            // A no-remove request cannot turn surviving same-version
-                            // data into dangling cleanup or its grace deferral.
-                            let preserve_surviving_data = !opts.remove
-                                && data_errs_by_disk
-                                    .values()
-                                    .any(|parts| !parts.is_empty() && parts.iter().all(|status| *status == CHECK_PART_SUCCESS));
-                            if read_repair_uses_shared_lock || preserve_unrepairable || preserve_surviving_data {
+                            // A no-remove request cannot turn surviving data into dangling
+                            // cleanup or its grace deferral.
+                            if read_repair_uses_shared_lock || preserve_unrepairable || !opts.remove {
                                 return Ok((result, Some(cannot_heal_err)));
                             }
 
@@ -1815,8 +1812,8 @@ impl SetDisks {
                                                 checksum_info.algorithm
                                             };
 
-                                            match create_bitrot_reader(
-                                                metadata.data.as_deref(),
+                                            match create_bitrot_reader_from_bytes(
+                                                metadata.data.clone(),
                                                 Some(disk),
                                                 bucket,
                                                 &path_join_buf(&[object, &src_data_dir, &format!("part.{}", part.number)]),
@@ -1913,8 +1910,7 @@ impl SetDisks {
                                                 // if let Some(w) = writer.as_any().downcast_ref::<BitrotFileWriter>() {
                                                 //     parts_metadata[index].data = Some(w.inline_data().to_vec());
                                                 // }
-                                                parts_metadata[index].data =
-                                                    Some(writer.into_inline_data().map(Bytes::from).unwrap_or_default());
+                                                parts_metadata[index].data = Some(writer.into_inline_data().unwrap_or_default());
                                             }
                                             parts_metadata[index].set_inline_data();
                                         } else {
@@ -2202,6 +2198,13 @@ impl SetDisks {
                 }
             }
             Err(err) => {
+                // All replicas explicitly missing was handled before the
+                // quorum check. A partial read cannot prove object absence.
+                let err = if matches!(err, DiskError::FileNotFound | DiskError::FileVersionNotFound) {
+                    DiskError::ErasureReadQuorum
+                } else {
+                    err
+                };
                 if let Some(retirement) = retirement
                     && parts_metadata
                         .iter()
@@ -2241,7 +2244,8 @@ impl SetDisks {
                     }
                     return Ok((item, cleanup.err()));
                 }
-                if allow_explicit_version_regen
+                if !opts.dry_run
+                    && allow_explicit_version_regen
                     && !version_id.is_empty()
                     && self
                         .try_regenerate_explicit_version_meta(bucket, object, version_id, &parts_metadata, &errs, &disks)
@@ -2260,7 +2264,7 @@ impl SetDisks {
                     .await;
                 }
 
-                if opts.dry_run || preserve_unrepairable {
+                if opts.dry_run || preserve_unrepairable || !opts.remove {
                     return Ok((
                         self.default_heal_result(FileInfo::default(), &errs, bucket, object, version_id)
                             .await,
@@ -3261,6 +3265,13 @@ impl SetDisks {
     }
 }
 
+fn selected_heal_data_dir(metadata: &FileInfo, opts: &HealOpts) -> Option<[u8; 16]> {
+    if opts.read_repair || opts.dry_run || metadata.deleted || metadata.is_remote() {
+        return None;
+    }
+    metadata.data_dir.filter(|id| !id.is_nil()).map(|id| *id.as_bytes())
+}
+
 fn finalize_object_heal_result(
     mut result: HealResultItem,
     mut error: Option<Error>,
@@ -3283,6 +3294,9 @@ fn finalize_object_heal_result(
             required: 1,
             achieved: 0,
         });
+    }
+    if error.is_some() {
+        result.quorum_selected_data_dir = None;
     }
     (result, error)
 }
@@ -3998,6 +4012,7 @@ mod heal_result_report_tests {
             metadata_verified: true,
             metadata_repair_verified: true,
             legacy_identity_unverified: true,
+            quorum_selected_data_dir: Some([1; 16]),
             ..Default::default()
         };
 
@@ -4008,6 +4023,7 @@ mod heal_result_report_tests {
         assert!(!result.metadata_verified);
         assert!(!result.metadata_repair_verified);
         assert!(!result.legacy_identity_unverified);
+        assert_eq!(result.quorum_selected_data_dir, None);
         assert!(absence.is_none());
         assert!(matches!(
             error,
@@ -4019,6 +4035,134 @@ mod heal_result_report_tests {
                 achieved: 0,
             }) if bucket == "bucket" && object == "object"
         ));
+    }
+
+    #[test]
+    fn selected_data_dir_is_a_quorum_metadata_observation() {
+        let generation = Uuid::new_v4();
+        let mut metadata = FileInfo {
+            data_dir: Some(generation),
+            ..Default::default()
+        };
+        let opts = HealOpts::default();
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), Some(*generation.as_bytes()));
+        assert_eq!(
+            super::selected_heal_data_dir(&metadata, &HealOpts { no_lock: true, ..opts }),
+            Some(*generation.as_bytes())
+        );
+        assert_eq!(super::selected_heal_data_dir(&metadata, &HealOpts { dry_run: true, ..opts }), None);
+        assert_eq!(
+            super::selected_heal_data_dir(
+                &metadata,
+                &HealOpts {
+                    read_repair: true,
+                    ..opts
+                }
+            ),
+            None
+        );
+        metadata.data_dir = Some(Uuid::nil());
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.data_dir = None;
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.data_dir = Some(generation);
+        metadata.deleted = true;
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+        metadata.deleted = false;
+        metadata.transition_status = TRANSITION_COMPLETE.to_owned();
+        assert_eq!(super::selected_heal_data_dir(&metadata, &opts), None);
+    }
+
+    #[test]
+    fn failed_heal_does_not_publish_selected_generation() {
+        let result = rustfs_madmin::heal_commands::HealResultItem {
+            quorum_selected_data_dir: Some([1; 16]),
+            ..Default::default()
+        };
+        let mut absence = None;
+        let (result, error) =
+            super::finalize_object_heal_result(result, Some(Error::FileNotFound), &mut absence, false, "b", "o");
+        assert!(error.is_some());
+        assert_eq!(result.quorum_selected_data_dir, None);
+    }
+
+    #[tokio::test]
+    async fn heal_result_observes_current_generation_after_unversioned_overwrite() {
+        let (_temp_dirs, _disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "heal-result-generation";
+        let object = "object.bin";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create test bucket");
+
+        let put_opts = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        let mut first = PutObjReader::from_vec(vec![0x11; 1024 * 1024]);
+        let first_info = set
+            .put_object(bucket, object, &mut first, &put_opts)
+            .await
+            .expect("write first generation");
+        let first_generation = first_info.data_dir.expect("first object data directory");
+        let heal_opts = HealOpts {
+            scan_mode: HealScanMode::Deep,
+            ..Default::default()
+        };
+        let (first_result, first_error) =
+            crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &heal_opts)
+                .await
+                .expect("heal first generation");
+        assert!(first_error.is_none());
+        assert_eq!(first_result.quorum_selected_data_dir, Some(*first_generation.as_bytes()));
+
+        let mut second = PutObjReader::from_vec(vec![0x22; 1024 * 1024]);
+        let second_info = set
+            .put_object(bucket, object, &mut second, &put_opts)
+            .await
+            .expect("overwrite unversioned object");
+        let second_generation = second_info.data_dir.expect("second object data directory");
+        assert_ne!(first_generation, second_generation);
+        let (second_result, second_error) =
+            crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &heal_opts)
+                .await
+                .expect("heal second generation");
+        assert!(second_error.is_none());
+        assert_eq!(second_result.quorum_selected_data_dir, Some(*second_generation.as_bytes()));
+        assert_ne!(second_result.quorum_selected_data_dir, first_result.quorum_selected_data_dir);
+
+        let (unlocked_result, unlocked_error) = crate::storage_api_contracts::heal::HealOperations::heal_object(
+            set.as_ref(),
+            bucket,
+            object,
+            "",
+            &HealOpts {
+                no_lock: true,
+                ..heal_opts
+            },
+        )
+        .await
+        .expect("observe quorum selection without a namespace lock");
+        assert!(unlocked_error.is_none());
+        assert_eq!(unlocked_result.quorum_selected_data_dir, Some(*second_generation.as_bytes()));
+
+        for opts in [
+            HealOpts {
+                read_repair: true,
+                ..heal_opts
+            },
+            HealOpts {
+                dry_run: true,
+                ..heal_opts
+            },
+        ] {
+            let (result, error) =
+                crate::storage_api_contracts::heal::HealOperations::heal_object(set.as_ref(), bucket, object, "", &opts)
+                    .await
+                    .expect("observe heal without an eligible lock");
+            assert!(error.is_none());
+            assert_eq!(result.quorum_selected_data_dir, None);
+        }
     }
 
     #[test]
@@ -7525,12 +7669,13 @@ mod heal_result_report_tests {
                 "",
                 &HealOpts {
                     no_lock: true,
+                    remove: true,
                     ..Default::default()
                 },
             )
             .await
             .expect("unsafe dangling state should be reported without deletion");
-        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")
@@ -7571,6 +7716,7 @@ mod heal_result_report_tests {
                 .expect("seed exact stale historical version");
             let opts = HealOpts {
                 no_lock: true,
+                remove: true,
                 scan_mode: HealScanMode::Deep,
                 ..Default::default()
             };
@@ -7646,6 +7792,443 @@ mod heal_result_report_tests {
         .await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn heal_without_remove_preserves_unrecoverable_unversioned_shards() {
+        use crate::disk::{CHECK_PART_FILE_NOT_FOUND, CHECK_PART_SUCCESS};
+        use crate::object_api::WriteCompletion;
+        use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+        use std::time::Duration;
+
+        // Exercise the same on-disk layout with explicit removal first, so
+        // an unrelated early failure cannot masquerade as preservation.
+        for remove in [true, false] {
+            let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+            let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(45), async {
+                let bucket = if remove {
+                    "heal-remove-unversioned"
+                } else {
+                    "heal-preserve-unversioned"
+                };
+                let object = "object.bin";
+                let old_time = OffsetDateTime::from_unix_timestamp(1).expect("fixture modification time");
+                let elapsed = (OffsetDateTime::now_utc() - old_time).whole_seconds();
+                let grace = rustfs_utils::get_env_u64("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", 3600);
+                assert!(
+                    elapsed > i64::try_from(grace).unwrap_or(i64::MAX),
+                    "fixture must be outside the configured dangling-delete grace period"
+                );
+                set.make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("create fixture bucket");
+                let options = ObjectOptions {
+                    mod_time: Some(old_time),
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                };
+                set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x5a; 1024 * 1024]), &options)
+                    .await
+                    .expect("write all four fixture shards");
+
+                let mut metadata = Vec::new();
+                let mut infos = Vec::new();
+                for (dir, disk) in dirs.iter().zip(&disks) {
+                    metadata.push(
+                        tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("read each committed metadata file"),
+                    );
+                    infos.push(
+                        disk.read_version("", bucket, object, "", &ReadOptions::default())
+                            .await
+                            .expect("read each committed unversioned metadata replica"),
+                    );
+                }
+                let selected = &infos[0];
+                let data_dir = selected.data_dir.expect("fixture must be non-inline");
+                assert!(selected.version_id.is_none_or(|id| id.is_nil()));
+                assert_eq!(selected.mod_time, Some(old_time));
+                let missing_count = selected.erasure.parity_blocks + 1;
+                assert!(missing_count < disks.len(), "at least one physical shard must survive");
+                assert!(infos.iter().all(|info| {
+                    info.data_dir == Some(data_dir)
+                        && info.version_id.is_none_or(|id| id.is_nil())
+                        && info.erasure.parity_blocks == selected.erasure.parity_blocks
+                }));
+                let part_path = |dir: &TempDir| dir.path().join(bucket).join(object).join(data_dir.to_string()).join("part.1");
+                let surviving_shard = tokio::fs::read(part_path(&dirs[missing_count]))
+                    .await
+                    .expect("read the shard that must survive");
+                for dir in dirs.iter().take(missing_count) {
+                    tokio::fs::remove_file(part_path(dir)).await.expect("remove one exact shard");
+                }
+                for (index, (disk, info)) in disks.iter().zip(&infos).enumerate() {
+                    let checked = disk.check_parts(bucket, object, info).await.expect("check fixture shards");
+                    let expected = if index < missing_count {
+                        CHECK_PART_FILE_NOT_FOUND
+                    } else {
+                        CHECK_PART_SUCCESS
+                    };
+                    assert_eq!(checked.results, vec![expected], "disk {index} has the intended shard state");
+                }
+                let visible = set
+                    .get_object_info(
+                        bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("metadata quorum remains visible before heal");
+                assert_eq!(visible.data_dir, Some(data_dir));
+
+                let (result, error) = <SetDisks as crate::storage_api_contracts::heal::HealOperations>::heal_object(
+                    set.as_ref(),
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        remove,
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("heal returns an object result");
+                if remove {
+                    assert!(error.is_none(), "explicit dangling cleanup must succeed: {error:?}");
+                    for dir in &dirs {
+                        assert!(
+                            tokio::fs::metadata(dir.path().join(bucket))
+                                .await
+                                .expect("bucket remains readable")
+                                .is_dir()
+                        );
+                        assert!(
+                            matches!(
+                                tokio::fs::symlink_metadata(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE)).await,
+                                Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                            ),
+                            "explicit removal must remove the metadata replica"
+                        );
+                    }
+                    assert!(
+                        matches!(tokio::fs::symlink_metadata(part_path(&dirs[missing_count])).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound),
+                        "explicit removal must remove the surviving shard"
+                    );
+                    assert_eq!(result.after.drives.len(), disks.len());
+                    assert!(
+                        result
+                            .after
+                            .drives
+                            .iter()
+                            .all(|drive| drive.state == DriveState::Missing.to_string())
+                    );
+                } else {
+                    for (index, (dir, before)) in dirs.iter().zip(&metadata).enumerate() {
+                        let after = tokio::fs::read(dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE))
+                            .await
+                            .expect("remove=false must keep each metadata replica");
+                        assert_eq!(&after, before, "remove=false changed metadata on disk {index}");
+                    }
+                    assert_eq!(
+                        tokio::fs::read(part_path(&dirs[missing_count]))
+                            .await
+                            .expect("remove=false must keep the surviving shard"),
+                        surviving_shard
+                    );
+                    assert!(matches!(&error, Some(Error::ErasureReadQuorum)), "unexpected heal result: {error:?}");
+                    assert_eq!(result.before.drives.len(), disks.len());
+                    assert_eq!(
+                        result
+                            .before
+                            .drives
+                            .iter()
+                            .filter(|drive| drive.state == DriveState::Missing.to_string())
+                            .count(),
+                        missing_count
+                    );
+                    let mut absence = None;
+                    let (_, proof_error) = set
+                        .heal_object_with_absence(
+                            bucket,
+                            object,
+                            "",
+                            &HealOpts {
+                                scan_mode: HealScanMode::Deep,
+                                ..Default::default()
+                            },
+                            &mut absence,
+                            AbsenceProofRequest {
+                                retirement: None,
+                                allow_unversioned: true,
+                            },
+                        )
+                        .await
+                        .expect("repeat through the absence-proof path");
+                    assert!(matches!(proof_error, Some(Error::ErasureReadQuorum)));
+                    assert!(absence.is_none(), "surviving shards cannot produce an absence proof");
+                }
+            }))
+            .catch_unwind()
+            .await;
+            drop(set);
+            drop(disks);
+            if !matches!(&outcome, Ok(Ok(()))) {
+                let retained: Vec<_> = dirs.into_iter().map(TempDir::keep).collect();
+                eprintln!("unrecoverable-shard fixture retained: {retained:?}");
+                match outcome {
+                    Ok(Err(_)) => panic!("unrecoverable-shard fixture timed out"),
+                    Err(panic) => std::panic::resume_unwind(panic),
+                    Ok(Ok(())) => unreachable!(),
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_without_remove_preserves_explicit_version_metadata_during_dry_run() {
+        use crate::object_api::{ShardIntegrityWriteMode, WriteCompletion};
+        use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+        use std::time::Duration;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(45), async {
+            let bucket = "heal-dry-run-versioned";
+            let object = "object.bin";
+            set.make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create fixture bucket");
+            let original = set
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![0x67; 1024 * 1024]),
+                    &ObjectOptions {
+                        versioned: true,
+                        shard_integrity_write_mode: Some(ShardIntegrityWriteMode::Legacy),
+                        write_completion: WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write a real version on all four disks");
+            let version = original.version_id.expect("explicit version");
+            assert!(!version.is_nil());
+            let generation = original.data_dir.expect("external data generation");
+            let version_string = version.to_string();
+            let metadata_path = |dir: &TempDir| dir.path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+            let shard_path = |dir: &TempDir| {
+                dir.path()
+                    .join(bucket)
+                    .join(object)
+                    .join(generation.to_string())
+                    .join("part.1")
+            };
+            let mut shards = Vec::new();
+            for (dir, disk) in dirs.iter().zip(&disks) {
+                let info = disk
+                    .read_version("", bucket, object, &version_string, &ReadOptions::default())
+                    .await
+                    .expect("initial metadata on each disk");
+                assert_eq!(info.version_id, Some(version));
+                assert_eq!(info.data_dir, Some(generation));
+                assert!(info.parts.iter().all(|part| part.integrity.is_none()));
+                assert!(
+                    rustfs_filemeta::shard_integrity::descriptor_from_metadata(&info.metadata)
+                        .expect("metadata protection descriptor")
+                        .is_none()
+                );
+                shards.push(tokio::fs::read(shard_path(dir)).await.expect("save original shard"));
+            }
+            let surviving_metadata = tokio::fs::read(metadata_path(&dirs[0]))
+                .await
+                .expect("save surviving metadata");
+            for dir in dirs.iter().skip(1) {
+                tokio::fs::remove_file(metadata_path(dir))
+                    .await
+                    .expect("remove one metadata replica");
+            }
+            for disk in disks.iter().skip(1) {
+                assert!(matches!(
+                    disk.read_version("", bucket, object, &version_string, &ReadOptions::default())
+                        .await,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ));
+            }
+
+            let mut absence = None;
+            let (_, error) = set
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version_string,
+                    &HealOpts {
+                        dry_run: true,
+                        ..Default::default()
+                    },
+                    &mut absence,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+                .expect("dry-run reports the metadata quorum failure");
+            assert!(matches!(error, Some(Error::ErasureReadQuorum)), "partial metadata must not look absent");
+            assert!(absence.is_none());
+            assert_eq!(
+                tokio::fs::read(metadata_path(&dirs[0])).await.expect("surviving metadata"),
+                surviving_metadata
+            );
+            for (index, dir) in dirs.iter().enumerate() {
+                if index != 0 {
+                    assert!(matches!(
+                        tokio::fs::symlink_metadata(metadata_path(dir)).await,
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                    ));
+                }
+                assert_eq!(tokio::fs::read(shard_path(dir)).await.expect("original shard"), shards[index]);
+            }
+
+            let (_, error) = set
+                .heal_object_with_absence(
+                    bucket,
+                    object,
+                    &version_string,
+                    &HealOpts::default(),
+                    &mut absence,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+                .expect("normal heal attempts metadata regeneration");
+            assert!(error.is_none(), "normal heal must repair the same layout: {error:?}");
+            assert!(absence.is_none());
+            for (index, (dir, disk)) in dirs.iter().zip(&disks).enumerate() {
+                let info = disk
+                    .read_version("", bucket, object, &version_string, &ReadOptions::default())
+                    .await
+                    .expect("normal heal restored metadata");
+                assert_eq!(info.version_id, Some(version));
+                assert_eq!(info.data_dir, Some(generation));
+                assert_eq!(tokio::fs::read(shard_path(dir)).await.expect("original shard"), shards[index]);
+            }
+        }))
+        .catch_unwind()
+        .await;
+        drop(set);
+        drop(disks);
+        if !matches!(&outcome, Ok(Ok(()))) {
+            let retained: Vec<_> = dirs.into_iter().map(TempDir::keep).collect();
+            eprintln!("dry-run versioned fixture retained: {retained:?}");
+            match outcome {
+                Ok(Err(_)) => panic!("dry-run versioned fixture timed out"),
+                Err(panic) => std::panic::resume_unwind(panic),
+                Ok(Ok(())) => unreachable!(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn heal_without_remove_preserves_dangling_inline_metadata_and_emits_no_absence_proof() {
+        use futures::FutureExt as _;
+        use std::panic::AssertUnwindSafe;
+        use std::time::Duration;
+
+        temp_env::async_with_vars([("RUSTFS_HEAL_DANGLING_DELETE_GRACE_SECS", Some("0"))], async {
+            for remove in [true, false] {
+                let bucket = if remove {
+                    "inline-dangling-remove"
+                } else {
+                    "inline-dangling-preserve"
+                };
+                let object = "stale.txt";
+                let (dirs, set, disks) =
+                    dangling_inline_test_fixture(bucket, object, OffsetDateTime::now_utc() - time::Duration::hours(2)).await;
+                let outcome = AssertUnwindSafe(tokio::time::timeout(Duration::from_secs(45), async {
+                    let metadata = dirs[0].path().join(bucket).join(object).join(STORAGE_FORMAT_FILE);
+                    let before = tokio::fs::read(&metadata).await.expect("read surviving inline metadata");
+                    let mut absence = None;
+                    let (_, error) = set
+                        .heal_object_with_absence(
+                            bucket,
+                            object,
+                            "",
+                            &HealOpts {
+                                no_lock: true,
+                                remove,
+                                ..Default::default()
+                            },
+                            &mut absence,
+                            AbsenceProofRequest {
+                                retirement: None,
+                                allow_unversioned: true,
+                            },
+                        )
+                        .await
+                        .expect("dangling inline heal returns an object result");
+                    if remove {
+                        assert!(error.is_none(), "explicit cleanup must succeed: {error:?}");
+                        assert!(
+                            absence.as_ref().is_some_and(|proof| proof.removed),
+                            "successful cleanup must prove removal"
+                        );
+                        assert!(matches!(
+                            tokio::fs::symlink_metadata(metadata).await,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound
+                        ));
+                        let (_, missing_error) = set
+                            .heal_object_with_absence(
+                                bucket,
+                                object,
+                                "",
+                                &HealOpts {
+                                    no_lock: true,
+                                    ..Default::default()
+                                },
+                                &mut absence,
+                                AbsenceProofRequest {
+                                    retirement: None,
+                                    allow_unversioned: true,
+                                },
+                            )
+                            .await
+                            .expect("fully absent object returns a result");
+                        assert!(matches!(missing_error, Some(Error::FileNotFound)));
+                        assert!(absence.is_some_and(|proof| !proof.removed));
+                    } else {
+                        assert!(matches!(error, Some(Error::ErasureReadQuorum)), "partial metadata must not look absent");
+                        assert!(absence.is_none(), "a surviving candidate cannot prove authoritative absence");
+                        assert_eq!(tokio::fs::read(metadata).await.expect("metadata must remain"), before);
+                    }
+                }))
+                .catch_unwind()
+                .await;
+                drop(set);
+                drop(disks);
+                if !matches!(&outcome, Ok(Ok(()))) {
+                    let retained: Vec<_> = dirs.into_iter().map(TempDir::keep).collect();
+                    eprintln!("dangling-inline fixture retained: {retained:?}");
+                    match outcome {
+                        Ok(Err(_)) => panic!("dangling-inline fixture timed out"),
+                        Err(panic) => std::panic::resume_unwind(panic),
+                        Ok(Ok(())) => unreachable!(),
+                    }
+                }
+            }
+        })
+        .await;
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn heal_reports_success_after_dangling_inline_cleanup() {
@@ -7662,6 +8245,7 @@ mod heal_result_report_tests {
                     "",
                     &HealOpts {
                         no_lock: true,
+                        remove: true,
                         ..Default::default()
                     },
                 )
@@ -7692,6 +8276,7 @@ mod heal_result_report_tests {
                     "",
                     &HealOpts {
                         no_lock: true,
+                        remove: true,
                         ..Default::default()
                     },
                 )
@@ -7742,13 +8327,14 @@ mod heal_result_report_tests {
                     &HealOpts {
                         dry_run: true,
                         no_lock: true,
+                        remove: true,
                         ..Default::default()
                     },
                 )
                 .await
                 .expect("dry-run should report the dangling candidate without mutation");
 
-            assert_eq!(error, Some(DiskError::FileNotFound));
+            assert_eq!(error, Some(DiskError::ErasureReadQuorum));
             assert!(
                 temp_dirs[0]
                     .path()
@@ -7772,8 +8358,9 @@ mod heal_result_report_tests {
         seed_meta_regen_test_metadata(&disks, 0, bucket, object, &metadata).await;
         set.disks.write().await[1] = None;
 
-        let (_, err) = set
-            .heal_object(
+        let mut absence = None;
+        let (_, error) = set
+            .heal_object_with_absence(
                 bucket,
                 object,
                 "",
@@ -7781,10 +8368,31 @@ mod heal_result_report_tests {
                     no_lock: true,
                     ..Default::default()
                 },
+                &mut absence,
+                AbsenceProofRequest {
+                    retirement: None,
+                    allow_unversioned: true,
+                },
+            )
+            .await
+            .expect("offline shard state should be reported without removal");
+        assert!(matches!(error, Some(Error::ErasureReadQuorum)));
+        assert!(absence.is_none(), "offline members cannot prove absence");
+
+        let (_, err) = set
+            .heal_object(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    no_lock: true,
+                    remove: true,
+                    ..Default::default()
+                },
             )
             .await
             .expect("offline shard state should be reported without deletion");
-        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")
@@ -7821,12 +8429,13 @@ mod heal_result_report_tests {
                 "",
                 &HealOpts {
                     no_lock: true,
+                    remove: true,
                     ..Default::default()
                 },
             )
             .await
             .expect("part probe timeout should be reported without deletion");
-        assert_eq!(err, Some(DiskError::FileNotFound));
+        assert_eq!(err, Some(DiskError::ErasureReadQuorum));
         let surviving = disks[0]
             .as_ref()
             .expect("first test disk should be online")

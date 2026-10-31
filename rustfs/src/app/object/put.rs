@@ -1734,7 +1734,9 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
+        let prelookup_required = version_id.is_some()
+            || (!super::shared::put_like_write_creates_new_version(&opts)
+                && object_lock_checks_required_for_state(&object_lock_config_state));
         #[cfg(test)]
         let prelookup_required = prelookup_required || injected_put_storage_failure(PutStorageTestStage::Prelookup).is_some();
         // Outer None = prelookup skipped (accounting comes from the commit
@@ -2322,7 +2324,7 @@ impl DefaultObjectUsecase {
 /// `previous_current_size` value the usage-accounting helpers expect. Outer
 /// `None` = unknown (no quorum agreement, or a peer predates the field) — the
 /// caller must fall back to the degraded accounting path.
-pub(super) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Option<Option<u64>> {
+pub(crate) fn previous_current_size_from_backfill(backfill: Option<OldCurrentSize>) -> Option<Option<u64>> {
     backfill.map(|observation| match observation {
         OldCurrentSize::Present(size) => Some(size.max(0) as u64),
         OldCurrentSize::Absent => None,

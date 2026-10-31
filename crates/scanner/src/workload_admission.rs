@@ -15,17 +15,21 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, LazyLock, OnceLock, RwLock};
 
+use rustfs_concurrency::adaptive::permit_set::{AdaptivePermitSet, NodeResourcePermit};
 use rustfs_concurrency::adaptive::{NodeAdmission, NodePermit};
 use rustfs_concurrency::{AdmissionState, WorkloadAdmissionRegistrySnapshot, WorkloadAdmissionSnapshotProvider, WorkloadClass};
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
 use crate::ScannerError;
+use crate::storage_api::owner::{PhysicalDiskBinding, PhysicalDiskPlan, ecstore_with_background_resource_set};
 
 static SCANNER_NODE_ADMISSION: OnceLock<Arc<NodeAdmission>> = OnceLock::new();
 
 tokio::task_local! {
     static SCANNER_NODE_REQUESTS: ScannerNodeRequestSender;
+    static SCANNER_PHYSICAL_DISK: Option<Arc<PhysicalDiskBinding>>;
+    static SCANNER_METADATA_UNITS: AdaptivePermitSet;
     static SCANNER_NODE_OPERATION_CANCEL: CancellationToken;
 }
 
@@ -36,8 +40,33 @@ pub(crate) fn scanner_node_operation_cancellation() -> Option<CancellationToken>
 
 pub(crate) struct ScannerNodeRequest {
     pub(crate) owner: Arc<NodeAdmission>,
-    pub(crate) respond: oneshot::Sender<NodePermit>,
+    pub(crate) physical: Option<Arc<PhysicalDiskPlan>>,
+    pub(crate) respond: oneshot::Sender<Result<ScannerNodePermit, ScannerError>>,
     pub(crate) cancel: CancellationToken,
+}
+
+pub(crate) enum ScannerNodePermit {
+    Node(NodePermit),
+    Physical {
+        permit: NodeResourcePermit,
+        plan: Arc<PhysicalDiskPlan>,
+    },
+}
+
+impl ScannerNodePermit {
+    pub(crate) fn complete(self) {
+        match self {
+            Self::Node(permit) => permit.complete(),
+            Self::Physical { permit, .. } => permit.complete(),
+        }
+    }
+}
+
+pub(crate) async fn with_scanner_physical_disk<F: std::future::Future>(
+    binding: Option<Arc<PhysicalDiskBinding>>,
+    operation: F,
+) -> F::Output {
+    SCANNER_PHYSICAL_DISK.scope(binding, operation).await
 }
 
 pub(crate) type ScannerNodeRequestSender = mpsc::Sender<ScannerNodeRequest>;
@@ -90,6 +119,32 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
     cancel: &CancellationToken,
     operation: impl std::future::Future<Output = Result<T, E>>,
 ) -> Result<Result<T, E>, ScannerError> {
+    run_scanner_operation(owner, cancel, operation, false).await
+}
+
+/// Metadata parsing may subsequently dispatch lifecycle work on other disks.
+/// Only its local metadata read inherits the scanner's physical resource set.
+pub(crate) async fn run_scanner_metadata_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<Result<T, E>, ScannerError> {
+    run_scanner_operation(owner, cancel, operation, true).await
+}
+
+pub(crate) async fn with_scanner_metadata_io<F: std::future::Future>(operation: F) -> F::Output {
+    match SCANNER_METADATA_UNITS.try_with(Clone::clone) {
+        Ok(units) => ecstore_with_background_resource_set(units, operation).await,
+        Err(_) => operation.await,
+    }
+}
+
+async fn run_scanner_operation<T, E>(
+    owner: Option<&Arc<NodeAdmission>>,
+    cancel: &CancellationToken,
+    operation: impl std::future::Future<Output = Result<T, E>>,
+    metadata: bool,
+) -> Result<Result<T, E>, ScannerError> {
     let Some(owner) = owner else {
         return Ok(operation.await);
     };
@@ -97,7 +152,20 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
     if cancel.is_cancelled() {
         return Err(ScannerError::Other("Operation cancelled".to_string()));
     }
-    let permit = match owner.try_acquire() {
+    let physical = SCANNER_PHYSICAL_DISK.try_with(|binding| binding.as_ref().and_then(|binding| binding.plan()));
+    let physical = match physical {
+        Ok(Some(plan)) => Some(plan),
+        Ok(None) => return Err(ScannerError::ResourceDeferred),
+        Err(_) => None,
+    };
+    let available = match &physical {
+        Some(plan) => plan.try_acquire(owner).map(|permit| ScannerNodePermit::Physical {
+            permit,
+            plan: plan.clone(),
+        }),
+        None => owner.try_acquire().map(ScannerNodePermit::Node),
+    };
+    let permit = match available {
         Some(permit) => permit,
         None => {
             let sender = SCANNER_NODE_REQUESTS
@@ -108,12 +176,13 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
                 sender
                     .send(ScannerNodeRequest {
                         owner: owner.clone(),
+                        physical,
                         respond,
                         cancel: cancel.clone(),
                     })
                     .await
                     .map_err(|_| ScannerError::ResourceDeferred)?;
-                response.await.map_err(|_| ScannerError::ResourceDeferred)
+                response.await.map_err(|_| ScannerError::ResourceDeferred)?
             };
             tokio::select! {
                 biased;
@@ -124,6 +193,27 @@ pub(crate) async fn run_scanner_node_operation<T, E>(
     };
     #[cfg(test)]
     let _ = TEST_SCANNER_AFTER_NODE_ACQUIRE.try_with(|hook| hook());
+    // Native work retains only its captured physical leaves, never the node
+    // slot that cancellation returns below.
+    let native = match &permit {
+        ScannerNodePermit::Node(_) => None,
+        ScannerNodePermit::Physical { permit, plan } => {
+            if !plan.is_current() {
+                return Err(ScannerError::ResourceDeferred);
+            }
+            Some(
+                plan.capture_native(permit.resources())
+                    .map_err(|_| ScannerError::ResourceDeferred)?,
+            )
+        }
+    };
+    let operation = async move {
+        match native {
+            None => operation.await,
+            Some(native) if metadata => SCANNER_METADATA_UNITS.scope(native, operation).await,
+            Some(native) => ecstore_with_background_resource_set(native, operation).await,
+        }
+    };
     let operation_started = AtomicBool::new(false);
     tokio::pin!(operation);
     let observed = std::future::poll_fn(|context| {

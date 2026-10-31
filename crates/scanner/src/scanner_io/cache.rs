@@ -11,8 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// scanner cache locks and the cache snapshot persist/publish path.
 use super::*;
+/// scanner cache locks and the cache snapshot persist/publish path.
+use crate::data_usage_define::clone_cache_value;
 use crate::{ScannerConfigObjectDelete, ScannerObjectIO};
 use rustfs_scanner_metrics::usage_candidate::{
     ScannerUsageCandidateKind as CandidateKind, ScannerUsageCandidateOutcome as CandidateOutcome,
@@ -181,7 +182,7 @@ impl ScannerCacheLockGuards {
     }
 
     /// Suspend the same traversal while yielding its cache lease. Lock order on
-    /// resumption is node admission -> cache lease -> cache revision reads.
+    /// resumption is physical/node admission -> cache lease -> revision reads.
     pub(crate) async fn resume_node_operation(
         &mut self,
         store: Arc<SetDisks>,
@@ -196,10 +197,23 @@ impl ScannerCacheLockGuards {
         if request.respond.is_closed() {
             return Ok(());
         }
-        let crate::workload_admission::ScannerNodeRequest { owner, respond, cancel } = request;
+        let crate::workload_admission::ScannerNodeRequest {
+            owner,
+            physical,
+            respond,
+            cancel,
+        } = request;
         drop(self.scoped.take());
         let resume = async {
-            let permit = owner.acquire().await;
+            use crate::workload_admission::ScannerNodePermit;
+            let permit = match physical {
+                Some(plan) => plan
+                    .acquire(&owner)
+                    .await
+                    .map(|permit| ScannerNodePermit::Physical { permit, plan })
+                    .ok_or(crate::ScannerError::ResourceDeferred),
+                None => Ok(ScannerNodePermit::Node(owner.acquire().await)),
+            };
             *self = acquire_scanner_cache_locks(store.as_ref(), cache_name, source)
                 .await
                 .map_err(Error::other)?;
@@ -641,6 +655,11 @@ impl ScannerPublicationExpectation {
         Arc::ptr_eq(&self.candidate, &other.candidate) && self.candidate.1 == other.candidate.1
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(crate) fn e2e_digests(&self) -> (String, String) {
+        (crate::e2e_barrier::hex(&self.candidate.0), crate::e2e_barrier::hex(&self.candidate.1.0))
+    }
+
     #[cfg(test)]
     pub(crate) fn for_tests(candidate_digest: [u8; 32], coverage_digest: DataUsageScanPlanDigest) -> Self {
         Self {
@@ -823,7 +842,7 @@ pub(super) fn completed_usage_candidate(
                     scan_plan_digest: Some(result.info.scan_plan_digest.ok_or(CandidateOutcome::SetState)?.0),
                     complete: true,
                     tombstone: false,
-                    segment_invalidation_proof: result.info.segment_invalidation_proof.clone(),
+                    segment_invalidation_proof: clone_cache_value(&result.info.segment_invalidation_proof),
                 })
             })
             .collect::<std::result::Result<Vec<_>, CandidateOutcome>>()?;
@@ -1019,7 +1038,7 @@ pub(super) fn observational_data_usage_info(
                         selected.info.scan_plan_digest.map(|digest| digest.0),
                         selected.info.last_update,
                         true,
-                        selected.info.segment_invalidation_proof.clone(),
+                        clone_cache_value(&selected.info.segment_invalidation_proof),
                     )
                 } else {
                     (
@@ -1179,6 +1198,84 @@ fn log_missing_set_snapshot_metadata(store: &SetDisks, info: &DataUsageCacheInfo
         snapshot_leader_epoch = info.leader_epoch,
         "Scanner set snapshot is missing required metadata"
     );
+}
+
+/// Saves a set's service order over its unchanged cache, which an incomplete
+/// cycle otherwise never writes. Under the set cache lock and its revisions the
+/// save cannot replace newer coverage; a failed save costs fairness only.
+pub(super) async fn persist_scanner_service_ledger(
+    store: Arc<SetDisks>,
+    source: DataUsageCacheSource,
+    mut ledger: DataUsageBucketServiceLedger,
+    cycle: u64,
+    leader_epoch: u64,
+    expected_publication_epoch: u64,
+) -> bool {
+    let log_skipped = |state: &str, error: &dyn std::fmt::Display| {
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle,
+            leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
+            error = %error,
+            "Scanner kept the previous bucket service order"
+        );
+    };
+    let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            log_skipped(error.state(), &error);
+            return false;
+        }
+    };
+    let mut persisted = DataUsageCache::default();
+    let revisions = match persisted.load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME).await {
+        Ok(revisions) => revisions,
+        Err(error) => {
+            log_skipped("service_order_load_failed", &error);
+            return false;
+        }
+    };
+    if persisted.info.next_cycle > cycle
+        || persisted.info.leader_epoch > leader_epoch
+        || persisted
+            .info
+            .scan_bucket_service
+            .as_ref()
+            .is_some_and(|saved| saved.leader_epoch > leader_epoch)
+    {
+        log_skipped("service_order_stale", &"a newer scanner owns the set cache");
+        return false;
+    }
+    if guard.is_lock_lost() {
+        log_skipped("service_order_lock_lost", &"set cache lock was lost");
+        return false;
+    }
+    if persisted.info.name.is_empty() {
+        // First incomplete cycle of a set: the order is its only content.
+        persisted.info.name = DATA_USAGE_ROOT.to_string();
+        persisted.info.source = Some(source);
+        persisted.info.leader_epoch = leader_epoch;
+        persisted.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+    }
+    ledger.leader_epoch = leader_epoch;
+    persisted.info.scan_bucket_service = Some(ledger);
+    match persisted
+        .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            log_skipped("service_order_save_failed", &error);
+            false
+        }
+    }
 }
 
 pub(super) async fn persist_and_publish_cache_snapshot(
