@@ -301,16 +301,16 @@ class GateTests(unittest.TestCase):
             # A complete plan lookup is represented by equivalent explicit expressions here.
             if job in gate.ALWAYS_JOBS:
                 expression = "true"
-            elif job in gate.EXTENDED_FEATURE_JOBS:
-                expression = "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"merge_group\",\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
+            elif job == 'connect-feature-boundaries':
+                expression = "needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect == 'true' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
+            elif job in gate.NIGHTLY_JOBS:
+                expression = "needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job in gate.OPTIONAL_JOBS[:2]:
                 expression = "contains(fromJSON('[\"schedule\",\"workflow_dispatch\"]'), github.event_name)"
             elif job == 'e2e-full':
                 expression = "github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch' || (github.event_name == 'push' && github.ref == 'refs/heads/main')"
             elif job in gate.SHARD_JOBS:
                 expression = "needs.classify-changes.outputs.rehearse_shards == 'true'"
-            elif job == 'connect-feature-boundaries':
-                expression = "needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect == 'true'"
             elif job in gate.E2E_JOBS:
                 expression = "needs.classify-changes.outputs.mode != 'docs'"
             else:
