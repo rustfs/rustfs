@@ -20,6 +20,8 @@ mod capture_bounds;
 mod commit_recovery_store;
 #[path = "backup_maintenance_store_tests.rs"]
 mod maintenance_store;
+#[path = "backup_reference_revalidation_store_tests.rs"]
+mod reference_revalidation_store;
 
 #[tokio::test]
 async fn restore_request_cancellation_before_replacement_delete_resumes_the_original_plan() {
