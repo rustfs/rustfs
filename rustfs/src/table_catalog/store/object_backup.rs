@@ -20,14 +20,27 @@ use super::object::{
 use super::*;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::num::NonZeroUsize;
 
+#[path = "object_backup_commit_recovery.rs"]
+mod commit_recovery;
+#[path = "object_backup_inventory.rs"]
+mod inventory;
+#[path = "object_backup_maintenance.rs"]
+mod maintenance;
+#[path = "object_backup_prepare.rs"]
+mod prepare;
 #[path = "object_backup_transfer.rs"]
 mod transfer;
 
+use inventory::{ObjectCatalogBackupReference, ObjectCatalogBackupReferenceKind, validate_object_catalog_backup_reference_shape};
+
 const OBJECT_CATALOG_BACKUP_VERSION: u16 = 1;
+const OBJECT_CATALOG_BACKUP_INVENTORY_VERSION: u16 = 2;
 const OBJECT_CATALOG_BACKUP_MAX_SIZE: usize = 64 * 1024 * 1024;
+const OBJECT_CATALOG_BACKUP_MAX_OBJECTS: usize = 1_000_000;
 const OBJECT_CATALOG_BACKUP_OBJECT_MAX_SIZE: usize = 16 * 1024 * 1024;
-const OBJECT_CATALOG_RESTORE_STATE_VERSION: u16 = 1;
+const OBJECT_CATALOG_RESTORE_STATE_VERSION: u16 = 2;
 const OBJECT_CATALOG_RESTORE_STATE_MAX_SIZE: usize = 16 * 1024;
 const OBJECT_CATALOG_RESTORE_INTENT_MAX_SIZE: usize = 4 * 1024 * 1024;
 
@@ -40,6 +53,20 @@ struct ObjectCatalogBackup {
     created_at: String,
     source_catalog_etag: String,
     objects: Vec<ObjectCatalogBackupObject>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_backup_references"
+    )]
+    references: Option<Vec<ObjectCatalogBackupReference>>,
+}
+
+fn deserialize_backup_references<'de, D>(deserializer: D) -> Result<Option<Vec<ObjectCatalogBackupReference>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    // Missing is the historical v1 shape; an explicitly null inventory is invalid.
+    Vec::<ObjectCatalogBackupReference>::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -150,6 +177,63 @@ fn catalog_backup_identity(
     Ok(backup_sha256(&data))
 }
 
+fn catalog_backup_inventory_identity(
+    table_bucket: &str,
+    fingerprint: &str,
+    objects: &[ObjectCatalogBackupObject],
+    references: &[ObjectCatalogBackupReference],
+) -> TableCatalogStoreResult<String> {
+    let data = serde_json::to_vec(&(OBJECT_CATALOG_BACKUP_INVENTORY_VERSION, table_bucket, fingerprint, objects, references))
+        .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog backup inventory: {error}")))?;
+    Ok(backup_sha256(&data))
+}
+
+fn catalog_backup_verification_totals(backup: &ObjectCatalogBackup) -> TableCatalogStoreResult<(usize, u64)> {
+    let add_size = |total: u64, size: u64| {
+        total
+            .checked_add(size)
+            .ok_or_else(|| TableCatalogStoreError::Invalid("catalog backup byte total overflows u64".to_string()))
+    };
+    let (count, bytes) = if let Some(references) = &backup.references {
+        (
+            references.len(),
+            references
+                .iter()
+                .map(|reference| reference.size_bytes)
+                .try_fold(0u64, add_size),
+        )
+    } else {
+        (
+            backup.objects.len(),
+            backup.objects.iter().map(|object| object.size_bytes).try_fold(0u64, add_size),
+        )
+    };
+    Ok((count, bytes?))
+}
+
+fn append_backup_object(
+    objects: &mut Vec<ObjectCatalogBackupObject>,
+    encoded_bytes: &mut usize,
+    object: ObjectCatalogBackupObject,
+) -> TableCatalogStoreResult<()> {
+    if objects.len() == OBJECT_CATALOG_BACKUP_MAX_OBJECTS {
+        return Err(TableCatalogStoreError::Invalid(
+            "catalog backup object count exceeds its limit".to_string(),
+        ));
+    }
+    let size = serde_json::to_vec(&object)
+        .map_err(|error| TableCatalogStoreError::Internal(format!("failed to measure catalog backup payload: {error}")))?
+        .len();
+    let total = encoded_bytes
+        .checked_add(size)
+        .and_then(|total| total.checked_add(1))
+        .filter(|total| *total <= OBJECT_CATALOG_BACKUP_MAX_SIZE)
+        .ok_or_else(|| TableCatalogStoreError::Invalid("catalog backup payload exceeds its encoded byte budget".to_string()))?;
+    *encoded_bytes = total;
+    objects.push(object);
+    Ok(())
+}
+
 fn restore_request_fingerprint(
     table_bucket: &str,
     restore_id: &str,
@@ -161,6 +245,10 @@ fn restore_request_fingerprint(
         .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode catalog restore request: {error}")))?;
     Ok(backup_sha256(&encoded))
 }
+
+#[cfg(test)]
+#[path = "object_backup_version_tests.rs"]
+mod version_tests;
 
 impl<B> ObjectTableCatalogStore<B>
 where
@@ -175,15 +263,43 @@ where
         let backup: ObjectCatalogBackup = serde_json::from_slice(data).map_err(|error| {
             TableCatalogStoreError::Invalid(format!("invalid catalog backup at line {} column {}", error.line(), error.column()))
         })?;
-        if backup.version != OBJECT_CATALOG_BACKUP_VERSION || backup.table_bucket != table_bucket {
+        if !matches!(backup.version, OBJECT_CATALOG_BACKUP_VERSION | OBJECT_CATALOG_BACKUP_INVENTORY_VERSION)
+            || backup.table_bucket != table_bucket
+            || (backup.version == OBJECT_CATALOG_BACKUP_VERSION) != backup.references.is_none()
+        {
             return Err(TableCatalogStoreError::Invalid(
                 "catalog backup identity or version does not match its request".to_string(),
             ));
         }
         self.validate_object_catalog_backup_objects(table_bucket, &backup.objects)?;
-        if catalog_backup_fingerprint(&backup.objects)? != backup.source_catalog_etag
-            || catalog_backup_identity(table_bucket, &backup.source_catalog_etag, &backup.objects)? != backup.backup_id
-        {
+        let expected_identity = if let Some(references) = &backup.references {
+            validate_object_catalog_backup_reference_shape(table_bucket, references)?;
+            for object in backup.objects.iter().filter(|object| object.bucket == table_bucket) {
+                let reference = references
+                    .binary_search_by(|reference| reference.object.cmp(&object.object))
+                    .ok()
+                    .map(|index| &references[index])
+                    .ok_or_else(|| {
+                        TableCatalogStoreError::Invalid(
+                            "catalog backup current metadata is missing from its inventory".to_string(),
+                        )
+                    })?;
+                if reference.kind != ObjectCatalogBackupReferenceKind::TableMetadata
+                    || reference.size_bytes != object.size_bytes
+                    || reference.sha256.as_deref() != Some(object.sha256.as_str())
+                {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "catalog backup embedded metadata does not match its inventory".to_string(),
+                    ));
+                }
+            }
+            catalog_backup_inventory_identity(table_bucket, &backup.source_catalog_etag, &backup.objects, references)?
+        } else {
+            catalog_backup_identity(table_bucket, &backup.source_catalog_etag, &backup.objects)?
+        };
+        // Reject malformed declared sizes before raw import can persist a candidate.
+        catalog_backup_verification_totals(&backup)?;
+        if catalog_backup_fingerprint(&backup.objects)? != backup.source_catalog_etag || expected_identity != backup.backup_id {
             return Err(TableCatalogStoreError::Invalid(
                 "catalog backup content does not match its identity".to_string(),
             ));
@@ -305,7 +421,7 @@ where
                 error.column()
             ))
         })?;
-        if state.version != OBJECT_CATALOG_RESTORE_STATE_VERSION
+        if !matches!(state.version, 1 | OBJECT_CATALOG_RESTORE_STATE_VERSION)
             || state.table_bucket != table_bucket
             || Uuid::parse_str(&state.restore_epoch).is_err()
             || state.restore_id.is_empty()
@@ -338,7 +454,7 @@ where
         };
         let intent: ObjectCatalogRestoreIntent = serde_json::from_slice(&stored.data)
             .map_err(|_| TableCatalogStoreError::Invalid("invalid catalog restore intent".to_string()))?;
-        if intent.version != OBJECT_CATALOG_RESTORE_STATE_VERSION
+        if !matches!(intent.version, 1 | OBJECT_CATALOG_RESTORE_STATE_VERSION)
             || intent.table_bucket != table_bucket
             || intent.restore_id != restore_id
             || Uuid::parse_str(&intent.restore_epoch).is_err()
@@ -626,26 +742,61 @@ where
     ) -> TableCatalogStoreResult<Vec<ObjectCatalogBackupObject>> {
         let prefix = self.paths.table_bucket_root_prefix(table_bucket);
         let mut objects = Vec::new();
-        for object in self.backend.list_objects(self.catalog_bucket(), &prefix).await? {
-            objects.push(self.capture_backup_object(self.catalog_bucket(), &object).await?);
-        }
-        let catalog_objects = objects.clone();
-        for object in catalog_objects {
-            if !object.object.ends_with(TABLE_ENTRY_FILE) {
-                continue;
+        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("catalog backup page limit must be positive".to_string()))?;
+        let mut cursor: Option<String> = None;
+        let mut encoded_bytes = 0usize;
+        loop {
+            let page = self
+                .backend
+                .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
+                .await?;
+            if page.objects.len() > limit.get() || (page.is_truncated && page.objects.is_empty()) {
+                return Err(TableCatalogStoreError::Invalid("invalid catalog backup listing page".to_string()));
             }
+            for object in page.objects {
+                if !object.starts_with(&prefix) || cursor.as_ref().is_some_and(|previous| object <= *previous) {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "catalog backup listing escaped its prefix or did not advance".to_string(),
+                    ));
+                }
+                let payload = self.capture_backup_object(self.catalog_bucket(), &object).await?;
+                append_backup_object(&mut objects, &mut encoded_bytes, payload)?;
+                cursor = Some(object);
+            }
+            if !page.is_truncated {
+                break;
+            }
+        }
+        let mut entries = Vec::new();
+        for object in objects.iter().filter(|object| object.object.ends_with(TABLE_ENTRY_FILE)) {
             let entry: TableEntry = serde_json::from_slice(&object.data)
                 .map_err(|error| TableCatalogStoreError::Invalid(format!("table catalog entry is invalid: {error}")))?;
+            validate_table_entry_object(&self.paths, &object.object, &entry)?;
+            if entry.table_bucket != table_bucket {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup table owner belongs to another bucket".to_string(),
+                ));
+            }
+            entries.push(entry);
+        }
+        for entry in entries {
             if entry.state != TableCatalogEntryState::Active {
                 continue;
             }
             let metadata_object = table_catalog_object_key_from_location(&entry.table_bucket, &entry.metadata_location)
                 .ok_or_else(|| TableCatalogStoreError::Invalid("table metadata location is not an object path".to_string()))?;
+            if !is_valid_table_metadata_location_for_entry(&entry, &metadata_object) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "catalog backup metadata is outside its owner's metadata scope".to_string(),
+                ));
+            }
             if !objects
                 .iter()
                 .any(|candidate| candidate.bucket == entry.table_bucket && candidate.object == metadata_object)
             {
-                objects.push(self.capture_backup_object(&entry.table_bucket, &metadata_object).await?);
+                let payload = self.capture_backup_object(&entry.table_bucket, &metadata_object).await?;
+                append_backup_object(&mut objects, &mut encoded_bytes, payload)?;
             }
         }
         objects.sort_by(|left, right| left.bucket.cmp(&right.bucket).then_with(|| left.object.cmp(&right.object)));
@@ -727,8 +878,10 @@ where
         self.ensure_no_active_restore(table_bucket).await?;
         let objects = self.capture_object_catalog_backup_objects(table_bucket).await?;
         self.validate_object_catalog_backup_objects(table_bucket, &objects)?;
+        self.validate_backup_commit_recovery(table_bucket, &objects)?;
+        let maintenance = self.validate_backup_maintenance_authority(table_bucket, &objects)?;
         mutation_fence.ensure_held()?;
-        self.validate_catalog_backup_snapshot_graph(table_bucket, &objects).await?;
+        let references = self.capture_object_catalog_backup_references(table_bucket, &objects).await?;
         mutation_fence.ensure_held()?;
         let source_catalog_etag = catalog_backup_fingerprint(&objects)?;
         if expected_catalog_etag.is_some_and(|expected| expected != source_catalog_etag) {
@@ -739,15 +892,17 @@ where
         let mut created_at = OffsetDateTime::now_utc()
             .format(&time::format_description::well_known::Rfc3339)
             .map_err(|error| TableCatalogStoreError::Internal(format!("failed to format backup timestamp: {error}")))?;
-        let backup_id = catalog_backup_identity(table_bucket, &source_catalog_etag, &objects)?;
+        let backup_id = catalog_backup_inventory_identity(table_bucket, &source_catalog_etag, &objects, &references)?;
         let backup = ObjectCatalogBackup {
-            version: OBJECT_CATALOG_BACKUP_VERSION,
+            version: OBJECT_CATALOG_BACKUP_INVENTORY_VERSION,
             backup_id: backup_id.clone(),
             table_bucket: table_bucket.to_string(),
             created_at: created_at.clone(),
             source_catalog_etag: source_catalog_etag.clone(),
             objects,
+            references: Some(references),
         };
+        let (verified_object_count, verified_bytes) = catalog_backup_verification_totals(&backup)?;
         let encoded = serde_json::to_vec(&backup)
             .map_err(|error| TableCatalogStoreError::Internal(format!("failed to encode object catalog backup: {error}")))?;
         if encoded.len() > OBJECT_CATALOG_BACKUP_MAX_SIZE {
@@ -773,7 +928,8 @@ where
                     && existing.backup_id == backup.backup_id
                     && existing.table_bucket == backup.table_bucket
                     && existing.source_catalog_etag == backup.source_catalog_etag
-                    && existing.objects == backup.objects;
+                    && existing.objects == backup.objects
+                    && existing.references == backup.references;
                 if !same_identity {
                     return Err(TableCatalogStoreError::Conflict(
                         "catalog backup identity is already occupied by different content".to_string(),
@@ -785,19 +941,18 @@ where
             Err(error) => return Err(error),
         };
         mutation_fence.ensure_held()?;
-        let verified_bytes = backup.objects.iter().map(|object| object.size_bytes).sum();
         Ok(TableCatalogBackupReport {
             table_bucket: table_bucket.to_string(),
             backup_id,
             status,
             backup_path: path,
             source_snapshot_etag: source_catalog_etag.clone(),
-            source_snapshot_version: OBJECT_CATALOG_BACKUP_VERSION,
+            source_snapshot_version: backup.version,
             catalog_fingerprint: source_catalog_etag,
             object_count: backup.objects.len(),
-            verified_object_count: backup.objects.len(),
+            verified_object_count,
             verified_bytes,
-            maintenance_object_count: 0,
+            maintenance_object_count: maintenance.object_count,
             created_at,
         })
     }
@@ -809,8 +964,13 @@ where
         allow_replace: bool,
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<(Vec<ObjectCatalogRestoreWrite>, Vec<ObjectCatalogRestoreDelete>)> {
-        self.validate_catalog_backup_snapshot_graph(table_bucket, &backup.objects)
-            .await?;
+        if let Some(references) = &backup.references {
+            self.validate_object_catalog_backup_references(table_bucket, &backup.objects, references)
+                .await?;
+        } else {
+            self.validate_catalog_backup_snapshot_graph(table_bucket, &backup.objects)
+                .await?;
+        }
         fence.ensure_held()?;
         let target_prefix = self.paths.table_bucket_root_prefix(table_bucket);
         let current = self.backend.list_objects(self.catalog_bucket(), &target_prefix).await?;
@@ -887,8 +1047,15 @@ where
         intent: &ObjectCatalogRestoreIntent,
     ) -> TableCatalogStoreResult<()> {
         let prefix = self.paths.table_bucket_root_prefix(&intent.table_bucket);
+        // Version 1 receipts predate maintenance counting. Preserve their
+        // recorded result; version 2 binds the actual sidecars in the plan.
+        let maintenance_object_count = if intent.version == 1 {
+            0
+        } else {
+            self.backup_maintenance_object_count(&intent.table_bucket, &backup.objects)
+        };
         if intent.object_count != backup.objects.len()
-            || intent.maintenance_object_count != 0
+            || intent.maintenance_object_count != maintenance_object_count
             || intent.source_catalog_etag != backup.source_catalog_etag
             || intent.backup_id != backup.backup_id
             || intent.writes.len() != backup.objects.len()
@@ -1040,6 +1207,8 @@ where
             return Ok(None);
         }
         let objects = self.capture_object_catalog_backup_objects(table_bucket).await?;
+        self.validate_backup_commit_recovery(table_bucket, &objects)?;
+        self.validate_backup_maintenance_authority(table_bucket, &objects)?;
         catalog_backup_fingerprint(&objects).map(Some)
     }
 
@@ -1132,6 +1301,11 @@ where
             ));
         }
 
+        // Receipt replay above must remain valid after later maintenance work.
+        // A new or interrupted restore may publish only stable source authority.
+        self.validate_backup_commit_recovery(table_bucket, &backup.objects)?;
+        let maintenance = self.validate_backup_maintenance_authority(table_bucket, &backup.objects)?;
+
         let (mut intent, mut intent_etag) = match saved {
             Some(saved) => saved,
             None => {
@@ -1161,7 +1335,7 @@ where
                     previous_snapshot_etag,
                     restored_snapshot_etag: backup.source_catalog_etag.clone(),
                     object_count: backup.objects.len(),
-                    maintenance_object_count: 0,
+                    maintenance_object_count: maintenance.object_count,
                     writes,
                     deletes,
                     created_at: now.clone(),

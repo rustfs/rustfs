@@ -48,7 +48,7 @@ where
         Ok(artifact.data)
     }
 
-    /// Persists one validated v1 artifact without publishing catalog or metadata objects.
+    /// Persists one validated versioned artifact without publishing catalog or metadata objects.
     ///
     /// Only the artifact key is conditionally created. Exact retries keep its bytes,
     /// ETag and original creation timestamp; conflicting content is never replaced.
@@ -61,6 +61,7 @@ where
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         let backup = self.decode_object_catalog_backup(table_bucket, &data)?;
         let _validated_tables = self.validate_catalog_backup_metadata_identities(table_bucket, &backup.objects)?;
+        let (verified_object_count, verified_bytes) = catalog_backup_verification_totals(&backup)?;
         let path = self.paths.catalog_backup_path(table_bucket, &backup.backup_id);
         let guards = self.acquire_object_backup_fence(table_bucket).await?;
         let fence = Self::object_backup_mutation_fence(&guards);
@@ -116,12 +117,12 @@ where
             status,
             backup_path: path,
             source_snapshot_etag: backup.source_catalog_etag.clone(),
-            source_snapshot_version: OBJECT_CATALOG_BACKUP_VERSION,
+            source_snapshot_version: backup.version,
             catalog_fingerprint: backup.source_catalog_etag,
             object_count: backup.objects.len(),
-            verified_object_count: backup.objects.len(),
-            verified_bytes: backup.objects.iter().map(|object| object.size_bytes).sum(),
-            maintenance_object_count: 0,
+            verified_object_count,
+            verified_bytes,
+            maintenance_object_count: self.backup_maintenance_object_count(table_bucket, &backup.objects),
             created_at: backup.created_at,
         })
     }

@@ -2764,6 +2764,18 @@ pub(crate) async fn validate_table_snapshot_changes<B>(
 where
     B: TableCatalogObjectBackend,
 {
+    validate_table_snapshot_changes_with_budget(context, current_metadata, metadata).await?;
+    Ok(())
+}
+
+async fn validate_table_snapshot_changes_with_budget<B>(
+    context: &TableSnapshotGraphValidationContext<'_, B>,
+    current_metadata: Option<&serde_json::Value>,
+    metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<SnapshotGraphReadBudget>
+where
+    B: TableCatalogObjectBackend,
+{
     validate_supported_table_metadata_fields(metadata)?;
     let snapshot_ids = metadata_array_ids(metadata, "snapshots", "snapshot-id", "snapshot")?;
     validate_table_statistics_references(metadata, &snapshot_ids)?;
@@ -2807,6 +2819,69 @@ where
                 }
             }
         }
+    }
+    Ok(budget)
+}
+
+/// Validates every retained snapshot and returns its bounded physical object inventory.
+///
+/// Manifest lists and manifests are retained even when all their entries are deleted. Only live data/delete
+/// references are included, and every such object has passed the existing existence validation. This uses the
+/// validator's existing caches without another storage traversal or Avro decode. Statistics are enumerated
+/// separately with `table_statistics_object_references`.
+pub(crate) async fn validated_table_snapshot_graph_inventory<B>(
+    context: &TableSnapshotGraphValidationContext<'_, B>,
+    metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<BTreeMap<String, TableMetadataMaintenanceObjectKind>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let budget = validate_table_snapshot_changes_with_budget(context, None, metadata).await?;
+    let mut inventory = BTreeMap::new();
+    for object in budget.manifest_lists.keys() {
+        insert_validated_snapshot_graph_inventory_object(
+            &mut inventory,
+            object.clone(),
+            TableMetadataMaintenanceObjectKind::ManifestList,
+        )?;
+    }
+    for (object, manifest) in &budget.manifests {
+        insert_validated_snapshot_graph_inventory_object(
+            &mut inventory,
+            object.clone(),
+            TableMetadataMaintenanceObjectKind::ManifestFile,
+        )?;
+        for reference in manifest.references.iter() {
+            if !matches!(reference.entry_status, Some(0 | 1)) {
+                continue;
+            }
+            let object = snapshot_graph_object_key(context, &reference.location, reference.object_kind.clone())?;
+            if !budget.validated_live_objects.contains(&object) {
+                return Err(TableCatalogStoreError::Internal(
+                    "snapshot inventory contains a live object without successful existence validation".to_string(),
+                ));
+            }
+            insert_validated_snapshot_graph_inventory_object(&mut inventory, object, reference.object_kind.clone())?;
+        }
+    }
+    Ok(inventory)
+}
+
+fn insert_validated_snapshot_graph_inventory_object(
+    inventory: &mut BTreeMap<String, TableMetadataMaintenanceObjectKind>,
+    object: String,
+    kind: TableMetadataMaintenanceObjectKind,
+) -> TableCatalogStoreResult<()> {
+    match inventory.entry(object) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(kind);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != kind => {
+            return Err(TableCatalogStoreError::Invalid(
+                "snapshot inventory object is referenced with conflicting kinds".to_string(),
+            ));
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
     }
     Ok(())
 }

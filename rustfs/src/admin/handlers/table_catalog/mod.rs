@@ -80,6 +80,9 @@ const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const TABLE_CATALOG_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 const CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE: usize = 64 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE: usize = 24 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE: usize = 16 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE: usize = CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE.div_ceil(3) * 4;
 const TABLE_CATALOG_COMMIT_REQUIREMENT_MAX_COUNT: usize = 1_024;
 const TABLE_CATALOG_COMMIT_UPDATE_MAX_COUNT: usize = 1_024;
 const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -185,6 +188,8 @@ static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {
 static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
 static EXPORT_TABLE_CATALOG_BACKUP_HANDLER: ExportTableCatalogBackupHandler = ExportTableCatalogBackupHandler {};
 static IMPORT_TABLE_CATALOG_BACKUP_HANDLER: ImportTableCatalogBackupHandler = ImportTableCatalogBackupHandler {};
+static PREPARE_TABLE_CATALOG_BACKUP_OBJECT_HANDLER: PrepareTableCatalogBackupObjectHandler =
+    PrepareTableCatalogBackupObjectHandler {};
 static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
@@ -514,6 +519,16 @@ struct CatalogBackupRequest {
 struct CatalogBackupExportRequest {
     #[serde(rename = "backup-id")]
     backup_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBackupObjectPrepareRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
+    object: String,
+    #[serde(rename = "data-base64")]
+    data_base64: String,
 }
 
 #[derive(Debug, Deserialize)]

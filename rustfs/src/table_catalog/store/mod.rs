@@ -21,7 +21,7 @@ mod manifest;
 mod object;
 mod object_backup;
 
-pub(crate) use backup_types::{TableCatalogBackupReport, TableCatalogRestoreReport};
+pub(crate) use backup_types::{TableCatalogBackupObjectPreparationReport, TableCatalogBackupReport, TableCatalogRestoreReport};
 #[cfg(test)]
 pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use manifest::table_catalog_backing_manifest;
@@ -2024,6 +2024,22 @@ where
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         match self {
             Self::ObjectBacked(store) => store.import_object_catalog_backup(table_bucket, data).await,
+        }
+    }
+
+    pub(crate) async fn prepare_catalog_backup_object(
+        &self,
+        table_bucket: &str,
+        backup_id: &str,
+        object: &str,
+        data: Vec<u8>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupObjectPreparationReport> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .prepare_object_catalog_backup_object(table_bucket, backup_id, object, data)
+                    .await
+            }
         }
     }
 

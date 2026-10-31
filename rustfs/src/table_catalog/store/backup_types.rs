@@ -22,6 +22,24 @@ pub(crate) enum TableCatalogBackupStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum TableCatalogBackupObjectPreparationStatus {
+    Prepared,
+    AlreadyPresent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(crate) struct TableCatalogBackupObjectPreparationReport {
+    pub table_bucket: String,
+    pub backup_id: String,
+    pub object: String,
+    pub status: TableCatalogBackupObjectPreparationStatus,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub etag: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(crate) struct TableCatalogBackupReport {
     pub table_bucket: String,
     pub backup_id: String,

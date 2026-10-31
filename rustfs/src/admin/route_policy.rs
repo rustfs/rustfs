@@ -1165,6 +1165,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/prepare",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
         "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
@@ -1462,6 +1468,12 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/catalog/backup/import",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/prepare",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -2302,6 +2314,8 @@ mod tests {
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/export", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
         assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",

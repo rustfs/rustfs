@@ -515,6 +515,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/backup/export", "/analytics/catalog/backup/export"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/backup/import", "/analytics/catalog/backup/import"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/backup/prepare", "/analytics/catalog/backup/prepare"),
         table_route_sample(
             Method::POST,
             "/{warehouse}/catalog/warehouse-index/backfill",
@@ -719,6 +720,7 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup/export", "/analytics/catalog/backup/export"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup/import", "/analytics/catalog/backup/import"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup/prepare", "/analytics/catalog/backup/prepare"),
         compat_table_route_sample(
             Method::POST,
             "/{warehouse}/catalog/warehouse-index/backfill",

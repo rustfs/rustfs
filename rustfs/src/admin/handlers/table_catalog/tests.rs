@@ -121,6 +121,18 @@ async fn call_catalog_backup_import_handler(request: S3Request<Body>) -> S3Resul
     ImportTableCatalogBackupHandler {}.call(request, matched.params).await
 }
 
+async fn call_catalog_backup_prepare_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/prepare"), ())
+            .expect("backup preparation test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup preparation test route should match");
+    PrepareTableCatalogBackupObjectHandler {}.call(request, matched.params).await
+}
+
 async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router
@@ -1840,6 +1852,7 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("CreateTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("ExportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("ImportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("PrepareTableCatalogBackupObjectHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestoreTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
         ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
@@ -2063,6 +2076,7 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     for handler in [
         "ExportTableCatalogBackupHandler",
         "ImportTableCatalogBackupHandler",
+        "PrepareTableCatalogBackupObjectHandler",
         "BackfillTableWarehouseIndexHandler",
         "RestListNamespacesHandler",
         "RestCreateNamespaceHandler",
@@ -2328,6 +2342,8 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
     let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
     let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
     let _: &CreateTableCatalogBackupHandler = &CREATE_TABLE_CATALOG_BACKUP_HANDLER;
+    let _: &PrepareTableCatalogBackupObjectHandler = &PREPARE_TABLE_CATALOG_BACKUP_OBJECT_HANDLER;
+    assert_operation::<PrepareTableCatalogBackupObjectHandler>();
     let _: &RestoreTableCatalogBackupHandler = &RESTORE_TABLE_CATALOG_BACKUP_HANDLER;
     let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
     let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
@@ -2582,7 +2598,97 @@ struct BackupTransferHandlerFixture {
     _data_root: tempfile::TempDir,
 }
 
+struct BackupPreparationSourceArtifact {
+    backup_id: String,
+    artifact: Vec<u8>,
+    object: String,
+    data: Vec<u8>,
+    sha256: String,
+}
+
+fn backup_object_prepare_body(backup_id: &str, object: &str, data: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "backup-id": backup_id,
+        "object": object,
+        "data-base64": base64_simd::STANDARD.encode_to_string(data),
+    }))
+    .expect("object preparation request JSON")
+}
+
 impl BackupTransferHandlerFixture {
+    async fn create_preparation_source(&self) -> BackupPreparationSourceArtifact {
+        self.catalog
+            .put_table_bucket(table_bucket_entry_from_metadata_marker(&self.bucket))
+            .await
+            .unwrap();
+        let namespace = crate::table_catalog::Namespace::parse("sales").unwrap();
+        create_namespace_response(
+            &self.catalog,
+            &self.bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["sales".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "type": "struct", "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }
+        }))
+        .unwrap();
+        create_table_response(
+            &self.catalog,
+            &TableCommitObjectBackend::trusted(self.backend.clone()),
+            &self.bucket,
+            &namespace,
+            request,
+            true,
+        )
+        .await
+        .expect("Catalog create must publish the source metadata through its normal control-plane boundary");
+        let table = self
+            .catalog
+            .load_table(&self.bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .unwrap();
+        let backup = self.catalog.create_catalog_backup(&self.bucket, None).await.unwrap();
+        let artifact = self
+            .backend
+            .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&artifact.data).unwrap();
+        assert_eq!(value["version"], 2);
+        let reference = value["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reference| reference["bucket"] == self.bucket && reference["object"] == table.metadata_location)
+            .expect("source v2 backup must inventory its current metadata");
+        assert_eq!(reference["kind"], "TABLE_METADATA");
+        let payload = self
+            .backend
+            .read_object(&self.bucket, &table.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference["size_bytes"].as_u64(), Some(u64::try_from(payload.data.len()).unwrap()));
+        BackupPreparationSourceArtifact {
+            backup_id: backup.backup_id,
+            artifact: artifact.data,
+            object: table.metadata_location,
+            data: payload.data,
+            sha256: reference["sha256"].as_str().unwrap().to_string(),
+        }
+    }
+
     async fn new(bucket: &str) -> Self {
         let (data_root, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
         object_store
@@ -3011,6 +3117,285 @@ async fn catalog_backup_transfer_handlers_authenticate_before_store_access() {
             assert!(error.message().unwrap_or_default().contains("authentication required"));
         }
     }
+}
+
+#[test]
+fn catalog_backup_object_prepare_request_is_strict() {
+    let request: CatalogBackupObjectPrepareRequest =
+        serde_json::from_str(r#"{"backup-id":"backup-a","object":"tables/table-id/data/part.parquet","data-base64":"Zg=="}"#)
+            .unwrap();
+    assert_eq!(request.backup_id, "backup-a");
+    assert_eq!(request.object, "tables/table-id/data/part.parquet");
+    assert_eq!(request.data_base64, "Zg==");
+    for invalid in [
+        r#"{}"#,
+        r#"{"backup-id":"a","object":"object"}"#,
+        r#"{"backup-id":"a","data-base64":"Zg=="}"#,
+        r#"{"object":"object","data-base64":"Zg=="}"#,
+        r#"{"backupId":"a","object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","dataBase64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":"Zg==","unknown":true}"#,
+        r#"{"backup-id":"a","backup-id":"b","object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","object":"other","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":"Zg==","data-base64":"Zg=="}"#,
+        r#"{"backup-id":null,"object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":null,"data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":null}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":42}"#,
+        r#"[]"#,
+    ] {
+        assert!(
+            serde_json::from_str::<CatalogBackupObjectPrepareRequest>(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_backup_prepare_handler_authenticates_before_store_or_body_access() {
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        let request = S3Request {
+            input: Body::from(b"not-json".to_vec()),
+            method: Method::POST,
+            uri: format!("{prefix}/warehouse/catalog/backup/prepare").parse().unwrap(),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let error = call_catalog_backup_prepare_handler(request)
+            .await
+            .expect_err("preparation must authenticate first");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("authentication required"));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_publication() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-prepare-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            let backup = source.create_preparation_source().await;
+            let source_before = source.inventory().await;
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            assert!(target.catalog.get_table_bucket(&bucket).await.unwrap().is_none());
+            let imported = call_catalog_backup_import_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                backup.artifact.clone(),
+            ))
+            .await
+            .expect("target must accept the candidate artifact before object preparation");
+            assert_backup_transfer_response_is_private(&imported);
+            let request_body = backup_object_prepare_body(&backup.backup_id, &backup.object, &backup.data);
+            let before = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.request(prefix, "prepare", request_body.clone());
+                request.credentials = Some(s3s::auth::Credentials {
+                    access_key: "backup-transfer-reader".to_string(),
+                    secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
+                });
+                let error = call_catalog_backup_prepare_handler(request)
+                    .await
+                    .expect_err("reader cannot prepare backup objects");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before);
+            }
+            let prepared = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                request_body.clone(),
+            ))
+            .await
+            .expect("warehouse-authorized operator can prepare the exact source payload");
+            assert_backup_transfer_response_is_private(&prepared);
+            let prepared: serde_json::Value = serde_json::from_slice(&prepared.output.1.bytes().unwrap()).unwrap();
+            assert_eq!(prepared["status"], "PREPARED");
+            assert_eq!(prepared["table_bucket"], bucket);
+            assert_eq!(prepared["backup_id"], backup.backup_id);
+            assert_eq!(prepared["object"], backup.object);
+            assert_eq!(prepared["sha256"], backup.sha256);
+            assert_eq!(prepared["size_bytes"].as_u64(), Some(u64::try_from(backup.data.len()).unwrap()));
+            let mut after = target.inventory().await;
+            let stored = after
+                .remove(&(bucket.clone(), backup.object.clone()))
+                .expect("preparation must add only the referenced payload");
+            assert_eq!(stored.0, backup.data);
+            assert!(stored.1.is_some());
+            assert_eq!(prepared["etag"].as_str(), stored.1.as_deref());
+            assert_eq!(after, before, "preparation published catalog, intent, or other objects");
+            assert!(target.catalog.get_table_bucket(&bucket).await.unwrap().is_none());
+            let prepared_versions = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let repeated =
+                    call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", request_body.clone()))
+                        .await
+                        .expect("exact preparation retries must remain idempotent");
+                assert_backup_transfer_response_is_private(&repeated);
+                let mut repeated: serde_json::Value = serde_json::from_slice(&repeated.output.1.bytes().unwrap()).unwrap();
+                assert_eq!(repeated["status"], "ALREADY_PRESENT");
+                repeated["status"] = prepared["status"].clone();
+                assert_eq!(repeated, prepared);
+                assert_eq!(target.inventory().await, prepared_versions, "retry changed bytes or ETags");
+            }
+            let mut changed = backup.data.clone();
+            changed.push(b' ');
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                backup_object_prepare_body(&backup.backup_id, &backup.object, &changed),
+            ))
+            .await
+            .expect_err("a changed body cannot overwrite prepared bytes");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, prepared_versions);
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_COMPAT_PREFIX,
+                "prepare",
+                backup_object_prepare_body(&backup.backup_id, "unlisted/object.metadata.json", &backup.data),
+            ))
+            .await
+            .expect_err("a valid body cannot authorize an unlisted object");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, prepared_versions);
+
+            let foreign_bucket = format!("foreign-prepare-{}", Uuid::new_v4().simple());
+            let target_store = target.context.object_store();
+            target_store
+                .make_bucket(&foreign_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            enable_table_bucket_marker(&target_store, &foreign_bucket).await.unwrap();
+            let before_foreign = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.operator_request(prefix, "prepare", request_body.clone());
+                request.uri = format!("{prefix}/{foreign_bucket}/catalog/backup/prepare").parse().unwrap();
+                let error = call_catalog_backup_prepare_handler(request)
+                    .await
+                    .expect_err("warehouse permission must not authorize another warehouse");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before_foreign);
+                assert!(target.backend.list_objects(&foreign_bucket, "").await.unwrap().is_empty());
+            }
+            assert_eq!(source.inventory().await, source_before);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_prepare_handler_rejects_strict_json_base64_limits_and_disabled_buckets_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-prepare-limits-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            let backup = source.create_preparation_source().await;
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            call_catalog_backup_import_handler(target.operator_request(TABLE_CATALOG_PREFIX, "import", backup.artifact.clone()))
+                .await
+                .unwrap();
+            let before = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                for body in [
+                    b"not-json".to_vec(),
+                    br#"{"backup-id":"a","object":"object","data-base64":null}"#.to_vec(),
+                    br#"{"backup-id":"a","object":"object","data-base64":"","unknown":true}"#.to_vec(),
+                    br#"{"backup-id":"a","object":"object","object":"other","data-base64":""}"#.to_vec(),
+                ] {
+                    let error = call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", body))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                    assert_eq!(target.inventory().await, before);
+                }
+                for encoded in ["***", "Zg", "_w==", "Zm9v\n", "Zg===", "Zh=="] {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "backup-id": backup.backup_id, "object": backup.object, "data-base64": encoded,
+                    }))
+                    .unwrap();
+                    let error = call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", body))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest, "accepted nonstandard Base64 {encoded:?}");
+                    assert_eq!(target.inventory().await, before);
+                }
+            }
+            let oversized_encoded = serde_json::to_vec(&serde_json::json!({
+                "backup-id": backup.backup_id, "object": backup.object,
+                "data-base64": "A".repeat(CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE + 4),
+            }))
+            .unwrap();
+            let error =
+                call_catalog_backup_prepare_handler(target.operator_request(TABLE_CATALOG_PREFIX, "prepare", oversized_encoded))
+                    .await
+                    .expect_err("encoded length must be bounded before Base64 allocation");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("encoded preparation limit"));
+            assert_eq!(target.inventory().await, before);
+            let decoded_over_limit = backup_object_prepare_body(
+                &backup.backup_id,
+                &backup.object,
+                &vec![0; CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE + 1],
+            );
+            let error =
+                call_catalog_backup_prepare_handler(target.operator_request(TABLE_CATALOG_PREFIX, "prepare", decoded_over_limit))
+                    .await
+                    .expect_err("the equal-length padded Base64 boundary must still enforce the decoded limit");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, before);
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                vec![b' '; CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1],
+            ))
+            .await
+            .expect_err("the JSON body must be bounded before deserialization");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(target.inventory().await, before);
+            let mut length_request = target.operator_request(TABLE_CATALOG_PREFIX, "prepare", Vec::new());
+            length_request.headers.insert(
+                http::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&(CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1).to_string()).unwrap(),
+            );
+            let error = call_catalog_backup_prepare_handler(length_request).await.unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("request body is too large"));
+            assert_eq!(target.inventory().await, before);
+
+            let disabled_bucket = format!("disabled-prepare-{}", Uuid::new_v4().simple());
+            target
+                .context
+                .object_store()
+                .make_bucket(&disabled_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            let before_disabled = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.request(prefix, "prepare", b"not-json".to_vec());
+                request.uri = format!("{prefix}/{disabled_bucket}/catalog/backup/prepare").parse().unwrap();
+                let error = call_catalog_backup_prepare_handler(request).await.unwrap_err();
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(error.message().unwrap_or_default().contains("not table-enabled"));
+                assert_eq!(target.inventory().await, before_disabled);
+                assert!(target.backend.list_objects(&disabled_bucket, "").await.unwrap().is_empty());
+            }
+        },
+    )
+    .await;
 }
 
 #[test]

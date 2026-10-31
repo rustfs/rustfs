@@ -14,6 +14,176 @@
 
 use super::*;
 
+#[path = "backup_capture_bounds_tests.rs"]
+mod capture_bounds;
+#[path = "backup_commit_recovery_store_tests.rs"]
+mod commit_recovery_store;
+#[path = "backup_maintenance_store_tests.rs"]
+mod maintenance_store;
+
+#[tokio::test]
+async fn restore_request_cancellation_before_replacement_delete_resumes_the_original_plan() {
+    let (backend, backup, metadata_path) = backup_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let expected_entry = store
+        .load_table("analytics", "sales", "orders")
+        .await
+        .expect("load original table")
+        .expect("original table exists");
+    let original_metadata = backend
+        .read_object("analytics", &metadata_path)
+        .await
+        .expect("read original immutable metadata")
+        .expect("metadata exists");
+    backend
+        .seed_object("unrelated-bucket", "keep.bin", b"unrelated data must remain unchanged".to_vec())
+        .await;
+
+    store
+        .drop_table("analytics", "sales", "orders")
+        .await
+        .expect("remove table before restoring backup");
+    store
+        .drop_namespace("analytics", "sales")
+        .await
+        .expect("remove namespace before restoring backup");
+    let paths = TableCatalogObjectPaths::default();
+    let bucket_path = paths.table_bucket_entry_path("analytics");
+    let (catalog_prefix, _) = bucket_path.rsplit_once('/').expect("catalog bucket has a parent");
+    // This sorts before ordinary catalog records in the frozen deletion plan.
+    let extra_path = format!("{catalog_prefix}/000-cancel-before-delete.json");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &extra_path, b"stale target catalog object".to_vec())
+        .await;
+    let original_extra = backend
+        .read_object(RUSTFS_META_BUCKET, &extra_path)
+        .await
+        .expect("read extra target object")
+        .expect("extra target object exists");
+    let restore_id = "cancel-before-replacement-delete";
+    let barrier_path = paths.catalog_restore_state_path("analytics");
+    let intent_path = paths.catalog_restore_intent_path("analytics", restore_id);
+    let pause = backend.pause_next_delete(RUSTFS_META_BUCKET, &extra_path).await;
+    let worker_backend = backend.clone();
+    let backup_id = backup.backup_id.clone();
+    let request = tokio::spawn(async move {
+        ObjectTableCatalogStore::new(worker_backend)
+            .restore_object_catalog_backup_with_id("analytics", &backup_id, None, true, Some(restore_id))
+            .await
+    });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .expect("restore reached the first replacement delete");
+    let interrupted_barrier = restore_control_json(&backend, &barrier_path).await;
+    let interrupted_intent = restore_control_json(&backend, &intent_path).await;
+    assert_eq!(interrupted_barrier["state"], "APPLYING");
+    assert_eq!(interrupted_barrier["restore_id"], restore_id);
+    assert_eq!(interrupted_barrier["restore_epoch"], interrupted_intent["restore_epoch"]);
+    assert!(
+        interrupted_intent["deletes"]
+            .as_array()
+            .expect("frozen deletion plan")
+            .iter()
+            .any(|entry| entry["object"] == extra_path),
+        "the paused delete must already be authorized by the durable plan"
+    );
+    assert_eq!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &extra_path)
+            .await
+            .expect("read paused delete target"),
+        Some(original_extra.clone()),
+        "the paused request deleted its target before cancellation"
+    );
+
+    request.abort();
+    let cancelled = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, request)
+        .await
+        .expect("cancelled request released its task and fencing guards")
+        .expect_err("the paused restore request must be cancelled");
+    assert!(cancelled.is_cancelled());
+    assert_eq!(
+        backend
+            .read_object(RUSTFS_META_BUCKET, &extra_path)
+            .await
+            .expect("read cancelled delete target"),
+        Some(original_extra),
+        "cancelling before delete must preserve its original bytes and ETag"
+    );
+    let cancelled_versions = maintenance_test_object_versions(&backend).await;
+    assert_pending_restore_rejects_catalog_access(&backend).await;
+    assert_eq!(maintenance_test_object_versions(&backend).await, cancelled_versions);
+
+    let restarted = ObjectTableCatalogStore::new(backend.clone());
+    let restored = tokio::time::timeout(
+        TABLE_CATALOG_TEST_TIMEOUT,
+        restarted.restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, true, Some(restore_id)),
+    )
+    .await
+    .expect("retry must not retain locks from the cancelled request")
+    .expect("the same request resumes its durable replacement plan");
+    assert_eq!(restored.status, TableCatalogRestoreStatus::Restored);
+    assert!(
+        !backend
+            .object_exists(RUSTFS_META_BUCKET, &extra_path)
+            .await
+            .expect("inspect completed deletion")
+    );
+    let completed_barrier = restore_control_json(&backend, &barrier_path).await;
+    let completed_intent = restore_control_json(&backend, &intent_path).await;
+    assert_eq!(completed_barrier["state"], "COMPLETED");
+    assert_eq!(completed_barrier["restore_epoch"], interrupted_barrier["restore_epoch"]);
+    assert_eq!(
+        completed_intent["writes"], interrupted_intent["writes"],
+        "retry replaced the original write plan"
+    );
+    assert_eq!(
+        completed_intent["deletes"], interrupted_intent["deletes"],
+        "retry replaced the original delete plan"
+    );
+    let loaded = restarted
+        .load_table("analytics", "sales", "orders")
+        .await
+        .expect("load completed restore")
+        .expect("table restored");
+    assert_eq!(loaded.table_uuid, expected_entry.table_uuid);
+    assert_eq!(loaded.warehouse_location, expected_entry.warehouse_location);
+    assert_eq!(loaded.metadata_location, expected_entry.metadata_location);
+    assert_eq!(loaded.version_token, expected_entry.version_token);
+    assert_eq!(loaded.generation, expected_entry.generation);
+    assert_eq!(loaded, expected_entry);
+    assert_eq!(
+        backend
+            .read_object("analytics", &metadata_path)
+            .await
+            .expect("read restored metadata"),
+        Some(original_metadata),
+        "recovery rewrote immutable Iceberg metadata"
+    );
+
+    let mut expected_versions = cancelled_versions;
+    expected_versions.remove(&(RUSTFS_META_BUCKET.to_string(), extra_path));
+    let mut actual_versions = maintenance_test_object_versions(&backend).await;
+    for path in [&barrier_path, &intent_path] {
+        expected_versions.remove(&(RUSTFS_META_BUCKET.to_string(), path.clone()));
+        actual_versions.remove(&(RUSTFS_META_BUCKET.to_string(), path.clone()));
+    }
+    assert_eq!(
+        actual_versions, expected_versions,
+        "resuming deletion rewrote already-applied catalog objects or unrelated data"
+    );
+
+    let completed_versions = maintenance_test_object_versions(&backend).await;
+    let replay = restarted
+        .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, true, Some(restore_id))
+        .await
+        .expect("completed request replays its original receipt");
+    let mut expected_receipt = restored;
+    expected_receipt.status = TableCatalogRestoreStatus::AlreadyRestored;
+    assert_eq!(replay, expected_receipt);
+    assert_eq!(maintenance_test_object_versions(&backend).await, completed_versions);
+}
+
 #[tokio::test]
 async fn completed_restore_sealed_publication_response_loss_replays_the_original_receipt() {
     let (backend, backup) = isolated_restore_fixture().await;

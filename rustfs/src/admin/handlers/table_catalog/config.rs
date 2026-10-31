@@ -159,6 +159,43 @@ impl Operation for ImportTableCatalogBackupHandler {
     }
 }
 
+/// Prepares one verified small object while leaving catalog publication to restore.
+pub struct PrepareTableCatalogBackupObjectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for PrepareTableCatalogBackupObjectHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_bounded_json_body::<CatalogBackupObjectPrepareRequest>(
+            &req.headers,
+            std::mem::take(&mut req.input),
+            CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE,
+            TABLE_CATALOG_REQUEST_BODY_TIMEOUT,
+            "catalog backup object preparation",
+        )
+        .await?;
+        if request.data_base64.len() > CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE {
+            return Err(S3Error::from(ApiError::invalid_request(
+                "data-base64 exceeds the encoded preparation limit",
+            )));
+        }
+        let data = base64_simd::STANDARD
+            .decode_to_vec(request.data_base64.as_bytes())
+            .map_err(|_| S3Error::from(ApiError::invalid_request("data-base64 must be standard padded Base64")))?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .prepare_catalog_backup_object(&warehouse, &request.backup_id, &request.object, data)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup-prepare", &warehouse, "", "", started, &result);
+        build_sensitive_json_response(StatusCode::OK, &result?)
+    }
+}
+
 pub struct RestoreTableCatalogBackupHandler {}
 
 #[async_trait::async_trait]
