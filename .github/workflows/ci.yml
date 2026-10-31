@@ -160,7 +160,7 @@ jobs:
       - name: Run shared quick checks
         uses: ./.github/actions/quick-checks
 
-  test-and-lint:
+  workspace-lint-and-build:
     name: Workspace Lint and Build
     if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
@@ -193,13 +193,13 @@ jobs:
 
       - name: Prepare test evidence
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           {
             echo "run_id=${GITHUB_RUN_ID}"
             echo "job=${GITHUB_JOB}"
             echo "runner=${RUNNER_NAME}"
             echo "started_at=$(date --utc --iso-8601=seconds)"
-          } > artifacts/test-and-lint/run-metadata.txt
+          } > artifacts/workspace/run-metadata.txt
 
       # Clippy gates every event, pull requests included. When it ran only after
       # merge, a lint regression merged freely and then failed every main run
@@ -233,11 +233,11 @@ jobs:
 
       - name: Run documentation tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           set +e
           timeout --verbose --signal=TERM --kill-after=30s 15m \
             python3 scripts/ci_test_artifact.py cargo doc --configuration workspace \
-            2>&1 | tee artifacts/test-and-lint/doctest.log
+            2>&1 | tee artifacts/workspace/doctest.log
           status=${PIPESTATUS[0]}
           {
             echo "command=cargo test --all --exclude e2e_test --doc"
@@ -246,7 +246,7 @@ jobs:
             echo
             echo "Remaining test-related processes:"
             pgrep -af 'cargo|rustdoc|target/.*/deps/' || true
-          } > artifacts/test-and-lint/doctest-diagnostics.txt
+          } > artifacts/workspace/doctest-diagnostics.txt
           exit "${status}"
 
       - name: Upload test reports and diagnostics
@@ -255,7 +255,7 @@ jobs:
         with:
           name: junit-test-and-lint-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: error
 
@@ -268,7 +268,7 @@ jobs:
 
   workspace-tests:
     name: Workspace tests
-    needs: [ test-and-lint, classify-changes ]
+    needs: [ workspace-lint-and-build, classify-changes ]
     # The archive retains compile-time fixture paths and the large test set
     # requires the same runner image until the hosted-runtime pilot passes.
     runs-on: sm-standard-4
@@ -293,14 +293,14 @@ jobs:
 
       - name: Extract and list workspace tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json \
-            > artifacts/test-and-lint/core-test-listing.json
-          python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json
+            > artifacts/workspace/core-test-listing.json
+          python3 scripts/check_test_wiring.py --check-core artifacts/workspace/core-test-listing.json
 
       - name: Run nextest tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           rm -f target/nextest/ci/junit.xml
           ./scripts/ci/resource_sampler.sh start nextest
           trap './scripts/ci/resource_sampler.sh stop' EXIT
@@ -309,7 +309,7 @@ jobs:
             cargo nextest run --profile ci --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --status-level all --final-status-level all \
-            2>&1 | tee artifacts/test-and-lint/nextest.log
+            2>&1 | tee artifacts/workspace/nextest.log
           status=${PIPESTATUS[0]}
           {
             echo "command=workspace archive execution"
@@ -321,13 +321,13 @@ jobs:
             echo
             echo "Kernel OOM / kill events:"
             dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
-          } > artifacts/test-and-lint/nextest-diagnostics.txt
+          } > artifacts/workspace/nextest-diagnostics.txt
           exit "${status}"
 
       - name: Verify workspace execution completeness
         run: |
-          python3 scripts/ci_test_artifact.py evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
-          ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
+          python3 scripts/ci_test_artifact.py evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
+          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
 
       - name: Run ignored ILM integration tests serially
         if: needs.classify-changes.outputs.mode == 'full'
@@ -358,7 +358,7 @@ jobs:
           name: workspace-test-evidence-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
-            artifacts/test-and-lint
+            artifacts/workspace
             artifacts/ilm-integration
           retention-days: 3
           if-no-files-found: error
@@ -368,7 +368,7 @@ jobs:
         if: needs.classify-changes.outputs.rehearse_shards == 'true'
         run: |
           python3 scripts/ci_test_shards.py prepare \
-            --listing artifacts/test-and-lint/core-test-listing.json \
+            --listing artifacts/workspace/core-test-listing.json \
             --junit target/nextest/ci/junit.xml --output artifacts/workspace-shard-plan
       - name: Upload same-run shard plan
         if: needs.classify-changes.outputs.rehearse_shards == 'true'
@@ -542,12 +542,12 @@ jobs:
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           rm -f target/nextest/ci/junit.xml
           ./scripts/ci/resource_sampler.sh start nextest-rio-v2
           trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2 \
-            2>&1 | tee artifacts/test-and-lint/nextest.log
+            2>&1 | tee artifacts/workspace/nextest.log
           cargo test -p rustfs --doc --features rio-v2
 
       - name: Upload rio-v2 test reports and diagnostics
@@ -557,7 +557,7 @@ jobs:
           name: junit-test-and-lint-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: error
 
@@ -633,7 +633,7 @@ jobs:
           path: |
             target/nextest/ci/junit.xml
             artifacts/protocol-tests
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: warn
 
@@ -980,7 +980,7 @@ jobs:
           path: |
             ${{ runner.temp }}/rustfs-e2e-smoke-logs/
             ${{ runner.temp }}/rustfs-e2e-smoke-list.json
-            artifacts/test-and-lint
+            artifacts/workspace
           if-no-files-found: warn
 
       - name: Upload e2e smoke JUnit report
@@ -1391,7 +1391,7 @@ jobs:
       - classify-changes
       - typos
       - quick-checks
-      - test-and-lint
+      - workspace-lint-and-build
       - workspace-tests
       - workspace-shards
       - workspace-shard-evidence
@@ -1427,7 +1427,7 @@ jobs:
       - required-checks
       - typos
       - quick-checks
-      - test-and-lint
+      - workspace-lint-and-build
       - workspace-tests
       - core-contract
       - test-and-lint-rio-v2
