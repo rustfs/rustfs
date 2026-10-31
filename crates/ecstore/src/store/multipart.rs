@@ -612,7 +612,7 @@ impl ECStore {
         }
         if opts.http_preconditions.is_some()
             && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, &opts).await
+            && let Some(err) = self.check_write_precondition(bucket, object, &opts, false).await
         {
             return Err(err);
         }
@@ -1154,12 +1154,33 @@ impl ECStore {
         Ok(())
     }
 
-    async fn check_write_precondition(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Option<StorageError> {
+    async fn check_write_precondition(
+        &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+        require_all_pools: bool,
+    ) -> Option<StorageError> {
         let mut lookup_opts = opts.clone();
         let http_preconditions = lookup_opts.http_preconditions?;
         lookup_opts.http_preconditions = None;
         lookup_opts.no_lock = true;
-        let oi = self.get_object_info_for_delete(bucket, object, &lookup_opts).await;
+        let oi = if require_all_pools {
+            lookup_opts.metadata_cache_safe = false;
+            lookup_opts.suppress_read_repair = true;
+            if let Err(err) = check_object_args(bucket, object) {
+                return Some(err);
+            }
+            let encoded_object = encode_dir_object(object);
+            self.get_latest_object_info_for_conditional_write(bucket, &encoded_object, &lookup_opts)
+                .await
+                .and_then(|(info, _)| {
+                    lookup_opts.precondition_check(&info)?;
+                    Ok(info)
+                })
+        } else {
+            self.get_object_info_for_delete(bucket, object, &lookup_opts).await
+        };
         crate::set_disk::SetDisks::evaluate_write_precondition(oi, &http_preconditions, bucket, object, opts)
     }
 
@@ -1186,11 +1207,13 @@ impl ECStore {
                 .await;
             return enqueue_transition_after_write(self.as_ref(), result, LcEventSrc::S3CompleteMultipartUpload, opts).await;
         }
-        if opts.http_preconditions.is_some()
-            && !opts.data_movement
-            && let Some(err) = self.check_write_precondition(bucket, object, opts).await
-        {
-            return Err(err);
+        if opts.http_preconditions.is_some() && !opts.data_movement {
+            // Preserve explicitly scoped internal reads and borrowed-lock callers.
+            let require_all_pools =
+                !opts.replication_request && !opts.no_lock && !opts.skip_decommissioned && !opts.skip_rebalancing;
+            if let Some(err) = self.check_write_precondition(bucket, object, opts, require_all_pools).await {
+                return Err(err);
+            }
         }
 
         let result = match self.multipart_upload_pool_idx(bucket, object, upload_id, opts).await {
