@@ -690,25 +690,45 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let current_opts = internal_object_info_lookup_opts(
-            get_opts(&bucket, &key, None, None, &req.headers)
-                .await
-                .map_err(ApiError::from)?,
-        );
+        let quota_metadata_sys = self.bucket_metadata_sys();
+        let quota_tracking = quota_metadata_sys.is_some();
+        let mut quota_enabled = false;
+        if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
+            let quota_checker = QuotaChecker::new(metadata_sys.clone());
+            let check_result =
+                map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
+            quota_enabled = check_result.quota_limit.is_some();
+            apply_quota_admission(&mut opts, &check_result)?;
+        }
+
         let object_lock_config_state = Box::pin(load_bucket_object_lock_config_state(&bucket)).await?;
-        let previous_current_sizes = match store.get_object_info(&bucket, &key, &current_opts).await {
-            Ok(existing_obj_info) => {
-                validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
-                let physical_size = existing_obj_info.size.max(0) as u64;
-                let logical_size = quota_object_size(&existing_obj_info);
-                Some((physical_size, logical_size))
-            }
-            Err(err) => {
-                if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
-                    return Err(ApiError::from(err).into());
+        let prelookup_required = quota_enabled
+            || (!super::object::shared::put_like_write_creates_new_version(&opts)
+                && super::object::shared::object_lock_checks_required_for_state(&object_lock_config_state));
+        let prelookup_previous_current_size: Option<Option<u64>> = if prelookup_required {
+            let current_opts = internal_object_info_lookup_opts(
+                get_opts(&bucket, &key, None, None, &req.headers)
+                    .await
+                    .map_err(ApiError::from)?,
+            );
+            match store.get_object_info(&bucket, &key, &current_opts).await {
+                Ok(existing_obj_info) => {
+                    validate_existing_object_lock_for_write(&object_lock_config_state, &existing_obj_info, &current_opts)?;
+                    Some(Some(if quota_enabled {
+                        quota_object_size(&existing_obj_info).map_err(ApiError::from)?
+                    } else {
+                        existing_obj_info.size.max(0) as u64
+                    }))
                 }
-                None
+                Err(err) => {
+                    if !is_err_object_not_found(&err) && !is_err_version_not_found(&err) {
+                        return Err(ApiError::from(err).into());
+                    }
+                    Some(None)
+                }
             }
+        } else {
+            None
         };
 
         // A lost Complete response retries the same upload id after staging is
@@ -745,24 +765,6 @@ impl DefaultMultipartUsecase {
 
         let upload_user_defined = multipart_info.as_ref().map(|info| info.user_defined.clone());
         let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&req);
-
-        let quota_metadata_sys = self.bucket_metadata_sys();
-        let quota_tracking = quota_metadata_sys.is_some();
-        let mut quota_enabled = false;
-        if let Some(metadata_sys) = quota_metadata_sys.as_ref() {
-            let quota_checker = QuotaChecker::new(metadata_sys.clone());
-            let check_result =
-                map_quota_check_outcome(&bucket, quota_checker.check_quota(&bucket, QuotaOperation::PutObject, 0).await)?;
-            quota_enabled = check_result.quota_limit.is_some();
-            apply_quota_admission(&mut opts, &check_result)?;
-        }
-
-        let previous_current_size = match previous_current_sizes {
-            Some((_, Ok(logical_size))) if quota_enabled => Some(logical_size),
-            Some((_, Err(err))) if quota_enabled => return Err(ApiError::from(err).into()),
-            Some((physical_size, _)) => Some(physical_size),
-            None => None,
-        };
 
         // Replication admission is decided at the object-creation commit, not
         // at multipart-session creation. Configuration and matching targets
@@ -831,11 +833,25 @@ impl DefaultMultipartUsecase {
                 if !obj_info.multipart_completion_replayed {
                     if quota_tracking {
                         let committed_size = quota_accounting_object_size(&obj_info, quota_enabled)?;
-
-                        if versioned {
-                            record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size).await;
-                        } else {
-                            record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                        match prelookup_previous_current_size
+                            .or_else(|| super::object::previous_current_size_from_backfill(obj_info.backfilled_old_current_size))
+                        {
+                            Some(previous_current_size) => {
+                                if versioned {
+                                    record_bucket_object_version_write_memory(&bucket, previous_current_size, committed_size)
+                                        .await;
+                                } else {
+                                    record_bucket_object_write_memory(&bucket, previous_current_size, committed_size).await;
+                                }
+                            }
+                            None => {
+                                crate::app::storage_api::data_usage::record_bucket_object_write_unknown_previous_memory(
+                                    &bucket,
+                                    committed_size,
+                                    versioned,
+                                )
+                                .await;
+                            }
                         }
                     }
 
