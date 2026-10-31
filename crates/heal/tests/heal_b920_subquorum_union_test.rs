@@ -157,7 +157,7 @@ async fn wait_for_object_copies(disks: &[PathBuf], bucket: &str, object: &str) {
 fn deep_heal_opts() -> HealOpts {
     HealOpts {
         recreate: true,
-        remove: false,
+        remove: true,
         scan_mode: HealScanMode::Deep,
         ..Default::default()
     }
@@ -633,6 +633,7 @@ mod absence_receipt_regressions {
                 version_id: Some(old.to_owned()),
             },
             HealOptions {
+                remove_corrupted: true,
                 scan_mode: HealScanMode::Deep,
                 pool_index: Some(0),
                 set_index: Some(0),
@@ -823,6 +824,7 @@ mod absence_receipt_regressions {
             },
             HealOptions {
                 recursive: true,
+                remove_corrupted: true,
                 scan_mode: HealScanMode::Deep,
                 ..Default::default()
             },

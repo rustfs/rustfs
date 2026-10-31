@@ -420,6 +420,7 @@ async fn real_storage_grace_round_trip() {
             &HealOpts {
                 scan_mode: rustfs_heal_contracts::heal_channel::HealScanMode::Deep,
                 recreate: true,
+                remove: true,
                 pool: Some(0),
                 set: Some(0),
                 ..Default::default()

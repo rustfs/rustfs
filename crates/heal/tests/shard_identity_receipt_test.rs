@@ -810,7 +810,13 @@ fn admin_mixed_batch_retains_repairs_after_object_retry_exhaustion() {
                     restarted.start().await.expect("restart with retained failed batch");
                     let restored = restarted.get_task_report(&token).await.expect("original token after restart");
                     assert_eq!(restored.status, report.status);
-                    assert_eq!(restored.outcome, report.outcome);
+                    // Quorum and Deep observations are local and never persisted.
+                    let mut expected_outcome = report.outcome.as_deref().cloned().expect("mixed batch outcome");
+                    for object in &mut expected_outcome.objects {
+                        object.quorum_selected_data_dir = None;
+                        object.deep_check_observed = false;
+                    }
+                    assert_eq!(restored.outcome.as_deref(), Some(&expected_outcome));
                     assert_eq!(restarted.get_queue_length().await, 0, "terminal batch must not replay");
                     restarted.stop().await.expect("stop restarted mixed batch manager");
                 });
