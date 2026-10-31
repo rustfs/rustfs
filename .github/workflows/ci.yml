@@ -449,7 +449,7 @@ jobs:
 
   connect-feature-boundaries:
     name: Connect Feature Boundaries
-    if: needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect != 'false' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect != 'false' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -499,11 +499,13 @@ jobs:
 
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    # Alternate feature configurations run on the nightly schedule, merge
-    # groups and manual dispatch. The default workspace remains the PR gate and
-    # the per-push main baseline: repeating four feature builds on every merge
-    # bought nothing the nightly run does not report within a day.
-    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
+    # Specialized boundary, hardware and alternate-feature lanes run only on
+    # the nightly schedule and manual dispatch. They do not gate a merge: the
+    # nightly run reports a regression within a day, and repeating these builds
+    # on every PR revision and merge group bought no earlier signal worth the
+    # runner occupancy. Workspace lint and tests, the core contract, the debug
+    # build, E2E smoke and the S3 lanes remain the pull-request gate.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -562,7 +564,7 @@ jobs:
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     # Same cadence as test-and-lint-rio-v2 above.
-    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -783,7 +785,7 @@ jobs:
     # job had neither, so each closed/merged PR really ran the whole io_uring
     # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
     # 30662728539) and kept the cancellation run in progress for minutes.
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so

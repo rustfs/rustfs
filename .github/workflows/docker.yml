@@ -329,13 +329,75 @@ jobs:
           echo "  - Create latest: $create_latest"
           echo "  - Source ref: $source_ref"
 
+  # Consume the trusted release certification for the exact version this
+  # workflow wraps and verify the certified input digests. A manual dispatch
+  # without that certification fails here and pushes no official tag; only
+  # results from the trusted verification sources carry release authority.
+  release-certification:
+    name: Release Certification
+    needs: build-check
+    if: needs.build-check.outputs.should_build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+          ref: ${{ needs.build-check.outputs.source_ref }}
+
+      - name: Download and verify release certification
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certification
+          run_id="$TRIGGERING_RUN_ID"
+          if [[ -z "$run_id" ]]; then
+            run_id="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$VERSION" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' || true)"
+          fi
+          if [[ -z "$run_id" ]]; then
+            echo "No certified Build and Release run found for ${VERSION}; failing closed" >&2
+            exit 1
+          fi
+          if ! gh run download "$run_id" -n release-certification -D certification; then
+            echo "Build run ${run_id} published no release-certification artifact; failing closed" >&2
+            exit 1
+          fi
+          python3 scripts/release/release_gate.py verify-promotion \
+            --plan .config/release-validation-plan.json \
+            --candidate certification/candidate.json \
+            --summary certification/release-gate-output \
+            --artifact-sha256 "$(jq -r '.deliverables[0].sha256' certification/candidate.json)" \
+            --artifact-name "$(jq -r '.deliverables[0].name' certification/candidate.json)"
+
+          # Input digest binding: every zip this image wraps must be the
+          # certified byte-for-byte content, never a mutable latest pointer.
+          while IFS=$'\t' read -r name location expected; do
+            echo "Verifying certified input ${name}"
+            actual="$(curl -fsSL "$location" | sha256sum | awk '{print $1}')"
+            if [[ "$actual" != "$expected" ]]; then
+              echo "Certified input ${name} does not match its recorded digest" >&2
+              exit 1
+            fi
+          done < <(jq -r '.deliverables[] | select(.name | contains("linux")) | [.name, .location, .sha256] | @tsv' certification/candidate.json)
+
   # Build multi-arch Docker images
   # Strategy: Build images using pre-built binaries from dl.rustfs.com
   # Supports both release and dev channel binaries based on build context
   # Only runs when should_build is true (which includes workflow success check)
   build-docker:
     name: Build Docker Images
-    needs: build-check
+    needs: [ build-check, release-certification ]
     if: needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
@@ -443,6 +505,14 @@ jobs:
           # Output tags
           echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
 
+          # Staging identity for this run's promotion: official tags are only
+          # created after the staged image verifies against the certification,
+          # and they point at this same digest (no rebuild-after-verify).
+          STAGING_TAG="staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${VARIANT_SUFFIX}"
+          STAGING_TAGS="${{ env.REGISTRY_DOCKERHUB }}:${STAGING_TAG},${{ env.REGISTRY_GHCR }}:${STAGING_TAG},${{ env.REGISTRY_QUAY }}:${STAGING_TAG}"
+          echo "staging_tags=$STAGING_TAGS" >> "$GITHUB_OUTPUT"
+          echo "staging_tag=$STAGING_TAG" >> "$GITHUB_OUTPUT"
+
           # Generate labels
           LABELS="org.opencontainers.image.title=RustFS"
           LABELS="$LABELS,org.opencontainers.image.description=RustFS distributed object storage system"
@@ -467,7 +537,9 @@ jobs:
           file: ${{ matrix.file }}
           platforms: ${{ env.DOCKER_PLATFORMS }}
           push: ${{ needs.build-check.outputs.should_push == 'true' }}
-          tags: ${{ steps.meta.outputs.tags }}
+          # Push to staging tags only: official tags are created by the
+          # certification-gated promotion step below from this same digest.
+          tags: ${{ steps.meta.outputs.staging_tags }}
           labels: ${{ steps.meta.outputs.labels }}
           # No layer cache. This build compiles nothing — it downloads a
           # release zip and runs apk/apt — so the cache could only save the
@@ -492,6 +564,114 @@ jobs:
           # Add retry mechanism by splitting the build process
           no-cache: false
           pull: true
+
+      # A later-built wrapper: the staged image must complete this platform's
+      # own binary identity verification before any official tag is written.
+      # It may not inherit an unverified package's conclusion.
+      - name: Verify staged image against certification
+        if: needs.build-check.outputs.should_push == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p certification
+          run_id="$TRIGGERING_RUN_ID"
+          if [[ -z "$run_id" ]]; then
+            run_id="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$VERSION" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' || true)"
+          fi
+          gh run download "$run_id" -n release-certification -D certification
+
+          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
+          case "${{ matrix.variant }}" in
+            musl) libc="musl" ;;
+            glibc) libc="gnu" ;;
+          esac
+          for platform in linux/amd64 linux/arm64; do
+            case "$platform" in
+              linux/amd64) arch_sub="x86_64" ;;
+              linux/arm64) arch_sub="aarch64" ;;
+            esac
+            docker pull --platform "$platform" "$STAGING_REF"
+            container="$(docker create --platform "$platform" "$STAGING_REF")"
+            docker cp "$container:/usr/bin/rustfs" "$RUNNER_TEMP/staged-rustfs"
+            docker rm "$container" >/dev/null
+            actual="$(sha256sum "$RUNNER_TEMP/staged-rustfs" | awk '{print $1}')"
+            expected="$(jq -r --arg needle "linux-${arch_sub}-${libc}" \
+              '[.deliverables[] | select(.name | contains($needle)) | .binary_sha256][0] // empty' \
+              certification/candidate.json)"
+            if [[ -z "$expected" || "$actual" != "$expected" ]]; then
+              echo "Staged image binary for ${platform} does not match the certified binary digest" >&2
+              exit 1
+            fi
+            python3 scripts/release/release_gate.py verify-promotion \
+              --plan .config/release-validation-plan.json \
+              --candidate certification/candidate.json \
+              --summary certification/release-gate-output \
+              --artifact "$RUNNER_TEMP/staged-rustfs" \
+              --artifact-role binary
+          done
+
+      - name: Promote staged image to official tags
+        if: needs.build-check.outputs.should_push == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
+          IFS=',' read -r -a official_tags <<< "${{ steps.meta.outputs.tags }}"
+          for tag in "${official_tags[@]}"; do
+            docker buildx imagetools create -t "$tag" "$STAGING_REF"
+            echo "Promoted $tag -> $STAGING_REF"
+          done
+
+      # Downstream consumers (Helm) verify this record instead of inheriting
+      # an unverified wrapper's conclusion.
+      - name: Record image promotion
+        if: needs.build-check.outputs.should_push == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_VALIDATION_TOKEN || github.token }}
+          TRIGGERING_RUN_ID: ${{ github.event.workflow_run.id }}
+          VERSION: ${{ needs.build-check.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p certification
+          run_id="$TRIGGERING_RUN_ID"
+          if [[ -z "$run_id" ]]; then
+            run_id="$(gh api --method GET \
+              "repos/${GITHUB_REPOSITORY}/actions/workflows/build.yml/runs" \
+              -f branch="$VERSION" -f status=success -F per_page=1 \
+              --jq '.workflow_runs[0].id // empty' || true)"
+          fi
+          gh run download "$run_id" -n release-certification -D certification
+          STAGING_REF="${{ env.REGISTRY_DOCKERHUB }}:staging-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}${{ matrix.suffix }}"
+          digest="$(docker buildx imagetools inspect "$STAGING_REF" --format '{{json .Manifest}}' | jq -r '.digest')"
+          candidate_sha="$(python3 -c "import json,hashlib,sys; sys.path.insert(0,'scripts/release'); import release_gate; print(release_gate.canonical_sha256(json.load(open('certification/candidate.json'))))")"
+          jq -n \
+            --arg version "$VERSION" \
+            --arg digest "$digest" \
+            --arg staging_ref "$STAGING_REF" \
+            --arg candidate_sha256 "$candidate_sha" \
+            --arg tags "${{ steps.meta.outputs.tags }}" \
+            --slurpfile candidate certification/candidate.json \
+            '{schema_version: 1, version: $version, image_digest: $digest, staging_ref: $staging_ref,
+              promoted_tags: ($tags | split(",")), candidate_sha256: $candidate_sha256,
+              binary_sha256s: ($candidate[0].deliverables | map(.binary_sha256) | unique)}' \
+            > image-promotion-record.json
+
+      - name: Upload image promotion record
+        if: needs.build-check.outputs.should_push == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-promotion-record${{ matrix.suffix }}
+          path: image-promotion-record.json
+          if-no-files-found: error
+          retention-days: 30
 
   # Note: Manifest creation is no longer needed as we only build one variant
   # Multi-arch manifests are automatically created by docker/build-push-action

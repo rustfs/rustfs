@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "evidence_profile": "release-artifact",
+  "run_id": "fixture-batch-1",
+  "run_attempt": 2,
+  "plan_sha256": "578bb57e65df8ba7a63e40aafc254fa644163270b7ec288fe3368bcd7c10ff86",
+  "tier": "release-certification",
+  "lane": "identity",
+  "case_id": "startup",
+  "product_commit": "3333333333333333333333333333333333333333",
+  "harness_commit": "1111111111111111111111111111111111111111",
+  "target_fingerprint": "rustfs-9.9.9-fixture-linux-x86_64-gnu",
+  "platform": {
+    "os": "linux",
+    "arch": "x86_64",
+    "abi": "gnu"
+  },
+  "started_at": "2026-09-26T10:01:00Z",
+  "finished_at": "2026-09-26T10:01:30Z",
+  "state": "quarantined",
+  "reason_code": "fixture-quarantined",
+  "reason_class": "NOT_APPLICABLE",
+  "evidence": [
+    {
+      "path": "cases/identity/startup-linux-x86_64-gnu.json",
+      "sha256": "8b8774175c55c400b337610a89fe725ad2637af8fcc4973a82ab218f9182b80d",
+      "size": 64
+    }
+  ],
+  "workflow": {
+    "repository": "rustfs/s3chaos",
+    "workflow_id": "release-gate.yml",
+    "run_id": "child-identity-linux-x86_64-gnu",
+    "run_attempt": 1,
+    "workflow_sha": "1111111111111111111111111111111111111111"
+  },
+  "artifact": {
+    "archive_sha256": "ea3ac1fb0ec4aa8fbec650f64ccdbc2543843c8d5734c3915d1b57d7cbb92ec8",
+    "binary_sha256": "7b77e78cc7b8f63a60f8a7101bebed6502f82e03016f4d4e11450f927e0a52fa",
+    "container_image_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+  }
+}
