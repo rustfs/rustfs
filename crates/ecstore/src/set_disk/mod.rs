@@ -120,7 +120,6 @@ use bytesize::ByteSize;
 use futures::future::join_all;
 use http::HeaderMap;
 use md5::{Digest as Md5Digest, Md5};
-use regex::Regex;
 use rustfs_config::MI_B;
 use rustfs_filemeta::metadata_keys;
 use rustfs_filemeta::{
@@ -8036,16 +8035,29 @@ fn parts_after_marker(part_numbers: &[usize], part_number_marker: usize) -> Opti
     Some(&part_numbers[index..])
 }
 
-pub fn canonicalize_etag(etag: &str) -> String {
-    let re = Regex::new("\"*?([^\"]*?)\"*?$").unwrap();
-    re.replace_all(etag, "$1").to_string()
+fn canonicalized_etag(etag: &str) -> Cow<'_, str> {
+    // Preserve the legacy suffix-matching behavior for embedded quotes.
+    let trimmed = etag.trim_end_matches('"');
+    let Some(last_quote) = trimmed.rfind('"') else {
+        return Cow::Borrowed(trimmed);
+    };
+    let prefix = trimmed[..last_quote].trim_end_matches('"');
+    let suffix = &trimmed[last_quote + 1..];
+    if prefix.is_empty() {
+        Cow::Borrowed(suffix)
+    } else {
+        let mut result = String::with_capacity(prefix.len() + suffix.len());
+        result.push_str(prefix);
+        result.push_str(suffix);
+        Cow::Owned(result)
+    }
 }
 
 pub fn e_tag_matches(etag: &str, condition: &str) -> bool {
     if condition.trim() == "*" {
         return true;
     }
-    canonicalize_etag(etag) == canonicalize_etag(condition)
+    canonicalized_etag(etag) == canonicalized_etag(condition)
 }
 
 fn weak_etag_matches(etag: &str, condition: &str) -> bool {
@@ -8060,7 +8072,7 @@ fn weak_etag_matches(etag: &str, condition: &str) -> bool {
             .or_else(|| trimmed.strip_prefix("w/"))
             .unwrap_or(trimmed)
     }
-    canonicalize_etag(strip_weak(etag)) == canonicalize_etag(strip_weak(condition))
+    canonicalized_etag(strip_weak(etag)) == canonicalized_etag(strip_weak(condition))
 }
 
 pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
@@ -13770,6 +13782,22 @@ mod tests {
         let result2 = SetDisks::shuffle_disks(&disks, &empty_distribution);
         assert_eq!(result2.len(), 3);
         assert!(result2.iter().all(|d| d.is_none()));
+    }
+
+    #[test]
+    fn canonicalized_etag_preserves_legacy_regex_semantics() {
+        let regex = regex::Regex::new("\"*?([^\"]*?)\"*?$").expect("valid legacy ETag pattern");
+        let alphabet = ['a', '"', '\n', 'é', '\0'];
+        for length in 0..=6_u32 {
+            for mut number in 0..alphabet.len().pow(length) {
+                let mut input = String::new();
+                for _ in 0..length {
+                    input.push(alphabet[number % alphabet.len()]);
+                    number /= alphabet.len();
+                }
+                assert_eq!(canonicalized_etag(&input), regex.replace_all(&input, "$1"), "input: {input:?}");
+            }
+        }
     }
 
     #[test]
