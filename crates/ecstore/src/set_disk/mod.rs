@@ -8075,12 +8075,9 @@ fn weak_etag_matches(etag: &str, condition: &str) -> bool {
     canonicalized_etag(strip_weak(etag)) == canonicalized_etag(strip_weak(condition))
 }
 
-pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<String>, if_match: Option<String>) -> bool {
-    let if_none_match = if_none_match
-        .as_deref()
-        .map(str::trim)
-        .filter(|condition| !condition.is_empty());
-    let if_match = if_match.as_deref().map(str::trim).filter(|condition| !condition.is_empty());
+pub fn should_prevent_write(oi: &ObjectInfo, if_none_match: Option<&str>, if_match: Option<&str>) -> bool {
+    let if_none_match = if_none_match.map(str::trim).filter(|condition| !condition.is_empty());
+    let if_match = if_match.map(str::trim).filter(|condition| !condition.is_empty());
 
     match &oi.etag {
         Some(etag) => {
@@ -14375,61 +14372,61 @@ mod tests {
             etag: Some("abc".to_string()),
             ..Default::default()
         };
-        let if_none_match = Some("abc".to_string());
+        let if_none_match = Some("abc");
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("*".to_string());
+        let if_none_match = Some("*");
         let if_match = None;
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
-        let if_match = Some("def".to_string());
+        let if_match = Some("def");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
-        let if_match = Some("*".to_string());
+        let if_match = Some("*");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
+        let if_none_match = Some("def");
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
-        let if_match = Some("*".to_string());
+        let if_none_match = Some("def");
+        let if_match = Some("*");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("def".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("def");
+        let if_match = Some("\"abc\"");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some("*".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("*");
+        let if_match = Some("\"abc\"");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let oi = ObjectInfo {
             etag: None,
             ..Default::default()
         };
-        let if_none_match = Some("*".to_string());
-        let if_match = Some("\"abc\"".to_string());
+        let if_none_match = Some("*");
+        let if_match = Some("\"abc\"");
         assert!(should_prevent_write(&oi, if_none_match, if_match));
 
         let if_none_match = None;
         let if_match = None;
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
-        let if_none_match = Some(String::new());
-        let if_match = Some(" ".to_string());
+        let if_none_match = Some("");
+        let if_match = Some(" ");
         assert!(!should_prevent_write(&oi, if_none_match, if_match));
 
         let oi = ObjectInfo {
             etag: Some("abc".to_string()),
             ..Default::default()
         };
-        assert!(should_prevent_write(&oi, Some("W/\"abc\"".to_string()), None));
-        assert!(!should_prevent_write(&oi, Some("W/\"def\"".to_string()), None));
-        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"".to_string())));
+        assert!(should_prevent_write(&oi, Some("W/\"abc\""), None));
+        assert!(!should_prevent_write(&oi, Some("W/\"def\""), None));
+        assert!(should_prevent_write(&oi, None, Some("W/\"abc\"")));
     }
 
     #[test]
