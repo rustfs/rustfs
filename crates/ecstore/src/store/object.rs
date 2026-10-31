@@ -31,7 +31,7 @@ use crate::bucket::lifecycle::{
 };
 use crate::bucket::metadata_sys::{
     acquire_bucket_metadata_transaction_read_lock_in, get_cached_bucket_incarnation_id_in, get_delete_config_from_disk_in,
-    get_object_lock_config_and_incarnation_from_disk_in,
+    get_object_lock_and_quota_config_from_disk_with_guard_in, get_object_lock_config_and_incarnation_from_disk_with_guard_in,
 };
 use crate::bucket::object_lock::objectlock_sys::{
     check_object_lock_for_deletion_with_state, ensure_recursive_force_delete_allowed_for_state,
@@ -3162,7 +3162,7 @@ impl ECStore {
         let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
         let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
         let (state, bucket_incarnation_id, config_revision) =
-            get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+            get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
             return Err(Error::other("bucket lifecycle lock was lost while loading the Object Lock snapshot"));
         }
@@ -3177,6 +3177,30 @@ impl ECStore {
         )))
     }
 
+    async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
+        check_valid_bucket_name(bucket)?;
+        let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
+        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let (state, bucket_incarnation_id, config_revision, quota_res) =
+            get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
+        if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
+            return Err(Error::other("bucket lifecycle lock was lost while loading the Object Lock snapshot"));
+        }
+        let snapshot = ObjectLockConfigSnapshot::for_guarded_store_bucket(
+            self.id,
+            bucket,
+            bucket_incarnation_id,
+            config_revision,
+            state,
+            lifecycle_guard,
+            metadata_guard,
+        );
+        if !self.ctx.lock_manager().is_disabled() {
+            snapshot.set_fresh_put_quota(quota_res);
+        }
+        Ok(Arc::new(snapshot))
+    }
+
     pub(super) async fn object_lock_config_snapshot_under_lifecycle_fence(
         &self,
         bucket: &str,
@@ -3187,7 +3211,7 @@ impl ECStore {
         }
         let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
         let (state, bucket_incarnation_id, config_revision) =
-            get_object_lock_config_and_incarnation_from_disk_in(&self.ctx, bucket).await?;
+            get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&metadata_guard)).await?;
         if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {
             return Err(Error::other("bucket lock was lost while loading the Object Lock snapshot"));
         }
@@ -4652,7 +4676,7 @@ impl ECStore {
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
             if opts.object_lock_config_snapshot.is_none() {
-                opts.object_lock_config_snapshot = Some(self.object_lock_config_snapshot(bucket).await?);
+                opts.object_lock_config_snapshot = Some(self.object_lock_config_snapshot_for_single_put(bucket).await?);
             }
             let snapshot = match opts.object_lock_config_snapshot.as_ref() {
                 Some(snapshot) if snapshot.is_valid_for_destructive_put(self.id, bucket, expected_incarnation_id) => {
@@ -4741,6 +4765,7 @@ impl ECStore {
         self.apply_decommission_target_mutation_fence(idx, object.as_str(), &mut opts, mutation_fence.or(fixed_read_anchor))
             .await;
         let expected_data_bytes = usize::try_from(data.size()).ok();
+        let mut transition_opts = opts.clone();
         let result = self
             .run_decommission_capacity_admitted_mutation_with_capacity_lease(
                 idx,
@@ -4772,7 +4797,8 @@ impl ECStore {
                 },
             )
             .await;
-        let result = enqueue_transition_after_write(self, result, LcEventSrc::S3PutObject, request_opts).await;
+        transition_opts.no_lock = request_opts.no_lock;
+        let result = enqueue_transition_after_write(self, result, LcEventSrc::S3PutObject, &transition_opts).await;
         if result.is_ok() {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
@@ -4788,7 +4814,7 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
-        let (object, opts) = self.prepare_put_object(bucket, object, opts).await?;
+        let (object, opts) = Box::pin(self.prepare_put_object(bucket, object, opts)).await?;
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
@@ -4797,11 +4823,16 @@ impl ECStore {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
         let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-        let result = self.pools[idx]
-            .put_object_with_old_current_size(bucket, object.as_str(), data, &opts)
-            .await;
+        let result = Box::pin(self.pools[idx].put_object_with_old_current_size(bucket, object.as_str(), data, &opts)).await;
         enqueue_recorded_tier_free_versions(self, receipt_sink).await;
-        result
+        match result {
+            Ok((object_info, old_current_size)) => {
+                Box::pin(enqueue_transition_after_write(self, Ok(object_info), LcEventSrc::S3PutObject, &opts))
+                    .await
+                    .map(|object_info| (object_info, old_current_size))
+            }
+            Err(err) => Err(err),
+        }
     }
 
     #[instrument(level = "trace", skip(self))]
@@ -4859,7 +4890,7 @@ impl ECStore {
         src_info: &mut ObjectInfo,
         src_opts: &ObjectOptions,
         dst_opts: &ObjectOptions,
-    ) -> Result<ObjectInfo> {
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         check_copy_obj_args(src_bucket, src_object)?;
         if src_bucket == dst_bucket && src_object == dst_object {
             // In-place copies (metadata replace, restore) rewrite a key that
@@ -4938,9 +4969,17 @@ impl ECStore {
         };
 
         if cp_src_dst_same {
-            let (_, pool_idx) = self
-                .get_latest_accessible_object_info_with_idx(src_bucket, &src_object, &version_aware_lookup_opts(src_opts, true))
-                .await?;
+            let pool_idx = if self.single_pool() {
+                0
+            } else {
+                self.get_latest_accessible_object_info_with_idx(
+                    src_bucket,
+                    &src_object,
+                    &version_aware_lookup_opts(src_opts, true),
+                )
+                .await?
+                .1
+            };
             let source_pool_writable = !self.is_suspended(pool_idx).await && !self.is_pool_rebalancing(pool_idx).await;
 
             if source_pool_writable
@@ -4961,7 +5000,8 @@ impl ECStore {
                                 .await
                         },
                     )
-                    .await;
+                    .await
+                    .map(|oi| (oi, None));
             }
 
             if source_pool_writable && !dst_opts.versioned && src_opts.version_id.is_none() {
@@ -4989,7 +5029,8 @@ impl ECStore {
                                     .await
                             },
                         )
-                        .await;
+                        .await
+                        .map(|oi| (oi, None));
                 }
                 // Transitioned object self-copy: restore from tier into the same pool.
                 let mut put_opts = ObjectOptions {
@@ -5017,7 +5058,7 @@ impl ECStore {
                 return if let Some(reader) = src_info.put_object_reader.as_mut() {
                     let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
                     let result = self.pools[pool_idx]
-                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .put_object_with_old_current_size(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
                     enqueue_recorded_tier_free_versions(self, receipt_sink).await;
                     result
@@ -5061,7 +5102,7 @@ impl ECStore {
                     }
                     let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
                     let result = self.pools[pool_idx]
-                        .put_object(dst_bucket, &dst_object, reader, &put_opts)
+                        .put_object_with_old_current_size(dst_bucket, &dst_object, reader, &put_opts)
                         .await;
                     enqueue_recorded_tier_free_versions(self, receipt_sink).await;
                     return result;
@@ -5081,11 +5122,14 @@ impl ECStore {
                                 .await
                         },
                     )
-                    .await;
+                    .await
+                    .map(|oi| (oi, None));
             }
         }
 
-        let pool_idx = if dst_opts.no_lock {
+        let pool_idx = if self.single_pool() && !self.is_suspended(0).await && !self.is_pool_rebalancing(0).await {
+            0
+        } else if dst_opts.no_lock {
             self.get_pool_idx_no_lock(dst_bucket, &dst_object, src_info.size).await?
         } else {
             self.get_pool_idx(dst_bucket, &dst_object, src_info.size).await?
@@ -5118,7 +5162,7 @@ impl ECStore {
         if let Some(put_object_reader) = src_info.put_object_reader.as_mut() {
             let receipt_sink = install_tier_free_version_receipt_sink(&mut put_opts);
             let result = self.pools[pool_idx]
-                .put_object(dst_bucket, dst_object_name, put_object_reader, &put_opts)
+                .put_object_with_old_current_size(dst_bucket, dst_object_name, put_object_reader, &put_opts)
                 .await;
             enqueue_recorded_tier_free_versions(self, receipt_sink).await;
             return result;
@@ -5350,8 +5394,9 @@ impl ECStore {
             opts.add_namespace_lock_guard(guard);
         }
         let current_bucket_incarnation_id = if let Some(metadata_guard) = _object_lock_metadata_guard.as_ref() {
+            let guard_ref = _bucket_lifecycle_guard.as_deref().unwrap_or_else(|| metadata_guard.as_ref());
             let (state, incarnation_id, config_revision) =
-                get_delete_config_from_disk_in(&self.ctx, bucket, None, opts.lifecycle_expiry_policy.as_ref()).await?;
+                get_delete_config_from_disk_in(&self.ctx, bucket, Some(guard_ref), opts.lifecycle_expiry_policy.as_ref()).await?;
             opts.object_lock_config_snapshot = Some(Arc::new(ObjectLockConfigSnapshot::for_store_bucket_under_lifecycle_fence(
                 self.id,
                 bucket,
@@ -5589,6 +5634,42 @@ impl ECStore {
                 .await?;
             obj.name = decode_dir_object(obj.name.as_str());
             return Ok(obj);
+        }
+
+        if self.single_pool()
+            && !creates_latest_marker
+            && !opts.data_movement
+            && opts.http_preconditions.is_none()
+            && !opts.replication_request
+            && !opts.versioned
+            && !opts.version_suspended
+            && opts.version_id.is_none()
+            && !self.is_suspended(0).await
+            && !self.is_pool_rebalancing(0).await
+        {
+            let pool = self.pools[0].clone();
+            match self
+                .run_external_decommission_capacity_object_delete(0, bucket, object, object, opts.clone(), |opts| async move {
+                    pool.delete_object(bucket, object, opts).await
+                })
+                .await
+            {
+                Ok(mut res) => {
+                    res.name = decode_dir_object(res.name.as_str());
+                    return Ok(res);
+                }
+                Err(err) if is_err_read_quorum(&err) => return Err(StorageError::ErasureWriteQuorum),
+                Err(err) => {
+                    if should_purge_orphan_dir_on_missing(&err, object) && self.purge_orphan_dir_object(bucket, object).await {
+                        return Ok(ObjectInfo {
+                            bucket: bucket.to_owned(),
+                            name: decode_dir_object(object),
+                            ..Default::default()
+                        });
+                    }
+                    return Err(err);
+                }
+            }
         }
 
         // Determine which pool contains it
@@ -9903,6 +9984,7 @@ mod tests {
                 copy_store
                     .handle_copy_object(bucket, source, bucket, target, &mut source_info, &ObjectOptions::default(), &options)
                     .await
+                    .map(|(oi, _)| oi)
             });
             let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
             tokio::time::timeout_at(deadline, barrier.wait_until_paused())

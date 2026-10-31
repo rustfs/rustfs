@@ -16,7 +16,6 @@ from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import summarize_scanner_heal_perf as summary
-import check_test_wiring as wiring
 
 
 def sha(path: Path) -> str:
@@ -118,6 +117,9 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "status": "pass",
             "foreground_p95_ms": 8.0,
             "foreground_p99_ms": 10.0,
+            "foreground_percentiles_ms_by_leg": {
+                leg: {"p95": 8.0, "p99": 10.0} for leg in summary.LEGS
+            },
             "throughput_ops": 100.0,
             "error_rate": 0.0,
             "p99_regression": 0.02,
@@ -200,7 +202,8 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         (self.abba / "manifest.json").write_text(json.dumps(self.manifest), encoding="utf-8")
         (self.abba / "report.json").write_text(json.dumps(self.report), encoding="utf-8")
 
-    def test_measured_pass_writes_quiet_artifacts(self):
+    @mock.patch.object(summary, "measured_provenance_verified", return_value=True)
+    def test_measured_pass_writes_quiet_artifacts(self, _verified):
         cache_log = self.root / "cache.log"
         cache_log.write_text(
             "compiler noise\nCACHE_COST "
@@ -237,7 +240,8 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertIn("w11_running_heal_build_statuses: observed,observed,observed", summary.markdown(result))
         self.assertEqual(result["cache_cost"]["max_save_body_amplification"], 2.0)
 
-    def test_release_descriptor_binds_g10_p1_p3_measured_artifacts(self):
+    @mock.patch.object(summary, "measured_provenance_verified", return_value=True)
+    def test_release_descriptor_rejects_unreconciled_comparison_percentiles(self, _verified):
         profile_paths = []
         for kind in summary.RELEASE_PROFILE_ARTIFACTS:
             artifact = self.root / f"{kind}.artifact"
@@ -252,36 +256,13 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "release_profile_artifact": profile_paths,
         })
         result = summary.build_summary(args)
-        summary.write_release_bundle_descriptor(args, result)
-        descriptor = summary.read_json(args.release_bundle_descriptor_out)
-        self.assertEqual(sorted(descriptor["gates"]), ["G10", "P1", "P3"])
-        self.assertEqual(
-            descriptor["gates"]["G10"]["evidence_fields"]["scheduler_bound_evidence"]["scheduler_bounds"],
-            list(summary.RELEASE_SCHEDULER_BOUNDS),
-        )
-        profile = descriptor["gates"]["P1"]["evidence_fields"]["profile_evidence"]
-        self.assertEqual(sorted(profile["profile_artifacts"]), sorted(summary.RELEASE_PROFILE_ARTIFACTS))
-        self.assertEqual(
-            profile["measurement_window_id"],
-            descriptor["gates"]["P3"]["evidence_fields"]["two_hour_pressure_measurement"]["measurement_window_id"],
-        )
-        for gate in ("G10", "P1", "P3"):
-            with mock.patch("subprocess.check_output", return_value="b" * 40):
-                status = wiring.scanner_heal_release_bundle_gate_status(
-                    Path(__file__).resolve().parents[1],
-                    args.release_bundle_descriptor_out,
-                    gate,
-                )
-            self.assertEqual(status["verified_gate"], gate)
-        save_frequency = profile["profile_artifacts"]["save-frequency"]
-        wrapper = args.release_bundle_descriptor_out.parent / save_frequency["artifact"]
-        payload = summary.read_json(wrapper)
-        raw_profile = args.release_bundle_descriptor_out.parent / payload["raw_profile_artifact"]
-        self.assertTrue(raw_profile.is_file())
-        self.assertEqual(payload["saved_bytes"], 8192)
-        self.assertEqual(payload["raw_profile_sha256"], sha(raw_profile))
+        with self.assertRaisesRegex(ValueError, "source evidence is unavailable"):
+            summary.write_release_bundle_descriptor(args, result)
+        self.assertFalse(args.release_bundle_descriptor_out.exists())
+        self.assertFalse((self.root / "release-descriptor-artifacts").exists())
 
-    def test_release_descriptor_requires_profile_artifacts(self):
+    @mock.patch.object(summary, "measured_provenance_verified", return_value=True)
+    def test_release_descriptor_stays_closed_without_profile_artifacts(self, _verified):
         args = type("Args", (), {
             "abba_dir": self.abba,
             "cache_cost_log": None,
@@ -290,8 +271,31 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             "release_source_revision": "b" * 40,
             "release_profile_artifact": [],
         })
-        with self.assertRaisesRegex(ValueError, "missing profile artifacts"):
+        with self.assertRaisesRegex(ValueError, "source evidence is unavailable"):
             summary.write_release_bundle_descriptor(args, summary.build_summary(args))
+        self.assertFalse(args.release_bundle_descriptor_out.exists())
+
+    def test_self_reported_measured_pass_has_unverified_provenance(self):
+        args = type("Args", (), {
+            "abba_dir": self.abba,
+            "cache_cost_log": None,
+            "require_cache_cost": False,
+            "release_bundle_descriptor_out": self.root / "release-descriptor.json",
+            "release_source_revision": "b" * 40,
+            "release_profile_artifact": [],
+        })
+        for claim in (None, "verified"):
+            with self.subTest(claim=claim):
+                if claim is not None:
+                    self.report["measurement_provenance"] = claim
+                    self.write_inputs()
+                result = summary.build_summary(args)
+                self.assertEqual(result["verdict"], "FAIL")
+                self.assertEqual(result["abba"]["measurement_provenance"], "unverified")
+                self.assertIn("not independently verified", result["reason"])
+                self.assertTrue(all(row["status"] == "unverified" for row in result["abba"]["w11_running_heal_build"]))
+                with self.assertRaisesRegex(ValueError, "requires a measured PASS"):
+                    summary.write_release_bundle_descriptor(args, result)
 
     def test_synthetic_report_fails_as_performance_conclusion(self):
         self.report.update(status="synthetic_validated", performance="pending", evidence="synthetic")
@@ -329,9 +333,122 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
         self.assertIsNone(result["abba"]["error_rate"])
         self.assertIsNone(result["abba"]["foreground_pressure_samples"])
         self.assertIsNone(result["abba"]["foreground_pressure_high_samples"])
-        self.assertIn("collector failed", result["reason"])
+        self.assertIn("error details omitted", result["reason"])
         self.assertIn("- completed_cells: 7", summary.markdown(result))
-        self.assertIn("- error: collector failed", summary.markdown(result))
+        self.assertIn("- error: details omitted", summary.markdown(result))
+
+    def test_historical_error_does_not_echo_raw_command(self):
+        sentinel = "TEST_ONLY_PRIVATE_ARG"
+        self.report = {"status": "failed", "performance": "pending", "evidence": "diagnostic",
+                       "completed_cells": 7, "error": f"Command ['client', '{sentinel}'] timed out"}
+        self.write_inputs()
+        args = type("Args", (), {"abba_dir": self.abba, "cache_cost_log": None,
+                                  "require_cache_cost": False, "json_out": None, "markdown_out": None})
+        result = summary.build_summary(args)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(sentinel, summary.markdown(result))
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["summarize_scanner_heal_perf.py", "--abba-dir", str(self.abba)]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(summary.main(), 1)
+        self.assertNotIn(sentinel, out.getvalue() + err.getvalue())
+
+    def test_unknown_report_labels_are_not_echoed(self):
+        sentinel = "TEST_ONLY_PRIVATE_LABEL"
+        self.report = {"status": sentinel, "performance": sentinel, "evidence": sentinel, "comparisons": []}
+        self.write_inputs()
+        result = summary.summarize_abba(self.abba)
+        self.assertEqual(result["gate_state"], "fail")
+        self.assertEqual(result["status"], "unknown")
+        self.assertEqual(result["performance"], "unknown")
+        self.assertEqual(result["evidence"], "unknown")
+        self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_unverified_provenance_does_not_echo_endpoints_or_flags(self):
+        sentinel = "TEST_ONLY_PRIVATE_ENDPOINT_OR_ARG"
+        self.report = {"status": "failed", "performance": "pending", "evidence": "diagnostic", "comparisons": []}
+        self.manifest["fixed"]["release_flags"] = f"--token={sentinel}"
+        self.manifest["fixed"]["durability"] = sentinel
+        self.manifest["baseline"]["revision"] = sentinel
+        self.manifest["started_at"] = sentinel
+        self.manifest["release_evidence"]["distributed"]["metrics_endpoints"] = [f"https://{sentinel}@node.example"]
+        self.write_inputs()
+        args = type("Args", (), {"abba_dir": self.abba, "cache_cost_log": None,
+                                  "require_cache_cost": False, "json_out": None, "markdown_out": None})
+        result = summary.build_summary(args)
+        self.assertEqual(result["verdict"], "FAIL")
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(sentinel, summary.markdown(result))
+
+    def test_unverified_comparison_labels_do_not_echo_free_text(self):
+        sentinel = "TEST_ONLY_PRIVATE_COMPARISON"
+        self.report.update(status="inconclusive", performance="pending")
+        self.report["comparisons"][0]["scenario"] = sentinel
+        self.report["comparisons"][0]["p1"]["baseline_walk_objects"] = sentinel
+        row = next(row for row in self.report["comparisons"]
+                   if row["scenario"] == "running-heal" and row["comparison"] == "build")
+        row["w10"]["status"] = sentinel
+        row["w10"]["candidate_delay_events"] = sentinel
+        row["w11"]["status"] = sentinel
+        row["w11"]["rss_growth"] = sentinel
+        self.write_inputs()
+        result = summary.summarize_abba(self.abba)
+        self.assertEqual(result["gate_state"], "fail")
+        self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_cache_cost_labels_do_not_echo_free_text(self):
+        sentinel = "TEST_ONLY_PRIVATE_CACHE_LABEL"
+        self.report = {"status": "failed", "performance": "pending", "evidence": "diagnostic", "comparisons": []}
+        self.write_inputs()
+        cache_log = self.root / "cache.log"
+        cache_log.write_text("CACHE_COST " + json.dumps({"schema": 1, "scenario": sentinel,
+            "cache_wire_bytes": 100, "save_body_bytes_per_sample": 200,
+            "clone": {"max_ns": 10}, "encode": {"max_ns": 20}, "save_inclusive": {"max_ns": 30},
+            "build": {"source_revision": sentinel, "source_tree": sentinel,
+                      "test_opt_level_override": sentinel}}) + "\n")
+        args = type("Args", (), {"abba_dir": self.abba, "cache_cost_log": cache_log,
+                                  "require_cache_cost": False, "json_out": None, "markdown_out": None})
+        result = summary.build_summary(args)
+        self.assertNotIn(sentinel, json.dumps(result))
+        self.assertNotIn(sentinel, summary.markdown(result))
+
+    def test_cli_error_does_not_echo_input_path(self):
+        sentinel = "TEST_ONLY_PRIVATE_PATH"
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.object(sys, "argv", ["summarize_scanner_heal_perf.py", "--abba-dir", str(self.root / sentinel)]), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            self.assertEqual(summary.main(), 1)
+        self.assertNotIn(sentinel, out.getvalue() + err.getvalue())
+
+    def test_unknown_cell_counts_are_not_zero_or_free_text(self):
+        sentinel = "TEST_ONLY_PRIVATE_COUNT"
+        for cells, completed in ((None, None), (sentinel, sentinel), ("absent", "absent")):
+            with self.subTest(cells=cells):
+                self.report = {"status": "failed", "performance": "pending", "evidence": "diagnostic",
+                               "cells": cells, "completed_cells": completed, "comparisons": []}
+                if cells == "absent":
+                    self.report.pop("cells")
+                    self.report.pop("completed_cells")
+                self.write_inputs()
+                result = summary.summarize_abba(self.abba)
+                self.assertIsNone(result["cells"])
+                self.assertIsNone(result["completed_cells"])
+                self.assertNotIn(sentinel, json.dumps(result))
+
+    def test_rejected_descriptor_does_not_write_summary_outputs(self):
+        json_out = self.root / "summary.json"
+        markdown_out = self.root / "summary.md"
+        descriptor = self.root / "descriptor.json"
+        argv = ["summarize_scanner_heal_perf.py", "--abba-dir", str(self.abba),
+                "--json-out", str(json_out), "--markdown-out", str(markdown_out),
+                "--release-bundle-descriptor-out", str(descriptor)]
+        with mock.patch.object(sys, "argv", argv), contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(summary.main(), 1)
+        self.assertFalse(json_out.exists())
+        self.assertFalse(markdown_out.exists())
+        self.assertFalse(descriptor.exists())
 
     def test_partial_error_rate_is_unknown(self):
         self.report.update(status="inconclusive", performance="pending")
@@ -343,6 +460,111 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
                     self.report["comparisons"][0]["error_rate"] = value
                 self.write_inputs()
                 self.assertIsNone(summary.summarize_abba(self.abba)["error_rate"])
+
+    def test_partial_w09_measurements_remain_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        fields = {"heal_start_p95_ms": "w09_worst_heal_start_p95_ms",
+                  "heal_duplicate_task_count": "w09_duplicate_task_count",
+                  "heal_lock_hold_p95_ms": "w09_worst_lock_hold_p95_ms"}
+        for field, output in fields.items():
+            for missing in (None, "short", "absent"):
+                with self.subTest(field=field, missing=missing):
+                    original = copy.deepcopy(self.report["comparisons"][0]["w09"])
+                    if missing is None:
+                        self.report["comparisons"][0]["w09"][field][1] = None
+                    elif missing == "short":
+                        self.report["comparisons"][0]["w09"][field] = [0]
+                    else:
+                        self.report["comparisons"][0]["w09"].pop(field)
+                    self.write_inputs()
+                    self.assertIsNone(summary.summarize_abba(self.abba)[output])
+                    self.report["comparisons"][0]["w09"] = original
+        self.report["comparisons"].pop()
+        self.write_inputs()
+        incomplete = summary.summarize_abba(self.abba)
+        for output in fields.values():
+            self.assertIsNone(incomplete[output])
+        self.assertIsNone(incomplete["worst_p99_regression"])
+        self.assertIsNone(incomplete["worst_throughput_loss"])
+        self.assertIsNone(incomplete["throughput_ops"])
+        self.assertIsNone(incomplete["max_reported_comparison_throughput_ops"])
+
+    def test_partial_candidate_p2_measurements_remain_unknown(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for missing in ("b1", "b2", "short", "absent", "comparison"):
+            with self.subTest(missing=missing):
+                original = copy.deepcopy(self.report["comparisons"])
+                row = self.report["comparisons"][0]
+                if missing == "b1":
+                    row["p2_post_stop_work_multiples"][1] = None
+                elif missing == "b2":
+                    row["p2_post_stop_work_multiples"][2] = None
+                elif missing == "short":
+                    row["p2_post_stop_work_multiples"] = [None, 1.0]
+                elif missing == "absent":
+                    row.pop("p2_post_stop_work_multiples")
+                else:
+                    self.report["comparisons"].pop()
+                self.write_inputs()
+                self.assertIsNone(summary.summarize_abba(self.abba)["p2_worst_post_stop_work_multiple"])
+                self.report["comparisons"] = original
+
+    def test_unverified_reported_percentiles_are_not_a_global_percentile(self):
+        self.report.update(status="inconclusive", performance="pending")
+        self.write_inputs()
+        result = summary.summarize_abba(self.abba)
+        self.assertIsNone(result["foreground_p95_ms"])
+        self.assertIsNone(result["foreground_p99_ms"])
+        self.assertIsNone(result["throughput_ops"])
+        self.assertEqual(result["max_reported_comparison_throughput_ops"], 100.0)
+
+    def test_passing_report_requires_each_leg_percentile(self):
+        self.report["comparisons"][0]["foreground_percentiles_ms_by_leg"].pop("B2")
+        self.write_inputs()
+        with self.assertRaisesRegex(ValueError, "foreground percentiles"):
+            summary.summarize_abba(self.abba)
+
+    def test_passing_report_rejects_invalid_leg_percentiles(self):
+        for p95, p99 in ((-1, 10), (1, float("inf")), (float("nan"), 10), (11, 10)):
+            with self.subTest(p95=p95, p99=p99):
+                self.report["comparisons"][0]["foreground_percentiles_ms_by_leg"]["B2"] = {"p95": p95, "p99": p99}
+                self.write_inputs()
+                with self.assertRaisesRegex(ValueError, "foreground percentiles"):
+                    summary.summarize_abba(self.abba)
+
+    def test_nonfinite_report_metrics_are_rejected(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for value in (float("inf"), float("nan")):
+            with self.subTest(value=value):
+                self.report["comparisons"][0]["p99_regression"] = value
+                self.write_inputs()
+                with self.assertRaisesRegex(ValueError, "invalid numeric field"):
+                    summary.summarize_abba(self.abba)
+
+    def test_per_leg_attempt_ratios_are_not_attempt_samples(self):
+        self.report.update(status="inconclusive", performance="pending")
+        self.write_inputs()
+        result = summary.summarize_abba(self.abba)
+        self.assertIsNone(result["attempt_cost_samples"])
+        self.assertGreater(result["reported_attempt_cost_ratio_count"], 0)
+        self.report["comparisons"][0]["w10_w11"].pop("attempt_cost_per_healed_object")
+        self.write_inputs()
+        self.assertIsNone(summary.summarize_abba(self.abba)["reported_attempt_cost_ratio_count"])
+
+    def test_error_rate_cannot_be_negative_or_exceed_one(self):
+        self.report.update(status="inconclusive", performance="pending")
+        for value in (-0.1, 1.1):
+            with self.subTest(value=value):
+                self.report["comparisons"][0]["error_rate"] = value
+                self.write_inputs()
+                with self.assertRaisesRegex(ValueError, "error_rate"):
+                    summary.summarize_abba(self.abba)
+
+    def test_passing_report_cannot_contain_request_errors(self):
+        self.report["comparisons"][0]["error_rate"] = 0.01
+        self.write_inputs()
+        with self.assertRaisesRegex(ValueError, "error_rate"):
+            summary.summarize_abba(self.abba)
 
     def test_partial_pressure_samples_are_unknown(self):
         self.report.update(status="inconclusive", performance="pending")
@@ -563,7 +785,8 @@ class ScannerHealPerfSummaryTest(unittest.TestCase):
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
-        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(process.returncode, 1, process.stderr)
+        self.assertTrue(process.stdout.startswith("FAIL scanner_heal_perf "))
         self.assertEqual(process.stdout.count("\n"), 1)
         self.assertEqual(process.stderr, "")
 

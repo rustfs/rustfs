@@ -30,8 +30,8 @@ use std::io::{self, Error};
 use std::net::IpAddr;
 use std::ops::Not as _;
 use std::pin::Pin;
-use std::sync::LazyLock;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
@@ -1409,6 +1409,24 @@ impl Stream for ReceiverStream {
     }
 }
 
+/// Owns a caller's memory reservation until the associated allocation is freed.
+pub type HttpWriterMemoryReservation = Box<dyn Send + Sync + 'static>;
+
+/// Reserves a full buffer capacity before the writer allocates or copies data.
+pub type HttpWriterMemoryReserver = Arc<dyn Fn(usize) -> io::Result<HttpWriterMemoryReservation> + Send + Sync + 'static>;
+
+struct ReservedHttpBytes {
+    // Release the allocation before its reservation, including its last slice.
+    bytes: Bytes,
+    _reservation: Arc<HttpWriterMemoryReservation>,
+}
+
+impl AsRef<[u8]> for ReservedHttpBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.bytes
+    }
+}
+
 // Not pin-projected: every field is `Unpin` and the `AsyncWrite` impl accesses
 // them through `get_mut()`, so a plain struct lets us add a manual `Drop`
 // (pin-project forbids one) to abort the background HTTP task — see below.
@@ -1421,6 +1439,8 @@ pub struct HttpWriter {
     sender: PollSender<Option<Bytes>>,
     handle: tokio::task::JoinHandle<std::io::Result<()>>,
     pending_chunk: BytesMut,
+    pending_reservation: Option<Arc<HttpWriterMemoryReservation>>,
+    memory_reserver: Option<HttpWriterMemoryReserver>,
     finish: bool,
     track_internode_metrics: bool,
     internode_operation: Option<&'static str>,
@@ -1432,6 +1452,32 @@ const HTTP_WRITER_BUFFER_SIZE: usize = 1024 * 1024;
 impl HttpWriter {
     /// Create a new HttpWriter for the given URL. The HTTP request is performed in the background.
     pub async fn new(url: String, method: Method, headers: HeaderMap) -> io::Result<Self> {
+        Self::with_memory_reserver(url, method, headers, None).await
+    }
+
+    /// Keep each pending and queued allocation charged through its last byte slice.
+    pub async fn new_with_memory_reserver(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        memory_reserver: HttpWriterMemoryReserver,
+    ) -> io::Result<Self> {
+        Self::with_memory_reserver(url, method, headers, Some(memory_reserver)).await
+    }
+
+    async fn with_memory_reserver(
+        url: String,
+        method: Method,
+        headers: HeaderMap,
+        memory_reserver: Option<HttpWriterMemoryReserver>,
+    ) -> io::Result<Self> {
+        // A rejected reservation must not leave an HTTP task or payload allocation.
+        let pending_reservation = memory_reserver
+            .as_ref()
+            .map(|reserve| reserve(HTTP_WRITER_BUFFER_SIZE))
+            .transpose()?
+            .map(Arc::new);
+        let pending_chunk = BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE);
         // http_log!("[HttpWriter::new] url: {url}, method: {method:?}, headers: {headers:?}");
         let url_clone = url.clone();
         let method_clone = method.clone();
@@ -1523,7 +1569,9 @@ impl HttpWriter {
             start_tx: Some(start_tx),
             sender: PollSender::new(sender),
             handle,
-            pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
+            pending_chunk,
+            pending_reservation,
+            memory_reserver,
             finish: false,
             track_internode_metrics,
             internode_operation,
@@ -1718,6 +1766,50 @@ fn send_error_to_io<T>(err: tokio_util::sync::PollSendError<T>, context: &str) -
 }
 
 impl HttpWriter {
+    fn ensure_pending_capacity(&mut self) -> io::Result<()> {
+        if let Some(reserve) = &self.memory_reserver {
+            if self.pending_reservation.is_some() {
+                if self.pending_chunk.capacity() != 0 || self.pending_chunk.try_reclaim(HTTP_WRITER_BUFFER_SIZE) {
+                    return Ok(());
+                }
+                // Outstanding output still owns this allocation. Release the
+                // empty tail before its guard, then reserve separate storage.
+                self.pending_chunk = BytesMut::new();
+                self.pending_reservation = None;
+            }
+            let reservation = reserve(HTTP_WRITER_BUFFER_SIZE)?;
+            self.pending_chunk = BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE);
+            self.pending_reservation = Some(Arc::new(reservation));
+        }
+        Ok(())
+    }
+
+    fn take_pending_chunk(&mut self) -> io::Result<Bytes> {
+        if self.memory_reserver.is_none() {
+            return Ok(self.pending_chunk.split().freeze());
+        }
+        let reservation = self
+            .pending_reservation
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| io::Error::other("HTTP writer buffer has no memory reservation"))?;
+        let bytes = self.pending_chunk.split().freeze();
+        // The tail keeps this allocation charged until it can be reclaimed
+        // without allocating, or is dropped before requesting new storage.
+        Ok(Bytes::from_owner(ReservedHttpBytes {
+            bytes,
+            _reservation: reservation,
+        }))
+    }
+
+    fn pending_capacity(&self) -> usize {
+        if self.memory_reserver.is_some() {
+            self.pending_chunk.capacity()
+        } else {
+            HTTP_WRITER_BUFFER_SIZE
+        }
+    }
+
     fn start_request(&mut self) {
         if let Some(start_tx) = self.start_tx.take() {
             let _ = start_tx.send(());
@@ -1738,7 +1830,7 @@ impl HttpWriter {
 
         match self.sender.poll_reserve(cx) {
             Poll::Ready(Ok(())) => {
-                let chunk = self.pending_chunk.split().freeze();
+                let chunk = self.take_pending_chunk()?;
                 self.sender
                     .send_item(Some(chunk))
                     .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
@@ -1763,7 +1855,7 @@ impl AsyncWrite for HttpWriter {
             return Poll::Ready(Err(err));
         }
 
-        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+        if !this.pending_chunk.is_empty() && this.pending_chunk.len() >= this.pending_capacity() {
             match this.poll_send_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -1774,11 +1866,22 @@ impl AsyncWrite for HttpWriter {
         if buf.len() >= HTTP_WRITER_BUFFER_SIZE && this.pending_chunk.is_empty() {
             match this.sender.poll_reserve(cx) {
                 Poll::Ready(Ok(())) => {
+                    let (chunk, written) = if this.memory_reserver.is_some() {
+                        if let Err(error) = this.ensure_pending_capacity() {
+                            this.sender.abort_send();
+                            return Poll::Ready(Err(error));
+                        }
+                        let written = buf.len().min(this.pending_capacity());
+                        this.pending_chunk.extend_from_slice(&buf[..written]);
+                        (this.take_pending_chunk()?, written)
+                    } else {
+                        (Bytes::copy_from_slice(&buf[..HTTP_WRITER_BUFFER_SIZE]), HTTP_WRITER_BUFFER_SIZE)
+                    };
                     this.sender
-                        .send_item(Some(Bytes::copy_from_slice(&buf[..HTTP_WRITER_BUFFER_SIZE])))
+                        .send_item(Some(chunk))
                         .map_err(|e| send_error_to_io(e, "HttpWriter send error"))?;
                     this.start_request();
-                    return Poll::Ready(Ok(HTTP_WRITER_BUFFER_SIZE));
+                    return Poll::Ready(Ok(written));
                 }
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(poll_send_error_to_io(err, "HttpWriter send error"))),
                 Poll::Pending => return Poll::Pending,
@@ -1786,7 +1889,10 @@ impl AsyncWrite for HttpWriter {
         }
 
         // A slot bounds memory only when every queued and pending chunk is bounded.
-        let written = buf.len().min(HTTP_WRITER_BUFFER_SIZE - this.pending_chunk.len());
+        if !buf.is_empty() {
+            this.ensure_pending_capacity()?;
+        }
+        let written = buf.len().min(this.pending_capacity() - this.pending_chunk.len());
         this.pending_chunk.extend_from_slice(&buf[..written]);
         if written > 0 {
             this.start_request();
@@ -1813,7 +1919,7 @@ impl AsyncWrite for HttpWriter {
             return Poll::Ready(Err(err));
         }
 
-        if this.pending_chunk.len() >= HTTP_WRITER_BUFFER_SIZE {
+        if !this.pending_chunk.is_empty() && this.pending_chunk.len() >= this.pending_capacity() {
             match this.poll_send_pending_chunk(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(err)) => return Poll::Ready(Err(err)),
@@ -1821,10 +1927,16 @@ impl AsyncWrite for HttpWriter {
             }
         }
 
-        let available = HTTP_WRITER_BUFFER_SIZE - this.pending_chunk.len();
+        if this.memory_reserver.is_some() && bufs.iter().any(|buf| !buf.is_empty()) {
+            this.ensure_pending_capacity()?;
+        }
+        let available = this.pending_capacity() - this.pending_chunk.len();
         let mut written = 0;
         for buf in bufs {
             let len = buf.len().min(available - written);
+            if len > 0 {
+                this.ensure_pending_capacity()?;
+            }
             this.pending_chunk.extend_from_slice(&buf[..len]);
             written += len;
             if written == available {
@@ -1884,6 +1996,11 @@ impl AsyncWrite for HttpWriter {
             // );
 
             self.finish = true;
+            if self.memory_reserver.is_some() {
+                // EOF has been queued, so this writer no longer needs its tail.
+                self.pending_chunk = BytesMut::new();
+                self.pending_reservation = None;
+            }
         }
         // Wait for the HTTP request to complete
         use futures::FutureExt;
@@ -2943,6 +3060,17 @@ mod tests {
     }
 
     fn paused_http_writer() -> (HttpWriter, tokio::sync::mpsc::Receiver<Option<Bytes>>) {
+        paused_http_writer_with_memory(None).expect("unrestricted writer")
+    }
+
+    fn paused_http_writer_with_memory(
+        memory_reserver: Option<HttpWriterMemoryReserver>,
+    ) -> io::Result<(HttpWriter, tokio::sync::mpsc::Receiver<Option<Bytes>>)> {
+        let pending_reservation = memory_reserver
+            .as_ref()
+            .map(|reserve| reserve(HTTP_WRITER_BUFFER_SIZE))
+            .transpose()?
+            .map(Arc::new);
         let (sender, receiver) = tokio::sync::mpsc::channel(HTTP_WRITER_CHANNEL_CAPACITY);
         let (_, err_rx) = tokio::sync::oneshot::channel();
         let writer = HttpWriter {
@@ -2954,11 +3082,510 @@ mod tests {
             sender: PollSender::new(sender),
             handle: tokio::spawn(std::future::pending()),
             pending_chunk: BytesMut::with_capacity(HTTP_WRITER_BUFFER_SIZE),
+            pending_reservation,
+            memory_reserver,
             finish: false,
             track_internode_metrics: false,
             internode_operation: None,
         };
-        (writer, receiver)
+        Ok((writer, receiver))
+    }
+
+    struct HttpWriterTestMemory {
+        limit: AtomicUsize,
+        used: AtomicUsize,
+        calls: AtomicUsize,
+    }
+
+    struct HttpWriterTestReservation {
+        memory: Arc<HttpWriterTestMemory>,
+        capacity: usize,
+    }
+
+    impl Drop for HttpWriterTestReservation {
+        fn drop(&mut self) {
+            self.memory.used.fetch_sub(self.capacity, Ordering::SeqCst);
+        }
+    }
+
+    impl HttpWriterTestMemory {
+        fn new(limit: usize) -> Arc<Self> {
+            Arc::new(Self {
+                limit: AtomicUsize::new(limit),
+                used: AtomicUsize::new(0),
+                calls: AtomicUsize::new(0),
+            })
+        }
+
+        fn reserver(self: &Arc<Self>) -> HttpWriterMemoryReserver {
+            let memory = self.clone();
+            Arc::new(move |capacity| {
+                assert_eq!(capacity, HTTP_WRITER_BUFFER_SIZE, "reserve full allocation capacity");
+                memory.calls.fetch_add(1, Ordering::SeqCst);
+                memory
+                    .used
+                    .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                        used.checked_add(capacity)
+                            .filter(|next| *next <= memory.limit.load(Ordering::SeqCst))
+                    })
+                    .map_err(|_| io::Error::from(io::ErrorKind::WouldBlock))?;
+                Ok(Box::new(HttpWriterTestReservation {
+                    memory: memory.clone(),
+                    capacity,
+                }) as HttpWriterMemoryReservation)
+            })
+        }
+
+        fn used(&self) -> usize {
+            self.used.load(Ordering::SeqCst)
+        }
+    }
+
+    #[test]
+    fn http_writer_memory_denial_precedes_runtime_or_allocation() {
+        use std::future::Future;
+
+        for limit in [0, HTTP_WRITER_BUFFER_SIZE - 1] {
+            let memory = HttpWriterTestMemory::new(limit);
+            let mut create = Box::pin(HttpWriter::new_with_memory_reserver(
+                "http://127.0.0.1/unpolled".to_owned(),
+                Method::PUT,
+                HeaderMap::new(),
+                memory.reserver(),
+            ));
+            let mut cx = Context::from_waker(std::task::Waker::noop());
+            // Spawning before admission would panic without a Tokio runtime.
+            assert!(
+                matches!(create.as_mut().poll(&mut cx), Poll::Ready(Err(error)) if error.kind() == io::ErrorKind::WouldBlock)
+            );
+            assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_tracks_pending_and_last_output_slice() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        memory.limit.store(0, Ordering::SeqCst);
+        writer.write_all(b"first").await.expect("pending payload");
+        writer.flush().await.expect("emit partial allocation");
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE - 5);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the empty tail still owns this allocation");
+        let frame = receiver.recv().await.expect("queued frame").expect("payload");
+        let clone = frame.clone();
+        let last = frame.slice(4..);
+        memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+        writer
+            .write_all(b"next")
+            .await
+            .expect("reuse the allocation's remaining tail");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(frame);
+        drop(clone);
+        drop(writer);
+        assert_eq!(last.as_ref(), b"t");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_shrink_rejects_new_scalar_and_vectored_storage() {
+        for mode in ["scalar", "fast", "vectored"] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+            writer
+                .write_all(&vec![0x5a; HTTP_WRITER_BUFFER_SIZE])
+                .await
+                .expect("fill the first allocation");
+            writer
+                .flush()
+                .await
+                .expect("first allocation transferred without a remaining tail");
+            let retained = receiver.recv().await.expect("first frame").expect("payload");
+            memory.limit.store(0, Ordering::SeqCst);
+            let error = match mode {
+                "vectored" => writer.write_vectored(&[IoSlice::new(b"lost"), IoSlice::new(b"bytes")]).await,
+                "fast" => writer.write(&vec![0xff; HTTP_WRITER_BUFFER_SIZE]).await,
+                _ => writer.write(b"lost bytes").await,
+            }
+            .expect_err("new storage must be rejected after shrink");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(writer.pending_chunk.capacity(), 0);
+            assert!(receiver.try_recv().is_err(), "rejected bytes must not be queued");
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            let calls = memory.calls.load(Ordering::SeqCst);
+            assert_eq!(writer.write(&[]).await.expect("empty write"), 0);
+            assert_eq!(memory.calls.load(Ordering::SeqCst), calls);
+            memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+            writer.write_all(b"accepted").await.expect("restored capacity");
+            writer.flush().await.expect("emit accepted bytes");
+            let accepted = receiver.recv().await.expect("accepted frame").expect("payload");
+            assert_eq!(accepted.as_ref(), b"accepted");
+            drop(writer);
+            drop(retained);
+            drop(accepted);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_full_queue_keeps_backpressure_and_capacity() {
+        for vectored in [false, true] {
+            let memory = HttpWriterTestMemory::new((HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+            let payload = vec![0xa5; HTTP_WRITER_BUFFER_SIZE];
+            for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+                let written = if vectored {
+                    writer
+                        .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                        .await
+                } else {
+                    writer.write(&payload).await
+                }
+                .expect("free queue slot");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+                writer.flush().await.expect("queue the complete allocation");
+            }
+            assert_eq!(memory.used(), HTTP_WRITER_CHANNEL_CAPACITY * HTTP_WRITER_BUFFER_SIZE);
+            assert_eq!(writer.pending_chunk.capacity(), 0);
+            if vectored {
+                let written = writer
+                    .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                    .await
+                    .expect("one bounded pending allocation beside the full queue");
+                assert_eq!(written, HTTP_WRITER_BUFFER_SIZE);
+                assert_eq!(memory.used(), (HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+            }
+            let calls = memory.calls.load(Ordering::SeqCst);
+            {
+                let write = writer.write(&payload);
+                tokio::pin!(write);
+                assert!(
+                    futures::poll!(&mut write).is_pending(),
+                    "a full queue must not accept another large write"
+                );
+            }
+            assert_eq!(
+                memory.calls.load(Ordering::SeqCst),
+                calls,
+                "backpressure must not allocate a fast-path copy"
+            );
+            if !vectored {
+                drop(receiver.recv().await.expect("free a queue slot"));
+                assert_eq!(writer.write(&payload).await.expect("resumed write"), HTTP_WRITER_BUFFER_SIZE);
+            }
+            drop(writer);
+            assert_eq!(memory.used(), HTTP_WRITER_CHANNEL_CAPACITY * HTTP_WRITER_BUFFER_SIZE);
+            while let Ok(frame) = receiver.try_recv() {
+                let frame = frame.expect("payload");
+                assert_eq!(frame.as_ref(), payload.as_slice());
+            }
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[test]
+    fn http_writer_memory_cancellation_and_runtime_shutdown_release_queued_storage() {
+        for cancel_writer in [false, true] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("writer runtime");
+            let writer = runtime.block_on(async {
+                let (mut writer, receiver) = paused_http_writer_with_memory(Some(memory.reserver())).expect("reserved writer");
+                writer.handle.abort();
+                writer.handle = tokio::spawn(async move {
+                    std::future::pending::<()>().await;
+                    drop(receiver);
+                    Ok(())
+                });
+                writer.write_all(b"queued").await.expect("pending bytes");
+                writer.flush().await.expect("queued allocation");
+                writer
+            });
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            if cancel_writer {
+                drop(writer);
+                runtime.block_on(tokio::task::yield_now());
+                assert_eq!(memory.used(), 0, "cancelled task must release its queue");
+                drop(runtime);
+            } else {
+                drop(runtime);
+                assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the writer still owns the shared tail");
+                drop(writer);
+                assert_eq!(memory.used(), 0, "the final pending owner releases its allocation");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_short_flushes_share_the_pending_allocation() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shared short-frame allocation");
+        let base = writer.pending_chunk.as_ptr();
+        for index in 0..16 {
+            writer
+                .write_all(&[0x37; 4096])
+                .await
+                .expect("write a short frame into the existing tail");
+            writer
+                .flush()
+                .await
+                .expect("flush a short frame without replacing its allocation");
+            let frame = receiver
+                .recv()
+                .await
+                .expect("receive the short frame")
+                .expect("short frame payload");
+            assert_eq!(frame.as_ptr(), base.wrapping_add(index * 4096), "split the original payload allocation");
+            assert_eq!(frame.as_ref(), &[0x37; 4096]);
+            drop(frame);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "the pending tail remains a real owner");
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE - 16 * 4096);
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_consumed_full_frames_reclaim_without_a_new_reservation() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the reclaimable allocation");
+        let base = writer.pending_chunk.as_ptr();
+        let payload = vec![0x37; HTTP_WRITER_BUFFER_SIZE];
+        memory.limit.store(0, Ordering::SeqCst);
+        for _ in 0..16 {
+            assert_eq!(
+                writer
+                    .write(&payload)
+                    .await
+                    .expect("reuse charged storage after the cap closes"),
+                payload.len()
+            );
+            writer.flush().await.expect("flush a complete reusable allocation");
+            let frame = receiver
+                .recv()
+                .await
+                .expect("receive the complete frame")
+                .expect("complete frame payload");
+            assert_eq!(frame.as_ptr(), base, "try_reclaim must reuse the allocation in place");
+            assert_eq!(frame.as_ref(), payload.as_slice());
+            drop(frame);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1, "reusing old storage is allowed after shrink");
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_last_slice_prevents_reclaim_and_keeps_both_allocations_charged() {
+        let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the first retained allocation");
+        writer
+            .write_all(&vec![0x5a; HTTP_WRITER_BUFFER_SIZE])
+            .await
+            .expect("queue the complete first allocation");
+        let first = receiver
+            .recv()
+            .await
+            .expect("receive the retained first frame")
+            .expect("first frame payload");
+        let last = first.slice(0..1);
+        drop(first);
+        memory.limit.store(0, Ordering::SeqCst);
+        let error = writer
+            .write(b"n")
+            .await
+            .expect_err("a live slice prevents reclaim under the closed cap");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(writer.pending_chunk.capacity(), 0);
+        assert!(writer.pending_reservation.is_none(), "failed reclaim drops the empty view and its guard");
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        memory.limit.store(2 * HTTP_WRITER_BUFFER_SIZE, Ordering::SeqCst);
+        writer
+            .write_all(b"new")
+            .await
+            .expect("reserve a separate allocation beside the live slice");
+        writer.flush().await.expect("queue bytes from the second allocation");
+        let second = receiver
+            .recv()
+            .await
+            .expect("receive the second frame")
+            .expect("second frame payload");
+        assert_ne!(second.as_ptr(), last.as_ptr(), "a live slice prevents storage reuse");
+        assert_eq!(memory.used(), 2 * HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(second);
+        assert_eq!(
+            memory.used(),
+            HTTP_WRITER_BUFFER_SIZE,
+            "new pending tail still owns the second allocation"
+        );
+        drop(writer);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_half_full_tail_bounds_scalar_fast_and_vectored_writes() {
+        for mode in ["scalar", "fast", "vectored"] {
+            let memory = HttpWriterTestMemory::new(2 * HTTP_WRITER_BUFFER_SIZE);
+            let (mut writer, mut receiver) =
+                paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the half-filled allocation");
+            let prefix = vec![0x11; HTTP_WRITER_BUFFER_SIZE / 2];
+            writer.write_all(&prefix).await.expect("fill half of the original allocation");
+            writer.flush().await.expect("split off the first half and retain the tail");
+            let first = receiver
+                .recv()
+                .await
+                .expect("receive the first half")
+                .expect("first half payload");
+            assert_eq!(writer.pending_chunk.capacity(), HTTP_WRITER_BUFFER_SIZE / 2);
+            memory.limit.store(0, Ordering::SeqCst);
+            let payload = vec![0x5a; HTTP_WRITER_BUFFER_SIZE];
+            let written = match mode {
+                "fast" => writer.write(&payload).await,
+                "vectored" => {
+                    writer
+                        .write_vectored(&[IoSlice::new(&payload[..32]), IoSlice::new(&payload[32..])])
+                        .await
+                }
+                _ => writer.write(&payload[..payload.len() - 1]).await,
+            }
+            .expect("the half-capacity tail remains usable after the budget shrinks");
+            assert_eq!(written, HTTP_WRITER_BUFFER_SIZE / 2, "bound {mode} writes by actual tail capacity");
+            writer
+                .flush()
+                .await
+                .expect("flush the full remaining half without growing storage");
+            let tail = receiver
+                .recv()
+                .await
+                .expect("receive the remaining half")
+                .expect("tail payload");
+            assert_eq!(tail.as_ref(), &payload[..written]);
+            assert_eq!(tail.as_ptr(), first.as_ptr().wrapping_add(prefix.len()));
+            assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            let error = writer
+                .write(b"new storage")
+                .await
+                .expect_err("exhausted shared storage needs a new reservation");
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert!(receiver.try_recv().is_err(), "rejected bytes must not be queued");
+            drop(writer);
+            drop(first);
+            assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+            drop(tail);
+            assert_eq!(memory.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_short_queue_keeps_backpressure_and_one_allocation() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shared queued allocation");
+        for _ in 0..HTTP_WRITER_CHANNEL_CAPACITY {
+            writer.write_all(&[0x37; 4096]).await.expect("write one short queued frame");
+            writer.flush().await.expect("occupy one available queue slot");
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        let large = vec![0x37; HTTP_WRITER_BUFFER_SIZE];
+        {
+            let blocked = writer.write(&large);
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+        }
+        assert_eq!(memory.calls.load(Ordering::SeqCst), 1, "full queue cannot allocate a fast path");
+        writer
+            .write_all(b"pending")
+            .await
+            .expect("the charged tail accepts one pending short write");
+        {
+            let blocked = writer.flush();
+            tokio::pin!(blocked);
+            assert!(futures::poll!(&mut blocked).is_pending());
+        }
+        drop(writer);
+        for remaining in (0..HTTP_WRITER_CHANNEL_CAPACITY).rev() {
+            let frame = receiver
+                .recv()
+                .await
+                .expect("drain a queued short frame")
+                .expect("queued short payload");
+            assert_eq!(frame.as_ref(), &[0x37; 4096]);
+            drop(frame);
+            assert_eq!(memory.used(), if remaining == 0 { 0 } else { HTTP_WRITER_BUFFER_SIZE });
+        }
+        assert!(receiver.recv().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_clean_shutdown_releases_only_its_unused_tail() {
+        let memory = HttpWriterTestMemory::new(HTTP_WRITER_BUFFER_SIZE);
+        let (mut writer, mut receiver) =
+            paused_http_writer_with_memory(Some(memory.reserver())).expect("reserve the shutdown body allocation");
+        writer.handle.abort();
+        writer.handle = tokio::spawn(async { Ok(()) });
+        writer.write_all(b"body").await.expect("buffer the final body bytes");
+        writer
+            .shutdown()
+            .await
+            .expect("send the body and EOF, then join the completed request");
+        assert_eq!(writer.pending_chunk.capacity(), 0);
+        assert!(writer.pending_reservation.is_none());
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE, "queued body still owns this allocation");
+        let frame = receiver
+            .recv()
+            .await
+            .expect("receive the final body frame")
+            .expect("final body payload");
+        let last = frame.slice(1..2);
+        drop(frame);
+        assert!(receiver.recv().await.expect("receive the queued EOF").is_none());
+        drop(writer);
+        assert_eq!(memory.used(), HTTP_WRITER_BUFFER_SIZE);
+        drop(last);
+        assert_eq!(memory.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn http_writer_memory_round_trip_preserves_vectored_body_and_shutdown() {
+        let state = TestState::default();
+        let (url, handle) = start_test_server(state.clone()).await.expect("memory writer test server");
+        let memory = HttpWriterTestMemory::new((HTTP_WRITER_CHANNEL_CAPACITY + 1) * HTTP_WRITER_BUFFER_SIZE);
+        let header = [0x11; 32];
+        let payload = vec![0xa5; 3 * HTTP_WRITER_BUFFER_SIZE + 17];
+        let mut writer = HttpWriter::new_with_memory_reserver(url, Method::PUT, HeaderMap::new(), memory.reserver())
+            .await
+            .expect("reserved HTTP writer");
+        let mut slices = [IoSlice::new(&[]), IoSlice::new(&header), IoSlice::new(&payload)];
+        let mut remaining = slices.as_mut_slice();
+        while remaining.iter().any(|slice| !slice.is_empty()) {
+            let written = writer.write_vectored(remaining).await.expect("reserved vectored write");
+            assert!(written > 0 && written <= HTTP_WRITER_BUFFER_SIZE);
+            IoSlice::advance_slices(&mut remaining, written);
+        }
+        writer.flush().await.expect("flush final reserved allocation");
+        writer.shutdown().await.expect("complete reserved HTTP request");
+        let bodies = state.put_bodies.lock().await;
+        assert_eq!(bodies.len(), 1);
+        assert_eq!(&bodies[0][..header.len()], &header);
+        assert_eq!(&bodies[0][header.len()..], payload.as_slice());
+        assert_eq!(memory.used(), 0, "completed transport retains no payload reservation");
+        handle.abort();
     }
 
     #[tokio::test]

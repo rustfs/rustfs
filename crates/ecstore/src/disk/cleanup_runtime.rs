@@ -624,58 +624,58 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_dispatch_retains_resource_units_without_inheriting_disk_policy() {
-        use crate::disk::io_admission::{current_disk_io_context, with_background_disk_io, with_background_resource_unit};
-        use rustfs_concurrency::adaptive::AdaptiveAdmission;
-        use std::num::NonZeroU16;
+        use crate::disk::io_admission::{current_disk_io_context, test_resource_units, with_background_disk_io};
         use tokio_util::sync::CancellationToken;
 
-        for mode in 0..4 {
-            let runtime = Arc::new(CleanupRuntime::new(config(1, 1, 1)).expect("cleanup runtime"));
-            let worker_runtime = runtime.clone();
-            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let work = async move {
-                started_tx
-                    .send((current_resource_unit().is_some(), current_disk_io_context().is_none()))
-                    .expect("report worker context");
-                release_rx.await.expect("release owned worker");
-                Ok::<_, super::super::error::DiskError>(())
-            };
-            let task = tokio::spawn(with_background_disk_io(
-                CancellationToken::new(),
-                with_background_resource_unit(gate.acquire().await, async move {
-                    match mode {
-                        0 => worker_runtime
-                            .disk_operation(work, DiskAdmission::Request)
-                            .await
-                            .expect("disk operation"),
-                        1 => worker_runtime.gc_operation(move |_| work).await.expect("GC operation"),
-                        2 => {
-                            let reservation = worker_runtime.reserve().expect("cleanup reservation");
-                            run(Some(reservation), async { work.await.expect("cleanup operation") }).await;
+        for physical_count in [1, 2] {
+            for mode in 0..4 {
+                let runtime = Arc::new(CleanupRuntime::new(config(1, 1, 1)).expect("cleanup runtime"));
+                let worker_runtime = runtime.clone();
+                let (unit, gates) = test_resource_units(physical_count);
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let work = async move {
+                    started_tx
+                        .send((current_resource_unit().is_some(), current_disk_io_context().is_none()))
+                        .expect("report worker context");
+                    release_rx.await.expect("release owned worker");
+                    Ok::<_, super::super::error::DiskError>(())
+                };
+                let task = tokio::spawn(with_background_disk_io(
+                    CancellationToken::new(),
+                    with_optional_resource_unit(Some(unit), async move {
+                        match mode {
+                            0 => worker_runtime
+                                .disk_operation(work, DiskAdmission::Request)
+                                .await
+                                .expect("disk operation"),
+                            1 => worker_runtime.gc_operation(move |_| work).await.expect("GC operation"),
+                            2 => {
+                                let reservation = worker_runtime.reserve().expect("cleanup reservation");
+                                run(Some(reservation), async { work.await.expect("cleanup operation") }).await;
+                            }
+                            _ => spawn(None, work)
+                                .await
+                                .expect("unisolated worker")
+                                .expect("unisolated operation"),
                         }
-                        _ => spawn(None, work)
-                            .await
-                            .expect("unisolated worker")
-                            .expect("unisolated operation"),
+                    }),
+                ));
+                let (inherited, original_policy) = deadline(started_rx).await.expect("owned work starts");
+                task.abort();
+                assert!(task.await.expect_err("waiter cancelled").is_cancelled());
+                let held: Vec<_> = gates.iter().map(|gate| gate.snapshot().active).collect();
+                release_tx.send(()).expect("owned work survives cancellation");
+                deadline(async {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
                     }
-                }),
-            ));
-            let (inherited, original_policy) = deadline(started_rx).await.expect("owned work starts");
-            task.abort();
-            assert!(task.await.expect_err("waiter cancelled").is_cancelled());
-            let held = gate.snapshot().active;
-            release_tx.send(()).expect("owned work survives cancellation");
-            deadline(async {
-                while gate.snapshot().active != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await;
-            assert!(inherited, "mode {mode} lost resource ownership");
-            assert!(original_policy, "mode {mode} changed the detached worker's disk policy");
-            assert_eq!(held, 1, "mode {mode} released a live worker's unit");
+                })
+                .await;
+                assert!(inherited, "mode {mode} lost resource ownership");
+                assert!(original_policy, "mode {mode} changed the detached worker's disk policy");
+                assert_eq!(held, vec![1; physical_count], "mode {mode} released a live worker's unit");
+            }
         }
     }
     fn config(pending: usize, workers: usize, blocking_threads: usize) -> Config {

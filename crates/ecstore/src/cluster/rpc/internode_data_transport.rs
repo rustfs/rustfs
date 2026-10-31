@@ -33,7 +33,9 @@ use rustfs_config::{
     DEFAULT_INTERNODE_DATA_TRANSPORT, ENV_RUSTFS_INTERNODE_DATA_TRANSPORT, INTERNODE_DATA_TRANSPORT_TCP,
     KNOWN_INTERNODE_DATA_TRANSPORT_BACKENDS,
 };
-use rustfs_rio::{ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter};
+use rustfs_rio::{
+    ChunkReaderBox, HttpChunkReader, HttpReader, HttpWriter, HttpWriterMemoryReservation, HttpWriterMemoryReserver,
+};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::future::Future;
@@ -65,6 +67,19 @@ const PUT_FILE_V1_CAPABILITY_TTL: Duration = Duration::from_secs(30);
 const PUT_FILE_CAPABILITY_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const CONTENT_TYPE_JSON: &str = "application/json";
 const CONTENT_TYPE_MSGPACK: &str = "application/msgpack";
+
+fn http_writer_memory_reserver() -> Option<HttpWriterMemoryReserver> {
+    crate::disk::current_resource_unit()
+        .and_then(|resources| resources.memory_budget())
+        .map(|budget| {
+            // Payloads can outlive the operation; never retain its node or disk units.
+            Arc::new(move |capacity| {
+                budget
+                    .reserve(capacity)
+                    .map(|reservation| Box::new(reservation) as HttpWriterMemoryReservation)
+            }) as HttpWriterMemoryReserver
+        })
+}
 
 fn unsupported_transport_message(transport: &str) -> String {
     format!(
@@ -346,13 +361,17 @@ impl InternodeDataTransport for TcpHttpInternodeDataTransport {
     }
 
     async fn open_write(&self, request: WriteStreamRequest) -> Result<FileWriter> {
+        let memory_reserver = http_writer_memory_reserver();
         let server_epoch = self.put_file_auth_capability(&request.endpoint).await?;
         let auth_scope = server_epoch.map(|server_epoch| (Uuid::new_v4(), server_epoch));
         let url = build_put_file_stream_url(&request, auth_scope);
         let endpoint = request.endpoint;
         let mut headers = json_headers();
         build_auth_headers(&url, &Method::PUT, &mut headers)?;
-        let writer = HttpWriter::new(url.clone(), Method::PUT, headers).await?;
+        let writer = match memory_reserver {
+            Some(reserve) => HttpWriter::new_with_memory_reserver(url.clone(), Method::PUT, headers, reserve).await?,
+            None => HttpWriter::new(url.clone(), Method::PUT, headers).await?,
+        };
         match auth_scope {
             Some((nonce, server_epoch)) => Ok(Box::new(PutFileAuthWriter::new(writer, url, nonce, endpoint, server_epoch))),
             None => Ok(Box::new(writer)),
@@ -947,6 +966,193 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use tokio::io::AsyncWriteExt;
     use tokio::sync::{Barrier, Notify};
+
+    fn memory_test_write_request(authenticated: bool) -> WriteStreamRequest {
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let endpoint = format!("http://writer-memory-{}.invalid", Uuid::new_v4());
+        put_file_capability_cache_entry(&endpoint).write().cached = Some(if authenticated {
+            PutFileCapabilityState::V1 {
+                server_epoch: Uuid::new_v4(),
+                revalidate_after: Instant::now() + PUT_FILE_V1_CAPABILITY_TTL,
+            }
+        } else {
+            PutFileCapabilityState::LegacyUntil(Instant::now() + PUT_FILE_LEGACY_CAPABILITY_TTL)
+        });
+        WriteStreamRequest {
+            endpoint,
+            disk: "disk-a".to_owned(),
+            volume: "bucket".to_owned(),
+            path: "part.1".to_owned(),
+            append: false,
+            size: 4,
+        }
+    }
+
+    #[tokio::test]
+    async fn http_write_memory_reserver_outlives_only_the_memory_scope() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        assert!(http_writer_memory_reserver().is_none(), "foreground must use the existing writer");
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(2 * 1024 * 1024, Duration::from_secs(30));
+        let (resources, gates) = test_resource_units(2);
+        let request = memory_test_write_request(true);
+        let endpoint = request.endpoint.clone();
+        let writer = with_optional_resource_unit(
+            Some(resources.with_memory_budget(memory.clone())),
+            TcpHttpInternodeDataTransport.open_write(request),
+        )
+        .await;
+        PUT_FILE_CAPABILITY_CACHE.write().remove(&endpoint);
+        let mut writer = writer.expect("admitted transport writer");
+        assert!(
+            gates.iter().all(|gate| gate.snapshot().active == 0),
+            "the callback must not retain disk units"
+        );
+        assert_eq!(memory.snapshot().used, 1024 * 1024);
+        writer.write_all(b"data").await.expect("buffered bytes");
+        writer.flush().await.expect("transfer charged allocation to queue");
+        memory.set_sampled_limit(2 * 1024 * 1024, Duration::ZERO);
+        writer
+            .write_all(&vec![0x5a; 1024 * 1024 - 4])
+            .await
+            .expect("reuse the already charged tail after observation expiry");
+        assert_eq!(memory.snapshot().used, 1024 * 1024, "reuse must not allocate separate storage");
+        let error = writer
+            .write(b"rejected")
+            .await
+            .expect_err("expired observation must reject new storage");
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+        assert!(
+            crate::disk::background_memory::is_memory_pressure(&error),
+            "preserve the typed memory-pressure marker"
+        );
+        assert_eq!(memory.snapshot().used, 1024 * 1024, "queued storage remains charged after expiry");
+        drop(writer);
+        tokio::task::yield_now().await;
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn http_write_memory_denial_preserves_the_budget_error() {
+        use crate::disk::{BackgroundMemoryBudget, test_resource_units, with_optional_resource_unit};
+
+        for (authenticated, sample) in [false, true].into_iter().flat_map(|authenticated| {
+            [
+                None,
+                Some((1024 * 1024 - 1, Duration::from_secs(30))),
+                Some((1024 * 1024, Duration::ZERO)),
+            ]
+            .into_iter()
+            .map(move |sample| (authenticated, sample))
+        }) {
+            let memory = BackgroundMemoryBudget::new();
+            if let Some((limit, valid_for)) = sample {
+                memory.set_sampled_limit(limit, valid_for);
+            }
+            let (resources, _) = test_resource_units(1);
+            let request = memory_test_write_request(authenticated);
+            let endpoint = request.endpoint.clone();
+            let result = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                TcpHttpInternodeDataTransport.open_write(request),
+            )
+            .await;
+            PUT_FILE_CAPABILITY_CACHE.write().remove(&endpoint);
+            let error = match result {
+                Err(Error::Io(error)) => error,
+                Err(error) => panic!("unexpected transport error: {error}"),
+                Ok(_) => panic!("unavailable memory must reject construction"),
+            };
+            assert!(crate::disk::background_memory::is_memory_pressure(&error));
+            assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+            assert_eq!(memory.snapshot().used, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn admitted_remote_reads_bind_receiver_admission_to_the_http_signature() {
+        use crate::disk::with_background_resource_unit;
+        use rustfs_concurrency::adaptive::AdaptiveAdmission;
+        use std::num::NonZeroU16;
+
+        crate::runtime::sources::ensure_test_rpc_secret();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("remote admission listener");
+        let address = listener.local_addr().expect("remote admission address");
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.expect("remote read connection");
+            let mut bytes = Vec::new();
+            while !bytes.windows(4).any(|window| window == b"\r\n\r\n") {
+                let mut chunk = [0; 1024];
+                let read = socket.read(&mut chunk).await.expect("remote read headers");
+                assert!(read > 0 && bytes.len() < 16 * 1024, "bounded complete request headers");
+                bytes.extend_from_slice(&chunk[..read]);
+            }
+            let request = std::str::from_utf8(&bytes).expect("HTTP request");
+            let mut lines = request.split("\r\n");
+            let target = lines
+                .next()
+                .expect("request line")
+                .split_whitespace()
+                .nth(1)
+                .expect("request target")
+                .to_owned();
+            let mut headers = HeaderMap::new();
+            for line in lines.take_while(|line| !line.is_empty()) {
+                let (name, value) = line.split_once(':').expect("header field");
+                headers.append(
+                    http::header::HeaderName::from_bytes(name.as_bytes()).expect("header name"),
+                    HeaderValue::from_str(value.trim()).expect("header value"),
+                );
+            }
+            socket
+                .write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 5\r\nconnection: close\r\n\r\nhello")
+                .await
+                .expect("remote read response");
+            (target, headers)
+        });
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 1);
+        let resource = gate.try_acquire().expect("sender device admission");
+        let mut reader = tokio::time::timeout(
+            Duration::from_secs(5),
+            with_background_resource_unit(
+                resource,
+                TcpHttpInternodeDataTransport.open_read(ReadStreamRequest {
+                    endpoint: format!("http://{address}"),
+                    disk: "disk-a".to_owned(),
+                    volume: "bucket".to_owned(),
+                    path: "part.1".to_owned(),
+                    offset: 0,
+                    length: 5,
+                    stall_timeout: Some(Duration::from_secs(5)),
+                }),
+            ),
+        )
+        .await
+        .expect("bounded remote request")
+        .expect("remote reader");
+        let mut body = Vec::new();
+        reader.read_to_end(&mut body).await.expect("complete remote body");
+        assert_eq!(body, b"hello");
+        let (target, headers) = server.await.expect("remote request capture");
+        assert_eq!(gate.snapshot().active, 0, "remote body does not retain the sender's device");
+        assert_eq!(
+            headers
+                .get("x-rustfs-rpc-background-admission")
+                .and_then(|value| value.to_str().ok()),
+            Some("v1"),
+            "resource-controlled remote work must request receiver-side admission"
+        );
+        crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &headers).expect("bound request signature");
+        let mut stripped = headers;
+        stripped.remove("x-rustfs-rpc-background-admission");
+        assert!(
+            crate::cluster::rpc::verify_rpc_signature(&target, &Method::GET, &stripped).is_err(),
+            "removing background admission must invalidate the signature"
+        );
+    }
 
     async fn wait_for_capability_flight_waiters(entry: &PutFileCapabilityCacheEntry, waiters: usize) {
         tokio::time::timeout(Duration::from_secs(5), async {

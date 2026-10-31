@@ -86,6 +86,10 @@ pub struct HealResultItem {
     /// Wire-decoded and legacy results cannot supply this in-process proof.
     #[serde(skip)]
     pub resolved_version_id: Option<[u8; 16]>,
+    /// Data directory selected from quorum metadata during storage execution.
+    /// This is an in-process observation, not a lock or final-identity proof.
+    #[serde(skip)]
+    pub quorum_selected_data_dir: Option<[u8; 16]>,
     #[serde(rename = "detail")]
     pub detail: String,
     #[serde(default, rename = "deleteRecovery", skip_serializing_if = "Option::is_none")]
@@ -174,12 +178,15 @@ mod tests {
     fn resolved_heal_version_is_not_wire_proof() {
         let item = HealResultItem {
             resolved_version_id: Some([0; 16]),
+            quorum_selected_data_dir: Some([1; 16]),
             legacy_identity_unverified: true,
             ..Default::default()
         };
         let mut wire = serde_json::to_value(&item).expect("heal result should serialize");
         assert!(wire.get("resolved_version_id").is_none());
         assert!(wire.get("resolvedVersionId").is_none());
+        assert!(wire.get("quorum_selected_data_dir").is_none());
+        assert!(wire.get("quorumSelectedDataDir").is_none());
         assert!(wire.get("repair_verified").is_none());
         assert!(wire.get("repairVerified").is_none());
         assert!(wire.get("metadata_verified").is_none());
@@ -191,8 +198,11 @@ mod tests {
         wire["legacy_identity_unverified"] = serde_json::json!(true);
         wire["legacyIdentityUnverified"] = serde_json::json!(true);
         wire["resolved_version_id"] = serde_json::json!(vec![0; 16]);
+        wire["quorum_selected_data_dir"] = serde_json::json!(vec![1; 16]);
+        wire["quorumSelectedDataDir"] = serde_json::json!(vec![1; 16]);
         let decoded: HealResultItem = serde_json::from_value(wire).expect("legacy wire shape should remain readable");
         assert_eq!(decoded.resolved_version_id, None, "wire input cannot supply owner proof");
+        assert_eq!(decoded.quorum_selected_data_dir, None, "wire input cannot supply the local observation");
         assert!(!decoded.legacy_identity_unverified, "wire input cannot supply owner classification");
     }
 

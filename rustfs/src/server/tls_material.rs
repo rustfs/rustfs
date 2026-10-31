@@ -21,6 +21,10 @@
 //! TLS acceptor directly from the pre-loaded server material — no double reads.
 
 use crate::startup_runtime_sources;
+use futures::{
+    FutureExt,
+    future::{BoxFuture, Shared},
+};
 use rustfs_common::MtlsIdentityPem;
 use rustfs_config::{
     DEFAULT_SERVER_MTLS_ENABLE, DEFAULT_TLS_KEYLOG, DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL,
@@ -42,6 +46,7 @@ use std::sync::RwLock;
 use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::Duration;
 use tokio_rustls::TlsAcceptor;
+use tokio_util::task::TaskTracker;
 use tracing::{debug, info, warn};
 
 const LOG_COMPONENT_TLS: &str = "tls";
@@ -71,20 +76,47 @@ const SYSTEM_CA_PATHS: &[&str] = &[
 /// Returns the fully enriched snapshot ready for both outbound publishing and
 /// acceptor construction.
 pub async fn load_tls_material(tls_path: &str) -> Result<rustfs_tls_runtime::TlsMaterialSnapshot, TlsMaterialError> {
+    load_tls_material_observed(
+        tls_path,
+        #[cfg(test)]
+        None,
+    )
+    .await
+}
+
+async fn load_tls_material_observed(
+    tls_path: &str,
+    #[cfg(test)] read_control: Option<Arc<ReloadReadTestControl>>,
+) -> Result<rustfs_tls_runtime::TlsMaterialSnapshot, TlsMaterialError> {
     if tls_path.is_empty() {
         return Err(TlsMaterialError::Io("TLS path is empty".into()));
     }
 
     let tls_source = TlsSource::from_directory(tls_path);
     let mut snapshot = tokio::task::spawn_blocking(move || {
-        let pinned_source = tls_source.snapshot().map_err(map_runtime_tls_error)?;
-        if let Some(snapshot) =
-            super::tls_publish::configured_server_snapshot(&tls_source.base_dir.to_string_lossy(), &pinned_source)
-                .map_err(|_| TlsMaterialError::Io("invalid certificate publication source".into()))?
-        {
-            return Ok(snapshot);
+        #[cfg(test)]
+        if let Some(control) = &read_control {
+            control.entered.cancel();
+            let _ = control.release.lock().unwrap_or_else(|e| e.into_inner()).recv();
         }
-        rustfs_tls_runtime::TlsMaterialSnapshot::load_from_snapshot(&pinned_source).map_err(map_runtime_tls_error)
+        let result = (|| {
+            let pinned_source = tls_source.snapshot().map_err(map_runtime_tls_error)?;
+            if let Some(snapshot) =
+                super::tls_publish::configured_server_snapshot(&tls_source.base_dir.to_string_lossy(), &pinned_source)
+                    .map_err(|_| TlsMaterialError::Io("invalid certificate publication source".into()))?
+            {
+                return Ok(snapshot);
+            }
+            rustfs_tls_runtime::TlsMaterialSnapshot::load_from_snapshot(&pinned_source).map_err(map_runtime_tls_error)
+        })();
+        #[cfg(test)]
+        if let Some(control) = &read_control {
+            control
+                .result
+                .store(if result.is_ok() { 1 } else { 2 }, std::sync::atomic::Ordering::Release);
+            control.finished.cancel();
+        }
+        result
     })
     .await
     .map_err(|_| TlsMaterialError::Io("TLS material loader failed".into()))??;
@@ -571,6 +603,13 @@ fn tls_key_log() -> bool {
 pub enum TlsMaterialError {
     Io(String),
     Parse(String),
+    ReloadStopping,
+    ReloadTaskFailed(Arc<tokio::task::JoinError>),
+    #[cfg(feature = "http3")]
+    ReloadStartupCleanup {
+        reload: Box<TlsMaterialError>,
+        http3_join_error: Arc<tokio::task::JoinError>,
+    },
 }
 
 impl std::fmt::Display for TlsMaterialError {
@@ -578,11 +617,34 @@ impl std::fmt::Display for TlsMaterialError {
         match self {
             TlsMaterialError::Io(msg) => write!(f, "TLS material I/O error: {msg}"),
             TlsMaterialError::Parse(msg) => write!(f, "TLS material parse error: {msg}"),
+            TlsMaterialError::ReloadStopping => write!(f, "TLS reload group is stopping"),
+            TlsMaterialError::ReloadTaskFailed(error) => {
+                write!(f, "TLS reload group {}", if error.is_cancelled() { "cancelled" } else { "panicked" })
+            }
+            #[cfg(feature = "http3")]
+            TlsMaterialError::ReloadStartupCleanup { http3_join_error, .. } => write!(
+                f,
+                "TLS reload startup failed; HTTP/3 outer join {}",
+                if http3_join_error.is_cancelled() {
+                    "cancelled"
+                } else {
+                    "panicked"
+                }
+            ),
         }
     }
 }
 
-impl std::error::Error for TlsMaterialError {}
+impl std::error::Error for TlsMaterialError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::ReloadTaskFailed(error) => Some(error.as_ref()),
+            #[cfg(feature = "http3")]
+            Self::ReloadStartupCleanup { reload, .. } => Some(reload.as_ref()),
+            _ => None,
+        }
+    }
+}
 
 // ── TLS Handshake Error Classification ──
 
@@ -723,11 +785,14 @@ async fn reload_acceptors(
 #[derive(Clone)]
 struct ReloadTarget {
     holder: Arc<TlsAcceptorHolder>,
+    rounds: TaskTracker,
     #[cfg(feature = "http3")]
     http3_endpoint: Option<quinn::Endpoint>,
 }
 
 struct ReloadState {
+    closing: bool,
+    round_tokens: Option<Vec<tokio_util::task::task_tracker::TaskTrackerToken>>,
     targets: HashMap<u64, ReloadTarget>,
     accepted: Arc<rustfs_tls_runtime::TlsMaterialSnapshot>,
     tcp: Arc<TlsAcceptor>,
@@ -741,6 +806,15 @@ struct ReloadGroup {
     state: Mutex<ReloadState>,
     changed: tokio::sync::Notify,
     next_id: std::sync::atomic::AtomicU64,
+    driver: std::sync::OnceLock<ReloadJoin>,
+    #[cfg(test)]
+    read_control: Mutex<Option<Arc<ReloadReadTestControl>>>,
+    #[cfg(test)]
+    panic_before_read: std::sync::atomic::AtomicBool,
+    #[cfg(test)]
+    failure_entered: tokio_util::sync::CancellationToken,
+    #[cfg(test)]
+    driver_abort: std::sync::OnceLock<tokio::task::AbortHandle>,
     #[cfg(test)]
     pass_completed: tokio::sync::Notify,
 }
@@ -774,6 +848,14 @@ pub(crate) fn notify_server_publication(tls_path: &str) {
     }
 }
 
+#[cfg(test)]
+struct ReloadReadTestControl {
+    entered: tokio_util::sync::CancellationToken,
+    finished: tokio_util::sync::CancellationToken,
+    release: Mutex<std::sync::mpsc::Receiver<()>>,
+    result: std::sync::atomic::AtomicU8,
+}
+
 struct ReloadRegistration {
     group: Arc<ReloadGroup>,
     id: u64,
@@ -781,13 +863,120 @@ struct ReloadRegistration {
 
 impl Drop for ReloadRegistration {
     fn drop(&mut self) {
-        self.group
-            .state
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .targets
-            .remove(&self.id);
+        {
+            let _registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = self.group.state.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(target) = state.targets.remove(&self.id) {
+                // Round tokens are captured under this same lock before a read starts.
+                target.rounds.close();
+            }
+            if state.targets.is_empty() {
+                state.closing = true;
+            }
+        }
         self.group.changed.notify_one();
+    }
+}
+
+struct ReloadRound {
+    group: Arc<ReloadGroup>,
+}
+
+impl Drop for ReloadRound {
+    fn drop(&mut self) {
+        let tokens = self.group.state.lock().unwrap_or_else(|e| e.into_inner()).round_tokens.take();
+        drop(tokens);
+    }
+}
+
+type ReloadJoin = Shared<BoxFuture<'static, Result<(), Arc<tokio::task::JoinError>>>>;
+
+/// A stopped registration has drained every round captured before its stop fence.
+/// The shared result records the original group task's eventual join, including failures.
+#[derive(Clone)]
+pub(crate) struct TlsReloadRetirement {
+    joined: ReloadJoin,
+}
+
+impl std::fmt::Debug for TlsReloadRetirement {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TlsReloadRetirement")
+            .field("group_joined", &self.group_joined())
+            .finish()
+    }
+}
+
+impl TlsReloadRetirement {
+    pub(crate) fn group_joined(&self) -> bool {
+        matches!(self.joined.peek(), Some(Ok(())))
+    }
+
+    pub(crate) fn join_error(&self) -> Option<&Arc<tokio::task::JoinError>> {
+        self.joined.peek().and_then(|result| result.as_ref().err())
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_retirement_from_task(task: tokio::task::JoinHandle<()>) -> TlsReloadRetirement {
+    TlsReloadRetirement {
+        joined: task.map(|result| result.map_err(Arc::new)).boxed().shared(),
+    }
+}
+
+#[cfg(test)]
+impl TlsReloadRetirement {
+    pub(crate) async fn test_observe_join(&self) {
+        let _ = self.joined.clone().await;
+    }
+}
+
+pub(crate) struct TlsReloadTask {
+    registration: Mutex<Option<ReloadRegistration>>,
+    group: Arc<ReloadGroup>,
+    rounds: TaskTracker,
+    joined: ReloadJoin,
+}
+
+impl TlsReloadTask {
+    pub(crate) fn request_stop(&self) {
+        // Handle registration -> registry -> group state; no inverse acquisition or await.
+        self.registration.lock().unwrap_or_else(|e| e.into_inner()).take();
+    }
+
+    pub(crate) async fn wait_stopped(&self) -> TlsReloadRetirement {
+        self.request_stop();
+        self.rounds.wait().await;
+        let _ = self.joined.clone().now_or_never();
+        let empty = self.group.state.lock().unwrap_or_else(|e| e.into_inner()).targets.is_empty();
+        if empty {
+            // The same-lock last-stop fence marks this generation closing.
+            // New listeners cannot revive it; they receive ReloadStopping until it exits.
+            let _ = self.joined.clone().await;
+        }
+        TlsReloadRetirement {
+            joined: self.joined.clone(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn abort(&self) {
+        self.request_stop();
+    }
+}
+
+impl Drop for TlsReloadTask {
+    fn drop(&mut self) {
+        self.request_stop();
+    }
+}
+
+// Existing module tests request stop with abort(), then await the same real group.
+#[cfg(test)]
+impl std::future::Future for TlsReloadTask {
+    type Output = Result<(), Arc<tokio::task::JoinError>>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        self.get_mut().joined.poll_unpin(cx)
     }
 }
 
@@ -868,7 +1057,7 @@ pub(crate) fn spawn_reload_loop(
     initial: rustfs_tls_runtime::TlsMaterialSnapshot,
     prepared: PreparedServerTls,
     #[cfg(feature = "http3")] http3_endpoint: Option<quinn::Endpoint>,
-) -> Result<Option<tokio::task::JoinHandle<()>>, TlsMaterialError> {
+) -> Result<Option<TlsReloadTask>, TlsMaterialError> {
     if !get_env_bool(ENV_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_ENABLE) {
         return Ok(None);
     }
@@ -877,11 +1066,24 @@ pub(crate) fn spawn_reload_loop(
     let mut registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
     registry.retain(|_, group| group.strong_count() != 0);
     let existing = registry.get(&tls_path).and_then(Weak::upgrade);
+    if let Some(group) = &existing {
+        if group.state.lock().unwrap_or_else(|e| e.into_inner()).closing {
+            return Err(TlsMaterialError::ReloadStopping);
+        }
+        if let Some(result) = group.driver.get().and_then(|joined| joined.clone().now_or_never()) {
+            return Err(match result {
+                Ok(()) => TlsMaterialError::ReloadStopping,
+                Err(error) => TlsMaterialError::ReloadTaskFailed(error),
+            });
+        }
+    }
     let first = existing.is_none();
     let group = existing.unwrap_or_else(|| {
         Arc::new(ReloadGroup {
             required_startup_files,
             state: Mutex::new(ReloadState {
+                closing: false,
+                round_tokens: None,
                 targets: HashMap::new(),
                 accepted: initial.clone(),
                 tcp: holder.get(),
@@ -891,11 +1093,21 @@ pub(crate) fn spawn_reload_loop(
             }),
             changed: tokio::sync::Notify::new(),
             next_id: std::sync::atomic::AtomicU64::new(1),
+            driver: std::sync::OnceLock::new(),
+            #[cfg(test)]
+            read_control: Mutex::new(None),
+            #[cfg(test)]
+            panic_before_read: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            failure_entered: tokio_util::sync::CancellationToken::new(),
+            #[cfg(test)]
+            driver_abort: std::sync::OnceLock::new(),
             #[cfg(test)]
             pass_completed: tokio::sync::Notify::new(),
         })
     });
     let id = group.next_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let rounds = TaskTracker::new();
     {
         let mut state = group.state.lock().unwrap_or_else(|e| e.into_inner());
         #[cfg(feature = "http3")]
@@ -908,26 +1120,45 @@ pub(crate) fn spawn_reload_loop(
             endpoint.set_server_config(state.quic.clone());
         }
         holder.swap(&TlsAcceptorHolder::new(state.tcp.clone()));
+        if let Some(tokens) = &mut state.round_tokens {
+            // A listener joining mid-round can receive this publication too.
+            tokens.push(rounds.token());
+        }
         state.targets.insert(
             id,
             ReloadTarget {
                 holder,
+                rounds: rounds.clone(),
                 #[cfg(feature = "http3")]
                 http3_endpoint,
             },
         );
     }
     registry.insert(tls_path.clone(), Arc::downgrade(&group));
-    drop(registry);
     if first {
-        tokio::spawn(run_reload_group(tls_path, group.clone()));
+        let driver = tokio::spawn(run_reload_group(tls_path, group.clone()));
+        #[cfg(test)]
+        let _ = group.driver_abort.set(driver.abort_handle());
+        let joined = driver.map(|result| result.map_err(Arc::new)).boxed().shared();
+        let _ = group.driver.set(joined);
     }
+    let joined = group
+        .driver
+        .get()
+        .expect("registered group retains its original driver")
+        .clone();
+    drop(registry);
     group.changed.notify_one();
-    let registration = ReloadRegistration { group, id };
-    Ok(Some(tokio::spawn(async move {
-        let _registration = registration;
-        std::future::pending::<()>().await;
-    })))
+    let registration = ReloadRegistration {
+        group: group.clone(),
+        id,
+    };
+    Ok(Some(TlsReloadTask {
+        registration: Mutex::new(Some(registration)),
+        group,
+        rounds,
+        joined,
+    }))
 }
 
 async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
@@ -941,19 +1172,39 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
             _ = group.changed.notified() => {},
         }
         let (accepted, empty) = {
-            let state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+            let mut state = group.state.lock().unwrap_or_else(|e| e.into_inner());
+            state.round_tokens = Some(state.targets.values().map(|target| target.rounds.token()).collect());
             (state.accepted.clone(), state.targets.is_empty())
         };
+        let round = ReloadRound { group: group.clone() };
         if empty {
             let mut registry = RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner());
             if group.state.lock().unwrap_or_else(|e| e.into_inner()).targets.is_empty() {
-                registry.remove(&tls_path);
+                if registry
+                    .get(&tls_path)
+                    .and_then(Weak::upgrade)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &group))
+                {
+                    registry.remove(&tls_path);
+                }
                 return;
             }
             continue;
         }
+        #[cfg(test)]
+        if group.panic_before_read.swap(false, std::sync::atomic::Ordering::AcqRel) {
+            group.failure_entered.cancel();
+            panic!("test TLS group driver failure");
+        }
         let result = async {
-            let candidate = load_tls_material(&tls_path).await?;
+            #[cfg(test)]
+            let read_control = group.read_control.lock().unwrap_or_else(|e| e.into_inner()).take();
+            let candidate = load_tls_material_observed(
+                &tls_path,
+                #[cfg(test)]
+                read_control,
+            )
+            .await?;
             validate_candidate_replacement(&accepted, &candidate)?;
             validate_required_material_files(&group.required_startup_files, &candidate)?;
             // Listener initialization can load a newer bundle than startup published.
@@ -1031,6 +1282,8 @@ async fn run_reload_group(tls_path: String, group: Arc<ReloadGroup>) {
                     result = "rejected", error = %error, "TLS material update rejected");
             }
         }
+        // Complete reads, parsing, publication and result processing before retiring this round.
+        drop(round);
         #[cfg(test)]
         group.pass_completed.notify_one();
     }
@@ -1058,6 +1311,305 @@ mod tests {
         let CertifiedKey { cert, signing_key } = rcgen::generate_simple_self_signed(vec![subject.to_string()]).unwrap();
         fs::write(dir.join(RUSTFS_TLS_CERT), cert.pem()).unwrap();
         fs::write(dir.join(rustfs_config::RUSTFS_TLS_KEY), signing_key.serialize_pem()).unwrap();
+    }
+
+    fn register_test_reload(path: &str, initial: rustfs_tls_runtime::TlsMaterialSnapshot) -> TlsReloadTask {
+        let prepared = PreparedServerTls::from_snapshot(&initial)
+            .expect("prepare fixture")
+            .expect("server material");
+        let holder = prepared.tcp_acceptor().expect("fixture acceptor");
+        spawn_reload_loop(
+            path.into(),
+            holder,
+            initial,
+            prepared,
+            #[cfg(feature = "http3")]
+            None,
+        )
+        .expect("register actual reloader")
+        .expect("reload enabled")
+    }
+
+    async fn assert_owned_reload_stop(failed_read: bool, cancel_observer: bool, sharing: &str) {
+        ensure_rustls_crypto_provider();
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TRUST_SYSTEM_CA, Some("0")),
+                (ENV_TRUST_LEAF_CERT_AS_CA, Some("0")),
+            ],
+            async {
+                let dir = TempDir::new().expect("owned TLS input");
+                write_test_cert_pair(dir.path(), "owned-stop.example");
+                let path = dir.path().to_str().expect("fixture path");
+                let initial = load_tls_material(path).await.expect("initial real material");
+                // Load the second owned input before any reload task or native pause exists.
+                let mut registration_snapshot = Some(load_tls_material(path).await.expect("second real registration snapshot"));
+                let task = register_test_reload(path, initial);
+                let existing_peer = (sharing == "existing")
+                    .then(|| register_test_reload(path, registration_snapshot.take().expect("preloaded existing registration")));
+                let group = task.group.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let control = Arc::new(ReloadReadTestControl {
+                    entered: tokio_util::sync::CancellationToken::new(),
+                    finished: tokio_util::sync::CancellationToken::new(),
+                    release: Mutex::new(release_rx),
+                    result: std::sync::atomic::AtomicU8::new(0),
+                });
+                *group.read_control.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
+                let entered = tokio::time::timeout(Duration::from_secs(5), control.entered.cancelled())
+                    .await
+                    .is_ok();
+                let mid = (sharing == "mid-round")
+                    .then(|| register_test_reload(path, registration_snapshot.take().expect("preloaded mid-round registration")));
+                let input_changed =
+                    !failed_read || fs::write(dir.path().join(RUSTFS_TLS_CERT), b"invalid certificate fixture").is_ok();
+                let first = mid.as_ref().unwrap_or(&task);
+                first.request_stop();
+                let mut observer = Box::pin(first.wait_stopped());
+                let pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(observer.as_mut(), cx).is_pending())
+                })
+                .await;
+                let native_still_running = !control.finished.is_cancelled();
+                let closing_rejection = if sharing.is_empty() {
+                    let initial = registration_snapshot.take().expect("preloaded closing registration");
+                    let prepared = PreparedServerTls::from_snapshot(&initial)
+                        .expect("same prepared input")
+                        .expect("server");
+                    let holder = prepared.tcp_acceptor().expect("same acceptor");
+                    Some(spawn_reload_loop(
+                        path.into(),
+                        holder,
+                        initial,
+                        prepared,
+                        #[cfg(feature = "http3")]
+                        None,
+                    ))
+                } else {
+                    None
+                };
+                // Disconnecting this sender also releases native work during assertion unwinding.
+                let first_receipt = if cancel_observer {
+                    drop(observer);
+                    drop(release_tx);
+                    tokio::time::timeout(Duration::from_secs(5), first.wait_stopped()).await
+                } else {
+                    drop(release_tx);
+                    tokio::time::timeout(Duration::from_secs(5), observer).await
+                };
+                let first_was_group_joined = first_receipt.as_ref().is_ok_and(|receipt| receipt.group_joined());
+                let closing_was_rejected =
+                    matches!(&closing_rejection, Some(Err(TlsMaterialError::ReloadStopping))) || !sharing.is_empty();
+                if let Some(Ok(Some(unexpected))) = closing_rejection {
+                    unexpected.request_stop();
+                    let _ = tokio::time::timeout(Duration::from_secs(5), unexpected.wait_stopped()).await;
+                }
+                let remaining = if sharing == "mid-round" {
+                    Some(&task)
+                } else {
+                    existing_peer.as_ref()
+                };
+                let later_receipt = if let Some(remaining) = remaining {
+                    remaining.request_stop();
+                    Some(tokio::time::timeout(Duration::from_secs(5), remaining.wait_stopped()).await)
+                } else {
+                    None
+                };
+                // Cleanup observes the same actual driver even when a bounded test observation failed.
+                let final_join = group.driver.get().expect("same original driver").clone().await;
+                // The original selected native closure is joined by the original group, not a noop barrier.
+                let finished = control.finished.is_cancelled();
+                let result = control.result.load(std::sync::atomic::Ordering::Acquire);
+                let receipt = first_receipt.expect("original stopped registration drains");
+                if let Some(receipt) = later_receipt {
+                    assert!(receipt.expect("last group drains").group_joined());
+                }
+                assert!(final_join.is_ok(), "original group joined after all registrations stopped");
+                assert!(entered, "selected original native read entered");
+                assert!(pending && native_still_running, "stop cannot discard an entered native read");
+                assert!(finished);
+                assert!(input_changed, "actual parser failure input was installed");
+                assert!(closing_was_rejected, "a closing old group explicitly rejects new registrations");
+                assert_eq!(result, if failed_read { 2 } else { 1 }, "actual native result retained through stop");
+                assert!(receipt.group_joined(), "earlier receipt observes the same eventual real group join");
+                assert_eq!(
+                    first_was_group_joined,
+                    sharing.is_empty(),
+                    "an independent live registration remains active"
+                );
+                if cancel_observer {
+                    assert!(
+                        group
+                            .driver
+                            .get()
+                            .expect("same original driver")
+                            .peek()
+                            .is_some_and(Result::is_ok)
+                    );
+                }
+                assert!(!RELOAD_GROUPS.lock().unwrap_or_else(|e| e.into_inner()).contains_key(path));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_stop_waits_for_original_native_success() {
+        assert_owned_reload_stop(false, false, "").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_stop_waits_for_original_native_error() {
+        assert_owned_reload_stop(true, false, "").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_cancelled_observer_retains_original_native_owner() {
+        assert_owned_reload_stop(false, true, "").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_mid_round_listener_waits_for_its_publication_round() {
+        assert_owned_reload_stop(false, false, "mid-round").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_existing_shared_listener_waits_for_its_captured_round() {
+        assert_owned_reload_stop(false, false, "existing").await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_late_ready_keeps_original_http_deadline_failed() {
+        ensure_rustls_crypto_provider();
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TRUST_SYSTEM_CA, Some("0")),
+                (ENV_TRUST_LEAF_CERT_AS_CA, Some("0")),
+            ],
+            async {
+                let dir = TempDir::new().expect("owned late observation input");
+                write_test_cert_pair(dir.path(), "late-stop.example");
+                let path = dir.path().to_str().expect("fixture path");
+                let initial = load_tls_material(path).await.expect("initial real material");
+                let task = register_test_reload(path, initial);
+                let group = task.group.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                let control = Arc::new(ReloadReadTestControl {
+                    entered: tokio_util::sync::CancellationToken::new(),
+                    finished: tokio_util::sync::CancellationToken::new(),
+                    release: Mutex::new(release_rx),
+                    result: std::sync::atomic::AtomicU8::new(0),
+                });
+                *group.read_control.lock().unwrap_or_else(|e| e.into_inner()) = Some(control.clone());
+                let entered = tokio::time::timeout(Duration::from_secs(5), control.entered.cancelled())
+                    .await
+                    .is_ok();
+                task.request_stop();
+                tokio::time::pause();
+                let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+                let mut outcome = super::super::http::test_retire_http12_scope(std::future::ready(()), deadline).await;
+                let pending;
+                let joined;
+                {
+                    let mut observer = Box::pin(super::super::http::retire_tls_reloader(&task, &mut outcome, deadline));
+                    pending = std::future::poll_fn(|cx| {
+                        std::task::Poll::Ready(std::future::Future::poll(observer.as_mut(), cx).is_pending())
+                    })
+                    .await;
+                    tokio::time::advance(Duration::from_secs(10)).await;
+                    drop(release_tx);
+                    joined = group.driver.get().expect("same actual driver").clone().await;
+                    // The owned result is already ready before the original observer is polled again.
+                    observer.await;
+                }
+                tokio::time::resume();
+                assert!(entered && pending);
+                assert!(joined.is_ok() && control.finished.is_cancelled());
+                assert_eq!(control.result.load(std::sync::atomic::Ordering::Acquire), 1);
+                assert!(
+                    outcome.deadline_missed(),
+                    "late Ready cannot erase the original absolute 10-second observation failure"
+                );
+                assert!(outcome.verified_scope_complete(), "cleanup genuinely joined the TLS group");
+            },
+        )
+        .await;
+    }
+
+    async fn assert_reload_driver_failure(cancel: bool) {
+        ensure_rustls_crypto_provider();
+        temp_env::async_with_vars(
+            [
+                (ENV_TLS_RELOAD_ENABLE, Some("1")),
+                (ENV_SERVER_MTLS_ENABLE, Some("0")),
+                (ENV_TRUST_SYSTEM_CA, Some("0")),
+                (ENV_TRUST_LEAF_CERT_AS_CA, Some("0")),
+            ],
+            async {
+                let dir = TempDir::new().expect("owned driver fixture");
+                write_test_cert_pair(dir.path(), "driver-stop.example");
+                let path = dir.path().to_str().expect("path");
+                let initial = load_tls_material(path).await.expect("initial material");
+                let task = register_test_reload(path, initial);
+                let group = task.group.clone();
+                let entered = if cancel {
+                    // This task has not been polled; no native read is detached by this error injection.
+                    group.driver_abort.get().expect("actual original task").abort();
+                    true
+                } else {
+                    group.panic_before_read.store(true, std::sync::atomic::Ordering::Release);
+                    tokio::time::timeout(Duration::from_secs(5), group.failure_entered.cancelled())
+                        .await
+                        .is_ok()
+                };
+                task.request_stop();
+                let receipt = tokio::time::timeout(Duration::from_secs(5), task.wait_stopped())
+                    .await
+                    .expect("actual failed driver joins");
+                let error = receipt.join_error().expect("actual typed JoinError retained");
+                assert!(entered, "actual driver reached the failure boundary");
+                assert_eq!(error.is_cancelled(), cancel);
+                assert_eq!(error.is_panic(), !cancel);
+                assert!(!receipt.group_joined());
+                let typed = TlsMaterialError::ReloadTaskFailed(error.clone());
+                assert_eq!(
+                    typed.to_string(),
+                    if cancel {
+                        "TLS reload group cancelled"
+                    } else {
+                        "TLS reload group panicked"
+                    }
+                );
+                let source = std::error::Error::source(&typed).expect("actual join source");
+                assert!(std::ptr::eq(
+                    source.downcast_ref::<tokio::task::JoinError>().expect("typed source"),
+                    error.as_ref()
+                ));
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_original_driver_panic_remains_failure() {
+        assert_reload_driver_failure(false).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn owned_reload_original_driver_cancel_remains_failure() {
+        assert_reload_driver_failure(true).await;
     }
 
     #[tokio::test]

@@ -127,6 +127,7 @@ pub struct ErasureSetHealer {
     replacement_task_id: Option<String>,
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
     replacement_execution: Option<Arc<super::storage::ReplacementExecution>>,
+    work_parent: Option<super::manager::HealWork>,
     mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
 }
 
@@ -367,6 +368,7 @@ impl ErasureSetHealer {
             replacement_task_id: None,
             replacement_target_identities: None,
             replacement_execution: None,
+            work_parent: None,
             mainline_pacer: None,
         }
     }
@@ -378,6 +380,11 @@ impl ErasureSetHealer {
 
     pub(crate) fn with_unresolved_delete_recovery(mut self, unresolved: bool) -> Self {
         self.unresolved_delete_recovery = unresolved;
+        self
+    }
+
+    pub(super) fn with_work_parent(mut self, parent: Option<super::manager::HealWork>) -> Self {
+        self.work_parent = parent;
         self
     }
 
@@ -1349,6 +1356,8 @@ impl ErasureSetHealer {
             };
             (
                 HealObjectOutcome {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Metadata,
                         bucket: RUSTFS_META_BUCKET.to_string(),
@@ -1720,6 +1729,8 @@ impl ErasureSetHealer {
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
                 let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
                 let execution = self.replacement_execution.clone();
+                let replacement_object = execution.is_some();
+                let work_parent = execution.as_ref().and(self.work_parent.as_ref()).cloned();
                 let failure_identity = execution
                     .as_ref()
                     .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
@@ -1751,10 +1762,22 @@ impl ErasureSetHealer {
                         let result = if cancel_token.is_cancelled() {
                             (0, Err(Error::TaskCancelled))
                         } else {
-                            match storage
-                                .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
-                                .await
-                            {
+                            let result = if replacement_object {
+                                storage
+                                    .heal_object_with_task_cancel(
+                                        &bucket_name,
+                                        &object_name,
+                                        version_id.as_deref(),
+                                        &heal_opts,
+                                        &cancel_token,
+                                    )
+                                    .await
+                            } else {
+                                storage
+                                    .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
+                                    .await
+                            };
+                            match result {
                                 Ok((result, None)) if target_outcomes_complete(&result, &target_endpoints) => {
                                     let object_size = result_object_size_u64(&result);
                                     if !replacement_commit_evidence_required {
@@ -1846,7 +1869,11 @@ impl ErasureSetHealer {
                 };
                 page_tasks.push(async move {
                     if let (Some(execution), Some((key, object, version))) = (execution, failure_identity) {
-                        match execution.run(work).await {
+                        let result = match work_parent {
+                            Some(parent) => execution.run_owned(&parent, work).await,
+                            None => execution.run(work).await,
+                        };
+                        match result {
                             Ok(result) => result,
                             Err(error) => (key, object, version, (0, Err(error)), None),
                         }
@@ -2758,6 +2785,8 @@ mod resume_loop_tests {
                 .unwrap_or(Some(HealObjectDisposition::Repaired));
             let receipt = if error.is_none() {
                 disposition.map(|disposition| HealObjectReceipt {
+                    deep_check_observed: false,
+                    quorum_selected_data_dir: None,
                     identity: HealObjectIdentity {
                         kind: HealObjectKind::Object,
                         bucket: bucket.to_owned(),

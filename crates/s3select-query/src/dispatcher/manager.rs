@@ -28,11 +28,12 @@ use datafusion::{
         record_batch::RecordBatch,
     },
     datasource::{
-        file_format::{csv::CsvFormat, json::JsonFormat},
+        file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat, json::JsonFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
     error::Result as DFResult,
     execution::{RecordBatchStream, SendableRecordBatchStream},
+    object_store::ObjectStoreExt as _,
     sql::sqlparser::parser::ParserError,
 };
 use futures::Stream;
@@ -61,7 +62,7 @@ use tokio::{
 };
 
 use crate::{
-    dispatcher::{json_document_table::JsonDocumentTable, parquet_table::ParquetSelectTable},
+    dispatcher::{json_document_table::JsonDocumentTable, json_lines_schema, parquet_table::ParquetSelectTable},
     execution::factory::QueryExecutionFactoryRef,
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
     metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
@@ -508,7 +509,11 @@ impl SimpleQueryDispatcher {
                 return Err(SelectError::InvalidDataSource.into());
             };
 
-        let resolve_schema = listing_options.infer_schema(session.inner(), &table_path).await?;
+        let resolve_schema = if self.input.request.input_serialization.json.is_some() {
+            infer_json_lines_schema(session, &table_path).await?
+        } else {
+            listing_options.infer_schema(session.inner(), &table_path).await?
+        };
         let config = if need_rename_volume_name {
             let mut new_fields = Vec::new();
             for (i, field) in resolve_schema.fields().iter().enumerate() {
@@ -547,6 +552,14 @@ impl SimpleQueryDispatcher {
 
         Ok(current_session_table_provider)
     }
+}
+
+/// Reads the object like DataFusion's `JsonFormat::infer_schema` does, but
+/// keeps the source key order (see `json_lines_schema::infer_schema`).
+async fn infer_json_lines_schema(session: &SessionCtx, table_path: &ListingTableUrl) -> DFResult<SchemaRef> {
+    let store = session.inner().runtime_env().object_store(table_path.object_store())?;
+    let bytes = store.get(table_path.prefix()).await?.bytes().await?;
+    Ok(Arc::new(json_lines_schema::infer_schema(&bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)?))
 }
 
 fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
@@ -856,6 +869,7 @@ mod tests {
             array::{Int32Array, StringArray},
             datatypes::{DataType, Field, Schema, SchemaRef},
             record_batch::RecordBatch,
+            util::display::array_value_to_string,
         },
         common::DataFusionError,
         execution::object_store::ObjectStoreUrl,
@@ -1725,6 +1739,334 @@ mod tests {
             }
             assert_eq!(values, ["selected"], "key={key}, json={json}");
         }
+    }
+
+    async fn json_lines_plan_schema(data: &'static [u8], sql: &str) -> SchemaRef {
+        let mut input = test_input();
+        input.key = "records.json".to_owned();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.json = Some(JSONInput {
+            type_: Some(JSONType::from_static(JSONType::LINES)),
+        });
+        let input = Arc::new(input);
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let dispatcher = test_dispatcher_for_input(
+            Arc::clone(&input),
+            Arc::new(Semaphore::new(1)),
+            Duration::from_secs(30),
+            Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))),
+        );
+        let query = Query::new(QueryContext { input }, sql.to_owned());
+        let machine = dispatcher.build_query_state_machine(query).await.expect("build query state");
+        let store_url = ObjectStoreUrl::parse("s3://test-bucket").expect("test store URL");
+        let store = machine
+            .session
+            .inner()
+            .runtime_env()
+            .object_store(&store_url)
+            .expect("test store");
+        store
+            .put(&Path::from("records.json"), data.into())
+            .await
+            .expect("write JSON LINES object");
+        let Plan::Query(plan) = dispatcher
+            .build_logical_plan(machine)
+            .await
+            .expect("plan JSON LINES query")
+            .expect("select plan");
+        Arc::new(plan.df_plan.schema().as_arrow().clone())
+    }
+
+    fn field_names(fields: &datafusion::arrow::datatypes::Fields) -> Vec<&str> {
+        fields.iter().map(|field| field.name().as_str()).collect()
+    }
+
+    fn struct_fields(data_type: &DataType) -> &datafusion::arrow::datatypes::Fields {
+        match data_type {
+            DataType::Struct(fields) => fields,
+            DataType::List(item) => struct_fields(item.data_type()),
+            other => panic!("expected a struct or list of structs, got {other}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn json_lines_select_star_keeps_source_field_order() {
+        let schema = json_lines_plan_schema(
+            b"{\"z\":1,\"a b\":{\"y\":true,\"B\":[{\"k2\":1,\"k1\":2}]},\"A\":\"x\"}\n\n  \r\n{\"A\":\"y\",\"$c\":2,\"a b\":{\"x\":1}}\r\n",
+            "SELECT * FROM S3Object",
+        )
+        .await;
+
+        assert_eq!(field_names(schema.fields()), ["z", "a b", "A", "$c"]);
+        let nested = struct_fields(schema.field_with_name("a b").expect("nested field").data_type());
+        assert_eq!(field_names(nested), ["y", "B", "x"]);
+        let listed = struct_fields(nested.find("B").expect("list field").1.data_type());
+        assert_eq!(field_names(listed), ["k2", "k1"]);
+    }
+
+    #[tokio::test]
+    async fn path_projections_are_named_after_their_last_key() {
+        const DATA: &[u8] = b"{\"obj0\":{\"id\":\"id0\",\"inner\":{\"Key\":1}}}\n";
+        for (sql, expected) in [
+            ("SELECT s.obj0.id, s.obj0.inner.\"Key\" FROM S3Object s", ["id", "Key"].as_slice()),
+            ("SELECT obj0.id FROM S3Object", &["id"]),
+            ("SELECT s.obj0.id FROM S3Object s ORDER BY s.obj0.id", &["id"]),
+            ("SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id", &["id", "count(*)"]),
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), expected, "{sql}");
+        }
+    }
+
+    #[tokio::test]
+    async fn path_projection_names_do_not_clash_with_other_columns() {
+        const DATA: &[u8] = b"{\"id\":\"top\",\"obj0\":{\"id\":\"id0\"}}\n";
+        for sql in ["SELECT *, s.obj0.id FROM S3Object s", "SELECT s.*, s.obj0.id FROM S3Object s"] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), ["id", "obj0", "s.obj0[id]"], "{sql}");
+        }
+        for sql in [
+            "SELECT s.obj0.id FROM S3Object s ORDER BY s.id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY upper(s.id)",
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), ["s.obj0[id]"], "{sql}");
+        }
+        let schema = json_lines_plan_schema(DATA, "SELECT s.obj0.id, (s.id) FROM S3Object s").await;
+        assert_eq!(field_names(schema.fields()), ["s.obj0[id]", "id"]);
+    }
+
+    #[tokio::test]
+    async fn path_aliases_do_not_collide_with_retained_path_names() {
+        const DATA: &[u8] = br#"{"id":"top","obj0":{"id":"a"},"obj1":{"id":"b"},"obj2":{"s.obj0[id]":"c","obj0":"d"}}"#;
+        for (sql, expected) in [
+            (
+                "SELECT s.obj0.id, s.obj1.id, s.obj2.\"s.obj0[id]\" FROM S3Object s",
+                vec!["s.obj0[id]", "s.obj1[id]", "s.obj2[s.obj0[id]]"],
+            ),
+            (
+                "SELECT s.obj2.\"s.obj0[id]\", s.obj1.id, s.obj0.id FROM S3Object s",
+                vec!["s.obj2[s.obj0[id]]", "s.obj1[id]", "s.obj0[id]"],
+            ),
+            ("SELECT (s.obj0.id), s.obj2.\"s.obj0[id]\" FROM S3Object s", vec!["id", "s.obj0[id]"]),
+            (
+                "SELECT s.obj0.id, s.obj2.\"s.obj0[id]\" FROM S3Object s ORDER BY s.id",
+                vec!["s.obj0[id]", "s.obj2[s.obj0[id]]"],
+            ),
+            ("SELECT s.obj2.obj0 FROM S3Object s ORDER BY s.obj0.id", vec!["s.obj2[obj0]"]),
+            ("SELECT s.obj2.obj0 FROM S3Object s ORDER BY (s.obj0.id)", vec!["s.obj2[obj0]"]),
+        ] {
+            let schema = json_lines_plan_schema(DATA, sql).await;
+            assert_eq!(field_names(schema.fields()), expected, "{sql}");
+        }
+    }
+
+    const PATH_NAMES_DATA: &[u8] = br#"{"id":"A","x":"B","n":1,"obj":{"lower(s.id)":7,"count(*)":3,"id":"x","ID":"X","s.n":2,"s.n + Int64(1)":3},"obj0":{"id":"a"},"obj1":{"id":"b"},"obj2":{"s.obj0[id]":"c","obj0":"d"},"a":{"id":1},"b":{"id":2}}
+"#;
+
+    /// Plans and runs `sql` over a stored JSON LINES object through the
+    /// production dispatcher. Returns the planned output names and the rows.
+    async fn production_json_lines_query(bucket: &str, key: &str, sql: &str) -> QueryResult<(Vec<String>, Vec<Vec<String>>)> {
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = bucket.to_owned();
+        input.key = key.to_owned();
+        input.request.expression = sql.to_owned();
+        let input = Arc::new(input);
+        let snapshot = snapshot_test_env().await.prepare_select_object_snapshot(bucket, key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(QueryContext { input }, sql.to_owned(), snapshot);
+        let machine = dispatcher.build_query_state_machine(query).await?;
+        let plan = dispatcher
+            .build_logical_plan(Arc::clone(&machine))
+            .await?
+            .expect("SELECT should produce a logical plan");
+        let Plan::Query(query_plan) = &plan;
+        let names = query_plan
+            .df_plan
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.name().clone())
+            .collect();
+        let Output::StreamData(stream) = dispatcher.execute_logical_plan(plan, machine).await? else {
+            panic!("SELECT should return rows");
+        };
+        let batches: Vec<_> = stream.try_collect().await?;
+        let rows = batches
+            .iter()
+            .flat_map(|batch| {
+                (0..batch.num_rows()).map(|row| {
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| array_value_to_string(column, row).expect("display a result value"))
+                        .collect()
+                })
+            })
+            .collect();
+        Ok((names, rows))
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_path_alias_does_not_duplicate_a_retained_path_name() {
+        const BUCKET: &str = "s3select-retained-path-name";
+        const KEY: &str = "retained.jsonl";
+        let env = snapshot_test_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(
+            BUCKET,
+            KEY,
+            br#"{"obj0":{"id":"a"},"obj1":{"id":"b"},"obj2":{"s.obj0[id]":"c"}}
+"#
+            .to_vec(),
+        )
+        .await;
+        let (names, rows) =
+            production_json_lines_query(BUCKET, KEY, "SELECT s.obj0.id, s.obj1.id, s.obj2.\"s.obj0[id]\" FROM S3Object s")
+                .await
+                .expect("the query plans and runs");
+        assert_eq!(names, ["s.obj0[id]", "s.obj1[id]", "s.obj2[s.obj0[id]]"]);
+        assert_eq!(rows, [["a", "b", "c"]]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_path_projections_take_their_key_only_when_it_is_a_unique_output_name() {
+        const BUCKET: &str = "s3select-path-projection-names";
+        const KEY: &str = "names.jsonl";
+        let env = snapshot_test_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, KEY, PATH_NAMES_DATA.to_vec()).await;
+        let cases: &[(&str, &[&str])] = &[
+            (
+                "SELECT s.obj.\"lower(s.id)\", LOWER(s.id) FROM S3Object s",
+                &["s.obj[lower(s.id)]", "lower(s.id)"],
+            ),
+            (
+                "SELECT LOWER(s.id), s.obj.\"lower(s.id)\" FROM S3Object s",
+                &["lower(s.id)", "s.obj[lower(s.id)]"],
+            ),
+            (
+                "SELECT s.obj.\"count(*)\", COUNT(*) FROM S3Object s GROUP BY s.obj.\"count(*)\"",
+                &["s.obj[count(*)]", "count(*)"],
+            ),
+            ("SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id", &["id", "count(*)"]),
+            ("SELECT s.obj0.id, LOWER(s.id) FROM S3Object s", &["id", "lower(s.id)"]),
+            ("SELECT s.obj0.id, s.x AS id FROM S3Object s", &["s.obj0[id]", "id"]),
+            ("SELECT s.x AS id, s.obj0.id FROM S3Object s", &["id", "s.obj0[id]"]),
+            (
+                "SELECT *, s.obj0.id FROM S3Object s",
+                &["id", "x", "n", "obj", "obj0", "obj1", "obj2", "a", "b", "s.obj0[id]"],
+            ),
+            ("SELECT s.obj.ID, s.id FROM S3Object s", &["s.obj[id]", "id"]),
+            ("SELECT s.obj.\"ID\", s.id FROM S3Object s", &["ID", "id"]),
+            ("SELECT s.obj.\"s.n\", CAST(s.n AS INT) FROM S3Object s", &["s.obj[s.n]", "s.n"]),
+            (
+                "SELECT s.n + 1, s.obj.\"s.n + Int64(1)\" FROM S3Object s",
+                &["s.n + Int64(1)", "s.obj[s.n + Int64(1)]"],
+            ),
+            ("SELECT s.obj0.id FROM S3Object s ORDER BY s.id", &["s.obj0[id]"]),
+            ("SELECT s.obj0.id FROM S3Object s ORDER BY s.obj0.id", &["id"]),
+            ("SELECT (s.obj0.id) FROM S3Object s", &["id"]),
+            ("SELECT s.obj0.id, (s.id) FROM S3Object s", &["s.obj0[id]", "id"]),
+            ("SELECT s.a.id, s.b.id FROM S3Object s", &["s.a[id]", "s.b[id]"]),
+            ("SELECT s.a.id, s.b.id, s.obj2.obj0 FROM S3Object s", &["s.a[id]", "s.b[id]", "obj0"]),
+            ("SELECT s.obj2.\"s.obj0[id]\", s.obj0.id FROM S3Object s", &["s.obj0[id]", "id"]),
+            (
+                "SELECT s.obj2.\"s.obj0[id]\", s.obj1.id, s.obj0.id FROM S3Object s",
+                &["s.obj2[s.obj0[id]]", "s.obj1[id]", "s.obj0[id]"],
+            ),
+            (
+                "SELECT s.obj2.\"s.obj0[id]\", s.obj0.id, LOWER(s.id) FROM S3Object s",
+                &["s.obj0[id]", "id", "lower(s.id)"],
+            ),
+        ];
+        for (sql, expected) in cases {
+            let (names, _) = production_json_lines_query(BUCKET, KEY, sql)
+                .await
+                .unwrap_or_else(|error| panic!("{sql}: {error}"));
+            assert_eq!(names, *expected, "{sql}");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_path_projection_naming_keeps_queries_planning() {
+        const BUCKET: &str = "s3select-path-projection-planning";
+        const KEY: &str = "planning.jsonl";
+        let env = snapshot_test_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, KEY, PATH_NAMES_DATA.to_vec()).await;
+        env.put_object_bytes(BUCKET, "no-top-level-id.jsonl", br#"{"obj0":{"id":"a"},"obj1":{"id":"b"}}"#.to_vec())
+            .await;
+        let mut failures = Vec::new();
+        // GROUP BY resolves a SELECT alias when no input column has its name.
+        for sql in [
+            "SELECT s.obj0.id FROM S3Object s GROUP BY id",
+            "SELECT s.obj0.id, s.obj1.id AS k FROM S3Object s GROUP BY id, k",
+        ] {
+            if let Err(error) = production_json_lines_query(BUCKET, "no-top-level-id.jsonl", sql).await {
+                failures.push(format!("{sql}: {error}"));
+            }
+        }
+        // Each query also plans when every path projection keeps DataFusion's name.
+        for sql in [
+            "SELECT s.obj0.id FROM S3Object s",
+            "SELECT obj0.id FROM S3Object",
+            "SELECT s.obj0.id FROM S3Object s WHERE s.obj0.id = 'a'",
+            "SELECT s.obj0.id FROM S3Object s WHERE s.obj0.id IN ('a', 'b') LIMIT 1",
+            "SELECT s.obj0.id FROM S3Object s LIMIT 0",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY s.obj0.id DESC LIMIT 1",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY s.id",
+            "SELECT s.obj0.id FROM S3Object s ORDER BY upper(s.id)",
+            "SELECT s.obj0.id AS k FROM S3Object s ORDER BY k",
+            "SELECT s.obj0.id, s.obj2.obj0 FROM S3Object s ORDER BY s.obj0.id",
+            "SELECT s.obj2.obj0 FROM S3Object s ORDER BY (s.obj0.id)",
+            "SELECT s.obj0.id, s.id FROM S3Object s ORDER BY 2",
+            "SELECT s.obj0.id FROM S3Object s GROUP BY s.obj0.id",
+            "SELECT s.obj0.id, COUNT(*) FROM S3Object s GROUP BY s.obj0.id",
+            "SELECT s.obj0.id, COUNT(*) AS id FROM S3Object s GROUP BY s.obj0.id",
+            "SELECT COUNT(*), s.obj0.id FROM S3Object s GROUP BY s.obj0.id ORDER BY COUNT(*)",
+            "SELECT COUNT(s.obj0.id) FROM S3Object s",
+            "SELECT MAX(s.obj0.id) FROM S3Object s",
+            "SELECT UPPER(s.obj0.id), s.obj0.id FROM S3Object s",
+            "SELECT s.obj0.id, s.obj0.id = 'a' FROM S3Object s",
+            "SELECT s.obj0.id, s.obj0.id AS x FROM S3Object s",
+            "SELECT s.obj0.id, s.id FROM S3Object s",
+            "SELECT s.obj0.id, (s.id) FROM S3Object s",
+            "SELECT (s.obj0.id), s.obj2.\"s.obj0[id]\" FROM S3Object s",
+            "SELECT s.obj0.id AS id, s.a.id FROM S3Object s",
+            "SELECT s.obj0.id, s.x AS id FROM S3Object s",
+            "SELECT s.obj0.id AS \"s.a[id]\", s.b.id FROM S3Object s",
+            "SELECT s.obj.ID, s.id FROM S3Object s",
+            "SELECT s.obj.\"ID\", LOWER(s.id) FROM S3Object s",
+            "SELECT s.obj.id, s.obj0.id FROM S3Object s",
+            "SELECT s.a.id, s.b.id FROM S3Object s",
+            "SELECT s.a.id, s.b.id, s.obj2.obj0 FROM S3Object s",
+            "SELECT *, s.obj0.id FROM S3Object s",
+            "SELECT s.*, s.obj0.id FROM S3Object s",
+            "SELECT s.obj.\"lower(s.id)\", LOWER(s.id) FROM S3Object s",
+            "SELECT LOWER(s.id), s.obj.\"lower(s.id)\" FROM S3Object s",
+            "SELECT s.obj.\"count(*)\", COUNT(*) FROM S3Object s GROUP BY s.obj.\"count(*)\"",
+            "SELECT s.obj.\"s.n\", CAST(s.n AS INT) FROM S3Object s",
+            "SELECT s.obj.\"s.n + Int64(1)\", s.n + 1 FROM S3Object s",
+            "SELECT s.obj0.id, CAST(s.n AS INT) FROM S3Object s",
+            "SELECT s.obj0.id, s.obj1.id, s.obj2.\"s.obj0[id]\" FROM S3Object s",
+            "SELECT s.obj2.\"s.obj0[id]\", s.obj1.id, s.obj0.id FROM S3Object s",
+            "SELECT s.obj2.\"s.obj0[id]\", s.obj0.id FROM S3Object s",
+            "SELECT s.obj2.\"s.obj0[id]\", s.obj0.id, LOWER(s.id) FROM S3Object s",
+            "SELECT (s.obj0.id), (s.obj1.id) FROM S3Object s",
+            "SELECT s.obj.\"ID\", s.obj0.id FROM S3Object s",
+        ] {
+            match production_json_lines_query(BUCKET, KEY, sql).await {
+                Ok((names, _)) if names.iter().collect::<std::collections::HashSet<_>>().len() != names.len() => {
+                    failures.push(format!("{sql}: duplicate names {names:?}"));
+                }
+                Ok(_) => {}
+                Err(error) => failures.push(format!("{sql}: {error}")),
+            }
+        }
+        assert!(failures.is_empty(), "{failures:#?}");
     }
 
     #[tokio::test]
@@ -2840,5 +3182,111 @@ mod tests {
         ));
         assert_eq!(admission.available_permits(), 1);
         assert!(output.next().await.is_none());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_alias_does_not_collide_with_computed_output_name() {
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = "s3select-review-name-collision".to_string();
+        input.key = "collision.jsonl".to_string();
+        input.request.expression = "SELECT s.obj.\"lower(s.id)\", LOWER(s.id) FROM S3Object s".to_string();
+        let input = Arc::new(input);
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{\"id\":\"A\",\"obj\":{\"lower(s.id)\":7}}\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("production session");
+        let result = dispatcher.build_logical_plan(Arc::clone(&machine)).await;
+        if let Err(error) = &result {
+            panic!(
+                "real production planner rejected a previously valid query: {error}; S3 classification={:?}",
+                error.s3_select_policy_error()
+            );
+        }
+        let plan = result.expect("valid production query").expect("query plan");
+        let Plan::Query(query_plan) = &plan;
+        let schema = query_plan.df_plan.schema();
+        assert_eq!(schema.fields().len(), 2);
+        assert_ne!(schema.field(0).name(), schema.field(1).name());
+        let output = dispatcher
+            .execute_logical_plan(plan, machine)
+            .await
+            .expect("execute production query");
+        let Output::StreamData(stream) = output else {
+            panic!("query must return rows");
+        };
+        let batches: Vec<_> = stream.try_collect().await.expect("read production result");
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let batch = batches.iter().find(|batch| batch.num_rows() == 1).expect("one result row");
+        let key = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("integer key");
+        let lower = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .expect("lowercase string");
+        assert_eq!(key.value(0), 7);
+        assert_eq!(lower.value(0), "a");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn path_alias_does_not_collide_with_computed_sort_name() {
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = "s3select-sort-name-collision".to_string();
+        input.key = "collision.jsonl".to_string();
+        input.request.expression = "SELECT s.obj.\"lower(s.id)\" FROM S3Object s ORDER BY LOWER(s.id)".to_string();
+        let input = Arc::new(input);
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, b"{\"id\":\"A\",\"obj\":{\"lower(s.id)\":7}}\n".to_vec())
+            .await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("production session");
+        let result = dispatcher.build_logical_plan(Arc::clone(&machine)).await;
+        if let Err(error) = &result {
+            panic!(
+                "real production planner rejected a previously valid query: {error}; S3 classification={:?}",
+                error.s3_select_policy_error()
+            );
+        }
+        let plan = result.expect("valid production query").expect("query plan");
+        let Plan::Query(query_plan) = &plan;
+        let schema = query_plan.df_plan.schema();
+        assert_eq!(schema.fields().len(), 1);
+        let output = dispatcher
+            .execute_logical_plan(plan, machine)
+            .await
+            .expect("execute production query");
+        let Output::StreamData(stream) = output else {
+            panic!("query must return rows");
+        };
+        let batches: Vec<_> = stream.try_collect().await.expect("read production result");
+        assert_eq!(batches.iter().map(|batch| batch.num_rows()).sum::<usize>(), 1);
+        let batch = batches.iter().find(|batch| batch.num_rows() == 1).expect("one result row");
+        let key = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::Int64Array>()
+            .expect("integer key");
+        assert_eq!(key.value(0), 7);
     }
 }

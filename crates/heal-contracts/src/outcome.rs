@@ -88,6 +88,12 @@ pub enum HealObjectDisposition {
 pub struct HealObjectReceipt {
     pub identity: HealObjectIdentity,
     pub disposition: HealObjectDisposition,
+    /// Data directory selected from quorum metadata during storage execution.
+    /// This does not establish lock ownership or identity at completion.
+    pub quorum_selected_data_dir: Option<Uuid>,
+    /// Storage completed its Deep check path for the selected metadata.
+    /// This does not certify all bytes, final identity, or scanner coverage.
+    pub deep_check_observed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

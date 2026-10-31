@@ -15,8 +15,8 @@
 use crate::storage_api::startup::shutdown::{shutdown_background_services, wait_for_detached_mutations};
 use crate::{
     server::{
-        SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownHandle, ShutdownSignal, shutdown_event_notifier,
-        stop_audit_system,
+        SHUTDOWN_TIMEOUT, ServiceState, ServiceStateManager, ShutdownHandle, ShutdownReceipt, ShutdownSignal, ShutdownWaitError,
+        shutdown_event_notifier, stop_audit_system,
     },
     startup_optional_runtime_sidecars::{
         OptionalRuntimeServices, prepare_optional_runtime_shutdowns, shutdown_optional_runtime_services,
@@ -200,7 +200,7 @@ fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<Bac
     steps
 }
 
-/// Last step of the shutdown sequence, once every front end has drained.
+/// Observe detached work after front-task joins and maintenance cleanup.
 ///
 /// A delete whose client disconnected keeps running on its own task; wait for
 /// those to reach the end of their on-disk steps. Then record the shutdown as
@@ -210,6 +210,8 @@ fn background_shutdown_steps(enable_scanner: bool, enable_heal: bool) -> Vec<Bac
 /// may not have completed. Returns whether the markers were cleared.
 async fn finish_detached_mutations_and_clear_unclean_shutdown_markers<W, WaitFut, ClearFut>(
     background_handoff_complete: bool,
+    maintenance_result: &std::io::Result<()>,
+    front_result: &FrontShutdownReport,
     detached_mutation_timeout: std::time::Duration,
     wait_for_detached_mutations: W,
     clear_unclean_shutdown_markers: ClearFut,
@@ -219,6 +221,16 @@ where
     WaitFut: Future<Output = bool>,
     ClearFut: Future<Output = ()>,
 {
+    let maintenance_retired = match maintenance_result {
+        Ok(()) => true,
+        Err(error) => error
+            .get_ref()
+            .and_then(|error| error.downcast_ref::<MaintenanceShutdownFailure>())
+            .is_some_and(|failure| failure.joined),
+    };
+    if !maintenance_retired || !front_result.producers_retired() {
+        return false;
+    }
     let detached_mutations_drained = wait_for_detached_mutations(detached_mutation_timeout).await;
     if !detached_mutations_drained {
         warn!(
@@ -233,11 +245,351 @@ where
             "Detached mutations did not finish before shutdown; retaining unclean-shutdown markers"
         );
     }
-    if !(background_handoff_complete && detached_mutations_drained) {
+    if !(background_handoff_complete
+        && maintenance_result.is_ok()
+        && front_result.allows_marker_clear()
+        && detached_mutations_drained)
+    {
         return false;
     }
     clear_unclean_shutdown_markers.await;
     true
+}
+
+type PendingCapacityShutdown = std::pin::Pin<Box<dyn Future<Output = std::result::Result<(), tokio::task::JoinError>> + Send>>;
+
+/// Own the same accepted capacity shutdown through the later lifecycle cleanup.
+pub(crate) struct CapacityShutdownReport {
+    configured: bool,
+    timed_out: bool,
+    result: Option<std::result::Result<(), tokio::task::JoinError>>,
+    pending: Option<PendingCapacityShutdown>,
+}
+
+#[derive(Debug)]
+struct CapacityShutdownFailure {
+    timed_out: bool,
+    joined: bool,
+    join_error: Option<tokio::task::JoinError>,
+}
+
+impl std::fmt::Display for CapacityShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match &self.join_error {
+            Some(error) => join_failure_reason(error),
+            None if self.joined => "owned tasks joined",
+            None => "actual join unconfirmed",
+        };
+        if self.timed_out {
+            write!(f, "capacity shutdown exceeded its original deadline: {reason}")
+        } else {
+            write!(f, "capacity shutdown failed: {reason}")
+        }
+    }
+}
+
+impl std::error::Error for CapacityShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.join_error.as_ref().map(|error| error as _)
+    }
+}
+
+impl CapacityShutdownReport {
+    async fn observe_deadline(&mut self) {
+        let Some(shutdown) = self.pending.as_mut() else {
+            return;
+        };
+        info!(
+            target: "rustfs::main::handle_shutdown",
+            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+            component = LOG_COMPONENT_MAIN,
+            subsystem = LOG_SUBSYSTEM_STARTUP,
+            state = "stopping",
+            service = BACKGROUND_SERVICE_CAPACITY,
+            "Background service shutdown started"
+        );
+        let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+        let observed = tokio::time::timeout_at(deadline, shutdown.as_mut()).await;
+        // Ready wins inside Tokio Timeout, so a late observation must fail closed.
+        self.timed_out |= observed.is_err() || tokio::time::Instant::now() >= deadline;
+        match &observed {
+            Ok(Ok(())) if !self.timed_out => info!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stopped",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                "Background service shutdown completed"
+            ),
+            Ok(Err(err)) if !self.timed_out => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stop_failed",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                reason = join_failure_reason(err),
+                "Background service shutdown failed"
+            ),
+            _ => error!(
+                target: "rustfs::main::handle_shutdown",
+                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
+                component = LOG_COMPONENT_MAIN,
+                subsystem = LOG_SUBSYSTEM_STARTUP,
+                state = "stop_failed",
+                service = BACKGROUND_SERVICE_CAPACITY,
+                reason = "timeout",
+                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
+                "Background service shutdown timed out"
+            ),
+        }
+        if let Ok(result) = observed {
+            self.result = Some(result);
+            self.pending = None;
+        }
+    }
+
+    fn allows_marker_clear(&self) -> bool {
+        !self.configured || (!self.timed_out && matches!(self.result, Some(Ok(()))))
+    }
+
+    pub(crate) async fn finish(mut self) -> std::io::Result<()> {
+        if let Some(pending) = self.pending.take() {
+            // Cleanup-only observation of the same future never resets its deadline.
+            self.result = Some(pending.await);
+        }
+        if !self.configured || (!self.timed_out && matches!(self.result, Some(Ok(())))) {
+            return Ok(());
+        }
+        let joined = self.result.is_some();
+        let join_error = self.result.and_then(std::result::Result::err);
+        Err(std::io::Error::new(
+            if self.timed_out {
+                std::io::ErrorKind::TimedOut
+            } else {
+                std::io::ErrorKind::Other
+            },
+            CapacityShutdownFailure {
+                timed_out: self.timed_out,
+                joined,
+                join_error,
+            },
+        ))
+    }
+}
+
+#[derive(Debug)]
+struct MaintenanceShutdownFailure {
+    timed_out: bool,
+    joined: bool,
+    join_error: Option<tokio::task::JoinError>,
+}
+
+impl std::fmt::Display for MaintenanceShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let reason = match &self.join_error {
+            Some(error) => join_failure_reason(error),
+            None if self.joined => "owned task joined",
+            None => "actual join unconfirmed",
+        };
+        if self.timed_out {
+            write!(f, "maintenance shutdown exceeded its original deadline: {reason}")
+        } else {
+            write!(f, "maintenance shutdown failed: {reason}")
+        }
+    }
+}
+
+impl std::error::Error for MaintenanceShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.join_error.as_ref().map(|error| error as _)
+    }
+}
+
+pub(crate) async fn stop_table_maintenance(
+    runtime: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
+) -> std::io::Result<()> {
+    let Some(mut runtime) = runtime else {
+        return Ok(());
+    };
+    runtime.request_stop();
+    let join = runtime.join();
+    tokio::pin!(join);
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TIMEOUT;
+    let observed = tokio::time::timeout_at(deadline, join.as_mut()).await;
+    // Tokio polls Ready first, so confirm observation against the original deadline.
+    let timed_out = observed.is_err() || tokio::time::Instant::now() >= deadline;
+    let observed_join = match observed {
+        Ok(result) => result,
+        // The original deadline stays failed while this same owner finishes.
+        Err(_) => join.await,
+    };
+    if !timed_out && matches!(observed_join.as_ref(), Some(Ok(()))) {
+        return Ok(());
+    }
+    Err(std::io::Error::new(
+        if timed_out {
+            std::io::ErrorKind::TimedOut
+        } else {
+            std::io::ErrorKind::Other
+        },
+        MaintenanceShutdownFailure {
+            timed_out,
+            joined: observed_join.is_some(),
+            join_error: observed_join.and_then(std::result::Result::err),
+        },
+    ))
+}
+
+#[derive(Debug, Default)]
+enum FrontObservation {
+    #[default]
+    NotConfigured,
+    Unconfirmed,
+    Observed(Result<ShutdownReceipt, ShutdownWaitError>),
+}
+
+impl FrontObservation {
+    fn http12(&self) -> Option<&crate::server::Http12ShutdownOutcome> {
+        match self {
+            Self::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))) => Some(outcome),
+            Self::Observed(Err(error)) => error.http12_outcome(),
+            _ => None,
+        }
+    }
+
+    fn error(&self) -> Option<ShutdownWaitError> {
+        match self {
+            Self::Observed(Err(error)) => Some(error.clone()),
+            Self::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))) => outcome.late_failure(),
+            _ => None,
+        }
+    }
+
+    fn retired(&self) -> bool {
+        matches!(self, Self::NotConfigured) || self.http12().is_some_and(|outcome| outcome.verified_scope_complete())
+    }
+
+    fn allows_marker_clear(&self) -> bool {
+        matches!(self, Self::NotConfigured)
+            || matches!(self, Self::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))) if outcome.verified_scope_complete())
+    }
+}
+
+/// Retain positive receipts as well as failed/unknown observations until Root consumes them.
+#[derive(Debug, Default)]
+pub(crate) struct FrontShutdownReport {
+    s3: FrontObservation,
+    console: FrontObservation,
+    optional: Vec<ShutdownWaitError>,
+    optional_expected: Option<usize>,
+    optional_joined: bool,
+}
+
+impl FrontShutdownReport {
+    fn producers_retired(&self) -> bool {
+        self.s3.retired()
+            && self.console.retired()
+            && self.optional_expected.is_none_or(|count| count == 0 && self.optional_joined)
+    }
+
+    fn allows_marker_clear(&self) -> bool {
+        self.s3.allows_marker_clear()
+            && self.console.allows_marker_clear()
+            && self.optional_expected.is_none_or(|count| count == 0 && self.optional_joined)
+            && self.optional.is_empty()
+    }
+
+    pub(crate) fn into_result(self) -> Result<(), Box<FrontShutdownFailure>> {
+        if self.allows_marker_clear() {
+            return Ok(());
+        }
+        let deadline_missed = [&self.s3, &self.console]
+            .into_iter()
+            .any(|observation| observation.http12().is_some_and(|outcome| outcome.deadline_missed()));
+        let incomplete_leaf_proof = !self.producers_retired();
+        Err(Box::new(FrontShutdownFailure {
+            s3: self.s3.error(),
+            console: self.console.error(),
+            optional: self.optional,
+            deadline_missed,
+            incomplete_leaf_proof,
+        }))
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FrontShutdownFailure {
+    s3: Option<ShutdownWaitError>,
+    console: Option<ShutdownWaitError>,
+    optional: Vec<ShutdownWaitError>,
+    deadline_missed: bool,
+    incomplete_leaf_proof: bool,
+}
+
+impl FrontShutdownFailure {
+    pub(crate) fn deadline_missed(&self) -> bool {
+        self.deadline_missed
+    }
+}
+
+impl std::fmt::Display for FrontShutdownFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("front task shutdown failed")?;
+        if self.incomplete_leaf_proof {
+            f.write_str("; configured front child retirement unconfirmed")?;
+        }
+        for (service, error) in [("s3", self.s3.as_ref()), ("console", self.console.as_ref())] {
+            if let Some(error) = error {
+                write!(f, "; {service}: {error}")?;
+            }
+        }
+        for error in &self.optional {
+            write!(f, "; optional_protocol: {error}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for FrontShutdownFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        self.s3
+            .as_ref()
+            .or(self.console.as_ref())
+            .or(self.optional.first())
+            .map(|error| error as _)
+    }
+}
+
+pub(crate) async fn join_startup_fronts(
+    s3: &mut Option<ShutdownHandle>,
+    console: &mut Option<ShutdownHandle>,
+    optional: &mut Vec<ShutdownHandle>,
+    report: &mut FrontShutdownReport,
+) {
+    for handle in s3.iter().chain(console.iter()).chain(optional.iter()) {
+        handle.signal();
+    }
+    if s3.is_some() && matches!(report.s3, FrontObservation::NotConfigured) {
+        report.s3 = FrontObservation::Unconfirmed;
+    }
+    if console.is_some() && matches!(report.console, FrontObservation::NotConfigured) {
+        report.console = FrontObservation::Unconfirmed;
+    }
+    if report.optional_expected.is_none() {
+        report.optional_expected = Some(optional.len());
+    }
+    if let Some(handle) = s3.as_mut() {
+        report.s3 = FrontObservation::Observed(handle.wait_checked().await);
+        let _ = s3.take();
+    }
+    if let Some(handle) = console.as_mut() {
+        report.console = FrontObservation::Observed(handle.wait_checked().await);
+        let _ = console.take();
+    }
+    shutdown_optional_runtime_services(optional, &mut report.optional).await;
+    report.optional_joined = true;
 }
 
 pub(crate) struct StartupBackgroundTasks {
@@ -248,12 +600,12 @@ pub(crate) struct StartupBackgroundTasks {
 pub(crate) async fn run_startup_shutdown_sequence(
     state_manager: &ServiceStateManager,
     shutdown_signal: ShutdownSignal,
-    s3_shutdown_handle: Option<ShutdownHandle>,
-    console_shutdown_handle: Option<ShutdownHandle>,
+    mut s3_shutdown_handle: Option<ShutdownHandle>,
+    mut console_shutdown_handle: Option<ShutdownHandle>,
     optional_runtimes: OptionalRuntimeServices,
     background_tasks: StartupBackgroundTasks,
     ctx: CancellationToken,
-) {
+) -> (CapacityShutdownReport, std::io::Result<()>, FrontShutdownReport) {
     let StartupBackgroundTasks {
         capacity: capacity_tasks,
         table_maintenance,
@@ -283,49 +635,18 @@ pub(crate) async fn run_startup_shutdown_sequence(
         handle.signal();
     }
 
-    if let Some(capacity_tasks) = capacity_tasks {
-        info!(
-            target: "rustfs::main::handle_shutdown",
-            event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-            component = LOG_COMPONENT_MAIN,
-            subsystem = LOG_SUBSYSTEM_STARTUP,
-            service = BACKGROUND_SERVICE_CAPACITY,
-            state = "stopping",
-            "Background service shutdown started"
-        );
-        match tokio::time::timeout(SHUTDOWN_TIMEOUT, capacity_tasks.shutdown()).await {
-            Ok(Ok(())) => info!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stopped",
-                "Background service shutdown completed"
-            ),
-            Ok(Err(err)) => error!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stop_failed",
-                reason = join_failure_reason(&err),
-                "Background service shutdown failed"
-            ),
-            Err(_) => error!(
-                target: "rustfs::main::handle_shutdown",
-                event = EVENT_BACKGROUND_SERVICE_SHUTDOWN,
-                component = LOG_COMPONENT_MAIN,
-                subsystem = LOG_SUBSYSTEM_STARTUP,
-                service = BACKGROUND_SERVICE_CAPACITY,
-                state = "stop_failed",
-                reason = "timeout",
-                timeout_secs = SHUTDOWN_TIMEOUT.as_secs(),
-                "Background service shutdown timed out"
-            ),
-        }
+    let mut optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
+    for handle in &optional_runtime_shutdowns {
+        handle.signal();
     }
+
+    let mut capacity_report = CapacityShutdownReport {
+        configured: capacity_tasks.is_some(),
+        timed_out: false,
+        result: None,
+        pending: capacity_tasks.map(|tasks| Box::pin(tasks.shutdown()) as _),
+    };
+    capacity_report.observe_deadline().await;
 
     let enable_scanner = get_env_bool_with_aliases(ENV_SCANNER_ENABLED, &[ENV_SCANNER_ENABLED_DEPRECATED], true);
     let enable_heal = get_env_bool_with_aliases(ENV_HEAL_ENABLED, &[ENV_HEAL_ENABLED_DEPRECATED], true);
@@ -397,8 +718,6 @@ pub(crate) async fn run_startup_shutdown_sequence(
     );
     crate::storage_api::startup::shutdown::store_compression_total_in_backend().await;
 
-    let optional_runtime_shutdowns = prepare_optional_runtime_shutdowns(optional_runtimes);
-
     info!(
         target: "rustfs::main::handle_shutdown",
         event = EVENT_EVENT_NOTIFIER_SHUTDOWN,
@@ -465,21 +784,22 @@ pub(crate) async fn run_startup_shutdown_sequence(
         state = "stopping",
         "RustFS server stopping"
     );
-    if let Some(s3_shutdown_handle) = s3_shutdown_handle {
-        s3_shutdown_handle.shutdown().await;
-    }
-    if let Some(console_shutdown_handle) = console_shutdown_handle {
-        console_shutdown_handle.shutdown().await;
-    }
-    shutdown_optional_runtime_services(optional_runtime_shutdowns).await;
-    let maintenance_drained = match table_maintenance {
-        Some(runtime) => runtime.shutdown(SHUTDOWN_TIMEOUT).await,
-        None => true,
-    };
-    // FTP, SFTP and WebDAV can start deletes too: wait for detached mutations
-    // only after every front end has stopped.
+    let mut front_failures = FrontShutdownReport::default();
+    join_startup_fronts(
+        &mut s3_shutdown_handle,
+        &mut console_shutdown_handle,
+        &mut optional_runtime_shutdowns,
+        &mut front_failures,
+    )
+    .await;
+    let front_result = front_failures;
+    let maintenance_result = stop_table_maintenance(table_maintenance).await;
+    // Unknown front leaves cannot authorize the downstream fence. A retired HTTP
+    // scope may finish cleanup after a late/failed receipt, while its marker stays dirty.
     finish_detached_mutations_and_clear_unclean_shutdown_markers(
-        heal_handoff_complete && maintenance_drained,
+        heal_handoff_complete && capacity_report.allows_marker_clear(),
+        &maintenance_result,
+        &front_result,
         DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
         wait_for_detached_mutations,
         rustfs_heal::heal::clear_unclean_shutdown_markers(),
@@ -494,6 +814,7 @@ pub(crate) async fn run_startup_shutdown_sequence(
         state = "stopped",
         "RustFS server stopped"
     );
+    (capacity_report, maintenance_result, front_result)
 }
 
 async fn run_embedded_runtime_cleanup(mut cleanup: EmbeddedRuntimeCleanup) {
@@ -673,6 +994,305 @@ mod tests {
     use tokio::sync::broadcast;
     use tokio_util::sync::CancellationToken;
 
+    #[tokio::test(start_paused = true)]
+    async fn capacity_report_late_ready_observation_keeps_deadline_failure_and_original_join() {
+        for panics in [false, true] {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                let _ = entered_tx.send(());
+                if release_rx.await.is_ok() {
+                    let _ = completed_tx.send(());
+                    assert!(!panics, "expected late capacity task failure");
+                }
+            });
+            let task_id = task.id();
+            let task_finished = task.abort_handle();
+            entered_rx.await.expect("the real task must start before observation");
+            let mut report = super::CapacityShutdownReport {
+                configured: true,
+                timed_out: false,
+                result: None,
+                pending: Some(Box::pin(task)),
+            };
+            let (first_pending, released, completed) = {
+                let mut observation = Box::pin(report.observe_deadline());
+                let first_pending = std::future::poll_fn(|cx| {
+                    std::task::Poll::Ready(std::future::Future::poll(observation.as_mut(), cx).is_pending())
+                })
+                .await;
+                // Leave the actual observer unpolled until the original deadline
+                // has passed and the same real task has completely finished.
+                tokio::time::advance(super::SHUTDOWN_TIMEOUT + Duration::from_millis(1)).await;
+                let released = release_tx.send(()).is_ok();
+                let completed = completed_rx.await.is_ok();
+                while !task_finished.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+                if first_pending {
+                    observation.await;
+                }
+                (first_pending, released, completed)
+            };
+            let timed_out = report.timed_out;
+            let marker_allowed = report.allows_marker_clear();
+            let consumed = report.pending.is_none();
+            let joined = report.result.is_some();
+            let error = report.finish().await.expect_err("a late Ready observation must stay failed");
+            // Every assertion follows release, actual task exit and final observation.
+            assert!(first_pending && released && completed && consumed && joined);
+            assert!(timed_out && !marker_allowed);
+            assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+            if panics {
+                let failure = error.get_ref().expect("typed capacity failure");
+                let source = std::error::Error::source(failure).expect("late actual JoinError source");
+                let source = source
+                    .downcast_ref::<tokio::task::JoinError>()
+                    .expect("actual JoinError type");
+                assert!(source.is_panic());
+                assert_eq!(source.id(), task_id);
+            }
+        }
+    }
+
+    async fn assert_early_tls_receipt_final_join(fail: bool) {
+        use super::{FrontObservation, FrontShutdownReport};
+        use crate::server::ShutdownReceipt;
+
+        let release = tokio_util::sync::CancellationToken::new();
+        let child_release = release.clone();
+        // This unit fixture tests Root propagation only, not TLS/native retirement.
+        let actual_task = tokio::spawn(async move {
+            child_release.cancelled().await;
+            assert!(!fail, "test late TLS driver panic");
+        });
+        let receipt = crate::server::tls_material::test_retirement_from_task(actual_task);
+        let outcome =
+            crate::server::test_retire_http12_scope(std::future::ready(()), tokio::time::Instant::now() + Duration::from_secs(5))
+                .await
+                .with_test_tls_receipt(receipt.clone());
+        let before_join = outcome.verified_scope_complete();
+        let original_deadline_missed = outcome.deadline_missed();
+        let report = FrontShutdownReport {
+            s3: FrontObservation::Observed(Ok(ShutdownReceipt::Http12ChildrenRetired(outcome))),
+            ..Default::default()
+        };
+        release.cancel();
+        receipt.test_observe_join().await;
+        let result = report.into_result();
+        assert!(!before_join, "an own-round receipt cannot certify an unjoined group");
+        assert!(!original_deadline_missed, "this original scope observation was timely");
+        if fail {
+            let failure = result.expect_err("late real group failure vetoes marker clearing");
+            let error = failure.s3.expect("the earlier positive receipt retains the late failure");
+            let source = std::error::Error::source(&error).expect("actual JoinError source");
+            assert!(
+                source
+                    .downcast_ref::<tokio::task::JoinError>()
+                    .expect("typed JoinError")
+                    .is_panic()
+            );
+            assert!(!failure.deadline_missed, "late error does not rewrite the frozen scope deadline");
+        } else {
+            result.expect("retained early receipt sees the eventual original successful group join");
+        }
+    }
+
+    #[tokio::test]
+    async fn early_positive_tls_receipt_preserves_late_original_join_error() {
+        assert_early_tls_receipt_final_join(true).await;
+    }
+
+    #[tokio::test]
+    async fn early_positive_tls_receipt_sees_original_group_join_success() {
+        assert_early_tls_receipt_final_join(false).await;
+    }
+
+    #[tokio::test]
+    async fn capacity_report_ready_future_is_polled_once_and_cached_success_finishes() {
+        let polls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed_polls = polls.clone();
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: None,
+            pending: Some(Box::pin(std::future::poll_fn(move |_| {
+                assert_eq!(observed_polls.fetch_add(1, std::sync::atomic::Ordering::SeqCst), 0);
+                std::task::Poll::Ready(Ok(()))
+            }))),
+        };
+        assert!(!report.allows_marker_clear(), "unobserved completion cannot clear markers");
+        report.finish().await.expect("the ready future should finish once");
+        assert_eq!(polls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let completed = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: Some(Ok(())),
+            pending: None,
+        };
+        assert!(completed.allows_marker_clear());
+        completed
+            .finish()
+            .await
+            .expect("consumed timely completion needs no second poll");
+    }
+
+    #[tokio::test]
+    async fn capacity_report_configured_unknown_completion_fails_closed() {
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: None,
+            pending: None,
+        };
+        assert!(!report.allows_marker_clear());
+        assert_eq!(
+            report.finish().await.expect_err("unknown completion must fail").kind(),
+            std::io::ErrorKind::Other
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_report_timeout_waits_for_held_future_and_stays_failed() {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (completed_tx, completed_rx) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            started_tx.send(()).expect("the test should observe the task start");
+            release_rx.await.expect("the same held task must remain alive until release");
+            completed_tx.send(()).expect("the test should observe actual completion");
+        });
+        started_rx.await.expect("the real task should start");
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: true,
+            result: None,
+            pending: Some(Box::pin(task)),
+        };
+        assert!(!report.allows_marker_clear());
+        let mut finish = Box::pin(report.finish());
+        tokio::select! {
+            biased;
+            result = finish.as_mut() => panic!("finish returned before the held task was released: {result:?}"),
+            _ = std::future::ready(()) => {}
+        }
+        release_tx.send(()).expect("finish must not cancel the held task");
+        let error = finish
+            .await
+            .expect_err("late successful join must retain the timeout failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        completed_rx
+            .await
+            .expect("the same task must really complete before finish returns");
+
+        let completed_late = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: true,
+            result: Some(Ok(())),
+            pending: None,
+        };
+        assert!(
+            !completed_late.allows_marker_clear(),
+            "late completion must not restore marker eligibility"
+        );
+        assert_eq!(
+            completed_late
+                .finish()
+                .await
+                .expect_err("cached late completion must remain failed")
+                .kind(),
+            std::io::ErrorKind::TimedOut
+        );
+    }
+
+    #[tokio::test]
+    async fn capacity_report_preserves_actual_join_error_source() {
+        let task = tokio::spawn(async { panic!("expected capacity report task failure") });
+        let task_id = task.id();
+        let join_error = task.await.expect_err("the real task should panic");
+        let report = super::CapacityShutdownReport {
+            configured: true,
+            timed_out: false,
+            result: Some(Err(join_error)),
+            pending: None,
+        };
+        assert!(!report.allows_marker_clear());
+        let error = report
+            .finish()
+            .await
+            .expect_err("the observed task failure must remain a failure");
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        let failure = error.get_ref().expect("the typed capacity failure must remain attached");
+        let source = std::error::Error::source(failure).expect("the real JoinError must remain the source");
+        let source = source
+            .downcast_ref::<tokio::task::JoinError>()
+            .expect("the source must retain its JoinError type");
+        assert!(source.is_panic());
+        assert_eq!(source.id(), task_id, "the original task identity must survive error propagation");
+    }
+
+    #[tokio::test]
+    async fn maintenance_failures_keep_markers_after_detached_mutations_finish() {
+        let task = tokio::spawn(async { panic!("expected maintenance marker fixture failure") });
+        let join_error = task.await.expect_err("actual task should fail");
+        for failure in [
+            super::MaintenanceShutdownFailure {
+                timed_out: true,
+                joined: true,
+                join_error: None,
+            },
+            super::MaintenanceShutdownFailure {
+                timed_out: false,
+                joined: false,
+                join_error: None,
+            },
+            super::MaintenanceShutdownFailure {
+                timed_out: false,
+                joined: true,
+                join_error: Some(join_error),
+            },
+        ] {
+            let retired = failure.joined;
+            let temp_dir = tempfile::tempdir().expect("marker fixture directory");
+            let marker = temp_dir.path().join("unclean-shutdown");
+            std::fs::write(&marker, b"").expect("marker fixture must exist");
+            let maintenance_result = Err(std::io::Error::new(
+                if failure.timed_out {
+                    std::io::ErrorKind::TimedOut
+                } else {
+                    std::io::ErrorKind::Other
+                },
+                failure,
+            ));
+            let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed_wait = waited.clone();
+            let cleared = finish_detached_mutations_and_clear_unclean_shutdown_markers(
+                true,
+                &maintenance_result,
+                &super::FrontShutdownReport::default(),
+                super::DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
+                |timeout| async move {
+                    assert_eq!(timeout, super::DETACHED_MUTATION_SHUTDOWN_TIMEOUT);
+                    observed_wait.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
+                async {
+                    std::fs::remove_file(&marker).expect("only a verified shutdown may clear the marker");
+                },
+            )
+            .await;
+            assert!(!cleared, "late, unconfirmed and failed maintenance must retain markers");
+            assert!(marker.exists(), "completed detached mutations cannot erase the maintenance failure");
+            assert_eq!(
+                waited.load(std::sync::atomic::Ordering::SeqCst),
+                retired,
+                "detached waiting requires an actual maintenance join"
+            );
+        }
+    }
+
     #[test]
     fn background_shutdown_plan_keeps_scanner_before_ahm() {
         assert_eq!(
@@ -695,6 +1315,8 @@ mod tests {
     ) -> bool {
         finish_detached_mutations_and_clear_unclean_shutdown_markers(
             heal_handoff_complete,
+            &Ok(()),
+            &super::FrontShutdownReport::default(),
             timeout,
             |timeout| async move { tokio::time::timeout(timeout, detached_mutation).await.is_ok() },
             async {
@@ -919,5 +1541,281 @@ mod tests {
         allow_cleanup_tx.send(()).expect("cleanup should finish");
         cleanup_task.await.expect("cleanup task should not panic");
         assert!(!temp_path.exists(), "temporary data should be removed only after runtime cleanup");
+    }
+    #[tokio::test]
+    async fn front_join_collector_retains_panic_and_console_owner_after_cancelled_observer() {
+        use std::{future::Future, task::Poll};
+        let (tx, _rx) = broadcast::channel(1);
+        let panic = tokio::spawn(async { panic!("expected s3 outer task panic") });
+        let panic_id = panic.id();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !panic.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let mut s3 = Some(ShutdownHandle::new(tx, panic));
+        let (tx, mut rx) = broadcast::channel(1);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let mut console = Some(ShutdownHandle::new(
+            tx,
+            tokio::spawn(async move {
+                let _ = rx.recv().await;
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+            }),
+        ));
+        let mut optional = Vec::new();
+        let mut failures = super::FrontShutdownReport::default();
+        let mut observer = Box::pin(super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut failures));
+        let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
+        drop(observer);
+        let retained = s3.is_none() && console.is_some() && failures.s3.error().is_some();
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        if let Some(handle) = &console {
+            handle.signal();
+        }
+        let _ = release_tx.send(());
+        let completed = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut failures).await;
+        let failure = failures
+            .into_result()
+            .expect_err("the earlier panic cannot be overwritten on retry");
+        assert!(ready && pending && retained && entered && completed);
+        assert!(s3.is_none() && console.is_none() && optional.is_empty());
+        match failure.s3.expect("s3 failure remains owned") {
+            crate::server::ShutdownWaitError::Join(error) => {
+                assert!(error.is_panic());
+                assert_eq!(error.id(), panic_id);
+            }
+            error => panic!("actual panic was erased: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn front_join_collector_joins_held_optional_after_other_front_failures() {
+        use std::{future::Future, task::Poll};
+        let (tx, _rx) = broadcast::channel(1);
+        let s3 = tokio::spawn(async { panic!("expected s3 aggregate failure") });
+        let s3_id = s3.id();
+        let (optional_tx, _rx) = broadcast::channel(1);
+        let optional_panic = tokio::spawn(async { panic!("expected optional aggregate failure") });
+        let optional_id = optional_panic.id();
+        let ready = tokio::time::timeout(Duration::from_secs(5), async {
+            while !s3.is_finished() || !optional_panic.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .is_ok();
+        let mut s3 = Some(ShutdownHandle::new(tx, s3));
+        let mut console = None;
+        let (held_tx, mut held_rx) = broadcast::channel(1);
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+        let held = ShutdownHandle::new(
+            held_tx,
+            tokio::spawn(async move {
+                let _ = held_rx.recv().await;
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                let _ = done_tx.send(());
+            }),
+        );
+        let mut optional = vec![ShutdownHandle::new(optional_tx, optional_panic), held];
+        let mut failures = super::FrontShutdownReport::default();
+        let mut observer = Box::pin(super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut failures));
+        let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
+        drop(observer);
+        let retained = optional.len() == 1 && failures.s3.error().is_some() && failures.optional.len() == 1;
+        let entered = tokio::time::timeout(Duration::from_secs(5), entered_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        for handle in &optional {
+            handle.signal();
+        }
+        let _ = release_tx.send(());
+        let completed = tokio::time::timeout(Duration::from_secs(5), done_rx)
+            .await
+            .is_ok_and(|r| r.is_ok());
+        super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut failures).await;
+        let failure = failures.into_result().expect_err("all real join failures are retained");
+        assert!(ready && pending && retained && entered && completed);
+        assert!(s3.is_none() && console.is_none() && optional.is_empty());
+        match failure.s3.expect("s3 error") {
+            crate::server::ShutdownWaitError::Join(error) => assert_eq!(error.id(), s3_id),
+            error => panic!("lost s3 error: {error}"),
+        }
+        match failure.optional.first().expect("optional error") {
+            crate::server::ShutdownWaitError::Join(error) => assert_eq!(error.id(), optional_id),
+            error => panic!("lost optional error: {error}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn front_panic_and_unknown_receipts_keep_actual_marker_after_detached_cleanup() {
+        for unknown in [false, true] {
+            let (tx, _rx) = broadcast::channel(1);
+            let task = tokio::spawn(async move {
+                if !unknown {
+                    panic!("expected front marker failure");
+                }
+            });
+            let mut handle = ShutdownHandle::new(tx, task);
+            if unknown {
+                handle.wait_checked().await.expect("consume the real initial receipt");
+            }
+            let mut s3 = Some(handle);
+            let mut console = None;
+            let mut optional = Vec::new();
+            let mut failures = super::FrontShutdownReport::default();
+            super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut failures).await;
+            let front_result = failures;
+            let temp = tempfile::tempdir().expect("owned marker directory");
+            let marker = temp.path().join("unclean-shutdown");
+            std::fs::write(&marker, b"retained unclean marker").expect("real marker");
+            let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let observed = waited.clone();
+            let cleared = finish_detached_mutations_and_clear_unclean_shutdown_markers(
+                true,
+                &Ok(()),
+                &front_result,
+                super::DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
+                move |_| async move {
+                    observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                    true
+                },
+                async {
+                    std::fs::remove_file(&marker).expect("only successful receipts may clear");
+                },
+            )
+            .await;
+            assert!(!cleared && front_result.into_result().is_err());
+            assert!(
+                !waited.load(std::sync::atomic::Ordering::SeqCst),
+                "unknown front leaves must not close the downstream fence"
+            );
+            assert_eq!(std::fs::read(&marker).expect("marker must remain"), b"retained unclean marker");
+            assert!(s3.is_none() && console.is_none() && optional.is_empty());
+        }
+    }
+    #[tokio::test]
+    async fn http12_retired_late_failure_allows_cleanup_but_never_clears_marker() {
+        let (tx, _rx) = broadcast::channel(1);
+        let task = tokio::spawn(crate::server::test_retire_http12_scope(
+            async {
+                panic!("expected original scoped HTTP child failure");
+            },
+            tokio::time::Instant::now(),
+        ));
+        let mut s3 = Some(ShutdownHandle::new_http12(tx, task));
+        let mut console = None;
+        let mut optional = Vec::new();
+        let mut report = super::FrontShutdownReport::default();
+        super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut report).await;
+        assert!(report.producers_retired(), "actual scope joined despite its failed deadline");
+        let dir = tempfile::tempdir().expect("owned marker fixture");
+        let marker = dir.path().join("unclean-shutdown");
+        std::fs::write(&marker, b"retained").expect("real marker");
+        let waited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let observed = waited.clone();
+        let cleared = finish_detached_mutations_and_clear_unclean_shutdown_markers(
+            true,
+            &Ok(()),
+            &report,
+            super::DETACHED_MUTATION_SHUTDOWN_TIMEOUT,
+            move |_| async move {
+                observed.store(true, std::sync::atomic::Ordering::SeqCst);
+                true
+            },
+            async {
+                std::fs::remove_file(&marker).expect("only successful proof can clear");
+            },
+        )
+        .await;
+        assert!(
+            waited.load(std::sync::atomic::Ordering::SeqCst),
+            "retired-but-failed scope permits cleanup only"
+        );
+        assert!(!cleared);
+        assert_eq!(std::fs::read(&marker).expect("marker remains"), b"retained");
+        let error = report.into_result().expect_err("original failure remains");
+        assert!(error.deadline_missed());
+        let source = std::error::Error::source(&error).expect("HTTP wait error");
+        assert!(
+            std::error::Error::source(source)
+                .expect("original child JoinError")
+                .is::<tokio::task::JoinError>()
+        );
+    }
+    #[tokio::test]
+    async fn configured_optional_outer_join_does_not_fabricate_leaf_proof() {
+        let (tx, _rx) = broadcast::channel(1);
+        let mut optional = vec![ShutdownHandle::new(tx, tokio::spawn(async {}))];
+        let mut report = super::FrontShutdownReport::default();
+        super::join_startup_fronts(&mut None, &mut None, &mut optional, &mut report).await;
+        assert!(optional.is_empty() && report.optional_joined, "actual outer handle joined");
+        assert!(!report.producers_retired() && !report.allows_marker_clear());
+        let failure = report
+            .into_result()
+            .expect_err("actual configured instance still lacks child proof");
+        assert!(failure.incomplete_leaf_proof && failure.optional.is_empty());
+        assert!(
+            std::error::Error::source(&failure).is_none(),
+            "do not fabricate a JoinError for unknown children"
+        );
+    }
+
+    #[tokio::test]
+    async fn front_signals_every_actual_instance_before_pending_first_join() {
+        let (s3_tx, mut s3_rx) = broadcast::channel(1);
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let mut s3 = Some(ShutdownHandle::new(
+            s3_tx,
+            tokio::spawn(async move {
+                let _ = s3_rx.recv().await;
+                let _ = release_rx.await;
+            }),
+        ));
+        let (console_tx, mut console_rx) = broadcast::channel(1);
+        let (console_seen_tx, console_seen_rx) = tokio::sync::oneshot::channel();
+        let mut console = Some(ShutdownHandle::new(
+            console_tx,
+            tokio::spawn(async move {
+                let _ = console_rx.recv().await;
+                let _ = console_seen_tx.send(());
+            }),
+        ));
+        let (optional_tx, mut optional_rx) = broadcast::channel(1);
+        let (optional_seen_tx, optional_seen_rx) = tokio::sync::oneshot::channel();
+        let mut optional = vec![ShutdownHandle::new(
+            optional_tx,
+            tokio::spawn(async move {
+                let _ = optional_rx.recv().await;
+                let _ = optional_seen_tx.send(());
+            }),
+        )];
+        let mut report = super::FrontShutdownReport::default();
+        let mut observer = Box::pin(super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut report));
+        let pending =
+            std::future::poll_fn(|cx| std::task::Poll::Ready(std::future::Future::poll(observer.as_mut(), cx).is_pending()))
+                .await;
+        drop(observer);
+        let console_signalled = tokio::time::timeout(Duration::from_secs(5), console_seen_rx).await;
+        let optional_signalled = tokio::time::timeout(Duration::from_secs(5), optional_seen_rx).await;
+        let _ = release_tx.send(());
+        super::join_startup_fronts(&mut s3, &mut console, &mut optional, &mut report).await;
+        assert!(pending && matches!(console_signalled, Ok(Ok(()))) && matches!(optional_signalled, Ok(Ok(()))));
+        assert!(s3.is_none() && console.is_none() && optional.is_empty());
+        assert!(report.into_result().is_err(), "legacy outer joins are not leaf receipts");
     }
 }

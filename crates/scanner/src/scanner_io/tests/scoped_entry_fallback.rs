@@ -139,6 +139,7 @@ async fn run_entry(
                 service_cohort: None,
                 resolved_scope_observer: Some(observer),
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )

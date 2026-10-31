@@ -22,6 +22,7 @@ async fn put_fixture_object(store: &Arc<ECStore>, bucket: &str, object: &str) {
 struct CycleHooks {
     resolved_scope_observer: Option<tokio::sync::oneshot::Sender<ScannerBucketScanScope>>,
     post_walk_gate: Option<tokio::sync::oneshot::Receiver<()>>,
+    peer_observations: Option<super::super::io_cycle::ScannerCyclePeerObservations>,
 }
 
 async fn run_cycle(
@@ -31,6 +32,7 @@ async fn run_cycle(
     requires_full_scan: bool,
     hooks: CycleHooks,
 ) -> (ScannerCycleResult, DataUsageInfo) {
+    let peer_cycle = hooks.peer_observations.is_some();
     let ctx = CancellationToken::new();
     let budget = ScannerCycleBudget::new(&ctx, ScannerCycleBudgetConfig::default());
     let (updates, mut receiver) = mpsc::channel(1);
@@ -52,12 +54,20 @@ async fn run_cycle(
                 service_cohort: None,
                 resolved_scope_observer: hooks.resolved_scope_observer,
                 post_walk_gate: hooks.post_walk_gate,
+                peer_observations: hooks.peer_observations,
             },
         ),
     )
     .await
     .expect("cycle should finish within the test deadline")
     .expect("cycle should succeed");
+    if peer_cycle {
+        assert_eq!(
+            result.status,
+            ScannerCycleStatus::Complete,
+            "one remote hot bucket cannot supersede certified cold buckets"
+        );
+    }
     let snapshot = receiver.recv().await.expect("cycle should publish a snapshot");
     assert!(receiver.recv().await.is_none(), "a cycle publishes one terminal snapshot");
     (result, snapshot)
@@ -91,6 +101,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         CycleHooks {
             resolved_scope_observer: None,
             post_walk_gate: None,
+            peer_observations: None,
         },
     )
     .await;
@@ -128,6 +139,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         CycleHooks {
             resolved_scope_observer: Some(observer),
             post_walk_gate: Some(gate),
+            peer_observations: None,
         },
     )
     .await;
@@ -175,6 +187,7 @@ async fn write_during_walk_leaves_only_that_bucket_pending_and_scopes_the_next_c
         CycleHooks {
             resolved_scope_observer: Some(observer),
             post_walk_gate: None,
+            peer_observations: None,
         },
     )
     .await;
@@ -226,6 +239,7 @@ async fn pending_put_tail_across_the_walk_no_longer_vetoes_the_cycle() {
         CycleHooks {
             resolved_scope_observer: None,
             post_walk_gate: None,
+            peer_observations: None,
         },
     )
     .await;
@@ -285,6 +299,7 @@ async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
         CycleHooks {
             resolved_scope_observer: Some(observer),
             post_walk_gate: Some(gate),
+            peer_observations: None,
         },
     )
     .await;
@@ -304,5 +319,232 @@ async fn guardrail_veto_still_supersedes_the_cycle_onto_the_observed_route() {
         freshness.last_guardrail_veto_reason,
         format!("maintenance_generation@{}", crate::scanner::LOCAL_SCANNER_ACTIVITY_NODE)
     );
+    clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn remote_hot_bucket_keeps_cold_buckets_certified_and_scopes_the_next_cycle() {
+    run_remote_certification_cycle(false).await;
+}
+
+#[tokio::test]
+#[serial]
+async fn a_verified_empty_ack_on_a_full_scope_keeps_the_remote_hot_bucket_pending() {
+    run_remote_certification_cycle(true).await;
+}
+
+async fn run_remote_certification_cycle(empty_ack: bool) {
+    let (_temp_dir, store) = setup_local_scanner_store(1, 1).await;
+    clear_dirty_usage_buckets_for_tests();
+    let mut incarnations = BTreeMap::new();
+    for bucket in BUCKETS {
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        put_fixture_object(&store, bucket, "initial").await;
+        record_dirty_usage_bucket(bucket);
+        incarnations.insert(
+            bucket.to_string(),
+            store.all_set_disks()[0]
+                .find_bucket_incarnation_id_from_disk(bucket)
+                .await
+                .expect("read actual incarnation")
+                .expect("fixture bucket has an incarnation"),
+        );
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let peers = Arc::new(StdMutex::new(BTreeMap::from([
+        (
+            "peer-a:9000".to_string(),
+            peer_dirty_usage_snapshot(&Uuid::from_u128(101).to_string(), 7, true, &[]),
+        ),
+        (
+            "peer-b:9000".to_string(),
+            peer_dirty_usage_snapshot(&Uuid::from_u128(102).to_string(), 7, true, &[]),
+        ),
+    ])));
+    // These are the RPC observations only. Bucket listing, traversal, cache
+    // coverage, classification and candidate production use the real cycle.
+    let activity_peers = Arc::clone(&peers);
+    let dirty_peers = Arc::clone(&peers);
+    let observations = super::super::io_cycle::ScannerCyclePeerObservations {
+        activity: Arc::new(move || {
+            activity_peers
+                .lock()
+                .expect("peer fixture lock")
+                .iter()
+                .map(|(host, peer)| {
+                    (
+                        host.clone(),
+                        crate::scanner::scanner_node_activity_for_tests(
+                            &peer.instance_id,
+                            peer.generation,
+                            peer.generation,
+                            !peer.buckets.is_empty(),
+                        ),
+                    )
+                })
+                .collect()
+        }),
+        dirty_usage: Arc::new(move || {
+            dirty_peers
+                .lock()
+                .expect("peer fixture lock")
+                .iter()
+                .map(|(host, snapshot)| (host.clone(), snapshot.clone()))
+                .collect()
+        }),
+        scoped_ack_capable: true,
+    };
+    let (result, baseline) = run_cycle(
+        &store,
+        1,
+        None,
+        true,
+        CycleHooks {
+            resolved_scope_observer: None,
+            post_walk_gate: None,
+            peer_observations: Some(observations.clone()),
+        },
+    )
+    .await;
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert!(result.clear_verified_usage().is_empty());
+    assert!(baseline.is_complete_bucket_usage_snapshot());
+    let initial_dirty = if empty_ack {
+        vec!["hot-bucket"]
+    } else {
+        vec!["cold-bucket", "idle-bucket"]
+    };
+    for bucket in initial_dirty {
+        put_fixture_object(&store, bucket, "second").await;
+        let mut locked = peers.lock().expect("peer fixture lock");
+        let peer = locked.get_mut("peer-a:9000").expect("remote producer exists");
+        peer.generation += 1;
+        peer.buckets.insert(
+            bucket.to_string(),
+            crate::storage_api::EcstoreScannerPeerDirtyUsageBucket {
+                bucket_incarnation: incarnations[bucket],
+                generation: peer.generation,
+            },
+        );
+        peer.pending_bucket_count = u64::try_from(peer.buckets.len()).expect("bounded fixture");
+    }
+    wait_for_namespace_commit_tails(store.as_ref()).await;
+    let (observer, resolved_scope) = tokio::sync::oneshot::channel();
+    let (release, gate) = tokio::sync::oneshot::channel();
+    let writer_store = Arc::clone(&store);
+    let writer_peers = Arc::clone(&peers);
+    let hot_incarnation = incarnations["hot-bucket"];
+    let writer = tokio::spawn(async move {
+        let scope = resolved_scope.await.expect("real cycle resolved its scope");
+        put_fixture_object(&writer_store, "hot-bucket", "during-walk").await;
+        {
+            let mut locked = writer_peers.lock().expect("peer fixture lock");
+            let peer = locked.get_mut("peer-a:9000").expect("remote producer exists");
+            peer.generation += 1;
+            peer.buckets.insert(
+                "hot-bucket".to_string(),
+                crate::storage_api::EcstoreScannerPeerDirtyUsageBucket {
+                    bucket_incarnation: hot_incarnation,
+                    generation: peer.generation,
+                },
+            );
+            peer.pending_bucket_count = u64::try_from(peer.buckets.len()).expect("bounded fixture");
+        }
+        wait_for_namespace_commit_tails(writer_store.as_ref()).await;
+        release.send(()).expect("cycle awaits its actual post-walk proof");
+        scope
+    });
+    let (result, published) = run_cycle(
+        &store,
+        2,
+        (!empty_ack).then(|| baseline_bytes(&baseline)),
+        false,
+        CycleHooks {
+            resolved_scope_observer: Some(observer),
+            post_walk_gate: Some(gate),
+            peer_observations: Some(observations.clone()),
+        },
+    )
+    .await;
+    let scope = writer.await.expect("writer completed");
+    if empty_ack {
+        assert!(scope.is_default(), "this case exercises the full-scope generation fallback");
+    } else {
+        assert_eq!(
+            scope.selected_buckets_for_tests(),
+            Some(&HashSet::from(["cold-bucket".to_string(), "idle-bucket".to_string()]))
+        );
+    }
+    assert_eq!(
+        result.status,
+        ScannerCycleStatus::Complete,
+        "one remote hot bucket cannot supersede certified cold buckets"
+    );
+    assert_eq!(published.usage_snapshot_pending_buckets, vec!["hot-bucket".to_string()]);
+    assert_eq!(published.usage_snapshot_converged, Some(false));
+    assert!(!published.usage_snapshot_observational);
+    assert_eq!(published.buckets_usage["cold-bucket"].objects_count, if empty_ack { 1 } else { 2 });
+    assert_eq!(published.buckets_usage["idle-bucket"].objects_count, if empty_ack { 1 } else { 2 });
+    if !empty_ack {
+        assert_eq!(published.buckets_usage["hot-bucket"].objects_count, 1);
+    }
+    assert!(result.has_remote_dirty_usage_pending());
+    let acknowledgements = &result.remote_dirty_usage_acknowledgements;
+    if empty_ack {
+        assert!(acknowledgements.is_empty(), "a verified empty scoped ACK cannot become a generation ACK");
+    } else {
+        assert_eq!(acknowledgements.len(), 1, "the clean peer is proved without a fabricated ACK");
+        let crate::scanner::ScannerDirtyUsageAcknowledgementKind::Scoped { owner_id, entries } = &acknowledgements[0].kind else {
+            panic!("certified remote buckets require exact scoped ACKs");
+        };
+        assert_eq!(
+            entries.iter().map(|entry| entry.bucket.as_str()).collect::<BTreeSet<_>>(),
+            BTreeSet::from(["cold-bucket", "idle-bucket"])
+        );
+        {
+            let mut locked = peers.lock().expect("peer fixture lock");
+            let peer = locked
+                .get_mut(&acknowledgements[0].host)
+                .expect("ACK targets the original peer");
+            assert_eq!(&peer.owner_id, owner_id);
+            assert_eq!(peer.instance_id, acknowledgements[0].instance_id);
+            // Model the RPC receiver only after asserting the production sender's
+            // exact scope; this does not claim runtime publication/receiver proof.
+            for entry in entries {
+                let current = peer.buckets.get(&entry.bucket).expect("ACK names an observed tuple");
+                assert_eq!(
+                    (current.bucket_incarnation, current.generation),
+                    (entry.bucket_incarnation, entry.generation)
+                );
+                peer.buckets.remove(&entry.bucket);
+            }
+            peer.pending_bucket_count = u64::try_from(peer.buckets.len()).expect("bounded fixture");
+        }
+    }
+    let _ = result.clear_verified_usage();
+    let (observer, resolved_scope) = tokio::sync::oneshot::channel();
+    let (result, next) = run_cycle(
+        &store,
+        3,
+        Some(baseline_bytes(&published)),
+        false,
+        CycleHooks {
+            resolved_scope_observer: Some(observer),
+            post_walk_gate: None,
+            peer_observations: Some(observations),
+        },
+    )
+    .await;
+    assert_eq!(
+        resolved_scope.await.expect("next cycle scope").selected_buckets_for_tests(),
+        Some(&HashSet::from(["hot-bucket".to_string()]))
+    );
+    assert_eq!(result.status, ScannerCycleStatus::Complete);
+    assert_eq!(next.buckets_usage["hot-bucket"].objects_count, if empty_ack { 3 } else { 2 });
+    assert_eq!(next.usage_snapshot_converged, Some(true));
     clear_dirty_usage_buckets_for_tests();
 }

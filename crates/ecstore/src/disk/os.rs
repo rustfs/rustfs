@@ -286,6 +286,11 @@ mod dir_fsync_failures {
 
     static FAILURES: LazyLock<Mutex<HashMap<PathBuf, io::ErrorKind>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
+    #[cfg(target_os = "linux")]
+    pub(super) fn has_any() -> bool {
+        !FAILURES.lock().is_empty()
+    }
+
     pub(super) fn set(dir: &Path, kind: io::ErrorKind) {
         FAILURES.lock().insert(dir.to_path_buf(), kind);
     }
@@ -323,7 +328,12 @@ pub fn set_local_dir_fsync_failure(disk: &crate::disk::Disk, volume: &str, path:
     Ok(())
 }
 
-/// Pause a real namespace mutation inside its physical executor.
+#[cfg(all(target_os = "linux", any(test, feature = "test-util")))]
+pub(crate) fn has_dir_fsync_test_failures() -> bool {
+    dir_fsync_failures::has_any()
+}
+
+/// Pause a real native filesystem operation inside its physical executor.
 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
 pub(crate) mod prepared_publication_test_hooks {
     use super::*;
@@ -333,6 +343,7 @@ pub(crate) mod prepared_publication_test_hooks {
         PreparedRename,
         Rename,
         Remove,
+        NativeReadOpen,
         MetadataReadAfterOpen,
         MetadataReadAfterRead,
         #[cfg(test)]
@@ -370,6 +381,17 @@ pub(crate) mod prepared_publication_test_hooks {
             let _pause = super::enter_blocking_test_hook();
             hook();
         }
+    }
+
+    pub(crate) fn has_any_hooks() -> bool {
+        if !BEFORE_PUBLICATION.lock().is_empty() {
+            return true;
+        }
+        #[cfg(test)]
+        if !RENAME_DESTINATIONS.lock().is_empty() || !HARDLINK_DESTINATIONS.lock().is_empty() {
+            return true;
+        }
+        false
     }
 
     #[cfg(test)]
@@ -459,6 +481,8 @@ pub enum LocalPublicationStage {
     PreparedRename,
     Rename,
     Remove,
+    /// Pause an accepted native read/open before its original syscall.
+    NativeReadOpen,
     MetadataReadAfterOpen,
     MetadataReadAfterRead,
 }
@@ -473,6 +497,7 @@ impl LocalPublicationPause {
             LocalPublicationStage::PreparedRename => prepared_publication_test_hooks::Stage::PreparedRename,
             LocalPublicationStage::Rename => prepared_publication_test_hooks::Stage::Rename,
             LocalPublicationStage::Remove => prepared_publication_test_hooks::Stage::Remove,
+            LocalPublicationStage::NativeReadOpen => prepared_publication_test_hooks::Stage::NativeReadOpen,
             LocalPublicationStage::MetadataReadAfterOpen => prepared_publication_test_hooks::Stage::MetadataReadAfterOpen,
             LocalPublicationStage::MetadataReadAfterRead => prepared_publication_test_hooks::Stage::MetadataReadAfterRead,
         };
@@ -758,7 +783,7 @@ fn set_file_fdatasync_group_commit_wait_for_test(wait_micros: u64) {
     file_fdatasync_group_commit_override::set_wait_micros(wait_micros);
 }
 
-fn file_fdatasync_group_commit_enabled() -> bool {
+pub(crate) fn file_fdatasync_group_commit_enabled() -> bool {
     #[cfg(test)]
     if let Some(enabled) = file_fdatasync_group_commit_override::get() {
         return enabled;
@@ -859,13 +884,13 @@ impl OpenedDstDirFsyncGroup {
 
 struct DstDirFsyncWaiter {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     result_tx: oneshot::Sender<SharedDstDirFsyncResult>,
 }
 
 struct DstDirFsyncOwner {
     _namespace: Option<Arc<dyn Send + Sync>>,
-    _resource: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    _resource: Option<super::io_admission::ResourceIoUnit>,
 }
 
 #[derive(Clone)]
@@ -1307,7 +1332,7 @@ type FileFdatasyncGroupKey = (usize, bool);
 
 struct FileFdatasyncWaiter {
     files: Vec<PathBuf>,
-    resource_unit: Option<rustfs_concurrency::adaptive::AdaptivePermit>,
+    resource_unit: Option<super::io_admission::ResourceIoUnit>,
     enqueued_at: Option<Instant>,
     wait_role: &'static str,
     result_tx: oneshot::Sender<SharedFileFdatasyncResult>,
@@ -2392,6 +2417,10 @@ pub(crate) mod file_sync_probe {
         configure(root, None, false)
     }
 
+    pub(crate) fn is_active() -> bool {
+        !ROOTS.read().expect("file sync probe lock poisoned").is_empty()
+    }
+
     pub(super) fn set_failing(root: &Path) -> ProbeGuard {
         configure(root, Some(1), false)
     }
@@ -2553,18 +2582,25 @@ fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
 
 /// Fdatasync every regular file directly inside `dir`, then fsync the directory
 /// itself.
-#[allow(
-    dead_code,
-    reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+#[cfg_attr(
+    not(target_os = "linux"),
+    allow(
+        dead_code,
+        reason = "reached only through sync_dir_files, whose callers are tests (backlog#1823)"
+    )
 )]
 pub fn sync_dir_files_std(dir: impl AsRef<Path>) -> io::Result<()> {
-    for entry in std::fs::read_dir(dir.as_ref())? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            sync_file(&entry.path())?;
-        }
-    }
-    fsync_dir_std(dir)
+    let dir = dir.as_ref();
+    let files = regular_files(dir)?;
+    rustfs_io_metrics::record_put_rename_fdatasync_batch(rustfs_io_metrics::PUT_RENAME_FDATASYNC_BATCH_MODE_SERIAL, files.len());
+    sync_files(&files)?;
+    let fsync_started = rustfs_io_metrics::put_stage_timer();
+    let result = fsync_dir_std(dir);
+    rustfs_io_metrics::record_put_object_stage_duration_from(
+        rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_SRC_DIR_FSYNC,
+        fsync_started,
+    );
+    result
 }
 
 /// Async wrapper around [`sync_dir_files_std`]. Large directories flush files
@@ -3805,6 +3841,23 @@ pub(crate) async fn rename_all_with_prepared_source(
     })
     .await
     .map_err(to_file_error)?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn rename_all_with_commit_guard_on_thread(source: &Path, destination: &Path, guard: &RenameCommitGuard) -> Result<()> {
+    guard.directories.prepare_destination().map_err(to_file_error)?;
+    #[cfg(test)]
+    prepared_publication_test_hooks::run_rename_destination(source, destination);
+    #[cfg(any(test, feature = "test-util"))]
+    {
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
+        prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
+    }
+    #[cfg(test)]
+    multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::Rename, destination)
+        .map_err(to_file_error)?;
+    guard.directories.rename(source, destination, None).map_err(to_file_error)?;
     Ok(())
 }
 
@@ -6483,6 +6536,7 @@ pub(crate) fn sync_multipart_owned_record_parents(
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
         }
+        #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
         #[cfg(unix)]
         {
@@ -11100,54 +11154,71 @@ mod tests {
 
     #[tokio::test]
     async fn resource_native_dispatch_retains_each_unit_after_caller_cancellation() {
-        use crate::disk::io_admission::with_background_resource_unit;
-        use rustfs_concurrency::adaptive::AdaptiveAdmission;
-        use std::num::NonZeroU16;
+        use crate::disk::io_admission::{test_resource_units, with_optional_resource_unit};
 
         let mut retained = Vec::new();
-        for lane in [None, Some(DiskBlockingLane::Foreground), Some(DiskBlockingLane::Fsync)] {
-            let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
-            let unit = gate.acquire().await;
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let (finished_tx, finished_rx) = oneshot::channel();
-            let worker = tokio::spawn(with_background_resource_unit(unit, async move {
-                let operation = move || {
-                    started_tx.send(()).expect("native operation entered");
-                    let _ = release_rx.blocking_recv();
-                    let _ = finished_tx.send(());
-                    Ok(())
-                };
-                match lane {
-                    Some(lane) => {
-                        DiskBlockingQueue::new()
-                            .run_on_lane(
-                                lane,
-                                "native operation failed",
-                                DiskBlockingQueue::test_stages_for_lane(lane),
-                                move |_| operation(),
-                            )
-                            .await
+        for physical_count in [1, 2] {
+            for lane in [
+                None,
+                Some(DiskBlockingLane::Foreground),
+                Some(DiskBlockingLane::Isolated),
+                Some(DiskBlockingLane::Fsync),
+            ] {
+                let (unit, gates) = test_resource_units(physical_count);
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let (finished_tx, finished_rx) = oneshot::channel();
+                let worker = tokio::spawn(with_optional_resource_unit(Some(unit), async move {
+                    let operation = move || {
+                        started_tx.send(()).expect("native operation entered");
+                        let _ = release_rx.blocking_recv();
+                        let _ = finished_tx.send(());
+                        Ok(())
+                    };
+                    match lane {
+                        Some(lane) => {
+                            DiskBlockingQueue::new()
+                                .run_on_lane(
+                                    lane,
+                                    "native operation failed",
+                                    DiskBlockingQueue::test_stages_for_lane(lane),
+                                    move |_| operation(),
+                                )
+                                .await
+                        }
+                        None => fsync_spawn_blocking(operation).await.expect("native operation joined"),
                     }
-                    None => fsync_spawn_blocking(operation).await.expect("native operation joined"),
-                }
-            }));
-            started_rx.await.expect("native operation started");
-            worker.abort();
-            assert!(worker.await.expect_err("caller cancelled").is_cancelled());
-            retained.push(gate.snapshot().active);
-            // Drain native work before assertions, including in the negative control.
-            release_tx.send(()).expect("release native operation");
-            finished_rx.await.expect("native operation finished");
-            tokio::time::timeout(Duration::from_secs(1), async {
-                while gate.snapshot().active != 0 {
-                    tokio::task::yield_now().await;
-                }
-            })
-            .await
-            .expect("native completion returns the unit");
+                }));
+                started_rx.await.expect("native operation started");
+                worker.abort();
+                assert!(worker.await.expect_err("caller cancelled").is_cancelled());
+                retained.push(gates.iter().map(|gate| gate.snapshot().active).collect::<Vec<_>>());
+                // Drain native work before assertions, including in the negative control.
+                release_tx.send(()).expect("release native operation");
+                finished_rx.await.expect("native operation finished");
+                tokio::time::timeout(Duration::from_secs(1), async {
+                    while gates.iter().any(|gate| gate.snapshot().active != 0) {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .expect("native completion returns the unit");
+            }
         }
-        assert_eq!(retained, [1, 1, 1], "fsync and both queue lanes must retain their own producer's unit");
+        assert_eq!(
+            retained,
+            [
+                vec![1],
+                vec![1],
+                vec![1],
+                vec![1],
+                vec![1, 1],
+                vec![1, 1],
+                vec![1, 1],
+                vec![1, 1]
+            ],
+            "native dispatch and all queue lanes must retain their own producer's units"
+        );
     }
 
     #[tokio::test]

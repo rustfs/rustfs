@@ -145,9 +145,11 @@ pub(super) fn skipped(identity: Option<HealObjectIdentity>, reason: &str) -> Opt
     identity.map(|identity| {
         (
             CanonicalObjectOutcome {
+                deep_check_observed: false,
                 identity,
                 disposition: HealObjectDisposition::Unknown,
                 detail: Some(reason.to_owned()),
+                quorum_selected_data_dir: None,
             },
             0,
         )
@@ -249,9 +251,11 @@ pub(super) async fn heal_object(
             (size, legacy),
             Some((
                 CanonicalObjectOutcome {
+                    deep_check_observed: false,
                     identity,
                     disposition,
                     detail,
+                    quorum_selected_data_dir: None,
                 },
                 failures,
             )),

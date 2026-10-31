@@ -12,7 +12,7 @@ enum DirectoryOrder {
     FailOpen(std::io::ErrorKind),
 }
 
-pub(in crate::scanner_folder) type OrderedEntries = VecDeque<std::io::Result<tokio::fs::DirEntry>>;
+pub(in crate::scanner_folder) type OrderedEntries = VecDeque<std::io::Result<native_io::DirEntry>>;
 static ORDERED_DIRECTORIES: LazyLock<Mutex<HashMap<String, DirectoryOrder>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
 struct OrderedDirectory(String);
@@ -52,7 +52,7 @@ impl Drop for OrderedDirectory {
 
 pub(in crate::scanner_folder) async fn ordered_entries(
     path: &str,
-    reader: &mut tokio::fs::ReadDir,
+    reader: &mut native_io::ReadDir,
 ) -> std::io::Result<Option<OrderedEntries>> {
     let order = ORDERED_DIRECTORIES
         .lock()

@@ -15,6 +15,7 @@
 pub mod access;
 pub mod concurrency;
 pub mod deadlock_detector;
+pub(crate) mod denial_audit;
 pub mod ecfs;
 pub(crate) mod helper;
 pub mod options;

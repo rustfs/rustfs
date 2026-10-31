@@ -73,7 +73,7 @@ def partition(listing, junit, protected, count=2):
             durations[key] = seconds
     require(set(durations) == expected, "duration baseline does not cover the selected tests")
     binaries = {binary for binary, _ in expected}
-    require(all(re.fullmatch(r"[A-Za-z0-9_.:-]+", binary) for binary in binaries), "unsupported binary ID")
+    require(all(re.fullmatch(r"[A-Za-z0-9_./:-]+", binary) for binary in binaries), "unsupported binary ID")
     reserved = {binary for binary, _ in protected}
     components = [reserved] if reserved else []
     components += [{binary} for binary in sorted(binaries - reserved)]
@@ -130,7 +130,7 @@ def load_plan(directory):
     protected = set(plan["protected_binaries"])
     require(protected <= expected and any(protected <= set(shard["binaries"]) for shard in shards), "split resource component")
     for shard in shards:
-        require(shard["binaries"] and all(re.fullmatch(r"[A-Za-z0-9_.:-]+", name) for name in shard["binaries"]), "invalid shard binary")
+        require(shard["binaries"] and all(re.fullmatch(r"[A-Za-z0-9_./:-]+", name) for name in shard["binaries"]), "invalid shard binary")
         require(shard["filter"] == " or ".join(f"binary_id(={name})" for name in shard["binaries"]), "shard filter mismatch")
     return plan, listing
 

@@ -57,6 +57,7 @@ async fn run_cycle(store: &Arc<ECStore>, cycle: u64, options: CycleOptions) -> (
                 service_cohort: None,
                 resolved_scope_observer: options.resolved_scope_observer,
                 post_walk_gate: None,
+                peer_observations: None,
             },
         ),
     )

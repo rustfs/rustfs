@@ -140,6 +140,7 @@ async fn scan_plan(set: &Arc<SetDisks>, names: &[&str], cycle: u64) -> ScannerBu
         ),
         dirty_usage_buckets: Arc::new(dirty_usage_buckets_for_tests()),
         bucket_failures: ScannerBucketFailureState::default(),
+        bucket_completions: None,
         pending_maintenance_work: Arc::new(AtomicBool::new(false)),
         cache_cycle_floor: Arc::new(AtomicU64::new(cycle)),
         cold_zero_walk_reuse_observed: Arc::new(AtomicBool::new(false)),

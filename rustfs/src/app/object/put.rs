@@ -1734,7 +1734,9 @@ impl DefaultObjectUsecase {
         // replication), the lookup is skipped and accounting is backfilled from
         // the dst xl.meta that rename_data already reads, saving a full-disk
         // metadata fanout per PUT.
-        let prelookup_required = version_id.is_some() || object_lock_checks_required_for_state(&object_lock_config_state);
+        let prelookup_required = version_id.is_some()
+            || (!super::shared::put_like_write_creates_new_version(&opts)
+                && object_lock_checks_required_for_state(&object_lock_config_state));
         #[cfg(test)]
         let prelookup_required = prelookup_required || injected_put_storage_failure(PutStorageTestStage::Prelookup).is_some();
         // Outer None = prelookup skipped (accounting comes from the commit

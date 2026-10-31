@@ -1700,6 +1700,15 @@ mod tests {
         );
 
         let mut cluster = RustFSTestClusterEnvironment::with_topology(topology.cluster_topology()).await?;
+        let bucket = "heal-restart-during-rebuild";
+        let mrf_fallback_scope = if !background_enabled {
+            let path = PathBuf::from(&cluster.temp_dir).join("skip-outage-mrf-fallback");
+            std::fs::write(&path, format!("{bucket}/cluster/written-while-node-down-"))?;
+            cluster.set_env("RUSTFS_E2E_SKIP_MRF_FALLBACK_PATH", path.to_string_lossy().into_owned());
+            Some(path)
+        } else {
+            None
+        };
         cluster.set_env("RUSTFS_UNSAFE_BYPASS_DISK_CHECK", "true");
         cluster.set_env("RUSTFS_HEAL_ENABLED", "true");
         if let Some(storage_class) = evidence_case.and_then(|case| case.storage_class_standard) {
@@ -1952,6 +1961,21 @@ mod tests {
             }
         };
 
+        if let Some(path) = &mrf_fallback_scope {
+            let observed = path.with_extension("observed");
+            let expected = format!("{bucket}/{outage_key}");
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if tokio::fs::read_to_string(&observed).await.ok().as_deref() == Some(expected.as_str()) {
+                    break;
+                }
+                if Instant::now() >= deadline {
+                    return Err("outage repair did not reach the isolated best-effort fallback before target rejoin".into());
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        }
+
         assert!(
             !outage_target_manifest_required
                 || target_set_peer_drives
@@ -2045,7 +2069,12 @@ mod tests {
             } else {
                 cluster_heal_is_idle(&recovered)
             };
-            if ready {
+            let pool_ready = if ready && background_enabled && !outage_write_deferred_until_rejoin {
+                all_nodes_pool_metadata_readiness(&cluster, recovery_deadline).await.0
+            } else {
+                true
+            };
+            if ready && pool_ready {
                 break;
             }
             if Instant::now() >= recovery_deadline {
@@ -2540,6 +2569,10 @@ mod tests {
                 outage_census.erasure_index,
                 "the outage object must be rebuilt into the selected replacement drive's erasure-set slot"
             );
+        }
+
+        if let Some(path) = &mrf_fallback_scope {
+            std::fs::remove_file(path)?;
         }
 
         if let Some(cycle_end) = scanner_cycle_floor {

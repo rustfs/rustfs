@@ -21,8 +21,10 @@ use rustfs_lock::NamespaceLockWrapper;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Notify;
 
+pub(crate) use rustfs_ecstore::spawn_blocking_with_resource_ownership as ecstore_spawn_blocking_with_resource_ownership;
 pub(crate) use rustfs_ecstore::with_background_disk_io as ecstore_with_background_disk_io;
-#[cfg(all(test, unix))]
+pub(crate) use rustfs_ecstore::with_background_resource_set as ecstore_with_background_resource_set;
+#[cfg(test)]
 pub(crate) use rustfs_ecstore::with_background_resource_unit as ecstore_with_background_resource_unit;
 
 pub(crate) use s3s::dto::{
@@ -116,8 +118,10 @@ pub(crate) use rustfs_ecstore::api::layout::{
     EndpointServerPools as EcstoreEndpointServerPools, Endpoints as EcstoreEndpoints, PoolEndpoints as EcstorePoolEndpoints,
     SetupType as EcstoreSetupType,
 };
-pub(crate) use rustfs_ecstore::api::notification::NotificationSys as EcstoreNotificationSys;
 pub(crate) use rustfs_ecstore::api::notification::scanner_peer_transport_error_message_is_retryable;
+pub(crate) use rustfs_ecstore::api::notification::{
+    NotificationSys as EcstoreNotificationSys, ScannerPublicationLeaseGrant as EcstoreScannerPublicationLeaseGrant,
+};
 pub(crate) use rustfs_ecstore::api::object::{
     SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitState,
 };
@@ -126,13 +130,15 @@ pub(crate) use rustfs_ecstore::api::rebalance::{
     RebalStatus as EcstoreRebalStatus, RebalanceInfo as EcstoreRebalanceInfo, RebalanceMeta as EcstoreRebalanceMeta,
     RebalanceStats as EcstoreRebalanceStats,
 };
-#[cfg(test)]
-pub(crate) use rustfs_ecstore::api::rpc::ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket;
 pub(crate) use rustfs_ecstore::api::rpc::{
     ScannerBucketListing as EcstoreScannerBucketListing,
     ScannerDirtyUsageAcknowledgement as EcstoreScannerDirtyUsageAcknowledgement,
     ScannerPeerDirtyUsageSnapshot as EcstoreScannerPeerDirtyUsageSnapshot,
     ScannerScopedDirtyUsageAckEntry as EcstoreScannerScopedDirtyUsageAckEntry,
+};
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::rpc::{
+    ScannerPeerDirtyUsageBucket as EcstoreScannerPeerDirtyUsageBucket, ScannerPublicationLease as EcstoreScannerPublicationLease,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::runtime::InstanceContext as EcstoreInstanceContext;
@@ -174,6 +180,9 @@ pub(crate) mod owner {
     #[cfg(test)]
     pub(crate) use super::ecstore_set_object_store_resolver;
     #[cfg(test)]
+    pub(crate) use super::ecstore_spawn_blocking_with_resource_ownership;
+    pub(crate) use super::ecstore_with_background_resource_set;
+    #[cfg(test)]
     pub(crate) use super::storage_contracts::DiskSetSelector;
     #[cfg(all(test, unix))]
     pub(crate) use super::{
@@ -186,6 +195,10 @@ pub(crate) mod owner {
     };
     #[cfg(test)]
     pub(crate) use super::{NativeScannerPauseBacklogWriteFault, SourceCleanupDeleteBarrier};
+    pub(crate) use rustfs_ecstore::api::disk::{
+        BackgroundEncodeBuffer as EcstoreBackgroundEncodeBuffer, BackgroundMemoryBudget as EcstoreBackgroundMemoryBudget,
+        PhysicalDiskBinding, PhysicalDiskPlan,
+    };
 
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::object::{WriteCommitGuard, WriteCompletion};
@@ -379,6 +392,11 @@ pub(crate) mod scan {
         SCANNER_ACTIVITY_PROTOCOL_VERSION, SCANNER_ACTIVITY_V6_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_MAX_ENTRIES,
         SCANNER_DIRTY_USAGE_SNAPSHOT_PROTOCOL_VERSION, SCANNER_DIRTY_USAGE_SNAPSHOT_RPC_MAX_MESSAGE_SIZE,
         SCANNER_SCOPED_DIRTY_USAGE_ACK_MAX_ENTRIES,
+    };
+    #[cfg(test)]
+    pub(crate) use super::{
+        EcstoreScannerPeerDirtyUsageBucket, EcstoreScannerPeerDirtyUsageSnapshot, EcstoreScannerPublicationLease,
+        EcstoreScannerPublicationLeaseGrant,
     };
 }
 

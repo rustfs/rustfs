@@ -57,8 +57,6 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
-# Match the streaming inference's field order in Arrow's JSON reference.
-serde_json = { workspace = true, features = ["preserve_order"] }
 
 [lib]
 doctest = false

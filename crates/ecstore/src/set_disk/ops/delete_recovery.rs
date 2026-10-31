@@ -97,6 +97,14 @@ pub(crate) mod test_hooks {
             .push((bucket.to_owned(), object.to_owned(), hook));
     }
 
+    pub(super) fn has_before_gc_finalize(bucket: &str, object: &str) -> bool {
+        BEFORE_GC_FINALIZE
+            .lock()
+            .expect("GC finalize hooks")
+            .iter()
+            .any(|(hook_bucket, hook_object, _)| hook_bucket == bucket && hook_object == object)
+    }
+
     pub(super) async fn run_before_gc_finalize(bucket: &str, object: &str) {
         let hook = {
             let mut hooks = BEFORE_GC_FINALIZE.lock().expect("GC finalize hooks");
@@ -418,6 +426,59 @@ impl SetDisks {
             .unwrap_or_else(|| self.ctx.begin_namespace_commit());
         context.namespace_owner = Some(Arc::new((owner, Arc::clone(&transaction_guard))));
         let can_commit = context.can_commit;
+        let can_try_local_fast_path = disks.len() == self.set_drive_count
+            && disks.iter().all(|d| d.as_ref().is_some_and(|d| d.is_local()))
+            && !crate::disk::local::has_delete_version_test_failpoints()
+            && {
+                #[cfg(test)]
+                {
+                    !test_hooks::has_before_gc_finalize(bucket, object)
+                }
+                #[cfg(not(test))]
+                {
+                    true
+                }
+            };
+        if can_try_local_fast_path && can_commit() {
+            let fast_published = join_all(disks.iter().map(|disk| async {
+                if !can_commit() {
+                    return Err(DiskError::other("delete recovery namespace fence was lost"));
+                }
+                let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+                disk.try_publish_prepared_delete_local(bucket, object, transaction, context.namespace_owner.clone())
+                    .await
+            }))
+            .await;
+            let all_fast_published = fast_published.len() == self.set_drive_count
+                && fast_published.iter().all(|res| matches!(res, Ok(Some((_, true, true)))));
+            if all_fast_published && can_commit() {
+                #[cfg(test)]
+                test_hooks::record_cleanup_attempt(bucket, object);
+                let finalized = join_all(disks.iter().zip(fast_published.iter()).map(|(disk, pub_res)| {
+                    let ns_owner = context.namespace_owner.clone();
+                    async move {
+                        if !can_commit() {
+                            return Ok(false);
+                        }
+                        let Some(disk) = disk.as_ref() else {
+                            return Ok(false);
+                        };
+                        let Ok(Some((journal, _, _))) = pub_res else {
+                            return Ok(false);
+                        };
+                        disk.try_finish_and_finalize_prepared_delete_local(bucket, object, transaction, journal, ns_owner)
+                            .await
+                    }
+                }))
+                .await;
+                if finalized.iter().all(|res| matches!(res, Ok(true))) {
+                    if let Some(ticket) = context.recovery_ticket.as_ref() {
+                        self.ctx.delete_recovery_hints().ack(ticket);
+                    }
+                    return Ok(());
+                }
+            }
+        }
         let states = inspect(disks, bucket, object, transaction).await;
         let untouched_absence = |state: &Result<DeleteRecoveryInspection>| matches!(state, Ok(state) if state.state == DeleteRecoveryState::Absent && state.current_digest.is_none());
         if states.iter().filter(|state| untouched_absence(state)).count() >= write_quorum

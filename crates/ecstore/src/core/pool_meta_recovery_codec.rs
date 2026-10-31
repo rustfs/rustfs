@@ -391,7 +391,7 @@ pub(super) async fn fixture_inline_pool_meta_replicas(payload: &[u8], modified: 
         writer.shutdown().await.expect("fixture bitrot writer should finish");
         let mut info = base.clone();
         info.erasure.index = *coding_index;
-        info.data = Some(Bytes::from(writer.into_inline_data().expect("fixture writer should retain inline bytes")));
+        info.data = Some(writer.into_inline_data().expect("fixture writer should retain inline bytes"));
         let mut meta = FileMeta::new();
         meta.add_version(info).expect("test inline FileInfo should serialize");
         raw.push(Bytes::from(meta.marshal_msg().expect("test xl.meta should serialize")));

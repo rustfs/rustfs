@@ -99,6 +99,9 @@ impl ECStore {
         fi: FileInfo,
         expected: Uuid,
     ) -> DiskResult<()> {
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
+        }
         let disk_ref = disk_ref.to_owned();
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
@@ -117,6 +120,9 @@ impl ECStore {
         opts: DeleteOptions,
         expected: Uuid,
     ) -> DiskResult<()> {
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
+        }
         let disk_ref = disk_ref.to_owned();
         let path = target.1.to_owned();
         self.run_bucket_heal_at_incarnation(target.0, expected, &Default::default(), move |store, volume, _| async move {
@@ -143,6 +149,9 @@ impl ECStore {
     ) -> DiskResult<()> {
         if expected.is_nil() || opts.undo_write || self.ctx.lock_manager().is_disabled() {
             return Err(DiskError::other("invalid incarnation-bound heal deletion"));
+        }
+        if crate::disk::remote_io_admission::active() {
+            local_disk_candidate(&self.ctx, disk_ref).await?;
         }
         let fence = Arc::new(
             self.acquire_bucket_incarnation_fence(target.0, expected)
@@ -300,7 +309,9 @@ impl ECStore {
 // The optional ID is a cold lookup to cache only after final admission.
 async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> DiskResult<(DiskStore, Option<Uuid>)> {
     let map = ctx.local_disk_map();
-    if let Some(disk) = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned() {
+    let path_disk = map.read().await.get(disk_ref).and_then(Option::as_ref).cloned();
+    if let Some(disk) = path_disk {
+        admit_rpc_disk(&disk)?;
         return Ok((disk, None));
     }
     let disk_id = Uuid::parse_str(disk_ref).map_err(|_| DiskError::DiskNotFound)?;
@@ -309,10 +320,15 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
         let cached_disk = map.read().await.get(&path).and_then(Option::as_ref).cloned();
         if let Some(disk) = cached_disk
             && matches!(disk.as_ref(), Disk::Local(_))
-            && disk.get_disk_id().await? == Some(disk_id)
         {
-            return Ok((disk, None));
+            admit_rpc_disk(&disk)?;
+            if disk.get_disk_id().await? == Some(disk_id) {
+                return Ok((disk, None));
+            }
         }
+    }
+    if crate::disk::remote_io_admission::active() {
+        return Err(DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)));
     }
     let disks: Vec<_> = map.read().await.values().filter_map(Clone::clone).collect();
     // Disk identity may perform format I/O. No registry guard spans this await.
@@ -322,6 +338,17 @@ async fn local_disk_candidate(ctx: &Arc<InstanceContext>, disk_ref: &str) -> Dis
         }
     }
     Err(DiskError::DiskNotFound)
+}
+
+fn admit_rpc_disk(disk: &DiskStore) -> DiskResult<()> {
+    use crate::disk::remote_io_admission;
+    if remote_io_admission::active() {
+        let binding = disk
+            .physical_admission()
+            .ok_or_else(|| DiskError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)))?;
+        remote_io_admission::admit(&binding).map_err(DiskError::Io)?;
+    }
+    Ok(())
 }
 
 async fn admit_local_disk(
@@ -481,6 +508,18 @@ pub async fn find_local_disk_by_ref(disk_ref: &str) -> Option<DiskStore> {
     }
 
     None
+}
+
+/// Resolve and admit an authenticated RPC's target before its storage locks.
+/// Unknown UUID mappings defer background work instead of probing unrelated disks.
+pub async fn find_local_disk_by_ref_for_rpc(disk_ref: &str) -> DiskResult<Option<DiskStore>> {
+    use crate::disk::remote_io_admission;
+
+    if !remote_io_admission::active() {
+        return Ok(find_local_disk_by_ref(disk_ref).await);
+    }
+    let (disk, _) = local_disk_candidate(&crate::runtime::global::current_ctx(), disk_ref).await?;
+    Ok(Some(disk))
 }
 
 pub async fn all_local_disk_path() -> Vec<String> {
@@ -841,6 +880,92 @@ mod tests {
             assert!(!ctx.namespace_commits_pending());
             assert_eq!(ctx.namespace_commit_generation(), 0);
         }
+    }
+
+    #[tokio::test]
+    async fn remote_background_target_lookup_defers_before_io_and_reuses_multi_phase_admission() {
+        use crate::disk::{RemoteBackgroundIo, with_remote_background_io};
+        use rustfs_concurrency::adaptive::{
+            AdaptiveAdmission, FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure,
+        };
+        use std::num::NonZeroU16;
+
+        let ctx = Arc::new(InstanceContext::new());
+        let root = tempfile::tempdir().expect("target directory");
+        let id = Uuid::new_v4();
+        let disk = target_disk(&ctx, root.path(), id).await;
+        disk.make_volume("bucket").await.expect("fixture volume");
+        let gate = AdaptiveAdmission::new(NonZeroU16::MIN, 0);
+        disk.physical_admission()
+            .expect("local binding")
+            .set_test_capacity(vec![gate.clone()])
+            .expect("physical device");
+        let node = NodeAdmission::new(NonZeroU16::MIN);
+        node.update(
+            &mut FeedbackController::new(),
+            Some(FeedbackObservation {
+                generation: 1,
+                max_concurrency: 1,
+                pressure: ResourcePressure::Unknown,
+                completed_units: None,
+            }),
+        );
+        let path = disk.endpoint().to_string();
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            assert!(
+                matches!(disk.read_all("bucket", "object").await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "no implicit target admission"
+            );
+            assert!(
+                matches!(local_disk_candidate(&ctx, &path).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "closed receiver capacity"
+            );
+            gate.set_limit(1);
+            assert!(
+                matches!(local_disk_candidate(&ctx, &id.to_string()).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "cold UUID cannot probe unrelated disks"
+            );
+            assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+            let (selected, _) = local_disk_candidate(&ctx, &path).await.expect("select known local path");
+            assert!(Arc::ptr_eq(&selected, &disk));
+            for body in [b"first phase".as_slice(), b"second phase".as_slice()] {
+                disk.write_all("bucket", "object", bytes::Bytes::copy_from_slice(body))
+                    .await
+                    .expect("write phase");
+                let (again, _) = local_disk_candidate(&ctx, &path)
+                    .await
+                    .expect("repeat target resolution at capacity one");
+                assert_eq!(again.read_all("bucket", "object").await.expect("read phase").as_ref(), body);
+                assert_eq!([node.snapshot().active, gate.snapshot().active], [1, 1]);
+            }
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!([node.completed(), gate.completed()], [Some(1), Some(1)]);
+        assert!(record_local_disk_id_if_active(&ctx, &disk, id).await);
+        let replacement = target_disk(&ctx, root.path(), Uuid::new_v4()).await;
+        replacement
+            .physical_admission()
+            .expect("replacement binding")
+            .set_test_capacity(vec![gate.clone()])
+            .expect("replacement device");
+        with_remote_background_io(Some(RemoteBackgroundIo::new(node.clone())), async {
+            assert!(
+                matches!(local_disk_candidate(&ctx, &id.to_string()).await,
+                Err(DiskError::Io(error)) if error.kind() == std::io::ErrorKind::WouldBlock),
+                "stale UUID must not resolve replacement data"
+            );
+        })
+        .await;
+        assert_eq!([node.snapshot().active, gate.snapshot().active], [0, 0]);
+        assert_eq!(
+            [node.completed(), gate.completed()],
+            [Some(1), Some(1)],
+            "identity checks alone are not work completion"
+        );
     }
 
     #[tokio::test]

@@ -5,12 +5,11 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime
 from decimal import Decimal
 import hashlib
 import json
 from pathlib import Path
-import shutil
 import sys
 from typing import Any
 
@@ -18,8 +17,8 @@ from scanner_abba import (
     LEGS,
     MIN_MEASURED_RELEASE_DURATION_SECONDS,
     RELEASE_PROFILE_ARTIFACTS,
-    RELEASE_SCHEDULER_BOUNDS,
     SCENARIOS,
+    measured_provenance_verified,
     validate_release_evidence_manifest,
 )
 
@@ -27,7 +26,10 @@ MAX_JSON_BYTES = 1024 * 1024
 CACHE_COST_PREFIX = "CACHE_COST "
 PASS_STATES = {"pass"}
 FAIL_STATES = {"fail", "failed"}
-RELEASE_DESCRIPTOR_GATES = ("G10", "P1", "P3")
+REPORT_STATES = PASS_STATES | FAIL_STATES | {"inconclusive", "incomplete", "pending", "synthetic_validated", "unknown"}
+PERFORMANCE_STATES = PASS_STATES | FAIL_STATES | {"inconclusive", "pending", "unknown"}
+EVIDENCE_TYPES = {"measured", "synthetic", "diagnostic"}
+OBSERVATION_STATES = {"observed", "no_measured_benefit", "rss_regression", "pending", "inconclusive", "not_applicable", "unknown"}
 
 
 def require(condition: bool, message: str) -> None:
@@ -42,6 +44,15 @@ def read_json(path: Path) -> dict[str, Any]:
         value = json.load(stream)
     require(isinstance(value, dict), f"expected JSON object: {path}")
     return value
+
+
+def read_json_snapshot(path: Path) -> tuple[dict[str, Any], str]:
+    with path.open("rb") as stream:
+        data = stream.read(MAX_JSON_BYTES + 1)
+    require(len(data) <= MAX_JSON_BYTES, "oversized JSON artifact")
+    value = json.loads(data)
+    require(isinstance(value, dict), "expected JSON object")
+    return value, hashlib.sha256(data).hexdigest()
 
 
 def write_json(path: Path, value: dict[str, Any]) -> None:
@@ -61,13 +72,43 @@ def digest(path: Path) -> str:
 
 def number(value: Any, name: str) -> Decimal:
     require(type(value) in (float, int), f"invalid numeric field: {name}")
-    return Decimal(str(value))
+    result = Decimal(str(value))
+    require(result.is_finite(), f"invalid numeric field: {name}")
+    return result
 
 
 def maybe_number(value: Any, name: str) -> Decimal | None:
     if value is None:
         return None
     return number(value, name)
+
+
+def safe_observed_number(value: Any) -> int | float | None:
+    if type(value) not in (int, float) or not Decimal(str(value)).is_finite():
+        return None
+    return value
+
+
+def safe_count(value: Any) -> int | None:
+    return value if type(value) is int and value >= 0 else None
+
+
+def safe_observation_state(value: Any) -> str:
+    return value if isinstance(value, str) and value in OBSERVATION_STATES else "unknown"
+
+
+def safe_hex(value: Any, length: int) -> str | None:
+    return value if isinstance(value, str) and len(value) == length and all(c in "0123456789abcdef" for c in value) else None
+
+
+def safe_timestamp(value: Any) -> str | None:
+    if not isinstance(value, str) or len(value) > 64:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return value if parsed.tzinfo is not None else None
 
 
 def pct(value: Decimal | None) -> str:
@@ -94,13 +135,6 @@ def require_integer(value: Any, name: str, minimum: int = 0) -> int:
     return value
 
 
-def timestamp(value: Any, name: str) -> str:
-    require(isinstance(value, str) and value.strip(), f"missing timestamp: {name}")
-    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
-    require(parsed.tzinfo is not None, f"timestamp must include timezone: {name}")
-    return parsed.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
-
-
 def require_metric_series(value: Any, name: str, minimum: Decimal | None = None,
                           maximum: Decimal | None = None) -> list[Decimal | None]:
     require(isinstance(value, list) and value, f"missing performance evidence field: {name}")
@@ -116,6 +150,16 @@ def require_metric_series(value: Any, name: str, minimum: Decimal | None = None,
 
 
 def require_measured_comparison_evidence(comparison: dict[str, Any], index: int) -> None:
+    percentiles = comparison.get("foreground_percentiles_ms_by_leg")
+    require(isinstance(percentiles, dict) and set(percentiles) == set(LEGS),
+            f"comparison {index} missing foreground percentiles by leg")
+    for leg in LEGS:
+        row = percentiles[leg]
+        require(isinstance(row, dict), f"comparison {index} invalid {leg} foreground percentiles")
+        p95 = number(row.get("p95"), f"comparison {index} {leg} foreground percentiles p95")
+        p99 = number(row.get("p99"), f"comparison {index} {leg} foreground percentiles p99")
+        require(p95.is_finite() and p99.is_finite() and p95 >= 0 and p99 > 0 and p95 <= p99,
+                f"comparison {index} invalid {leg} foreground percentiles")
     w10_w11 = comparison.get("w10_w11")
     require(isinstance(w10_w11, dict), f"comparison {index} missing W10/W11 evidence")
     pressure = require_metric_series(
@@ -243,12 +287,16 @@ def has_complete_abba_matrix(manifest: dict[str, Any], report: dict[str, Any], c
 def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     manifest_path = abba_dir / "manifest.json"
     report_path = abba_dir / "report.json"
-    manifest = read_json(manifest_path)
-    report = read_json(report_path)
+    manifest, manifest_sha256 = read_json_snapshot(manifest_path)
+    report, report_sha256 = read_json_snapshot(report_path)
     report_state = report.get("status")
     performance_state = report.get("performance")
     require(isinstance(report_state, str) and report_state, "report.status missing")
     require(isinstance(performance_state, str) and performance_state, "report.performance missing")
+    report_state = report_state if report_state in REPORT_STATES else "unknown"
+    performance_state = performance_state if performance_state in PERFORMANCE_STATES else "unknown"
+    evidence_type = report.get("evidence")
+    evidence_type = evidence_type if isinstance(evidence_type, str) and evidence_type in EVIDENCE_TYPES else "unknown"
     comparisons = report.get("comparisons")
     if comparisons is None:
         require(report_state not in PASS_STATES, "passing report requires comparisons")
@@ -261,6 +309,7 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     throughput_losses: list[Decimal] = []
     p1_rows = []
     p2_values: list[Decimal | None] = []
+    p2_complete = matrix_complete
     foreground_p95_values: list[Decimal | None] = []
     foreground_p99_values: list[Decimal | None] = []
     throughput_values: list[Decimal | None] = []
@@ -269,17 +318,20 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
     pressure_high_samples = 0
     pressure_samples_complete = matrix_complete
     pressure_high_samples_complete = matrix_complete
-    attempt_cost_samples = 0
+    attempt_cost_ratio_count = 0
+    attempt_cost_ratios_complete = matrix_complete
     start_p95_values: list[Decimal | None] = []
     duplicate_task_values: list[Decimal | None] = []
     lock_hold_values: list[Decimal | None] = []
+    w09_complete = {field: matrix_complete for field in
+                    ("heal_start_p95_ms", "heal_duplicate_task_count", "heal_lock_hold_p95_ms")}
     w10_rows = []
     w11_rows = []
     for index, comparison in enumerate(comparisons):
         require(isinstance(comparison, dict), f"comparison {index} must be an object")
         state = comparison.get("status")
         require(isinstance(state, str) and state, f"comparison {index} missing status")
-        counts[state] += 1
+        counts[state if state in REPORT_STATES else "unknown"] += 1
         p99_regressions.append(number(comparison.get("p99_regression"), f"comparison {index} p99_regression"))
         throughput_change = number(comparison.get("throughput_change"), f"comparison {index} throughput_change")
         throughput_losses.append(max(Decimal("0"), -throughput_change))
@@ -288,31 +340,37 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
         p1 = comparison.get("p1")
         if isinstance(p1, dict):
             p1_rows.append({
-                "scenario": comparison.get("scenario"),
-                "comparison": comparison.get("comparison"),
-                "round": comparison.get("round"),
+                "scenario": comparison.get("scenario") if comparison.get("scenario") in SCENARIOS else "unknown",
+                "comparison": comparison.get("comparison") if comparison.get("comparison") in ("build", "background") else "unknown",
+                "round": safe_count(comparison.get("round")),
                 "required_reduction": float(number(p1.get("required_reduction"), "p1.required_reduction")),
                 "observed_reduction": float(number(p1.get("observed_reduction"), "p1.observed_reduction")),
                 "repeatability_drift": (
                     None if p1.get("repeatability_drift") is None
                     else float(number(p1.get("repeatability_drift"), "p1.repeatability_drift"))
                 ),
-                "baseline_walk_objects": p1.get("baseline_walk_objects"),
-                "baseline_cold_walk_objects": p1.get("baseline_cold_walk_objects"),
-                "candidate_walk_objects": p1.get("candidate_walk_objects"),
-                "candidate_cold_walk_objects": p1.get("candidate_cold_walk_objects"),
+                "baseline_walk_objects": safe_count(p1.get("baseline_walk_objects")),
+                "baseline_cold_walk_objects": safe_count(p1.get("baseline_cold_walk_objects")),
+                "candidate_walk_objects": safe_count(p1.get("candidate_walk_objects")),
+                "candidate_cold_walk_objects": safe_count(p1.get("candidate_cold_walk_objects")),
             })
         p2 = comparison.get("p2_post_stop_work_multiples")
-        if isinstance(p2, list):
-            p2_values.extend(maybe_number(value, "p2_post_stop_work_multiple") for value in p2)
+        if isinstance(p2, list) and len(p2) == len(LEGS):
+            candidate = [maybe_number(p2[index], "p2_post_stop_work_multiple") for index in (1, 2)]
+            p2_values.extend(candidate)
+            if any(value is None for value in candidate):
+                p2_complete = False
+        else:
+            p2_complete = False
         w09 = comparison.get("w09")
-        if isinstance(w09, dict):
-            for value in w09.get("heal_start_p95_ms", []):
-                start_p95_values.append(maybe_number(value, "heal_start_p95_ms"))
-            for value in w09.get("heal_duplicate_task_count", []):
-                duplicate_task_values.append(maybe_number(value, "heal_duplicate_task_count"))
-            for value in w09.get("heal_lock_hold_p95_ms", []):
-                lock_hold_values.append(maybe_number(value, "heal_lock_hold_p95_ms"))
+        for field, values in (("heal_start_p95_ms", start_p95_values),
+                              ("heal_duplicate_task_count", duplicate_task_values),
+                              ("heal_lock_hold_p95_ms", lock_hold_values)):
+            samples = w09.get(field) if isinstance(w09, dict) else None
+            if isinstance(samples, list):
+                values.extend(maybe_number(value, field) for value in samples)
+            if not isinstance(samples, list) or len(samples) != len(LEGS) or any(value is None for value in samples):
+                w09_complete[field] = False
         w10_w11 = comparison.get("w10_w11")
         if isinstance(w10_w11, dict):
             samples = w10_w11.get("foreground_pressure_samples")
@@ -325,112 +383,143 @@ def summarize_abba(abba_dir: Path) -> dict[str, Any]:
                 pressure_high_samples += sum(require_integer(value, "foreground_pressure_high_samples", 0) for value in high_samples)
             else:
                 pressure_high_samples_complete = False
-            for value in w10_w11.get("attempt_cost_per_healed_object", []):
-                if value is not None:
-                    attempt_cost_samples += 1
+            costs = w10_w11.get("attempt_cost_per_healed_object")
+            if isinstance(costs, list) and len(costs) == len(LEGS):
+                attempt_cost_ratio_count += sum(value is not None for value in costs)
+            else:
+                attempt_cost_ratios_complete = False
         else:
             pressure_samples_complete = False
             pressure_high_samples_complete = False
+            attempt_cost_ratios_complete = False
         w10 = comparison.get("w10")
         if isinstance(w10, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w10_rows.append({
-                "round": comparison.get("round"),
-                "status": w10.get("status"),
-                "pacing_observed": w10.get("pacing_observed"),
-                "candidate_pressure_high_ratio": w10.get("candidate_pressure_high_ratio"),
-                "candidate_delay_events": w10.get("candidate_delay_events"),
-                "foreground_p99_change": w10.get("foreground_p99_change"),
-                "foreground_throughput_change": w10.get("foreground_throughput_change"),
+                "round": safe_count(comparison.get("round")),
+                "status": safe_observation_state(w10.get("status")),
+                "pacing_observed": w10.get("pacing_observed") if type(w10.get("pacing_observed")) is bool else None,
+                "candidate_pressure_high_ratio": safe_observed_number(w10.get("candidate_pressure_high_ratio")),
+                "candidate_delay_events": safe_count(w10.get("candidate_delay_events")),
+                "foreground_p99_change": safe_observed_number(w10.get("foreground_p99_change")),
+                "foreground_throughput_change": safe_observed_number(w10.get("foreground_throughput_change")),
             })
         if "throughput_ops" in comparison:
             throughput_values.append(maybe_number(comparison.get("throughput_ops"), "throughput_ops"))
-        error_rate_values.append(maybe_number(comparison.get("error_rate"), "error_rate"))
+        error_rate = maybe_number(comparison.get("error_rate"), "error_rate")
+        require(error_rate is None or Decimal("0") <= error_rate <= Decimal("1"), "invalid error_rate")
+        error_rate_values.append(error_rate)
         w11 = comparison.get("w11")
         if isinstance(w11, dict) and comparison.get("scenario") == "running-heal" and comparison.get("comparison") == "build":
             w11_rows.append({
-                "round": comparison.get("round"),
-                "status": w11.get("status"),
-                "rss_growth": w11.get("rss_growth"),
-                "rss_growth_limit": w11.get("rss_growth_limit"),
-                "heal_lock_wait_p99_change": w11.get("heal_lock_wait_p99_change"),
-                "foreground_p99_change": w11.get("foreground_p99_change"),
-                "foreground_throughput_change": w11.get("foreground_throughput_change"),
-                "candidate_attempt_cost_per_healed_object": w11.get("candidate_attempt_cost_per_healed_object"),
+                "round": safe_count(comparison.get("round")),
+                "status": safe_observation_state(w11.get("status")),
+                "rss_growth": safe_observed_number(w11.get("rss_growth")),
+                "rss_growth_limit": safe_observed_number(w11.get("rss_growth_limit")),
+                "heal_lock_wait_p99_change": safe_observed_number(w11.get("heal_lock_wait_p99_change")),
+                "foreground_p99_change": safe_observed_number(w11.get("foreground_p99_change")),
+                "foreground_throughput_change": safe_observed_number(w11.get("foreground_throughput_change")),
+                "candidate_attempt_cost_per_healed_object": safe_observed_number(w11.get("candidate_attempt_cost_per_healed_object")),
             })
 
     measured = report.get("evidence") == "measured"
-    passed = report_state in PASS_STATES and performance_state in PASS_STATES and measured
-    if passed:
+    reported_pass = report_state in PASS_STATES and performance_state in PASS_STATES and measured
+    verified = measured and measured_provenance_verified(abba_dir)
+    if reported_pass:
         require_complete_abba_matrix(manifest, report, comparisons)
         validate_release_evidence_manifest({**manifest, "evidence": "measured"})
         for index, comparison in enumerate(comparisons):
             require_measured_comparison_evidence(comparison, index)
         require(all(value is not None for value in error_rate_values), "error_rate must be measured")
+        require(all(value == 0 for value in error_rate_values), "passing report has nonzero error_rate")
         require(pressure_samples_complete, "foreground_pressure_samples must be measured")
         require(pressure_high_samples_complete, "foreground_pressure_high_samples must be measured")
+    passed = reported_pass and verified
+    if not verified and report.get("evidence") != "synthetic":
+        for row in w10_rows + w11_rows:
+            if row["status"] == "observed":
+                row["status"] = "unverified"
     gate_state = "pass" if passed else "fail"
     if report_state == "synthetic_validated":
         reason = "synthetic evidence validates the harness only; measured performance remains pending"
     elif report_state in FAIL_STATES and isinstance(report.get("error"), str) and report["error"]:
-        reason = f"ABBA report status is {report_state}: {report['error']}"
+        reason = f"ABBA report status is {report_state}; error details omitted"
     elif report_state not in PASS_STATES:
         reason = f"ABBA report status is {report_state}"
     elif performance_state not in PASS_STATES:
         reason = f"performance status is {performance_state}"
     elif not measured:
         reason = "measured evidence is required for a performance conclusion"
+    elif not verified:
+        reason = "measured source windows and client percentiles are not independently verified"
     else:
         reason = "measured ABBA report passed"
 
     fixed = manifest.get("fixed", {})
     require(isinstance(fixed, dict), "manifest.fixed must be an object")
+    baseline = manifest.get("baseline") if isinstance(manifest.get("baseline"), dict) else {}
+    candidate = manifest.get("candidate") if isinstance(manifest.get("candidate"), dict) else {}
     return {
         "gate_state": gate_state,
         "reason": reason,
         "status": report_state,
         "performance": performance_state,
-        "evidence": report.get("evidence"),
-        "cells": report.get("cells", 0),
-        "completed_cells": report.get("completed_cells"),
-        "error": report.get("error"),
+        "evidence": evidence_type,
+        "measurement_provenance": "verified" if verified else "unverified",
+        "cells": safe_count(report.get("cells")),
+        "completed_cells": safe_count(report.get("completed_cells")),
+        # Historical reports may contain unredacted subprocess arguments.
+        "error": "details omitted" if isinstance(report.get("error"), str) and report["error"] else None,
         "comparisons_total": len(comparisons),
         "comparison_status_counts": dict(sorted(counts.items())),
-        "worst_p99_regression": None if not p99_regressions else float(max(p99_regressions)),
-        "worst_throughput_loss": None if not throughput_losses else float(max(throughput_losses)),
-        "foreground_p95_ms": None if max_decimal(foreground_p95_values) is None else float(max_decimal(foreground_p95_values)),
-        "foreground_p99_ms": None if max_decimal(foreground_p99_values) is None else float(max_decimal(foreground_p99_values)),
-        "throughput_ops": None if max_decimal(throughput_values) is None else float(max_decimal(throughput_values)),
+        "worst_p99_regression": float(max(p99_regressions)) if matrix_complete and p99_regressions else None,
+        "worst_throughput_loss": float(max(throughput_losses)) if matrix_complete and throughput_losses else None,
+        # Comparisons describe different legs and windows. Their maxima are
+        # not a percentile of one measured request population.
+        "foreground_p95_ms": None,
+        "foreground_p99_ms": None,
+        "max_reported_comparison_p95_ms": (None if max_decimal(foreground_p95_values) is None
+                                           else float(max_decimal(foreground_p95_values))),
+        "max_reported_comparison_p99_ms": (None if max_decimal(foreground_p99_values) is None
+                                           else float(max_decimal(foreground_p99_values))),
+        "throughput_ops": None,
+        "max_reported_comparison_throughput_ops": (float(max(throughput_values))
+                                                   if matrix_complete and len(throughput_values) == len(comparisons)
+                                                   and all(value is not None for value in throughput_values) else None),
         "error_rate": (None if not matrix_complete or any(value is None for value in error_rate_values)
                        else float(max_decimal(error_rate_values))),
         "foreground_pressure_samples": pressure_samples if pressure_samples_complete else None,
         "foreground_pressure_high_samples": pressure_high_samples if pressure_high_samples_complete else None,
-        "attempt_cost_samples": attempt_cost_samples,
-        "p2_worst_post_stop_work_multiple": None if max_decimal(p2_values) is None else float(max_decimal(p2_values)),
-        "w09_worst_heal_start_p95_ms": None if max_decimal(start_p95_values) is None else float(max_decimal(start_p95_values)),
-        "w09_duplicate_task_count": None if max_decimal(duplicate_task_values) is None else float(max_decimal(duplicate_task_values)),
-        "w09_worst_lock_hold_p95_ms": None if max_decimal(lock_hold_values) is None else float(max_decimal(lock_hold_values)),
+        "attempt_cost_samples": None,
+        "reported_attempt_cost_ratio_count": attempt_cost_ratio_count if attempt_cost_ratios_complete else None,
+        "p2_worst_post_stop_work_multiple": float(max(p2_values)) if p2_complete and p2_values else None,
+        "w09_worst_heal_start_p95_ms": (float(max(start_p95_values))
+                                         if w09_complete["heal_start_p95_ms"] and start_p95_values else None),
+        "w09_duplicate_task_count": (float(max(duplicate_task_values))
+                                     if w09_complete["heal_duplicate_task_count"] and duplicate_task_values else None),
+        "w09_worst_lock_hold_p95_ms": (float(max(lock_hold_values))
+                                       if w09_complete["heal_lock_hold_p95_ms"] and lock_hold_values else None),
         "p1_reductions": p1_rows,
         "w10_running_heal_build": w10_rows,
         "w11_running_heal_build": w11_rows,
         "provenance": {
             "abba_dir": str(abba_dir.resolve()),
-            "manifest_sha256": digest(manifest_path),
-            "report_sha256": digest(report_path),
-            "baseline_revision": manifest.get("baseline", {}).get("revision"),
-            "baseline_sha256": manifest.get("baseline", {}).get("sha256"),
-            "candidate_revision": manifest.get("candidate", {}).get("revision"),
-            "candidate_sha256": manifest.get("candidate", {}).get("sha256"),
-            "adapter_sha256": manifest.get("adapter_sha256"),
-            "collector_sha256": manifest.get("collector_sha256"),
-            "config_sha256": fixed.get("config_sha256"),
-            "dataset_sha256": fixed.get("dataset_sha256"),
-            "release_flags": fixed.get("release_flags"),
-            "durability": fixed.get("durability"),
-            "topology": fixed.get("topology"),
-            "offered_load_ops": fixed.get("offered_load_ops"),
-            "release_evidence": manifest.get("release_evidence"),
-            "started_at": report.get("started_at") or manifest.get("started_at"),
-            "finished_at": report.get("finished_at"),
+            "manifest_sha256": manifest_sha256,
+            "report_sha256": report_sha256,
+            "baseline_revision": safe_hex(baseline.get("revision"), 40),
+            "baseline_sha256": safe_hex(baseline.get("sha256"), 64),
+            "candidate_revision": safe_hex(candidate.get("revision"), 40),
+            "candidate_sha256": safe_hex(candidate.get("sha256"), 64),
+            "adapter_sha256": safe_hex(manifest.get("adapter_sha256"), 64),
+            "collector_sha256": safe_hex(manifest.get("collector_sha256"), 64),
+            "config_sha256": safe_hex(fixed.get("config_sha256"), 64),
+            "dataset_sha256": safe_hex(fixed.get("dataset_sha256"), 64),
+            "release_flags_present": isinstance(fixed.get("release_flags"), str) and bool(fixed["release_flags"]),
+            "durability": fixed.get("durability") if fixed.get("durability") in ("drive-sync=on", "drive-sync=off") else None,
+            "topology": fixed.get("topology") if fixed.get("topology") == "EC8+4" else None,
+            "offered_load_ops": safe_observed_number(fixed.get("offered_load_ops")),
+            "release_evidence_present": isinstance(manifest.get("release_evidence"), dict),
+            "started_at": safe_timestamp(report.get("started_at")) or safe_timestamp(manifest.get("started_at")),
+            "finished_at": safe_timestamp(report.get("finished_at")),
         },
     }
 
@@ -461,7 +550,8 @@ def summarize_cache_cost(path: Path) -> dict[str, Any]:
     max_save_ns = Decimal("0")
     build_sources = set()
     for index, record in enumerate(records):
-        scenarios[str(record.get("scenario"))] += 1
+        scenario = record.get("scenario")
+        scenarios[scenario if isinstance(scenario, str) and scenario in ("unchanged", "small_dirty", "all_dirty") else "unknown"] += 1
         wire = number(record.get("cache_wire_bytes"), f"cache_cost {index} cache_wire_bytes")
         save_body = number(record.get("save_body_bytes_per_sample"), f"cache_cost {index} save_body_bytes_per_sample")
         require(wire > 0, f"cache_cost {index} has zero wire bytes")
@@ -479,7 +569,14 @@ def summarize_cache_cost(path: Path) -> dict[str, Any]:
                 max_save_ns = max(max_save_ns, value)
         build = record.get("build", {})
         require(isinstance(build, dict), f"cache_cost {index} build must be an object")
-        build_sources.add((build.get("source_revision"), build.get("source_tree"), build.get("test_opt_level_override")))
+        revision = build.get("source_revision")
+        revision = (revision if isinstance(revision, str) and 1 <= len(revision) <= 40
+                    and all(c in "0123456789abcdef" for c in revision) else None)
+        tree = build.get("source_tree")
+        tree = tree if tree in ("clean", "dirty", "unknown") else None
+        opt = build.get("test_opt_level_override")
+        opt = opt if opt in ("0", "1", "2", "3", "s", "z") else None
+        build_sources.add((revision, tree, opt))
     return {
         "records": len(records),
         "scenario_counts": dict(sorted(scenarios.items())),
@@ -499,362 +596,9 @@ def summarize_cache_cost(path: Path) -> dict[str, Any]:
     }
 
 
-def profile_artifact_map(values: list[str] | None) -> dict[str, Path]:
-    artifacts: dict[str, Path] = {}
-    for value in values or []:
-        require("=" in value, "profile artifact must use KIND=PATH")
-        kind, raw_path = value.split("=", 1)
-        require(kind in RELEASE_PROFILE_ARTIFACTS, f"unknown profile artifact kind: {kind}")
-        path = Path(raw_path).resolve()
-        require(path.is_file() and path.stat().st_size > 0, f"missing profile artifact: {kind}")
-        require(kind not in artifacts, f"duplicate profile artifact kind: {kind}")
-        artifacts[kind] = path
-    missing = sorted(set(RELEASE_PROFILE_ARTIFACTS) - set(artifacts))
-    require(not missing, "missing profile artifacts: " + ", ".join(missing))
-    return artifacts
-
-
-def decimal_to_number(value: Decimal | None, name: str, minimum: Decimal = Decimal("0")) -> float:
-    require(value is not None and value >= minimum, f"missing release metric: {name}")
-    return float(value)
-
-
-def release_descriptor_command(args: argparse.Namespace) -> list[str]:
-    command = [
-        "scripts/summarize_scanner_heal_perf.py",
-        "--abba-dir",
-        str(args.abba_dir),
-    ]
-    if args.cache_cost_log:
-        command.extend(["--cache-cost-log", str(args.cache_cost_log)])
-    if args.require_cache_cost:
-        command.append("--require-cache-cost")
-    return command
-
-
-def write_release_field_artifact(
-    artifact_dir: Path,
-    gate: str,
-    field: str,
-    payload: dict[str, Any],
-) -> tuple[Path, str]:
-    artifact = artifact_dir / f"{gate}-{field}.json"
-    write_json(artifact, payload)
-    return artifact, digest(artifact)
-
-
-def profile_wrapper_artifact(
-    artifact_dir: Path,
-    source_revision: str,
-    run_id: str,
-    window_id: str,
-    kind: str,
-    path: Path,
-    profile_measurements: dict[str, Any],
-) -> dict[str, Any]:
-    required_metrics = {
-        "allocation-profile": ("resolved_samples", "allocation_bytes"),
-        "flamegraph": ("resolved_samples",),
-        "rss-samples": ("resolved_samples", "rss_peak_bytes"),
-        "save-frequency": ("resolved_samples", "save_operations", "saved_bytes"),
-    }[kind]
-    raw_artifact = artifact_dir / f"P1-profile_evidence-{kind}.raw{path.suffix}"
-    shutil.copyfile(path, raw_artifact)
-    wrapper = artifact_dir / f"P1-profile_evidence-{kind}.json"
-    payload = {
-        "schema": 1,
-        "evidence_type": "measured",
-        "source_revision": source_revision,
-        "run_id": run_id,
-        "measurement_window_id": window_id,
-        "gate": "P1",
-        "field": "profile_evidence",
-        "artifact_kind": kind,
-        "raw_profile_name": path.name,
-        "raw_profile_artifact": raw_artifact.relative_to(artifact_dir.parent).as_posix(),
-        "raw_profile_sha256": digest(raw_artifact),
-        "raw_profile_bytes": raw_artifact.stat().st_size,
-        "raw_profile_format": path.suffix.lower().lstrip(".") or "binary",
-    }
-    for metric in required_metrics:
-        payload[metric] = require_integer(profile_measurements.get(metric), metric, 1)
-    write_json(wrapper, payload)
-    return {
-        "artifact": wrapper.relative_to(artifact_dir.parent).as_posix(),
-        "sha256": digest(wrapper),
-        "artifact_format": "json",
-        "source_revision": source_revision,
-        "run_id": run_id,
-        "measurement_window_id": window_id,
-    }
-
-
-def release_field(
-    artifact_dir: Path,
-    source_revision: str,
-    run_id: str,
-    window_id: str,
-    started_at: str,
-    finished_at: str,
-    command: list[str],
-    gate: str,
-    field: str,
-    summary_text: str,
-    evidence: dict[str, Any],
-) -> dict[str, Any]:
-    payload = {
-        "schema": 1,
-        "evidence_type": "measured",
-        "source_revision": source_revision,
-        "run_id": run_id,
-        "measurement_window_id": window_id,
-        "gate": gate,
-        "field": field,
-        **evidence,
-    }
-    artifact, artifact_sha = write_release_field_artifact(artifact_dir, gate, field, payload)
-    return {
-        "evidence_type": "measured",
-        "source_revision": source_revision,
-        "run_id": run_id,
-        "measurement_window_id": window_id,
-        "started_at": started_at,
-        "finished_at": finished_at,
-        "command": command,
-        "artifact": artifact.relative_to(artifact_dir.parent).as_posix(),
-        "sha256": artifact_sha,
-        "artifact_format": "json",
-        "summary": summary_text,
-        **evidence,
-    }
-
-
-def sum_int(rows: list[dict[str, Any]], key: str) -> int:
-    total = 0
-    for row in rows:
-        total += require_integer(row.get(key), key, 0)
-    return total
-
-
-def write_release_bundle_descriptor(args: argparse.Namespace, summary: dict[str, Any]) -> None:
+def write_release_bundle_descriptor(_args: argparse.Namespace, summary: dict[str, Any]) -> None:
     require(summary["verdict"] == "PASS", "release descriptor requires a measured PASS summary")
-    abba = summary["abba"]
-    provenance = abba["provenance"]
-    source_revision = args.release_source_revision or provenance.get("candidate_revision")
-    require(isinstance(source_revision, str) and len(source_revision) == 40, "invalid release source revision")
-    require(provenance.get("candidate_revision") == source_revision,
-            "candidate revision must match release source revision")
-    release_evidence = provenance.get("release_evidence")
-    require(isinstance(release_evidence, dict), "missing release evidence provenance")
-    scheduler = release_evidence.get("scheduler")
-    require(isinstance(scheduler, dict), "missing release_evidence.scheduler")
-    profile = release_evidence.get("profile")
-    require(isinstance(profile, dict), "missing release_evidence.profile")
-    profile_measurements = profile.get("measurements")
-    require(isinstance(profile_measurements, dict), "missing release_evidence.profile.measurements")
-    profile_costs = {
-        "resolved_samples": require_integer(profile_measurements.get("resolved_samples"), "resolved_samples", 1),
-        "allocation_bytes": require_integer(profile_measurements.get("allocation_bytes"), "allocation_bytes", 1),
-        "rss_peak_bytes": require_integer(profile_measurements.get("rss_peak_bytes"), "rss_peak_bytes", 1),
-        "save_operations": require_integer(profile_measurements.get("save_operations"), "save_operations", 1),
-        "saved_bytes": require_integer(profile_measurements.get("saved_bytes"), "saved_bytes", 1),
-    }
-    profile_artifacts = profile_artifact_map(args.release_profile_artifact)
-
-    descriptor = args.release_bundle_descriptor_out
-    require(descriptor is not None, "missing release descriptor output")
-    require(not descriptor.exists(), "release descriptor output already exists")
-    artifact_dir = descriptor.parent / f"{descriptor.stem}-artifacts"
-    require(not artifact_dir.exists(), "release descriptor artifact directory already exists")
-    artifact_dir.mkdir(parents=True)
-
-    started_at = timestamp(provenance.get("started_at") or release_evidence.get("started_at"), "release started_at")
-    finished_at = timestamp(provenance.get("finished_at") or release_evidence.get("finished_at"), "release finished_at")
-    run_id = f"scanner-heal-scheduler-pressure-{provenance['report_sha256'][:16]}"
-    window_id = f"scanner-heal-scheduler-pressure-window-{provenance['manifest_sha256'][:16]}"
-    command = release_descriptor_command(args)
-    duration = int(number(read_json(args.abba_dir / "manifest.json").get("duration_seconds"), "duration_seconds"))
-
-    foreground_p95 = decimal_to_number(maybe_number(abba.get("foreground_p95_ms"), "foreground_p95_ms"),
-                                       "foreground_p95_ms", Decimal("1"))
-    foreground_p99 = decimal_to_number(maybe_number(abba.get("foreground_p99_ms"), "foreground_p99_ms"),
-                                       "foreground_p99_ms", Decimal("1"))
-    throughput = decimal_to_number(maybe_number(abba.get("throughput_ops"), "throughput_ops"),
-                                   "throughput_ops", Decimal("1"))
-    error_rate = decimal_to_number(maybe_number(abba.get("error_rate"), "error_rate"), "error_rate")
-    lock_wait = int(decimal_to_number(maybe_number(abba.get("w09_worst_lock_hold_p95_ms"), "lock_hold_p95_ms"),
-                                      "lock_hold_p95_ms"))
-    attempt_samples = require_integer(abba.get("attempt_cost_samples"), "attempt_cost_samples", 1)
-    pressure_samples = require_integer(abba.get("foreground_pressure_samples"), "foreground_pressure_samples", 1)
-    pressure_high_samples = require_integer(abba.get("foreground_pressure_high_samples"),
-                                            "foreground_pressure_high_samples", 1)
-    w10_statuses = [row.get("status") for row in abba.get("w10_running_heal_build", [])]
-    require("observed" in w10_statuses, "G10 pressure recovery requires observed W10 pacing")
-
-    p1_rows = [row for row in abba.get("p1_reductions", []) if row.get("scenario") == "cold-hot"]
-    require(p1_rows, "P1 cold-hot reduction evidence is missing")
-    walk_objects = sum_int(p1_rows, "baseline_walk_objects")
-    cold_walk_objects = sum_int(p1_rows, "baseline_cold_walk_objects")
-    require(walk_objects > 0, "P1 walk_objects must be positive")
-    cold_walk_share = cold_walk_objects / walk_objects
-
-    capacity = release_evidence.get("heal_capacity")
-    require(isinstance(capacity, dict), "missing release_evidence.heal_capacity")
-    recovery = release_evidence.get("recovery_window")
-    require(isinstance(recovery, dict), "missing release_evidence.recovery_window")
-
-    descriptor_value = {
-        "schema": 1,
-        "evidence": "measured",
-        "source_revision": source_revision,
-        "gates": {
-            "G10": {
-                "status": "pass",
-                "lane": "scheduler-pressure",
-                "evidence_type": "measured",
-                "evidence_fields": {
-                "scheduler_bound_evidence": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "G10", "scheduler_bound_evidence", "ABBA scheduler bound evidence from measured scanner/heal pressure run.",
-                    {
-                        "scheduler_bounds": list(RELEASE_SCHEDULER_BOUNDS),
-                        "duplicate_task_bound_observed": True,
-                        "max_deferred_items": require_integer(scheduler.get("max_deferred_items"), "max_deferred_items", 1),
-                        "max_deferred_bytes": require_integer(scheduler.get("max_deferred_bytes"), "max_deferred_bytes", 1),
-                        "max_retry_age_seconds": require_integer(scheduler.get("max_retry_age_seconds"), "max_retry_age_seconds", 1),
-                        "duplicate_task_count": 0,
-                        "duration_seconds": duration,
-                    },
-                ),
-                "pressure_recovery_evidence": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "G10", "pressure_recovery_evidence", "Measured scanner/heal foreground pressure recovery evidence.",
-                    {
-                        "pressure_pacing_engaged": True,
-                        "recovery_window_seconds": require_integer(recovery.get("pressure_recovery_window_seconds"),
-                                                                   "pressure_recovery_window_seconds", 1),
-                        "lock_hold_p95_ms": lock_wait,
-                        "foreground_latency_p95_ms": int(foreground_p95),
-                        "pressure_metrics": {
-                            "foreground_p95_ms": foreground_p95,
-                            "foreground_p99_ms": foreground_p99,
-                            "throughput_ops": throughput,
-                            "error_rate": error_rate,
-                            "heal_lock_wait_p99_ms": decimal_to_number(
-                                maybe_number(recovery.get("heal_lock_wait_p99_ms"), "heal_lock_wait_p99_ms"),
-                                "heal_lock_wait_p99_ms",
-                            ),
-                            "attempt_cost_samples": attempt_samples,
-                            "foreground_pressure_samples": pressure_samples,
-                            "foreground_pressure_high_samples": pressure_high_samples,
-                        },
-                        "duration_seconds": duration,
-                    },
-                ),
-                },
-            },
-            "P1": {
-                "status": "pass",
-                "lane": "scheduler-pressure",
-                "evidence_type": "measured",
-                "evidence_fields": {
-                "cold_walk_share_measurement": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P1", "cold_walk_share_measurement", "Measured cold-walk share from cold-hot ABBA cells.",
-                    {
-                        "cold_walk_share": cold_walk_share,
-                        "walk_objects": walk_objects,
-                        "cold_walk_objects": cold_walk_objects,
-                        "duration_seconds": duration,
-                    },
-                ),
-                "foreground_latency_throughput_measurement": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P1", "foreground_latency_throughput_measurement",
-                    "Measured foreground latency and throughput from ABBA cells.",
-                    {
-                        "foreground_latency_p95_ms": int(foreground_p95),
-                        "foreground_latency_p99_ms": int(foreground_p99),
-                        "throughput_ops_per_second": int(throughput),
-                        "error_count": 0,
-                        "foreground_p95_ms": foreground_p95,
-                        "foreground_p99_ms": foreground_p99,
-                        "throughput_ops": throughput,
-                        "error_rate": error_rate,
-                        "duration_seconds": duration,
-                    },
-                ),
-                "profile_evidence": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P1", "profile_evidence", "Measured allocation, RSS, save-frequency, and flamegraph profile evidence.",
-                    {
-                        **profile_costs,
-                        "profile_artifacts": {
-                            kind: profile_wrapper_artifact(
-                                artifact_dir, source_revision, run_id, window_id, kind, path, profile_costs
-                            )
-                            for kind, path in sorted(profile_artifacts.items())
-                        },
-                        "duration_seconds": duration,
-                    },
-                ),
-                },
-            },
-            "P3": {
-                "status": "pass",
-                "lane": "scheduler-pressure",
-                "evidence_type": "measured",
-                "evidence_fields": {
-                "two_hour_pressure_measurement": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P3", "two_hour_pressure_measurement", "Measured two-hour ABBA pressure run.",
-                    {
-                        "fixed_offered_load": True,
-                        "foreground_latency_p99_ms": int(foreground_p99),
-                        "attempt_cost_samples": attempt_samples,
-                        "abba_legs": list(LEGS),
-                        "scenarios": list(SCENARIOS),
-                        "foreground_p95_ms": foreground_p95,
-                        "foreground_p99_ms": foreground_p99,
-                        "throughput_ops": throughput,
-                        "duration_seconds": duration,
-                    },
-                ),
-                "heal_capacity_measurement": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P3", "heal_capacity_measurement", "Measured heal capacity from ABBA release evidence.",
-                    {
-                        "completed_heal_objects": require_integer(capacity.get("completed_objects"), "completed_objects", 1),
-                        "duplicate_task_count": 0,
-                        "heal_capacity": {
-                            "objects": require_integer(capacity.get("objects"), "objects", 1),
-                            "versions": require_integer(capacity.get("versions"), "versions", 1),
-                            "bytes": require_integer(capacity.get("bytes"), "bytes", 1),
-                            "completed_objects": require_integer(capacity.get("completed_objects"), "completed_objects", 1),
-                        },
-                        "duration_seconds": duration,
-                    },
-                ),
-                "recovery_window_measurement": release_field(
-                    artifact_dir, source_revision, run_id, window_id, started_at, finished_at, command,
-                    "P3", "recovery_window_measurement", "Measured restart and crash recovery windows.",
-                    {
-                        "pressure_recovery_window_seconds": require_integer(recovery.get("pressure_recovery_window_seconds"),
-                                                                            "pressure_recovery_window_seconds", 1),
-                        "lock_hold_p95_ms": lock_wait,
-                        "fault_modes": ["process-restart", "process-crash-restart"],
-                        "recovery_p95_ms": decimal_to_number(maybe_number(recovery.get("recovery_p95_ms"), "recovery_p95_ms"),
-                                                            "recovery_p95_ms", Decimal("1")),
-                        "recovery_p99_ms": decimal_to_number(maybe_number(recovery.get("recovery_p99_ms"), "recovery_p99_ms"),
-                                                            "recovery_p99_ms", Decimal("1")),
-                        "duration_seconds": duration,
-                    },
-                ),
-                },
-            },
-        },
-    }
-    write_json(descriptor, descriptor_value)
+    raise ValueError("release descriptor source evidence is unavailable")
 
 
 def markdown(summary: dict[str, Any]) -> str:
@@ -867,7 +611,7 @@ def markdown(summary: dict[str, Any]) -> str:
         "",
         f"- verdict: {summary['verdict']}",
         f"- reason: {summary['reason']}",
-        f"- abba: status={abba['status']} performance={abba['performance']} evidence={abba['evidence']} cells={abba['cells']} comparisons={abba['comparisons_total']}",
+        f"- abba: status={abba['status']} performance={abba['performance']} evidence={abba['evidence']} cells={abba['cells'] if abba['cells'] is not None else 'pending'} comparisons={abba['comparisons_total']}",
         f"- worst_p99_regression: {pct(p99)}",
         f"- worst_throughput_loss: {pct(throughput)}",
         f"- p2_worst_post_stop_work_multiple: {ratio(p2)}",
@@ -923,7 +667,7 @@ def main() -> int:
     parser.add_argument("--json-out", type=Path, help="Write the normalized summary JSON artifact")
     parser.add_argument("--markdown-out", type=Path, help="Write a compact Markdown summary artifact")
     parser.add_argument("--release-bundle-descriptor-out", type=Path,
-                        help="Write a measured G10/P1/P3 release-bundle descriptor")
+                        help="Reserved; verified source evidence is not yet available")
     parser.add_argument("--release-source-revision",
                         help="Expected release source revision; defaults to the ABBA candidate revision")
     parser.add_argument("--release-profile-artifact", action="append",
@@ -931,13 +675,13 @@ def main() -> int:
     args = parser.parse_args()
     try:
         summary = build_summary(args)
+        if args.release_bundle_descriptor_out:
+            write_release_bundle_descriptor(args, summary)
         if args.json_out:
             write_json(args.json_out, summary)
         if args.markdown_out:
             args.markdown_out.parent.mkdir(parents=True, exist_ok=True)
             args.markdown_out.write_text(markdown(summary), encoding="utf-8")
-        if args.release_bundle_descriptor_out:
-            write_release_bundle_descriptor(args, summary)
         abba = summary["abba"]
         print(
             f"{summary['verdict']} scanner_heal_perf "
@@ -946,7 +690,7 @@ def main() -> int:
         )
         return 0 if summary["verdict"] == "PASS" else 1
     except (ValueError, OSError, json.JSONDecodeError) as error:
-        print(f"FAIL scanner_heal_perf error={error}", file=sys.stderr)
+        print(f"FAIL scanner_heal_perf error={type(error).__name__}", file=sys.stderr)
         return 1
 
 

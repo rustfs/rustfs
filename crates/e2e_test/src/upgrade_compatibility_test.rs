@@ -1112,8 +1112,9 @@ async fn wait_for_upgrade_writes(
             match response {
                 Ok(Ok(_)) => break,
                 Ok(Err(error)) => {
+                    let code = error.as_service_error().and_then(ProvideErrorMetadata::code);
                     if error.raw_response().map(|response| response.status().as_u16()) != Some(503)
-                        || error.as_service_error().and_then(ProvideErrorMetadata::code) != Some("ServiceUnavailable")
+                        || !matches!(code, Some("ServiceUnavailable" | "SlowDown" | "SlowDownRead"))
                     {
                         return Err(format!("{phase}: node {node} {probe} failed: {error:?}").into());
                     }

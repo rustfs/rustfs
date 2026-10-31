@@ -51,6 +51,10 @@ impl Drop for ObservationGuard {
     }
 }
 
+pub(in crate::scanner_folder) fn install_raw_entry_observer(root: PathBuf) -> ObservationGuard {
+    install_raw_entry_budget(root, u64::MAX)
+}
+
 pub(in crate::scanner_folder) fn install_raw_entry_budget(root: PathBuf, limit: u64) -> ObservationGuard {
     *OBSERVATION.lock().expect("install raw-entry observation") = Some(Observation {
         root,
@@ -83,6 +87,45 @@ pub(super) async fn read_bounded(path: &Path) -> Vec<u8> {
     bytes
 }
 
+/// Creates a flat synthetic bucket and the checkpointable cache a first sweep
+/// starts from.
+pub(super) async fn seed_flat_bucket(disk_root: &Path, objects: usize) -> DataUsageCache {
+    tokio::fs::create_dir(disk_root).await.expect("create fresh synthetic disk");
+    for index in 0..objects {
+        let object = format!("object-{index:04}");
+        let version = Uuid::from_u128(u128::try_from(index).expect("fixture index") + 1);
+        let bytes = metadata_for_object_version("bucket", &object, Some(version));
+        write_test_object_metadata_bytes(disk_root, "bucket", &object, &bytes).await;
+    }
+    let mut initial = DataUsageCache::default();
+    initial.info.name = "bucket".to_string();
+    let source = crate::data_usage_define::DataUsageCacheSource::new(0, 0);
+    let plan = crate::data_usage_define::DataUsageScanPlanDigest([31; 32]);
+    let identity = crate::data_usage_define::DataUsageScanIdentity {
+        version: 1,
+        bucket_incarnation: Uuid::from_u128(31),
+        set_layout: crate::data_usage_define::DataUsageScanPlanDigest([32; 32]),
+        publication_epoch: 1,
+        tier_registry_generation: 0,
+        scan_mode: HealScanMode::Normal,
+    };
+    assert_eq!(
+        initial.prepare_bucket_checkpoint("bucket", 1, 0, source, plan, identity),
+        crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
+    );
+    initial.info.skip_healing = true;
+    initial.replace("bucket", "", DataUsageEntry::default());
+    initial
+}
+
+pub(super) fn observed_raw_entries() -> u64 {
+    OBSERVATION
+        .lock()
+        .expect("read raw-entry observation")
+        .as_ref()
+        .map_or(0, |observation| observation.entries)
+}
+
 async fn round(request: &Request) -> serde_json::Value {
     assert!((1..=1024).contains(&request.objects));
     assert!((1..=4096).contains(&request.raw_entry_budget));
@@ -90,31 +133,7 @@ async fn round(request: &Request) -> serde_json::Value {
     let disk_root = request.workspace.join("disk");
     let cache_path = request.workspace.join("cache.bin");
     if request.round == 0 {
-        tokio::fs::create_dir(&disk_root).await.expect("create fresh synthetic disk");
-        for index in 0..request.objects {
-            let object = format!("object-{index:04}");
-            let version = Uuid::from_u128(u128::try_from(index).expect("fixture index") + 1);
-            let bytes = metadata_for_object_version("bucket", &object, Some(version));
-            write_test_object_metadata_bytes(&disk_root, "bucket", &object, &bytes).await;
-        }
-        let mut initial = DataUsageCache::default();
-        initial.info.name = "bucket".to_string();
-        let source = crate::data_usage_define::DataUsageCacheSource::new(0, 0);
-        let plan = crate::data_usage_define::DataUsageScanPlanDigest([31; 32]);
-        let identity = crate::data_usage_define::DataUsageScanIdentity {
-            version: 1,
-            bucket_incarnation: Uuid::from_u128(31),
-            set_layout: crate::data_usage_define::DataUsageScanPlanDigest([32; 32]),
-            publication_epoch: 1,
-            tier_registry_generation: 0,
-            scan_mode: HealScanMode::Normal,
-        };
-        assert_eq!(
-            initial.prepare_bucket_checkpoint("bucket", 1, 0, source, plan, identity),
-            crate::data_usage_define::DataUsageCachePrepareOutcome::Reset
-        );
-        initial.info.skip_healing = true;
-        initial.replace("bucket", "", DataUsageEntry::default());
+        let initial = seed_flat_bucket(&disk_root, request.objects).await;
         tokio::fs::write(&cache_path, initial.marshal_msg().expect("initial cache codec"))
             .await
             .expect("persist initial cache");
@@ -137,10 +156,11 @@ async fn round(request: &Request) -> serde_json::Value {
         &parent,
         crate::scanner_budget::ScannerCycleBudgetConfig {
             max_objects: Some(request.raw_entry_budget),
+            max_entries: Some(request.raw_entry_budget),
             ..Default::default()
         },
     );
-    let _observation_guard = install_raw_entry_budget(disk.path(), request.raw_entry_budget);
+    let _observation_guard = install_raw_entry_observer(disk.path());
     let result = scan_data_folder(
         budget.token(),
         budget.clone(),

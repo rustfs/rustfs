@@ -140,7 +140,23 @@ impl ReplacementExecution {
     /// A dropped page waiter must not release the lease of a mutation that is
     /// still executing. The owned worker keeps the lease through its I/O.
     pub(crate) async fn run<T: Send + 'static>(self: Arc<Self>, work: impl Future<Output = T> + Send + 'static) -> Result<T> {
-        tokio::spawn(async move {
+        self.run_with_owner(None, work).await
+    }
+
+    pub(super) async fn run_owned<T: Send + 'static>(
+        self: Arc<Self>,
+        parent: &super::manager::HealWork,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T> {
+        self.run_with_owner(Some(parent), work).await
+    }
+
+    async fn run_with_owner<T: Send + 'static>(
+        self: Arc<Self>,
+        parent: Option<&super::manager::HealWork>,
+        work: impl Future<Output = T> + Send + 'static,
+    ) -> Result<T> {
+        super::manager::spawn_heal_work(parent, move |_parent| async move {
             let _execution = self;
             work.await
         })

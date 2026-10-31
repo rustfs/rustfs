@@ -1638,6 +1638,7 @@ pub(super) async fn requeue_bucket_work(
     bucket: &BucketInfo,
     work_guard: &mut BucketWorkGuard,
 ) -> bool {
+    work_guard.settle_service_for_requeue();
     if bucket_tx.send(bucket.clone()).await.is_err() {
         return false;
     }

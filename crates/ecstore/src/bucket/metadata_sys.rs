@@ -1435,6 +1435,7 @@ pub(crate) async fn get_object_lock_config_state_in(
 
 /// Re-read the Object Lock state and bucket incarnation from the same
 /// authoritative metadata blob while the caller holds the transaction lock.
+#[cfg(all(test, feature = "test-util"))]
 pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
@@ -1453,6 +1454,27 @@ pub(crate) async fn get_object_lock_config_and_incarnation_from_disk_with_guard_
     get_delete_config_from_disk_in(ctx, bucket, guard, None).await
 }
 
+#[allow(clippy::type_complexity)]
+pub(crate) async fn get_object_lock_and_quota_config_from_disk_with_guard_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+) -> Result<(
+    ObjectLockConfigState,
+    Uuid,
+    OffsetDateTime,
+    std::result::Result<(Option<BucketQuota>, Uuid, OffsetDateTime), String>,
+)> {
+    let (state, incarnation_id, updated_at, quota_res) =
+        get_delete_and_quota_config_from_disk_in(ctx, bucket, guard, None, true).await?;
+    Ok((
+        state,
+        incarnation_id,
+        updated_at,
+        quota_res.unwrap_or(Ok((None, incarnation_id, updated_at))),
+    ))
+}
+
 /// Validate queued expiration against the same fresh metadata used for Object
 /// Lock admission. The caller holds the transaction read lock through commit,
 /// so a successful lifecycle update cannot be followed by an old-policy delete.
@@ -1462,6 +1484,24 @@ pub(crate) async fn get_delete_config_from_disk_in(
     guard: Option<&rustfs_lock::NamespaceLockGuard>,
     expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
 ) -> Result<(ObjectLockConfigState, Uuid, OffsetDateTime)> {
+    let (state, incarnation_id, updated_at, _) =
+        get_delete_and_quota_config_from_disk_in(ctx, bucket, guard, expiry_policy, false).await?;
+    Ok((state, incarnation_id, updated_at))
+}
+
+#[allow(clippy::type_complexity)]
+async fn get_delete_and_quota_config_from_disk_in(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    expiry_policy: Option<&rustfs_lifecycle::ExpiryPolicySnapshot>,
+    include_quota: bool,
+) -> Result<(
+    ObjectLockConfigState,
+    Uuid,
+    OffsetDateTime,
+    Option<std::result::Result<(Option<BucketQuota>, Uuid, OffsetDateTime), String>>,
+)> {
     let bucket_meta_sys_lock = bucket_metadata_sys_of(ctx)?;
     let bucket_meta_sys = bucket_meta_sys_lock.read().await.clone();
 
@@ -1477,7 +1517,7 @@ pub(crate) async fn get_delete_config_from_disk_in(
                 .await?
         }
     };
-    match authority {
+    match &authority {
         BucketMetadataAuthority::Authoritative(metadata)
             if metadata.bucket_incarnation_sidecar && !metadata.bucket_incarnation_id.is_nil() =>
         {
@@ -1489,11 +1529,11 @@ pub(crate) async fn get_delete_config_from_disk_in(
                 }
             }
             let object_lock_config_updated_at = metadata.object_lock_config_updated_at;
-            Ok((
-                object_lock_config_state_from_authoritative_metadata(&metadata)?,
-                metadata.bucket_incarnation_id,
-                object_lock_config_updated_at,
-            ))
+            let state = object_lock_config_state_from_authoritative_metadata(metadata)?;
+            let incarnation_id = metadata.bucket_incarnation_id;
+            let quota_res = include_quota
+                .then(|| quota_config_and_incarnation_from_authority(bucket, authority).map_err(|err| err.to_string()));
+            Ok((state, incarnation_id, object_lock_config_updated_at, quota_res))
         }
         BucketMetadataAuthority::Authoritative(_) => {
             Err(Error::other(format!("bucket incarnation metadata is not authoritative: {bucket}")))
@@ -1562,6 +1602,23 @@ pub(crate) async fn get_quota_config_and_incarnation_from_disk_for_options_in(
         .ok_or_else(|| Error::other("quota snapshot does not hold this bucket's metadata transaction fence"))?;
     if snapshot_guard.is_released() {
         return Err(Error::other("quota snapshot metadata transaction fence was released"));
+    }
+
+    #[cfg(test)]
+    let has_injected_error = sys.object_lock_disk_read_errors.read().await.contains(bucket);
+    #[cfg(not(test))]
+    let has_injected_error = false;
+    if !ctx.lock_manager().is_disabled()
+        && !has_injected_error
+        && let Some(fresh_quota) = snapshot.take_fresh_put_quota()
+    {
+        if snapshot_guard.is_lock_lost()
+            || snapshot_guard.is_released()
+            || !snapshot.is_valid_for_destructive_put(store.id, bucket, opts.expected_bucket_incarnation_id.unwrap_or_default())
+        {
+            return Err(Error::other("quota snapshot fence or bucket incarnation changed during the disk read"));
+        }
+        return fresh_quota.map_err(Error::other);
     }
 
     // The snapshot carries the caller's lifecycle fence, excluding deletion.
@@ -1750,9 +1807,22 @@ struct MetadataPublishGuard {
     _guard: tokio::sync::OwnedMutexGuard<MetadataPublishLockState>,
 }
 
+static LOCAL_META_MUTATION_GEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+pub(crate) fn bump_local_meta_mutation_gen() {
+    LOCAL_META_MUTATION_GEN.fetch_add(1, std::sync::atomic::Ordering::Release);
+}
+
+pub(crate) fn current_local_meta_mutation_gen() -> u64 {
+    LOCAL_META_MUTATION_GEN.load(std::sync::atomic::Ordering::Acquire)
+}
+
+type LocalAuthorityCache = Arc<StdMutex<HashMap<String, (u64, Arc<BucketMetadata>)>>>;
+
 #[derive(Debug, Clone)]
 pub struct BucketMetadataSys {
     metadata_map: Arc<RwLock<HashMap<String, Arc<BucketMetadata>>>>,
+    local_authority_cache: LocalAuthorityCache,
     /// Serializes metadata-map commits and their derived cache updates for one
     /// bucket. Namespace locks, when present, are acquired before this lock.
     metadata_publish_locks: Arc<MetadataPublishLockRegistry>,
@@ -1796,6 +1866,7 @@ impl BucketMetadataSys {
     pub fn new(api: Arc<ECStore>) -> Self {
         Self {
             metadata_map: Arc::new(RwLock::new(HashMap::new())),
+            local_authority_cache: Arc::new(StdMutex::new(HashMap::new())),
             metadata_publish_locks: Arc::new(MetadataPublishLockRegistry {
                 locks: StdMutex::new(HashMap::new()),
             }),
@@ -2160,6 +2231,7 @@ impl BucketMetadataSys {
     }
 
     pub async fn set(&self, bucket: String, bm: Arc<BucketMetadata>) {
+        bump_local_meta_mutation_gen();
         if !is_meta_bucketname(&bucket) {
             let publish_lock = self.metadata_publish_lock(&bucket);
             let _publish_guard = publish_lock.lock().await;
@@ -2178,6 +2250,7 @@ impl BucketMetadataSys {
     ///
     /// Returns `true` if an entry was present. Reserved meta buckets are ignored.
     pub async fn remove(&self, bucket: &str) -> bool {
+        bump_local_meta_mutation_gen();
         if is_meta_bucketname(bucket) {
             return false;
         }
@@ -2198,6 +2271,7 @@ impl BucketMetadataSys {
     }
 
     async fn _reset(&mut self) {
+        bump_local_meta_mutation_gen();
         let mut map = self.metadata_map.write().await;
         map.clear();
         drop(map);
@@ -3001,30 +3075,77 @@ impl BucketMetadataSys {
             return Err(Error::other(format!("injected Object Lock metadata disk read failure: {bucket}")));
         }
 
-        match await_bucket_namespace_operation(Some(guard), bucket, "bucket metadata snapshot existence check", async {
-            self.object_store()
-                .get_bucket_info_from_sets_at_read_quorum(bucket, &crate::storage_api_contracts::bucket::BucketOptions::default())
-                .await
-        })
-        .await
-        {
+        let store = self.object_store();
+        let can_use_local_authority_cache = !store.ctx.lock_manager().is_disabled() && store.all_disks_local_and_online();
+        let gen_before = current_local_meta_mutation_gen();
+        let cached_authority = can_use_local_authority_cache
+            .then(|| {
+                self.local_authority_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .get(bucket)
+                    .filter(|(cached_gen, _)| *cached_gen == gen_before)
+                    .map(|(_, bm)| Arc::clone(bm))
+            })
+            .flatten();
+        if let Some(cached) = cached_authority {
+            await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata authoritative snapshot",
+                std::future::ready(Ok::<_, Error>(())),
+            )
+            .await?;
+            if current_local_meta_mutation_gen() == gen_before && store.all_disks_local_and_online() {
+                return Ok(BucketMetadataAuthority::Authoritative(cached));
+            }
+        }
+
+        let (bucket_info_res, metadata_res) = tokio::join!(
+            Box::pin(await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata snapshot existence check",
+                async {
+                    store
+                        .get_bucket_info_from_sets_at_read_quorum(
+                            bucket,
+                            &crate::storage_api_contracts::bucket::BucketOptions::default(),
+                        )
+                        .await
+                },
+            )),
+            Box::pin(await_bucket_namespace_operation(
+                Some(guard),
+                bucket,
+                "bucket metadata authoritative snapshot",
+                load_bucket_metadata_parse_with_presence(Arc::clone(&store), bucket, true),
+            )),
+        );
+        match bucket_info_res {
             Ok(_) => {}
             Err(Error::VolumeNotFound) => return Ok(BucketMetadataAuthority::MissingBucket),
             Err(err) => return Err(err),
         }
 
-        let (metadata, persisted) = await_bucket_namespace_operation(
-            Some(guard),
-            bucket,
-            "bucket metadata authoritative snapshot",
-            load_bucket_metadata_parse_with_presence(self.object_store(), bucket, true),
-        )
-        .await?;
+        let (metadata, persisted) = metadata_res?;
         if persisted && metadata.lock_enabled && !metadata.bucket_creation_committed {
             return Err(Error::ErasureWriteQuorum);
         }
         if persisted {
-            Ok(BucketMetadataAuthority::Authoritative(Arc::new(metadata)))
+            let metadata = Arc::new(metadata);
+            if can_use_local_authority_cache
+                && metadata.bucket_incarnation_sidecar
+                && !metadata.bucket_incarnation_id.is_nil()
+                && current_local_meta_mutation_gen() == gen_before
+                && store.all_disks_local_and_online()
+            {
+                self.local_authority_cache
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .insert(bucket.to_string(), (gen_before, Arc::clone(&metadata)));
+            }
+            Ok(BucketMetadataAuthority::Authoritative(metadata))
         } else {
             Ok(BucketMetadataAuthority::Fabricated)
         }

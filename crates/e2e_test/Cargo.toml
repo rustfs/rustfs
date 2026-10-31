@@ -25,6 +25,7 @@ workspace = true
 
 [features]
 default = []
+scanner-peer-mixed-version = []
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

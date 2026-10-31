@@ -546,6 +546,24 @@ pub(crate) struct ScannerNodeActivity {
     pub(super) publication_blocked: bool,
 }
 
+#[cfg(feature = "e2e-test-hooks")]
+impl ScannerNodeActivity {
+    pub(crate) fn e2e_observation(&self) -> serde_json::Value {
+        serde_json::json!({
+            "instance_id": self.instance_id,
+            "namespace_generation": self.namespace_generation,
+            "maintenance_generation": self.maintenance_generation,
+            "protocol_version": self.protocol_version,
+            "topology_digest": crate::e2e_barrier::hex(&self.topology_digest),
+            "data_movement_active": self.data_movement_active,
+            "dirty_usage_generation": self.dirty_usage_generation,
+            "dirty_usage_pending": self.dirty_usage_pending,
+            "movement_generation": self.movement_generation,
+            "publication_blocked": self.publication_blocked,
+        })
+    }
+}
+
 pub(crate) type ScannerActivitySnapshot = BTreeMap<String, ScannerNodeActivity>;
 
 #[cfg(test)]

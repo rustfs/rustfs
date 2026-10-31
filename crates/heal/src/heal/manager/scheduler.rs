@@ -74,7 +74,7 @@ impl HealManager {
         let workload_provider = self.workload_provider.clone();
         let disposition_cache = self.disposition_cache.clone();
 
-        tokio::spawn(async move {
+        self.workers.spawn_fixed(0, move |parent| async move {
             let mut interval = interval(config.read().await.heal_interval);
 
             loop {
@@ -92,7 +92,7 @@ impl HealManager {
                         break;
                     }
                     _ = notify.notified(), if event_driven_scheduler_enable => {
-                        Self::process_heal_queue(HealQueueContext {
+                        Self::process_owned_heal_queue(HealQueueContext {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
@@ -109,11 +109,11 @@ impl HealManager {
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
                             disposition_cache: &disposition_cache,
-                        })
+                        }, &parent)
                         .await;
                     }
                     _ = interval.tick() => {
-                        Self::process_heal_queue(HealQueueContext {
+                        Self::process_owned_heal_queue(HealQueueContext {
                             heal_queue: &heal_queue,
                             active_heals: &active_heals,
                             completed_heals: &completed_heals,
@@ -130,19 +130,28 @@ impl HealManager {
                             cancel_token: &cancel_token,
                             workload_provider: &workload_provider,
                             disposition_cache: &disposition_cache,
-                        })
+                        }, &parent)
                         .await;
                     }
                 }
             }
-        });
+        })?;
 
         Ok(())
     }
 
     /// Process heal queue
     /// Processes multiple tasks per cycle when capacity allows and queue has high-priority items
+    #[cfg(test)]
     pub(super) async fn process_heal_queue(context: HealQueueContext<'_>) {
+        Self::process_heal_queue_inner(context, None).await;
+    }
+
+    async fn process_owned_heal_queue(context: HealQueueContext<'_>, parent: &HealWork) {
+        Self::process_heal_queue_inner(context, Some(parent)).await;
+    }
+
+    async fn process_heal_queue_inner(context: HealQueueContext<'_>, parent: Option<&HealWork>) {
         let HealQueueContext {
             heal_queue,
             active_heals,
@@ -254,7 +263,7 @@ impl HealManager {
                 let config_for_spawn = config.clone();
 
                 // start heal task
-                tokio::spawn(async move {
+                spawn_heal_work(parent, move |parent| async move {
                     debug!(
                         target: "rustfs::heal::manager",
                         event = EVENT_HEAL_SCHEDULER_STATE,
@@ -267,7 +276,7 @@ impl HealManager {
                         state = "task_started",
                         "Heal scheduler task started"
                     );
-                    let result = task.execute().await;
+                    let result = task.execute_owned(parent.clone()).await;
                     let retry_request = retry_request_for_result_with_budget(task.as_ref(), &result).await;
                     record_task_disposition(&disposition_cache_clone, task.as_ref(), &result, retry_request.is_some()).await;
                     match &result {
@@ -506,7 +515,7 @@ impl HealManager {
                         let retry_notify = notify_clone.clone();
                         let retry_manager_cancel_token = manager_cancel_token.clone();
                         let retry_config = config_for_spawn.clone();
-                        tokio::spawn(async move {
+                        spawn_heal_work(parent.as_ref(), move |_parent| async move {
                             let mut grace_admission_backoff = Duration::ZERO;
                             loop {
                                 let now = SystemTime::now()
@@ -735,7 +744,7 @@ impl HealManager {
 
         if delayed_by_mainline_throttle && let Some(pressure) = mainline_pressure {
             Self::record_mainline_throttle_delay(pressure, &config);
-            Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep);
+            Self::schedule_mainline_throttle_recheck(notify.clone(), config.mainline_max_sleep, parent, cancel_token.clone());
         }
 
         // Log queue status if items remain

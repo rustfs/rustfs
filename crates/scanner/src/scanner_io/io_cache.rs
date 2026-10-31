@@ -11,8 +11,9 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-/// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
 use super::*;
+/// ScannerIOCache implementation for SetDisks: bucket ordering, worker fan-out, merge, and publish.
+use crate::data_usage_define::clone_cache_value;
 
 pub(super) async fn collect_completed_bucket_results(
     ctx: CancellationToken,
@@ -202,7 +203,7 @@ pub(super) fn prepare_scoped_set_scan(
             lkg_last_update: old_cache.info.last_update,
             lkg_leader_epoch: Some(old_cache.info.leader_epoch),
             lkg_scan_plan_digest: old_cache.info.scan_plan_digest,
-            scan_bucket_incarnations: old_cache.info.scan_bucket_incarnations.clone(),
+            scan_bucket_incarnations: clone_cache_value(&old_cache.info.scan_bucket_incarnations),
             ..Default::default()
         },
         cache: HashMap::new(),
@@ -308,6 +309,7 @@ impl ScannerIOCache for SetDisks {
             publication_epoch,
             dirty_usage_buckets,
             bucket_failures,
+            bucket_completions,
             pending_maintenance_work,
             cache_cycle_floor,
             cold_zero_walk_reuse_observed,
@@ -346,10 +348,21 @@ impl ScannerIOCache for SetDisks {
                 None
             }
         };
+        let persisted_bucket_service = old_cache
+            .info
+            .scan_bucket_service
+            .take()
+            .filter(|_| old_cache.info.source == Some(source));
         // Captured before `prepare_for_scan` clears the mark: only a complete
         // snapshot may stand in for a bucket whose walk stops early.
         let old_cache_certified = old_cache.info.snapshot_complete && old_cache.info.last_update.is_some();
         let current_bucket_incarnations = scanner_current_bucket_incarnations(self.as_ref(), &all_buckets).await;
+        let service_round = Arc::new(ScannerBucketServiceRound::new(DataUsageBucketServiceLedger::restore(
+            clone_cache_value(&persisted_bucket_service),
+            expected_publication_epoch,
+            all_buckets.iter().map(|bucket| bucket.name.as_str()),
+            current_bucket_incarnations.as_ref(),
+        )));
         let scoped_scan = prepare_scoped_set_scan(
             &old_cache,
             &buckets,
@@ -395,8 +408,8 @@ impl ScannerIOCache for SetDisks {
                             scan_plan_digest: Some(scan_plan_digest),
                             scan_coverage_digest: Some(bucket_coverage_digest),
                             cache_key_format: DATA_USAGE_CACHE_KEY_FORMAT,
-                            segment_invalidation_proof: completed_segment_invalidation_proof.clone(),
-                            scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
+                            segment_invalidation_proof: clone_cache_value(&completed_segment_invalidation_proof),
+                            scan_bucket_incarnations: clone_cache_value(&current_bucket_incarnations).unwrap_or_default(),
                             ..Default::default()
                         },
                         cache: HashMap::new(),
@@ -410,6 +423,7 @@ impl ScannerIOCache for SetDisks {
             };
             cache.info.last_update = Some(now);
             cache.info.snapshot_complete = true;
+            cache.info.scan_bucket_service = persisted_bucket_service;
             let replication_execution = super::cache::scanner_replication_execution_digest(execution_digest, &cache);
             cache.info.scan_execution_digest = Some(replication_execution);
             cache.info.segment_invalidation_proof = completed_segment_invalidation_proof;
@@ -451,8 +465,8 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no online disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
-            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            let lkg = old_cache.info.snapshot_complete.then(|| clone_cache_value(&old_cache));
+            let mut incomplete_scope = clone_cache_value(&lkg).unwrap_or_default();
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;
@@ -551,8 +565,8 @@ impl ScannerIOCache for SetDisks {
                 "Scanner set state found no usable namespace scanner disks"
             );
             reset_disk_bucket_scan_gauges(&pool_label, &set_label);
-            let lkg = old_cache.info.snapshot_complete.then(|| old_cache.clone());
-            let mut incomplete_scope = lkg.clone().unwrap_or_default();
+            let lkg = old_cache.info.snapshot_complete.then(|| clone_cache_value(&old_cache));
+            let mut incomplete_scope = clone_cache_value(&lkg).unwrap_or_default();
             incomplete_scope.info.name = DATA_USAGE_ROOT.to_string();
             incomplete_scope.info.next_cycle = want_cycle;
             incomplete_scope.info.last_update = None;
@@ -728,7 +742,7 @@ impl ScannerIOCache for SetDisks {
                     lkg_leader_epoch: old_cache.info.lkg_leader_epoch,
                     lkg_scan_plan_digest: old_cache.info.lkg_scan_plan_digest,
                     segment_invalidation_proof: None,
-                    scan_bucket_incarnations: current_bucket_incarnations.clone().unwrap_or_default(),
+                    scan_bucket_incarnations: clone_cache_value(&current_bucket_incarnations).unwrap_or_default(),
                     ..Default::default()
                 },
                 cache: HashMap::new(),
@@ -751,10 +765,13 @@ impl ScannerIOCache for SetDisks {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .order_buckets(source, &mut scan_order);
         }
+        // Durable age outranks both orders above; they only break its ties,
+        // so a restart cannot hand the budget back to the same first buckets.
+        service_round.order_buckets(&mut scan_order);
 
         for bucket in scan_order.iter() {
             if let Some(c) = old_cache.find(&bucket.name) {
-                cache.replace(&bucket.name, DATA_USAGE_ROOT, c.clone());
+                cache.replace(&bucket.name, DATA_USAGE_ROOT, clone_cache_value(c));
             }
 
             if let Err(e) = bucket_tx.send(bucket.clone()).await {
@@ -788,6 +805,7 @@ impl ScannerIOCache for SetDisks {
         } in walkers
         {
             let service_cohort_clone = service_cohort.clone();
+            let service_round_clone = service_round.clone();
             let bucket_rx_mutex_clone = bucket_rx_mutex.clone();
             let bucket_tx_clone = bucket_tx.clone();
             let remaining_bucket_work_clone = remaining_bucket_work.clone();
@@ -809,6 +827,8 @@ impl ScannerIOCache for SetDisks {
             let scope_clone = scope.clone();
             let cache_cycle_floor_clone = cache_cycle_floor.clone();
             let expected_publication_epoch_clone = expected_publication_epoch;
+            #[cfg(feature = "e2e-test-hooks")]
+            let worker_incarnations = current_bucket_incarnations.clone();
             let remote_server_epoch = match worker_mode {
                 NamespaceScannerWorkerMode::RemoteV4(server_epoch) => Some(server_epoch),
                 NamespaceScannerWorkerMode::Coordinator => None,
@@ -870,6 +890,13 @@ impl ScannerIOCache for SetDisks {
                             .unwrap_or_else(|poisoned| poisoned.into_inner())
                             .record_admitted(source, &bucket.name);
                     }
+                    let (bucket_budget, scan_ctx) = budget_clone.for_bucket(&ctx_clone);
+                    work_guard.claim_service(
+                        service_round_clone.clone(),
+                        &bucket.name,
+                        ctx_clone.clone(),
+                        bucket_budget.clone(),
+                    );
 
                     debug!(
                         target: "rustfs::scanner::io",
@@ -909,10 +936,10 @@ impl ScannerIOCache for SetDisks {
                             break;
                         };
                         remote_session_sequence = next_sequence;
-                        let remote_outcome = crate::remote_scanner::scan_remote_bucket(
+                        let remote_scan = crate::remote_scanner::scan_remote_bucket(
                             &disk,
-                            ctx_clone.clone(),
-                            budget_clone.clone(),
+                            scan_ctx.clone(),
+                            bucket_budget.clone(),
                             crate::remote_scanner::RemoteScannerScanSpec {
                                 bucket: &bucket.name,
                                 next_cycle: want_cycle,
@@ -925,8 +952,13 @@ impl ScannerIOCache for SetDisks {
                                 skip_healing: healing,
                                 scan_mode,
                             },
-                        )
-                        .await;
+                        );
+                        #[cfg(feature = "e2e-test-hooks")]
+                        let remote_scan = crate::e2e_barrier::worker_observation::with_incarnation(
+                            worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)).copied(),
+                            remote_scan,
+                        );
+                        let remote_outcome = remote_scan.await;
                         match remote_outcome {
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Complete {
                                 usage,
@@ -950,6 +982,11 @@ impl ScannerIOCache for SetDisks {
                                 }
                             }
                             Ok(crate::remote_scanner::RemoteScannerOutcome::Partial) => {
+                                // A remote count budget stops on entries it does
+                                // not report back, so the partial proves no failure.
+                                if bucket_budget.max_objects().is_some() || bucket_budget.max_directories().is_some() {
+                                    work_guard.mark_service_interrupted();
+                                }
                                 record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
                                 debug!(
                                     target: "rustfs::scanner::io",
@@ -1087,6 +1124,11 @@ impl ScannerIOCache for SetDisks {
                     };
                     #[cfg(test)]
                     super::tests::observe_coordinator_bucket_scan_admitted(worker_index, &bucket.name).await;
+                    #[cfg(test)]
+                    if super::tests::coordinator_bucket_scan_fails(&bucket.name) {
+                        record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
+                        continue;
+                    }
 
                     // Lock order: scanner leader fence -> set-scoped per-bucket cache lock ->
                     // cache object read/write.
@@ -1322,10 +1364,27 @@ impl ScannerIOCache for SetDisks {
                     let (checkpoint_tx, mut checkpoint_rx) = mpsc::channel::<DataUsageCache>(1);
                     let (node_tx, mut node_rx) = crate::workload_admission::scanner_node_request_channel();
 
-                    let scan_ctx = ctx_clone.child_token();
+                    let scan_position_before = cache.durable_scan_position();
+                    #[cfg(feature = "e2e-test-hooks")]
+                    {
+                        let disk_uuid = if crate::e2e_barrier::worker_observation::enabled() {
+                            crate::storage_api::owner::EcstoreDiskAPI::get_disk_id(disk.as_ref()).await.ok().flatten()
+                        } else { None };
+                        let location = disk.get_disk_location();
+                        let _ = crate::e2e_barrier::checkpoint("bucket_walk", serde_json::json!({
+                            "epoch": leader_epoch, "cycle": want_cycle,
+                            "pool": source.pool_index, "set": source.set_index,
+                            "bucket": bucket.name, "drive": disk.path().display().to_string(),
+                            "worker_kind": "local", "worker_path": disk.path().display().to_string(),
+                            "worker_endpoint": crate::storage_api::owner::EcstoreDiskAPI::endpoint(disk.as_ref()).grid_host(),
+                            "disk_uuid": disk_uuid,
+                            "disk_index": location.disk_idx,
+                            "bucket_incarnation": worker_incarnations.as_ref().and_then(|values| values.get(&bucket.name)),
+                        })).await;
+                    }
                     let scan = crate::workload_admission::with_scanner_node_requests(node_tx, disk.clone().nsscanner_disk(
                         scan_ctx.clone(),
-                        budget_clone.clone(),
+                        bucket_budget.clone(),
                         set_disk_inventory_clone.as_ref().clone(),
                         cache,
                         None,
@@ -1475,6 +1534,20 @@ impl ScannerIOCache for SetDisks {
                     }
                     let scan_outcome = match scan_result {
                         Ok(scan_outcome) => scan_outcome,
+                        Err(e) if bucket_budget.quantum_exhausted() => {
+                            record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
+                            debug!(
+                                target: "rustfs::scanner::io",
+                                event = EVENT_SCANNER_DISK_BUCKET_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_IO,
+                                bucket = %bucket.name,
+                                state = "quantum_exhausted_without_progress",
+                                error = %e,
+                                "Scanner bucket quantum ended before durable progress"
+                            );
+                            continue;
+                        }
                         Err(e) => {
                             record_failed_dirty_bucket(&failed_dirty_buckets_clone, &bucket.name).await;
                             if ctx_clone.is_cancelled() {
@@ -1516,7 +1589,12 @@ impl ScannerIOCache for SetDisks {
                             }
                             (completed_cache, false)
                         }
-                        ScannerDiskScanOutcome::Partial(partial_cache) => (partial_cache, true),
+                        ScannerDiskScanOutcome::Partial(partial_cache) => {
+                            if partial_cache.info.scan_resource_deferred {
+                                work_guard.mark_service_interrupted();
+                            }
+                            (partial_cache, true)
+                        }
                         ScannerDiskScanOutcome::NamespaceNotFound(_) => {
                             if requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await {
                                 increment_disk_bucket_scans_queued(
@@ -1540,7 +1618,6 @@ impl ScannerIOCache for SetDisks {
                         }
                     };
                     if partial {
-                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
                         let done_save = Metrics::time(Metric::SaveUsage);
                         let partial_saved = if cache_guard.is_lock_lost() {
                             false
@@ -1578,6 +1655,21 @@ impl ScannerIOCache for SetDisks {
                         if partial_saved {
                             log_saved_partial_bucket_cache(&cache, &cache_name);
                         }
+                        // Only saved forward motion earns another turn in this
+                        // cycle; otherwise the bucket waits for the next one.
+                        if partial_saved
+                            && bucket_budget.quantum_exhausted()
+                            && cache.durable_scan_position() != scan_position_before
+                            && requeue_bucket_work(&bucket_tx_clone, &bucket, &mut work_guard).await
+                        {
+                            increment_disk_bucket_scans_queued(
+                                &queued_disk_bucket_scans_clone,
+                                &pool_label_clone,
+                                &set_label_clone,
+                            );
+                            continue;
+                        }
+                        record_partial_dirty_bucket(&partial_dirty_buckets_clone, &bucket.name).await;
 
                         continue;
                     }
@@ -1752,6 +1844,22 @@ impl ScannerIOCache for SetDisks {
             return Err(err);
         }
 
+        // Record only actual worker completions, before adding carried values.
+        // The root's cold entries cannot certify a newly observed peer tuple.
+        if let Some(completions) = bucket_completions {
+            let completed_incarnations = completed_buckets
+                .iter()
+                .filter_map(|bucket| {
+                    current_bucket_incarnations
+                        .as_ref()?
+                        .get(bucket)
+                        .filter(|incarnation| !incarnation.is_nil())
+                        .map(|incarnation| (bucket.clone(), *incarnation))
+                })
+                .collect();
+            completions.lock().await.insert(source, completed_incarnations);
+        }
+
         let carried_buckets = carry_partial_bucket_values(
             &mut cache,
             &old_cache,
@@ -1782,6 +1890,14 @@ impl ScannerIOCache for SetDisks {
                 .await
                 .extend(carried_buckets.iter().cloned());
         }
+        let service_ledger = {
+            let failed = bucket_failures.hard.lock().await;
+            let partial = bucket_failures.partial.lock().await;
+            service_round.settle(&completed_buckets, &failed, &partial)
+        };
+        if let Some(ledger) = &service_ledger {
+            record_bucket_failure_debt(source, want_cycle, ledger);
+        }
         let completed_count = completed_buckets.len();
         let covered_count = completed_count.saturating_add(carried_buckets.len());
         let coverage_complete =
@@ -1809,6 +1925,7 @@ impl ScannerIOCache for SetDisks {
             if cold_zero_walk_reuse_candidate {
                 cold_zero_walk_reuse_observed.store(true, Ordering::Release);
             }
+            cache.info.scan_bucket_service = service_ledger.or(persisted_bucket_service);
             let _ = persist_and_publish_cache_snapshot(
                 self.clone(),
                 &updates,
@@ -1866,6 +1983,20 @@ impl ScannerIOCache for SetDisks {
                 cancelled = ctx.is_cancelled(),
                 "Scanner set cache publish skipped because cycle did not complete cleanly"
             );
+            // Publish the scope first: a contended cache lock must not delay it.
+            // A stopped owner leaves the set cache untouched; only a budget stop
+            // or a finished incomplete cycle hands its order to the next one.
+            if let Some(ledger) = service_ledger.filter(|_| !ctx.is_cancelled() || budget.budget_elapsed()) {
+                persist_scanner_service_ledger(
+                    self.clone(),
+                    source,
+                    ledger,
+                    want_cycle,
+                    leader_epoch,
+                    expected_publication_epoch,
+                )
+                .await;
+            }
         }
 
         debug!(

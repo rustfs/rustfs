@@ -30,15 +30,21 @@ pub mod local;
 pub mod multipart_source;
 pub mod os;
 
+pub(crate) use io_admission::memory as background_memory;
+pub(crate) use io_admission::remote as remote_io_admission;
+pub use io_admission::{
+    BackgroundMemoryBudget, PhysicalDiskBinding, PhysicalDiskPlan, PhysicalDiskSample, PhysicalDiskSampler, PhysicalResourcePlan,
+    RemoteBackgroundIo, spawn_blocking_with_resource_ownership, with_background_disk_io, with_background_resource_set,
+    with_background_resource_unit, with_remote_background_io,
+};
 pub use local::pool_meta_native::{PoolMetaNativeCasCondition, PoolMetaNativeFileIdentity};
 
 #[cfg(test)]
-pub(crate) use io_admission::DiskIoClass;
+pub(crate) use io_admission::{DiskIoClass, test_resource_units};
 pub(crate) use io_admission::{
-    acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, with_optional_disk_io_context,
-    with_optional_resource_unit,
+    PhysicalHealBinding, acquire_context_disk_io_permit, current_disk_io_context, current_resource_unit, has_resource_io_scope,
+    with_optional_disk_io_context, with_optional_resource_unit,
 };
-pub use io_admission::{with_background_disk_io, with_background_resource_unit};
 
 pub const RUSTFS_META_BUCKET: &str = ".rustfs.sys";
 pub const MIGRATING_META_BUCKET: &str = ".minio.sys";
@@ -305,6 +311,14 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// Physical ownership belongs to the node hosting the local attachment.
+    pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
+        match self {
+            Self::Local(disk) => Some(disk.physical_admission()),
+            Self::Remote(_) => None,
+        }
+    }
+
     /// A read-only probe; the physical delete repeats the same leaf checks.
     pub async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
         match self {
@@ -384,6 +398,39 @@ impl Disk {
                 disk.settle_delete_transaction(volume, object, transaction, expected_fingerprint, action)
                     .await
             }
+        }
+    }
+
+    pub(crate) async fn try_publish_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Ok(None),
+        }
+    }
+
+    pub(crate) async fn try_finish_and_finalize_prepared_delete_local(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        journal: &DeleteRecoveryJournal,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<bool> {
+        match self {
+            Self::Local(disk) => {
+                disk.try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
+                    .await
+            }
+            Self::Remote(_) => Ok(false),
         }
     }
 

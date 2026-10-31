@@ -1,8 +1,7 @@
 // Copyright 2026 RustFS Team
 // Licensed under the Apache License, Version 2.0.
 
-//! Opt-in node scheduling feedback. This is not a physical-disk reservation or
-//! a byte budget: native work and escaping buffers require their own owners.
+//! Opt-in node scheduling, physical-device feedback and native stream-buffer caps.
 
 use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
 use rustfs_concurrency::foreground::ForegroundWindow;
@@ -13,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio_util::sync::CancellationToken;
 
 use crate::cgroup_resources::live::{CpuCoreObservation, CpuQuotaSample, ResourceSample};
+use crate::storage_api::startup::background::{BackgroundMemoryBudget, ECStore, PhysicalDiskSample, PhysicalDiskSampler};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) const MAXIMUM: NonZeroU16 = NonZeroU16::new(256).expect("fixed nonzero scheduling bound");
@@ -371,46 +371,83 @@ fn cpu_core_pressure(
     }
 }
 
-struct Lifetime(Arc<NodeAdmission>);
+// Match the resource policy's low-pressure headroom, and cap this staging
+// storage at ten percent of the effective memory limit. Headroom is already net
+// of retained allocations; using it directly conservatively includes other work.
+fn memory_capacity(sample: ResourceSample) -> u64 {
+    (sample.memory_limit / 10).min(sample.memory_headroom.saturating_sub(sample.memory_limit / 5))
+}
+
+struct Lifetime(Arc<NodeAdmission>, Arc<BackgroundMemoryBudget>);
 impl Drop for Lifetime {
     fn drop(&mut self) {
+        self.1.set_sampled_limit(0, Duration::ZERO);
         self.0.update(&mut FeedbackController::new(), None);
     }
 }
 
 pub(crate) fn start(
     owner: Arc<NodeAdmission>,
+    memory: Arc<BackgroundMemoryBudget>,
+    store: Arc<ECStore>,
     cancel: CancellationToken,
     provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>,
 ) {
-    let lifetime = Lifetime(owner);
+    let lifetime = Lifetime(owner, memory);
     tokio::spawn(async move {
         let lifetime = lifetime;
         let mut policy = Policy::default();
         let mut controller = FeedbackController::new();
+        let mut physical = PhysicalDiskSampler::default();
         let mut tick = tokio::time::interval(SAMPLE_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! { biased; _ = cancel.cancelled() => break, _ = tick.tick() => {} }
             // One blocking sample at a time. A stuck reader cannot create an
             // unbounded worker queue; the previous admission lease expires.
-            let sample = tokio::select! {
+            let disks = PhysicalDiskSample::collect(&store);
+            let samples = tokio::select! {
                 biased;
                 _ = cancel.cancelled() => break,
-                result = tokio::task::spawn_blocking(|| {
+                result = tokio::task::spawn_blocking(move || {
                     let began = Instant::now();
-                    let (sample, quota_ancestors, cpu_cores) = crate::cgroup_resources::live::sample_for_admission()?;
-                    Ok::<_, std::io::Error>(TimedResources { sample, quota_ancestors, cpu_cores, began, ended: Instant::now() })
-                }) => result.ok().and_then(Result::ok),
+                    let sample = crate::cgroup_resources::live::sample_for_admission().ok().map(
+                        |(sample, quota_ancestors, cpu_cores)| TimedResources {
+                            sample,
+                            quota_ancestors,
+                            cpu_cores,
+                            began,
+                            ended: Instant::now(),
+                        },
+                    );
+                    (sample, disks.read())
+                }) => result.ok(),
             };
             let foreground = crate::foreground_observation::latest_window();
             let registry = provider.workload_admission_snapshot();
             // Recheck age after every input read, including a delayed provider.
-            let observation = policy.observe(Instant::now(), sample, foreground, &registry);
-            let decision = lifetime.0.update(&mut controller, observation);
+            let observation = policy.observe(
+                Instant::now(),
+                samples.as_ref().and_then(|(sample, _)| sample.clone()),
+                foreground,
+                &registry,
+            );
+            let memory_limit = observation
+                .and_then(|_| samples.as_ref().and_then(|(sample, _)| sample.as_ref()))
+                .map_or(0, |sample| memory_capacity(sample.sample));
+            lifetime.1.set_sampled_limit(memory_limit, Duration::from_secs(3));
+            let decision = lifetime
+                .0
+                .update_with_probe(&mut controller, observation, physical.node_may_probe());
+            if let Some((_, disks)) = samples {
+                physical.publish(disks, observation.map_or(ResourcePressure::Unknown, |sample| sample.pressure));
+            }
             if rustfs_io_metrics::metrics_enabled() {
                 metrics::gauge!("rustfs_background_node_admission_limit").set(f64::from(decision.limit));
                 metrics::gauge!("rustfs_background_node_admission_active").set(f64::from(lifetime.0.snapshot().active));
+                let memory = lifetime.1.snapshot();
+                metrics::gauge!("rustfs_background_buffer_memory_limit_bytes").set(memory.limit as f64);
+                metrics::gauge!("rustfs_background_buffer_memory_retained_bytes").set(memory.used as f64);
             }
         }
     });
@@ -434,6 +471,19 @@ mod tests {
             io_stall_usec: Some(0),
             identity: 1,
         }
+    }
+
+    #[test]
+    fn buffer_capacity_respects_effective_limit_and_headroom() {
+        let mut sample = resources();
+        for (headroom, expected) in [(0, 0), (199, 0), (200, 0), (201, 1), (250, 50), (300, 100), (1000, 100)] {
+            sample.memory_headroom = headroom;
+            assert_eq!(memory_capacity(sample), expected, "headroom={headroom}");
+        }
+        sample.memory_limit = 500;
+        assert_eq!(memory_capacity(sample), 50, "a hot shrink changes the absolute cap");
+        sample.memory_limit = 0;
+        assert_eq!(memory_capacity(sample), 0, "missing effective capacity cannot grant memory");
     }
 
     fn timed(at: Instant, sample: ResourceSample) -> TimedResources {
@@ -1025,7 +1075,10 @@ mod tests {
             }),
         );
         let active = owner.acquire().await;
-        drop(Lifetime(owner.clone()));
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(1024, Duration::from_secs(3));
+        drop(Lifetime(owner.clone(), memory.clone()));
+        assert_eq!(memory.snapshot().limit, 0, "sampler shutdown closes new buffer admission");
         assert_eq!(owner.snapshot().limit, 0);
         assert_eq!(owner.snapshot().active, 1);
         assert!(owner.try_acquire().is_none());

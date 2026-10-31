@@ -1815,12 +1815,13 @@ impl S3 for FS {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        let _ = store
-            .get_bucket_info(&bucket, &BucketOptions::default())
-            .await
-            .map_err(ApiError::from)?;
-
-        validate_bucket_object_lock_enabled(&bucket).await?;
+        if let Err(err) = validate_bucket_object_lock_enabled(&bucket).await {
+            let _ = store
+                .get_bucket_info(&bucket, &BucketOptions::default())
+                .await
+                .map_err(ApiError::from)?;
+            return Err(err);
+        }
 
         let opts: ObjectOptions = get_opts(&bucket, &key, version_id, None, &req.headers)
             .await
@@ -1841,19 +1842,22 @@ impl S3 for FS {
         // once BEFORE the commit and persist the pending marker with it, so a restart between
         // the commit and the worker write-back leaves a Pending status on disk for the scanner
         // to re-drive. Scheduling without that marker would lose the task silently.
-        let dsc = match store.get_object_info(&bucket, &key, &opts).await.ok() {
-            Some(info) => {
-                must_replicate_metadata(
-                    &bucket,
-                    &key,
-                    &info.user_defined,
-                    info.user_tags.as_ref().clone(),
-                    popts.delete_marker_replication_status(),
-                    popts.clone(),
-                )
-                .await
-            }
-            None => ReplicateDecision::new(),
+        let dsc = if crate::app::storage_api::bucket::metadata_sys::get_replication_config(&bucket)
+            .await
+            .is_ok()
+            && let Ok(info) = store.get_object_info(&bucket, &key, &opts).await
+        {
+            must_replicate_metadata(
+                &bucket,
+                &key,
+                &info.user_defined,
+                info.user_tags.as_ref().clone(),
+                popts.delete_marker_replication_status(),
+                popts.clone(),
+            )
+            .await
+        } else {
+            ReplicateDecision::new()
         };
 
         let mut eval_metadata = parse_object_lock_legal_hold(legal_hold)?;

@@ -17,7 +17,9 @@ SAFE_ENVIRONMENT = frozenset({
     "RUSTFS_ADDRESS", "RUSTFS_CONSOLE_ENABLE", "RUSTFS_ERASURE_SET_DRIVE_COUNT",
     "RUSTFS_STORAGE_CLASS_STANDARD", "RUSTFS_DURABILITY_MODE", "RUSTFS_NEW_BUCKET_DURABILITY_MODE",
     "RUSTFS_SCANNER_ENABLED", "RUSTFS_HEAL_ENABLED", "RUSTFS_SCANNER_SPEED", "RUSTFS_SCANNER_IDLE_MODE",
-    "RUSTFS_SCANNER_START_DELAY_SECS", "RUSTFS_SCANNER_CYCLE",
+    "RUSTFS_SCANNER_START_DELAY_SECS", "RUSTFS_SCANNER_CYCLE", "RUSTFS_SCANNER_PREFIX_ATTRIBUTION",
+    "HOTPATH_FOCUS", "HOTPATH_ALLOC_CUMULATIVE", "HOTPATH_PROMETHEUS_HOST", "HOTPATH_PROMETHEUS_PORT",
+    "HOTPATH_METRICS_PORT", "HOTPATH_OUTPUT_PATH", "HOTPATH_DRAIN_INTERVAL",
     "RUSTFS_HEAL_ADAPTIVE_ADMISSION",
     "RUSTFS_OBJECT_LOCK_DIAG_ENABLE", "RUSTFS_OBS_LOGS_EXPORT_ENABLED", "RUSTFS_OBS_TRACES_EXPORT_ENABLED",
     "RUSTFS_OBS_METRICS_EXPORT_ENABLED", "RUST_LOG", "NO_PROXY", "no_proxy",
@@ -66,7 +68,7 @@ def environment_digest(raw, expected):
         key = key.decode()
         if key in PRIVATE_ENVIRONMENT:
             continue
-        if key.startswith("RUSTFS_") or key in SAFE_ENVIRONMENT:
+        if key.startswith(("RUSTFS_", "HOTPATH_")) or key in SAFE_ENVIRONMENT:
             require(key in SAFE_ENVIRONMENT and key not in observed, "unrecognized or duplicate benchmark environment")
             observed[key] = value.decode()
     require(observed == expected, "benchmark environment mismatch")

@@ -37,6 +37,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::info;
 use uuid::Uuid;
 
+mod heal_generation_observation;
 mod storage_api;
 
 #[path = "lifecycle/scanner_heal_scope.rs"]

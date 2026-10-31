@@ -979,6 +979,30 @@ async fn test_namespace_lock_distributed_retries_transient_acquire_timeout() {
     drop(guard);
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_namespace_lock_retries_when_backoff_exceeds_remaining_budget() {
+    let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
+    let flaky_clients = managers
+        .iter()
+        .map(|manager| Arc::new(FlakyAcquireClient::new(manager.clone(), 1)))
+        .collect::<Vec<_>>();
+    let clients = flaky_clients
+        .iter()
+        .map(|client| client.clone() as Arc<dyn LockClient>)
+        .collect::<Vec<_>>();
+    let lock = NamespaceLock::with_clients("short-retry-budget".to_string(), clients);
+    let resource = create_test_object_key("bucket", "short-retry-budget");
+
+    // The first jittered backoff is at least 187 ms, but a second attempt can
+    // still succeed within this budget once the transient failure has cleared.
+    let guard = lock
+        .get_write_lock(resource, "owner", Duration::from_millis(180))
+        .await
+        .expect("a backoff longer than the remaining budget must not discard the remaining attempt");
+    assert!(flaky_clients.iter().any(|client| client.acquire_attempts() >= 2));
+    drop(guard);
+}
+
 #[tokio::test]
 async fn test_namespace_lock_distributed_waits_full_timeout_for_late_release() {
     let managers = (0..3).map(|_| Arc::new(GlobalLockManager::new())).collect::<Vec<_>>();
@@ -1136,10 +1160,16 @@ async fn test_namespace_lock_distributed_contention_quorum_miss_times_out() {
     let lock = NamespaceLock::with_clients("contention-timeout".to_string(), clients);
     let resource = create_test_object_key("bucket", "object-contention-timeout");
 
-    let err = lock
-        .get_write_lock(resource, "owner-a", Duration::from_millis(40))
+    let timeout = Duration::from_millis(40);
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(2), lock.get_write_lock(resource, "owner-a", timeout))
         .await
+        .expect("contended acquisition must remain bounded")
         .expect_err("ordinary contention should exhaust acquire timeout");
+    assert!(
+        started.elapsed() >= timeout,
+        "a contended acquisition must not return before its configured deadline"
+    );
 
     let err_str = err.to_string().to_lowercase();
     assert!(err_str.contains("timeout"), "expected timeout after contention retries, got: {err}");

@@ -18,6 +18,7 @@ These implementation, style, and quality rules apply to all contributions, regar
 - Do not include agent, tool, contributor, account, or organization names in branch names.
 - Push to the user-requested remote or the repository's configured push remote. Do not hard-code or infer a remote from an account name.
 - Check free space before artifact-heavy builds, tests, coverage, or downloads. Re-check before a broad gate when space is tight.
+- Before handoff, remove the Cargo target directories and temporary worktrees the task created unless they stay intentionally or hold unmerged work. Identify build output by Cargo's markers (`.rustc_info.json`, `CACHEDIR.TAG`), not by directory name: `target` is also a source directory here.
 - Remove only task-owned temporary/build artifacts. Never delete another task's worktree or uncommitted data.
 - At handoff, mention disk or cleanup details only when they affected execution or artifacts/worktrees remain intentionally.
 - For Docker verification, ensure the tested image contains the intended binary. `buildx build` without `--load` leaves the image in the build cache; use the Makefile's loaded image and rebuild without cache only when stale artifacts are evidenced.

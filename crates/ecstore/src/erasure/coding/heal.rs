@@ -12,8 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::disk::background_memory::{Reservation, is_memory_pressure};
 use crate::disk::disk_store::get_object_disk_read_timeout;
 use crate::disk::error::{Error, Result};
+use crate::disk::{BackgroundMemoryBudget, current_resource_unit};
 use crate::erasure::coding::BitrotReader;
 use crate::erasure::coding::BitrotWriterWrapper;
 use crate::erasure::coding::encode::MultiWriter;
@@ -22,6 +24,7 @@ use futures::StreamExt;
 use futures::stream::FuturesUnordered;
 use std::io;
 use std::io::ErrorKind;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::AsyncRead;
 use tracing::{trace, warn};
@@ -30,21 +33,53 @@ const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_ERASURE: &str = "erasure";
 const EVENT_ERASURE_HEAL_STARTED: &str = "erasure_heal_started";
 
+struct HealShards {
+    // Drop payloads before refunding their reservations on every error path.
+    shards: Vec<Option<Vec<u8>>>,
+    memory: Vec<Option<Reservation>>,
+    budget: Option<Arc<BackgroundMemoryBudget>>,
+}
+
+impl HealShards {
+    fn reserve_missing(&mut self, shard_size: usize) -> io::Result<()> {
+        if let Some(budget) = &self.budget {
+            for (shard, memory) in self.shards.iter().zip(&mut self.memory) {
+                if shard.is_none() {
+                    *memory = Some(budget.reserve(shard_size)?);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn into_bytes(self) -> Vec<Bytes> {
+        self.shards
+            .into_iter()
+            .zip(self.memory)
+            .map(|(shard, memory)| Reservation::wrap(Bytes::from(shard.unwrap_or_default()), memory))
+            .collect()
+    }
+}
+
 async fn read_heal_shards<R>(
     readers: &mut [Option<BitrotReader<R>>],
     shard_size: usize,
     read_timeout: Duration,
-) -> (Vec<Option<Vec<u8>>>, Vec<Option<Error>>)
+) -> Result<(HealShards, Vec<Option<Error>>)>
 where
     R: AsyncRead + Unpin + Send + Sync,
 {
     let num_readers = readers.len();
-    let mut shards = vec![None; num_readers];
+    let mut shards = HealShards {
+        shards: vec![None; num_readers],
+        memory: std::iter::repeat_with(|| None).take(num_readers).collect(),
+        budget: current_resource_unit().and_then(|resources| resources.memory_budget()),
+    };
     let mut errs = vec![None; num_readers];
     let mut retire_readers = Vec::new();
 
     if shard_size == 0 {
-        return (shards, errs);
+        return Ok((shards, errs));
     }
 
     {
@@ -55,8 +90,17 @@ where
                 continue;
             };
 
+            let budget = shards.budget.clone();
             futures.push(Box::pin(async move {
-                let mut buf = vec![0; shard_size];
+                let memory = match budget.as_ref().map(|budget| budget.reserve(shard_size)).transpose() {
+                    Ok(memory) => memory,
+                    Err(error) => return (index, Err(Error::from(error)), false),
+                };
+                let mut buf = Vec::new();
+                if buf.try_reserve_exact(shard_size).is_err() {
+                    return (index, Err(Error::from(io::Error::from(ErrorKind::OutOfMemory))), false);
+                }
+                buf.resize(shard_size, 0);
                 let read_result = if read_timeout.is_zero() {
                     reader.read(&mut buf).await
                 } else {
@@ -75,7 +119,7 @@ where
                 match read_result {
                     Ok(n) => {
                         buf.truncate(n);
-                        (index, Ok(buf), false)
+                        (index, Ok((buf, memory)), false)
                     }
                     Err(err) => {
                         let should_retire = err.kind() == ErrorKind::TimedOut;
@@ -87,10 +131,14 @@ where
 
         while let Some((index, result, should_retire)) = futures.next().await {
             match result {
-                Ok(shard) => {
-                    shards[index] = Some(shard);
+                Ok((shard, memory)) => {
+                    shards.shards[index] = Some(shard);
+                    shards.memory[index] = memory;
                 }
                 Err(err) => {
+                    if matches!(&err, Error::Io(error) if is_memory_pressure(error)) {
+                        return Err(err);
+                    }
                     errs[index] = Some(err);
                     if should_retire {
                         retire_readers.push(index);
@@ -105,7 +153,7 @@ where
         warn!(shard_index = index, "retiring timed-out heal shard reader");
     }
 
-    (shards, errs)
+    Ok((shards, errs))
 }
 
 fn heal_writer_failure(writers: &mut MultiWriter<'_>, error: io::Error) -> Error {
@@ -164,7 +212,7 @@ impl super::Erasure {
         for block_index in start_block..end_block {
             let shard_offset = block_index * self.shard_size();
             let shard_size = self.shard_size().min(shard_file_size.saturating_sub(shard_offset));
-            let (mut shards, errs) = read_heal_shards(&mut readers, shard_size, read_timeout).await;
+            let (mut owned_shards, errs) = read_heal_shards(&mut readers, shard_size, read_timeout).await?;
 
             // Every source shard is already bitrot-verified by its reader, so any
             // data_shards survivors are sufficient to reconstruct — requiring more
@@ -183,6 +231,24 @@ impl super::Erasure {
                 return Err(Error::ErasureReadQuorum);
             }
 
+            owned_shards.reserve_missing(shard_size)?;
+            let source_parity_bytes =
+                owned_shards
+                    .shards
+                    .iter()
+                    .skip(self.data_shards)
+                    .flatten()
+                    .try_fold(0usize, |total, shard| {
+                        total
+                            .checked_add(shard.len())
+                            .ok_or_else(|| io::Error::from(ErrorKind::OutOfMemory))
+                    })?;
+            let _source_memory = owned_shards
+                .budget
+                .as_ref()
+                .map(|budget| budget.reserve(source_parity_bytes))
+                .transpose()?;
+            let shards = &mut owned_shards.shards;
             let source_parity = shards
                 .iter()
                 .enumerate()
@@ -190,24 +256,23 @@ impl super::Erasure {
                 .filter_map(|(index, shard)| shard.as_ref().map(|shard| (index, shard.clone())))
                 .collect::<Vec<_>>();
             if self.parity_shards > 0 {
-                self.decode_data_and_parity(&mut shards)?;
-                if !source_parity.is_empty() && !self.verify_data_and_parity(&shards)? {
+                self.decode_data_and_parity(shards)?;
+                if !source_parity.is_empty() && !self.verify_data_and_parity(shards)? {
                     return Err(Error::other("can not reconstruct data: inconsistent heal source shards"));
                 }
-                for (index, source) in source_parity {
-                    let Some(rebuilt) = shards[index].as_ref() else {
+                for (index, source) in &source_parity {
+                    let Some(rebuilt) = shards[*index].as_ref() else {
                         return Err(Error::other("can not reconstruct data: missing rebuilt parity shard"));
                     };
-                    if rebuilt != &source {
+                    if rebuilt != source {
                         return Err(Error::other("can not reconstruct data: inconsistent heal source shards"));
                     }
                 }
             }
 
-            let shards = shards
-                .into_iter()
-                .map(|s| Bytes::from(s.unwrap_or_default()))
-                .collect::<Vec<_>>();
+            drop(source_parity);
+            drop(_source_memory);
+            let shards = owned_shards.into_bytes();
 
             if let Err(error) = writers.write(shards).await {
                 return Err(heal_writer_failure(&mut writers, error));
@@ -307,15 +372,101 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_shards_retain_memory_through_missing_outputs_and_last_slice() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(24, Duration::from_secs(30));
+        let mut readers = vec![
+            Some(BitrotReader::new(Cursor::new(vec![7; 8]), 8, HashAlgorithm::None, false)),
+            None,
+            Some(BitrotReader::new(Cursor::new(vec![9; 8]), 8, HashAlgorithm::None, false)),
+        ];
+        let (resources, _) = test_resource_units(1);
+        let (mut shards, _) = with_optional_resource_unit(
+            Some(resources.with_memory_budget(memory.clone())),
+            read_heal_shards(&mut readers, 8, Duration::ZERO),
+        )
+        .await
+        .expect("read two accounted shards");
+        assert_eq!(memory.snapshot().used, 16);
+        shards
+            .reserve_missing(8)
+            .expect("reserve the reconstructed output before allocation");
+        shards.shards[1] = Some(vec![11; 8]);
+        assert_eq!(memory.snapshot().used, 24);
+        let bytes = shards.into_bytes();
+        let slice = bytes[1].slice(1..3);
+        memory.set_sampled_limit(0, Duration::ZERO);
+        drop(bytes);
+        assert_eq!(slice.as_ref(), &[11; 2]);
+        assert_eq!(memory.snapshot().used, 8);
+        drop(slice);
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
+    async fn heal_memory_denial_is_not_replaced_with_read_quorum() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+
+        let erasure = Erasure::new(2, 1, 16);
+        let encoded = erasure.encode_data(&[37; 16]).expect("valid source shards");
+        for limit in [0, 23, 31, 39] {
+            let memory = BackgroundMemoryBudget::new();
+            memory.set_sampled_limit(limit, Duration::from_secs(30));
+            let readers = encoded
+                .iter()
+                .map(|shard| Some(BitrotReader::new(Cursor::new(shard.clone()), 8, HashAlgorithm::None, false)))
+                .collect();
+            let mut writers = vec![Some(inline_writer(8)), None, None];
+            let (resources, _) = test_resource_units(1);
+            let result = with_optional_resource_unit(
+                Some(resources.with_memory_budget(memory.clone())),
+                erasure.heal(&mut writers, readers, 16, &[]),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(Error::Io(error)) if error.kind() == ErrorKind::WouldBlock),
+                "limit={limit}"
+            );
+            assert_eq!(memory.snapshot().used, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_heal_shard_reads_release_allocated_payloads() {
+        use crate::disk::{test_resource_units, with_optional_resource_unit};
+
+        let memory = BackgroundMemoryBudget::new();
+        memory.set_sampled_limit(16, Duration::from_secs(30));
+        let mut readers = vec![
+            Some(BitrotReader::new(PendingReader, 8, HashAlgorithm::None, false)),
+            Some(BitrotReader::new(PendingReader, 8, HashAlgorithm::None, false)),
+        ];
+        let (resources, _) = test_resource_units(1);
+        let mut read = Box::pin(with_optional_resource_unit(
+            Some(resources.with_memory_budget(memory.clone())),
+            read_heal_shards(&mut readers, 8, Duration::ZERO),
+        ));
+        assert!(futures::poll!(&mut read).is_pending());
+        assert_eq!(memory.snapshot().used, 16);
+        memory.set_sampled_limit(0, Duration::ZERO);
+        drop(read);
+        assert_eq!(memory.snapshot().used, 0);
+    }
+
+    #[tokio::test]
     async fn read_heal_shards_returns_empty_slots_for_zero_sized_shards() {
         let mut readers = vec![
             Some(BitrotReader::new(Cursor::new(vec![1, 2, 3]), 0, HashAlgorithm::None, false)),
             None,
         ];
 
-        let (shards, errs) = read_heal_shards(&mut readers, 0, Duration::ZERO).await;
+        let (shards, errs) = read_heal_shards(&mut readers, 0, Duration::ZERO)
+            .await
+            .expect("empty read succeeds");
 
-        assert_eq!(shards, vec![None, None]);
+        assert_eq!(shards.shards, vec![None, None]);
         assert_eq!(errs, vec![None, None]);
     }
 
@@ -323,9 +474,11 @@ mod tests {
     async fn read_heal_shards_records_reader_errors_and_retiring_timeouts() {
         let mut readers = vec![Some(BitrotReader::new(FailingReader, 4, HashAlgorithm::None, false))];
 
-        let (shards, errs) = read_heal_shards(&mut readers, 4, Duration::ZERO).await;
+        let (shards, errs) = read_heal_shards(&mut readers, 4, Duration::ZERO)
+            .await
+            .expect("ordinary failures remain per-shard");
 
-        assert!(shards[0].is_none());
+        assert!(shards.shards[0].is_none());
         assert!(
             errs[0]
                 .as_ref()
@@ -334,9 +487,11 @@ mod tests {
         assert!(readers[0].is_some(), "ordinary read errors must not retire readers");
 
         let mut timeout_readers = vec![Some(BitrotReader::new(PendingReader, 4, HashAlgorithm::None, false))];
-        let (shards, errs) = read_heal_shards(&mut timeout_readers, 4, Duration::from_millis(1)).await;
+        let (shards, errs) = read_heal_shards(&mut timeout_readers, 4, Duration::from_millis(1))
+            .await
+            .expect("timeouts remain per-shard");
 
-        assert_eq!(shards, vec![None]);
+        assert_eq!(shards.shards, vec![None]);
         assert!(errs[0].as_ref().is_some_and(|err| err.to_string().contains("timed out")));
         assert!(timeout_readers[0].is_none(), "timed-out readers are retired");
     }

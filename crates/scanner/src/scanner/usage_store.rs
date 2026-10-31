@@ -84,6 +84,27 @@ impl DataUsagePublicationResult {
         (self.outcome, self.proof)
     }
 
+    #[cfg(feature = "e2e-test-hooks")]
+    pub(super) fn e2e_durable_observation(
+        &self,
+        epoch: u64,
+        cycle: u64,
+        expected: &crate::scanner_io::ScannerPublicationExpectation,
+    ) -> Option<serde_json::Value> {
+        let outcome = match self.outcome {
+            DataUsagePersistOutcome::Saved => "saved",
+            DataUsagePersistOutcome::AlreadyDurable => "already_durable",
+            _ => return None,
+        };
+        let (root_version, root_digest) = self.proof.as_ref()?.verified_version_for(expected)?;
+        let (candidate_digest, coverage_digest) = expected.e2e_digests();
+        Some(serde_json::json!({
+            "epoch": epoch, "cycle": cycle, "outcome": outcome,
+            "candidate_sha256": candidate_digest, "coverage_sha256": coverage_digest,
+            "root_version": root_version, "root_sha256": crate::e2e_barrier::hex(root_digest),
+        }))
+    }
+
     pub(super) fn observation_for_attempt(
         &self,
         scanner_epoch: u64,
@@ -1067,6 +1088,23 @@ where
                 break DataUsagePersistOutcome::Deferred(ScannerCycleDeferReason::PublicationLeaseDeadlineExceeded);
             }
 
+            #[cfg(feature = "e2e-test-hooks")]
+            if !observational
+                && target_path == DATA_USAGE_OBJ_NAME_PATH.as_str()
+                && let (Some(expected), Some(epoch), Some(cycle)) =
+                    (ack_expectation.as_ref(), data_usage_info.scanner_epoch, data_usage_info.scanner_cycle)
+                && expected.matches_encoded_candidate(&data_digest)
+            {
+                let (candidate_digest, coverage_digest) = expected.e2e_digests();
+                let _ = crate::e2e_barrier::checkpoint(
+                    "root_before_publish",
+                    serde_json::json!({
+                        "epoch": epoch, "cycle": cycle,
+                        "candidate_sha256": candidate_digest, "coverage_sha256": coverage_digest,
+                    }),
+                )
+                .await;
+            }
             let done_save = Metrics::time(Metric::SaveUsage);
             let (save_result, commit_state) = {
                 let publication_scope = storeapi

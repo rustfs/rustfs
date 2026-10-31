@@ -17,10 +17,10 @@ use crate::cluster::rpc::http_auth::RPC_REPLAY_SCOPE_VERSION_HEADER;
 use crate::cluster::rpc::http_auth::{
     AuthenticatedPeerReplayCapabilities, RPC_AUTH_VERSION_HEADER, RPC_AUTH_VERSION_V2, RPC_BOOT_EPOCH_CHALLENGE_HEADER,
     RPC_CONTENT_SHA256_HEADER, RPC_REPLAY_CACHE_CAPABILITY_HEADER, RPC_REPLAY_CACHE_CAPABILITY_PROOF_HEADER,
-    RollingMutationBodyDigest, TIMESTAMP_HEADER, internode_rpc_body_digest_strict,
-    verify_tonic_peer_replay_capabilities_response,
+    RollingMutationBodyDigest, TIMESTAMP_HEADER, gen_tonic_replay_scope_headers_with_admission, internode_rpc_body_digest_strict,
+    rpc_background_admission, verify_tonic_peer_replay_capabilities_response,
 };
-use crate::cluster::rpc::{gen_tonic_replay_scope_headers, gen_tonic_signature_headers, normalize_tonic_rpc_audience};
+use crate::cluster::rpc::{gen_tonic_signature_headers, normalize_tonic_rpc_audience};
 #[cfg(test)]
 use crate::cluster::rpc::{tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers};
 use crate::disk::error::{DiskError, Error as DiskErrorType, RpcStatusError};
@@ -415,7 +415,16 @@ where
                     .get(RPC_CONTENT_SHA256_HEADER)
                     .and_then(|value| value.to_str().ok()),
             ) {
-                match gen_tonic_replay_scope_headers(audience, request.uri().path(), timestamp, content_sha256, boot_epoch) {
+                match rpc_background_admission(request.headers()).and_then(|background| {
+                    gen_tonic_replay_scope_headers_with_admission(
+                        audience,
+                        request.uri().path(),
+                        timestamp,
+                        content_sha256,
+                        boot_epoch,
+                        background,
+                    )
+                }) {
                     Ok(headers) => request.headers_mut().extend(headers),
                     Err(error) => debug!(error = %error, "could not attach replay-scoped RPC signature"),
                 }

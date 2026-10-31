@@ -175,8 +175,10 @@ const DEFAULT_RUSTFS_GET_BITROT_DECODE_OVERLAP_ENABLE: bool = false;
 /// stripe via their stripe handle — only when a data shard is missing or dies.
 /// This halves per-GET read bytes, IOPS, and bitrot hashing on healthy
 /// objects with 2+2 layouts.
-/// Default: false (current behavior: every live shard reader is read on every
-/// stripe).
+/// Default: false for raw `Erasure::decode` calls without deferred parity
+/// handles; `DataBlocksFirst` reader setup attaches deferred parity handles and
+/// leaves those parity reserves unengaged by default unless this env var is set
+/// to `false`.
 const ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: &str = "RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE";
 const DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE: bool = false;
 
@@ -187,6 +189,13 @@ pub(crate) fn get_lockstep_data_shards_only_enabled() -> bool {
             ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
             DEFAULT_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE,
         )
+}
+
+/// Whether `DataBlocksFirst` reader setup and `with_deferred_parity_handles`
+/// should keep parity shards deferred until needed on healthy GETs.
+pub(crate) fn get_lockstep_data_shards_only_with_deferred_parity_enabled() -> bool {
+    matches!(decode_read_policy(), DecodeReadPolicy::DemandBound)
+        || rustfs_utils::get_env_bool(ENV_RUSTFS_GET_LOCKSTEP_DATA_SHARDS_ONLY_ENABLE, true)
 }
 
 /// Get whether bitrot-decode overlap is enabled.
@@ -832,6 +841,13 @@ where
     pub(crate) fn with_deferred_parity_handles(mut self, mut handles: Vec<Option<DeferredReaderStripeHandle>>) -> Self {
         handles.resize_with(self.readers.len(), || None);
         handles.truncate(self.readers.len());
+        if get_lockstep_data_shards_only_with_deferred_parity_enabled() {
+            for (index, handle) in handles.iter().enumerate().skip(self.data_shards) {
+                if handle.is_some() {
+                    self.engaged[index] = false;
+                }
+            }
+        }
         self.deferred_handles = handles;
         self
     }
@@ -2596,7 +2612,8 @@ impl Erasure {
         // the ordinary GET read quorum. Only the opt-in GET rollout requires a
         // surplus source; available surplus shards and integrity proofs are
         // still verified before any reconstructed copy bytes are emitted.
-        let require_surplus_source = reader.demand_bound_lockstep && matches!(decode_read_policy(), DecodeReadPolicy::Default);
+        let require_surplus_source =
+            get_lockstep_data_shards_only_enabled() && matches!(decode_read_policy(), DecodeReadPolicy::Default);
 
         let start = offset / self.block_size;
         let end = end_offset.saturating_sub(1) / self.block_size;
@@ -4367,9 +4384,9 @@ mod tests {
         .await;
     }
 
-    /// Compatibility lock: with the gate off (default), the lockstep path
-    /// keeps the pre-backlog#923 behavior and reads every live shard —
-    /// including parity — on every stripe.
+    /// Compatibility lock: with the gate off (default), raw `Erasure::decode`
+    /// without deferred parity handles keeps the pre-backlog#923 behavior and
+    /// reads every live shard — including parity — on every stripe.
     #[tokio::test]
     #[serial_test::serial]
     async fn test_lockstep_default_reads_all_shards_per_stripe() {
