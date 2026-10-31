@@ -1,29 +1,29 @@
 # Cryptographic compliance positioning
 
-**Use this when:** writing README, CHANGELOG, release notes, marketing, RFP, or security-questionnaire text that touches FIPS, or reasoning about the `rustfs-crypto` `fips` feature and algorithm deprecation.
-**Source of truth:** `scripts/check_fips_wording.sh` (the enforced guard); `crates/crypto/Cargo.toml` (`fips` feature); `crates/crypto/src/encdec/id.rs` (`ID` algorithm bytes); `rustfs/src/startup_runtime_hooks.rs` (`install_default_crypto_provider`).
+**Use this when:** writing README, CHANGELOG, release notes, marketing, RFP, or security-questionnaire text that touches FIPS, or reasoning about the `rustfs` / `rustfs-tls-runtime` / `rustfs-crypto` `fips` features and algorithm deprecation.
+**Source of truth:** `scripts/check_fips_wording.sh` (the enforced guard); `rustfs/Cargo.toml` and `crates/tls-runtime/Cargo.toml` (`fips` feature); `crates/crypto/Cargo.toml` (`fips` feature); `crates/crypto/src/encdec/id.rs` (`ID` algorithm bytes); `rustfs/src/startup_runtime_hooks.rs` (`install_default_crypto_provider`).
 
 This document records where RustFS stands on cryptographic module validation and what may and may not be said about it, so the question is answered once, from the code. For where master key material lives per backend, see [KMS backend security properties](kms-backend-security.md).
 
 ## Status: not FIPS 140-3 validated
 
-**RustFS is not FIPS 140-3 (or 140-2) validated, and no component it links runs as a validated cryptographic module.** There is no CMVP certificate covering RustFS or the libraries it uses in the shipped configuration. This is a deliberate position and not a statement about algorithm strength: the algorithms in use are standard, well-reviewed AEADs. Validation is a property of a specific module build, its documented boundary, and a certificate — none of which RustFS has or pursues.
+**RustFS is not FIPS 140-3 (or 140-2) validated as a product, and in the default build no component it links runs as a validated cryptographic module.** There is no CMVP certificate covering RustFS itself, or the libraries it uses in the default shipped configuration. An opt-in `--features fips` build flag on `rustfs` switches the `rustls` / `aws-lc-rs` provider to `aws-lc-fips-sys` for TLS, X.509, and JWT operations, while object data-path and local KMS operations remain on unvalidated RustCrypto software implementations. Validation is a property of a specific module build, its documented boundary, and a certificate — none of which RustFS as a whole has or pursues.
 
 ### What the process actually links
 
 | Layer | Where | Implementation | Primitives | Validated module |
 | --- | --- | --- | --- | --- |
-| TLS (S3 server, internode, outbound clients) | Process-wide default provider installed by `install_default_crypto_provider` in `rustfs/src/startup_runtime_hooks.rs` | `rustls` with the `aws-lc-rs` provider | TLS 1.2/1.3 suites, `prefer-post-quantum` hybrid key exchange | No — the ordinary `aws-lc-rs` build, not the `aws-lc-fips-sys`-backed FIPS variant |
+| TLS (S3 server, internode, outbound clients) | Process-wide default provider installed by `install_default_crypto_provider` in `rustfs/src/startup_runtime_hooks.rs` | `rustls` with the `aws-lc-rs` provider (`default_provider` by default; `default_fips_provider` when built with `--features fips`) | TLS 1.2/1.3 suites, `prefer-post-quantum` hybrid key exchange (restricted to FIPS-approved suites and groups when `--features fips` is enabled) | No in the default build (`aws-lc-sys`); opt-in `--features fips` links `aws-lc-fips-sys` and asserts `provider.fips()` at startup |
 | Object data path AEAD (SSE) | `crates/kms/src/encryption/ciphers.rs`, `crates/rio/src/encrypt_reader.rs`, `crates/rio-v2/src/encrypt_reader.rs` | RustCrypto `aes-gcm`, `chacha20poly1305` | AES-256-GCM, ChaCha20-Poly1305 | No |
 | DEK wrapping | `crates/kms/src/encryption/dek.rs` | RustCrypto `aes-gcm` | AES-256-GCM | No |
 | Local KMS backend master key | `crates/kms/src/backends/local.rs` | RustCrypto `argon2`, `aes-gcm` | Argon2id KDF, AES-256-GCM | No |
-| Config and IAM blobs at rest | `crates/crypto/src/encdec/` (`rustfs-crypto`) | RustCrypto `pbkdf2`/`argon2`, `aes-gcm`, `chacha20poly1305`, `sha2` | see [the `fips` feature](#the-rustfs-crypto-fips-feature-what-it-actually-does) | No |
-| JWT signing and verification | `jsonwebtoken` with the `aws_lc_rs` feature (`crates/crypto`, `crates/iam`, `crates/policy`) | AWS-LC through `aws-lc-rs` | Non-FIPS build | No |
+| Config and IAM blobs at rest | `crates/crypto/src/encdec/` (`rustfs-crypto`) | RustCrypto `pbkdf2`/`argon2`, `aes-gcm`, `chacha20poly1305`, `sha2` | see [the `rustfs-crypto` `fips` feature](#the-rustfs-crypto-fips-feature-what-it-actually-does) | No |
+| JWT signing and verification | `jsonwebtoken` with the `aws_lc_rs` feature (`crates/crypto`, `crates/iam`, `crates/policy`) | AWS-LC through `aws-lc-rs` | Non-FIPS `aws-lc-sys` build by default; unified with `aws-lc-fips-sys` when `rustfs` is built with `--features fips` | No in the default build; links `aws-lc-fips-sys` only when built with `-p rustfs --features fips` |
 
 Two consequences are commonly assumed the other way:
 
-- **AWS-LC being present does not imply FIPS.** `aws-lc-rs` has a FIPS variant; the workspace does not enable it anywhere.
-- **The data path never touches AWS-LC.** Every byte of object plaintext is encrypted by RustCrypto software implementations. Swapping the TLS provider would not change that; see route 1 below.
+- **AWS-LC being present does not imply FIPS in the default build.** `aws-lc-rs` has a FIPS variant (`aws-lc-fips-sys`); default builds do not enable it. Building `rustfs` with `--features fips` enables `rustls/fips`, `tokio-rustls/fips`, and `rustfs-tls-runtime/fips`, which links `aws-lc-fips-sys` and installs `rustls::crypto::default_fips_provider()` (see [below](#the-rustfs-and-rustfs-tls-runtime-fips-feature)).
+- **The object data path never touches AWS-LC.** Every byte of object plaintext is encrypted by RustCrypto software implementations, even when `rustfs` is built with `--features fips`. Enabling the TLS FIPS provider does not change the object encryption data path; see route 1 below.
 
 ## Terminology red lines for external material
 
@@ -50,6 +50,15 @@ Boilerplate when the topic cannot be avoided:
 
 `scripts/check_fips_wording.sh` greps `README.md` and `CHANGELOG.md` for the banned phrases above, and separately rejects any wording under `crates/kms` that describes the Vault KV2 backend as wrapping key material through Vault's Transit engine (`KmsBackend::VaultKv2` stores RustFS-wrapped material in KV v2 and never calls Transit; use `VaultTransit` when cryptographic isolation is the requirement). This document is intentionally outside the scan: it needs the terminology to define the policy.
 
+## The `rustfs` and `rustfs-tls-runtime` `fips` feature
+
+`rustfs/Cargo.toml` (`fips = ["rustls/fips", "tokio-rustls/fips", "rustfs-tls-runtime/fips"]`) and `crates/tls-runtime/Cargo.toml` (`fips = ["rustls/fips"]`) define an opt-in Cargo feature (disabled by default) for builds that require the `aws-lc-fips-sys` cryptographic module on the `aws-lc-rs` / `rustls` path:
+
+- **What it enables:** Activates `rustls/fips` and `tokio-rustls/fips`, which pull in `aws-lc-rs/fips` (`aws-lc-fips-sys`) and `rustls-webpki/aws-lc-rs-fips`. Because Cargo unifies features across the dependency graph, other `aws-lc-rs` consumers in the binary (`jsonwebtoken`, `rcgen`, `google-cloud-auth`, `async-nats`) also link against `aws-lc-fips-sys`.
+- **Runtime provider installation:** In `rustfs/src/startup_runtime_hooks.rs`, `build_default_crypto_provider()` selects `rustls::crypto::default_fips_provider()` (instead of `rustls::crypto::aws_lc_rs::default_provider()`) and asserts `provider.fips()` on startup, restricting TLS negotiation to FIPS-approved cipher suites (e.g., `TLS_AES_256_GCM_SHA384`, `TLS_AES_128_GCM_SHA256`, `TLS_ECDHE_*_AES_*_GCM_*`) and key exchange groups (excluding `TLS_CHACHA20_POLY1305_SHA256` and `X25519`).
+- **Build requirements:** Compiling `aws-lc-fips-sys` requires CMake, Go, and Clang/`libclang` in the build environment (unlike the default `aws-lc-sys` build).
+- **What it does not change:** It does not alter the object data-path AEAD (`crates/kms`, `crates/rio`, `crates/rio-v2`) or `rustfs-crypto` config/IAM blob encryption, which continue to use pure-Rust `RustCrypto` crates.
+
 ## The `rustfs-crypto` `fips` feature: what it actually does
 
 `crates/crypto/Cargo.toml` declares `default = ["crypto", "fips"]`, so the feature is on in every normal build. Its entire effect is **which algorithm the write path selects**; the implementation is RustCrypto either way.
@@ -71,7 +80,7 @@ Selection sites are `crates/crypto/src/encdec/encrypt.rs` and `crates/crypto/src
 
 | Route | Scope | What it buys | Verdict |
 | --- | --- | --- | --- |
-| 1. Adopt the `aws-lc-rs` FIPS variant (`aws-lc-fips-sys`) | The TLS provider swap is the small part. Every AEAD call in the data path (`crates/kms/src/encryption/`, `crates/rio*/src/encrypt_reader.rs`, `crates/kms/src/backends/local.rs`, `crates/crypto/src/encdec/`) would be re-implemented against `aws-lc-rs` primitives; Argon2id (no FIPS status) and ChaCha20-Poly1305 would need read-only compatibility stories. Build needs CMake, a C toolchain, and Go, on a narrower target set — the static musl release already hits AWS-LC's `getentropy` abort on kernels older than 3.17, and the FIPS variant constrains the matrix strictly harder | The accurate claim becomes "cryptographic operations are performed by a FIPS 140-3 validated module", not "RustFS is FIPS validated"; a product-level claim additionally needs a documented boundary, approved-mode enforcement, self-tests, zeroization, and entropy documentation | Heavy; re-opens an open platform-support problem. Justified only by a named customer or regulatory commitment |
+| 1. Adopt the `aws-lc-rs` FIPS variant (`aws-lc-fips-sys`) across the data path | The TLS/X.509/JWT provider swap is wired via the opt-in `-p rustfs --features fips` build flag. Extending `aws-lc-fips-sys` to the data path would require re-implementing every AEAD/KDF call in `crates/kms/src/encryption/`, `crates/rio*/src/encrypt_reader.rs`, `crates/kms/src/backends/local.rs`, and `crates/crypto/src/encdec/` against `aws-lc-rs` primitives; Argon2id (no FIPS status) and ChaCha20-Poly1305 would need read-only compatibility stories. Build needs CMake, a C toolchain, Clang/`libclang`, and Go, on a narrower target set — the static musl release already hits AWS-LC's `getentropy` abort on kernels older than 3.17, and the FIPS variant constrains the matrix strictly harder | The accurate claim becomes "cryptographic operations are performed by a FIPS 140-3 validated module", not "RustFS is FIPS validated"; a product-level claim additionally needs a documented boundary, approved-mode enforcement, self-tests, zeroization, and entropy documentation | Data-path rewrite remains heavy and re-opens platform-support constraints; TLS/X.509/JWT is opt-in via `--features fips` |
 | 2. Let an externally validated KMS carry key operations | Mostly built: the `VaultTransit` backend never lets key-encryption key material leave Vault, so master key generation, wrapping, unwrapping, and rotation happen inside whatever module Vault's seal/HSM is validated against. Remaining work is configuration guidance and a supported-deployment statement | A defensible partial answer to "where do keys live and who validated that". The object data path stays RustCrypto and TLS stays non-FIPS AWS-LC: "key management operations are performed by an externally validated module; the object data path is not validated" | Nearest partial step, no code rewrite. Point customers here when the requirement is key custody rather than a certificate covering the storage layer |
 | 3. Make no validation claim (current default) | This document plus the grep guard | Nothing further | The current decision. FIPS 140-3 validation is not a roadmap target; adjacent items (PKCS#11, KMIP, BYOK, signing keys) are deferred for lack of demand and because HSM-dependent paths cannot be exercised in CI |
 
