@@ -68,7 +68,9 @@ async fn backup_capture_rejects_malformed_pages_before_publishing_any_object() {
     ] {
         let (backend, _, _) = backup_fixture().await;
         let paths = TableCatalogObjectPaths::default();
-        let prefix = paths.table_bucket_root_prefix("analytics");
+        let bucket_path = paths.table_bucket_entry_path("analytics");
+        let (parent, _) = bucket_path.rsplit_once('/').expect("catalog bucket entry has a parent");
+        let prefix = format!("{parent}/");
         let before = backup_capture_persisted_state(&backend).await;
         let existing = before
             .objects
@@ -159,7 +161,9 @@ async fn backup_capture_rejects_malformed_pages_before_publishing_any_object() {
 #[tokio::test]
 async fn backup_capture_stops_reading_when_the_encoded_payload_budget_is_exhausted() {
     let (backend, _, _) = backup_fixture().await;
-    let prefix = TableCatalogObjectPaths::default().table_bucket_root_prefix("analytics");
+    let bucket_path = TableCatalogObjectPaths::default().table_bucket_entry_path("analytics");
+    let (parent, _) = bucket_path.rsplit_once('/').expect("catalog bucket entry has a parent");
+    let prefix = format!("{parent}/");
     let first_path = format!("{prefix}zz-backup-budget-0.bin");
     let second_path = format!("{prefix}zz-backup-budget-1.bin");
     let tail_path = format!("{prefix}zz-backup-budget-2-tail.bin");

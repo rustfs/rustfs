@@ -198,8 +198,11 @@ fn backup_rejects_different_attempt_or_lease_even_with_the_same_job_id() {
             changed.job.lease_id = "another-lease".to_string();
         }
         let latest = report_paths(&entry, &stable.job.job_id)[1].clone();
-        *objects.iter_mut().find(|object| object.object == latest).unwrap() =
-            object(latest, serde_json::to_vec(&changed).unwrap());
+        let target = objects
+            .iter_mut()
+            .find(|object| object.object == latest)
+            .expect("latest maintenance receipt");
+        *target = object(latest, serde_json::to_vec(&changed).unwrap());
         assert_recovery_required(store.validate_backup_maintenance_authority("analytics", &objects));
     }
 }
@@ -211,7 +214,11 @@ fn backup_does_not_repair_partially_published_terminal_receipts() {
     publish(&mut objects, &entry, &running);
     let terminal = report(&entry, "same-attempt", TableMetadataMaintenanceJobStatus::Successful);
     let named = report_paths(&entry, &terminal.job.job_id)[0].clone();
-    *objects.iter_mut().find(|object| object.object == named).unwrap() = object(named, serde_json::to_vec(&terminal).unwrap());
+    let target = objects
+        .iter_mut()
+        .find(|object| object.object == named)
+        .expect("named maintenance receipt");
+    *target = object(named, serde_json::to_vec(&terminal).unwrap());
     let before = objects.clone();
     assert_recovery_required(store.validate_backup_maintenance_authority("analytics", &objects));
     assert_eq!(objects, before);
@@ -298,7 +305,11 @@ fn a_deleted_catalog_owner_still_cannot_restore_a_discoverable_running_lease() {
         .unwrap()
         .object
         .clone();
-    *objects.iter_mut().find(|object| object.object == path).unwrap() = object(path, serde_json::to_vec(&entry).unwrap());
+    let target = objects
+        .iter_mut()
+        .find(|object| object.object == path)
+        .expect("catalog owner entry");
+    *target = object(path, serde_json::to_vec(&entry).unwrap());
     publish(
         &mut objects,
         &entry,
