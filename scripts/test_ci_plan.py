@@ -116,7 +116,7 @@ class PlannerTests(unittest.TestCase):
         plan = self.repo.plan(self.repo.commit(), base=baseline)
         self.assertEqual(plan['packages'], ['consumer', 'core', 'leaf', 'rustfs'])
         self.assertEqual(plan['jobs']['connect-feature-boundaries'], 'skipped')
-        for job in ('test-and-lint', 'workspace-tests', 'core-contract', 'e2e-tests',
+        for job in ('workspace-lint-and-build', 'workspace-tests', 'core-contract', 'e2e-tests',
                     's3-implemented-tests', 's3-lifecycle-behavior-tests'):
             self.assertEqual(plan['jobs'][job], 'success')
 
@@ -233,7 +233,8 @@ class PlannerTests(unittest.TestCase):
         result = subprocess.run([sys.executable, '-I', str(script), 'select'], cwd=self.repo.root, env=env, capture_output=True, text=True)
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in output.read_text().splitlines())
-        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards'})
+        self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards', 'plan_contract'})
+        self.assertEqual(values['plan_contract'], '2')
         plan = json.loads(values['plan'])
         self.assertEqual(plan['policy']['revision'], self.repo.base)
         self.assertEqual(plan['policy']['rollout'], 'shadow')
@@ -295,6 +296,25 @@ class GateTests(unittest.TestCase):
         needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': '{'}
         self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
 
+    def test_plan_from_a_previous_contract_cannot_authorize_the_new_job_set(self):
+        # A base planner predating the NIGHTLY_JOBS contract still emits
+        # connect-feature-boundaries as required success on a pull request. The
+        # current verifier must reject that plan instead of accepting the old
+        # responsibility, so the workflow's contract-marker fallback is the only
+        # path that can widen or narrow the required set.
+        stale = self.plan()
+        stale['jobs'] = dict(stale['jobs'], **{'connect-feature-boundaries': 'success',
+                                              'uring-integration': 'success',
+                                              'test-and-lint-rio-v2': 'success',
+                                              'test-and-lint-protocols': 'success'})
+        stale['not_applicable'] = {job: 'fixture' for job, state in stale['jobs'].items() if state == 'skipped'}
+        expected = gate.expected_results('full', 'pull_request', 'refs/heads/main')
+        self.assertEqual(expected['connect-feature-boundaries'], 'skipped')
+        needs = {job: {'result': result} for job, result in expected.items()}
+        needs['classify-changes']['outputs'] = {'mode': 'full', 'plan': json.dumps(stale, separators=(',', ':')),
+                                                'connect': 'true', 'full_validation': 'true', 'rehearse_shards': 'false'}
+        self.assertTrue(gate.verify_results(needs, 'pull_request', 'refs/heads/main'))
+
     def workflow(self):
         jobs = {}
         for job in gate.ALWAYS_JOBS + gate.CODE_JOBS + gate.OPTIONAL_JOBS:
@@ -317,7 +337,7 @@ class GateTests(unittest.TestCase):
                 expression = "needs.classify-changes.outputs.mode == 'full'"
             expression = f"({expression}) && (github.event_name != 'pull_request' || github.event.action != 'closed')"
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
-        jobs['test-and-lint']['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
+        jobs['workspace-lint-and-build']['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
             {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'}]}}
         jobs['required-checks'] = {'name': 'Test and Lint', 'if': "always() && (github.event_name != 'pull_request' || github.event.action != 'closed')",
@@ -387,7 +407,7 @@ class GateTests(unittest.TestCase):
         workflow['jobs']['required-checks']['needs'].reverse()
         for job in ('workspace-tests', 'core-contract', 'e2e-tests', 's3-implemented-tests', 's3-lifecycle-behavior-tests'):
             del workflow['jobs'][job]['if']
-            workflow['jobs'][job]['needs'] = ['test-and-lint' if job == 'workspace-tests' else 'build-rustfs-debug-binary']
+            workflow['jobs'][job]['needs'] = ['workspace-lint-and-build' if job == 'workspace-tests' else 'build-rustfs-debug-binary']
         self.assertEqual(self.check(workflow), [])
         for mutate in (
             lambda w: w['jobs']['required-checks']['needs'].pop(),
@@ -395,7 +415,7 @@ class GateTests(unittest.TestCase):
             lambda w: w['jobs']['required-checks'].update({'if': "'always()' == 'always()'"}),
             lambda w: w['jobs']['required-checks']['steps'][0].update({'run': 'python3 scripts/ci_gate.py verify || true'}),
             lambda w: w['jobs']['typos'].update({'continue-on-error': 'true'}),
-            lambda w: w['jobs']['test-and-lint']['steps'][0].update({'if': 'false'}),
+            lambda w: w['jobs']['workspace-lint-and-build']['steps'][0].update({'if': 'false'}),
             lambda w: w['jobs']['test-and-lint-protocols']['strategy']['matrix']['features'].pop(),
             lambda w: w['jobs'].update({'unaccounted': {'name': 'New'}}),
             lambda w: w['on']['pull_request'].update({'paths': ['README.md']}),

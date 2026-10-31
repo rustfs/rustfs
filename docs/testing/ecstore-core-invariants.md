@@ -142,7 +142,7 @@ filtered and malformed listing cases, and missing or altered required fixtures.
 Those cases must fail; an optional legacy fixture test that returns early is
 not evidence for a required fixture.
 
-The `test-and-lint` artifact contains the native log, listing, JUnit and
+The `artifacts/workspace` evidence directory contains the native log, listing, JUnit and
 execution receipt. A native test that reopens a disk in the same process does
 not establish process-crash or power-loss durability.
 

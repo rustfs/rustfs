@@ -705,7 +705,7 @@ def check_ilm_build_budget(root: Path) -> list[str]:
             "--workspace-remap": "$GITHUB_WORKSPACE",
             "--target-dir-remap": "$GITHUB_WORKSPACE/target",
         }
-        if ("test-and-lint" not in job.get("needs", []) or "--archive-file" in tokens
+        if ("workspace-lint-and-build" not in job.get("needs", []) or "--archive-file" in tokens
                 or any(tokens.count(flag) != 1 or tokens[tokens.index(flag) + 1:tokens.index(flag) + 2] != [value]
                        for flag, value in reuse_options.items())):
             return ["ILM integration must consume the workspace producer archive"]
@@ -729,7 +729,7 @@ def check_ilm_build_budget(root: Path) -> list[str]:
             return ["ILM integration must propagate failures"]
         if 'status=${PIPESTATUS[0]}' not in command or 'exit "${status}"' not in command or "|| true" in command.split('status=${PIPESTATUS[0]}')[0]:
             return ["ILM integration must retain the actual test exit status"]
-        producer_steps = jobs.get("test-and-lint", {}).get("steps", [])
+        producer_steps = jobs.get("workspace-lint-and-build", {}).get("steps", [])
         builds = [item for item in producer_steps if "ci_test_artifact.py build --configuration workspace" in item.get("run", "")]
         if len(builds) != 1:
             return ["ILM integration requires one workspace archive producer"]
