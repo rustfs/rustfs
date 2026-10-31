@@ -9573,6 +9573,15 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         };
         let mut replacement_metadata = (*src_info.user_defined).clone();
         rustfs_filemeta::shard_integrity::clear_integrity_metadata(&mut replacement_metadata);
+        if src_info.version_only {
+            // Shared shard files retain the selected version's persisted framing.
+            let suffix = crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX;
+            rustfs_utils::http::remove_str(&mut replacement_metadata, suffix);
+            if rustfs_utils::http::contains_key_str(&fi.metadata, suffix) {
+                let quantum = rustfs_utils::http::get_consistent_str(&fi.metadata, suffix).ok_or(Error::FileCorrupt)?;
+                rustfs_utils::http::insert_str(&mut replacement_metadata, suffix, quantum.to_owned());
+            }
+        }
         for suffix in [
             rustfs_filemeta::shard_integrity::SUFFIX_SHARD_INTEGRITY,
             rustfs_filemeta::shard_integrity::SUFFIX_INLINE_INTEGRITY,
@@ -24560,6 +24569,168 @@ mod put_object_tmp_cleanup_tests {
             .delete_object(bucket, object, version_opts)
             .await
             .expect("version delete must not be wedged by cleared lock metadata");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_only_copy_preserves_quantized_shared_data() {
+        assert_version_only_copy_frame_metadata(true).await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn version_only_copy_ignores_injected_frame_markers() {
+        assert_version_only_copy_frame_metadata(false).await;
+    }
+
+    async fn assert_version_only_copy_frame_metadata(quantized: bool) {
+        const BLOCK: usize = 64 * 1024;
+        const FRAME: usize = 16 * 1024;
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "copy-version-frame-metadata";
+        let object = if quantized {
+            "quantized"
+        } else {
+            "legacy-with-injected-marker"
+        };
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create version-only copy bucket");
+        }
+        let payload: Vec<u8> = (0..2 * BLOCK + 17)
+            .map(|index| u8::try_from(index % 251).expect("bounded fixture byte"))
+            .collect();
+        let mut put_options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        put_options
+            .user_defined
+            .insert(crate::object_api::EC_BLOCK_SIZE_HINT_INTERNAL_KEY.to_owned(), BLOCK.to_string());
+        let enabled = if quantized { "true" } else { "false" };
+        let source = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some(enabled)),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some(enabled)),
+                (rustfs_config::ENV_SHARD_INTEGRITY_WRITE, Some("false")),
+            ],
+            async {
+                set.put_object(bucket, object, &mut PutObjReader::from_vec(payload.clone()), &put_options)
+                    .await
+                    .expect("write physical source version")
+            },
+        )
+        .await;
+        let source_version = source.version_id.expect("source version ID").to_string();
+        let source_options = ObjectOptions {
+            version_id: Some(source_version.clone()),
+            versioned: true,
+            ..Default::default()
+        };
+        let mut source_info = set
+            .get_object_info(bucket, object, &source_options)
+            .await
+            .expect("project source metadata");
+        assert!(!rustfs_utils::http::contains_key_str(
+            &source_info.user_defined,
+            crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX
+        ));
+        let mut source_data_dirs = Vec::new();
+        for disk in &disks {
+            let fi = disk
+                .read_version("", bucket, object, &source_version, &crate::disk::ReadOptions::default())
+                .await
+                .expect("read source physical layout");
+            assert!(!fi.inline_data(), "fixture must share real shard files");
+            assert_eq!(fi.erasure.block_size, BLOCK);
+            assert_eq!(
+                crate::object_api::persisted_ec_read_quantum(
+                    &fi.metadata,
+                    BLOCK,
+                    fi.erasure.data_blocks,
+                    fi.erasure.shard_size(),
+                )
+                .expect("source frame geometry"),
+                quantized.then_some(FRAME)
+            );
+            source_data_dirs.push(fi.data_dir);
+        }
+        if !quantized {
+            // Replacement metadata cannot change the format of reused bytes.
+            crate::object_api::insert_ec_read_quantum(Arc::make_mut(&mut source_info.user_defined), FRAME);
+        }
+        source_info.version_only = true;
+        let copied = temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_EC_READ_QUANTUM_ENABLE, Some("false")),
+                (rustfs_config::ENV_EC_READ_QUANTUM_FLEET_CONFIRMED, Some("false")),
+            ],
+            async {
+                set.copy_object(
+                    bucket,
+                    object,
+                    bucket,
+                    object,
+                    &mut source_info,
+                    &source_options,
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("version-only copy must commit a new version")
+            },
+        )
+        .await;
+        let copy_version = copied.version_id.expect("copied version ID").to_string();
+        assert_ne!(copy_version, source_version);
+        assert!(!rustfs_utils::http::contains_key_str(
+            &copied.user_defined,
+            crate::object_api::EC_READ_QUANTUM_INFO_INTERNAL_SUFFIX
+        ));
+        for version in [&source_version, &copy_version] {
+            let mut reader = set
+                .get_object_reader(
+                    bucket,
+                    object,
+                    None,
+                    HeaderMap::new(),
+                    &ObjectOptions {
+                        version_id: Some(version.clone()),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("source and copied version must open");
+            let mut actual = Vec::new();
+            reader
+                .stream
+                .read_to_end(&mut actual)
+                .await
+                .expect("shared frames must remain readable");
+            assert_eq!(actual, payload);
+        }
+        for (disk, source_data_dir) in disks.iter().zip(source_data_dirs) {
+            let fi = disk
+                .read_version("", bucket, object, &copy_version, &crate::disk::ReadOptions::default())
+                .await
+                .expect("read copied version layout");
+            assert_eq!(fi.data_dir, source_data_dir, "version-only copy must reuse source data");
+            assert_eq!(
+                crate::object_api::persisted_ec_read_quantum(
+                    &fi.metadata,
+                    BLOCK,
+                    fi.erasure.data_blocks,
+                    fi.erasure.shard_size(),
+                )
+                .expect("copied frame geometry"),
+                quantized.then_some(FRAME)
+            );
+            for key in ["x-rustfs-internal-ec-read-quantum", "x-minio-internal-ec-read-quantum"] {
+                assert_eq!(fi.metadata.get(key).map(String::as_str), quantized.then_some("16384"));
+            }
+        }
     }
 
     #[tokio::test]

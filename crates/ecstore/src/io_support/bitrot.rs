@@ -584,7 +584,7 @@ fn bitrot_encoded_range(offset: usize, length: usize, shard_size: usize, checksu
     adjust_shard_read_params(offset, length, shard_size, &checksum_algo)
 }
 
-fn bitrot_encoded_range_with_frame_size(
+pub(crate) fn bitrot_encoded_range_with_frame_size(
     offset: usize,
     length: usize,
     shard_size: usize,
@@ -595,10 +595,8 @@ fn bitrot_encoded_range_with_frame_size(
         return bitrot_encoded_range(offset, length, shard_size, checksum_algo);
     }
 
-    // The caller starts every reader at a logical shard boundary.  Keep the
-    // mapping explicit nevertheless: each logical shard has a fixed number of
-    // authenticated frames, so seeking to shard N must skip all hashes in the
-    // preceding logical shards as well.
+    // A frame-aligned range may begin inside a logical shard. Skip the hashes
+    // in preceding logical shards as well as those before this frame.
     let frames_per_shard = shard_size.div_ceil(frame_size);
     let hash_size = checksum_algo.size();
     let logical_shards = offset / shard_size;
