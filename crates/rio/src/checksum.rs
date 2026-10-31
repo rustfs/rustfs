@@ -1728,4 +1728,123 @@ mod tests {
         let xxh3_multipart = ChecksumType(ChecksumType::XXHASH3.0 | ChecksumType::MULTIPART.0);
         assert!(!xxh3_multipart.is_s3s_typed());
     }
+
+    fn software_crc32_bitwise(reflected_poly: u32, data: &[u8]) -> [u8; 4] {
+        let mut crc = !0u32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (reflected_poly & mask);
+            }
+        }
+        (!crc).to_be_bytes()
+    }
+
+    fn software_crc64_nvme_bitwise(data: &[u8]) -> [u8; 8] {
+        let reflected_poly = super::CRC64_NVME_POLYNOMIAL.reverse_bits();
+        let mut crc = !0u64;
+        for &b in data {
+            crc ^= u64::from(b);
+            for _ in 0..8 {
+                let mask = (crc & 1).wrapping_neg();
+                crc = (crc >> 1) ^ (reflected_poly & mask);
+            }
+        }
+        (!crc).to_be_bytes()
+    }
+
+    #[test]
+    fn rio_crc_simd_matches_bitwise_scalar_across_tail_and_vector_boundaries() {
+        for &size in &[
+            0usize,
+            1,
+            7,
+            8,
+            15,
+            16,
+            17,
+            31,
+            32,
+            33,
+            63,
+            64,
+            65,
+            127,
+            128,
+            129,
+            255,
+            256,
+            257,
+            1024,
+            4096 + 17,
+            64 * 1024,
+        ] {
+            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+            let crc32_simd = Checksum::new_from_data(ChecksumType::CRC32, &payload).expect("crc32");
+            let crc32c_simd = Checksum::new_from_data(ChecksumType::CRC32C, &payload).expect("crc32c");
+            let crc64_simd = Checksum::new_from_data(ChecksumType::CRC64_NVME, &payload).expect("crc64nvme");
+
+            let crc32_sw = software_crc32_bitwise(0xEDB88320, &payload);
+            let crc32c_sw = software_crc32_bitwise(0x82F63B78, &payload);
+            let crc64_sw = software_crc64_nvme_bitwise(&payload);
+
+            assert_eq!(crc32_simd.raw.as_slice(), &crc32_sw, "CRC32 SIMD vs scalar mismatch at {size}B");
+            assert_eq!(crc32c_simd.raw.as_slice(), &crc32c_sw, "CRC32C SIMD vs scalar mismatch at {size}B");
+            assert_eq!(crc64_simd.raw.as_slice(), &crc64_sw, "CRC64_NVME SIMD vs scalar mismatch at {size}B");
+        }
+    }
+
+    #[test]
+    #[ignore = "utility throughput microbenchmark; run via cargo test -p rustfs-rio --lib --release -- --ignored --nocapture"]
+    fn microbench_rio_checksum_simd_vs_scalar_and_all_base_algorithms() {
+        use std::hint::black_box;
+        use std::io::Write as _;
+        use std::time::Instant;
+
+        for &(size, iters) in &[(1024usize, 100usize), (64 * 1024, 20), (1024 * 1024, 4)] {
+            let payload: Vec<u8> = (0..size).map(|i| ((i * 31 + 17) % 251) as u8).collect();
+            let total_mib = (size * iters) as f64 / (1024.0 * 1024.0);
+
+            // Verify SIMD-accelerated CRC32 / CRC32C / CRC64_NVME against bitwise scalar reference at 1 KiB & 64 KiB.
+            if size <= 64 * 1024 {
+                let crc32_simd = Checksum::new_from_data(ChecksumType::CRC32, &payload).expect("crc32");
+                let crc32c_simd = Checksum::new_from_data(ChecksumType::CRC32C, &payload).expect("crc32c");
+                let crc64_simd = Checksum::new_from_data(ChecksumType::CRC64_NVME, &payload).expect("crc64nvme");
+
+                let t_sw = Instant::now();
+                let crc32_sw = software_crc32_bitwise(0xEDB88320, black_box(&payload));
+                let crc32c_sw = software_crc32_bitwise(0x82F63B78, black_box(&payload));
+                let crc64_sw = software_crc64_nvme_bitwise(black_box(&payload));
+                let sw_elapsed = t_sw.elapsed();
+
+                assert_eq!(crc32_simd.raw.as_slice(), &crc32_sw, "CRC32 SIMD vs scalar mismatch at {size}B");
+                assert_eq!(crc32c_simd.raw.as_slice(), &crc32c_sw, "CRC32C SIMD vs scalar mismatch at {size}B");
+                assert_eq!(crc64_simd.raw.as_slice(), &crc64_sw, "CRC64_NVME SIMD vs scalar mismatch at {size}B");
+                println!(
+                    "[microbench][rio::checksum] size={size}B bitwise scalar reference check passed in {:?}",
+                    sw_elapsed
+                );
+            }
+
+            for &checksum_type in super::BASE_CHECKSUM_TYPES {
+                let mut hasher = checksum_type.hasher().expect("base checksum type must have hasher");
+                let t0 = Instant::now();
+                let mut digest = Vec::new();
+                for _ in 0..iters {
+                    hasher.reset();
+                    hasher.write_all(black_box(&payload)).expect("hasher write_all");
+                    digest = hasher.finalize();
+                    black_box(&digest);
+                }
+                let elapsed = t0.elapsed();
+                assert_eq!(digest.len(), checksum_type.raw_byte_len());
+                let mibs = total_mib / elapsed.as_secs_f64().max(1e-9);
+                println!(
+                    "[microbench][rio::checksum] size={size}B algo={} throughput={mibs:.1} MiB/s",
+                    checksum_type
+                );
+            }
+        }
+    }
 }
