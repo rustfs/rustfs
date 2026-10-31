@@ -33,8 +33,8 @@ Run URLs are `https://github.com/rustfs/rustfs/actions/runs/<id>`. Re-open the r
 | `workflow_dispatch` | manual full validation | [41152382212](https://github.com/rustfs/rustfs/actions/runs/41152382212) | full suite set ran and the aggregate accepted the complete plan (85 min) |
 | `workflow_run` | `Scheduled Validation Watchdog` | [41161431618](https://github.com/rustfs/rustfs/actions/runs/41161431618) | independent filter/monitor path executed against the registry |
 | `merge_group` | first queued candidate after queue enablement | see below | live evidence attached after the first queue entry completes |
-| Documentation-only PR | this document's own PR | see below | `docs` mode: expensive jobs required **skipped** |
-| Isolated E2E PR | drill branch confined to `crates/e2e_test/src/` | see below | `e2e` mode: Connect/ILM/protocol lanes required **skipped** |
+| Documentation-only PR | PR #9088, this document's own PR | [41162871854](https://github.com/rustfs/rustfs/actions/runs/41162871854) | `docs` mode: `Select CI scope` recorded `mode: docs`; `Test and Lint` accepted in 8 s with every expensive job required **skipped** |
+| Isolated E2E PR | PR #9089, comment-only change under `crates/e2e_test/src/` | [41163203959](https://github.com/rustfs/rustfs/actions/runs/41163203959) | `e2e` mode: Connect boundary, serial ILM, rio-v2/protocol lanes and real io_uring required **skipped**; workspace build, E2E and both S3 lanes retained |
 
 ## Repeating a drill
 
