@@ -5601,7 +5601,7 @@ impl SetDisks {
         let part = ObjectPartInfo::unmarshal(&meta)?;
         let integrity = part.integrity.map(Arc::new);
 
-        self.recover_part_transaction(&dst_object, write_quorum).await?;
+        self.recover_part_transaction(dst_object, write_quorum).await?;
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
