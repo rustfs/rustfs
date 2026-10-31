@@ -37,8 +37,8 @@ use crate::error::{
 use crate::object_api::{ObjectInfo, ObjectOptions};
 use crate::set_disk::SetDisks;
 use crate::storage_api_contracts::list::{
-    ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo, StorageListObjectsV2Info, StorageObjectInfoOrErr,
-    StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
+    AuthoritativeListOperations, ListObjectsInfo as StorageListObjectsInfo, StorageListObjectVersionsInfo,
+    StorageListObjectsV2Info, StorageObjectInfoOrErr, StorageWalkOptions, VersionMarker, WalkVersionsSortOrder,
 };
 use crate::store::ECStore;
 use crate::store::utils::is_reserved_or_invalid_bucket;
@@ -79,6 +79,21 @@ type ListObjectsV2Info = StorageListObjectsV2Info<ObjectInfo>;
 type ListObjectVersionsInfo = StorageListObjectVersionsInfo<ObjectInfo>;
 type ObjectInfoOrErr = StorageObjectInfoOrErr<ObjectInfo, Error>;
 type WalkOptions = StorageWalkOptions<fn(&rustfs_filemeta::FileInfo) -> bool>;
+
+#[async_trait::async_trait]
+impl AuthoritativeListOperations for ECStore {
+    async fn walk_authoritative(
+        self: Arc<Self>,
+        rx: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        check_list_objs_args(bucket, prefix, &None)?;
+        self.walk_authoritatively(rx, bucket, prefix, result, opts).await
+    }
+}
 
 /// Build the versioned listing options used by recursive object walks.
 ///
@@ -1519,6 +1534,57 @@ impl ECStore {
 
         result
     }
+
+    async fn walk_authoritatively(
+        self: Arc<Self>,
+        cancellation: CancellationToken,
+        bucket: &str,
+        prefix: &str,
+        result: Sender<ObjectInfoOrErr>,
+        opts: WalkOptions,
+    ) -> Result<()> {
+        let cancel = cancellation.child_token();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let mut scans = Vec::new();
+        let mut inputs = Vec::new();
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                let (sender, receiver) = mpsc::channel(1);
+                inputs.push(receiver);
+                let mut scan = recursive_walk_list_path_options(bucket.to_owned(), prefix, &opts);
+                // Internal absence checks must include reserved object prefixes.
+                scan.skip_hidden_prefix_check = true;
+                scans.push(set.list_versions_authoritatively(cancel.clone(), scan, sender));
+            }
+        }
+        if scans.is_empty() {
+            return Err(StorageError::ErasureReadQuorum);
+        }
+
+        let (sender, receiver) = mpsc::channel(100);
+        let forwarder = spawn_walk_entry_forwarder(cancel.clone(), receiver, result, opts, bucket.to_owned());
+        let merge = spawn_listing_merge(cancel.clone(), inputs, sender);
+        let scan_results = join_all(scans).await;
+        let merge_result = merge.await.map_err(Error::from)?;
+        let forward_result = forwarder.await.map_err(Error::from);
+
+        // An unavailable set cannot establish absence, even when another set
+        // completed. Only an explicitly missing directory or volume is empty.
+        for scan in scan_results {
+            match scan {
+                Ok(outcome) if !outcome.limit_reached => {}
+                Ok(_) => return Err(StorageError::ErasureReadQuorum),
+                Err(StorageError::FileNotFound | StorageError::VolumeNotFound) => {}
+                Err(err) => return Err(err),
+            }
+        }
+        merge_result?;
+        forward_result?;
+        if cancellation.is_cancelled() {
+            return Err(Error::other("authoritative object walk was cancelled"));
+        }
+        Ok(())
+    }
 }
 
 /// Forwards merged raw entries to a walk consumer as `ObjectInfoOrErr`,
@@ -2489,7 +2555,8 @@ impl SetDisks {
     /// Version scan for set-scoped callers that act on absence: set walks
     /// (tier reference proofs, tier-delete journals, pool maintenance) and the
     /// recursive prefix-delete scan. Every online drive is read and each
-    /// version is resolved at the read quorum of its own erasure layout; a
+    /// version uses the read quorum of its own erasure layout. Null versions
+    /// in the system bucket also retain GET's commit-proof selection. A
     /// version that cannot be ruled out fails the scan instead of being
     /// omitted. Merged `ListObjectVersions` pages go through `list_path`.
     async fn list_versions_authoritatively(
@@ -2828,6 +2895,7 @@ mod test {
     use crate::error::{Result, StorageError};
     use crate::object_api::{ObjectInfo, ObjectOptions, PutObjReader};
     use crate::set_disk::{SetDisks, hermetic_set_disks_isolated};
+    use crate::storage_api_contracts::list::AuthoritativeListOperations as _;
     use crate::storage_api_contracts::namespace::NamespaceLocking as _;
     use crate::storage_api_contracts::object::ObjectIO as _;
     use bytes::Bytes;
@@ -5689,6 +5757,126 @@ mod test {
     }
 
     #[test]
+    fn authoritative_system_bucket_scan_rejects_uncommitted_null_version_split() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        for new_etag in ["new", "old"] {
+            let new =
+                test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), new_etag, Uuid::from_u128(2));
+            let entries = MetaCacheEntries(vec![Some(old.clone()), Some(old.clone()), Some(new.clone()), Some(new)]);
+
+            assert!(matches!(
+                SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &[None, None, None, None], 4, 2),
+                Err(DiskError::ErasureReadQuorum)
+            ));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_selects_committed_null_version() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for (new_copies, expected) in [(1, "old"), (3, "new"), (4, "new")] {
+            let entries = MetaCacheEntries(
+                (0..4)
+                    .map(|slot| Some(if slot < new_copies { new.clone() } else { old.clone() }))
+                    .collect(),
+            );
+            let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &[None, None, None, None], 4, 2)
+                .expect("committed generation should resolve")
+                .expect("committed record should be present");
+            let info = resolved
+                .to_fileinfo(RUSTFS_META_BUCKET)
+                .expect("resolved metadata should decode");
+
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some(expected));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_matches_degraded_null_version_reads() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for (old_copies, new_copies, expected) in [
+            (2, 1, Some("old")),
+            (1, 2, None),
+            (0, 3, Some("new")),
+            (0, 2, Some("new")),
+            (0, 1, None),
+        ] {
+            let entries = MetaCacheEntries(
+                (0..4)
+                    .map(|slot| {
+                        if slot < old_copies {
+                            Some(old.clone())
+                        } else if slot < old_copies + new_copies {
+                            Some(new.clone())
+                        } else {
+                            None
+                        }
+                    })
+                    .collect(),
+            );
+            let errors = (0..4)
+                .map(|slot| (slot >= old_copies + new_copies).then_some(DiskError::DiskNotFound))
+                .collect::<Vec<_>>();
+            let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &errors, 4, 2);
+
+            if let Some(expected) = expected {
+                let info = resolved
+                    .expect("degraded committed record should resolve")
+                    .expect("degraded committed record should be present")
+                    .to_fileinfo(RUSTFS_META_BUCKET)
+                    .expect("resolved metadata should decode");
+                assert_eq!(info.metadata.get("etag").map(String::as_str), Some(expected));
+            } else {
+                assert!(matches!(resolved, Err(DiskError::ErasureReadQuorum)));
+            }
+        }
+    }
+
+    #[test]
+    fn authoritative_user_bucket_scan_keeps_null_version_read_quorum_selection() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let old = test_unversioned_object_meta_entry("entry.json", time, "old", Uuid::from_u128(1));
+        let new = test_unversioned_object_meta_entry("entry.json", time + time::Duration::seconds(1), "new", Uuid::from_u128(2));
+        for old_copies in [1, 2] {
+            let entries = MetaCacheEntries(vec![
+                Some(new.clone()),
+                Some(new.clone()),
+                Some(old.clone()),
+                (old_copies == 2).then(|| old.clone()),
+            ]);
+            let errors = [None, None, None, (old_copies == 1).then_some(DiskError::DiskNotFound)];
+            let resolved = SetDisks::resolve_listed_versions("bucket", entries, &errors, 4, 2)
+                .expect("user bucket read quorum should resolve")
+                .expect("user bucket record should be present");
+            let info = resolved.to_fileinfo("bucket").expect("resolved metadata should decode");
+
+            assert_eq!(info.metadata.get("etag").map(String::as_str), Some("new"));
+        }
+    }
+
+    #[test]
+    fn authoritative_system_bucket_scan_keeps_explicit_version_read_quorum() {
+        let time = time::OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid fixture time");
+        let entry = test_object_meta_entry_with_erasure_versions("entry.json", &[(time, "version", 2, 2)]);
+        let entries = MetaCacheEntries(vec![Some(entry.clone()), Some(entry), None, None]);
+        let errors = [None, None, Some(DiskError::DiskNotFound), Some(DiskError::DiskNotFound)];
+        let resolved = SetDisks::resolve_listed_versions(RUSTFS_META_BUCKET, entries, &errors, 4, 2)
+            .expect("explicit version read quorum should resolve")
+            .expect("explicit version should be present");
+        let info = resolved
+            .to_fileinfo(RUSTFS_META_BUCKET)
+            .expect("resolved metadata should decode");
+
+        assert_eq!(info.version_id, Some(Uuid::from_u128(1)));
+        assert_eq!(info.metadata.get("etag").map(String::as_str), Some("version"));
+    }
+
+    #[test]
     fn authoritative_version_scan_tolerates_corrupt_replicas_only_with_version_quorum() {
         let entry = test_object_meta_entry_with_erasure_versions(
             "readable.bin",
@@ -6029,6 +6217,49 @@ mod test {
         Bytes::from(meta.marshal_msg().expect("encode fixture xl.meta"))
     }
 
+    #[tokio::test]
+    async fn authoritative_store_walk_includes_reserved_prefix_versions() {
+        let bucket = "catalog-cleanup-versions";
+        let name = ".rustfs-table/namespaces/ns/tables/table/metadata/metadata.json";
+        let (_dirs, store) = single_set_store(16).await;
+        let set = &store.pools[0].disk_set[0];
+        for (slot, disk) in set.disks.read().await.iter().enumerate() {
+            let disk = disk.as_ref().expect("fixture drive is online");
+            disk.make_volume(bucket).await.expect("create bucket volume");
+            disk.write_all(
+                bucket,
+                &format!("{name}/{STORAGE_FORMAT_FILE}"),
+                versioned_object_metadata(bucket, name, &[(2, 1_700_000_002), (1, 1_700_000_001)], slot),
+            )
+            .await
+            .expect("persist reserved metadata versions");
+        }
+        let (sender, mut receiver) = mpsc::channel(1);
+        let walk = store
+            .clone()
+            .walk_authoritative(CancellationToken::new(), bucket, "", sender, super::WalkOptions::default());
+        let collect = async {
+            let mut versions = Vec::new();
+            while let Some(item) = receiver.recv().await {
+                assert!(item.err.is_none(), "reserved metadata must decode: {:?}", item.err);
+                let item = item.item.expect("walk must return an object");
+                versions.push((item.name, item.version_id));
+            }
+            versions
+        };
+        let (walk, versions) = timeout(Duration::from_secs(10), async { tokio::join!(walk, collect) })
+            .await
+            .expect("authoritative reserved-prefix walk must terminate");
+        walk.expect("authoritative walk must succeed");
+        assert_eq!(
+            versions,
+            [
+                (name.to_string(), Some(Uuid::from_u128(1))),
+                (name.to_string(), Some(Uuid::from_u128(2)))
+            ]
+        );
+    }
+
     // A versioned DeleteObject(versionId) can reach write quorum while three
     // drives are offline; they keep the deleted version after they return. A
     // different drive going offline later must not turn that sub-quorum
@@ -6098,6 +6329,16 @@ mod test {
             let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
                 .await
                 .expect("set walk must terminate");
+            assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
+            let (sender, mut receiver) = mpsc::channel(16);
+            let walk =
+                store
+                    .clone()
+                    .walk_authoritative(CancellationToken::new(), bucket, "", sender, super::WalkOptions::default());
+            let drain = async { while receiver.recv().await.is_some() {} };
+            let (walk, ()) = timeout(Duration::from_secs(10), async { tokio::join!(walk, drain) })
+                .await
+                .expect("authoritative store walk must terminate");
             assert!(matches!(walk, Err(StorageError::ErasureReadQuorum)), "{walk:?}");
             let recursive_delete_scan = set
                 .clone()
