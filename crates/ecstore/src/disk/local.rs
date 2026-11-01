@@ -12436,14 +12436,6 @@ impl LocalDisk {
 #[cfg(unix)]
 const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
 
-/// Largest window read with one positioned read. On block storage a cold read
-/// of about 1 MiB completes as one device request, while a single larger read
-/// waits on each readahead chunk in turn; growing sequential reads keep
-/// readahead pipelined for larger windows (measured boundary between
-/// 1 MiB + 32 and 2 MiB + 64 bytes).
-#[cfg(unix)]
-const LOCAL_BATCH_SINGLE_READ_MAX_BYTES: usize = 1536 * 1024;
-
 /// Positioned reads for local EC shard files, returned in request order.
 ///
 /// Small windows share a single `spawn_blocking`, collapsing per-shard
@@ -12545,25 +12537,25 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            // Both branches fill the exactly sized spare capacity
-                            // without zero-initializing it first.
-                            if length > LOCAL_BATCH_SINGLE_READ_MAX_BYTES {
-                                use std::io::{Read as _, Seek as _, SeekFrom};
-
-                                // The descriptor is private to this request, so moving
-                                // its file offset is safe.
-                                let mut reader = &file;
-                                if offset > 0 {
-                                    let start = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
-                                    reader.seek(SeekFrom::Start(start)).map_err(DiskError::from)?;
-                                }
-                                let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
-                                total = reader.take(limit).read_to_end(&mut buf).map_err(DiskError::from)?;
-                                if total < length {
-                                    return Err(DiskError::FileCorrupt);
-                                }
-                                return Ok(());
+                            // Announce the exact window before reading it. Kernel
+                            // readahead otherwise sizes its first request from the
+                            // read size: a small window at offset 0 pulls several
+                            // times its size, and a multi-MiB read is split into
+                            // serial readahead chunks. WILLNEED submits exactly the
+                            // window at once. It is advisory, so an unsupported hint
+                            // must not fail the read.
+                            #[cfg(target_os = "linux")]
+                            if let (Ok(start), Ok(len)) = (u64::try_from(offset), u64::try_from(length)) {
+                                let _ = rustix::fs::fadvise(
+                                    &file,
+                                    start,
+                                    std::num::NonZeroU64::new(len),
+                                    rustix::fs::Advice::WillNeed,
+                                );
                             }
+                            // `with_capacity` reserves exactly `length` bytes, so each
+                            // positioned read fills only the remaining requested span
+                            // without zero-initializing it first.
                             while total < length {
                                 let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
                                 let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
@@ -35085,8 +35077,7 @@ mod test {
         let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
         std::fs::write(&path, &content).expect("write multi-page shard");
         let unaligned = 2 * window + 7;
-        // Windows on both sides of the single-read limit, at zero and nonzero offsets.
-        assert!(window <= LOCAL_BATCH_SINGLE_READ_MAX_BYTES && 2 * window > LOCAL_BATCH_SINGLE_READ_MAX_BYTES);
+        // Windows of one and two q frames, at zero and nonzero offsets.
         let windows = [
             (0, window),
             (window, window),
@@ -35105,6 +35096,50 @@ mod test {
             let bytes = result.as_ref().expect("window inside the shard");
             assert_eq!(bytes.len(), length, "window at {offset} must not over-read");
             assert_eq!(bytes.as_ref(), &content[offset..offset + length], "window at {offset}");
+        }
+    }
+
+    /// A cold batch read must bring in only its window. Without an exact hint,
+    /// kernel readahead sizes the first request from the read size, so a 16 KiB
+    /// window at offset 0 caches several times its pages and a 2 MiB window
+    /// almost twice its pages.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn test_batch_shard_pread_cold_read_caches_only_its_window() {
+        use rustix::fs::{Advice, fadvise};
+
+        let dir = tempfile::tempdir().expect("cold window fixture");
+        let path = dir.path().join("shard");
+        std::fs::write(&path, vec![5u8; 8 << 20]).expect("write cold window shard");
+        std::fs::File::open(&path)
+            .expect("open shard for sync")
+            .sync_all()
+            .expect("clean pages before eviction");
+        let page = mmap_page_size().expect("page size should be available") as usize;
+        let evict = || {
+            let file = std::fs::File::open(&path).expect("open shard for eviction");
+            fadvise(&file, 0, None, Advice::DontNeed).expect("evict shard pages");
+        };
+        evict();
+        assert_eq!(
+            resident_pages(&path),
+            0,
+            "the temporary filesystem must be able to drop page cache, otherwise residency is unobservable"
+        );
+        for length in [16 * 1024 + 32, 2 * 1024 * 1024 + 64] {
+            evict();
+            let results = batch_shard_pread(vec![(path.clone(), 0, length)]).await;
+            assert_eq!(results[0].as_ref().expect("cold window read").len(), length);
+            let window_pages = length.div_ceil(page);
+            let resident = resident_pages(&path);
+            assert!(
+                resident >= window_pages,
+                "the window itself must be resident: {resident} < {window_pages}"
+            );
+            assert!(
+                resident <= window_pages + window_pages / 8 + 4,
+                "a {length}-byte cold read cached {resident} pages for a {window_pages}-page window"
+            );
         }
     }
 
