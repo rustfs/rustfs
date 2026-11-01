@@ -126,7 +126,11 @@ async fn assert_empty_catalog_cleanup_objects_unchanged(
     assert!(after.contains_key(&("analytics".to_string(), metadata_path.to_string())));
     let paths = TableCatalogObjectPaths::default();
     let indexes = paths.warehouse_index_entries_prefix("analytics");
-    assert!(after.keys().any(|(bucket, key)| bucket == RUSTFS_META_BUCKET && key.starts_with(&indexes)));
+    assert!(
+        after
+            .keys()
+            .any(|(bucket, key)| bucket == RUSTFS_META_BUCKET && key.starts_with(&indexes))
+    );
     let marker = &after[&(RUSTFS_META_BUCKET.to_string(), paths.table_bucket_entry_path("analytics"))];
     let entry: TableBucketEntry = serde_json::from_slice(&marker.data).unwrap();
     assert_eq!(entry.state, TableCatalogEntryState::Active, "cleanup disabled the catalog");
@@ -172,7 +176,9 @@ async fn empty_catalog_cleanup_rejects_persisted_restore_with_held_read_permit()
     .await
     .expect("cleanup must reject the persisted barrier without reacquiring its held permit");
     match result {
-        Err(TableCatalogStoreError::Unavailable(message)) => assert!(message.contains("interrupted catalog restore"), "{message}"),
+        Err(TableCatalogStoreError::Unavailable(message)) => {
+            assert!(message.contains("interrupted catalog restore"), "{message}")
+        }
         Err(error) => panic!("cleanup rejected for the wrong reason: {error:?}"),
         Ok(_) => panic!("cleanup accepted an active persisted restore"),
     }
@@ -192,7 +198,9 @@ async fn empty_catalog_cleanup_rejects_legacy_control_with_held_read_permit() {
         let publication = backend.with_held_cleanup_publication("analytics").await.unwrap();
         assert_eq!(TableCommitPublication::catalog_migration_read_permit_status(&publication), Some(true));
         assert!(TableCommitPublication::holds_table_bucket(&publication, "analytics"));
-        backend.seed_object(RUSTFS_META_BUCKET, &path, b"legacy-control-state".to_vec()).await;
+        backend
+            .seed_object(RUSTFS_META_BUCKET, &path, b"legacy-control-state".to_vec())
+            .await;
         let before = maintenance_test_object_versions(&backend).await;
         let configured = ConfiguredTableCatalogStore::ObjectBacked(ObjectTableCatalogStore::new(backend.clone()));
         let result = tokio::time::timeout(
