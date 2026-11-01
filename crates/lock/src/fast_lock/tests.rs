@@ -112,6 +112,67 @@ mod fast_lock_tests {
     }
 
     #[tokio::test]
+    async fn force_unlock_old_tail_cannot_release_new_tail() {
+        let manager = create_test_manager();
+        let key = ObjectKey::new("test-bucket", "force-tail-generation");
+        let owner: Arc<str> = Arc::from("same-owner");
+        let mut old = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("old writer");
+        assert!(old.downgrade_committed_tail());
+        assert_eq!(manager.force_unlock(&key), 1);
+        let mut new = manager
+            .acquire_write_lock(key.clone(), owner.clone())
+            .await
+            .expect("new writer");
+        assert!(new.downgrade_committed_tail());
+        drop(old);
+        let attempt =
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, Arc::from("competing-writer")))
+                .await;
+        assert!(attempt.is_err(), "dropping the old guard must not release the new tail");
+        drop(new);
+    }
+
+    #[tokio::test]
+    async fn committed_tail_allows_reader_while_writer_waits() {
+        let manager = Arc::new(create_test_manager());
+        let key = ObjectKey::new("test-bucket", "tail-handoff");
+        let mut tail = manager
+            .acquire_write_lock(key.clone(), Arc::from("first-writer"))
+            .await
+            .expect("initial writer");
+        let writer = tokio::spawn({
+            let manager = Arc::clone(&manager);
+            let key = key.clone();
+            async move { manager.acquire_write_lock(key, Arc::from("second-writer")).await }
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while manager.current_lock_counts().1 == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second writer should be queued");
+        assert!(tail.downgrade_committed_tail());
+        let reader = tokio::time::timeout(Duration::from_secs(2), manager.acquire_read_lock(key, Arc::from("reader")))
+            .await
+            .expect("reader should not wait behind committed tail")
+            .expect("reader should acquire");
+        assert!(!writer.is_finished(), "tail and reader must exclude the next writer");
+        drop(tail);
+        assert!(!writer.is_finished(), "reader still excludes the next writer");
+        drop(reader);
+        let writer = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("writer should resume")
+            .expect("writer task should join")
+            .expect("writer should acquire");
+        drop(writer);
+    }
+
+    #[tokio::test]
     async fn current_lock_counts_report_live_holders_and_waiters() {
         let manager = Arc::new(create_test_manager());
         let key = ObjectKey::new("test-bucket", "contended-object");

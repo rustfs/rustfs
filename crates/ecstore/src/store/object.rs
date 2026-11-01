@@ -81,6 +81,7 @@ const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
 const RESTORE_WORKER_LOCK_PREFIX: &str = "ilm/restore-worker-locks";
 const RESTORE_WORKER_LOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+const MULTIPOOL_RESERVATION_HINT_TIMEOUT: Duration = Duration::from_millis(50);
 const TIER_DELETE_DISPATCH_LOCAL_REPLAY_CONCURRENCY: usize = 16;
 
 fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
@@ -3773,6 +3774,8 @@ impl ECStore {
             return Ok((None, false, Some(capacity_guard)));
         }
         drop(capacity_guard);
+        #[cfg(test)]
+        crate::core::pools::notify_decommission_external_object_capacity_released(self.id);
         if no_lock {
             return Ok((None, false, None));
         }
@@ -4814,16 +4817,126 @@ impl ECStore {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
-        let (object, opts) = Box::pin(self.prepare_put_object(bucket, object, opts)).await?;
+        let mut early_opts = opts.clone();
+        // Bucket publication precedes lifecycle and metadata transaction locks.
+        let prepared = if !self.ctx.lock_manager().is_disabled()
+            && crate::set_disk::put_rename_early_ack_enabled()
+            && early_opts.write_completion == crate::object_api::WriteCompletion::Quorum
+            && early_opts.overwrites_existing_version()
+            && !is_meta_bucketname(bucket)
+            && !early_opts.no_lock
+            && !early_opts.data_movement
+            && early_opts.write_lock_context.is_none()
+            && early_opts.object_lock_config_snapshot.is_none()
+            && early_opts.bucket_lifecycle_lock_fence.is_none()
+            && early_opts.namespace_lock_fence.is_none()
+            && early_opts.scanner_publication_commit_scope.is_none()
+            && early_opts.decommission_capacity_admission.is_none()
+            && early_opts.decommission_capacity.is_none()
+            && early_opts.quota_admission.is_none()
+            && early_opts
+                .put_object_cancellation
+                .as_ref()
+                .is_none_or(|token| !token.is_cancelled())
+            && rustfs_utils::path::object_name_disk_identity(object).as_ref()
+                != rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+        {
+            check_new_object_args(bucket, object, false)?;
+            let incarnation = match early_opts.expected_bucket_incarnation_id {
+                Some(incarnation) => incarnation,
+                None => self.bucket_incarnation_id(bucket).await?,
+            };
+            early_opts.expected_bucket_incarnation_id = Some(incarnation);
+            let encoded = encode_dir_object(object);
+            let tentative_pool = if self.single_pool() {
+                Some(0)
+            } else {
+                // This is only a hint; the locked selection below must agree
+                // before its reservations can protect a commit.
+                tokio::time::timeout(
+                    MULTIPOOL_RESERVATION_HINT_TIMEOUT,
+                    self.get_pool_idx_for_reservation_hint(bucket, &encoded, data.size()),
+                )
+                .await
+                .ok()
+                .and_then(Result::ok)
+            };
+            if let Some(pool_idx) = tentative_pool {
+                let set = self.pools[pool_idx].get_disks_by_key(&encoded);
+                let disks = set.disks.read().await.clone();
+                let reservations = if self.single_pool() {
+                    crate::set_disk::prepare_rename_metadata_reservations(&disks, bucket, &encoded, incarnation, &self.ctx, true)
+                        .await?
+                } else if let Some(permit) = self.ctx.try_acquire_speculative_reservation() {
+                    // Keep the preparation owner alive after the hint budget expires.
+                    // A late response must still be received and its token cancelled.
+                    let bucket = bucket.to_owned();
+                    let object = encoded.clone();
+                    let ctx = Arc::clone(&self.ctx);
+                    let (sender, receiver) = tokio::sync::oneshot::channel();
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let mut sender = sender;
+                        let prepared = crate::set_disk::prepare_rename_metadata_reservations_until_abandoned(
+                            &disks,
+                            &bucket,
+                            &object,
+                            incarnation,
+                            &ctx,
+                            crate::set_disk::RenameReservationMode::Owned,
+                            sender.closed(),
+                        )
+                        .await;
+                        let _ = sender.send(prepared);
+                    });
+                    tokio::time::timeout(MULTIPOOL_RESERVATION_HINT_TIMEOUT, receiver)
+                        .await
+                        .ok()
+                        .and_then(|result| result.ok())
+                        .transpose()?
+                        .flatten()
+                } else {
+                    // When detached owners are saturated, use only the distinct
+                    // short-lease RPC; unknown tokens then expire promptly.
+                    tokio::time::timeout(
+                        MULTIPOOL_RESERVATION_HINT_TIMEOUT,
+                        crate::set_disk::prepare_rename_metadata_reservations_until_abandoned(
+                            &disks,
+                            bucket,
+                            &encoded,
+                            incarnation,
+                            &self.ctx,
+                            crate::set_disk::RenameReservationMode::ShortOwned,
+                            std::future::pending(),
+                        ),
+                    )
+                    .await
+                    .ok()
+                    .transpose()?
+                    .flatten()
+                };
+                reservations.map(|reservations| (pool_idx, reservations))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        #[cfg(test)]
+        crate::set_disk::pause_put_object_commit(bucket, object, crate::set_disk::PutObjectCommitPause::BeforeBucketSnapshot)
+            .await;
+        let (object, opts) = Box::pin(self.prepare_put_object(bucket, object, &early_opts)).await?;
         let idx = self
             .select_put_object_pool_idx(bucket, object.as_str(), data.size(), &opts)
             .await?;
+        let prepared = prepared.and_then(|(pool_idx, reservations)| (pool_idx == idx).then_some(reservations));
         let mut opts = opts;
         if !self.single_pool() {
             opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
         }
         let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
-        let result = Box::pin(self.pools[idx].put_object_with_old_current_size(bucket, object.as_str(), data, &opts)).await;
+        let result =
+            Box::pin(self.pools[idx].put_object_with_prepared_reservations(bucket, object.as_str(), data, &opts, prepared)).await;
         enqueue_recorded_tier_free_versions(self, receipt_sink).await;
         match result {
             Ok((object_info, old_current_size)) => {
@@ -9936,6 +10049,1289 @@ mod tests {
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn multipool_early_ack_prepares_before_snapshot_and_orders_the_next_put() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        use crate::disk::ReadOptions;
+                        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+
+                        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+                            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                            let (_other_dirs, other) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                            let store =
+                                Arc::new(new_prepared_reader_test_store_with_ctx(&[original, other], Arc::clone(&ctx)).await);
+                            let set = store.pools[0].get_disks_by_key("object");
+                            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+                            let other_disks = store.pools[1]
+                                .get_disks_by_key("object")
+                                .disks
+                                .read()
+                                .await
+                                .iter()
+                                .flatten()
+                                .cloned()
+                                .collect::<Vec<_>>();
+                            {
+                                let map = ctx.local_disk_map();
+                                let mut active = map.write().await;
+                                for disk in disks.iter().chain(&other_disks) {
+                                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                                }
+                            }
+                            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                            let bucket = "ecstore-reservation-order";
+                            let object = "object";
+                            store
+                                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                                .await
+                                .expect("create bucket");
+                            store
+                                .handle_put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![b'0'; 1 << 20]),
+                                    &ObjectOptions {
+                                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("seed object in its pool");
+                            let tasks = rename_fanout_barrier::observe_tasks(object);
+                            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                            let first_store = Arc::clone(&store);
+                            let first = tokio::spawn(async move {
+                                first_store
+                                    .handle_put_object(
+                                        bucket,
+                                        object,
+                                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                                        &ObjectOptions::default(),
+                                    )
+                                    .await
+                            });
+                            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                                .await
+                                .expect("first tail pauses");
+                            first.await.expect("first task").expect("first PUT");
+                            let second = tokio::time::timeout(
+                                Duration::from_secs(7),
+                                store.handle_put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                                    &ObjectOptions::default(),
+                                ),
+                            )
+                            .await;
+                            barrier.release();
+                            drop(barrier);
+                            let (second, _) = second.expect("second PUT completes").expect("second PUT succeeds");
+                            tokio::time::timeout(Duration::from_secs(30), async {
+                                while tasks.running() != 0 {
+                                    tokio::task::yield_now().await;
+                                }
+                            })
+                            .await
+                            .expect("rename tails drain");
+                            let expected_etag = second.etag.as_ref().expect("second ETag");
+                            let idx = store.get_pool_idx_no_lock(bucket, object, 1).await.expect("selected pool");
+                            let selected = store.pools[idx].get_disks_by_key(object);
+                            let selected_disks = selected.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+                            for disk in &selected_disks {
+                                let info = disk
+                                    .read_version("", bucket, object, "", &ReadOptions::default())
+                                    .await
+                                    .expect("read latest metadata");
+                                assert_eq!(info.metadata.get("etag"), Some(expected_etag));
+                                let parts = disk.check_parts(bucket, object, &info).await.expect("check latest shards");
+                                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+                            }
+                        })
+                        .await;
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread completes");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn changed_pool_selection_discards_tentative_reservations() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        use crate::set_disk::{
+                            ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, PutObjectCommitBarrier, PutObjectCommitPause,
+                        };
+                        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+                            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                            let (_first_dirs, first) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                            let (_second_dirs, second) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                            let store =
+                                Arc::new(new_prepared_reader_test_store_with_ctx(&[first, second], Arc::clone(&ctx)).await);
+                            for pool in &store.pools {
+                                let set = pool.get_disks_by_key("object");
+                                for disk in set.disks.read().await.iter().flatten() {
+                                    ctx.local_disk_map()
+                                        .write()
+                                        .await
+                                        .insert(disk.endpoint().to_string(), Some(disk.clone()));
+                                }
+                            }
+                            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                            let bucket = "tentative-pool-changed";
+                            let object = "object";
+                            store
+                                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                                .await
+                                .expect("create bucket");
+                            store.pools[0]
+                                .put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                                    &ObjectOptions {
+                                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("seed initial pool");
+                            assert_eq!(
+                                store
+                                    .get_pool_idx_no_lock(bucket, object, 8193)
+                                    .await
+                                    .expect("initial selection"),
+                                0
+                            );
+                            let barrier =
+                                PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeBucketSnapshot);
+                            let worker = Arc::clone(&store);
+                            let put = tokio::spawn(async move {
+                                worker
+                                    .handle_put_object(
+                                        bucket,
+                                        object,
+                                        &mut PutObjReader::from_vec(vec![3; 8193]),
+                                        &ObjectOptions::default(),
+                                    )
+                                    .await
+                            });
+                            barrier.wait_until_paused().await;
+                            store.pools[1]
+                                .put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![2; 8193]),
+                                    &ObjectOptions {
+                                        mod_time: Some(OffsetDateTime::now_utc() + time::Duration::seconds(5)),
+                                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("publish a newer object to the other pool");
+                            assert_eq!(store.get_pool_idx(bucket, object, 8193).await.expect("changed selection"), 1);
+                            barrier.release();
+                            drop(barrier);
+                            let (result, _) = tokio::time::timeout(Duration::from_secs(20), put)
+                                .await
+                                .expect("PUT completes")
+                                .expect("PUT task")
+                                .expect("PUT succeeds");
+                            let latest = store.pools[1]
+                                .get_object_info(bucket, object, &ObjectOptions::default())
+                                .await
+                                .expect("read final target");
+                            assert_eq!(latest.etag, result.etag, "the selected pool must contain the completed PUT");
+                            let old = store.pools[0]
+                                .get_object_info(bucket, object, &ObjectOptions::default())
+                                .await
+                                .expect("read original pool");
+                            assert_ne!(
+                                old.etag, result.etag,
+                                "stale tentative reservations must not publish into the original pool"
+                            );
+                        })
+                        .await;
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread completes");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn tentative_selection_does_not_wait_for_slow_nonquorum_disk() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        use crate::set_disk::rename_fanout_barrier;
+                        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                        let (_first_dirs, first) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let (_second_dirs, second) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first, second], Arc::clone(&ctx)).await);
+                        for pool in &store.pools {
+                            let set = pool.get_disks_by_key("object");
+                            for disk in set.disks.read().await.iter().flatten() {
+                                ctx.local_disk_map()
+                                    .write()
+                                    .await
+                                    .insert(disk.endpoint().to_string(), Some(disk.clone()));
+                            }
+                        }
+                        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                        let bucket = "slow-selection-disk";
+                        let object = "object";
+                        store
+                            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create bucket");
+                        for (i, pool) in store.pools.iter().enumerate() {
+                            pool.put_object(
+                                bucket,
+                                object,
+                                &mut PutObjReader::from_vec(vec![u8::try_from(i).expect("pool index"); 8193]),
+                                &ObjectOptions {
+                                    mod_time: Some(
+                                        OffsetDateTime::now_utc()
+                                            + time::Duration::seconds(i64::try_from(i).expect("pool index")),
+                                    ),
+                                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("seed both pools");
+                        }
+                        let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_READ_VERSION);
+                        let locked_store = Arc::clone(&store);
+                        let locked = tokio::spawn(async move { locked_store.get_pool_idx(bucket, object, 8193).await });
+                        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+                            .await
+                            .expect("metadata disk pauses");
+                        let locked_result = tokio::time::timeout(Duration::from_secs(3), locked).await;
+                        if locked_result.is_err() {
+                            barrier.release();
+                            drop(barrier);
+                            panic!("the locked baseline did not reach quorum without the slow disk");
+                        }
+                        locked_result
+                            .expect("locked lookup completes")
+                            .expect("locked task")
+                            .expect("locked selection");
+                        for pool in &store.pools {
+                            pool.get_disks_by_key(object)
+                                .invalidate_get_object_metadata_cache(bucket, object)
+                                .await;
+                        }
+                        let calls = disk_call_counters::observe(object);
+                        let hint_store = Arc::clone(&store);
+                        let mut hint =
+                            tokio::spawn(async move { hint_store.get_pool_idx_for_reservation_hint(bucket, object, 8193).await });
+                        let hint_result = tokio::time::timeout(Duration::from_secs(3), &mut hint).await;
+                        barrier.release();
+                        drop(barrier);
+                        if hint_result.is_err() {
+                            let _ = tokio::time::timeout(Duration::from_secs(20), hint).await;
+                            panic!("tentative pool selection waited for a nonquorum disk");
+                        }
+                        assert!(
+                            (0..4).any(|index| calls.for_disk(disk_call_counters::KIND_READ_VERSION, index) > 0),
+                            "cold speculative lookup must issue disk reads"
+                        );
+                        hint_result
+                            .expect("hint lookup completes")
+                            .expect("hint task")
+                            .expect("hint selection");
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread completes");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn speculative_selection_does_not_double_slow_missing_pool_wait() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                        let (_first_dirs, first) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let (_second_dirs, second) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first, second], Arc::clone(&ctx)).await);
+                        for pool in &store.pools {
+                            let set = pool.get_disks_by_key("object");
+                            for disk in set.disks.read().await.iter().flatten() {
+                                ctx.local_disk_map()
+                                    .write()
+                                    .await
+                                    .insert(disk.endpoint().to_string(), Some(disk.clone()));
+                            }
+                        }
+                        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                        let bucket = "slow-missing-pool";
+                        store
+                            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create bucket");
+                        for key in ["objects/baseline", "objects/speculative"] {
+                            store.pools[0]
+                                .put_object(
+                                    bucket,
+                                    key,
+                                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                                    &ObjectOptions {
+                                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                        ..Default::default()
+                                    },
+                                )
+                                .await
+                                .expect("seed object in one pool");
+                            for pool in &store.pools {
+                                pool.get_disks_by_key(key)
+                                    .invalidate_get_object_metadata_cache(bucket, key)
+                                    .await;
+                            }
+                        }
+                        async fn measured(store: &Arc<ECStore>, bucket: &str, key: &str, early: &'static str) -> (Duration, u64) {
+                            let calls = disk_call_counters::observe(key);
+                            temp_env::async_with_vars(
+                                [
+                                    ("RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE", Some(early)),
+                                    ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DELAY_MS", Some("1200")),
+                                    ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_DISKS", Some("0")),
+                                    ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_BUCKET", Some(bucket)),
+                                    ("RUSTFS_GET_METADATA_SLOWTAIL_FAULT_OBJECT_PREFIX", Some("objects/")),
+                                ],
+                                async {
+                                    let started = tokio::time::Instant::now();
+                                    tokio::time::timeout(
+                                        Duration::from_secs(15),
+                                        store.handle_put_object(
+                                            bucket,
+                                            key,
+                                            &mut PutObjReader::from_vec(vec![2; 8193]),
+                                            &ObjectOptions::default(),
+                                        ),
+                                    )
+                                    .await
+                                    .expect("PUT completes")
+                                    .expect("PUT succeeds");
+                                    (started.elapsed(), calls.total(disk_call_counters::KIND_METADATA_SLOWTAIL_FAULT))
+                                },
+                            )
+                            .await
+                        }
+                        let (baseline, baseline_faults) = measured(&store, bucket, "objects/baseline", "false").await;
+                        let (candidate, candidate_faults) = measured(&store, bucket, "objects/speculative", "true").await;
+                        assert!(baseline_faults > 0 && candidate_faults > 0, "both PUTs must encounter the delayed disk");
+                        assert!(
+                            candidate <= baseline + Duration::from_millis(800),
+                            "speculative lookup doubled slow-missing-pool wait: baseline={baseline:?} candidate={candidate:?}"
+                        );
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread completes");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn metadata_snapshot_stays_held_when_reservation_preparation_fails() {
+        use crate::set_disk::{
+            ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, PutObjectCommitBarrier, PutObjectCommitPause, rename_fanout_barrier,
+        };
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "tail-owner-fallback";
+            let object = "first";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            ctx.local_disk_map().write().await.remove(&disks[1].endpoint().to_string());
+            let before_rename = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeQuotaRename);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(bucket, object, &mut PutObjReader::from_vec(vec![1; 1 << 20]), &ObjectOptions::default())
+                    .await
+            });
+            before_rename.wait_until_paused().await;
+            ctx.local_disk_map()
+                .write()
+                .await
+                .insert(disks[1].endpoint().to_string(), Some(disks[1].clone()));
+            before_rename.release();
+            drop(before_rename);
+            barrier.wait_until_paused().await;
+            tokio::time::timeout(Duration::from_secs(20), first)
+                .await
+                .expect("first PUT completes")
+                .expect("first task")
+                .expect("first PUT");
+            let writer_ctx = Arc::clone(&ctx);
+            let mut writer = tokio::spawn(async move {
+                crate::bucket::metadata_sys::update_in(
+                    &writer_ctx,
+                    bucket,
+                    crate::bucket::metadata::BUCKET_TAGGING_CONFIG,
+                    b"<Tagging><TagSet><Tag><Key>phase</Key><Value>fallback</Value></Tag></TagSet></Tagging>".to_vec(),
+                )
+                .await
+            });
+            let before = tokio::time::timeout(Duration::from_millis(300), &mut writer).await;
+            barrier.release();
+            drop(barrier);
+            assert!(before.is_err(), "fallback must retain its snapshot while the physical tail is paused");
+            tokio::time::timeout(Duration::from_secs(20), writer)
+                .await
+                .expect("writer completes")
+                .expect("writer task")
+                .expect("metadata update");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn different_key_put_not_blocked_by_metadata_writer_behind_committed_tail() {
+        use crate::disk::ReadOptions;
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "tail-metadata-contention";
+            let object = "first";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(bucket, object, &mut PutObjReader::from_vec(vec![1; 1 << 20]), &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            let (first, _) = first.await.expect("first task").expect("first PUT");
+            let writer_ctx = Arc::clone(&ctx);
+            let mut writer = tokio::spawn(async move {
+                crate::bucket::metadata_sys::update_in(
+                    &writer_ctx,
+                    bucket,
+                    crate::bucket::metadata::BUCKET_TAGGING_CONFIG,
+                    b"<Tagging><TagSet><Tag><Key>phase</Key><Value>after-ack</Value></Tag></TagSet></Tagging>".to_vec(),
+                )
+                .await
+            });
+            let writer_pending = match tokio::time::timeout(Duration::from_millis(500), &mut writer).await {
+                Ok(result) => {
+                    result.expect("writer task joins").expect("writer succeeds");
+                    false
+                }
+                Err(_) => true,
+            };
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(bucket, "second", &mut PutObjReader::from_vec(vec![2; 8193]), &ObjectOptions::default()),
+            )
+            .await;
+            let delete_store = Arc::clone(&store);
+            let mut delete = tokio::spawn(async move {
+                delete_store
+                    .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+                "bucket deletion must wait for the reserved physical tail"
+            );
+            barrier.release();
+            drop(barrier);
+            let deletion = tokio::time::timeout(Duration::from_secs(20), delete)
+                .await
+                .expect("bucket deletion completes")
+                .expect("bucket deletion task");
+            assert!(
+                matches!(
+                    deletion,
+                    Err(StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. })
+                ),
+                "the committed objects must keep the bucket nonempty"
+            );
+            if writer_pending {
+                tokio::time::timeout(Duration::from_secs(20), writer)
+                    .await
+                    .expect("writer completes")
+                    .expect("writer task joins")
+                    .expect("writer succeeds");
+            }
+            second.expect("second PUT completes").expect("different key PUT succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first tail drains");
+            let metadata = crate::bucket::metadata_sys::get_in(&ctx, bucket)
+                .await
+                .expect("read changed metadata");
+            assert!(metadata.tagging_config.is_some(), "the bucket configuration update must persist");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("read first metadata");
+                assert_eq!(info.metadata.get("etag"), first.etag.as_ref());
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check first shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn object_lock_policy_update_during_reserved_tail_keeps_versions_protected() {
+        use crate::disk::ReadOptions;
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "tail-object-lock-policy";
+            let object = "first";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions { lock_enabled: true, ..Default::default() })
+                .await
+                .expect("create bucket");
+            crate::bucket::metadata_sys::update_in(
+                &ctx, bucket, crate::bucket::metadata::OBJECT_LOCK_CONFIG,
+                b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+            ).await.expect("set original retention policy");
+            let tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(bucket, object, &mut PutObjReader::from_vec(vec![1; 1 << 20]), &ObjectOptions { versioned: true, version_id: Some(Uuid::new_v4().to_string()), ..Default::default() })
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            let (first, _) = first.await.expect("first task").expect("first PUT");
+            let writer_ctx = Arc::clone(&ctx);
+            let mut writer = tokio::spawn(async move {
+                crate::bucket::metadata_sys::update_in(
+                    &writer_ctx,
+                    bucket,
+                    crate::bucket::metadata::OBJECT_LOCK_CONFIG,
+                    b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled><Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule></ObjectLockConfiguration>".to_vec(),
+                )
+                .await
+            });
+            let writer_pending = match tokio::time::timeout(Duration::from_millis(500), &mut writer).await {
+                Ok(result) => {
+                    result.expect("writer task joins").expect("writer succeeds");
+                    false
+                }
+                Err(_) => true,
+            };
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(bucket, "second", &mut PutObjReader::from_vec(vec![2; 8193]), &ObjectOptions { versioned: true, version_id: Some(Uuid::new_v4().to_string()), ..Default::default() }),
+            )
+            .await;
+            let delete_store = Arc::clone(&store);
+            let mut delete = tokio::spawn(async move {
+                delete_store
+                    .handle_delete_bucket(bucket, &crate::storage_api_contracts::bucket::DeleteBucketOptions::default())
+                    .await
+            });
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+                "bucket deletion must wait for the reserved physical tail"
+            );
+            barrier.release();
+            drop(barrier);
+            let deletion = tokio::time::timeout(Duration::from_secs(20), delete)
+                .await
+                .expect("bucket deletion completes")
+                .expect("bucket deletion task");
+            assert!(
+                matches!(
+                    deletion,
+                    Err(StorageError::BucketNotEmpty(_) | StorageError::BucketNotEmptyWithDetails { .. })
+                ),
+                "the committed objects must keep the bucket nonempty"
+            );
+            if writer_pending {
+                tokio::time::timeout(Duration::from_secs(20), writer)
+                    .await
+                    .expect("writer completes")
+                    .expect("writer task joins")
+                    .expect("writer succeeds");
+            }
+            let (second, _) = second.expect("second PUT completes").expect("different key PUT succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("first tail drains");
+            for (key, info) in [(object, &first), ("second", &second)] {
+                let err = store.handle_put_object(
+                    bucket, key, &mut PutObjReader::from_vec(vec![3; 8193]),
+                    &ObjectOptions { versioned: true, version_id: Some(info.version_id.expect("committed version ID").to_string()), ..Default::default() },
+                ).await.expect_err("updated default retention must protect committed versions");
+                assert!(matches!(err, StorageError::PrefixAccessDenied(_, _)), "unexpected retention error: {err:?}");
+            }
+            let metadata = crate::bucket::metadata_sys::get_in(&ctx, bucket)
+                .await
+                .expect("read changed metadata");
+            assert!(metadata.object_lock_config.is_some(), "the bucket configuration update must persist");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, &first.version_id.expect("first version ID").to_string(), &ReadOptions::default())
+                    .await
+                    .expect("read first metadata");
+                assert_eq!(info.metadata.get("etag"), first.etag.as_ref());
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check first shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ecstore_early_ack_prepares_before_snapshot_and_orders_the_next_put() {
+        use crate::disk::ReadOptions;
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "ecstore-reservation-order";
+            let object = "object";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("first tail pauses");
+            first.await.expect("first task").expect("first PUT");
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                    &ObjectOptions::default(),
+                ),
+            )
+            .await;
+            barrier.release();
+            drop(barrier);
+            let (second, _) = second.expect("second PUT completes").expect("second PUT succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rename tails drain");
+            let expected_etag = second.etag.as_ref().expect("second ETag");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("read latest metadata");
+                assert_eq!(info.metadata.get("etag"), Some(expected_etag));
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check latest shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn ecstore_new_version_early_ack_orders_the_next_put() {
+        use crate::disk::ReadOptions;
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "ecstore-versioned-reservation-order";
+            let object = "object";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("first tail pauses");
+            first.await.expect("first task").expect("first PUT");
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
+            barrier.release();
+            drop(barrier);
+            let (second, _) = second.expect("second PUT completes").expect("second PUT succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rename tails drain");
+            let expected_etag = second.etag.as_ref().expect("second ETag");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("read latest metadata");
+                assert_eq!(info.metadata.get("etag"), Some(expected_etag));
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check latest shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn local_prepared_reservations_hold_bucket_publication_fence() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+        let set = store.pools[0].get_disks_by_key("object");
+        let disks = set.disks.read().await.clone();
+        {
+            let map = ctx.local_disk_map();
+            let mut active = map.write().await;
+            for disk in disks.iter().flatten() {
+                active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+            }
+        }
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "local-reservation-bucket-fence";
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let reservations =
+            crate::set_disk::prepare_rename_metadata_reservations(&disks, bucket, "object", incarnation, &ctx, true)
+                .await
+                .expect("prepare reservations")
+                .expect("all disks prepared");
+        let lock = store
+            .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock");
+        let mut writer = Box::pin(lock.get_write_lock(Duration::from_secs(10)));
+        assert!(tokio::time::timeout(Duration::from_millis(50), &mut writer).await.is_err());
+        drop(reservations);
+        let guard = tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("reservations release fence")
+            .expect("writer lock");
+        drop(guard);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn long_staged_put_does_not_timeout_the_next_overwrite() {
+        use crate::set_disk::{
+            ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, PutObjectCommitBarrier, PutObjectCommitPause, rename_fanout_barrier,
+        };
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "long-staged-reservation";
+            let object = "object";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let staging_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+            let tail_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let writer = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                writer
+                    .handle_put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            staging_barrier.wait_until_paused().await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(25)).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(26)).await;
+            tokio::task::yield_now().await;
+            tokio::time::resume();
+            staging_barrier.release();
+            tokio::time::timeout(Duration::from_secs(30), tail_barrier.wait_until_paused())
+                .await
+                .expect("first tail pauses");
+            first.await.expect("first task").expect("first PUT");
+            drop(staging_barrier);
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                    &ObjectOptions::default(),
+                ),
+            )
+            .await;
+            tail_barrier.release();
+            drop(tail_barrier);
+            assert!(matches!(second, Ok(Ok(_))), "second PUT after a long staging interval failed: {second:?}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn bucket_reservations_do_not_exhaust_shared_lock_holders() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+        let set = store.pools[0].get_disks_by_key("object");
+        let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+        {
+            let map = ctx.local_disk_map();
+            let mut active = map.write().await;
+            for disk in &disks {
+                active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+            }
+        }
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "reservation-reader-capacity";
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let disk = disks[0].endpoint().to_string();
+        let mut tokens = Vec::new();
+        let mut failure = None;
+        for index in 0..256 {
+            match store
+                .reserve_local_object_metadata_at_incarnation(
+                    &disk,
+                    bucket,
+                    &format!("object-{index}"),
+                    incarnation,
+                    Duration::from_secs(1),
+                )
+                .await
+            {
+                Ok(token) => tokens.push(token),
+                Err(error) => {
+                    failure = Some((index, error));
+                    break;
+                }
+            }
+        }
+        for token in tokens {
+            assert!(
+                store
+                    .cancel_local_object_metadata_reservation(&disk, token)
+                    .await
+                    .expect("cancel token")
+            );
+        }
+        assert!(failure.is_none(), "bucket reservations exhausted shared lock holders: {failure:?}");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn expired_reservation_fence_does_not_bypass_a_waiting_bucket_writer() {
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+        let set = store.pools[0].get_disks_by_key("object");
+        let disk = set.disks.read().await.iter().flatten().next().expect("local disk").clone();
+        ctx.local_disk_map()
+            .write()
+            .await
+            .insert(disk.endpoint().to_string(), Some(disk.clone()));
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "reservation-writer-fairness";
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+        let disk_ref = disk.endpoint().to_string();
+        let first = store
+            .reserve_local_object_metadata_at_incarnation(&disk_ref, bucket, "first", incarnation, Duration::from_secs(5))
+            .await
+            .expect("first reservation");
+        let lock = store
+            .new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock");
+        let mut writer = Box::pin(lock.get_write_lock(Duration::from_secs(10)));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut writer).await.is_err(),
+            "writer waits for first token"
+        );
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(2)).await;
+        tokio::time::resume();
+        let mut second = Box::pin(store.reserve_local_object_metadata_at_incarnation(
+            &disk_ref,
+            bucket,
+            "second",
+            incarnation,
+            Duration::from_secs(5),
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second).await.is_err(),
+            "expired cached reader must not bypass writer"
+        );
+        assert!(
+            store
+                .cancel_local_object_metadata_reservation(&disk_ref, first)
+                .await
+                .expect("cancel first token")
+        );
+        let guard = tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("writer proceeds")
+            .expect("writer lock");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut second).await.is_err(),
+            "new reader waits while writer holds the lock"
+        );
+        drop(guard);
+        let token = tokio::time::timeout(Duration::from_secs(2), second)
+            .await
+            .expect("reader proceeds")
+            .expect("second reservation");
+        assert!(
+            store
+                .cancel_local_object_metadata_reservation(&disk_ref, token)
+                .await
+                .expect("cancel second token")
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn forced_capacity_probe_cannot_publish_after_a_new_pool_writer() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+                        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                        let (_dirs, first) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let (_other_dirs, second) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first, second], Arc::clone(&ctx)).await);
+                        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                        let bucket = "forced-capacity-probe";
+                        let object = "object";
+                        store
+                            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create bucket");
+                        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeQuotaRename);
+                        let put_store = Arc::clone(&store);
+                        let put = tokio::spawn(async move {
+                            put_store
+                                .handle_put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                                    &ObjectOptions::default(),
+                                )
+                                .await
+                        });
+                        barrier.wait_until_paused().await;
+                        let manager = ctx.lock_manager().as_fast_lock_manager().expect("local lock manager");
+                        let key = rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, crate::core::pools::POOL_META_NAME);
+                        assert_eq!(manager.force_unlock(&key), 1, "force release capacity probe");
+                        let lock = store.pools[0]
+                            .new_ns_lock(RUSTFS_META_BUCKET, crate::core::pools::POOL_META_NAME)
+                            .await
+                            .expect("pool lock");
+                        let writer = lock.get_write_lock(Duration::from_secs(5)).await.expect("new pool writer");
+                        barrier.release();
+                        let result = tokio::time::timeout(Duration::from_secs(30), put)
+                            .await
+                            .expect("PUT finishes")
+                            .expect("PUT task");
+                        assert!(
+                            matches!(&result, Err(StorageError::NamespaceLockQuorumUnavailable { .. })),
+                            "a PUT must reject a lost capacity probe: {result:?}"
+                        );
+                        drop(writer);
+                        assert!(
+                            matches!(
+                                store.handle_get_object_info(bucket, object, &ObjectOptions::default()).await,
+                                Err(StorageError::ObjectNotFound(..))
+                            ),
+                            "the rejected PUT must not publish an object"
+                        );
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test completes");
+    }
+
+    #[tokio::test]
+    async fn force_released_local_bucket_fence_cannot_activate_a_prepared_reservation() {
+        for released in ["publication", "lifecycle"] {
+            let fast = Arc::new(rustfs_lock::FastObjectLockManager::new());
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(fast.clone()));
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("reservation-force".into(), manager);
+            let publication_key = rustfs_lock::ObjectKey::new("bucket", "publication");
+            let publication = lock
+                .get_read_lock(publication_key.clone(), "reservation", Duration::from_secs(5))
+                .await
+                .expect("publication lock");
+            let lifecycle = lock
+                .get_read_lock(rustfs_lock::ObjectKey::new("bucket", "lifecycle"), "reservation", Duration::from_secs(5))
+                .await
+                .expect("lifecycle lock");
+            let bucket_registry = Arc::new(crate::store::bucket_fence::BucketFenceRegistry::default());
+            let lifecycle =
+                crate::store::bucket_fence::BucketIncarnationFenceGuard::new(bucket_registry.clone(), "bucket", lifecycle, true);
+            let slot = bucket_registry.reservation_slot("bucket", Uuid::new_v4());
+            let owner = Arc::new(crate::store::bucket_fence::ReservationFenceGuard::new(publication, lifecycle, slot));
+            let registry = crate::disk::os::MetadataReservationRegistry::new(1);
+            let path = std::path::Path::new("bucket/object");
+            let disk = Uuid::new_v4();
+            let token = registry
+                .prepare_with_owner(path, disk, Some(owner))
+                .expect("prepare reservation");
+            let released_key = rustfs_lock::ObjectKey::new("bucket", released);
+            assert_eq!(fast.force_unlock(&released_key), 1, "force release {released}");
+            let replacement = lock
+                .get_write_lock(released_key, "bucket-delete", Duration::from_secs(5))
+                .await
+                .expect("bucket writer acquires after forced release");
+            assert!(
+                registry.activate(token, path, disk).await.is_err(),
+                "a released fence cannot activate a write"
+            );
+            drop(replacement);
+        }
+    }
+
+    #[tokio::test]
+    async fn lost_bucket_fence_cannot_activate_a_prepared_reservation() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
+            rustfs_lock::FastObjectLockManager::new(),
+        )));
+        let client = Arc::new(RefreshLossLockClient::with_manager(manager));
+        let lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
+            "reservation-loss".to_string(),
+            vec![client.clone() as Arc<dyn rustfs_lock::LockClient>],
+            1,
+        );
+        let acquire = |object: &'static str| {
+            rustfs_lock::LockRequest::new(
+                rustfs_lock::ObjectKey::new("bucket", object),
+                rustfs_lock::LockType::Shared,
+                "reservation-loss",
+            )
+            .with_ttl(Duration::from_secs(2))
+            .with_refresh_interval(Duration::from_millis(20))
+        };
+        let publication = lock
+            .acquire_guard(&acquire("publication"))
+            .await
+            .expect("publication request")
+            .expect("publication quorum");
+        let signal = publication.lock_lost_signal().expect("distributed loss signal");
+        let lifecycle = lock
+            .acquire_guard(&acquire("lifecycle"))
+            .await
+            .expect("lifecycle request")
+            .expect("lifecycle quorum");
+        let bucket_registry = Arc::new(crate::store::bucket_fence::BucketFenceRegistry::default());
+        let lifecycle =
+            crate::store::bucket_fence::BucketIncarnationFenceGuard::new(bucket_registry.clone(), "bucket", lifecycle, true);
+        let incarnation = Uuid::new_v4();
+        let slot = bucket_registry.reservation_slot("bucket", incarnation);
+        let owner = Arc::new(crate::store::bucket_fence::ReservationFenceGuard::new(publication, lifecycle, slot));
+        let registry = crate::disk::os::MetadataReservationRegistry::new(1);
+        let key = std::path::Path::new("bucket/object");
+        let disk = Uuid::new_v4();
+        let token = registry
+            .prepare_with_owner(key, disk, Some(owner))
+            .expect("prepare reservation");
+        client.reject_refreshes();
+        tokio::time::timeout(Duration::from_secs(5), signal.notified())
+            .await
+            .expect("publication lock loss");
+        assert!(
+            registry.activate(token, key, disk).await.is_err(),
+            "a lost bucket fence must not enter the mutation queue"
+        );
     }
 
     #[tokio::test]

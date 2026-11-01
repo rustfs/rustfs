@@ -27,9 +27,10 @@ pub(crate) mod fixture {
     pub(crate) use rustfs_ecstore::api::disk::endpoint::Endpoint;
     pub(crate) use rustfs_ecstore::api::layout::{EndpointServerPools, Endpoints, PoolEndpoints};
     pub(crate) use rustfs_ecstore::api::object::{PutObjReader, SelectObjectSnapshot};
+    pub(crate) use rustfs_ecstore::api::runtime::InstanceContext;
     #[cfg(feature = "put-object-commit-barrier")]
     pub(crate) use rustfs_ecstore::api::set_disk as ecstore_set_disk;
-    pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks};
+    pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks, init_local_disks_with_instance_ctx};
     pub(crate) use rustfs_storage_api::{BucketOperations, BucketOptions, MakeBucketOptions, ObjectIO};
 
     #[cfg(test)]

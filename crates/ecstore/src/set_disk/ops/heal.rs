@@ -34,11 +34,64 @@ mod heal_lock_wait_tests;
 #[derive(Clone, Copy)]
 struct ExplicitVersionHeal<'a> {
     opts: &'a HealOpts,
+    staging_guard: Option<&'a Arc<tokio::sync::Mutex<rustfs_lock::NamespaceLockGuard>>>,
     allow_regeneration: bool,
     preserve_unrepairable: bool,
     commit_fence: Option<&'a (dyn Fn() -> bool + Sync)>,
     namespace_owner: Option<&'a Arc<dyn Send + Sync>>,
     retirement: Option<&'a MarkerRetirementContext<'a>>,
+}
+
+async fn restore_heal_exclusive_guard(
+    guard: &Arc<tokio::sync::Mutex<rustfs_lock::NamespaceLockGuard>>,
+) -> disk::error::Result<()> {
+    tokio::time::timeout(get_lock_acquire_timeout(), async {
+        loop {
+            {
+                let mut guard = guard.lock().await;
+                if guard.is_lock_lost() {
+                    return Err(DiskError::DiskOngoingReq);
+                }
+                let waiting = tokio::time::timeout(std::time::Duration::from_secs(1), guard.waiting_writer()).await;
+                if !matches!(waiting, Ok(Some(false))) {
+                    return Err(DiskError::Timeout);
+                }
+                if tokio::time::timeout(std::time::Duration::from_secs(1), guard.try_upgrade_committed_tail())
+                    .await
+                    .unwrap_or(false)
+                {
+                    // A writer may have waited on a peer that upgraded while
+                    // another peer was still waiting for its readers to drain.
+                    let waiting = tokio::time::timeout(std::time::Duration::from_secs(1), guard.waiting_writer()).await;
+                    return if matches!(waiting, Ok(Some(false))) {
+                        Ok(())
+                    } else {
+                        Err(DiskError::Timeout)
+                    };
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .map_err(|_| DiskError::Timeout)?
+}
+
+async fn wait_for_heal_writer(guard: &Arc<tokio::sync::Mutex<rustfs_lock::NamespaceLockGuard>>) {
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let waiting =
+            tokio::time::timeout(std::time::Duration::from_secs(1), async { guard.lock().await.waiting_writer().await }).await;
+        if !matches!(waiting, Ok(Some(false))) {
+            return;
+        }
+    }
+}
+
+fn cleanup_heal_staging_without_waiting(set: SetDisks, tmp_id: String) {
+    drop(tokio::spawn(async move {
+        let _ = set.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+    }));
 }
 
 // Keep the large heal state machine and its construction temporary out of
@@ -844,6 +897,7 @@ impl SetDisks {
             version_id,
             ExplicitVersionHeal {
                 opts,
+                staging_guard: None,
                 allow_regeneration: true,
                 preserve_unrepairable: false,
                 commit_fence: None,
@@ -994,6 +1048,7 @@ impl SetDisks {
     ) -> disk::error::Result<(HealResultItem, Option<DiskError>)> {
         let ExplicitVersionHeal {
             opts,
+            staging_guard,
             allow_regeneration: allow_explicit_version_regen,
             preserve_unrepairable,
             commit_fence,
@@ -1701,7 +1756,29 @@ impl SetDisks {
                         let dst_data_dir = data_dir;
 
                         if !latest_meta.deleted && !latest_meta.is_remote() {
-                            let stage_result: disk::error::Result<Option<DiskError>> = async {
+                            let mut shared_staging = false;
+                            if let Some(guard) = staging_guard {
+                                let supported = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                                    guard.lock().await.supports_heal_lock_transition().await
+                                })
+                                .await
+                                .unwrap_or(false);
+                                if supported {
+                                    let converted = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+                                        guard.lock().await.downgrade_committed_tail().await
+                                    })
+                                    .await
+                                    .unwrap_or(false);
+                                    if converted {
+                                        shared_staging = true;
+                                    } else {
+                                        // Some peers may have converted. Abort without committing;
+                                        // dropping the guard releases each retained lease.
+                                        return Err(DiskError::Timeout);
+                                    }
+                                }
+                            }
+                            let stage = async {
                                 let erasure_info = latest_meta.erasure.clone();
                                 let mut writer_failures = HealWriterFailures::new(disks_to_heal_count);
 
@@ -1926,16 +2003,42 @@ impl SetDisks {
 
                                 writer_failures.warn(bucket, object, version_id, "partial_targets_unavailable");
                                 Ok(None)
-                            }
-                            .await;
+                            };
+                            let stage_result: disk::error::Result<Option<DiskError>> = if shared_staging {
+                                if let Some(guard) = staging_guard {
+                                    tokio::select! {
+                                        result = stage => result,
+                                        _ = wait_for_heal_writer(guard) => {
+                                            // The UUID prefix is private to this attempt. Cleanup must not
+                                            // retain the namespace lock while a foreground writer waits;
+                                            // the stale-tmp sweeper also covers a cancelled disk operation.
+                                            cleanup_heal_staging_without_waiting(self.clone(), tmp_id.clone());
+                                            return Err(DiskError::Timeout);
+                                        }
+                                    }
+                                } else {
+                                    stage.await
+                                }
+                            } else {
+                                stage.await
+                            };
                             match stage_result {
                                 Ok(None) => {}
                                 failure => {
-                                    // Release readers and writers before removing all parts
-                                    // staged under this heal's exclusively owned prefix.
-                                    let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    if shared_staging {
+                                        cleanup_heal_staging_without_waiting(self.clone(), tmp_id.clone());
+                                    } else {
+                                        let _ = self.delete_all(RUSTFS_META_TMP_BUCKET, &tmp_id).await;
+                                    }
                                     return failure.map(|error| (result, error));
                                 }
+                            }
+                            if shared_staging
+                                && let Some(guard) = staging_guard
+                                && let Err(error) = restore_heal_exclusive_guard(guard).await
+                            {
+                                cleanup_heal_staging_without_waiting(self.clone(), tmp_id.clone());
+                                return Err(error);
                             }
                         }
                         let _read_repair_write_lock_guard = if let Some(expected_fingerprint) = read_repair_commit_fingerprint {
@@ -3616,6 +3719,7 @@ impl SetDisks {
             &version,
             ExplicitVersionHeal {
                 opts: &opts,
+                staging_guard: None,
                 allow_regeneration: false,
                 preserve_unrepairable: true,
                 commit_fence: Some(can_commit),
@@ -3676,6 +3780,7 @@ impl SetDisks {
                         version_id,
                         ExplicitVersionHeal {
                             opts: &read_opts,
+                            staging_guard: None,
                             allow_regeneration: false,
                             preserve_unrepairable: true,
                             commit_fence: Some(&can_commit),
@@ -3702,7 +3807,7 @@ impl SetDisks {
                 .new_ns_lock(bucket, object)
                 .await
                 .map_err(|e| e.narrow_to_disk().unwrap_or_else(DiskError::other))?;
-            Some(Arc::new(
+            Some(Arc::new(tokio::sync::Mutex::new(
                 measure_heal_object_lock(
                     "heal_object",
                     HealObjectLockKind::Write,
@@ -3714,7 +3819,7 @@ impl SetDisks {
                         .narrow_to_disk()
                         .unwrap_or_else(DiskError::other)
                 })?,
-            ))
+            )))
         } else {
             None
         };
@@ -3732,10 +3837,18 @@ impl SetDisks {
             } else {
                 None
             };
+        let write_lock_loss = if let Some(guard) = &_write_lock_guard {
+            guard.lock().await.lock_lost_signal()
+        } else {
+            None
+        };
         let locks_lost = || {
-            _write_lock_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
+            write_lock_loss.as_ref().is_some_and(|signal| signal.is_lost())
                 || transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
         };
+        // Recovery cleanup can outlive its future. Never permit reads until
+        // every physical operation holding its recovery owner has finished.
+        let recovery_tail = Arc::new(());
         let mut recovery_removed_version = false;
         if !opts.read_repair
             && _write_lock_guard.is_some()
@@ -3762,6 +3875,7 @@ impl SetDisks {
                             Arc::new((
                                 scope.clone(),
                                 self.ctx.begin_namespace_commit(),
+                                Arc::clone(&recovery_tail),
                                 _write_lock_guard.clone(),
                                 transaction_guard.clone(),
                             )) as Arc<dyn Send + Sync>
@@ -3885,6 +3999,9 @@ impl SetDisks {
                 version_id,
                 ExplicitVersionHeal {
                     opts: &inner_opts,
+                    staging_guard: (Arc::strong_count(&recovery_tail) == 1)
+                        .then_some(_write_lock_guard.as_ref())
+                        .flatten(),
                     allow_regeneration: true,
                     preserve_unrepairable: false,
                     commit_fence: Some(&commit_fence),
@@ -3909,6 +4026,9 @@ impl SetDisks {
                             version_id,
                             ExplicitVersionHeal {
                                 opts: &inner_opts,
+                                staging_guard: (Arc::strong_count(&recovery_tail) == 1)
+                                    .then_some(_write_lock_guard.as_ref())
+                                    .flatten(),
                                 allow_regeneration: true,
                                 preserve_unrepairable: false,
                                 commit_fence: Some(&commit_fence),
@@ -6047,6 +6167,7 @@ mod heal_result_report_tests {
                 "",
                 ExplicitVersionHeal {
                     opts: &opts,
+                    staging_guard: None,
                     allow_regeneration: true,
                     preserve_unrepairable: false,
                     commit_fence: Some(&can_commit),
@@ -10635,6 +10756,369 @@ mod heal_result_report_tests {
         let mut actual = Vec::new();
         reader.stream.read_to_end(&mut actual).await.expect("read full object");
         assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn background_heal_storage_entry_keeps_readers_available_during_reconstruction() {
+        use crate::object_api::WriteCompletion;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "background-heal-storage-entry";
+        let object = "object.bin";
+        let expected = vec![0x37; 1024 * 1024];
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(expected.clone()),
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write object");
+        let metadata = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("read metadata");
+        let missing = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(metadata.data_dir.expect("external object data").to_string())
+            .join("part.1");
+        tokio::fs::remove_file(&missing).await.expect("remove shard");
+
+        let (_pause, arrived, release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+        let heal_set = set.clone();
+        let heal = tokio::spawn(async move {
+            let mut absence = None;
+            let result = heal_set
+                .heal_object_with_retirement(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        read_repair: false,
+                        ..Default::default()
+                    },
+                    &mut absence,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await;
+            (result, absence)
+        });
+        tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+            .await
+            .expect("read-repair reached shard reconstruction");
+        let mut reader = tokio::time::timeout(
+            Duration::from_millis(200),
+            set.get_object_reader(
+                bucket,
+                object,
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions {
+                    suppress_read_repair: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("background heal reconstruction should allow concurrent readers")
+        .expect("open object while reconstruction is paused");
+        let mut during_heal = Vec::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.stream.read_to_end(&mut during_heal))
+            .await
+            .expect("read completes while reconstruction is paused")
+            .expect("read object during reconstruction");
+        assert_eq!(during_heal, expected);
+        drop(reader);
+        release.notify_one();
+        let (result, absence) = tokio::time::timeout(Duration::from_secs(20), heal)
+            .await
+            .expect("repair finishes")
+            .expect("repair task joins");
+        let (_, error) = result.expect("repair operation succeeds");
+        assert!(error.is_none(), "repair failed: {error:?}");
+        assert!(absence.is_none());
+        assert!(missing.exists(), "missing shard was not restored");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read repaired object");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read full object");
+        assert_eq!(actual, expected);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn background_heal_does_not_timeout_foreground_put_during_long_reconstruction() {
+        use crate::object_api::WriteCompletion;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "background-heal-long-put";
+        let object = "object.bin";
+        set.make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        set.put_object(
+            bucket,
+            object,
+            &mut PutObjReader::from_vec(vec![0x37; 1024 * 1024]),
+            &ObjectOptions {
+                write_completion: WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write original object");
+        let metadata = disks[0]
+            .read_version("", bucket, object, "", &ReadOptions::default())
+            .await
+            .expect("read metadata");
+        let missing = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(metadata.data_dir.expect("external data").to_string())
+            .join("part.1");
+        tokio::fs::remove_file(missing).await.expect("remove shard");
+        let (_pause, arrived, release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+        let heal_set = set.clone();
+        let heal = tokio::spawn(async move {
+            let mut absence = None;
+            heal_set
+                .heal_object_with_retirement(
+                    bucket,
+                    object,
+                    "",
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                    &mut absence,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+            .await
+            .expect("reconstruction started");
+        let put = tokio::time::timeout(
+            Duration::from_secs(7),
+            set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![0x52; 1024]), &ObjectOptions::default()),
+        )
+        .await;
+        release.notify_one();
+        let heal_result = tokio::time::timeout(Duration::from_secs(20), heal)
+            .await
+            .expect("heal finishes after releasing reconstruction")
+            .expect("heal task joins");
+        put.expect("foreground PUT finishes during reconstruction")
+            .expect("foreground PUT must not time out");
+        assert!(
+            matches!(heal_result, Err(Error::Timeout)),
+            "interrupted heal must be retryable: {heal_result:?}"
+        );
+        drop(_pause);
+        let mut absence = None;
+        let (_, retry_error) = set
+            .heal_object_with_retirement(
+                bucket,
+                object,
+                "",
+                &HealOpts {
+                    scan_mode: HealScanMode::Deep,
+                    ..Default::default()
+                },
+                &mut absence,
+                AbsenceProofRequest {
+                    retirement: None,
+                    allow_unversioned: false,
+                },
+            )
+            .await
+            .expect("a later heal must retry the current object");
+        assert!(retry_error.is_none(), "retry must complete: {retry_error:?}");
+        let mut reader = set
+            .get_object_reader(bucket, object, None, http::HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("read foreground write after heal");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read full object");
+        assert_eq!(actual, vec![0x52; 1024], "stale heal must not overwrite the foreground write");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn background_heal_yields_to_version_delete_without_resurrecting_it() {
+        use crate::object_api::WriteCompletion;
+        use std::time::Duration;
+        use tokio::io::AsyncReadExt;
+
+        let (dirs, disks, set) = hermetic_set_disks_isolated(4).await;
+        let bucket = "background-heal-version-delete";
+        let object = "object.bin";
+        set.make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                versioning_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("create versioned bucket");
+        let original = set
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x37; 1024 * 1024]),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write original version");
+        let version = original.version_id.expect("version id").to_string();
+        let survivor = set
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(vec![0x52; 1024]),
+                &ObjectOptions {
+                    versioned: true,
+                    write_completion: WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write surviving version")
+            .version_id
+            .expect("surviving version id");
+        let metadata = disks[0]
+            .read_version("", bucket, object, &version, &ReadOptions::default())
+            .await
+            .expect("read original metadata");
+        let missing = dirs[0]
+            .path()
+            .join(bucket)
+            .join(object)
+            .join(metadata.data_dir.expect("external data").to_string())
+            .join("part.1");
+        tokio::fs::remove_file(missing).await.expect("remove shard");
+        let (_pause, arrived, release) =
+            ReadRepairPauseScope::install_at(bucket, object, super::ReadRepairPausePhase::PartStaging(1));
+        let heal_set = set.clone();
+        let heal_version = version.clone();
+        let heal = tokio::spawn(async move {
+            heal_set
+                .heal_object_with_retirement(
+                    bucket,
+                    object,
+                    &heal_version,
+                    &HealOpts {
+                        scan_mode: HealScanMode::Deep,
+                        ..Default::default()
+                    },
+                    &mut None,
+                    AbsenceProofRequest {
+                        retirement: None,
+                        allow_unversioned: false,
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), arrived.notified())
+            .await
+            .expect("reconstruction started");
+        let delete = tokio::time::timeout(
+            Duration::from_secs(7),
+            set.delete_object(
+                bucket,
+                object,
+                ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.clone()),
+                    object_lock_config_snapshot: Some(Arc::new(crate::set_disk::ObjectLockConfigSnapshot::new(
+                        crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await;
+        release.notify_one();
+        let heal_result = tokio::time::timeout(Duration::from_secs(20), heal)
+            .await
+            .expect("heal finishes")
+            .expect("heal task joins");
+        delete
+            .expect("foreground delete finishes")
+            .expect("foreground delete succeeds");
+        assert!(
+            matches!(heal_result, Err(Error::Timeout)),
+            "interrupted heal must be retryable: {heal_result:?}"
+        );
+        let result = set
+            .get_object_info(
+                bucket,
+                object,
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(version.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            matches!(&result, Err(Error::VersionNotFound(b, o, v)) if b == bucket && o == object && v == &version),
+            "stale heal must not resurrect the deleted version: {result:?}"
+        );
+        let mut survivor = set
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                http::HeaderMap::new(),
+                &ObjectOptions {
+                    versioned: true,
+                    version_id: Some(survivor.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("surviving version remains readable");
+        let mut body = Vec::new();
+        survivor.stream.read_to_end(&mut body).await.expect("read surviving version");
+        assert_eq!(body, vec![0x52; 1024]);
+        for disk in &disks {
+            let physical = disk.read_version("", bucket, object, &version, &ReadOptions::default()).await;
+            assert!(
+                matches!(physical, Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)),
+                "deleted version must remain absent on each disk: {physical:?}"
+            );
+        }
     }
 
     #[tokio::test]

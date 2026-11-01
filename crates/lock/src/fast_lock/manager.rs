@@ -96,11 +96,14 @@ impl FastObjectLockManager {
     /// Acquire object lock
     pub async fn acquire_lock(&self, request: ObjectLockRequest) -> Result<FastLockGuard, LockResult> {
         let shard = self.get_shard(&request.key);
-        match shard.acquire_lock(&request).await {
-            Ok(()) => {
-                let guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
+        match shard.acquire_guarded(&request).await {
+            Ok(acquired) => {
+                let mut guard = FastLockGuard::new(request.key, request.mode, request.owner, shard.clone());
                 // Register guard to prevent premature cleanup
-                shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
+                if !shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner(), &acquired) {
+                    guard.abandon_unregistered();
+                    return Err(LockResult::Timeout);
+                }
                 Ok(guard)
             }
             Err(err) => Err(err),
@@ -201,31 +204,15 @@ impl FastObjectLockManager {
         let mut all_failed = Vec::new();
         let mut guards = Vec::new();
 
-        for (shard_id, requests) in shard_groups {
-            let shard = self.shards[*shard_id].clone();
-
+        for (_, requests) in shard_groups {
             for request in requests {
                 let key = request.key.clone();
-                let owner = request.owner.clone();
-                let mode = request.mode;
-
-                let acquired = if shard.try_fast_path_only(request) {
-                    true
-                } else {
-                    match shard.acquire_lock(request).await {
-                        Ok(()) => true,
-                        Err(err) => {
-                            all_failed.push((key.clone(), err));
-                            false
-                        }
+                match self.acquire_lock(request.clone()).await {
+                    Ok(guard) => {
+                        all_successful.push(key);
+                        guards.push(guard);
                     }
-                };
-
-                if acquired {
-                    let guard = FastLockGuard::new(key.clone(), mode, owner.clone(), shard.clone());
-                    shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
-                    all_successful.push(key);
-                    guards.push(guard);
+                    Err(err) => all_failed.push((key, err)),
                 }
             }
         }
@@ -245,14 +232,10 @@ impl FastObjectLockManager {
         let mut acquired_guards = Vec::new();
         let mut failed_locks = Vec::new();
 
-        'outer: for (shard_id, requests) in shard_groups {
-            let shard = self.shards[*shard_id].clone();
-
+        'outer: for (_, requests) in shard_groups {
             for request in requests {
-                match shard.acquire_lock(request).await {
-                    Ok(()) => {
-                        let guard = FastLockGuard::new(request.key.clone(), request.mode, request.owner.clone(), shard.clone());
-                        shard.register_guard_with_info(guard.guard_id(), guard.key(), guard.mode(), guard.owner());
+                match self.acquire_lock(request.clone()).await {
+                    Ok(guard) => {
                         acquired_guards.push(guard);
                     }
                     Err(err) => {

@@ -410,6 +410,10 @@ impl ObjectLockDiagGuard {
         self
     }
 
+    async fn downgrade_committed_tail(&mut self) -> bool {
+        self.guard.downgrade_committed_tail().await
+    }
+
     /// Whether the underlying namespace lock's heartbeat has observed a
     /// refresh-quorum loss (backlog#899 Phase 2). Callers fence their commit
     /// point on this so a stale lock holder does not race a double-write.
@@ -902,6 +906,10 @@ mod core;
 pub(crate) use core::io_primitives::disk_call_counters;
 #[cfg(test)]
 pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+pub(crate) use core::io_primitives::{
+    RenameMetadataReservation, RenameReservationMode, align_rename_metadata_reservations, prepare_rename_metadata_reservations,
+    prepare_rename_metadata_reservations_until_abandoned, put_rename_early_ack_enabled,
+};
 mod ctx;
 mod metadata;
 mod ops;
@@ -927,6 +935,8 @@ pub(crate) use ops::object::TransitionUploadedCommitBarrier as SetDiskTransition
 pub(crate) use ops::object::body_cache_plaintext_len;
 #[cfg(all(test, feature = "test-util"))]
 pub(crate) use ops::object::cleanup_rejected_transition_upload_durably;
+#[cfg(test)]
+pub(crate) use ops::object::pause_put_object_commit;
 #[cfg(test)]
 pub(crate) use ops::object::{DeleteCleanupBarrier, DeleteObjectCommitBarrier};
 #[cfg(any(test, feature = "test-util"))]

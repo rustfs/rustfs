@@ -106,6 +106,8 @@ pub(crate) struct RenameDataGuards {
     pub(crate) scanner_publication_lease_token: Option<Uuid>,
     pub(crate) external_guard: Option<Arc<dyn Send + Sync>>,
     pub(crate) namespace_owner: Option<Arc<dyn Send + Sync>>,
+    pub(crate) metadata_reservation: Option<os::MetadataMutationReservation>,
+    pub(crate) metadata_reservation_token: Option<Uuid>,
 }
 
 /// Local preflight evidence stays outside DiskAPI and the RPC response format.
@@ -119,6 +121,13 @@ impl RenameDataObservation {
         Self {
             result,
             preflight_rejection: None,
+        }
+    }
+
+    fn not_dispatched(error: DiskError) -> Self {
+        Self {
+            result: Err(error),
+            preflight_rejection: Some(local::LocalRenamePreflightRejection::not_dispatched()),
         }
     }
 
@@ -311,6 +320,82 @@ pub enum Disk {
 }
 
 impl Disk {
+    /// Prepare an inert single-use reservation on this disk.
+    /// A lost remote response holds its bucket publication fence until expiration, but does not lock the object.
+    pub async fn prepare_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        incarnation: Uuid,
+        timeout: std::time::Duration,
+    ) -> Result<Uuid> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        match self {
+            Disk::Local(disk) => tokio::time::timeout(
+                timeout.min(std::time::Duration::from_secs(5)),
+                disk.prepare_object_metadata(bucket, object),
+            )
+            .await
+            .map_err(|_| DiskError::Timeout)?,
+            Disk::Remote(disk) => disk.reserve_object_metadata(bucket, object, incarnation, timeout).await,
+        }
+    }
+
+    /// Refresh an inert token while its sender stages the write.
+    pub async fn renew_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        match self {
+            Disk::Local(disk) => tokio::time::timeout(
+                timeout.min(std::time::Duration::from_secs(5)),
+                disk.renew_object_metadata(bucket, object, token),
+            )
+            .await
+            .map_err(|_| DiskError::Timeout)?,
+            Disk::Remote(disk) => disk.renew_object_metadata(bucket, object, token, timeout).await,
+        }
+    }
+
+    /// Enqueue a prepared token in object mutation order.
+    pub async fn activate_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        match self {
+            Disk::Local(disk) => tokio::time::timeout(
+                timeout.min(std::time::Duration::from_secs(5)),
+                disk.activate_object_metadata(bucket, object, token),
+            )
+            .await
+            .map_err(|_| DiskError::Timeout)?,
+            Disk::Remote(disk) => disk.activate_object_metadata(bucket, object, token, timeout).await,
+        }
+    }
+
+    /// Cancel an unclaimed reservation. False does not prove that a claim has
+    /// not already started a physical mutation.
+    pub async fn cancel_object_metadata_reservation(&self, token: Uuid) -> Result<bool> {
+        match self {
+            Disk::Local(disk) => Ok(disk.cancel_object_metadata_reservation(token)),
+            Disk::Remote(disk) => disk.cancel_object_metadata_reservation(token).await,
+        }
+    }
+
     /// Physical ownership belongs to the node hosting the local attachment.
     pub fn physical_admission(&self) -> Option<Arc<PhysicalDiskBinding>> {
         match self {
@@ -1251,18 +1336,33 @@ impl Disk {
                     .rename_data_observed_with_guards(src_volume, src_path, fi, dst_volume, dst_path, guards)
                     .await
             }
-            Disk::Remote(remote_disk) => RenameDataObservation::unknown(
-                remote_disk
-                    .rename_data_borrowed_with_fence(
-                        src_volume,
-                        src_path,
-                        fi,
-                        dst_volume,
-                        dst_path,
-                        guards.scanner_publication_lease_token,
-                    )
-                    .await,
-            ),
+            Disk::Remote(remote_disk) => {
+                if guards.metadata_reservation.is_some() {
+                    return RenameDataObservation::not_dispatched(DiskError::InvalidPath);
+                }
+                if let Some(token) = guards.metadata_reservation_token {
+                    if guards.scanner_publication_lease_token.is_some() {
+                        return RenameDataObservation::not_dispatched(DiskError::InvalidPath);
+                    }
+                    return RenameDataObservation::unknown(
+                        remote_disk
+                            .rename_data_with_metadata_reservation(src_volume, src_path, fi, dst_volume, dst_path, token)
+                            .await,
+                    );
+                }
+                RenameDataObservation::unknown(
+                    remote_disk
+                        .rename_data_borrowed_with_fence(
+                            src_volume,
+                            src_path,
+                            fi,
+                            dst_volume,
+                            dst_path,
+                            guards.scanner_publication_lease_token,
+                        )
+                        .await,
+                )
+            }
         }
     }
 
