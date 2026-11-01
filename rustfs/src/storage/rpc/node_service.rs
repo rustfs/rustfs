@@ -1826,6 +1826,34 @@ impl Node for NodeService {
         self.handle_rename_data(request, false, true, false).await
     }
 
+    async fn reserve_object_metadata(
+        &self,
+        request: Request<MetadataReservationRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        self.handle_reserve_object_metadata(request).await
+    }
+
+    async fn cancel_object_metadata_reservation(
+        &self,
+        request: Request<MetadataReservationCancelRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        self.handle_cancel_object_metadata_reservation(request).await
+    }
+
+    async fn activate_object_metadata_reservation(
+        &self,
+        request: Request<MetadataReservationActivateRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        self.handle_activate_object_metadata_reservation(request).await
+    }
+
+    async fn rename_reserved_data(
+        &self,
+        request: Request<ReservedRenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        self.handle_rename_reserved_data(request).await
+    }
+
     async fn undo_pool_meta_write(
         &self,
         request: Request<DeleteVersionRequest>,
@@ -3245,15 +3273,17 @@ mod tests {
         HealControlRequest, HealControlResponse, ListBucketRequest, ListDirRequest, ListVolumesRequest,
         LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest,
         LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, MakeBucketRequest,
-        MakeVolumeRequest, MakeVolumesRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest, PreparePartTransactionRequest,
+        MakeVolumeRequest, MakeVolumesRequest, MetadataReservationActivateRequest, MetadataReservationCancelRequest,
+        MetadataReservationRequest, Mss, PingRequest, PoolMetaNativeRecoveryRequest, PreparePartTransactionRequest,
         ReadAllRequest, ReadAtRequest, ReadMultipleRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
         RecoverMultipartSourceRequest, ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, RenameDataRequest,
-        RenameFileRequest, RenamePartRequest, ScannerActivityRequest, ScannerDirtyUsageSnapshotRequest,
-        ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ServerInfoRequest, SettlePartTransactionRequest,
-        SignalServiceRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-        StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest, StopRebalanceRequest, TierMutationAbortRequest,
-        TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, UpdateMetacacheListingRequest,
-        UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest, WriteRequest,
+        RenameFileRequest, RenamePartRequest, ReservedRenameDataRequest, ScannerActivityRequest,
+        ScannerDirtyUsageSnapshotRequest, ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest,
+        ServerInfoRequest, SettlePartTransactionRequest, SignalServiceRequest, SnapshotLeaseReleaseRequest,
+        SnapshotLeaseRenewRequest, SnapshotLeaseRequest, StartDecommissionRequest, StartProfilingRequest, StatVolumeRequest,
+        StopRebalanceRequest, TierMutationAbortRequest, TierMutationFailureClass, TierMutationPeerState,
+        TierMutationPrepareRequest, UpdateMetacacheListingRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+        WriteMetadataRequest, WriteRequest,
         heal_control_service_client::HealControlServiceClient,
         heal_control_service_server::{HealControlService as _, HealControlServiceServer},
         node_service_client::NodeServiceClient,
@@ -3271,8 +3301,12 @@ mod tests {
     use tonic::{Request, Response, Status};
     use uuid::Uuid;
 
-    const DISK_MUTATION_RPC_METHODS: [&str; 34] = [
+    const DISK_MUTATION_RPC_METHODS: [&str; 38] = [
         "renamedata",
+        "reserveobjectmetadata",
+        "activateobjectmetadatareservation",
+        "cancelobjectmetadatareservation",
+        "renamereserveddata",
         "renamemultipartdata",
         "recovermultipartsource",
         "renamedataatincarnation",
@@ -4969,6 +5003,43 @@ mod tests {
                 ..Default::default()
             },
             rustfs_protos::canonical_rename_data_request_body
+        );
+        assert_gated!(
+            reserve_object_metadata,
+            MetadataReservationRequest {
+                disk: disk.clone(),
+                bucket: "bucket".into(),
+                object: "object".into(),
+                timeout_ms: 5000,
+                bucket_incarnation_id: vec![1; 16].into(),
+            },
+            rustfs_protos::canonical_metadata_reservation_request_body
+        );
+        assert_gated!(
+            activate_object_metadata_reservation,
+            MetadataReservationActivateRequest {
+                disk: disk.clone(),
+                bucket: "bucket".into(),
+                object: "object".into(),
+                token: Uuid::new_v4().as_bytes().to_vec().into(),
+            },
+            rustfs_protos::canonical_metadata_reservation_activate_request_body
+        );
+        assert_gated!(
+            cancel_object_metadata_reservation,
+            MetadataReservationCancelRequest {
+                disk: disk.clone(),
+                token: Uuid::new_v4().as_bytes().to_vec().into(),
+            },
+            rustfs_protos::canonical_metadata_reservation_cancel_request_body
+        );
+        assert_gated!(
+            rename_reserved_data,
+            ReservedRenameDataRequest {
+                rename: Some(RenameDataRequest::default()),
+                token: Uuid::new_v4().as_bytes().to_vec().into(),
+            },
+            rustfs_protos::canonical_reserved_rename_data_request_body
         );
         assert_gated!(
             recover_multipart_source,
@@ -7475,11 +7546,15 @@ mod tests {
     }
 
     async fn target_rpc_fixture() -> TargetRpcFixture {
+        target_rpc_fixture_with_bucket_metadata(false).await
+    }
+
+    async fn target_rpc_fixture_with_bucket_metadata(initialize_bucket_metadata: bool) -> TargetRpcFixture {
         super::timeout(Duration::from_secs(90), async {
             let root = tempfile::tempdir().expect("target RPC root");
             let env = rustfs_test_utils::TestECStoreEnv::builder()
                 .base_dir(root.path())
-                .init_bucket_metadata(false)
+                .init_bucket_metadata(initialize_bucket_metadata)
                 .build()
                 .await;
             ObjectStore::new(env.ecstore.clone())
@@ -8146,6 +8221,13 @@ mod tests {
     }
 
     async fn stage_target_rpc(fixture: &TargetRpcFixture) -> (super::DiskStore, rustfs_filemeta::FileInfo, Vec<u8>) {
+        stage_target_rpc_inner(fixture, true).await
+    }
+
+    async fn stage_target_rpc_inner(
+        fixture: &TargetRpcFixture,
+        create_volume: bool,
+    ) -> (super::DiskStore, rustfs_filemeta::FileInfo, Vec<u8>) {
         use crate::storage::storage_api::ecstore_disk::{DiskAPI, ReadOptions};
         let set = fixture
             .env
@@ -8168,7 +8250,9 @@ mod tests {
         }];
         fi.data = Some(Bytes::from_static(b"target-rpc-inline"));
         fi.set_inline_data();
-        disk.make_volume("target-rpc").await.expect("target volume");
+        if create_volume {
+            disk.make_volume("target-rpc").await.expect("target volume");
+        }
         disk.write_metadata("target-rpc", "target-rpc", "staged", fi.clone())
             .await
             .expect("stage real inline body");
@@ -8218,6 +8302,303 @@ mod tests {
         let body = rustfs_protos::canonical_rename_data_request_body(request.get_ref()).expect("quota rename body");
         sign_quota_test_request(&mut request, &body, topology);
         request
+    }
+
+    #[tokio::test]
+    async fn metadata_reservation_handlers_bind_and_publish_on_the_target_disk() {
+        use crate::storage::storage_api::ecstore_disk::{DiskAPI, RUSTFS_META_TMP_BUCKET, ReadOptions};
+
+        let fixture = target_rpc_fixture_with_bucket_metadata(true).await;
+        fixture.env.make_bucket("target-rpc", false).await;
+        let incarnation = fixture
+            .env
+            .ecstore
+            .bucket_incarnation_id("target-rpc")
+            .await
+            .expect("bucket incarnation");
+        let (disk, fi, _) = stage_target_rpc_inner(&fixture, false).await;
+        disk.write_metadata(RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_BUCKET, "reserved-stage", fi.clone())
+            .await
+            .expect("stage reserved body");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let mut reserve = Request::new(MetadataReservationRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            timeout_ms: 5000,
+            bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+        });
+        let mut stale = Request::new(reserve.get_ref().clone());
+        stale.get_mut().bucket_incarnation_id = Uuid::new_v4().as_bytes().to_vec().into();
+        let stale_body = rustfs_protos::canonical_metadata_reservation_request_body(stale.get_ref()).expect("stale body");
+        set_tonic_canonical_body_digest(&mut stale, &stale_body).expect("stale digest");
+        mark_v2_authenticated(&mut stale);
+        assert!(
+            !service
+                .reserve_object_metadata(stale)
+                .await
+                .expect("stale handler")
+                .into_inner()
+                .success,
+            "a token must not be issued for a different bucket incarnation"
+        );
+        let mut self_lock = Request::new(reserve.get_ref().clone());
+        self_lock.get_mut().object = rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH.to_owned();
+        let self_lock_body =
+            rustfs_protos::canonical_metadata_reservation_request_body(self_lock.get_ref()).expect("self-lock body");
+        set_tonic_canonical_body_digest(&mut self_lock, &self_lock_body).expect("self-lock digest");
+        mark_v2_authenticated(&mut self_lock);
+        assert!(
+            !service
+                .reserve_object_metadata(self_lock)
+                .await
+                .expect("self-lock handler")
+                .into_inner()
+                .success,
+            "a token cannot hold the same lock that its object commit must acquire"
+        );
+        let body = rustfs_protos::canonical_metadata_reservation_request_body(reserve.get_ref()).expect("reserve body");
+        set_tonic_canonical_body_digest(&mut reserve, &body).expect("reserve digest");
+        mark_v2_authenticated(&mut reserve);
+        let response = service
+            .reserve_object_metadata(reserve)
+            .await
+            .expect("reserve RPC")
+            .into_inner();
+        assert!(response.success, "reservation must succeed: {:?}", response.error);
+        assert_eq!(response.protocol_version, 2);
+        let token = response.token;
+        let mut activate = Request::new(MetadataReservationActivateRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            token: token.clone(),
+        });
+        let body =
+            rustfs_protos::canonical_metadata_reservation_activate_request_body(activate.get_ref()).expect("activate body");
+        set_tonic_canonical_body_digest(&mut activate, &body).expect("activate digest");
+        mark_v2_authenticated(&mut activate);
+        let activated = service
+            .activate_object_metadata_reservation(activate)
+            .await
+            .expect("activate RPC")
+            .into_inner();
+        assert!(activated.success, "activation must succeed: {:?}", activated.error);
+        let message = ReservedRenameDataRequest {
+            rename: Some(RenameDataRequest {
+                disk: disk.endpoint().to_string(),
+                src_volume: RUSTFS_META_TMP_BUCKET.into(),
+                src_path: "reserved-stage".into(),
+                file_info: serde_json::to_string(&fi).expect("encode metadata"),
+                dst_volume: "target-rpc".into(),
+                dst_path: "destination".into(),
+                ..Default::default()
+            }),
+            token,
+        };
+        let body = rustfs_protos::canonical_reserved_rename_data_request_body(&message).expect("rename body");
+        let mut tampered = Request::new(message.clone());
+        set_tonic_canonical_body_digest(&mut tampered, &body).expect("rename digest");
+        mark_v2_authenticated(&mut tampered);
+        tampered.get_mut().rename.as_mut().expect("rename").dst_path = "other".into();
+        assert_eq!(
+            service
+                .rename_reserved_data(tampered)
+                .await
+                .expect_err("tampered object")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut rename = Request::new(message);
+        set_tonic_canonical_body_digest(&mut rename, &body).expect("rename digest");
+        mark_v2_authenticated(&mut rename);
+        let response = service.rename_reserved_data(rename).await.expect("rename RPC").into_inner();
+        assert!(response.success, "reserved rename must succeed: {:?}", response.error);
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read committed object");
+        assert_eq!(read.data, fi.data);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn reserved_rename_rpc_cancellation_does_not_stop_physical_publication() {
+        use crate::storage::storage_api::{
+            LocalPublicationPause, LocalPublicationStage,
+            contract::namespace::NamespaceLocking as _,
+            ecstore_disk::{DiskAPI, RUSTFS_META_TMP_BUCKET, ReadOptions},
+        };
+
+        let fixture = target_rpc_fixture_with_bucket_metadata(true).await;
+        fixture.env.make_bucket("target-rpc", false).await;
+        let incarnation = fixture
+            .env
+            .ecstore
+            .bucket_incarnation_id("target-rpc")
+            .await
+            .expect("bucket incarnation");
+        let (disk, fi, _) = stage_target_rpc_inner(&fixture, false).await;
+        disk.write_metadata(RUSTFS_META_TMP_BUCKET, RUSTFS_META_TMP_BUCKET, "reserved-cancel", fi.clone())
+            .await
+            .expect("stage reserved body");
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind RPC listener");
+        let addr = listener.local_addr().expect("RPC listener address");
+        let (shutdown, stopped) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(NodeServiceServer::new(service))
+                .serve_with_incoming_shutdown(TcpListenerStream::new(listener), async {
+                    let _ = stopped.await;
+                })
+                .await
+                .expect("serve RPC target");
+        });
+        let mut client = NodeServiceClient::connect(format!("http://{addr}"))
+            .await
+            .expect("connect RPC client");
+        let mut prepare = Request::new(MetadataReservationRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            timeout_ms: 5000,
+            bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+        });
+        let body = rustfs_protos::canonical_metadata_reservation_request_body(prepare.get_ref()).expect("prepare body");
+        set_tonic_canonical_body_digest(&mut prepare, &body).expect("prepare digest");
+        mark_v2_authenticated(&mut prepare);
+        let prepared = client
+            .reserve_object_metadata(prepare)
+            .await
+            .expect("prepare handler")
+            .into_inner();
+        assert!(prepared.success, "prepare: {:?}", prepared.error);
+        let mut activate = Request::new(MetadataReservationActivateRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            token: prepared.token.clone(),
+        });
+        let body =
+            rustfs_protos::canonical_metadata_reservation_activate_request_body(activate.get_ref()).expect("activate body");
+        set_tonic_canonical_body_digest(&mut activate, &body).expect("activate digest");
+        mark_v2_authenticated(&mut activate);
+        let activated = client
+            .activate_object_metadata_reservation(activate)
+            .await
+            .expect("activate handler")
+            .into_inner();
+        assert!(activated.success, "activate: {:?}", activated.error);
+        let mut rename = Request::new(ReservedRenameDataRequest {
+            rename: Some(RenameDataRequest {
+                disk: disk.endpoint().to_string(),
+                src_volume: RUSTFS_META_TMP_BUCKET.into(),
+                src_path: "reserved-cancel".into(),
+                dst_volume: "target-rpc".into(),
+                dst_path: "destination".into(),
+                file_info: serde_json::to_string(&fi).expect("encode metadata"),
+                ..Default::default()
+            }),
+            token: prepared.token,
+        });
+        let body = rustfs_protos::canonical_reserved_rename_data_request_body(rename.get_ref()).expect("rename body");
+        set_tonic_canonical_body_digest(&mut rename, &body).expect("rename digest");
+        mark_v2_authenticated(&mut rename);
+        let mut pause =
+            LocalPublicationPause::install(&disk, "target-rpc", "destination/xl.meta", LocalPublicationStage::PreparedRename)
+                .expect("install physical pause");
+        let mut handler = Box::pin(client.rename_reserved_data(rename));
+        super::timeout(Duration::from_secs(10), async {
+            tokio::select! {
+                result = &mut handler => panic!("handler completed before physical entry: {result:?}"),
+                entered = pause.entered() => entered.expect("physical executor entered"),
+            }
+        })
+        .await
+        .expect("bounded physical entry");
+        drop(handler);
+        assert!(
+            fixture.env.ecstore.namespace_commits_pending_for_test(),
+            "physical publication remains active"
+        );
+        let lifecycle = fixture
+            .env
+            .ecstore
+            .new_ns_lock("target-rpc", rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("bucket publication lock");
+        let mut bucket_writer = Box::pin(lifecycle.get_write_lock(Duration::from_secs(10)));
+        let early = super::timeout(Duration::from_millis(500), &mut bucket_writer).await;
+        let old_lifecycle = fixture
+            .env
+            .ecstore
+            .new_ns_lock("target-rpc", "")
+            .await
+            .expect("bucket lifecycle lock");
+        let mut old_writer = Box::pin(old_lifecycle.get_write_lock(Duration::from_secs(10)));
+        let old_early = super::timeout(Duration::from_millis(500), &mut old_writer).await;
+        drop(pause);
+        match early {
+            Ok(result) => {
+                drop(result.expect("early lifecycle result"));
+                panic!("bucket publication writer acquired while the remote physical write was still paused");
+            }
+            Err(_) => drop(
+                super::timeout(Duration::from_secs(10), bucket_writer)
+                    .await
+                    .expect("lifecycle owner drains")
+                    .expect("bucket writer acquires"),
+            ),
+        }
+        match old_early {
+            Ok(result) => {
+                drop(result.expect("early lifecycle result"));
+                panic!("bucket lifecycle writer acquired while the remote physical write was still paused");
+            }
+            Err(_) => drop(
+                super::timeout(Duration::from_secs(10), old_writer)
+                    .await
+                    .expect("lifecycle owner drains")
+                    .expect("bucket lifecycle writer acquires"),
+            ),
+        }
+        super::timeout(Duration::from_secs(10), async {
+            while fixture.env.ecstore.namespace_commits_pending_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("physical publication drains");
+        let read = disk
+            .read_version(
+                "target-rpc",
+                "target-rpc",
+                "destination",
+                &fi.version_id.expect("version").to_string(),
+                &ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read published object");
+        assert_eq!(read.data, fi.data);
+        drop(client);
+        let _ = shutdown.send(());
+        super::timeout(Duration::from_secs(10), server)
+            .await
+            .expect("RPC server shuts down")
+            .expect("RPC server task");
     }
 
     #[cfg(not(windows))]

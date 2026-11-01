@@ -604,8 +604,69 @@ impl LocalDiskWrapper {
         let super::RenameDataGuards {
             external_guard,
             namespace_owner,
+            metadata_reservation,
+            metadata_reservation_token,
             ..
         } = guards;
+        let metadata_reservation = match (metadata_reservation, metadata_reservation_token) {
+            (Some(_), Some(_)) => return super::RenameDataObservation::unknown(Err(DiskError::InvalidPath)),
+            (Some(reservation), None) => Some(reservation),
+            (None, Some(token)) => match self.disk.claim_object_metadata_reservation(token, dst_volume, dst_path) {
+                Ok(reservation) => Some(reservation),
+                // A missing token may already have been claimed by an earlier
+                // request that is still publishing; do not claim it was safe.
+                Err(DiskError::DiskOngoingReq) => {
+                    return super::RenameDataObservation::unknown(Err(DiskError::DiskOngoingReq));
+                }
+                Err(error) => return super::RenameDataObservation::not_dispatched(error),
+            },
+            (None, None) => None,
+        };
+        // A queued reservation must acquire its metadata lease before disk
+        // admission. Otherwise a waiting background mutation could hold the
+        // disk permit needed by the earlier lease owner.
+        let metadata_reservation = match metadata_reservation {
+            Some(reservation) => Some(reservation.wait().await),
+            None => None,
+        };
+        // The claimed reservation stays in this cancellable future while disk
+        // admission can wait. Only physical work moves into an owned task.
+        let prechecked_permit = if metadata_reservation.is_some() {
+            // Background admission is exclusive. Waiting for it while holding
+            // this object's lease can deadlock an admitted mutation waiting for
+            // the same lease. An already owned permit does not need to wait.
+            if current_disk_io_context().is_some_and(|context| {
+                context.class == DiskIoClass::Background
+                    && !context
+                        .permit
+                        .as_ref()
+                        .is_some_and(|permit| permit.is_for(&self.io_admission))
+            }) {
+                return super::RenameDataObservation::not_dispatched(DiskError::DiskOngoingReq);
+            }
+            let preflight = self
+                .with_native_resources(async {
+                    if self.health.is_faulty() {
+                        return Err(DiskError::FaultyDisk);
+                    }
+                    self.check_disk_stale().await?;
+                    self.acquire_disk_io_permit().await
+                })
+                .await;
+            match preflight {
+                Ok(Ok(Some(permit))) => Some(permit),
+                Ok(Ok(None)) => return super::RenameDataObservation::not_dispatched(DiskError::DiskOngoingReq),
+                Ok(Err(error)) | Err(error) => return super::RenameDataObservation::not_dispatched(error),
+            }
+        } else {
+            None
+        };
+        // The reserved metadata lease must outlive a cancelled RPC waiter.
+        let external_guard: Option<Arc<dyn Send + Sync>> = if metadata_reservation.is_some() {
+            Some(Arc::new(external_guard))
+        } else {
+            external_guard
+        };
         let operation = self.clone();
         let src_volume = src_volume.to_owned();
         let src_path = src_path.to_owned();
@@ -624,27 +685,54 @@ impl LocalDiskWrapper {
         };
         let observed = run_owned_mutation(external_guard, move || async move {
             let mut preflight_rejection = None;
-            let result = operation
-                .track_disk_health_mutation(
-                    "rename_data",
-                    DiskMetricMutation::Write,
-                    || async {
-                        // Preserve the former DiskAPI future's single boxing boundary.
-                        let observed = Box::pin(operation.disk.rename_data_observed(
-                            &src_volume,
-                            &src_path,
-                            &fi,
-                            &dst_volume,
-                            &dst_path,
-                            namespace_owner,
+            let rename = || async {
+                // Preserve the former DiskAPI future's single boxing boundary.
+                let observed = if let Some(reservation) = metadata_reservation {
+                    Box::pin(operation.disk.rename_data_observed_with_reservation(
+                        &src_volume,
+                        &src_path,
+                        &fi,
+                        &dst_volume,
+                        &dst_path,
+                        (namespace_owner, Some(reservation)),
+                    ))
+                    .await
+                } else {
+                    Box::pin(operation.disk.rename_data_observed(
+                        &src_volume,
+                        &src_path,
+                        &fi,
+                        &dst_volume,
+                        &dst_path,
+                        namespace_owner,
+                    ))
+                    .await
+                };
+                preflight_rejection = observed.preflight_rejection;
+                observed.result
+            };
+            let result = if let Some(permit) = prechecked_permit {
+                with_disk_io_permit(Some(permit), async {
+                    operation
+                        .with_native_resources(operation.track_admitted_disk_operation(
+                            "rename_data",
+                            move |io_permit| async move {
+                                let _io_permit = io_permit;
+                                rename().await
+                            },
+                            Duration::ZERO,
+                            TimeoutHealthAction::MarkFailure,
+                            DiskMetricMutation::Write,
+                            true,
                         ))
-                        .await;
-                        preflight_rejection = observed.preflight_rejection;
-                        observed.result
-                    },
-                    timeout_duration,
-                )
-                .await;
+                        .await?
+                })
+                .await
+            } else {
+                operation
+                    .track_disk_health_mutation("rename_data", DiskMetricMutation::Write, rename, timeout_duration)
+                    .await
+            };
             // Health tracking must observe the real disk error, not an Ok tuple.
             Ok(super::RenameDataObservation {
                 result,
@@ -1598,6 +1686,58 @@ pub struct LocalDiskWrapper {
 }
 
 impl LocalDiskWrapper {
+    /// Reserve the metadata mutation lock for one object on this disk instance.
+    /// Unclaimed reservations expire after 60 seconds.
+    pub async fn reserve_object_metadata(&self, bucket: &str, object: &str, timeout: Duration) -> Result<Uuid> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.reserve_object_metadata(bucket, object, timeout).await
+    }
+
+    /// Register an object metadata reservation in FIFO order on this disk.
+    /// The returned token may be claimed before its physical lease is available.
+    pub async fn enqueue_object_metadata(&self, bucket: &str, object: &str) -> Result<Uuid> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.enqueue_object_metadata(bucket, object).await
+    }
+
+    /// Prepare an inert reservation token bound to this disk and object.
+    pub async fn prepare_object_metadata(&self, bucket: &str, object: &str) -> Result<Uuid> {
+        self.prepare_object_metadata_with_owner(bucket, object, None).await
+    }
+
+    pub(crate) async fn prepare_object_metadata_with_owner(
+        &self,
+        bucket: &str,
+        object: &str,
+        owner: Option<Arc<dyn super::os::MetadataReservationFence>>,
+    ) -> Result<Uuid> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.prepare_object_metadata_with_owner(bucket, object, owner)
+    }
+
+    /// Enqueue a prepared token; a cancelled token cannot be reactivated.
+    pub async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.activate_object_metadata(bucket, object, token).await
+    }
+
+    /// Cancel an unclaimed reservation. A claimed physical operation retains its own lock.
+    pub fn cancel_object_metadata_reservation(&self, token: Uuid) -> bool {
+        self.disk.cancel_object_metadata_reservation(token)
+    }
+
     /// Create a new LocalDiskWrapper
     pub fn new(disk: Arc<LocalDisk>, health_check: bool) -> Self {
         let admission = DiskIoAdmission::new(disk.endpoint().to_string());
@@ -2577,6 +2717,7 @@ impl LocalDiskWrapper {
             timeout_duration,
             timeout_health_action,
             mutation,
+            false,
         ))
         .await?
     }
@@ -2588,6 +2729,7 @@ impl LocalDiskWrapper {
         timeout_duration: Duration,
         timeout_health_action: TimeoutHealthAction,
         mutation: DiskMetricMutation,
+        identity_prechecked: bool,
     ) -> Result<T>
     where
         F: FnOnce(Option<crate::disk::io_admission::DiskIoPermit>) -> Fut,
@@ -2609,7 +2751,7 @@ impl LocalDiskWrapper {
         }
 
         // Check if disk is stale
-        if let Err(err) = self.check_disk_stale().await {
+        if !identity_prechecked && let Err(err) = self.check_disk_stale().await {
             self.metrics.record_availability_error();
             return Err(err);
         }
@@ -5575,6 +5717,115 @@ mod tests {
         drop(delete);
         assert_eq!(wrapper.health.waiting_count(), 0, "a dropped delete must release its waiting slot");
         drop(metadata_lease);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_reserved_rename_releases_lease_before_disk_admission() {
+        use crate::disk::{RUSTFS_META_TMP_BUCKET, RenameDataGuards};
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+        endpoint.set_pool_index(0);
+        endpoint.set_set_index(0);
+        endpoint.set_disk_index(0);
+        let meta = dir.path().join(RUSTFS_META_BUCKET);
+        tokio::fs::create_dir_all(&meta).await.expect("metadata directory");
+        let mut format = FormatV3::new(1, 1);
+        format.erasure.this = format.erasure.sets[0][0];
+        tokio::fs::write(meta.join(FORMAT_CONFIG_FILE), format.to_json().expect("format bytes"))
+            .await
+            .expect("write format");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("formatted disk"));
+        disk.make_volume("bucket").await.expect("bucket volume");
+        let wrapper = Arc::new(LocalDiskWrapper::new(Arc::clone(&disk), false));
+        let token = wrapper
+            .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+            .await
+            .expect("reserve key");
+        wrapper.set_disk_id_state(Some(format.erasure.this)).await;
+        disk.format_info.write().await.last_check = None;
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        disk.install_format_probe_hook(false, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv_timeout(Duration::from_secs(30));
+        });
+        let publisher = Arc::clone(&wrapper);
+        let rename = tokio::spawn(async move {
+            publisher
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "staging",
+                    &FileInfo::default(),
+                    "bucket",
+                    "object",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("disk identity preflight starts")
+            .expect("preflight hook");
+        rename.abort();
+        assert!(matches!(rename.await, Err(error) if error.is_cancelled()));
+        let key = disk.get_object_path("bucket", "object").expect("object path");
+        let mut successor = Box::pin(crate::disk::os::acquire_metadata_mutation_lease(&key, None));
+        let released_before_io = tokio::time::timeout(Duration::from_secs(1), &mut successor).await.is_ok();
+        release_tx.send(()).expect("release disk identity preflight");
+        if !released_before_io {
+            drop(
+                tokio::time::timeout(Duration::from_secs(10), successor)
+                    .await
+                    .expect("preflight finishes"),
+            );
+        }
+        assert!(
+            released_before_io,
+            "a cancelled request must not retain the reservation before physical mutation starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn reserved_background_rename_does_not_wait_for_disk_admission() {
+        use crate::disk::{RUSTFS_META_TMP_BUCKET, RenameDataGuards};
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local disk"));
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        let token = wrapper
+            .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+            .await
+            .expect("reserve key");
+        let held = wrapper
+            .io_admission
+            .background(&CancellationToken::new())
+            .await
+            .expect("background permit");
+        let fi = FileInfo::default();
+        let rename = crate::disk::with_background_disk_io(
+            CancellationToken::new(),
+            wrapper.rename_data_observed_with_guards(
+                RUSTFS_META_TMP_BUCKET,
+                "staging",
+                &fi,
+                "bucket",
+                "object",
+                RenameDataGuards {
+                    metadata_reservation_token: Some(token),
+                    ..Default::default()
+                },
+            ),
+        );
+        let result = tokio::time::timeout(Duration::from_secs(1), rename).await;
+        drop(held);
+        let observation = result.expect("reserved mutation must not wait while holding the object lease");
+        assert!(matches!(&observation.result, Err(DiskError::DiskOngoingReq)));
+        assert!(observation.rejected_before_publication());
     }
 
     #[tokio::test]

@@ -906,6 +906,10 @@ mod core;
 pub(crate) use core::io_primitives::disk_call_counters;
 #[cfg(test)]
 pub(crate) use core::io_primitives::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+pub(crate) use core::io_primitives::{
+    RenameMetadataReservation, align_rename_metadata_reservations, prepare_rename_metadata_reservations,
+    put_rename_early_ack_enabled,
+};
 mod ctx;
 mod metadata;
 mod ops;

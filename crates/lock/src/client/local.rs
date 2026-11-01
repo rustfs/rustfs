@@ -394,6 +394,30 @@ impl LockClient for LocalClient {
         Ok(entry.guard.downgrade_committed_tail())
     }
 
+    async fn try_upgrade_committed_tail(&self, lock_id: &LockId) -> Result<bool> {
+        let shard = self.get_shard(lock_id);
+        let mut guards = shard.write().await;
+        let Some(entry) = guards.get_mut(lock_id) else { return Ok(false) };
+        if entry.is_expired() {
+            return Ok(false);
+        }
+        Ok(entry.guard.try_upgrade_committed_tail())
+    }
+
+    async fn supports_heal_lock_transition(&self, lock_id: &LockId) -> Result<bool> {
+        self.refresh(lock_id).await
+    }
+
+    async fn waiting_writer(&self, lock_id: &LockId) -> Result<Option<bool>> {
+        let shard = self.get_shard(lock_id);
+        let guards = shard.read().await;
+        let Some(entry) = guards.get(lock_id) else { return Ok(None) };
+        if entry.is_expired() {
+            return Ok(None);
+        }
+        Ok(entry.guard.waiting_writer())
+    }
+
     async fn force_release(&self, lock_id: &LockId) -> Result<bool> {
         self.release(lock_id).await
     }

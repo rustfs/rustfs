@@ -507,6 +507,161 @@ impl NodeService {
         Ok(store)
     }
 
+    pub(super) async fn handle_reserve_object_metadata(
+        &self,
+        request: Request<MetadataReservationRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        let body = rustfs_protos::canonical_metadata_reservation_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid reservation body"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("metadata reservation requires body-bound authentication"))?;
+        let request = request.into_inner();
+        if request.timeout_ms == 0 {
+            return Err(Status::invalid_argument("reservation timeout must be positive"));
+        }
+        let incarnation = Uuid::from_slice(&request.bucket_incarnation_id)
+            .ok()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Status::invalid_argument("invalid bucket incarnation"))?;
+        let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            return Err(Status::failed_precondition("storage instance is unavailable"));
+        };
+        let result = store
+            .reserve_local_object_metadata_at_incarnation(
+                &request.disk,
+                &request.bucket,
+                &request.object,
+                incarnation,
+                std::time::Duration::from_millis(request.timeout_ms.min(5000)),
+            )
+            .await;
+        Ok(Response::new(match result {
+            Ok(token) => SnapshotLeaseResponse {
+                success: true,
+                token: token.as_bytes().to_vec().into(),
+                protocol_version: 2,
+                error: None,
+            },
+            Err(error) => SnapshotLeaseResponse {
+                success: false,
+                token: Bytes::new(),
+                protocol_version: 2,
+                error: Some(error.into()),
+            },
+        }))
+    }
+
+    pub(super) async fn handle_activate_object_metadata_reservation(
+        &self,
+        request: Request<MetadataReservationActivateRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid reservation activation body"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("reservation activation requires body-bound authentication"))?;
+        let request = request.into_inner();
+        let token = Uuid::from_slice(&request.token)
+            .ok()
+            .filter(|token| !token.is_nil())
+            .ok_or_else(|| Status::invalid_argument("invalid reservation token"))?;
+        let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            return Err(Status::failed_precondition("storage instance is unavailable"));
+        };
+        Ok(Response::new(
+            match store
+                .activate_local_object_metadata_reservation(&request.disk, &request.bucket, &request.object, token)
+                .await
+            {
+                Ok(()) => SnapshotLeaseMutationResponse {
+                    success: true,
+                    error: None,
+                },
+                Err(error) => SnapshotLeaseMutationResponse {
+                    success: false,
+                    error: Some(error.into()),
+                },
+            },
+        ))
+    }
+
+    pub(super) async fn handle_cancel_object_metadata_reservation(
+        &self,
+        request: Request<MetadataReservationCancelRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        let body = rustfs_protos::canonical_metadata_reservation_cancel_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid reservation cancellation body"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("reservation cancellation requires body-bound authentication"))?;
+        let request = request.into_inner();
+        let token = Uuid::from_slice(&request.token)
+            .ok()
+            .filter(|token| !token.is_nil())
+            .ok_or_else(|| Status::invalid_argument("invalid reservation token"))?;
+        let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            return Err(Status::failed_precondition("storage instance is unavailable"));
+        };
+        Ok(Response::new(
+            match store.cancel_local_object_metadata_reservation(&request.disk, token).await {
+                Ok(cancelled) => SnapshotLeaseMutationResponse {
+                    success: cancelled,
+                    error: None,
+                },
+                Err(error) => SnapshotLeaseMutationResponse {
+                    success: false,
+                    error: Some(error.into()),
+                },
+            },
+        ))
+    }
+
+    pub(super) async fn handle_rename_reserved_data(
+        &self,
+        request: Request<ReservedRenameDataRequest>,
+    ) -> Result<Response<RenameDataResponse>, Status> {
+        let body = rustfs_protos::canonical_reserved_rename_data_request_body(request.get_ref())
+            .map_err(|_| Status::invalid_argument("invalid reserved rename body"))?;
+        verify_tonic_canonical_body_digest(&request, &body)
+            .map_err(|_| Status::permission_denied("reserved rename requires body-bound authentication"))?;
+        let request = request.into_inner();
+        let token = Uuid::from_slice(&request.token)
+            .ok()
+            .filter(|token| !token.is_nil())
+            .ok_or_else(|| Status::invalid_argument("invalid reservation token"))?;
+        let rename = request.rename.ok_or_else(|| Status::invalid_argument("missing rename"))?;
+        if !rename.scanner_publication_lease_token.is_empty() || !rename.bucket_incarnation_id.is_empty() {
+            return Err(Status::invalid_argument("reserved rename does not support scanner or heal scope"));
+        }
+        let decoded = decode_rename_data_request_file_info(&rename.file_info_bin, &rename.file_info)
+            .map_err(|_| Status::invalid_argument("invalid reserved rename FileInfo"))?;
+        let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
+            return Err(Status::failed_precondition("storage instance is unavailable"));
+        };
+        let result = store
+            .rename_local_data_reserved(
+                &rename.disk,
+                (&rename.src_volume, &rename.src_path),
+                &decoded.value,
+                (&rename.dst_volume, &rename.dst_path),
+                token,
+            )
+            .await;
+        let encoded = result.and_then(|value| encode_rename_data_response_payloads(&value, decoded.from_msgpack));
+        Ok(Response::new(match encoded {
+            Ok((rename_data_resp, rename_data_resp_bin)) => RenameDataResponse {
+                success: true,
+                rename_data_resp,
+                rename_data_resp_bin: rename_data_resp_bin.into(),
+                error: None,
+            },
+            Err(error) => RenameDataResponse {
+                success: false,
+                rename_data_resp: String::new(),
+                rename_data_resp_bin: Bytes::new(),
+                error: Some(error.into()),
+            },
+        }))
+    }
+
     pub(super) async fn handle_acquire_snapshot_lease(
         &self,
         request: Request<SnapshotLeaseRequest>,

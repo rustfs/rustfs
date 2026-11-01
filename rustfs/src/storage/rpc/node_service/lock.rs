@@ -49,6 +49,71 @@ async fn refresh_lock(
     lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
     args: &LockRequest,
 ) -> GenerallyLockResponse {
+    let writer_marker = rustfs_lock::client::HEAL_WAITING_WRITER_MARKER;
+    if args
+        .metadata
+        .tags
+        .get(writer_marker)
+        .is_some_and(|value| value == writer_marker)
+    {
+        return match lock_client.waiting_writer(&args.lock_id).await {
+            Ok(Some(waiting)) => GenerallyLockResponse {
+                success: true,
+                error_info: None,
+                lock_info: Some(format!("{writer_marker}:{}", u8::from(waiting))),
+            },
+            Ok(None) => GenerallyLockResponse {
+                success: false,
+                error_info: None,
+                lock_info: None,
+            },
+            Err(error) => GenerallyLockResponse {
+                success: false,
+                error_info: Some(error.to_string()),
+                lock_info: None,
+            },
+        };
+    }
+    let probe_marker = rustfs_lock::client::HEAL_LOCK_TRANSITION_PROBE_MARKER;
+    if args
+        .metadata
+        .tags
+        .get(probe_marker)
+        .is_some_and(|value| value == probe_marker)
+    {
+        return match lock_client.supports_heal_lock_transition(&args.lock_id).await {
+            Ok(success) => GenerallyLockResponse {
+                success,
+                error_info: None,
+                lock_info: success.then(|| probe_marker.to_owned()),
+            },
+            Err(error) => GenerallyLockResponse {
+                success: false,
+                error_info: Some(error.to_string()),
+                lock_info: None,
+            },
+        };
+    }
+    let upgrade_marker = rustfs_lock::client::COMMITTED_TAIL_UPGRADE_MARKER;
+    if args
+        .metadata
+        .tags
+        .get(upgrade_marker)
+        .is_some_and(|value| value == upgrade_marker)
+    {
+        return match lock_client.try_upgrade_committed_tail(&args.lock_id).await {
+            Ok(success) => GenerallyLockResponse {
+                success,
+                error_info: None,
+                lock_info: success.then(|| upgrade_marker.to_owned()),
+            },
+            Err(error) => GenerallyLockResponse {
+                success: false,
+                error_info: Some(error.to_string()),
+                lock_info: None,
+            },
+        };
+    }
     let marker = rustfs_lock::client::COMMITTED_TAIL_CONVERSION_MARKER;
     if args.metadata.tags.get(marker).is_some_and(|value| value == marker) {
         return match lock_client.downgrade_committed_tail(&args.lock_id).await {
@@ -365,6 +430,91 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
         assert!(result.lock_info.is_none());
+    }
+
+    #[tokio::test]
+    async fn refresh_reports_waiting_writer_for_held_lease() {
+        use super::refresh_lock;
+        use rustfs_lock::client::{HEAL_WAITING_WRITER_MARKER, LockClient};
+        use rustfs_lock::{LocalClient, LockRequest, LockType, ObjectKey};
+        use std::{sync::Arc, time::Duration};
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let key = ObjectKey::new("bucket", "writer-observation-rpc");
+        let mut held = LockRequest::new(key.clone(), LockType::Exclusive, "heal");
+        assert!(client.acquire_lock(&held).await.expect("acquire heal lease").success);
+        held.metadata
+            .tags
+            .insert(HEAL_WAITING_WRITER_MARKER.into(), HEAL_WAITING_WRITER_MARKER.into());
+        let writer = {
+            let client = Arc::clone(&client);
+            tokio::spawn(async move {
+                let request = LockRequest::new(key, LockType::Exclusive, "writer").with_acquire_timeout(Duration::from_secs(3));
+                let response = client.acquire_lock(&request).await.expect("writer request");
+                (request, response)
+            })
+        };
+        let expected = format!("{HEAL_WAITING_WRITER_MARKER}:1");
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let observed = refresh_lock(&client, &held).await;
+                if observed.lock_info.as_deref() == Some(expected.as_str()) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("waiting writer reported");
+        assert!(client.release(&held.lock_id).await.expect("release heal lease"));
+        let (request, response) = writer.await.expect("writer task");
+        assert!(response.success);
+        assert!(client.release(&request.lock_id).await.expect("release writer"));
+    }
+
+    #[tokio::test]
+    async fn refresh_upgrade_seals_lease_against_late_conversion() {
+        use super::refresh_lock;
+        use rustfs_lock::client::{
+            COMMITTED_TAIL_CONVERSION_MARKER, COMMITTED_TAIL_UPGRADE_MARKER, HEAL_LOCK_TRANSITION_PROBE_MARKER,
+            HEAL_WAITING_WRITER_MARKER, LockClient,
+        };
+        use rustfs_lock::{LocalClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::new());
+        let mut request = LockRequest::new(ObjectKey::new("bucket", "upgrade-rpc"), LockType::Exclusive, "owner");
+        assert!(client.acquire_lock(&request).await.expect("acquire lease").success);
+        request
+            .metadata
+            .tags
+            .insert(HEAL_LOCK_TRANSITION_PROBE_MARKER.into(), HEAL_LOCK_TRANSITION_PROBE_MARKER.into());
+        let probe = refresh_lock(&client, &request).await;
+        assert!(probe.success);
+        assert_eq!(probe.lock_info.as_deref(), Some(HEAL_LOCK_TRANSITION_PROBE_MARKER));
+        request.metadata.tags.clear();
+        request
+            .metadata
+            .tags
+            .insert(HEAL_WAITING_WRITER_MARKER.into(), HEAL_WAITING_WRITER_MARKER.into());
+        let observation = refresh_lock(&client, &request).await;
+        assert!(observation.success);
+        assert_eq!(observation.lock_info.as_deref(), Some(format!("{HEAL_WAITING_WRITER_MARKER}:0").as_str()));
+        request.metadata.tags.clear();
+        request
+            .metadata
+            .tags
+            .insert(COMMITTED_TAIL_UPGRADE_MARKER.into(), COMMITTED_TAIL_UPGRADE_MARKER.into());
+        let response = refresh_lock(&client, &request).await;
+        assert!(response.success);
+        assert_eq!(response.lock_info.as_deref(), Some(COMMITTED_TAIL_UPGRADE_MARKER));
+        request.metadata.tags.clear();
+        request
+            .metadata
+            .tags
+            .insert(COMMITTED_TAIL_CONVERSION_MARKER.into(), COMMITTED_TAIL_CONVERSION_MARKER.into());
+        assert!(!refresh_lock(&client, &request).await.success, "late conversion must be rejected");
+        assert!(client.release(&request.lock_id).await.expect("release lease"));
     }
 
     #[tokio::test]

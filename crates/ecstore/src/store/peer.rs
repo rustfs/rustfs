@@ -85,6 +85,171 @@ fn validate_bootstrap_volume(volume: &str) -> DiskResult<()> {
 }
 
 impl ECStore {
+    /// Prepare an inert user-object reservation on the currently admitted disk.
+    /// An unclaimed token expires and does not hold the object's metadata lock.
+    #[cfg(test)]
+    pub async fn reserve_local_object_metadata(
+        &self,
+        disk_ref: &str,
+        bucket: &str,
+        object: &str,
+        timeout: std::time::Duration,
+    ) -> DiskResult<Uuid> {
+        self.reserve_local_object_metadata_with_owner(disk_ref, bucket, object, timeout, None)
+            .await
+    }
+
+    /// Prepare before the caller acquires bucket lifecycle or object locks.
+    /// The token holds the bucket publication fence through physical completion.
+    pub async fn reserve_local_object_metadata_at_incarnation(
+        &self,
+        disk_ref: &str,
+        bucket: &str,
+        object: &str,
+        incarnation: Uuid,
+        timeout: std::time::Duration,
+    ) -> DiskResult<Uuid> {
+        if self.ctx.lock_manager().is_disabled()
+            || crate::bucket::utils::check_valid_bucket_name(bucket).is_err()
+            || is_meta_bucketname(bucket)
+            || incarnation.is_nil()
+            || timeout.is_zero()
+            || rustfs_utils::path::object_name_disk_identity(object).as_ref()
+                == rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+        {
+            return Err(DiskError::InvalidPath);
+        }
+        tokio::time::timeout(timeout.min(std::time::Duration::from_secs(5)), async {
+            let slot = self.bucket_fence_registry.reservation_slot(bucket, incarnation);
+            let mut cached = slot.owner.lock().await;
+            let owner = match cached.upgrade().filter(|owner| owner.is_reusable()) {
+                Some(owner) => owner,
+                None => {
+                    // Bucket deletion takes publication before lifecycle and metadata.
+                    let lock = self
+                        .handle_new_ns_lock(bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+                        .await
+                        .map_err(|error| DiskError::other(error.to_string()))?;
+                    let publication = lock
+                        .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
+                        .await
+                        .map_err(|error| DiskError::other(error.to_string()))?;
+                    // Older peers may acquire lifecycle without publication.
+                    let lifecycle = self
+                        .acquire_bucket_incarnation_fence(bucket, incarnation)
+                        .await
+                        .map_err(|error| DiskError::other(error.to_string()))?;
+                    let owner = Arc::new(super::bucket_fence::ReservationFenceGuard::new(publication, lifecycle, slot.clone()));
+                    if !owner.is_reusable() {
+                        return Err(DiskError::DiskOngoingReq);
+                    }
+                    *cached = Arc::downgrade(&owner);
+                    owner
+                }
+            };
+            drop(cached);
+            self.reserve_local_object_metadata_with_owner(disk_ref, bucket, object, timeout, Some(owner))
+                .await
+        })
+        .await
+        .map_err(|_| DiskError::Timeout)?
+    }
+
+    async fn reserve_local_object_metadata_with_owner(
+        &self,
+        disk_ref: &str,
+        bucket: &str,
+        object: &str,
+        timeout: std::time::Duration,
+        owner: Option<Arc<dyn crate::disk::os::MetadataReservationFence>>,
+    ) -> DiskResult<Uuid> {
+        if crate::bucket::utils::check_valid_bucket_name(bucket).is_err() || is_meta_bucketname(bucket) {
+            return Err(DiskError::InvalidPath);
+        }
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        tokio::time::timeout(
+            timeout.min(std::time::Duration::from_secs(5)),
+            wrapper.prepare_object_metadata_with_owner(bucket, object, owner),
+        )
+        .await
+        .map_err(|_| DiskError::Timeout)?
+    }
+
+    /// Atomically enqueue a prepared token on its original disk and object.
+    pub async fn activate_local_object_metadata_reservation(
+        &self,
+        disk_ref: &str,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+    ) -> DiskResult<()> {
+        if crate::bucket::utils::check_valid_bucket_name(bucket).is_err() || is_meta_bucketname(bucket) || token.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper.activate_object_metadata(bucket, object, token).await
+    }
+
+    /// Cancel an unclaimed token on the currently admitted disk.
+    /// A token already claimed by a physical mutation cannot be cancelled.
+    pub async fn cancel_local_object_metadata_reservation(&self, disk_ref: &str, token: Uuid) -> DiskResult<bool> {
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        Ok(wrapper.cancel_object_metadata_reservation(token))
+    }
+
+    /// Publish an ordinary staged user-object write using a one-shot disk reservation.
+    /// The token is bound to the admitted disk instance and destination. A claimed
+    /// physical mutation continues to own its lease if the RPC waiter is cancelled.
+    /// The caller must retain the bucket lifecycle fence until the physical tail
+    /// finishes; the reservation does not identify a bucket incarnation.
+    pub async fn rename_local_data_reserved(
+        &self,
+        disk_ref: &str,
+        source: (&str, &str),
+        fi: &FileInfo,
+        destination: (&str, &str),
+        token: Uuid,
+    ) -> DiskResult<RenameDataResp> {
+        if token.is_nil()
+            || source.0 != crate::disk::RUSTFS_META_TMP_BUCKET
+            || crate::bucket::utils::check_valid_bucket_name(destination.0).is_err()
+            || is_meta_bucketname(destination.0)
+            || rustfs_utils::http::metadata_compat::contains_key_str(
+                &fi.metadata,
+                crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+            )
+        {
+            return Err(DiskError::InvalidPath);
+        }
+        rename_local_data_with_ctx(
+            &self.ctx,
+            disk_ref,
+            source,
+            fi,
+            destination,
+            RenameDataGuards {
+                metadata_reservation_token: Some(token),
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
     /// Resolve a quota lease against this request's captured storage instance.
     pub async fn quota_mutation_fence_disk(&self, disk_ref: &str) -> DiskResult<DiskStore> {
         let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
@@ -270,6 +435,7 @@ impl ECStore {
                 scanner_publication_lease_token: scanner_token,
                 external_guard,
                 namespace_owner: None,
+                ..Default::default()
             },
         )
         .await
@@ -351,7 +517,7 @@ fn admit_rpc_disk(disk: &DiskStore) -> DiskResult<()> {
     Ok(())
 }
 
-async fn admit_local_disk(
+pub(crate) async fn admit_local_disk(
     ctx: &Arc<InstanceContext>,
     disk: &DiskStore,
     disk_id: Option<Uuid>,
@@ -781,6 +947,116 @@ mod tests {
         tokio::fs::read(dir.join(object).join(crate::disk::STORAGE_FORMAT_FILE))
             .await
             .expect("seeded metadata bytes")
+    }
+
+    #[tokio::test]
+    async fn reserved_target_rename_is_bound_to_the_admitted_disk() {
+        let ctx = Arc::new(InstanceContext::new());
+        let dir = tempfile::tempdir().expect("disk root");
+        let id = Uuid::new_v4();
+        let disk = target_disk(&ctx, dir.path(), id).await;
+        let disk_ref = disk.endpoint().to_string();
+        let store = super::super::tests::build_store_with_ctx(ctx.clone());
+        let version = Uuid::new_v4();
+        let fi = target_file_info("object", version, b"reserved");
+        seed_target(&disk, crate::disk::RUSTFS_META_TMP_BUCKET, "staged", fi.clone()).await;
+        tokio::fs::create_dir_all(dir.path().join("target-bucket"))
+            .await
+            .expect("user bucket");
+        assert!(matches!(
+            store
+                .reserve_local_object_metadata(
+                    &disk_ref,
+                    "target-bucket/../.rustfs.sys",
+                    "object",
+                    std::time::Duration::from_secs(5),
+                )
+                .await,
+            Err(DiskError::InvalidPath)
+        ));
+        assert!(matches!(
+            store
+                .reserve_local_object_metadata(&disk_ref, "", ".rustfs.sys/config", std::time::Duration::from_secs(5))
+                .await,
+            Err(DiskError::InvalidPath)
+        ));
+        let token = store
+            .reserve_local_object_metadata(&disk_ref, "target-bucket", "object", std::time::Duration::from_secs(5))
+            .await
+            .expect("reserve current disk");
+        assert!(matches!(
+            store
+                .rename_local_data_reserved(&disk_ref, ("target-bucket", "staged"), &fi, ("target-bucket", "object"), token)
+                .await,
+            Err(DiskError::InvalidPath)
+        ));
+        store
+            .activate_local_object_metadata_reservation(&disk_ref, "target-bucket", "object", token)
+            .await
+            .expect("activate token");
+        store
+            .rename_local_data_reserved(
+                &disk_ref,
+                (crate::disk::RUSTFS_META_TMP_BUCKET, "staged"),
+                &fi,
+                ("target-bucket", "object"),
+                token,
+            )
+            .await
+            .expect("reserved publication");
+        assert!(
+            !store
+                .cancel_local_object_metadata_reservation(&disk_ref, token)
+                .await
+                .expect("consumed token")
+        );
+        let read = disk
+            .read_version(
+                "target-bucket",
+                "target-bucket",
+                "object",
+                &version.to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("read reserved publication");
+        assert_eq!(read.data, fi.data);
+
+        let stale = store
+            .reserve_local_object_metadata(&disk_ref, "target-bucket", "object", std::time::Duration::from_secs(5))
+            .await
+            .expect("reserve before disk replacement");
+        let replacement = target_disk(&ctx, dir.path(), id).await;
+        assert!(matches!(
+            store
+                .rename_local_data_reserved(
+                    &disk_ref,
+                    (crate::disk::RUSTFS_META_TMP_BUCKET, "staged"),
+                    &fi,
+                    ("target-bucket", "object"),
+                    stale,
+                )
+                .await,
+            Err(DiskError::DiskOngoingReq)
+        ));
+        let after = replacement
+            .read_version(
+                "target-bucket",
+                "target-bucket",
+                "object",
+                &version.to_string(),
+                &crate::disk::ReadOptions {
+                    read_data: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("replacement retains publication");
+        assert_eq!(after.data, fi.data);
+        assert!(store.cancel_local_object_metadata_reservation(&disk_ref, stale).await.is_ok());
     }
 
     #[tokio::test]

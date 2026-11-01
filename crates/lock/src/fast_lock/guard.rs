@@ -40,6 +40,7 @@ pub struct FastLockGuard {
     released: bool,
     disabled: bool, // True when locks are disabled globally
     committed_tail: bool,
+    sealed_for_commit: bool,
     /// Unique ID for this guard instance to prevent double-release
     guard_id: u64,
 }
@@ -56,6 +57,7 @@ impl FastLockGuard {
             released: false,
             disabled: false,
             committed_tail: false,
+            sealed_for_commit: false,
             guard_id,
         }
     }
@@ -71,6 +73,7 @@ impl FastLockGuard {
             released: false,
             disabled: true,
             committed_tail: false,
+            sealed_for_commit: false,
             guard_id,
         }
     }
@@ -100,7 +103,7 @@ impl FastLockGuard {
 
     /// Keep excluding writers while permitting reads of the committed version.
     pub fn downgrade_committed_tail(&mut self) -> bool {
-        if self.released {
+        if self.released || self.sealed_for_commit {
             return false;
         }
         if self.committed_tail {
@@ -123,6 +126,40 @@ impl FastLockGuard {
         self.mode = LockMode::Shared;
         self.committed_tail = true;
         true
+    }
+
+    /// Try to restore exclusive ownership without releasing the writer fence.
+    pub fn try_upgrade_committed_tail(&mut self) -> bool {
+        if self.released || (!self.committed_tail && self.mode != LockMode::Exclusive) {
+            return false;
+        }
+        if !self.disabled {
+            let Some(shard) = &self.shard else { return false };
+            if !shard.try_upgrade_committed_tail(&self.key, &self.owner, self.guard_id) {
+                return false;
+            }
+        }
+        if self.committed_tail {
+            record_lock_held_release(LockMode::Shared);
+            record_lock_held_acquire(LockMode::Exclusive);
+        }
+        self.mode = LockMode::Exclusive;
+        self.committed_tail = false;
+        self.sealed_for_commit = true;
+        true
+    }
+
+    /// Observe writers waiting on this guard's exact object key.
+    pub fn waiting_writer(&self) -> Option<bool> {
+        if self.released {
+            return None;
+        }
+        if self.disabled {
+            return Some(false);
+        }
+        self.shard
+            .as_ref()?
+            .waiting_writer_for_guard(&self.key, &self.owner, self.guard_id)
     }
 
     fn release_physical(&self, shard: &LockShard) -> bool {

@@ -160,6 +160,20 @@ pub struct ObjectLockConfigSnapshot {
 }
 
 impl ObjectLockConfigSnapshot {
+    pub(crate) fn owns_lifecycle_guard(&self) -> bool {
+        self._lifecycle_guard.is_some()
+    }
+
+    pub(crate) fn owns_lifecycle_guard_for(&self, bucket: &str, incarnation: Option<Uuid>) -> bool {
+        self.bucket.as_deref() == Some(bucket)
+            && incarnation.is_some()
+            && self.bucket_incarnation_id == incarnation
+            && self
+                ._lifecycle_guard
+                .as_ref()
+                .is_some_and(|guard| !guard.is_lock_lost() && !guard.is_released())
+    }
+
     pub(crate) fn new(state: crate::bucket::metadata_sys::ObjectLockConfigState) -> Self {
         Self {
             store_id: None,

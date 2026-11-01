@@ -45,7 +45,8 @@
 use crate::error::{Result, StorageError};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_lock::distributed_lock::LockLostSignal;
@@ -98,9 +99,74 @@ pub(super) struct FenceRegistration {
 #[derive(Default)]
 pub(crate) struct BucketFenceRegistry {
     entries: Mutex<HashMap<String, FenceEntry>>,
+    reservation_slots: Mutex<HashMap<(String, Uuid), Weak<ReservationFenceSlot>>>,
+}
+
+#[derive(Default)]
+pub(super) struct ReservationFenceSlot {
+    pub(super) owner: tokio::sync::Mutex<Weak<ReservationFenceGuard>>,
+}
+
+/// Shared by short bursts of reservations, but never kept alive by the cache.
+pub(super) struct ReservationFenceGuard {
+    publication: NamespaceLockGuard,
+    lifecycle: BucketIncarnationFenceGuard,
+    created_at: tokio::time::Instant,
+    _slot: Arc<ReservationFenceSlot>,
+}
+
+impl ReservationFenceGuard {
+    pub(super) fn new(
+        publication: NamespaceLockGuard,
+        lifecycle: BucketIncarnationFenceGuard,
+        slot: Arc<ReservationFenceSlot>,
+    ) -> Self {
+        Self {
+            publication,
+            lifecycle,
+            created_at: tokio::time::Instant::now(),
+            _slot: slot,
+        }
+    }
+
+    pub(super) fn is_reusable(&self) -> bool {
+        // Stop admitting new reservations through this shared reader so a
+        // queued bucket writer can progress after the existing tails drain.
+        self.created_at.elapsed() < Duration::from_secs(1) && self.is_held()
+    }
+
+    fn is_held(&self) -> bool {
+        !self.publication.is_lock_lost()
+            && !self.publication.is_released()
+            && !self.lifecycle.is_lock_lost()
+            && self
+                .lifecycle
+                .namespace_lock_guard()
+                .is_some_and(|guard| !guard.is_released())
+    }
+}
+
+impl crate::disk::os::MetadataReservationFence for ReservationFenceGuard {
+    fn is_valid(&self) -> bool {
+        self.is_held()
+    }
 }
 
 impl BucketFenceRegistry {
+    pub(super) fn reservation_slot(&self, bucket: &str, incarnation: Uuid) -> Arc<ReservationFenceSlot> {
+        let mut slots = self.reservation_slots.lock().expect("reservation fence registry poisoned");
+        let key = (bucket.to_owned(), incarnation);
+        if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
+            return slot;
+        }
+        if slots.len() >= 1024 {
+            slots.retain(|_, slot| slot.strong_count() != 0);
+        }
+        let slot = Arc::new(ReservationFenceSlot::default());
+        slots.insert(key, Arc::downgrade(&slot));
+        slot
+    }
+
     /// Register a new live guard for `bucket` and return the memoized
     /// incarnation id if one is valid for the current coverage window.
     fn enter(&self, bucket: &str, loss_probe: LockLossProbe) -> FenceRegistration {

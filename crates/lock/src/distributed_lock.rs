@@ -438,6 +438,53 @@ impl DistributedLockGuard {
         !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
     }
 
+    /// Require every retained lease to confirm exclusivity before committing.
+    pub async fn try_upgrade_committed_tail(&mut self) -> bool {
+        if self.disarmed || self.lock_type != LockType::Exclusive || self.is_lock_lost() {
+            return false;
+        }
+        let results = futures::future::join_all(
+            self.entries
+                .iter()
+                .map(|entry| entry.client.try_upgrade_committed_tail(&entry.lock_id)),
+        )
+        .await;
+        !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
+    }
+
+    pub async fn supports_heal_lock_transition(&self) -> bool {
+        if self.disarmed || self.lock_type != LockType::Exclusive || !self.committed_tail_quorums_intersect || self.is_lock_lost()
+        {
+            return false;
+        }
+        let results = futures::future::join_all(
+            self.entries
+                .iter()
+                .map(|entry| entry.client.supports_heal_lock_transition(&entry.lock_id)),
+        )
+        .await;
+        !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
+    }
+
+    /// Observe contention on every held lease. Unknown peers prevent a false idle result.
+    pub async fn waiting_writer(&self) -> Option<bool> {
+        if self.disarmed || self.is_lock_lost() {
+            return None;
+        }
+        let results =
+            futures::future::join_all(self.entries.iter().map(|entry| entry.client.waiting_writer(&entry.lock_id))).await;
+        if self.is_lock_lost() {
+            return None;
+        }
+        if results.iter().any(|result| matches!(result, Ok(Some(true)))) {
+            return Some(true);
+        }
+        results
+            .iter()
+            .all(|result| matches!(result, Ok(Some(false))))
+            .then_some(false)
+    }
+
     /// Actual granted peer identities, which may differ from the logical guard ID.
     pub fn granted_lock_ids(&self) -> impl Iterator<Item = &LockId> {
         self.entries.iter().map(|entry| &entry.lock_id)

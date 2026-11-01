@@ -456,6 +456,7 @@ mod rebalance;
 pub(crate) use rebalance::PoolSpaceForTest;
 pub(crate) mod utils;
 
+pub(crate) use peer::admit_local_disk;
 use peer::init_local_peer;
 pub use peer::{
     BootstrapLocalTarget, all_local_disk, all_local_disk_path, find_local_disk_by_ref, find_local_disk_by_ref_for_rpc,

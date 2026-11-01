@@ -722,7 +722,10 @@ async fn unsupported_peer_keeps_exclusive_tail_lease() {
         .get_write_lock(resource.clone(), "first", Duration::from_secs(2))
         .await
         .expect("first writer");
+    assert!(!tail.supports_heal_lock_transition().await, "old peers must not claim support");
+    assert_eq!(tail.waiting_writer().await, None, "old peers cannot report contention");
     assert!(!tail.downgrade_committed_tail().await, "old peers must not claim conversion");
+    assert!(!tail.try_upgrade_committed_tail().await, "old peers must not claim upgrade support");
     assert!(
         lock.get_read_lock(resource.clone(), "reader", Duration::from_millis(150))
             .await
@@ -776,6 +779,121 @@ async fn distributed_committed_tail_allows_reader_and_excludes_writer() {
         .await
         .expect("writer after drain");
     assert!(writer.release());
+}
+
+#[tokio::test]
+async fn distributed_tail_upgrade_requires_all_leases_and_drained_readers() {
+    let clients: Vec<Arc<dyn crate::client::LockClient>> = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn crate::client::LockClient>)
+        .collect();
+    let lock = NamespaceLock::with_clients("tail-upgrade".to_owned(), clients);
+    let resource = ObjectKey::new("bucket", "tail-upgrade");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "heal", Duration::from_secs(2))
+        .await
+        .expect("write lock");
+    assert!(tail.supports_heal_lock_transition().await);
+    assert!(tail.downgrade_committed_tail().await);
+    let mut reader = lock
+        .get_read_lock(resource.clone(), "reader", Duration::from_secs(2))
+        .await
+        .expect("reader");
+    assert!(!tail.try_upgrade_committed_tail().await, "live readers prevent full upgrade");
+    assert!(reader.release());
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while !tail.try_upgrade_committed_tail().await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("retry must finish partial upgrades after asynchronous reader release");
+    assert!(tail.try_upgrade_committed_tail().await, "upgrade retries must be idempotent");
+    assert!(
+        lock.get_read_lock(resource.clone(), "reader", Duration::from_millis(150))
+            .await
+            .is_err()
+    );
+    assert!(tail.release());
+    let mut writer = lock
+        .get_write_lock(resource, "writer", Duration::from_secs(2))
+        .await
+        .expect("writer after release");
+    assert!(writer.release());
+}
+
+#[tokio::test]
+async fn distributed_tail_observes_a_waiting_writer() {
+    let clients: Vec<Arc<dyn crate::client::LockClient>> = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))) as Arc<dyn crate::client::LockClient>)
+        .collect();
+    let lock = Arc::new(NamespaceLock::with_clients("writer-observation".to_owned(), clients));
+    let resource = ObjectKey::new("bucket", "writer-observation");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "heal", Duration::from_secs(2))
+        .await
+        .expect("heal lock");
+    assert!(tail.downgrade_committed_tail().await);
+    assert_eq!(tail.waiting_writer().await, Some(false));
+    let writer = {
+        let lock = Arc::clone(&lock);
+        let resource = resource.clone();
+        tokio::spawn(async move { lock.get_write_lock(resource, "writer", Duration::from_secs(3)).await })
+    };
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while tail.waiting_writer().await != Some(true) {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("waiting writer becomes visible on a held peer");
+    assert!(tail.release());
+    let mut guard = writer.await.expect("writer task").expect("writer succeeds after release");
+    assert!(guard.release());
+}
+
+#[tokio::test]
+async fn distributed_partial_upgrade_remembers_contention_on_upgraded_peer() {
+    use crate::client::LockClient;
+
+    let clients: Vec<Arc<LocalClient>> = (0..3)
+        .map(|_| Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))))
+        .collect();
+    let lock = NamespaceLock::with_clients(
+        "partial-upgrade-writer".to_owned(),
+        clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+    );
+    let resource = ObjectKey::new("bucket", "partial-upgrade-writer");
+    let mut tail = lock
+        .get_write_lock(resource.clone(), "heal", Duration::from_secs(2))
+        .await
+        .expect("heal lock");
+    let ids = match &tail {
+        NamespaceLockGuard::Standard(guard) => guard.granted_lock_ids().cloned().collect::<Vec<_>>(),
+        NamespaceLockGuard::Fast(_) => panic!("distributed guard expected"),
+    };
+    let mut holders = Vec::new();
+    for client in &clients {
+        for id in &ids {
+            if client.check_status(id).await.expect("peer status").is_some() {
+                holders.push(Arc::clone(client));
+                break;
+            }
+        }
+    }
+    assert!(holders.len() >= 2, "write quorum must hold multiple peers");
+    assert!(tail.downgrade_committed_tail().await);
+    let reader = LockRequest::new(resource.clone(), LockType::Shared, "reader");
+    assert!(holders[0].acquire_lock(&reader).await.expect("reader request").success);
+    assert!(!tail.try_upgrade_committed_tail().await, "reader prevents a full upgrade");
+    let writer = LockRequest::new(resource, LockType::Exclusive, "writer").with_acquire_timeout(Duration::from_millis(100));
+    assert!(!holders[1].acquire_lock(&writer).await.expect("writer request").success);
+    assert_eq!(
+        tail.waiting_writer().await,
+        Some(true),
+        "partial upgrade must retain the earlier contention"
+    );
+    assert!(holders[0].release(&reader.lock_id).await.expect("release reader"));
+    assert!(tail.release());
 }
 
 #[tokio::test]

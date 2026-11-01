@@ -115,6 +115,30 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Try to restore exclusive access while retaining the writer fence.
+    pub async fn try_upgrade_committed_tail(&mut self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.try_upgrade_committed_tail().await,
+            Self::Fast(guard) => guard.try_upgrade_committed_tail(),
+        }
+    }
+
+    /// Check whether the held leases can safely use heal lock transitions.
+    pub async fn supports_heal_lock_transition(&self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.supports_heal_lock_transition().await,
+            Self::Fast(_) => true,
+        }
+    }
+
+    /// Observe whether a writer is waiting on this object's held leases.
+    pub async fn waiting_writer(&self) -> Option<bool> {
+        match self {
+            Self::Standard(guard) => guard.waiting_writer().await,
+            Self::Fast(guard) => guard.waiting_writer(),
+        }
+    }
+
     /// Manually release the lock early
     pub fn release(&mut self) -> bool {
         match self {

@@ -466,6 +466,39 @@ impl LockShard {
         true
     }
 
+    pub(crate) fn try_upgrade_committed_tail(&self, key: &ObjectKey, owner: &Arc<str>, guard_id: u64) -> bool {
+        let mut guards = self.active_guards.lock();
+        let Some(Some(info)) = guards.get_mut(&guard_id) else { return false };
+        if info.key != *key || info.owner.as_ref() != owner.as_ref() {
+            return false;
+        }
+        if info.mode == LockMode::Exclusive && !info.committed_tail {
+            return true;
+        }
+        if info.mode != LockMode::Shared || !info.committed_tail {
+            return false;
+        }
+        let objects = self.objects.read();
+        let Some(state) = objects.get(key) else { return false };
+        if !state.try_upgrade_committed_tail(owner) {
+            return false;
+        }
+        info.mode = LockMode::Exclusive;
+        info.committed_tail = false;
+        true
+    }
+
+    pub(crate) fn waiting_writer_for_guard(&self, key: &ObjectKey, owner: &Arc<str>, guard_id: u64) -> Option<bool> {
+        let guards = self.active_guards.lock();
+        let info = guards.get(&guard_id)?.as_ref()?;
+        if info.key != *key || info.owner.as_ref() != owner.as_ref() {
+            return None;
+        }
+        let objects = self.objects.read();
+        let state = objects.get(key)?;
+        Some(state.atomic_state.writer_observed_during_tail())
+    }
+
     /// Release a converted guard and its special reader-admission state.
     pub(crate) fn release_committed_tail_with_guard(&self, key: &ObjectKey, owner: &Arc<str>, guard_id: u64) -> bool {
         let mut guards = self.active_guards.lock();
@@ -1171,6 +1204,146 @@ mod tests {
                 .is_err(),
             "the new committed tail must still exclude writers"
         );
+    }
+
+    #[tokio::test]
+    async fn committed_tail_upgrade_waits_for_readers_and_keeps_writer_fenced() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "upgrade-tail");
+        let mut tail = manager.acquire_write_lock(key.clone(), "heal").await.expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        let reader = manager
+            .acquire_read_lock(key.clone(), "reader")
+            .await
+            .expect("reader during tail");
+        assert!(!tail.try_upgrade_committed_tail(), "an active reader must prevent exclusive commit");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_read_lock(key.clone(), "late-reader"))
+                .await
+                .is_err(),
+            "new readers must not starve a pending upgrade"
+        );
+        drop(reader);
+        assert!(tail.try_upgrade_committed_tail());
+        assert!(tail.try_upgrade_committed_tail(), "a repeated request must be idempotent");
+        assert!(
+            !tail.downgrade_committed_tail(),
+            "a delayed downgrade must not reopen reads after upgrade"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_read_lock(key.clone(), "reader"))
+                .await
+                .is_err()
+        );
+        drop(tail);
+        let _writer = manager.acquire_write_lock(key, "writer").await.expect("writer after release");
+    }
+
+    #[tokio::test]
+    async fn tail_remembers_a_writer_that_stopped_waiting_between_samples() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "brief-writer-observation");
+        let mut tail = manager.acquire_write_lock(key.clone(), "heal").await.expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key.clone(), "writer"))
+                .await
+                .is_err()
+        );
+        assert_eq!(tail.waiting_writer(), Some(true), "a short wait must not be missed by polling");
+        assert!(!tail.try_upgrade_committed_tail(), "observed contention must prevent a later commit");
+        drop(tail);
+        let next = manager.acquire_write_lock(key, "next").await.expect("next lock");
+        assert_eq!(next.waiting_writer(), Some(false), "contention must not leak to the next owner");
+    }
+
+    #[tokio::test]
+    async fn upgraded_tail_remembers_a_writer_that_stopped_waiting() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "upgraded-tail-brief-writer");
+        let mut tail = manager.acquire_write_lock(key.clone(), "heal").await.expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        assert!(tail.try_upgrade_committed_tail());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key.clone(), "writer"))
+                .await
+                .is_err()
+        );
+        assert_eq!(tail.waiting_writer(), Some(true), "upgraded leases must retain observed contention");
+        drop(tail);
+        let next = manager.acquire_write_lock(key, "next").await.expect("next lock");
+        assert_eq!(next.waiting_writer(), Some(false));
+    }
+
+    #[tokio::test]
+    async fn guard_observes_waiting_writer_and_rejects_stale_identity() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "waiting-writer-observation");
+        let mut tail = manager.acquire_write_lock(key.clone(), "heal").await.expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        assert_eq!(tail.waiting_writer(), Some(false));
+        let writer = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move { manager.acquire_write_lock(key, "foreground").await })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while tail.waiting_writer() != Some(true) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("writer becomes observable");
+        assert_eq!(manager.force_unlock(&key), 1);
+        assert_eq!(tail.waiting_writer(), None, "force-released guard must not inspect a replacement owner");
+        let _writer = writer.await.expect("writer task").expect("writer succeeds after release");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_pending_upgrade_allows_readers_again() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "cancel-upgrade");
+        let mut tail = manager.acquire_write_lock(key.clone(), "heal").await.expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        let reader = manager.acquire_read_lock(key.clone(), "reader").await.expect("first reader");
+        assert!(!tail.try_upgrade_committed_tail());
+        let mut waiting = {
+            let manager = manager.clone();
+            let key = key.clone();
+            tokio::spawn(async move { manager.acquire_read_lock(key, "waiting-reader").await })
+        };
+        assert!(tokio::time::timeout(Duration::from_millis(100), &mut waiting).await.is_err());
+        drop(tail);
+        let second = tokio::time::timeout(Duration::from_secs(2), waiting)
+            .await
+            .expect("reader wakes after cancellation")
+            .expect("reader task joins")
+            .expect("reader obtains lock");
+        drop((reader, second));
+    }
+
+    #[tokio::test]
+    async fn force_released_tail_cannot_claim_an_exclusive_upgrade() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "upgrade-stale");
+        let mut tail = manager
+            .acquire_write_lock(key.clone(), "same-owner")
+            .await
+            .expect("write lock");
+        assert!(tail.downgrade_committed_tail());
+        assert_eq!(manager.force_unlock(&key), 1);
+        let _new = manager.acquire_write_lock(key, "same-owner").await.expect("new owner");
+        assert!(!tail.try_upgrade_committed_tail());
+    }
+
+    #[tokio::test]
+    async fn exclusive_upgrade_ack_fences_a_late_downgrade() {
+        let manager = test_manager();
+        let key = ObjectKey::new("bucket", "late-downgrade");
+        let mut guard = manager.acquire_write_lock(key, "heal").await.expect("write lock");
+        assert!(guard.try_upgrade_committed_tail());
+        assert!(!guard.downgrade_committed_tail());
+        assert!(guard.try_upgrade_committed_tail());
     }
 
     #[tokio::test]

@@ -67,14 +67,15 @@ use rustfs_protos::proto_gen::node_service::{
     BatchReadVersionRequest, BatchReadVersionResponse, CheckPartsRequest, CompareAndUpdateFileOutcome,
     CompareAndUpdateFileRequest, DeletePathsRequest, DeleteRequest, DeleteVersionRequest, DeleteVersionsRequest,
     DeleteVersionsResponse, DeleteVolumeRequest, DiskInfoRequest, GuardedDeleteVersionsRequest, ListDirRequest,
-    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, PoolMetaNativeRecoveryRequest as PoolMetaNativeRecoveryRpcRequest,
-    PreparePartTransactionRequest, ReadAllRequest, ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse,
-    ReadPartsRequest, ReadVersionRequest, ReadXlRequest, RecoverDeleteTransactionRequest,
-    RecoverMultipartSourceRequest as RecoverMultipartSourceRpcRequest,
+    ListVolumesRequest, MakeVolumeRequest, MakeVolumesRequest, MetadataReservationActivateRequest,
+    MetadataReservationCancelRequest, MetadataReservationRequest,
+    PoolMetaNativeRecoveryRequest as PoolMetaNativeRecoveryRpcRequest, PreparePartTransactionRequest, ReadAllRequest,
+    ReadMetadataRequest, ReadMultipleRequest, ReadMultipleResponse, ReadPartsRequest, ReadVersionRequest, ReadXlRequest,
+    RecoverDeleteTransactionRequest, RecoverMultipartSourceRequest as RecoverMultipartSourceRpcRequest,
     RecoverMultipartSourceResponse as RecoverMultipartSourceRpcResponse, RenameDataRequest, RenameFileRequest,
-    SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest, SnapshotLeaseRequest,
-    SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest, WriteMetadataRequest,
-    node_service_client::NodeServiceClient,
+    ReservedRenameDataRequest, SettlePartTransactionRequest, SnapshotLeaseReleaseRequest, SnapshotLeaseRenewRequest,
+    SnapshotLeaseRequest, SnapshotLeaseResponse, StatVolumeRequest, UpdateMetadataRequest, VerifyFileRequest, WriteAllRequest,
+    WriteMetadataRequest, node_service_client::NodeServiceClient,
 };
 use serde::{Serialize, de::DeserializeOwned};
 use std::{
@@ -2452,6 +2453,194 @@ fn validate_decoded_file_info(file_info: &FileInfo) -> Result<()> {
 }
 
 impl RemoteDisk {
+    /// Prepare a remote token without retrying the RPC. It owns the bucket
+    /// publication fence but does not enter the object metadata queue yet.
+    pub async fn reserve_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        incarnation: Uuid,
+        timeout: Duration,
+    ) -> Result<Uuid> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        self.execute_with_timeout_for_op_and_health_action(
+            "reserve_object_metadata",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(MetadataReservationRequest {
+                    disk: self.endpoint.to_string(),
+                    bucket: bucket.to_owned(),
+                    object: object.to_owned(),
+                    timeout_ms: u64::try_from(timeout.as_millis()).map_err(|_| Error::other("reservation timeout overflow"))?,
+                    bucket_incarnation_id: incarnation.as_bytes().to_vec().into(),
+                });
+                let body = rustfs_protos::canonical_metadata_reservation_request_body(request.get_ref())
+                    .map_err(|_| Error::other("reservation request length overflow"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                let response = client
+                    .reserve_object_metadata(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.map(Into::into).unwrap_or(DiskError::Unexpected));
+                }
+                if response.protocol_version != 2 {
+                    return Err(DiskError::UnsupportedDisk);
+                }
+                Uuid::from_slice(&response.token)
+                    .ok()
+                    .filter(|token| !token.is_nil())
+                    .ok_or(DiskError::Unexpected)
+            },
+            timeout.min(Duration::from_secs(5)),
+            FailureHealthAction::IgnoreFailure,
+        )
+        .await
+    }
+
+    /// Enqueue a prepared token. The caller must cancel it on an indeterminate
+    /// result before allowing any subsequent unprotected mutation.
+    pub async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid, timeout: Duration) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        self.execute_with_timeout_for_op_and_health_action(
+            "activate_object_metadata_reservation",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(MetadataReservationActivateRequest {
+                    disk: self.endpoint.to_string(),
+                    bucket: bucket.to_owned(),
+                    object: object.to_owned(),
+                    token: token.as_bytes().to_vec().into(),
+                });
+                let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(request.get_ref())
+                    .map_err(|_| Error::other("reservation activation request length overflow"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                let response = client
+                    .activate_object_metadata_reservation(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.map(Into::into).unwrap_or(DiskError::Unexpected));
+                }
+                Ok(())
+            },
+            timeout.min(Duration::from_secs(5)),
+            FailureHealthAction::IgnoreFailure,
+        )
+        .await
+    }
+
+    /// Cancel an unclaimed remote reservation. False cannot prove that an
+    /// earlier claim did not start a physical mutation.
+    pub async fn cancel_object_metadata_reservation(&self, token: Uuid) -> Result<bool> {
+        self.execute_with_timeout_for_op(
+            "cancel_object_metadata_reservation",
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(MetadataReservationCancelRequest {
+                    disk: self.endpoint.to_string(),
+                    token: token.as_bytes().to_vec().into(),
+                });
+                let body = rustfs_protos::canonical_metadata_reservation_cancel_request_body(request.get_ref())
+                    .map_err(|_| Error::other("reservation cancellation request length overflow"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                let response = client
+                    .cancel_object_metadata_reservation(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if let Some(error) = response.error {
+                    return Err(error.into());
+                }
+                Ok(response.success)
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    /// Publish a staged user-object write using a remote one-shot reservation.
+    /// The caller must retain the bucket lifecycle fence until the tail drains.
+    pub async fn rename_data_with_metadata_reservation(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        token: Uuid,
+    ) -> Result<RenameDataResp> {
+        self.execute_with_timeout_for_op(
+            "rename_reserved_data",
+            || async {
+                let mut client = self.get_client().await?;
+                let rename = RenameDataRequest {
+                    disk: self.endpoint.to_string(),
+                    src_volume: src_volume.to_owned(),
+                    src_path: src_path.to_owned(),
+                    file_info: compat_json(fi)?,
+                    dst_volume: dst_volume.to_owned(),
+                    dst_path: dst_path.to_owned(),
+                    file_info_bin: encode_file_info_msgpack(fi)?.into(),
+                    scanner_publication_lease_token: Bytes::new(),
+                    bucket_incarnation_id: Bytes::new(),
+                };
+                let mut request = Request::new(ReservedRenameDataRequest {
+                    rename: Some(rename),
+                    token: token.as_bytes().to_vec().into(),
+                });
+                let body = rustfs_protos::canonical_reserved_rename_data_request_body(request.get_ref())
+                    .map_err(|_| Error::other("reserved rename request length overflow"))?;
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &body).map_err(Error::other)?;
+                let response = client
+                    .rename_reserved_data(request)
+                    .await
+                    .map_err(|status| {
+                        if status.code() == Code::Unimplemented {
+                            DiskError::UnsupportedDisk
+                        } else {
+                            status.into()
+                        }
+                    })?
+                    .into_inner();
+                if !response.success {
+                    return Err(response.error.map(Into::into).unwrap_or(DiskError::Unexpected));
+                }
+                decode_msgpack_or_json::<RenameDataResp>(
+                    &response.rename_data_resp_bin,
+                    &response.rename_data_resp,
+                    "RenameDataResp",
+                )
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
     #[tracing::instrument(level = "trace", skip_all)]
     pub(crate) async fn rename_data_borrowed(
         &self,
@@ -5105,6 +5294,56 @@ mod tests {
                 "/node_service.NodeService/RenameData",
             ],
             "each dispatch must use exactly one method; multipart publication must never downgrade",
+        );
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn metadata_reservation_old_peer_rejects_without_legacy_fallback() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        let token = Uuid::new_v4();
+        assert!(matches!(
+            remote
+                .reserve_object_metadata("bucket", "object", Uuid::new_v4(), Duration::from_secs(5))
+                .await,
+            Err(DiskError::UnsupportedDisk)
+        ));
+        assert!(matches!(
+            remote
+                .activate_object_metadata("bucket", "object", token, Duration::from_secs(5))
+                .await,
+            Err(DiskError::UnsupportedDisk)
+        ));
+        assert!(matches!(
+            remote.cancel_object_metadata_reservation(token).await,
+            Err(DiskError::UnsupportedDisk)
+        ));
+        assert!(matches!(
+            remote
+                .rename_data_with_metadata_reservation(
+                    crate::disk::RUSTFS_META_TMP_BUCKET,
+                    "staged",
+                    &sample_rename_data_file_info(),
+                    "bucket",
+                    "object",
+                    token,
+                )
+                .await,
+            Err(DiskError::UnsupportedDisk)
+        ));
+        assert_eq!(
+            *peer.peer.unsupported_methods.lock().expect("observed methods lock"),
+            vec![
+                "/node_service.NodeService/ReserveObjectMetadata",
+                "/node_service.NodeService/ActivateObjectMetadataReservation",
+                "/node_service.NodeService/CancelObjectMetadataReservation",
+                "/node_service.NodeService/RenameReservedData",
+            ],
+            "reservation operations must never downgrade to legacy methods",
         );
         peer.stop().await;
     }
