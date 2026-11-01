@@ -30,6 +30,7 @@ pub(crate) mod integration {
         ObjectOptions, PutObjReader, ShardIntegrityWriteMode, WriteCommitGuard, WriteCompletion,
     };
     pub(crate) use rustfs_ecstore::api::rebalance::{RebalStatus, RebalanceMeta, RebalanceStats};
+    pub(crate) use rustfs_ecstore::api::runtime::InstanceContext;
     pub(crate) use rustfs_ecstore::api::storage::ECStore;
     pub(crate) use rustfs_storage_api::BucketOperations;
     pub(crate) use rustfs_storage_api::MakeBucketOptions;

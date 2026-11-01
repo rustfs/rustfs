@@ -22,8 +22,10 @@ use parking_lot::Mutex;
 use rustfs_utils::path::SLASH_SEPARATOR;
 use std::{
     collections::{HashMap, VecDeque},
+    future::Future,
     io,
     path::{Component, Path, PathBuf},
+    pin::Pin,
     sync::{Arc, LazyLock, Weak},
     time::{Duration, Instant},
 };
@@ -2227,6 +2229,375 @@ static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistr
 pub(crate) struct MetadataMutationLease {
     _guard: OwnedMutexGuard<()>,
     _owner: Option<Arc<dyn Send + Sync>>,
+}
+
+pub(crate) trait MetadataReservationFence: Send + Sync {
+    fn is_valid(&self) -> bool;
+}
+
+/// Single-use ownership of the metadata lock for an exact physical object.
+pub(crate) struct MetadataMutationReservation {
+    key: PathBuf,
+    disk_instance: uuid::Uuid,
+    lease: MetadataReservationLease,
+    capacity: Option<OwnedSemaphorePermit>,
+    fence: Option<Arc<dyn MetadataReservationFence>>,
+}
+
+enum MetadataReservationLease {
+    Held(Arc<MetadataMutationLease>),
+    Queued(Pin<Box<dyn Future<Output = Arc<MetadataMutationLease>> + Send>>),
+}
+
+impl MetadataMutationReservation {
+    pub(crate) fn fence(&self) -> Option<Arc<dyn MetadataReservationFence>> {
+        self.fence.clone()
+    }
+
+    /// Wait for a previously enqueued lease without holding an I/O permit.
+    /// Dropping this future removes an unclaimed waiter from the FIFO queue.
+    pub(crate) async fn wait(self) -> Self {
+        let Self {
+            key,
+            disk_instance,
+            lease,
+            capacity,
+            fence,
+        } = self;
+        let lease = match lease {
+            MetadataReservationLease::Held(lease) => lease,
+            MetadataReservationLease::Queued(waiter) => waiter.await,
+        };
+        Self {
+            key,
+            disk_instance,
+            lease: MetadataReservationLease::Held(lease),
+            capacity,
+            fence,
+        }
+    }
+
+    pub(crate) fn into_lease_for(self, key: &Path, disk_instance: uuid::Uuid) -> Result<Arc<dyn Send + Sync>> {
+        if self.key != key || self.disk_instance != disk_instance {
+            return Err(DiskError::InvalidPath);
+        }
+        if self.fence.as_ref().is_some_and(|fence| !fence.is_valid()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        let MetadataReservationLease::Held(lease) = self.lease else {
+            return Err(DiskError::DiskOngoingReq);
+        };
+        Ok(match self.capacity {
+            Some(capacity) => Arc::new((lease, capacity)),
+            None => lease,
+        })
+    }
+}
+
+pub(crate) async fn reserve_metadata_mutation_lease(
+    object: &Path,
+    disk_instance: uuid::Uuid,
+    owner: Option<Arc<dyn Send + Sync>>,
+) -> MetadataMutationReservation {
+    MetadataMutationReservation {
+        key: object.to_path_buf(),
+        disk_instance,
+        lease: MetadataReservationLease::Held(acquire_metadata_mutation_lease(object, owner).await),
+        capacity: None,
+        fence: None,
+    }
+}
+
+struct MetadataReservationEntry {
+    state: MetadataReservationState,
+    expires_at: tokio::time::Instant,
+    renewal_ttl: Duration,
+}
+
+enum MetadataReservationState {
+    Prepared {
+        key: PathBuf,
+        disk_instance: uuid::Uuid,
+        capacity: Option<OwnedSemaphorePermit>,
+        owner: Option<Arc<dyn MetadataReservationFence>>,
+    },
+    Queued(MetadataMutationReservation),
+}
+
+/// Process-local, bounded one-shot reservations for one disk instance.
+pub(crate) struct MetadataReservationRegistry {
+    entries: Mutex<HashMap<uuid::Uuid, MetadataReservationEntry>>,
+    capacity: Arc<Semaphore>,
+}
+
+impl MetadataReservationRegistry {
+    pub(crate) fn new(limit: usize) -> Arc<Self> {
+        let registry = Arc::new(Self {
+            entries: Mutex::new(HashMap::new()),
+            capacity: Arc::new(Semaphore::new(limit)),
+        });
+        let weak = Arc::downgrade(&registry);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                let Some(registry) = weak.upgrade() else { break };
+                registry.remove_expired();
+            }
+        });
+        registry
+    }
+
+    pub(crate) async fn reserve(
+        &self,
+        key: &Path,
+        disk_instance: uuid::Uuid,
+        acquire_timeout: Duration,
+        owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<uuid::Uuid> {
+        let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                self.remove_expired();
+                Arc::clone(&self.capacity)
+                    .try_acquire_owned()
+                    .map_err(|_| DiskError::DiskOngoingReq)?
+            }
+        };
+        let mut reservation = tokio::time::timeout(acquire_timeout, reserve_metadata_mutation_lease(key, disk_instance, owner))
+            .await
+            .map_err(|_| DiskError::Timeout)?;
+        reservation.capacity = Some(capacity);
+        let token = uuid::Uuid::new_v4();
+        let mut entries = self.entries.lock();
+        match entries.entry(token) {
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(MetadataReservationEntry {
+                state: MetadataReservationState::Queued(reservation),
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(60),
+                renewal_ttl: Duration::from_secs(60),
+            }),
+            std::collections::hash_map::Entry::Occupied(_) => return Err(DiskError::Unexpected),
+        };
+        Ok(token)
+    }
+
+    /// Register this mutation in FIFO order before returning its token.
+    /// The mutex may still be held by an earlier operation when this returns.
+    pub(crate) async fn enqueue(&self, key: &Path, disk_instance: uuid::Uuid) -> Result<uuid::Uuid> {
+        let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                self.remove_expired();
+                Arc::clone(&self.capacity)
+                    .try_acquire_owned()
+                    .map_err(|_| DiskError::DiskOngoingReq)?
+            }
+        };
+        let object = key.to_path_buf();
+        let mut waiter: Pin<Box<dyn Future<Output = Arc<MetadataMutationLease>> + Send>> =
+            Box::pin(async move { acquire_metadata_mutation_lease(&object, None).await });
+        // Poll once so Tokio registers this waiter before the token can be
+        // acknowledged; retaining the future retains its position in the queue.
+        let lease = match futures::poll!(waiter.as_mut()) {
+            std::task::Poll::Ready(lease) => MetadataReservationLease::Held(lease),
+            std::task::Poll::Pending => MetadataReservationLease::Queued(waiter),
+        };
+        let token = uuid::Uuid::new_v4();
+        let reservation = MetadataMutationReservation {
+            key: key.to_path_buf(),
+            disk_instance,
+            lease,
+            capacity: Some(capacity),
+            fence: None,
+        };
+        let mut entries = self.entries.lock();
+        match entries.entry(token) {
+            std::collections::hash_map::Entry::Vacant(entry) => entry.insert(MetadataReservationEntry {
+                state: MetadataReservationState::Queued(reservation),
+                expires_at: tokio::time::Instant::now() + Duration::from_secs(60),
+                renewal_ttl: Duration::from_secs(60),
+            }),
+            std::collections::hash_map::Entry::Occupied(_) => return Err(DiskError::Unexpected),
+        };
+        Ok(token)
+    }
+
+    /// Allocate an inert token before a client asks to enter the FIFO queue.
+    /// A lost preparation response cannot hold an object metadata lock.
+    #[cfg(test)]
+    pub(crate) fn prepare(&self, key: &Path, disk_instance: uuid::Uuid) -> Result<uuid::Uuid> {
+        self.prepare_with_owner(key, disk_instance, None)
+    }
+
+    pub(crate) fn prepare_with_owner(
+        &self,
+        key: &Path,
+        disk_instance: uuid::Uuid,
+        owner: Option<Arc<dyn MetadataReservationFence>>,
+    ) -> Result<uuid::Uuid> {
+        self.prepare_with_owner_ttl(key, disk_instance, owner, Duration::from_secs(60))
+    }
+
+    pub(crate) fn prepare_with_owner_ttl(
+        &self,
+        key: &Path,
+        disk_instance: uuid::Uuid,
+        owner: Option<Arc<dyn MetadataReservationFence>>,
+        ttl: Duration,
+    ) -> Result<uuid::Uuid> {
+        if ttl.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        let expires_at = tokio::time::Instant::now().checked_add(ttl).ok_or(DiskError::Timeout)?;
+        let capacity = match Arc::clone(&self.capacity).try_acquire_owned() {
+            Ok(capacity) => capacity,
+            Err(_) => {
+                self.remove_expired();
+                Arc::clone(&self.capacity)
+                    .try_acquire_owned()
+                    .map_err(|_| DiskError::DiskOngoingReq)?
+            }
+        };
+        let token = uuid::Uuid::new_v4();
+        let entry = MetadataReservationEntry {
+            state: MetadataReservationState::Prepared {
+                key: key.to_path_buf(),
+                disk_instance,
+                capacity: Some(capacity),
+                owner,
+            },
+            expires_at,
+            renewal_ttl: ttl,
+        };
+        match self.entries.lock().entry(token) {
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(entry);
+                Ok(token)
+            }
+            std::collections::hash_map::Entry::Occupied(_) => Err(DiskError::Unexpected),
+        }
+    }
+
+    /// Extend an inert token or a queued short token without reviving an expired,
+    /// cancelled, or claimed entry. Long queued tokens remain non-renewable.
+    pub(crate) fn renew(&self, token: uuid::Uuid, key: &Path, disk_instance: uuid::Uuid) -> Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(&token).ok_or(DiskError::DiskOngoingReq)?;
+        let now = tokio::time::Instant::now();
+        if entry.expires_at <= now {
+            return Err(DiskError::Timeout);
+        }
+        let (stored_key, stored_instance, owner) = match &entry.state {
+            MetadataReservationState::Prepared {
+                key,
+                disk_instance,
+                owner,
+                ..
+            } => (key, disk_instance, owner),
+            MetadataReservationState::Queued(reservation) if entry.renewal_ttl <= Duration::from_secs(2) => {
+                (&reservation.key, &reservation.disk_instance, &reservation.fence)
+            }
+            MetadataReservationState::Queued(_) => return Err(DiskError::DiskOngoingReq),
+        };
+        if stored_key != key || *stored_instance != disk_instance {
+            return Err(DiskError::InvalidPath);
+        }
+        if owner.as_ref().is_some_and(|fence| !fence.is_valid()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        entry.expires_at = now + entry.renewal_ttl;
+        Ok(())
+    }
+
+    /// Atomically enqueue a prepared token. Cancellation and enqueue serialize
+    /// on the registry, so a delayed enqueue cannot revive a cancelled token.
+    pub(crate) async fn activate(&self, token: uuid::Uuid, key: &Path, disk_instance: uuid::Uuid) -> Result<()> {
+        std::future::poll_fn(|cx| {
+            let mut entries = self.entries.lock();
+            let Some(entry) = entries.get_mut(&token) else {
+                return std::task::Poll::Ready(Err(DiskError::DiskOngoingReq));
+            };
+            if entry.expires_at <= tokio::time::Instant::now() {
+                return std::task::Poll::Ready(Err(DiskError::Timeout));
+            }
+            let (stored_key, stored_instance, capacity, owner) = match &mut entry.state {
+                MetadataReservationState::Prepared {
+                    key,
+                    disk_instance,
+                    capacity,
+                    owner,
+                } => (key, disk_instance, capacity, owner),
+                MetadataReservationState::Queued(reservation) => {
+                    return std::task::Poll::Ready(if reservation.key != key || reservation.disk_instance != disk_instance {
+                        Err(DiskError::InvalidPath)
+                    } else if reservation.fence.as_ref().is_some_and(|fence| !fence.is_valid()) {
+                        Err(DiskError::DiskOngoingReq)
+                    } else {
+                        Ok(())
+                    });
+                }
+            };
+            if stored_key != key || *stored_instance != disk_instance {
+                return std::task::Poll::Ready(Err(DiskError::InvalidPath));
+            }
+            if owner.as_ref().is_some_and(|fence| !fence.is_valid()) {
+                return std::task::Poll::Ready(Err(DiskError::DiskOngoingReq));
+            }
+            let Some(capacity) = capacity.take() else {
+                return std::task::Poll::Ready(Err(DiskError::Unexpected));
+            };
+            let object = stored_key.clone();
+            let fence = owner.take();
+            let owner: Option<Arc<dyn Send + Sync>> = fence.clone().map(|fence| fence as Arc<dyn Send + Sync>);
+            let mut waiter: Pin<Box<dyn Future<Output = Arc<MetadataMutationLease>> + Send>> =
+                Box::pin(async move { acquire_metadata_mutation_lease(&object, owner).await });
+            let lease = match waiter.as_mut().poll(cx) {
+                std::task::Poll::Ready(lease) => MetadataReservationLease::Held(lease),
+                std::task::Poll::Pending => MetadataReservationLease::Queued(waiter),
+            };
+            entry.state = MetadataReservationState::Queued(MetadataMutationReservation {
+                key: stored_key.clone(),
+                disk_instance,
+                lease,
+                capacity: Some(capacity),
+                fence,
+            });
+            std::task::Poll::Ready(Ok(()))
+        })
+        .await
+    }
+
+    pub(crate) fn claim(&self, token: uuid::Uuid, key: &Path, disk_instance: uuid::Uuid) -> Result<MetadataMutationReservation> {
+        let entry = self.entries.lock().remove(&token).ok_or(DiskError::DiskOngoingReq)?;
+        if entry.expires_at <= tokio::time::Instant::now() {
+            return Err(DiskError::Timeout);
+        }
+        let MetadataReservationState::Queued(reservation) = entry.state else {
+            return Err(DiskError::DiskOngoingReq);
+        };
+        if reservation.key != key || reservation.disk_instance != disk_instance {
+            return Err(DiskError::InvalidPath);
+        }
+        if reservation.fence.as_ref().is_some_and(|fence| !fence.is_valid()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        Ok(reservation)
+    }
+
+    pub(crate) fn cancel(&self, token: uuid::Uuid) -> bool {
+        let removed = self.entries.lock().remove(&token);
+        removed.is_some()
+    }
+
+    fn remove_expired(&self) {
+        let now = tokio::time::Instant::now();
+        let expired: Vec<_> = self
+            .entries
+            .lock()
+            .extract_if(|_, entry| entry.expires_at <= now)
+            .map(|(_, entry)| entry)
+            .collect();
+        drop(expired);
+    }
 }
 
 pub(crate) async fn acquire_metadata_mutation_lease(

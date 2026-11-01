@@ -27,6 +27,7 @@ use futures::{StreamExt, stream::FuturesUnordered};
 use metrics::{counter, gauge};
 use rustfs_heal_contracts::heal_channel::{HealOpts, HealRequestSource, HealScanMode};
 use rustfs_madmin::heal_commands::HealResultItem;
+use std::collections::HashMap;
 use std::sync::{
     Arc,
     atomic::{AtomicUsize, Ordering},
@@ -1550,6 +1551,7 @@ impl ErasureSetHealer {
             let checkpoint = checkpoint_manager.get_checkpoint().await;
             let page_resume_index = *current_object_index;
             let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
+            let mut object_locks: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
             let mut page_tasks = FuturesUnordered::new();
             let mut completed_in_page = 0usize;
 
@@ -1721,6 +1723,7 @@ impl ErasureSetHealer {
                 let set_label = set_disk_id.to_string();
                 let heal_opts = self.heal_opts;
                 let semaphore = semaphore.clone();
+                let object_lock = object_locks.entry(object_name.clone()).or_default().clone();
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
                 let retry_replacement = replacement_commit_evidence_required && self.source == HealRequestSource::AutoHeal;
@@ -1735,6 +1738,13 @@ impl ErasureSetHealer {
                     .as_ref()
                     .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
                 let work = async move {
+                    // Versions share one namespace lock. Queue them before taking a
+                    // page permit so a waiting version cannot block other objects.
+                    let _object_guard = tokio::select! {
+                        biased;
+                        _ = cancel_token.cancelled() => return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled)), None),
+                        guard = object_lock.lock() => guard,
+                    };
                     let mut retries = 0;
                     let mut admin_identity = admin_identity;
                     let mut admin_task_id = admin_task_id;
@@ -4045,6 +4055,64 @@ mod resume_loop_tests {
         assert_eq!(calls.len(), 50, "each version healed exactly once under concurrency");
         let unique: std::collections::HashSet<_> = calls.into_iter().collect();
         assert_eq!(unique.len(), 50, "no version healed twice");
+    }
+
+    #[tokio::test]
+    async fn page_serializes_versions_without_blocking_other_objects() {
+        temp_env::async_with_vars(
+            [
+                (rustfs_config::ENV_HEAL_PAGE_PARALLEL_ENABLE, Some("true")),
+                (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
+            ],
+            async {
+                let mut env = make_env().await;
+                env.healer.source = HealRequestSource::AutoHeal;
+                env.healer = env
+                    .healer
+                    .with_replacement_targets(vec!["replacement-a".into()], Some(env.task_id.clone()));
+                let gate = Arc::new(tokio::sync::Semaphore::new(0));
+                *env.storage.heal_gate.lock().unwrap() = Some(gate.clone());
+                for (name, version) in [("a", "v1"), ("a", "v2"), ("b", "v1")] {
+                    env.storage
+                        .set_result(name, Some(version), replacement_target_ok_result("replacement-a", name));
+                }
+                env.storage.set_page(
+                    None,
+                    Page {
+                        items: vec![
+                            item("a", Some("v1"), false),
+                            item("a", Some("v2"), false),
+                            item("b", Some("v1"), false),
+                        ],
+                        next: None,
+                        truncated: false,
+                    },
+                );
+                let observe = async {
+                    let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                        loop {
+                            let notified = env.storage.heal_started.notified();
+                            if env.storage.calls().len() >= 2 {
+                                break;
+                            }
+                            notified.await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                    let calls = env.storage.calls();
+                    gate.add_permits(3);
+                    assert!(started, "different objects should run concurrently");
+                    assert_eq!(calls.len(), 2);
+                    assert!(calls.iter().any(|(name, _)| name == "a"));
+                    assert!(calls.iter().any(|(name, _)| name == "b"));
+                };
+                let ((processed, successful, failed, skipped, result), ()) = tokio::join!(run(&env), observe);
+                result.expect("all versions heal");
+                assert_eq!((processed, successful, failed, skipped), (3, 3, 0, 0));
+            },
+        )
+        .await;
     }
 
     #[tokio::test]

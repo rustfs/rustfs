@@ -194,13 +194,21 @@ async fn empty_replacement_with_committed_delete(
 
 mod serial_tests {
     use super::*;
+    use storage_api::integration::InstanceContext;
 
     async fn bucket_directory_loss_task(cluster: bool, missing: usize, dry_run: bool, source: HealRequestSource) {
         let temp = tempfile::tempdir().expect("isolated bucket recovery fixture");
         let env = rustfs_test_utils::TestECStoreEnv::builder()
             .base_dir(temp.path())
+            .instance_context(Arc::new(InstanceContext::new()))
             .build()
             .await;
+        let shutdown = env
+            .ecstore
+            .background_cancel_token()
+            .expect("fixture store must own a shutdown token");
+        assert!(!shutdown.is_cancelled(), "a new fixture must not inherit a previous store's shutdown");
+        eprintln!("bucket recovery: environment ready");
         let bucket = "task-directory-recovery";
         env.make_bucket(bucket, false).await;
         let storage = Arc::new(ECStoreHealStorage::new(env.ecstore.clone()));
@@ -213,6 +221,7 @@ mod serial_tests {
                 .await
                 .expect("remove only an empty bucket directory");
         }
+        eprintln!("bucket recovery: directories removed");
         assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).exists()).count(), 4 - missing);
         let mut request = HealRequest::new(
             if cluster {
@@ -237,6 +246,7 @@ mod serial_tests {
         }
         let task = HealTask::from_request(request, storage.clone());
         let result = task.execute().await;
+        eprintln!("bucket recovery: task returned");
         if missing == 4 || source != HealRequestSource::Admin {
             assert!(
                 result.is_err(),
@@ -259,6 +269,7 @@ mod serial_tests {
         };
         assert_eq!(env.disk_paths.iter().filter(|disk| disk.join(bucket).is_dir()).count(), remaining);
         assert_eq!(storage.admit_bucket_incarnation(bucket).await.expect("retained metadata"), expected);
+        shutdown.cancel();
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -267,7 +278,13 @@ mod serial_tests {
         for cluster in [false, true] {
             // Two surviving directories satisfy ordinary reads; one does not.
             for missing in [2, 3] {
-                bucket_directory_loss_task(cluster, missing, false, HealRequestSource::Admin).await;
+                eprintln!("bucket recovery: cluster={cluster}, missing={missing}");
+                tokio::time::timeout(
+                    Duration::from_secs(60),
+                    bucket_directory_loss_task(cluster, missing, false, HealRequestSource::Admin),
+                )
+                .await
+                .unwrap_or_else(|_| panic!("bucket recovery did not finish: cluster={cluster}, missing={missing}"));
             }
         }
     }

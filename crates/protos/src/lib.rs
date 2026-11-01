@@ -1092,6 +1092,56 @@ impl_canonical_mutation_body!(
 // its JSON compatibility copy — so tampering with either encoding, or stripping `_bin` to force
 // the JSON fallback decode path, breaks the signature-bound digest.
 
+pub fn canonical_metadata_reservation_request_body(
+    request: &proto_gen::node_service::MetadataReservationRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-metadata-reservation-request-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.object)?;
+    body.push_u64(request.timeout_ms);
+    body.push_bytes(&request.bucket_incarnation_id)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_metadata_reservation_cancel_request_body(
+    request: &proto_gen::node_service::MetadataReservationCancelRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-metadata-reservation-cancel-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_bytes(&request.token)?;
+    Ok(body.finish())
+}
+
+pub fn canonical_metadata_reservation_activate_request_body(
+    request: &proto_gen::node_service::MetadataReservationActivateRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-metadata-reservation-activate-v1\0");
+    body.push_str(&request.disk)?;
+    body.push_str(&request.bucket)?;
+    body.push_str(&request.object)?;
+    body.push_bytes(&request.token)?;
+    // Keep ordinary activations byte-compatible with existing peers. Renewal
+    // adds a distinct signed marker so an older peer cannot treat it as activation.
+    if request.renew_only {
+        body.push_bool(true);
+    }
+    Ok(body.finish())
+}
+
+pub fn canonical_reserved_rename_data_request_body(
+    request: &proto_gen::node_service::ReservedRenameDataRequest,
+) -> Result<Vec<u8>, std::num::TryFromIntError> {
+    let mut body = CanonicalBodyBuilder::new(b"rustfs-reserved-rename-data-v1\0");
+    if let Some(rename) = request.rename.as_ref() {
+        body.push_bytes(&canonical_rename_data_request_body(rename)?)?;
+    } else {
+        body.push_bytes(&[])?;
+    }
+    body.push_bytes(&request.token)?;
+    Ok(body.finish())
+}
+
 pub fn canonical_rename_data_request_body(
     request: &proto_gen::node_service::RenameDataRequest,
 ) -> Result<Vec<u8>, std::num::TryFromIntError> {
@@ -1720,6 +1770,96 @@ mod disk_mutation_canonical_tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn metadata_reservation_canonical_bodies_bind_scope_and_token() {
+        use proto_gen::node_service::{
+            MetadataReservationActivateRequest, MetadataReservationCancelRequest, MetadataReservationRequest,
+            ReservedRenameDataRequest,
+        };
+
+        let request = MetadataReservationRequest {
+            disk: "disk".into(),
+            bucket: "bucket".into(),
+            object: "object".into(),
+            timeout_ms: 5000,
+            bucket_incarnation_id: vec![1; 16].into(),
+        };
+        let mut bodies = vec![canonical_metadata_reservation_request_body(&request).expect("reservation body")];
+        for mutate in [
+            |r: &mut MetadataReservationRequest| r.disk = "other".into(),
+            |r: &mut MetadataReservationRequest| r.bucket = "other".into(),
+            |r: &mut MetadataReservationRequest| r.object = "other".into(),
+            |r: &mut MetadataReservationRequest| r.timeout_ms = 1,
+            |r: &mut MetadataReservationRequest| r.bucket_incarnation_id = vec![2; 16].into(),
+        ] {
+            let mut changed = request.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_metadata_reservation_request_body(&changed).expect("changed body"));
+        }
+        assert_all_distinct(&bodies);
+        let activation = MetadataReservationActivateRequest {
+            disk: "disk".into(),
+            bucket: "bucket".into(),
+            object: "object".into(),
+            token: vec![1; 16].into(),
+            renew_only: false,
+        };
+        let mut legacy_activation = CanonicalBodyBuilder::new(b"rustfs-metadata-reservation-activate-v1\0");
+        legacy_activation.push_str(&activation.disk).expect("disk");
+        legacy_activation.push_str(&activation.bucket).expect("bucket");
+        legacy_activation.push_str(&activation.object).expect("object");
+        legacy_activation.push_bytes(&activation.token).expect("token");
+        assert_eq!(
+            canonical_metadata_reservation_activate_request_body(&activation).expect("ordinary activation"),
+            legacy_activation.finish(),
+            "ordinary activation must retain its previous body digest"
+        );
+        let mut bodies = vec![canonical_metadata_reservation_activate_request_body(&activation).expect("activation body")];
+        for mutate in [
+            |r: &mut MetadataReservationActivateRequest| r.disk = "other".into(),
+            |r: &mut MetadataReservationActivateRequest| r.bucket = "other".into(),
+            |r: &mut MetadataReservationActivateRequest| r.object = "other".into(),
+            |r: &mut MetadataReservationActivateRequest| r.token = vec![2; 16].into(),
+            |r: &mut MetadataReservationActivateRequest| r.renew_only = true,
+        ] {
+            let mut changed = activation.clone();
+            mutate(&mut changed);
+            bodies.push(canonical_metadata_reservation_activate_request_body(&changed).expect("changed activation"));
+        }
+        assert_all_distinct(&bodies);
+        let cancellation = MetadataReservationCancelRequest {
+            disk: "disk".into(),
+            token: vec![1; 16].into(),
+        };
+        let mut changed = cancellation.clone();
+        changed.token = vec![2; 16].into();
+        assert_ne!(
+            canonical_metadata_reservation_cancel_request_body(&cancellation).expect("cancel body"),
+            canonical_metadata_reservation_cancel_request_body(&changed).expect("changed cancel body")
+        );
+        let rename = ReservedRenameDataRequest {
+            rename: Some(RenameDataRequest {
+                dst_path: "object".into(),
+                ..Default::default()
+            }),
+            token: vec![1; 16].into(),
+        };
+        let mut changed_token = rename.clone();
+        changed_token.token = vec![2; 16].into();
+        let mut changed_object = rename.clone();
+        changed_object.rename.as_mut().expect("rename").dst_path = "other".into();
+        assert_all_distinct(&[
+            canonical_reserved_rename_data_request_body(&rename).expect("rename body"),
+            canonical_reserved_rename_data_request_body(&changed_token).expect("changed token"),
+            canonical_reserved_rename_data_request_body(&changed_object).expect("changed object"),
+            canonical_reserved_rename_data_request_body(&ReservedRenameDataRequest {
+                rename: None,
+                token: rename.token,
+            })
+            .expect("missing rename"),
+        ]);
     }
 
     #[test]

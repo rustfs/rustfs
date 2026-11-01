@@ -58,7 +58,7 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -70,6 +70,9 @@ const SCANNER_PUBLICATION_STATE_ALLOWED: u8 = 1;
 const SCANNER_PUBLICATION_STATE_BLOCKED: u8 = 2;
 
 pub(crate) const SCANNER_PUBLICATION_LEASE_MAX_ENTRIES: usize = 256;
+
+// Bound abandoned speculative RPCs independently for each storage instance.
+pub(crate) const SPECULATIVE_RESERVATION_LIMIT: usize = 64;
 
 /// A lease is deliberately short-lived.  The coordinator treats expiry as a
 /// failed publication rather than silently continuing with a peer that may
@@ -99,6 +102,12 @@ pub(crate) struct ScannerPublicationLeaseEntry {
 pub(crate) struct NamespaceCommitGuard {
     ctx: Arc<InstanceContext>,
     counted: bool,
+}
+
+impl NamespaceCommitGuard {
+    pub(crate) fn covers_instance(&self, ctx: &Arc<InstanceContext>) -> bool {
+        Arc::ptr_eq(&self.ctx, ctx)
+    }
 }
 
 impl Drop for NamespaceCommitGuard {
@@ -332,6 +341,7 @@ pub struct InstanceContext {
     scanner_publication_state: AtomicU8,
     namespace_commits: AtomicU64,
     namespace_commit_generation: AtomicU64,
+    speculative_reservations: Arc<Semaphore>,
     /// Resolves object-encryption material at the application boundary.
     object_encryption_resolver: OnceLock<Arc<dyn ObjectEncryptionResolver>>,
     delete_recovery_hints: DeleteRecoveryHints,
@@ -392,6 +402,7 @@ impl InstanceContext {
             scanner_publication_state: AtomicU8::new(SCANNER_PUBLICATION_STATE_UNKNOWN),
             namespace_commits: AtomicU64::new(0),
             namespace_commit_generation: AtomicU64::new(0),
+            speculative_reservations: Arc::new(Semaphore::new(SPECULATIVE_RESERVATION_LIMIT)),
             object_encryption_resolver: OnceLock::new(),
             delete_recovery_hints: DeleteRecoveryHints::default(),
             tier_delete_journal_recovery_stores: std::sync::Mutex::new(HashSet::new()),
@@ -411,6 +422,11 @@ impl InstanceContext {
     /// This instance's namespace lock manager.
     pub fn lock_manager(&self) -> Arc<GlobalLockManager> {
         self.lock_manager.clone()
+    }
+
+    /// Skip speculative work when its detached owners already fill the instance budget.
+    pub(crate) fn try_acquire_speculative_reservation(&self) -> Option<OwnedSemaphorePermit> {
+        Arc::clone(&self.speculative_reservations).try_acquire_owned().ok()
     }
 
     /// Run a multi-step mutation on its own task and wait for its output.
@@ -1144,6 +1160,26 @@ mod tests {
     }
 
     #[test]
+    fn speculative_reservation_budget_is_bounded_and_instance_local() {
+        let first = InstanceContext::new();
+        let other = InstanceContext::new();
+        let mut permits = (0..super::SPECULATIVE_RESERVATION_LIMIT)
+            .map(|_| first.try_acquire_speculative_reservation().expect("initial permit"))
+            .collect::<Vec<_>>();
+        assert!(first.try_acquire_speculative_reservation().is_none());
+        assert!(
+            other.try_acquire_speculative_reservation().is_some(),
+            "budgets belong to their own instance"
+        );
+        drop(permits.pop());
+        let replacement = first
+            .try_acquire_speculative_reservation()
+            .expect("dropping an owner frees its slot");
+        assert!(first.try_acquire_speculative_reservation().is_none());
+        drop(replacement);
+    }
+
+    #[test]
     fn namespace_commit_guards_are_instance_local_and_count_until_last_owner() {
         let first = Arc::new(InstanceContext::new());
         let other = Arc::new(InstanceContext::new());
@@ -1151,6 +1187,8 @@ mod tests {
         other.set_scanner_publication_state(false);
         assert!(first.scanner_publication_state_allowed());
         let one = first.begin_namespace_commit();
+        assert!(one.covers_instance(&first));
+        assert!(!one.covers_instance(&other));
         let shared_owner = Arc::clone(&one);
         let two = first.begin_namespace_commit();
         assert!(first.namespace_commits_pending());

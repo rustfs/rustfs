@@ -604,6 +604,24 @@ impl ECStore {
         Ok(idx)
     }
 
+    /// A speculative hint only: callers must repeat the locked selection before committing.
+    pub(super) async fn get_pool_idx_for_reservation_hint(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
+        let opts = ObjectOptions {
+            no_lock: true,
+            metadata_cache_safe: true,
+            skip_decommissioned: true,
+            skip_rebalancing: true,
+            ..Default::default()
+        };
+        match self.get_pool_idx_existing_with_opts(bucket, object, &opts).await {
+            Ok(idx) => Ok(idx),
+            Err(err) if is_err_object_not_found(&err) => {
+                self.get_available_pool_idx(bucket, object, size).await.ok_or(Error::DiskFull)
+            }
+            Err(err) => Err(err),
+        }
+    }
+
     pub(super) async fn get_pool_idx_no_lock(&self, bucket: &str, object: &str, size: i64) -> Result<usize> {
         let idx = match self.get_pool_idx_existing_no_lock(bucket, object).await {
             Ok(res) => res,
