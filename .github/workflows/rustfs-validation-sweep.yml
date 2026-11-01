@@ -262,14 +262,32 @@ jobs:
               f"- Package: {os.environ.get('PACKAGE_URL', 'nightly (R2 latest)')}",
               f"- Source SHA: {os.environ.get('SOURCE_SHA', '')}",
               f"- auto-testing: {os.environ.get('AUTO_TESTING_SHA', '')}", "",
-              "Canonical validation cases (rustfs/auto-testing#113) executed by the sweep.", "",
-              "## Case Summary", "",
-              "| Case | Module | Status |",
-              "| --- | --- | --- |",
+              "Canonical validation cases (rustfs/auto-testing#113) executed by the sweep, grouped by catalog module.", "",
           ]
-          report += [f"| {case_id} | {module} | {status} |" for case_id, module, status in rows]
+          # Group the executed cases by catalog module (the major category:
+          # pool lifecycle, heal, ILM expiration, bucket/site replication, kms,
+          # data services, identity, s3 compatibility). Per-module subtotals
+          # deliberately use "- Subtotal:" so the dashboard overview regexes
+          # (which anchor on "- Total:") keep reading the grand totals below.
+          by_module = {}
+          module_order = []
+          for case_id, module, status in rows:
+              if module not in by_module:
+                  by_module[module] = []
+                  module_order.append(module)
+              by_module[module].append((case_id, status))
+          report += ["## Case Summary", ""]
+          for module in module_order:
+              cases = by_module[module]
+              mod_pass = sum(1 for _, st in cases if st == "PASS")
+              mod_fail = len(cases) - mod_pass
+              report += [f"### {module} ({len(cases)})", "",
+                         "| Case | Status |", "| --- | --- |"]
+              report += [f"| {case_id} | {status} |" for case_id, status in cases]
+              report += ["", f"- Subtotal: {mod_pass} passed, {mod_fail} failed", ""]
           report += [
-              "", f"- Total: {len(rows)}",
+              "## Totals", "",
+              f"- Total: {len(rows)}",
               f"- PASS: {passed}",
               f"- FAIL: {failed}",
               "- UNSUPPORTED: 0", "",
