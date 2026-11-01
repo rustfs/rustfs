@@ -12436,6 +12436,14 @@ impl LocalDisk {
 #[cfg(unix)]
 const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
 
+/// Largest window read with one positioned read. On block storage a cold read
+/// of about 1 MiB completes as one device request, while a single larger read
+/// waits on each readahead chunk in turn; growing sequential reads keep
+/// readahead pipelined for larger windows (measured boundary between
+/// 1 MiB + 32 and 2 MiB + 64 bytes).
+#[cfg(unix)]
+const LOCAL_BATCH_SINGLE_READ_MAX_BYTES: usize = 1536 * 1024;
+
 /// Positioned reads for local EC shard files, returned in request order.
 ///
 /// Small windows share a single `spawn_blocking`, collapsing per-shard
@@ -12537,9 +12545,25 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            // `with_capacity` reserves exactly `length` bytes, so each
-                            // positioned read fills only the remaining requested span
+                            // Both branches fill the exactly sized spare capacity
                             // without zero-initializing it first.
+                            if length > LOCAL_BATCH_SINGLE_READ_MAX_BYTES {
+                                use std::io::{Read as _, Seek as _, SeekFrom};
+
+                                // The descriptor is private to this request, so moving
+                                // its file offset is safe.
+                                let mut reader = &file;
+                                if offset > 0 {
+                                    let start = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+                                    reader.seek(SeekFrom::Start(start)).map_err(DiskError::from)?;
+                                }
+                                let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
+                                total = reader.take(limit).read_to_end(&mut buf).map_err(DiskError::from)?;
+                                if total < length {
+                                    return Err(DiskError::FileCorrupt);
+                                }
+                                return Ok(());
+                            }
                             while total < length {
                                 let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
                                 let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
@@ -35061,7 +35085,15 @@ mod test {
         let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
         std::fs::write(&path, &content).expect("write multi-page shard");
         let unaligned = 2 * window + 7;
-        let windows = [(0, window), (window, window), (unaligned, content.len() - unaligned)];
+        // Windows on both sides of the single-read limit, at zero and nonzero offsets.
+        assert!(window <= LOCAL_BATCH_SINGLE_READ_MAX_BYTES && 2 * window > LOCAL_BATCH_SINGLE_READ_MAX_BYTES);
+        let windows = [
+            (0, window),
+            (window, window),
+            (unaligned, content.len() - unaligned),
+            (0, 2 * window),
+            (window - 5, 2 * window),
+        ];
         let results = batch_shard_pread(
             windows
                 .iter()
