@@ -1,0 +1,421 @@
+# Copyright 2024 RustFS Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#      http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+name: RustFS Validation Sweep
+
+# Executes the migrated canonical validation cases (rustfs/auto-testing#113)
+# on the shared functional fleet. Everything with a lane executor is swept in
+# rotating nightly batches so the whole set is covered roughly weekly; a
+# single case or one module can be dispatched manually. That is the
+# implemented catalog (66 today) plus the eight planned cases whose dedicated
+# executors already exist and have live PASS evidence - fresh nightly
+# evidence feeds their acceptance review. heal.* cases stay on the
+# interactive validation flow: they require reviewed native/tool collectors
+# built by separate validation-tools runs before fleet execution.
+
+on:
+  schedule:
+    # After the nightly functional chain settles (chain starts ~16:48 UTC and
+    # runs for about two hours).
+    - cron: "30 19 * * *"
+  workflow_dispatch:
+    inputs:
+      case:
+        description: 'Single canonical validation case id (overrides module and rotation), e.g. pool.decommission'
+        type: string
+        required: false
+        default: ''
+      module:
+        description: 'Restrict the sweep to one catalog module, e.g. bucket-replication'
+        type: string
+        required: false
+        default: ''
+      limit:
+        description: 'Maximum cases per sweep (0 = run everything selected)'
+        type: number
+        required: false
+        default: 12
+      build_run_id:
+        description: 'Successful nightly package run; empty resolves the latest'
+        type: string
+        required: false
+        default: ''
+      build_run_attempt:
+        description: 'Attempt of that package run'
+        type: string
+        required: false
+        default: '1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rustfs-validation-sweep
+  cancel-in-progress: false
+
+env:
+  RUSTFS_NODES: ${{ secrets.RUSTFS_NODES || vars.RUSTFS_NODES || 'vm000 vm001 vm002 vm003' }}
+  RUSTFS_SSH_USER: ${{ secrets.RUSTFS_SSH_USER || vars.RUSTFS_SSH_USER || 'azureuser' }}
+  RUSTFS_ACCESS_KEY: ${{ secrets.RUSTFS_ACCESS_KEY }}
+  RUSTFS_SECRET_KEY: ${{ secrets.RUSTFS_SECRET_KEY }}
+  RUSTFS_NIGHTLY_PACKAGE_URL: ${{ vars.RUSTFS_NIGHTLY_PACKAGE_URL || 'https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb' }}
+  PF_TESTING_GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+
+jobs:
+  sweep:
+    if: github.repository == 'rustfs/rustfs'
+    runs-on: smoke-testing
+    timeout-minutes: 150
+    steps:
+      - name: Checkout chain tooling
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Resolve nightly candidate
+        id: candidate
+        env:
+          GH_TOKEN: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id }}
+          BUILD_RUN_ATTEMPT: ${{ inputs.build_run_attempt }}
+          CHAIN_OUTPUT: ${{ runner.temp }}/validation-sweep-candidate.json
+        run: |
+          set -euo pipefail
+          python3 scripts/resolve_functional_candidate.py
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          root = Path(os.environ["RUNNER_TEMP"]) / "validation-sweep"
+          root.mkdir(parents=True, exist_ok=True)
+          candidate = json.loads((Path(os.environ["RUNNER_TEMP"]) / "validation-sweep-candidate.json").read_text())
+          manifest = candidate["manifest"]
+          (root / "candidate.json").write_text(json.dumps({
+              "package_url": manifest["package_url"],
+              "package_sha256": manifest["package_sha256"],
+              "source_sha": manifest["source_sha"],
+          }, sort_keys=True) + "\n")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write("testing_sha=" + candidate["testing_sha"] + "\n")
+              output.write("package_url=" + manifest["package_url"] + "\n")
+              output.write("source_sha=" + manifest["source_sha"] + "\n")
+          PY
+
+      - name: Checkout auto-testing scripts
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          repository: rustfs/auto-testing
+          ref: ${{ steps.candidate.outputs.testing_sha }}
+          token: ${{ secrets.PF_TESTING_GH_TOKEN }}
+          path: auto-testing
+          persist-credentials: false
+
+      - name: Select sweep cases
+        id: select
+        env:
+          SELECTED_CASE: ${{ inputs.case }}
+          SELECTED_MODULE: ${{ inputs.module }}
+          CASE_LIMIT: ${{ inputs.limit }}
+          SWEEP_EVENT: ${{ github.event_name }}
+          SWEEP_ROOT: ${{ runner.temp }}/validation-sweep
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import datetime
+          import json
+          import os
+          from pathlib import Path
+          sweep_root = Path(os.environ["SWEEP_ROOT"])
+
+          catalog = json.loads(Path("auto-testing/validation-cases.json").read_text())
+          def sweepable(case):
+              status = case.get("source_status")
+              if status == "implemented":
+                  return True
+              # The remaining planned non-heal cases route to the lane
+              # executors and already have live PASS evidence; sweeping them
+              # nightly produces fresh evidence for their acceptance review.
+              return status == "planned" and not case["id"].startswith("heal.")
+
+          selected = [(case["id"], module["id"]) for module in catalog["modules"]
+                      for case in module["cases"]
+                      if sweepable(case)]
+          if not selected:
+              raise SystemExit("catalog has no sweepable cases")
+
+          one_case = os.environ.get("SELECTED_CASE", "").strip()
+          module_filter = os.environ.get("SELECTED_MODULE", "").strip()
+          known = {case_id for case_id, _ in selected}
+          modules = {module_id for _, module_id in selected}
+          if one_case:
+              if one_case not in known:
+                  raise SystemExit(f"unknown case or no lane executor for it: {one_case}")
+              selected = [(one_case, dict(selected)[one_case])]
+          elif module_filter:
+              if module_filter not in modules:
+                  raise SystemExit(f"unknown module or no implemented cases: {module_filter}")
+              selected = [pair for pair in selected if pair[1] == module_filter]
+          elif os.environ.get("SWEEP_EVENT") == "schedule":
+              # Stateless rotation: every night take one window of the catalog
+              # so a full sweep needs len(selected)/limit nights and no state
+              # has to be carried between runs.
+              limit = max(1, int(os.environ.get("CASE_LIMIT") or 12))
+              day = datetime.datetime.now(datetime.timezone.utc).timetuple().tm_yday
+              start = (day * limit) % len(selected)
+              selected = (selected[start:] + selected[:start])[:limit]
+          limit = int(os.environ.get("CASE_LIMIT") or 0)
+          if one_case or module_filter or (not os.environ.get("SWEEP_EVENT") == "schedule"):
+              if limit > 0:
+                  selected = selected[:limit]
+
+          (sweep_root / "sweep-cases.txt").write_text("".join(f"{case_id}\n" for case_id, _ in selected))
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"count={len(selected)}\n")
+          print(f"selected {len(selected)} case(s):", ", ".join(c for c, _ in selected))
+          PY
+
+      - name: Admit clean shared environment
+        id: environment
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-validation-sweep.json
+        run: python3 scripts/functional_environment.py enter --suite heal
+
+      - name: Run validation cases
+        id: run_cases
+        timeout-minutes: 120
+        env:
+          AUTO_TESTING_SHA: ${{ steps.candidate.outputs.testing_sha }}
+          SWEEP_ROOT: ${{ runner.temp }}/validation-sweep
+        run: |
+          set -uo pipefail
+          mkdir -p "${SWEEP_ROOT}/results"
+          : > "${SWEEP_ROOT}/results.txt"
+          while read -r CASE_ID; do
+            [ -n "${CASE_ID}" ] || continue
+            echo "::group::case ${CASE_ID}"
+            rm -rf "${SWEEP_ROOT}/run"
+            if ./auto-testing/scripts/run_validation_case.sh \
+                 "${CASE_ID}" "${SWEEP_ROOT}/candidate.json" \
+                 "${AUTO_TESTING_SHA}" "${SWEEP_ROOT}/run" \
+                 > "${SWEEP_ROOT}/results/${CASE_ID//\//_}.log" 2>&1; then
+              printf '%s\tPASS\n' "${CASE_ID}" >> "${SWEEP_ROOT}/results.txt"
+              echo "case ${CASE_ID}: PASS"
+            else
+              printf '%s\tFAIL\n' "${CASE_ID}" >> "${SWEEP_ROOT}/results.txt"
+              echo "case ${CASE_ID}: FAIL (log retained in the sweep artifact)"
+            fi
+            if [ -f "${SWEEP_ROOT}/run/report.md" ]; then
+              cp "${SWEEP_ROOT}/run/report.md" "${SWEEP_ROOT}/results/${CASE_ID//\//_}.report.md" 2>/dev/null || true
+            fi
+            echo "::endgroup::"
+            # Fleet hygiene between cases: the case runners set up their own
+            # topology, this purge guarantees the next case starts clean even
+            # when the previous one died mid-run.
+            for node in ${RUSTFS_NODES}; do
+              ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
+                SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+                ${SUDO} systemctl stop rustfs 2>/dev/null || true
+                if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                  ${SUDO} dpkg -P rustfs
+                fi
+                for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+                ${SUDO} rm -f /etc/default/rustfs
+              ' || echo "inter-case cleanup failed on ${node} (continuing)"
+            done
+          done < "${SWEEP_ROOT}/sweep-cases.txt"
+          echo "sweep finished: $(wc -l < "${SWEEP_ROOT}/results.txt") case(s) executed"
+
+      - name: Generate sweep report
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        env:
+          SWEEP_ROOT: ${{ runner.temp }}/validation-sweep
+          PACKAGE_URL: ${{ steps.candidate.outputs.package_url }}
+          SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          root = Path(os.environ["SWEEP_ROOT"])
+          catalog = json.loads(Path("auto-testing/validation-cases.json").read_text())
+          module_of = {case["id"]: module["id"] for module in catalog["modules"] for case in module["cases"]}
+          rows = []
+          for line in (root / "results.txt").read_text().splitlines():
+            if not line:
+                continue
+            case_id, status = line.split("\t")
+            rows.append((case_id, module_of.get(case_id, "?"), status))
+          passed = sum(1 for _, _, s in rows if s == "PASS")
+          failed = len(rows) - passed
+          run_url = (f"{os.environ.get('GITHUB_SERVER_URL', 'https://github.com')}/"
+                     f"{os.environ.get('GITHUB_REPOSITORY', 'rustfs/rustfs')}/actions/runs/"
+                     f"{os.environ.get('GITHUB_RUN_ID', '')}")
+
+          report = [
+              "# RustFS validation sweep report", "",
+              f"- Run: {run_url}",
+              f"- Attempt: {os.environ.get('GITHUB_RUN_ATTEMPT', '')}",
+              f"- Trigger: {os.environ.get('GITHUB_EVENT_NAME', '')}",
+              f"- Package: {os.environ.get('PACKAGE_URL', 'nightly (R2 latest)')}",
+              f"- Source SHA: {os.environ.get('SOURCE_SHA', '')}",
+              f"- auto-testing: {os.environ.get('AUTO_TESTING_SHA', '')}", "",
+              "Canonical validation cases (rustfs/auto-testing#113) executed by the sweep, grouped by catalog module.", "",
+          ]
+          # Group the executed cases by catalog module (the major category:
+          # pool lifecycle, heal, ILM expiration, bucket/site replication, kms,
+          # data services, identity, s3 compatibility). Per-module subtotals
+          # deliberately use "- Subtotal:" so the dashboard overview regexes
+          # (which anchor on "- Total:") keep reading the grand totals below.
+          by_module = {}
+          module_order = []
+          for case_id, module, status in rows:
+              if module not in by_module:
+                  by_module[module] = []
+                  module_order.append(module)
+              by_module[module].append((case_id, status))
+          report += ["## Case Summary", ""]
+          for module in module_order:
+              cases = by_module[module]
+              mod_pass = sum(1 for _, st in cases if st == "PASS")
+              mod_fail = len(cases) - mod_pass
+              report += [f"### {module} ({len(cases)})", "",
+                         "| Case | Status |", "| --- | --- |"]
+              report += [f"| {case_id} | {status} |" for case_id, status in cases]
+              report += ["", f"- Subtotal: {mod_pass} passed, {mod_fail} failed", ""]
+          report += [
+              "## Totals", "",
+              f"- Total: {len(rows)}",
+              f"- PASS: {passed}",
+              f"- FAIL: {failed}",
+              "- UNSUPPORTED: 0", "",
+              "Failing cases keep this workflow red only as a report; the sweep artifact",
+              "retains every case log and per-case report for diagnosis.", "",
+          ]
+          (root / "report.md").write_text("\n".join(report))
+          (root / "cases.md").write_text("\n".join(f"| {c} | {m} | {s} |" for c, m, s in rows) + "\n")
+          PY
+          cat "${SWEEP_ROOT}/report.md" >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload functional report to dashboard
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 2
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ env.PF_TESTING_GH_TOKEN }}
+          REPORT_FILE: ${{ runner.temp }}/validation-sweep/report.md
+          SUITE: validation
+        run: |
+          set -euo pipefail
+          if [ -z "${GH_TOKEN:-}" ]; then
+            echo "PF_TESTING_GH_TOKEN is not configured; skipping dashboard upload"
+            exit 0
+          fi
+          DATE="$(date -u +%Y-%m-%d)"
+          REPORT_PATH="functional-reports/${SUITE}/${DATE}.md"
+          B64_FILE="$(mktemp)"
+          python3 -c 'import base64,sys;print(base64.b64encode(open(sys.argv[1],"rb").read()).decode())' "${REPORT_FILE}" > "${B64_FILE}"
+          SHA="$(gh api "repos/rustfs/dashboard/contents/${REPORT_PATH}" -q '.sha' 2>/dev/null || true)"
+          if [ -n "${SHA}" ]; then
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" --arg sha "${SHA}" \
+              '{message:$msg, content:($content|rtrimstr("\n")), sha:$sha}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          else
+            jq -n --arg msg "report(${SUITE}): ${DATE}" --rawfile content "${B64_FILE}" \
+              '{message:$msg, content:($content|rtrimstr("\n"))}' \
+              | gh api --method PUT "repos/rustfs/dashboard/contents/${REPORT_PATH}" --input - >/dev/null
+          fi
+          echo "dashboard updated: ${REPORT_PATH}"
+
+      - name: Retain sweep evidence
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-validation-sweep-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ runner.temp }}/validation-sweep/report.md
+            ${{ runner.temp }}/validation-sweep/results.txt
+            ${{ runner.temp }}/validation-sweep/sweep-cases.txt
+            ${{ runner.temp }}/validation-sweep/candidate.json
+            ${{ runner.temp }}/validation-sweep/results/
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Cleanup environment (after)
+        id: environment_cleanup
+        timeout-minutes: 5
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        run: |
+          set -uo pipefail
+          cleanup_status=0
+          for node in ${RUSTFS_NODES}; do
+            ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
+              set -euo pipefail
+              SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
+              ${SUDO} systemctl stop rustfs 2>/dev/null || true
+              if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
+                ${SUDO} dpkg -P rustfs
+              fi
+              for i in 1 2 3 4; do ${SUDO} rm -rf /data/rustfs${i}/mnmd; done
+              ${SUDO} rm -f /etc/default/rustfs
+            ' || cleanup_status=$?
+          done
+          exit "${cleanup_status}"
+
+      - name: Release environment only after successful cleanup
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        timeout-minutes: 5
+        env:
+          FUNCTIONAL_ENVIRONMENT_RECEIPT: ${{ runner.temp }}/environment-validation-sweep.json
+          CLEANUP_OUTCOME: ${{ steps.environment_cleanup.outcome }}
+        run: python3 scripts/functional_environment.py finish --suite heal --cleanup-outcome "$CLEANUP_OUTCOME"
+
+      - name: Notify on failure
+        if: failure()
+        run: echo "RustFS validation sweep failed (harness/environment breakdown); see the sweep artifact for case logs."
+
+      - name: Enforce sweep result
+        if: ${{ always() && steps.environment.outcome == 'success' }}
+        env:
+          SWEEP_ROOT: ${{ runner.temp }}/validation-sweep
+        run: |
+          set -euo pipefail
+          if grep -q $'\tFAIL$' "${SWEEP_ROOT}/results.txt"; then
+            echo "validation sweep has failing cases:"
+            grep $'\tFAIL$' "${SWEEP_ROOT}/results.txt"
+            exit 1
+          fi
+
+  alert-on-failure:
+    name: Alert on scheduled failure
+    # A scheduled sweep failure usually means a canonical validation case
+    # regressed or the fleet environment broke; surface it as a tracking
+    # issue instead of leaving it in the Actions tab.
+    needs: [sweep]
+    if: github.repository == 'rustfs/rustfs' && (always() && github.event_name == 'schedule' && contains(needs.*.result, 'failure'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Open or update failure-tracking issue
+        uses: ./.github/actions/schedule-failure-issue
+        with:
+          github-token: ${{ secrets.BACKLOG_ISSUE_TOKEN }}
