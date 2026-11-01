@@ -2510,6 +2510,23 @@ impl RemoteDisk {
     /// Enqueue a prepared token. The caller must cancel it on an indeterminate
     /// result before allowing any subsequent unprotected mutation.
     pub async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid, timeout: Duration) -> Result<()> {
+        self.update_object_metadata_reservation(bucket, object, token, timeout, false)
+            .await
+    }
+
+    pub async fn renew_object_metadata(&self, bucket: &str, object: &str, token: Uuid, timeout: Duration) -> Result<()> {
+        self.update_object_metadata_reservation(bucket, object, token, timeout, true)
+            .await
+    }
+
+    async fn update_object_metadata_reservation(
+        &self,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+        timeout: Duration,
+        renew_only: bool,
+    ) -> Result<()> {
         if timeout.is_zero() {
             return Err(DiskError::Timeout);
         }
@@ -2522,6 +2539,7 @@ impl RemoteDisk {
                     bucket: bucket.to_owned(),
                     object: object.to_owned(),
                     token: token.as_bytes().to_vec().into(),
+                    renew_only,
                 });
                 let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(request.get_ref())
                     .map_err(|_| Error::other("reservation activation request length overflow"))?;
@@ -5319,6 +5337,12 @@ mod tests {
             Err(DiskError::UnsupportedDisk)
         ));
         assert!(matches!(
+            remote
+                .renew_object_metadata("bucket", "object", token, Duration::from_secs(5))
+                .await,
+            Err(DiskError::UnsupportedDisk)
+        ));
+        assert!(matches!(
             remote.cancel_object_metadata_reservation(token).await,
             Err(DiskError::UnsupportedDisk)
         ));
@@ -5339,6 +5363,7 @@ mod tests {
             *peer.peer.unsupported_methods.lock().expect("observed methods lock"),
             vec![
                 "/node_service.NodeService/ReserveObjectMetadata",
+                "/node_service.NodeService/ActivateObjectMetadataReservation",
                 "/node_service.NodeService/ActivateObjectMetadataReservation",
                 "/node_service.NodeService/CancelObjectMetadataReservation",
                 "/node_service.NodeService/RenameReservedData",

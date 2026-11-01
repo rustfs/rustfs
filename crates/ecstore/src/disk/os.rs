@@ -2432,6 +2432,33 @@ impl MetadataReservationRegistry {
         }
     }
 
+    /// Extend an inert token without reviving an expired or cancelled entry.
+    pub(crate) fn renew(&self, token: uuid::Uuid, key: &Path, disk_instance: uuid::Uuid) -> Result<()> {
+        let mut entries = self.entries.lock();
+        let entry = entries.get_mut(&token).ok_or(DiskError::DiskOngoingReq)?;
+        let now = tokio::time::Instant::now();
+        if entry.expires_at <= now {
+            return Err(DiskError::Timeout);
+        }
+        let MetadataReservationState::Prepared {
+            key: stored_key,
+            disk_instance: stored_instance,
+            owner,
+            ..
+        } = &entry.state
+        else {
+            return Err(DiskError::DiskOngoingReq);
+        };
+        if stored_key != key || *stored_instance != disk_instance {
+            return Err(DiskError::InvalidPath);
+        }
+        if owner.as_ref().is_some_and(|fence| !fence.is_valid()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        entry.expires_at = now + Duration::from_secs(60);
+        Ok(())
+    }
+
     /// Atomically enqueue a prepared token. Cancellation and enqueue serialize
     /// on the registry, so a delayed enqueue cannot revive a cancelled token.
     pub(crate) async fn activate(&self, token: uuid::Uuid, key: &Path, disk_instance: uuid::Uuid) -> Result<()> {

@@ -7898,6 +7898,14 @@ impl LocalDisk {
             .prepare_with_owner(&key, self.reservation_instance, owner)
     }
 
+    pub(in crate::disk) fn renew_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservations
+            .get()
+            .ok_or(DiskError::DiskOngoingReq)?
+            .renew(token, &key, self.reservation_instance)
+    }
+
     pub(in crate::disk) async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
         let key = self.get_object_path(bucket, object)?;
         self.metadata_reservations
@@ -21913,6 +21921,44 @@ mod test {
                 .await;
             assert!(!registry.cancel(token), "claimed token cannot be cancelled");
             drop(claimed);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn prepared_metadata_renewal_never_revives_cancelled_or_activated_tokens() {
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let other = disk.get_object_path("bucket", "other").expect("other path");
+            let registry = disk.metadata_reservation_registry();
+            let token = registry.prepare(&key, disk.reservation_instance).expect("prepare");
+            tokio::time::advance(Duration::from_secs(40)).await;
+            assert!(matches!(
+                registry.renew(token, &other, disk.reservation_instance),
+                Err(DiskError::InvalidPath)
+            ));
+            registry.renew(token, &key, disk.reservation_instance).expect("renew");
+            tokio::time::advance(Duration::from_secs(30)).await;
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("renewed token activates after original expiry");
+            assert!(matches!(
+                registry.renew(token, &key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+            assert!(registry.cancel(token));
+            assert!(matches!(
+                registry.renew(token, &key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+            let expired = registry
+                .prepare(&key, disk.reservation_instance)
+                .expect("prepare expiring token");
+            tokio::time::advance(Duration::from_secs(61)).await;
+            assert!(matches!(
+                registry.renew(expired, &key, disk.reservation_instance),
+                Err(DiskError::Timeout | DiskError::DiskOngoingReq)
+            ));
         }
 
         #[tokio::test]

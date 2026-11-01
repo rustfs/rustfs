@@ -1121,6 +1121,11 @@ pub fn canonical_metadata_reservation_activate_request_body(
     body.push_str(&request.bucket)?;
     body.push_str(&request.object)?;
     body.push_bytes(&request.token)?;
+    // Keep ordinary activations byte-compatible with existing peers. Renewal
+    // adds a distinct signed marker so an older peer cannot treat it as activation.
+    if request.renew_only {
+        body.push_bool(true);
+    }
     Ok(body.finish())
 }
 
@@ -1799,13 +1804,25 @@ mod disk_mutation_canonical_tests {
             bucket: "bucket".into(),
             object: "object".into(),
             token: vec![1; 16].into(),
+            renew_only: false,
         };
+        let mut legacy_activation = CanonicalBodyBuilder::new(b"rustfs-metadata-reservation-activate-v1\0");
+        legacy_activation.push_str(&activation.disk).expect("disk");
+        legacy_activation.push_str(&activation.bucket).expect("bucket");
+        legacy_activation.push_str(&activation.object).expect("object");
+        legacy_activation.push_bytes(&activation.token).expect("token");
+        assert_eq!(
+            canonical_metadata_reservation_activate_request_body(&activation).expect("ordinary activation"),
+            legacy_activation.finish(),
+            "ordinary activation must retain its previous body digest"
+        );
         let mut bodies = vec![canonical_metadata_reservation_activate_request_body(&activation).expect("activation body")];
         for mutate in [
             |r: &mut MetadataReservationActivateRequest| r.disk = "other".into(),
             |r: &mut MetadataReservationActivateRequest| r.bucket = "other".into(),
             |r: &mut MetadataReservationActivateRequest| r.object = "other".into(),
             |r: &mut MetadataReservationActivateRequest| r.token = vec![2; 16].into(),
+            |r: &mut MetadataReservationActivateRequest| r.renew_only = true,
         ] {
             let mut changed = activation.clone();
             mutate(&mut changed);

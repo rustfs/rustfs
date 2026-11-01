@@ -1724,6 +1724,15 @@ impl LocalDiskWrapper {
         self.disk.prepare_object_metadata_with_owner(bucket, object, owner)
     }
 
+    /// Refresh an inert token while the caller is still staging the write.
+    pub async fn renew_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.renew_object_metadata(bucket, object, token)
+    }
+
     /// Enqueue a prepared token; a cancelled token cannot be reactivated.
     pub async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
         if self.health.is_faulty() {

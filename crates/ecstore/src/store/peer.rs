@@ -182,6 +182,25 @@ impl ECStore {
         .map_err(|_| DiskError::Timeout)?
     }
 
+    /// Refresh an inert token on its original disk and object.
+    pub async fn renew_local_object_metadata_reservation(
+        &self,
+        disk_ref: &str,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+    ) -> DiskResult<()> {
+        if crate::bucket::utils::check_valid_bucket_name(bucket).is_err() || is_meta_bucketname(bucket) || token.is_nil() {
+            return Err(DiskError::InvalidPath);
+        }
+        let (disk, id) = local_disk_candidate(&self.ctx, disk_ref).await?;
+        let _owner = admit_local_disk(&self.ctx, &disk, id, false).await?;
+        let Disk::Local(wrapper) = disk.as_ref() else {
+            return Err(DiskError::DiskNotFound);
+        };
+        wrapper.renew_object_metadata(bucket, object, token).await
+    }
+
     /// Atomically enqueue a prepared token on its original disk and object.
     pub async fn activate_local_object_metadata_reservation(
         &self,

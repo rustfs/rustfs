@@ -343,6 +343,28 @@ impl Disk {
         }
     }
 
+    /// Refresh an inert token while its sender stages the write.
+    pub async fn renew_object_metadata(
+        &self,
+        bucket: &str,
+        object: &str,
+        token: Uuid,
+        timeout: std::time::Duration,
+    ) -> Result<()> {
+        if timeout.is_zero() {
+            return Err(DiskError::Timeout);
+        }
+        match self {
+            Disk::Local(disk) => tokio::time::timeout(
+                timeout.min(std::time::Duration::from_secs(5)),
+                disk.renew_object_metadata(bucket, object, token),
+            )
+            .await
+            .map_err(|_| DiskError::Timeout)?,
+            Disk::Remote(disk) => disk.renew_object_metadata(bucket, object, token, timeout).await,
+        }
+    }
+
     /// Enqueue a prepared token in object mutation order.
     pub async fn activate_object_metadata(
         &self,

@@ -4820,6 +4820,7 @@ impl ECStore {
             && !self.ctx.lock_manager().is_disabled()
             && crate::set_disk::put_rename_early_ack_enabled()
             && early_opts.write_completion == crate::object_api::WriteCompletion::Quorum
+            && early_opts.overwrites_existing_version()
             && !is_meta_bucketname(bucket)
             && !early_opts.no_lock
             && !early_opts.data_movement
@@ -10055,6 +10056,89 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn ecstore_new_version_early_ack_orders_the_next_put() {
+        use crate::disk::ReadOptions;
+        use crate::set_disk::{ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, rename_fanout_barrier};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "ecstore-versioned-reservation-order";
+            let object = "object";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                first_store
+                    .handle_put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("first tail pauses");
+            first.await.expect("first task").expect("first PUT");
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                    &ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                ),
+            )
+            .await;
+            barrier.release();
+            drop(barrier);
+            let (second, _) = second.expect("second PUT completes").expect("second PUT succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rename tails drain");
+            let expected_etag = second.etag.as_ref().expect("second ETag");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("read latest metadata");
+                assert_eq!(info.metadata.get("etag"), Some(expected_etag));
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check latest shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn local_prepared_reservations_hold_bucket_publication_fence() {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
@@ -10092,6 +10176,76 @@ mod tests {
             .expect("reservations release fence")
             .expect("writer lock");
         drop(guard);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn long_staged_put_does_not_timeout_the_next_overwrite() {
+        use crate::set_disk::{
+            ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, PutObjectCommitBarrier, PutObjectCommitPause, rename_fanout_barrier,
+        };
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+            let (_dirs, original) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+            let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[original], Arc::clone(&ctx)).await);
+            let set = store.pools[0].get_disks_by_key("object");
+            let disks = set.disks.read().await.iter().flatten().cloned().collect::<Vec<_>>();
+            {
+                let map = ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+            let bucket = "long-staged-reservation";
+            let object = "object";
+            store
+                .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let staging_barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeNamespace);
+            let tail_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let writer = Arc::clone(&store);
+            let first = tokio::spawn(async move {
+                writer
+                    .handle_put_object(
+                        bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![b'1'; 1 << 20]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            staging_barrier.wait_until_paused().await;
+            tokio::time::pause();
+            tokio::time::advance(Duration::from_secs(25)).await;
+            tokio::task::yield_now().await;
+            tokio::time::advance(Duration::from_secs(26)).await;
+            tokio::task::yield_now().await;
+            tokio::time::resume();
+            staging_barrier.release();
+            tokio::time::timeout(Duration::from_secs(30), tail_barrier.wait_until_paused())
+                .await
+                .expect("first tail pauses");
+            first.await.expect("first task").expect("first PUT");
+            drop(staging_barrier);
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                store.handle_put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![b'2'; 1 << 20]),
+                    &ObjectOptions::default(),
+                ),
+            )
+            .await;
+            tail_barrier.release();
+            drop(tail_barrier);
+            assert!(matches!(second, Ok(Ok(_))), "second PUT after a long staging interval failed: {second:?}");
+        })
+        .await;
     }
 
     #[tokio::test]

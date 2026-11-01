@@ -5022,6 +5022,7 @@ mod tests {
                 bucket: "bucket".into(),
                 object: "object".into(),
                 token: Uuid::new_v4().as_bytes().to_vec().into(),
+                renew_only: false,
             },
             rustfs_protos::canonical_metadata_reservation_activate_request_body
         );
@@ -8368,11 +8369,51 @@ mod tests {
         assert!(response.success, "reservation must succeed: {:?}", response.error);
         assert_eq!(response.protocol_version, 2);
         let token = response.token;
+        let mut tampered_renew = Request::new(MetadataReservationActivateRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            token: token.clone(),
+            renew_only: false,
+        });
+        let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(tampered_renew.get_ref())
+            .expect("ordinary activation body");
+        set_tonic_canonical_body_digest(&mut tampered_renew, &body).expect("ordinary activation digest");
+        mark_v2_authenticated(&mut tampered_renew);
+        tampered_renew.get_mut().renew_only = true;
+        assert_eq!(
+            service
+                .activate_object_metadata_reservation(tampered_renew)
+                .await
+                .expect_err("changing activation into renewal must invalidate the body digest")
+                .code(),
+            tonic::Code::PermissionDenied
+        );
+        let mut renew = Request::new(MetadataReservationActivateRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            token: token.clone(),
+            renew_only: true,
+        });
+        let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(renew.get_ref()).expect("renew body");
+        set_tonic_canonical_body_digest(&mut renew, &body).expect("renew digest");
+        mark_v2_authenticated(&mut renew);
+        assert!(
+            service
+                .activate_object_metadata_reservation(renew)
+                .await
+                .expect("renew RPC")
+                .into_inner()
+                .success,
+            "prepared reservation should renew without activation"
+        );
         let mut activate = Request::new(MetadataReservationActivateRequest {
             disk: disk.endpoint().to_string(),
             bucket: "target-rpc".into(),
             object: "destination".into(),
             token: token.clone(),
+            renew_only: false,
         });
         let body =
             rustfs_protos::canonical_metadata_reservation_activate_request_body(activate.get_ref()).expect("activate body");
@@ -8483,11 +8524,31 @@ mod tests {
             .expect("prepare handler")
             .into_inner();
         assert!(prepared.success, "prepare: {:?}", prepared.error);
+        let mut renew = Request::new(MetadataReservationActivateRequest {
+            disk: disk.endpoint().to_string(),
+            bucket: "target-rpc".into(),
+            object: "destination".into(),
+            token: prepared.token.clone(),
+            renew_only: true,
+        });
+        let body = rustfs_protos::canonical_metadata_reservation_activate_request_body(renew.get_ref()).expect("renew body");
+        set_tonic_canonical_body_digest(&mut renew, &body).expect("renew digest");
+        mark_v2_authenticated(&mut renew);
+        assert!(
+            client
+                .activate_object_metadata_reservation(renew)
+                .await
+                .expect("renew handler")
+                .into_inner()
+                .success,
+            "renewal over the real transport must retain the prepared token"
+        );
         let mut activate = Request::new(MetadataReservationActivateRequest {
             disk: disk.endpoint().to_string(),
             bucket: "target-rpc".into(),
             object: "destination".into(),
             token: prepared.token.clone(),
+            renew_only: false,
         });
         let body =
             rustfs_protos::canonical_metadata_reservation_activate_request_body(activate.get_ref()).expect("activate body");

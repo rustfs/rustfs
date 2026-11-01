@@ -567,21 +567,25 @@ impl NodeService {
         let LocalMutationTarget::Ready(store) = self.local_mutation_target() else {
             return Err(Status::failed_precondition("storage instance is unavailable"));
         };
-        Ok(Response::new(
-            match store
+        let result = if request.renew_only {
+            store
+                .renew_local_object_metadata_reservation(&request.disk, &request.bucket, &request.object, token)
+                .await
+        } else {
+            store
                 .activate_local_object_metadata_reservation(&request.disk, &request.bucket, &request.object, token)
                 .await
-            {
-                Ok(()) => SnapshotLeaseMutationResponse {
-                    success: true,
-                    error: None,
-                },
-                Err(error) => SnapshotLeaseMutationResponse {
-                    success: false,
-                    error: Some(error.into()),
-                },
+        };
+        Ok(Response::new(match result {
+            Ok(()) => SnapshotLeaseMutationResponse {
+                success: true,
+                error: None,
             },
-        ))
+            Err(error) => SnapshotLeaseMutationResponse {
+                success: false,
+                error: Some(error.into()),
+            },
+        }))
     }
 
     pub(super) async fn handle_cancel_object_metadata_reservation(

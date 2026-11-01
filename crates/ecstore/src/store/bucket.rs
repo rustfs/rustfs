@@ -2279,8 +2279,17 @@ mod tests {
         drop(
             lock.get_write_lock(Duration::from_secs(30))
                 .await
-                .expect("fixture rename tail should finish before checking its generation"),
+                .expect("fixture object lock should be available"),
         );
+        // A quorum-acknowledged rename can release the object lock while its
+        // physical tail still holds the instance-wide namespace owner.
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while ecstore.ctx.namespace_commits_pending() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("fixture namespace owners should drain before checking its generation");
         assert_eq!(
             ecstore.scanner_namespace_mutation_generation(),
             generation_before_put.saturating_add(3),

@@ -101,6 +101,12 @@ pub(crate) struct NamespaceCommitGuard {
     counted: bool,
 }
 
+impl NamespaceCommitGuard {
+    pub(crate) fn covers_instance(&self, ctx: &Arc<InstanceContext>) -> bool {
+        Arc::ptr_eq(&self.ctx, ctx)
+    }
+}
+
 impl Drop for NamespaceCommitGuard {
     fn drop(&mut self) {
         if self.counted {
@@ -1151,6 +1157,8 @@ mod tests {
         other.set_scanner_publication_state(false);
         assert!(first.scanner_publication_state_allowed());
         let one = first.begin_namespace_commit();
+        assert!(one.covers_instance(&first));
+        assert!(!one.covers_instance(&other));
         let shared_owner = Arc::clone(&one);
         let two = first.begin_namespace_commit();
         assert!(first.namespace_commits_pending());

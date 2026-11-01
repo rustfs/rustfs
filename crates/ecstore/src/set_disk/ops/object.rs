@@ -4803,8 +4803,40 @@ impl SetDisks {
                 .await?;
             }
 
-            // Remote publication owners were prepared before bucket metadata
-            // locks. Local-only fixtures can prepare before the object lock.
+            // A new version has no outer bucket snapshot. Prepare its remote
+            // owners after staging, before taking lifecycle or object locks.
+            let prepare_new_version = reservations.is_none()
+                && !opts.overwrites_existing_version()
+                && !self.ctx.lock_manager().is_disabled()
+                && crate::set_disk::put_rename_early_ack_enabled()
+                && write_context.acquires_namespace()
+                && write_context.allows_early_ack(opts.write_completion)
+                && publication_fence.is_none()
+                && opts.scanner_publication_commit_scope.is_none()
+                && opts.decommission_capacity_admission.is_none()
+                && opts.decommission_capacity.is_none()
+                && opts.quota_admission.is_none()
+                && opts.object_lock_config_snapshot.is_none()
+                && opts.bucket_lifecycle_lock_fence.is_none()
+                && opts.namespace_lock_fence.is_none()
+                && !opts.data_movement
+                && !is_meta_bucketname(bucket)
+                && opts
+                    .put_object_cancellation
+                    .as_ref()
+                    .is_none_or(|token| !token.is_cancelled())
+                && rustfs_utils::path::object_name_disk_identity(object).as_ref()
+                    != rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+                && crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx)
+                    .await
+                    .is_some();
+            #[cfg(any(test, feature = "test-util"))]
+            if prepare_new_version {
+                pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+            }
+
+            // Destructive writes prepare before the bucket snapshot. Local-only
+            // fixtures without a metadata store can prepare before the object lock.
             let prepared_metadata_reservations = if !self.ctx.lock_manager().is_disabled()
                 && crate::set_disk::put_rename_early_ack_enabled()
                 && write_context.acquires_namespace()
@@ -4817,6 +4849,16 @@ impl SetDisks {
             {
                 if let Some(prepared) = reservations {
                     crate::set_disk::align_rename_metadata_reservations(prepared, &shuffle_disks)
+                } else if prepare_new_version && let Some(incarnation) = source_bucket_incarnation_id.filter(|id| !id.is_nil()) {
+                    crate::set_disk::core::io_primitives::prepare_rename_metadata_reservations(
+                        &shuffle_disks,
+                        bucket,
+                        object,
+                        incarnation,
+                        &self.ctx,
+                        true,
+                    )
+                    .await?
                 } else if shuffle_disks.iter().flatten().all(|disk| disk.is_local())
                     && crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx)
                         .await
@@ -4861,7 +4903,9 @@ impl SetDisks {
                 || (write_context.acquires_namespace() && object_lock_guard.is_none() && !decommission_target_lock_covered)
             {
                 #[cfg(any(test, feature = "test-util"))]
-                pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+                if !prepare_new_version {
+                    pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+                }
                 if let Some(expected_incarnation_id) = source_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
                 {

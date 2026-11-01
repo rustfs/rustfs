@@ -528,6 +528,8 @@ pub struct MetadataReservationActivateRequest {
     pub object: ::prost::alloc::string::String,
     #[prost(bytes = "bytes", tag = "4")]
     pub token: ::prost::bytes::Bytes,
+    #[prost(bool, tag = "5")]
+    pub renew_only: bool,
 }
 #[allow(clippy::all)]
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
