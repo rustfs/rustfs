@@ -1338,8 +1338,8 @@ pub(in crate::set_disk) fn record_bitrot_reader_setup_strategy(
 }
 
 /// When all online shards are local and mmap-read is enabled, materialize
-/// shard bytes in batches instead of per-shard `spawn_blocking` via
-/// `open_disk_reader`. Demand-bound reads add parity batches only as needed.
+/// shard bytes through `batch_shard_pread` instead of the per-shard
+/// `open_disk_reader` path. Demand-bound reads add parity batches only as needed.
 #[cfg(unix)]
 #[allow(clippy::too_many_arguments)]
 async fn try_create_bitrot_readers_via_batch_pread(

@@ -12430,12 +12430,38 @@ impl LocalDisk {
     }
 }
 
-/// Batch positioned reads for local EC shard files in a single `spawn_blocking`.
+/// Shard windows at least this large are copy-bound: reading them concurrently
+/// beats one serial blocking pass, while smaller windows stay coalesced to save
+/// blocking-pool round trips.
+#[cfg(unix)]
+const LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES: usize = 512 * 1024;
+
+/// Positioned reads for local EC shard files, returned in request order.
 ///
-/// Collapses per-shard blocking-pool round-trips that dominate warm GET
-/// fan-out on single-node multi-disk topologies.
+/// Small windows share a single `spawn_blocking`, collapsing per-shard
+/// blocking-pool round-trips that dominate warm GET fan-out on single-node
+/// multi-disk topologies. When every window reaches
+/// `LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES`, each shard gets its own dispatch so
+/// copies and device reads proceed concurrently.
 #[cfg(unix)]
 pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
+    if requests.len() < 2
+        || requests
+            .iter()
+            .any(|(_, _, length)| *length < LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES)
+    {
+        return batch_shard_pread_blocking(requests).await;
+    }
+    futures::future::join_all(requests.into_iter().map(|request| batch_shard_pread_blocking(vec![request])))
+        .await
+        .into_iter()
+        .flatten()
+        .collect()
+}
+
+/// Read every request in turn inside one `spawn_blocking`.
+#[cfg(unix)]
+async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, usize)>) -> Vec<Result<Bytes>> {
     let n = requests.len();
     let metrics = rustfs_io_metrics::LocalBatchReadMetrics::capture();
     let submitted = metrics.as_ref().map(|_| std::time::Instant::now());
@@ -12443,7 +12469,7 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
     let diagnostic = crate::diagnostics::batch_read_diagnostics::Sample::capture();
     tokio::task::spawn_blocking(move || {
         use rustfs_io_metrics::LocalBatchReadStage;
-        use std::os::unix::fs::{FileExt, OpenOptionsExt};
+        use std::os::unix::fs::OpenOptionsExt;
 
         // The disabled build expands directly to the original operation.
         macro_rules! diagnostic_stage {
@@ -12511,26 +12537,20 @@ pub(crate) async fn batch_shard_pread(requests: Vec<(std::path::PathBuf, usize, 
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            if offset == 0 {
-                                use std::io::Read as _;
-                                total = (&file)
-                                    .take(u64::try_from(length).unwrap_or(u64::MAX))
-                                    .read_to_end(&mut buf)
-                                    .map_err(DiskError::from)?;
-                                if total < length {
+                            // `with_capacity` reserves exactly `length` bytes, so each
+                            // positioned read fills only the remaining requested span
+                            // without zero-initializing it first.
+                            while total < length {
+                                let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
+                                let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
+                                    Ok(nbytes) => nbytes,
+                                    Err(rustix::io::Errno::INTR) => continue,
+                                    Err(err) => return Err(DiskError::from(std::io::Error::from(err))),
+                                };
+                                if nbytes == 0 {
                                     return Err(DiskError::FileCorrupt);
                                 }
-                            } else {
-                                buf.resize(length, 0);
-                                while total < length {
-                                    let nbytes = file
-                                        .read_at(&mut buf[total..], u64::try_from(offset + total).unwrap_or(u64::MAX))
-                                        .map_err(DiskError::from)?;
-                                    if nbytes == 0 {
-                                        return Err(DiskError::FileCorrupt);
-                                    }
-                                    total += nbytes;
-                                }
+                                total += nbytes;
                             }
                             Ok::<_, DiskError>(())
                         }
@@ -34878,6 +34898,46 @@ mod test {
 
     #[cfg(unix)]
     #[test]
+    fn local_batch_reads_large_windows_per_shard_and_coalesces_small_windows() {
+        use crate::test_metrics::CapturingRecorder;
+
+        let dir = tempfile::tempdir().expect("dispatch shape directory");
+        let large = LOCAL_BATCH_PARALLEL_MIN_SHARD_BYTES;
+        let paths: Vec<_> = (0..2)
+            .map(|index| {
+                let path = dir.path().join(format!("shard-{index}"));
+                std::fs::write(&path, vec![u8::try_from(index).expect("small shard index"); large + 64])
+                    .expect("write dispatch shape shard");
+                path
+            })
+            .collect();
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("dispatch shape runtime");
+        let previous = rustfs_io_metrics::get_stage_metrics_enabled();
+        rustfs_io_metrics::set_get_stage_metrics_enabled(true);
+        let dispatches = |length: usize| {
+            let recorder = CapturingRecorder::default();
+            let requests = paths.iter().map(|path| (path.clone(), 64, length)).collect();
+            let results = metrics::with_local_recorder(&recorder, || runtime.block_on(batch_shard_pread(requests)));
+            for (index, result) in results.iter().enumerate() {
+                let bytes = result.as_ref().expect("window inside the shard");
+                assert_eq!(bytes.len(), length);
+                assert!(bytes.iter().all(|byte| usize::from(*byte) == index), "results keep request order");
+            }
+            recorder.histogram_values("rustfs_io_get_object_local_batch_shards", &[])
+        };
+        let large_shape = dispatches(large);
+        let small_shape = dispatches(large - 1);
+        rustfs_io_metrics::set_get_stage_metrics_enabled(previous);
+
+        assert_eq!(large_shape, vec![1.0, 1.0], "copy-bound windows must not serialize in one worker");
+        assert_eq!(small_shape, vec![2.0], "small windows must share one blocking dispatch");
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn local_batch_read_metrics_survive_caller_cancellation() {
         use crate::test_metrics::CapturingRecorder;
 
@@ -34989,6 +35049,30 @@ mod test {
         assert!(results[1].as_ref().expect("empty range at EOF").is_empty());
         for result in &results[2..] {
             assert!(matches!(result, Err(DiskError::FileCorrupt)), "invalid range: {result:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_batch_shard_pread_returns_exact_multi_page_windows() {
+        let dir = tempfile::tempdir().expect("multi-page window fixture");
+        let path = dir.path().join("shard");
+        let window = 1024 * 1024 + 32;
+        let content: Vec<u8> = (0..3 * window).map(|i| (i % 251) as u8).collect();
+        std::fs::write(&path, &content).expect("write multi-page shard");
+        let unaligned = 2 * window + 7;
+        let windows = [(0, window), (window, window), (unaligned, content.len() - unaligned)];
+        let results = batch_shard_pread(
+            windows
+                .iter()
+                .map(|&(offset, length)| (path.clone(), offset, length))
+                .collect(),
+        )
+        .await;
+        for (result, (offset, length)) in results.iter().zip(windows) {
+            let bytes = result.as_ref().expect("window inside the shard");
+            assert_eq!(bytes.len(), length, "window at {offset} must not over-read");
+            assert_eq!(bytes.as_ref(), &content[offset..offset + length], "window at {offset}");
         }
     }
 
