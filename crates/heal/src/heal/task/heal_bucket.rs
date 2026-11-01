@@ -25,6 +25,8 @@ const MAX_DEFERRED_AGE: Duration = Duration::from_secs(30);
 // Keep this extra attempt inside the existing deferred age and backoff caps.
 const MAX_SLOWDOWN_OBJECT_RETRIES: u32 = MAX_BUCKET_OBJECT_HEAL_RETRIES + 1;
 
+type HealListingPage = (Vec<HealListItem>, Option<String>, bool);
+
 struct DeferredObject {
     name: String,
     version_id: Option<String>,
@@ -663,9 +665,7 @@ impl HealTask {
             let mut listing_finished = false;
             let mut listing_attempt = 0;
             let mut listing_due = tokio::time::Instant::now();
-            let mut listing_inflight: Option<
-                std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<HealListItem>, Option<String>, bool)>> + Send>>,
-            > = None;
+            let mut listing_inflight: Option<futures::future::BoxFuture<'static, Result<HealListingPage>>> = None;
             let scope_result: Result<()> = async {
                 loop {
                     self.check_control_flags().await?;

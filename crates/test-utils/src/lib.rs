@@ -35,8 +35,9 @@ use std::sync::{Arc, Once};
 #[cfg(feature = "put-object-commit-barrier")]
 use ecstore_test_compat::fixture::ecstore_set_disk;
 use ecstore_test_compat::fixture::{
-    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, MakeBucketOptions, ObjectIO as _,
-    PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
+    BucketOperations as _, BucketOptions, ECStore, Endpoint, EndpointServerPools, Endpoints, InstanceContext, MakeBucketOptions,
+    ObjectIO as _, PoolEndpoints, PutObjReader, SelectObjectSnapshot, init_bucket_metadata_sys, init_local_disks,
+    init_local_disks_with_instance_ctx,
 };
 use tokio_util::sync::CancellationToken;
 
@@ -90,9 +91,8 @@ pub struct TestECStoreEnv {
     pub temp_root: PathBuf,
     /// The per-disk directories (`disk1`..`diskN`) under `temp_root`.
     pub disk_paths: Vec<PathBuf>,
-    /// The store, bootstrapped exactly like the historical test setups:
-    /// `init_local_disks` + `ECStore::new` on `127.0.0.1:0` (random port keeps
-    /// nextest's process-per-test parallelism safe).
+    /// The store, using the historical bootstrap context by default or the
+    /// explicit instance supplied to the builder, on `127.0.0.1:0`.
     pub ecstore: Arc<ECStore>,
     /// The single-pool, single-set topology the store was built from.
     ///
@@ -155,6 +155,7 @@ pub struct TestECStoreEnvBuilder {
     prefix: String,
     base_dir: Option<PathBuf>,
     init_bucket_metadata: bool,
+    instance_context: Option<Arc<InstanceContext>>,
 }
 
 impl Default for TestECStoreEnvBuilder {
@@ -164,6 +165,7 @@ impl Default for TestECStoreEnvBuilder {
             prefix: "rustfs_test_utils".to_string(),
             base_dir: None,
             init_bucket_metadata: true,
+            instance_context: None,
         }
     }
 }
@@ -193,6 +195,12 @@ impl TestECStoreEnvBuilder {
     /// (default `true`, as the heal bootstraps did).
     pub fn init_bucket_metadata(mut self, yes: bool) -> Self {
         self.init_bucket_metadata = yes;
+        self
+    }
+
+    /// Use an explicit instance instead of the process bootstrap context.
+    pub fn instance_context(mut self, context: Arc<InstanceContext>) -> Self {
+        self.instance_context = Some(context);
         self
     }
 
@@ -237,14 +245,22 @@ impl TestECStoreEnvBuilder {
         };
         let endpoint_pools = EndpointServerPools::from(vec![pool_endpoints]);
 
-        init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
-
         // Port 0 keeps ECStore-backed integration binaries parallel-safe under
         // nextest: no fixed peer port is ever shared between test processes.
         let server_addr: std::net::SocketAddr = "127.0.0.1:0".parse().expect("parse test addr");
-        let ecstore = ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
-            .await
-            .expect("build test ECStore");
+        let ecstore = if let Some(context) = self.instance_context {
+            init_local_disks_with_instance_ctx(&context, endpoint_pools.clone())
+                .await
+                .expect("init isolated local disks");
+            ECStore::new_with_instance_ctx(server_addr, endpoint_pools.clone(), CancellationToken::new(), context)
+                .await
+                .expect("build isolated test ECStore")
+        } else {
+            init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
+            ECStore::new(server_addr, endpoint_pools.clone(), CancellationToken::new())
+                .await
+                .expect("build test ECStore")
+        };
 
         // The production bootstrap only persists pool.bin from the elected
         // first cluster node.  Test stores intentionally have no cluster

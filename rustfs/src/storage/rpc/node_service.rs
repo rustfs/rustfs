@@ -7572,11 +7572,20 @@ mod tests {
     async fn target_rpc_fixture_with_bucket_metadata(initialize_bucket_metadata: bool) -> TargetRpcFixture {
         super::timeout(Duration::from_secs(90), async {
             let root = tempfile::tempdir().expect("target RPC root");
-            let env = rustfs_test_utils::TestECStoreEnv::builder()
+            let instance = if initialize_bucket_metadata {
+                crate::storage::storage_api::new_instance_ctx()
+            } else {
+                crate::storage::storage_api::bootstrap_instance_ctx()
+            };
+            let builder = rustfs_test_utils::TestECStoreEnv::builder()
                 .base_dir(root.path())
-                .init_bucket_metadata(initialize_bucket_metadata)
-                .build()
-                .await;
+                .init_bucket_metadata(initialize_bucket_metadata);
+            let builder = if initialize_bucket_metadata {
+                builder.instance_context(instance.clone())
+            } else {
+                builder
+            };
+            let env = builder.build().await;
             ObjectStore::new(env.ecstore.clone())
                 .save_iam_config(serde_json::json!({"version": 1}), format!("{}/format.json", *IAM_CONFIG_PREFIX))
                 .await
@@ -7589,10 +7598,9 @@ mod tests {
                 iam.clone(),
                 Arc::new(KmsServiceManager::new()),
             ));
-            let instance = crate::storage::storage_api::bootstrap_instance_ctx();
             assert!(
                 super::BootstrapLocalTarget::new(instance.clone()).is_for_store(&env.ecstore),
-                "the standard builder must use this exact instance context"
+                "the fixture must use this exact instance context"
             );
             super::timeout(Duration::from_secs(10), async {
                 while env.ecstore.namespace_commits_pending_for_test() {
@@ -8325,6 +8333,21 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
+    async fn isolated_reservation_fixture_does_not_capture_gating_store() {
+        let fixture = target_rpc_fixture_with_bucket_metadata(true).await;
+        fixture.env.make_bucket("rpc-isolated-order", false).await;
+        let (_store, bucket) = tokio::time::timeout(
+            Duration::from_secs(20),
+            crate::app::gating_test_env::durable_quota_test_bucket("rpc-isolated-order", 1024),
+        )
+        .await
+        .expect("gating fixture initializes after isolated RPC fixture");
+        assert!(!bucket.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn lost_short_reservation_rpc_response_releases_the_bucket_fence() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 
@@ -8500,6 +8523,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn short_metadata_reservation_expires_and_preserves_legacy_lifetime() {
         use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
 
@@ -8600,6 +8624,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn metadata_reservation_handlers_bind_and_publish_on_the_target_disk() {
         use crate::storage::storage_api::ecstore_disk::{DiskAPI, RUSTFS_META_TMP_BUCKET, ReadOptions};
 
