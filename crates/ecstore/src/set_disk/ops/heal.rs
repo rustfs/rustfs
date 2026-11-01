@@ -3918,6 +3918,19 @@ impl SetDisks {
                 ));
             }
             if let Some(error) = recovery.unresolved_heal_error() {
+                debug!(
+                    event = EVENT_SET_DISK_HEAL,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_SET_DISK,
+                    result = "delete_recovery_deferred",
+                    bucket,
+                    object,
+                    discovered = recovery.discovered,
+                    pending = recovery.pending,
+                    blocked = recovery.blocked,
+                    legacy_ambiguous = recovery.legacy_ambiguous,
+                    "Object heal deferred by delete recovery"
+                );
                 return Err(error);
             }
         }
