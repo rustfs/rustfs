@@ -15,12 +15,14 @@
 name: RustFS Validation Sweep
 
 # Executes the migrated canonical validation cases (rustfs/auto-testing#113)
-# on the shared functional fleet. The catalog's implemented cases (66 today,
-# all non-heal) are swept in rotating nightly batches so the whole catalog is
-# covered roughly weekly; a single case or one module can be dispatched
-# manually. heal.* cases stay on the interactive validation flow for now:
-# many of them require reviewed native/tool collectors built by separate
-# validation-tools runs before fleet execution.
+# on the shared functional fleet. Everything with a lane executor is swept in
+# rotating nightly batches so the whole set is covered roughly weekly; a
+# single case or one module can be dispatched manually. That is the
+# implemented catalog (66 today) plus the eight planned cases whose dedicated
+# executors already exist and have live PASS evidence - fresh nightly
+# evidence feeds their acceptance review. heal.* cases stay on the
+# interactive validation flow: they require reviewed native/tool collectors
+# built by separate validation-tools runs before fleet execution.
 
 on:
   schedule:
@@ -137,11 +139,20 @@ jobs:
           sweep_root = Path(os.environ["SWEEP_ROOT"])
 
           catalog = json.loads(Path("auto-testing/validation-cases.json").read_text())
+          def sweepable(case):
+              status = case.get("source_status")
+              if status == "implemented":
+                  return True
+              # The remaining planned non-heal cases route to the lane
+              # executors and already have live PASS evidence; sweeping them
+              # nightly produces fresh evidence for their acceptance review.
+              return status == "planned" and not case["id"].startswith("heal.")
+
           selected = [(case["id"], module["id"]) for module in catalog["modules"]
                       for case in module["cases"]
-                      if case.get("source_status") == "implemented"]
+                      if sweepable(case)]
           if not selected:
-              raise SystemExit("catalog has no implemented cases")
+              raise SystemExit("catalog has no sweepable cases")
 
           one_case = os.environ.get("SELECTED_CASE", "").strip()
           module_filter = os.environ.get("SELECTED_MODULE", "").strip()
@@ -149,7 +160,7 @@ jobs:
           modules = {module_id for _, module_id in selected}
           if one_case:
               if one_case not in known:
-                  raise SystemExit(f"unknown or not-implemented case: {one_case}")
+                  raise SystemExit(f"unknown case or no lane executor for it: {one_case}")
               selected = [(one_case, dict(selected)[one_case])]
           elif module_filter:
               if module_filter not in modules:
