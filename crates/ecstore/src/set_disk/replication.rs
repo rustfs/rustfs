@@ -165,6 +165,7 @@ impl SetDisks {
                         bucket,
                         object,
                         opts.no_lock,
+                        false,
                         DecommissionCapacityAdmission::Mutation,
                     )
                     .await?
@@ -275,6 +276,7 @@ impl SetDisks {
                         bucket,
                         object,
                         opts.no_lock,
+                        false,
                         DecommissionCapacityAdmission::Mutation,
                     )
                     .await?

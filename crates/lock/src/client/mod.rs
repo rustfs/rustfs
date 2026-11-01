@@ -20,6 +20,12 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 
+/// Marker exchanged in a refresh request and response for a committed-tail conversion.
+pub const COMMITTED_TAIL_CONVERSION_MARKER: &str = "rustfs-committed-tail-v1";
+pub const COMMITTED_TAIL_UPGRADE_MARKER: &str = "rustfs-committed-tail-upgrade-v1";
+pub const HEAL_LOCK_TRANSITION_PROBE_MARKER: &str = "rustfs-heal-lock-transition-probe-v1";
+pub const HEAL_WAITING_WRITER_MARKER: &str = "rustfs-heal-waiting-writer-v1";
+
 /// Lock client trait
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
@@ -47,6 +53,27 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
 
     /// Refresh lock
     async fn refresh(&self, lock_id: &LockId) -> Result<bool>;
+
+    /// Convert an exclusive lease to a reader-compatible committed-tail lease.
+    /// Unsupported peers retain their original lease and report `false`.
+    async fn downgrade_committed_tail(&self, _lock_id: &LockId) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Try to restore exclusive ownership, retaining the writer fence on failure.
+    async fn try_upgrade_committed_tail(&self, _lock_id: &LockId) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Check support without changing the lease mode.
+    async fn supports_heal_lock_transition(&self, _lock_id: &LockId) -> Result<bool> {
+        Ok(false)
+    }
+
+    /// Observe foreground writer contention, or return `None` when unsupported.
+    async fn waiting_writer(&self, _lock_id: &LockId) -> Result<Option<bool>> {
+        Ok(None)
+    }
 
     /// Force release lock
     async fn force_release(&self, lock_id: &LockId) -> Result<bool>;

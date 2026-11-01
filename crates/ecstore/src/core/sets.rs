@@ -655,6 +655,19 @@ impl Sets {
             .await
     }
 
+    pub(crate) async fn put_object_with_prepared_reservations(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        reservations: Option<Vec<Option<crate::set_disk::RenameMetadataReservation>>>,
+    ) -> Result<(ObjectInfo, Option<crate::disk::OldCurrentSize>)> {
+        self.get_disks_by_key(object)
+            .put_object_with_prepared_reservations(bucket, object, data, opts, reservations)
+            .await
+    }
+
     pub(crate) async fn put_object_with_old_current_size_for_data_movement(
         &self,
         bucket: &str,

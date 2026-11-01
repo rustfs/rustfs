@@ -576,6 +576,41 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn reserve_object_metadata(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::MetadataReservationRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn reserve_object_metadata_short(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::MetadataReservationRequest>,
+    ) -> Result<Response<SnapshotLeaseResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn activate_object_metadata_reservation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::MetadataReservationActivateRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn cancel_object_metadata_reservation(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::MetadataReservationCancelRequest>,
+    ) -> Result<Response<SnapshotLeaseMutationResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
+    async fn rename_reserved_data(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::ReservedRenameDataRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::RenameDataResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn rename_data_with_pool_meta_cas(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::RenameDataRequest>,

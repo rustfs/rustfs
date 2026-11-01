@@ -94,6 +94,7 @@ impl ObjectLockState {
     pub fn reset_for_reuse(&mut self) {
         // Reset atomic state
         self.atomic_state = crate::fast_lock::state::AtomicLockState::new();
+        self.force_epoch.store(0, Ordering::Relaxed);
 
         // Clear owners
         *self.current_owner.write() = None;

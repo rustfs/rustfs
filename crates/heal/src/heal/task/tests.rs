@@ -1658,7 +1658,9 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 struct MockStorage {
     retry_test_pages: Option<Vec<Vec<HealListItem>>>,
     retry_test_delays: HashMap<String, Duration>,
+    retry_test_attempt_delays: Mutex<HashMap<String, VecDeque<Duration>>>,
     retry_test_listing_delays: Mutex<VecDeque<Duration>>,
+    retry_test_disk_walk_pages: bool,
     retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
     list_each_bucket: bool,
@@ -1678,6 +1680,7 @@ struct MockStorage {
     object_heal_detail: Option<String>,
     object_heal_item: Option<HealResultItem>,
     bucket_incarnation_id: Mutex<Option<Uuid>>,
+    bucket_incarnation_reads: std::sync::atomic::AtomicUsize,
     bucket_incarnation_after_object_heal: Mutex<Option<Uuid>>,
     bucket_incarnation_after_listing: Mutex<Option<Uuid>>,
     bucket_incarnation_unavailable: Mutex<bool>,
@@ -2427,6 +2430,7 @@ impl HealStorageAPI for MockStorage {
     }
 
     async fn bucket_incarnation_id(&self, _bucket: &str) -> Result<Option<Uuid>> {
+        self.bucket_incarnation_reads.fetch_add(1, Ordering::Relaxed);
         if *self.bucket_incarnation_unavailable.lock().unwrap() {
             return Err(Error::Other("bucket incarnation unavailable".to_string()));
         }
@@ -2459,8 +2463,15 @@ impl HealStorageAPI for MockStorage {
     ) -> Result<(HealResultItem, Option<Error>)> {
         self.heal_object_calls.lock().unwrap().push(object.to_string());
         self.retry_test_events.lock().expect("events").push(format!("heal:{object}"));
-        if let Some(delay) = self.retry_test_delays.get(object) {
-            tokio::time::sleep(*delay).await;
+        let delay = self
+            .retry_test_attempt_delays
+            .lock()
+            .expect("attempt delays")
+            .get_mut(object)
+            .and_then(VecDeque::pop_front)
+            .or_else(|| self.retry_test_delays.get(object).copied());
+        if let Some(delay) = delay {
+            tokio::time::sleep(delay).await;
         }
         self.heal_object_version_ids
             .lock()
@@ -2913,6 +2924,11 @@ impl HealStorageAPI for MockStorage {
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         self.disk_walk_calls.lock().unwrap().push(set_disk_id.to_string());
+        if self.retry_test_disk_walk_pages {
+            return self
+                .list_objects_for_heal_page(_bucket, _prefix, continuation_token, _include_lifecycle_object_info)
+                .await;
+        }
         if continuation_token.is_some() {
             return Ok((Vec::new(), None, false));
         }
