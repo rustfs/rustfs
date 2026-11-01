@@ -28,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 #[derive(Clone)]
 pub struct NamespaceLockFence {
     signals: Arc<Vec<Arc<rustfs_lock::distributed_lock::LockLostSignal>>>,
+    local_probes: Arc<Vec<rustfs_lock::fast_lock::guard::FastLockGuardProbe>>,
     #[cfg(test)]
     forced_lost: Arc<Vec<Arc<std::sync::atomic::AtomicBool>>>,
 }
@@ -44,6 +45,7 @@ impl NamespaceLockFence {
     pub(crate) fn new() -> Self {
         Self {
             signals: Arc::default(),
+            local_probes: Arc::default(),
             #[cfg(test)]
             forced_lost: Arc::new(vec![Arc::new(std::sync::atomic::AtomicBool::new(false))]),
         }
@@ -58,16 +60,27 @@ impl NamespaceLockFence {
         {
             return true;
         }
-        self.signals.iter().any(|signal| signal.is_lost())
+        self.signals.iter().any(|signal| signal.is_lost()) || self.local_probes.iter().any(|probe| probe.is_lost())
     }
 
     pub(crate) fn add_signal(&mut self, signal: Arc<rustfs_lock::distributed_lock::LockLostSignal>) {
         Arc::make_mut(&mut self.signals).push(signal);
     }
 
+    fn add_local_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
+        if let rustfs_lock::NamespaceLockGuard::Fast(guard) = guard
+            && let Some(probe) = guard.release_probe()
+        {
+            Arc::make_mut(&mut self.local_probes).push(probe);
+        }
+    }
+
     fn extend(&mut self, other: &Self) {
         if !Arc::ptr_eq(&self.signals, &other.signals) {
             Arc::make_mut(&mut self.signals).extend(other.signals.iter().cloned());
+        }
+        if !Arc::ptr_eq(&self.local_probes, &other.local_probes) {
+            Arc::make_mut(&mut self.local_probes).extend(other.local_probes.iter().cloned());
         }
         #[cfg(test)]
         if !Arc::ptr_eq(&self.forced_lost, &other.forced_lost) {
@@ -106,6 +119,7 @@ impl NamespaceLockSignalTestFence {
     ) -> Self {
         let fence = NamespaceLockFence {
             signals: Arc::default(),
+            local_probes: Arc::default(),
             forced_lost: Arc::new(vec![loss_handle]),
         };
         let signal_key = Arc::as_ptr(signal) as usize;
@@ -222,6 +236,7 @@ impl ObjectLockConfigSnapshot {
         if let Some(signal) = lifecycle_guard.lock_lost_signal() {
             lifecycle_fence.add_signal(signal);
         }
+        lifecycle_fence.add_local_guard(&lifecycle_guard);
         Self {
             store_id: Some(store_id),
             bucket: Some(bucket.to_string()),
@@ -1367,6 +1382,13 @@ impl ObjectOptions {
         if let Some(signal) = guard.lock_lost_signal() {
             self.add_namespace_lock_lost_signal(signal);
         }
+        if let rustfs_lock::NamespaceLockGuard::Fast(local) = guard
+            && !local.is_disabled()
+        {
+            self.namespace_lock_fence
+                .get_or_insert_with(NamespaceLockFence::new)
+                .add_local_guard(guard);
+        }
     }
 
     pub fn add_bucket_lifecycle_lock_guard(&mut self, guard: &rustfs_lock::NamespaceLockGuard) {
@@ -1374,6 +1396,7 @@ impl ObjectOptions {
         if let Some(signal) = guard.lock_lost_signal() {
             fence.add_signal(signal);
         }
+        fence.add_local_guard(guard);
     }
 
     pub fn set_delete_replication_state(&mut self, dsc: ReplicateDecision) {

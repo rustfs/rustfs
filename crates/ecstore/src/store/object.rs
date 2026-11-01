@@ -10377,6 +10377,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn force_released_local_bucket_fence_cannot_activate_a_prepared_reservation() {
+        for released in ["publication", "lifecycle"] {
+            let fast = Arc::new(rustfs_lock::FastObjectLockManager::new());
+            let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(fast.clone()));
+            let lock = rustfs_lock::NamespaceLock::with_local_manager("reservation-force".into(), manager);
+            let publication_key = rustfs_lock::ObjectKey::new("bucket", "publication");
+            let publication = lock
+                .get_read_lock(publication_key.clone(), "reservation", Duration::from_secs(5))
+                .await
+                .expect("publication lock");
+            let lifecycle = lock
+                .get_read_lock(rustfs_lock::ObjectKey::new("bucket", "lifecycle"), "reservation", Duration::from_secs(5))
+                .await
+                .expect("lifecycle lock");
+            let bucket_registry = Arc::new(crate::store::bucket_fence::BucketFenceRegistry::default());
+            let lifecycle =
+                crate::store::bucket_fence::BucketIncarnationFenceGuard::new(bucket_registry.clone(), "bucket", lifecycle, true);
+            let slot = bucket_registry.reservation_slot("bucket", Uuid::new_v4());
+            let owner = Arc::new(crate::store::bucket_fence::ReservationFenceGuard::new(publication, lifecycle, slot));
+            let registry = crate::disk::os::MetadataReservationRegistry::new(1);
+            let path = std::path::Path::new("bucket/object");
+            let disk = Uuid::new_v4();
+            let token = registry
+                .prepare_with_owner(path, disk, Some(owner))
+                .expect("prepare reservation");
+            let released_key = rustfs_lock::ObjectKey::new("bucket", released);
+            assert_eq!(fast.force_unlock(&released_key), 1, "force release {released}");
+            let replacement = lock
+                .get_write_lock(released_key, "bucket-delete", Duration::from_secs(5))
+                .await
+                .expect("bucket writer acquires after forced release");
+            assert!(
+                registry.activate(token, path, disk).await.is_err(),
+                "a released fence cannot activate a write"
+            );
+            drop(replacement);
+        }
+    }
+
+    #[tokio::test]
     async fn lost_bucket_fence_cannot_activate_a_prepared_reservation() {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
             rustfs_lock::FastObjectLockManager::new(),

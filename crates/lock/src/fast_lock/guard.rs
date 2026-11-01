@@ -19,8 +19,8 @@ use crate::fast_lock::{
 use rustfs_io_metrics::{
     record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Global counter for guard IDs to prevent double-release
 static GUARD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -43,6 +43,19 @@ pub struct FastLockGuard {
     sealed_for_commit: bool,
     /// Unique ID for this guard instance to prevent double-release
     guard_id: u64,
+}
+
+/// A non-owning check of one local acquisition, including forced release.
+#[derive(Clone)]
+pub struct FastLockGuardProbe {
+    shard: Weak<LockShard>,
+    guard_id: u64,
+}
+
+impl FastLockGuardProbe {
+    pub fn is_lost(&self) -> bool {
+        self.shard.upgrade().is_none_or(|shard| !shard.is_guard_active(self.guard_id))
+    }
 }
 
 impl FastLockGuard {
@@ -221,9 +234,17 @@ impl FastLockGuard {
         );
     }
 
-    /// Check if the lock has been released
+    /// Check if the lock has been released, including by an administrator.
     pub fn is_released(&self) -> bool {
-        self.released
+        self.released || self.shard.as_ref().is_some_and(|shard| !shard.is_guard_active(self.guard_id))
+    }
+
+    /// Observe this acquisition without extending the lock's lifetime.
+    pub fn release_probe(&self) -> Option<FastLockGuardProbe> {
+        self.shard.as_ref().map(|shard| FastLockGuardProbe {
+            shard: Arc::downgrade(shard),
+            guard_id: self.guard_id,
+        })
     }
 
     /// Check if this guard represents a disabled lock

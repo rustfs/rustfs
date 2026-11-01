@@ -568,9 +568,8 @@ impl LockShard {
         guards.len()
     }
 
-    /// Check if a guard is active (for testing)
-    #[cfg(test)]
-    pub fn is_guard_active(&self, guard_id: u64) -> bool {
+    /// Check whether this exact guard still owns its acquisition.
+    pub(crate) fn is_guard_active(&self, guard_id: u64) -> bool {
         let guards = self.active_guards.lock();
         guards.contains_key(&guard_id)
     }
@@ -1358,12 +1357,17 @@ mod tests {
             .acquire_read_lock(key.clone(), "same-owner")
             .await
             .expect("second reader");
+        assert!(!old1.is_released());
+        assert!(!old2.is_released());
         assert_eq!(manager.force_unlock(&key), 1);
         let mut tail = manager
             .acquire_write_lock(key.clone(), "same-owner")
             .await
             .expect("new writer");
         assert!(tail.downgrade_committed_tail());
+        assert!(old1.is_released());
+        assert!(old2.is_released());
+        assert!(!tail.is_released());
         drop((old1, old2));
         assert!(
             tokio::time::timeout(Duration::from_millis(100), manager.acquire_write_lock(key, "competitor"))
