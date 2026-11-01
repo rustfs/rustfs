@@ -5,6 +5,7 @@ use super::{FdCache, FdCacheEntry, FdKey};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 
 fn key(volume: &str, path: &str, direct: bool) -> FdKey {
     FdKey {
@@ -52,7 +53,11 @@ async fn uring_fd_cache_exact_invalidation_removes_both_modes_and_preserves_othe
 async fn uring_fd_cache_exact_invalidation_bumps_one_generation_and_rejects_old_epoch_inserts() {
     let (_directory, file) = fixture();
     let cache = FdCache::new();
-    let entry = Arc::new(FdCacheEntry { file, len: 3 });
+    let entry = Arc::new(FdCacheEntry {
+        file,
+        len: 3,
+        invalidated: AtomicBool::new(false),
+    });
     let old_generation = cache.generation();
     cache.invalidate_exact("v", "part").await;
     let current_generation = cache.generation();
@@ -125,7 +130,7 @@ async fn uring_fd_cache_volume_and_clear_invalidation_cover_both_modes() {
         cache.insert(key("v", "part", direct), Arc::clone(&file)).await;
         assert!(
             cache.get(&key("v", "part", direct)).await.is_some(),
-            "new entries must survive the earlier volume predicate"
+            "new entries must survive the earlier volume invalidation"
         );
     }
     cache.clear();
@@ -164,6 +169,7 @@ async fn uring_fd_cache_invalidation_keeps_borrowed_old_inode_alive_and_allows_r
     let replacement = Arc::new(FdCacheEntry {
         file: Arc::new(File::open(directory.path().join("part")).expect("open replacement inode")),
         len: 11,
+        invalidated: AtomicBool::new(false),
     });
     for direct in [false, true] {
         let key = key("v", "part", direct);

@@ -5167,6 +5167,7 @@ impl LocalIoBackend for StdBackend {
                     Arc::new(FdCacheEntry {
                         file: Arc::new(file),
                         len: metadata_len,
+                        invalidated: AtomicBool::new(false),
                     })
                 });
                 #[cfg(not(target_os = "linux"))]
@@ -5607,6 +5608,9 @@ const FD_CACHE_CAPACITY: u64 = 512;
 #[cfg(any(target_os = "linux", all(unix, test)))]
 const FD_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
+const FD_CACHE_MAINTENANCE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+
 #[cfg(target_os = "linux")]
 fn is_io_uring_fd_cache_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_IO_URING_FD_CACHE, DEFAULT_RUSTFS_IO_URING_FD_CACHE)
@@ -5702,6 +5706,8 @@ struct FdCacheEntry {
     file: Arc<std::fs::File>,
     /// File length captured together with the descriptor.
     len: u64,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
+    invalidated: AtomicBool,
 }
 
 /// Per-disk cache of open descriptors for io_uring reads (backlog#1145).
@@ -5735,6 +5741,13 @@ struct FdCacheEntry {
 #[cfg(any(target_os = "linux", all(unix, test)))]
 struct FdCache {
     cache: moka::future::Cache<FdKey, Arc<FdCacheEntry>>,
+    // Moka's entry count can lag inserts. Only a cache that has never accepted
+    // an insert can safely skip the foreground invalidation scan.
+    has_inserted_entries: AtomicBool,
+    // The only sender belongs to this cache. Dropping it lets the worker finish
+    // maintenance and release its cache clone without retaining the backend.
+    maintenance_tx: tokio::sync::watch::Sender<()>,
+    maintenance_task: std::sync::OnceLock<tokio::task::JoinHandle<()>>,
     /// Bumped by every invalidation. A miss-path open snapshots this before it
     /// opens and refuses to insert if it moved, so an fd opened before a
     /// heal/delete commit can never be resurrected into the cache after the
@@ -5752,20 +5765,78 @@ impl FdCache {
     /// `new` (`FD_CACHE_TTL`); tests inject a short TTL to exercise the backstop
     /// eviction (rustfs/backlog#1180) without a multi-second wait.
     fn with_ttl(ttl: std::time::Duration) -> Self {
+        let (maintenance_tx, _) = tokio::sync::watch::channel(());
         Self {
             cache: moka::future::Cache::builder()
                 .max_capacity(FD_CACHE_CAPACITY)
                 .time_to_live(ttl)
-                // Required for `invalidate_entries_if`; without it that call
-                // fails at runtime instead of dropping stale descriptors.
-                .support_invalidation_closures()
                 .build(),
+            has_inserted_entries: AtomicBool::new(false),
+            maintenance_tx,
+            maintenance_task: std::sync::OnceLock::new(),
             generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
+    fn schedule_maintenance(&self) {
+        self.maintenance_task.get_or_init(|| {
+            let cache = self.cache.clone();
+            let mut notifications = self.maintenance_tx.subscribe();
+            // Invalidation runs on the disk API's Tokio runtime. Starting lazily
+            // keeps construction runtime-independent and idle caches task-free.
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval_at(
+                    tokio::time::Instant::now() + FD_CACHE_MAINTENANCE_INTERVAL,
+                    FD_CACHE_MAINTENANCE_INTERVAL,
+                );
+                interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    let stopping = tokio::select! {
+                        changed = notifications.changed() => changed.is_err(),
+                        _ = interval.tick() => false,
+                    };
+                    if stopping {
+                        cache.invalidate_all();
+                    }
+                    cache.run_pending_tasks().await;
+                    if stopping {
+                        break;
+                    }
+                    if cache.entry_count() != 0 {
+                        for (key, entry) in cache.iter() {
+                            if entry.invalidated.load(Ordering::Acquire) {
+                                // Concurrent replacement may evict a fresh fd;
+                                // a later read safely reopens it.
+                                cache.invalidate(key.as_ref()).await;
+                            }
+                        }
+                        cache.run_pending_tasks().await;
+                    }
+                }
+            })
+        });
+        self.maintenance_tx.send_replace(());
+    }
+
+    fn invalidate_matching(&self, matches: impl Fn(&FdKey) -> bool) {
+        if !self.has_inserted_entries.load(Ordering::Acquire) {
+            return;
+        }
+        // Entries already present are visited unless concurrently removed. The
+        // generation fence rejects an older open inserted after this scan.
+        for (key, entry) in self.cache.iter() {
+            if matches(&key) {
+                entry.invalidated.store(true, Ordering::Release);
+            }
+        }
+        self.schedule_maintenance();
+    }
+
     async fn get(&self, key: &FdKey) -> Option<Arc<FdCacheEntry>> {
-        self.cache.get(key).await
+        self.cache
+            .get(key)
+            .await
+            .filter(|entry| !entry.invalidated.load(Ordering::Acquire))
     }
 
     /// Current invalidation generation, snapshotted by the miss path before it
@@ -5783,6 +5854,7 @@ impl FdCache {
         if self.generation.load(Ordering::Acquire) != gen_at_open {
             return;
         }
+        self.has_inserted_entries.store(true, Ordering::Release);
         self.cache.insert(key.clone(), entry).await;
         if self.generation.load(Ordering::Acquire) != gen_at_open {
             self.cache.invalidate(&key).await;
@@ -5809,38 +5881,24 @@ impl FdCache {
     /// Drop every descriptor for `volume` whose path is `prefix` or lies under it.
     /// A component-boundary check keeps `a/b` from invalidating `a/bc`.
     ///
-    /// moka applies the predicate to entries inserted at or before this call and
-    /// guarantees a later `get` never returns one of them, so the invalidation is
-    /// effective immediately even though the removal itself is deferred. Reserved
-    /// for paths whose exact keys are unknown (`delete`); every predicate is
-    /// re-evaluated by subsequent `get`s, so registering one per write would tax
-    /// the read path.
+    /// Mark matching entries immediately so reads reject them while maintenance
+    /// removes them. The scan borrows its paths and retains no invalidation
+    /// closures when the cache is empty or idle.
     fn invalidate_under(&self, volume: &str, prefix: &str) {
-        // Bump before registering the predicate so a concurrent miss-path insert
+        // Bump before scanning the cache so a concurrent miss-path insert
         // that snapshotted the old generation is refused (rustfs/backlog#1176).
         self.generation.fetch_add(1, Ordering::AcqRel);
-        let volume = volume.to_owned();
-        let prefix = prefix.trim_end_matches('/').to_owned();
-        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| {
-            k.volume == volume && (k.path == prefix || k.path.strip_prefix(&prefix).is_some_and(|r| r.starts_with('/')))
-        };
-        if self.cache.invalidate_entries_if(matches).is_err() {
-            // Closure support is enabled at construction, so this is unreachable.
-            // If it ever changes, over-invalidate rather than serve a stale
-            // descriptor: correctness first, the cache refills on the next read.
-            self.cache.invalidate_all();
-        }
+        let prefix = prefix.trim_end_matches('/');
+        self.invalidate_matching(|k| {
+            k.volume == volume && (k.path == prefix || k.path.strip_prefix(prefix).is_some_and(|r| r.starts_with('/')))
+        });
     }
 
     /// Drop every descriptor for `volume` — the whole bucket is gone
     /// (rustfs/backlog#1177).
     fn invalidate_volume(&self, volume: &str) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        let volume = volume.to_owned();
-        let matches = move |k: &FdKey, _: &Arc<FdCacheEntry>| k.volume == volume;
-        if self.cache.invalidate_entries_if(matches).is_err() {
-            self.cache.invalidate_all();
-        }
+        self.invalidate_matching(|k| k.volume == volume);
     }
 
     /// Drop ALL descriptors — this disk instance is being retired
@@ -5848,6 +5906,7 @@ impl FdCache {
     fn clear(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
         self.cache.invalidate_all();
+        self.schedule_maintenance();
     }
 
     /// Unconditional insert. Production reads go through `insert_if_fresh` (the
@@ -5856,7 +5915,17 @@ impl FdCache {
     #[cfg(test)]
     async fn insert(&self, key: FdKey, file: Arc<std::fs::File>) {
         let len = file.metadata().map(|metadata| metadata.len()).unwrap_or_default();
-        self.cache.insert(key, Arc::new(FdCacheEntry { file, len })).await;
+        self.has_inserted_entries.store(true, Ordering::Release);
+        self.cache
+            .insert(
+                key,
+                Arc::new(FdCacheEntry {
+                    file,
+                    len,
+                    invalidated: AtomicBool::new(false),
+                }),
+            )
+            .await;
     }
 
     #[cfg(test)]
@@ -6455,6 +6524,7 @@ impl UringBackend {
                 let file = Arc::new(FdCacheEntry {
                     file: Arc::new(file),
                     len,
+                    invalidated: AtomicBool::new(false),
                 });
                 if let (Some((cache, key)), Some(gen_at_open)) = (cache_entry, gen_at_open) {
                     cache.insert_if_fresh(key, Arc::clone(&file), gen_at_open).await;
@@ -6627,6 +6697,7 @@ impl UringBackend {
                 let entry = Arc::new(FdCacheEntry {
                     file: Arc::new(file),
                     len,
+                    invalidated: AtomicBool::new(false),
                 });
                 if let (Some(cache), Some(gen_at_open)) = (cache, gen_at_open) {
                     cache.insert_if_fresh(key.clone(), Arc::clone(&entry), gen_at_open).await;
@@ -34099,11 +34170,217 @@ mod test {
         });
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_releases_descriptors_without_further_operations() {
+        let cache = FdCache::new();
+        for round in 0..4 {
+            let file = Arc::new(tempfile::tempfile().expect("create a descriptor to invalidate"));
+            let released = Arc::downgrade(&file);
+            let parts = if round == 1 || round == 2 { FD_CACHE_CAPACITY } else { 1 };
+            for part in 0..parts {
+                cache
+                    .insert(
+                        FdKey {
+                            volume: "bucket".into(),
+                            path: format!("object-{round}/part.{part}"),
+                            direct: false,
+                        },
+                        file.clone(),
+                    )
+                    .await;
+            }
+            drop(file);
+            if round % 2 == 0 {
+                cache.invalidate_under("bucket", &format!("object-{round}"));
+            } else {
+                cache.invalidate_volume("bucket");
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                while released.upgrade().is_some() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("invalidation must release descriptors without another cache operation");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_rejects_entries_before_maintenance() {
+        let cache = FdCache::new();
+        let key = FdKey {
+            volume: "bucket".into(),
+            path: "object/part.1".into(),
+            direct: false,
+        };
+        cache
+            .insert(key.clone(), Arc::new(tempfile::tempfile().expect("create a cached descriptor")))
+            .await;
+        assert!(cache.get(&key).await.is_some());
+        cache.invalidate_under("bucket", "object");
+
+        // No yield has allowed the maintenance task to remove the entry yet.
+        assert!(cache.cache.contains_key(&key));
+        assert!(cache.get(&key).await.is_none(), "a marked descriptor must never be served");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_idle_maintenance_releases_expired_descriptors() {
+        let cache = FdCache::with_ttl(std::time::Duration::from_millis(50));
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor with a short TTL"));
+        let released = Arc::downgrade(&file);
+        let key = FdKey {
+            volume: "retained".into(),
+            path: "part.1".into(),
+            direct: false,
+        };
+        cache.insert(key.clone(), file).await;
+        cache.invalidate_volume("other");
+        assert!(cache.get(&key).await.is_some(), "invalidation must preserve other volumes");
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("periodic maintenance must release expired descriptors while idle");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_maintenance_exits_when_cache_is_dropped() {
+        let mut cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to retire"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        cache.invalidate_volume("bucket");
+        let maintenance = cache.maintenance_task.take().expect("invalidation starts maintenance");
+        drop(cache);
+        tokio::time::timeout(std::time::Duration::from_secs(10), maintenance)
+            .await
+            .expect("dropping the cache must stop its maintenance task")
+            .expect("maintenance must complete without a panic");
+        assert!(released.upgrade().is_none(), "shutdown must release cached descriptors");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_maintenance_survives_request_cancellation() {
+        let cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to invalidate"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        let mut request = Box::pin(async {
+            cache.invalidate_volume("bucket");
+            std::future::pending::<()>().await;
+        });
+        let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(std::future::Future::poll(request.as_mut(), &mut context).is_pending());
+        drop(request);
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("maintenance must continue after the invalidating request is cancelled");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fd_cache_construction_does_not_require_a_runtime() {
+        let cache = FdCache::new();
+        assert!(cache.maintenance_task.get().is_none());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_invalidation_fences_an_open_before_the_first_insert() {
+        for mode in 0..2 {
+            let cache = FdCache::new();
+            let key = FdKey {
+                volume: "bucket".into(),
+                path: "object/part.1".into(),
+                direct: false,
+            };
+            let opened = Arc::new(FdCacheEntry {
+                file: Arc::new(tempfile::tempfile().expect("open the descriptor before invalidation")),
+                len: 0,
+                invalidated: AtomicBool::new(false),
+            });
+            let generation = cache.generation();
+            match mode {
+                0 => cache.invalidate_under("bucket", "object"),
+                _ => cache.invalidate_volume("bucket"),
+            }
+            cache.insert_if_fresh(key.clone(), opened, generation).await;
+            assert!(cache.get(&key).await.is_none(), "mode {mode} must reject a pre-invalidation open");
+
+            let fresh = Arc::new(FdCacheEntry {
+                file: Arc::new(tempfile::tempfile().expect("open a fresh descriptor after invalidation")),
+                len: 0,
+                invalidated: AtomicBool::new(false),
+            });
+            cache.insert_if_fresh(key.clone(), fresh.clone(), cache.generation()).await;
+            let cached = cache.get(&key).await.expect("a post-invalidation open must remain cacheable");
+            assert!(Arc::ptr_eq(&cached, &fresh));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn fd_cache_clear_releases_descriptors_without_further_reads() {
+        let cache = FdCache::new();
+        let file = Arc::new(tempfile::tempfile().expect("create a descriptor to retire"));
+        let released = Arc::downgrade(&file);
+        cache
+            .insert(
+                FdKey {
+                    volume: "bucket".into(),
+                    path: "part.1".into(),
+                    direct: false,
+                },
+                file,
+            )
+            .await;
+        cache.clear();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("clear must release retired descriptors without another cache operation");
+    }
+
     /// Prefix invalidation must respect component boundaries: dropping the
     /// descriptors for object `a/b` must not also drop those for `a/bc`.
-    /// moka applies the predicate lazily, so this also pins the guarantee we rely
-    /// on — a `get` after `invalidate_under` never returns a matched entry.
-    #[cfg(target_os = "linux")]
+    /// A `get` after `invalidate_under` must reject matched entries while
+    /// background maintenance removes them.
+    #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread")]
     async fn fd_cache_prefix_invalidation_respects_component_boundary() {
         use std::fs::File;
