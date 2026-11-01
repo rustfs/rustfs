@@ -490,12 +490,17 @@ pub(crate) mod table {
 
         pub(crate) mod list {
             pub(crate) use super::super::super::storage_contracts::{
-                ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr, WalkOptions,
+                AuthoritativeListOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr,
+                WalkOptions,
             };
         }
 
         pub(crate) mod namespace {
             pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
+        }
+
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::storage_contracts::MultipartUploadInspection;
         }
 
         pub(crate) mod object {

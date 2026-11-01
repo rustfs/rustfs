@@ -19,6 +19,8 @@ collection:
 
 - [Table maintenance periodic queueing](operations/s3-tables-maintenance-scheduler.md) — opt-in scheduling, limits, worker handoff, and recovery.
 
+- [S3 Tables catalog lifecycle](operations/s3-tables-catalog-lifecycle.md) — disablement, fenced empty-table cleanup, and registration-cache boundaries.
+
 For PUT cleanup admission, blocking-pool isolation, and optional CPU affinity,
 see [PUT cleanup isolation](operations/put-cleanup-isolation.md).
 

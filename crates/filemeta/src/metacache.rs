@@ -352,6 +352,22 @@ impl MetaCacheEntry {
         (prefer, true)
     }
 
+    pub fn matches_strict_borrowed(&mut self, other: &MetaCacheEntry) -> bool {
+        if self.name != other.name {
+            return false;
+        }
+
+        if other.is_dir() || self.is_dir() {
+            return other.is_dir() == self.is_dir();
+        }
+
+        if self.cached.is_none() && other.cached.is_none() {
+            return FileMeta::buffers_match_strict(&self.metadata, &other.metadata);
+        }
+
+        self.matches_strict(other)
+    }
+
     pub fn matches_strict(&mut self, other: &MetaCacheEntry) -> bool {
         if self.name != other.name {
             return false;
@@ -989,6 +1005,17 @@ impl<W: AsyncWrite + Unpin> MetacacheWriter<W> {
         Ok(())
     }
 
+    pub async fn write_obj_buffered(&mut self, obj: &MetaCacheEntry) -> Result<()> {
+        self.init().await?;
+
+        Self::encode_obj(&mut self.buf, obj)?;
+        if self.buf.len() >= METACACHE_READ_CHUNK_SIZE {
+            self.flush().await?;
+        }
+
+        Ok(())
+    }
+
     pub async fn close(&mut self) -> Result<()> {
         self.close_with_limit_reached(false).await
     }
@@ -1280,6 +1307,85 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
     async fn read_u32(&mut self) -> Result<u32> {
         let buf = self.read_more(4).await?;
         Ok(u32::from_be_bytes(buf.try_into().expect("Slice with incorrect length")))
+    }
+
+    pub fn skip_current(&mut self) -> bool {
+        if self.has_current && self.init && self.err.is_none() {
+            self.has_current = false;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub fn try_peek_buffered(&mut self) -> Option<Result<Option<MetaCacheEntry>>> {
+        if !self.init || self.err.is_some() || self.terminated {
+            return None;
+        }
+
+        let avail = &self.buf[self.pos..];
+        let &first = avail.first()?;
+        if first != 0xc3 {
+            return None;
+        }
+
+        let str_marker = *avail.get(1)?;
+        let (str_hdr, str_len) = match str_marker {
+            0xa0..=0xbf => (1usize, usize::from(str_marker & 0x1f)),
+            0xd9 => (2usize, usize::from(*avail.get(2)?)),
+            0xda => (3usize, usize::from(u16::from_be_bytes([*avail.get(2)?, *avail.get(3)?]))),
+            0xdb => (
+                5usize,
+                usize::try_from(u32::from_be_bytes([*avail.get(2)?, *avail.get(3)?, *avail.get(4)?, *avail.get(5)?])).ok()?,
+            ),
+            _ => return None,
+        };
+
+        let bin_offset = 1usize.checked_add(str_hdr)?.checked_add(str_len)?;
+        let bin_marker = *avail.get(bin_offset)?;
+        let (bin_hdr, bin_len) = match bin_marker {
+            0xc4 => (2usize, usize::from(*avail.get(bin_offset + 1)?)),
+            0xc5 => (
+                3usize,
+                usize::from(u16::from_be_bytes([*avail.get(bin_offset + 1)?, *avail.get(bin_offset + 2)?])),
+            ),
+            0xc6 => (
+                5usize,
+                usize::try_from(u32::from_be_bytes([
+                    *avail.get(bin_offset + 1)?,
+                    *avail.get(bin_offset + 2)?,
+                    *avail.get(bin_offset + 3)?,
+                    *avail.get(bin_offset + 4)?,
+                ]))
+                .ok()?,
+            ),
+            _ => return None,
+        };
+
+        let total_len = bin_offset.checked_add(bin_hdr)?.checked_add(bin_len)?;
+        if avail.len() < total_len {
+            return None;
+        }
+
+        let Ok(decoded) = from_utf8(&avail[1 + str_hdr..bin_offset]) else {
+            return None;
+        };
+        let name = decoded.to_owned();
+        let metadata = if bin_len == 0 {
+            Vec::new()
+        } else {
+            avail[bin_offset + bin_hdr..total_len].to_vec()
+        };
+
+        self.pos += total_len;
+        self.reset();
+        self.has_current = true;
+        Some(Ok(Some(MetaCacheEntry {
+            name,
+            metadata,
+            cached: None,
+            reusable: false,
+        })))
     }
 
     pub async fn skip(&mut self, size: usize) -> Result<()> {
@@ -4256,5 +4362,96 @@ mod tests {
             })
             .expect("resolve mixed empty");
         assert_eq!(res_mixed_empty.cached.expect("cached").versions.len(), 1);
+    }
+
+    #[test]
+    fn matches_strict_borrowed_matches_shallow_headers_and_rejects_corrupt_or_divergent_buffers() {
+        let base_bytes = create_real_xlmeta().expect("create real xlmeta");
+        let mut peer_fm = FileMeta::load(&base_bytes).expect("load base xlmeta");
+        // Mutate inner version payload (ver.meta) without changing shallow header.
+        let mut ver = FileMetaVersion::try_from(peer_fm.versions[1].meta.as_slice()).expect("decode version");
+        ver.object.as_mut().expect("object version").erasure_index += 1;
+        peer_fm.versions[1].meta = ver.marshal_msg().expect("marshal peer version");
+        let peer_bytes = peer_fm.marshal_msg().expect("marshal peer xlmeta");
+        assert_ne!(base_bytes, peer_bytes, "peer shard has distinct erasure index payload");
+
+        let mut e1 = MetaCacheEntry {
+            name: "obj-a".to_owned(),
+            metadata: base_bytes.clone(),
+            cached: None,
+            reusable: false,
+        };
+        let e1_clone = e1.clone();
+        let e2 = MetaCacheEntry {
+            name: "obj-a".to_owned(),
+            metadata: peer_bytes,
+            cached: None,
+            reusable: false,
+        };
+        assert!(e1.matches_strict_borrowed(&e2));
+        assert!(e1.matches_strict_borrowed(&e1_clone));
+
+        // Different shallow header must not match.
+        let mut newer_fm = FileMeta::load(&base_bytes).expect("load base xlmeta");
+        newer_fm.versions[0].header.version_id = Some(Uuid::new_v4());
+        let newer_entry = MetaCacheEntry {
+            name: "obj-a".to_owned(),
+            metadata: newer_fm.marshal_msg().expect("marshal newer xlmeta"),
+            cached: None,
+            reusable: false,
+        };
+        assert!(!e1.matches_strict_borrowed(&newer_entry));
+
+        // Identical corrupt buffers must return false, never true via byte-equality shortcut.
+        let mut corrupt = MetaCacheEntry {
+            name: "obj-a".to_owned(),
+            metadata: b"XL2 corrupt-payload".to_vec(),
+            cached: None,
+            reusable: false,
+        };
+        let corrupt_peer = corrupt.clone();
+        assert!(!corrupt.matches_strict_borrowed(&corrupt_peer));
+    }
+
+    #[tokio::test]
+    async fn try_peek_buffered_and_skip_current_match_async_peek_and_skip() {
+        let entries: Vec<_> = (0..5)
+            .map(|i| MetaCacheEntry {
+                name: format!("buffered-key-{i}"),
+                metadata: vec![i as u8; 16],
+                cached: None,
+                reusable: false,
+            })
+            .collect();
+        let mut buf = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut buf);
+        writer.write(&entries).await.expect("write entries");
+        writer.close_with_limit_reached(false).await.expect("close stream");
+
+        let mut reader = MetacacheReader::new(Cursor::new(buf.into_inner()));
+        assert!(reader.try_peek_buffered().is_none(), "uninitialized reader must defer to async peek");
+        assert!(!reader.skip_current(), "no current entry before first peek");
+
+        let first = reader.peek().await.expect("first peek").expect("entry 0");
+        assert_eq!(first, entries[0]);
+        assert!(reader.skip_current(), "skip_current must consume the peeked entry");
+        assert!(!reader.skip_current(), "second skip_current without peek must return false");
+
+        for expected in &entries[1..] {
+            let next = reader
+                .try_peek_buffered()
+                .expect("remaining entries are already buffered")
+                .expect("valid entry")
+                .expect("present entry");
+            assert_eq!(&next, expected);
+            assert!(reader.skip_current());
+        }
+
+        assert!(
+            reader.try_peek_buffered().is_none(),
+            "stream terminator must defer to async peek for trailer handling"
+        );
+        assert!(reader.peek().await.expect("eof peek").is_none());
+        assert_eq!(reader.limit_reached(), Some(false));
     }
 }

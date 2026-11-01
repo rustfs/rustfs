@@ -5637,13 +5637,11 @@ impl ECStore {
         }
 
         if self.single_pool()
-            && !creates_latest_marker
             && !opts.data_movement
             && opts.http_preconditions.is_none()
             && !opts.replication_request
-            && !opts.versioned
             && !opts.version_suspended
-            && opts.version_id.is_none()
+            && !opts.delete_marker
             && !self.is_suspended(0).await
             && !self.is_pool_rebalancing(0).await
         {
@@ -5655,6 +5653,10 @@ impl ECStore {
                 .await
             {
                 Ok(mut res) => {
+                    #[cfg(test)]
+                    if creates_latest_marker {
+                        pause_versioned_delete_marker_after_commit(bucket, object).await;
+                    }
                     res.name = decode_dir_object(res.name.as_str());
                     return Ok(res);
                 }

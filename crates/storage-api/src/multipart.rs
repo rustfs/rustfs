@@ -15,6 +15,15 @@
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+/// Checks upload absence before removing a bucket's data protections.
+#[async_trait::async_trait]
+pub trait MultipartUploadInspection: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    /// Unknown or unreadable upload ownership must fail this check.
+    async fn ensure_no_multipart_uploads(&self, bucket: &str) -> Result<(), Self::Error>;
+}
+
 #[derive(Debug, Default, Clone)]
 pub struct MultipartUploadResult {
     pub upload_id: String,
