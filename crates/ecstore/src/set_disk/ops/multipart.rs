@@ -3266,19 +3266,6 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         let mut decommission_target_lock_covered = false;
         let mut decommission_capacity_guard = None;
 
-        if opts.http_preconditions.is_some() {
-            if write_context.acquires_namespace() {
-                object_lock_guard = Some(
-                    self.acquire_write_lock_diag("complete_multipart_upload_precondition", bucket, object)
-                        .await?,
-                );
-            }
-
-            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
-                return Err(err);
-            }
-        }
-
         if let Some(store) = opts.decommission_capacity_admission.as_ref() {
             #[cfg(test)]
             {
@@ -3290,7 +3277,8 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     self.pool_index,
                     bucket,
                     object,
-                    !write_context.acquires_namespace() || object_lock_guard.is_some(),
+                    !write_context.acquires_namespace(),
+                    false,
                     DecommissionCapacityAdmission::ExistingMultipart,
                 )
                 .await?;
@@ -3303,6 +3291,28 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 self.acquire_write_lock_diag("complete_multipart_upload_commit", bucket, object)
                     .await?,
             );
+        }
+        // Evaluate the precondition after taking the fixed decommission domain
+        // and the target domain, so a staged upload on the retiring source
+        // cannot publish while migration holds its source read anchor.
+        if opts.http_preconditions.is_some() {
+            // The store's earlier cross-pool check is advisory. A write in a
+            // different pool can complete before this fixed-domain guard is
+            // acquired, so recheck all pools while it excludes those writes.
+            if decommission_object_lock_guard.is_some()
+                && !opts.data_movement
+                && !opts.replication_request
+                && !opts.no_lock
+                && !opts.skip_decommissioned
+                && !opts.skip_rebalancing
+                && let Some(store) = opts.decommission_capacity_admission.as_ref()
+                && let Some(err) = store.check_write_precondition(bucket, object, opts, true).await
+            {
+                return Err(err);
+            }
+            if let Some(err) = self.check_write_precondition(bucket, object, opts).await {
+                return Err(err);
+            }
         }
         let upload_guard = self
             .acquire_multipart_upload_write_lock("complete_multipart_upload_commit", bucket, object, upload_id, opts)

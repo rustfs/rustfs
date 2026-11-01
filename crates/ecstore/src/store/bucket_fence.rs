@@ -45,7 +45,8 @@
 use crate::error::{Result, StorageError};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use rustfs_lock::NamespaceLockGuard;
 use rustfs_lock::distributed_lock::LockLostSignal;
@@ -65,7 +66,7 @@ struct RegisteredGuard {
 
 enum LockLossProbe {
     Distributed(Arc<LockLostSignal>),
-    Local,
+    Local(Option<rustfs_lock::fast_lock::guard::FastLockGuardProbe>),
     #[cfg(test)]
     Test(Arc<std::sync::atomic::AtomicBool>),
 }
@@ -74,14 +75,19 @@ impl LockLossProbe {
     fn from_guard(guard: &NamespaceLockGuard) -> Self {
         match guard.lock_lost_signal() {
             Some(signal) => Self::Distributed(signal),
-            None => Self::Local,
+            None => Self::Local(match guard {
+                NamespaceLockGuard::Fast(guard) => guard.release_probe(),
+                NamespaceLockGuard::Standard(_) => None,
+            }),
         }
     }
 
     fn is_lost(&self) -> bool {
+        // Registry callers hold entries before checking a local shard; shard
+        // operations never acquire the bucket fence registry.
         match self {
             Self::Distributed(signal) => signal.is_lost(),
-            Self::Local => false,
+            Self::Local(probe) => probe.as_ref().is_some_and(|probe| probe.is_lost()),
             #[cfg(test)]
             Self::Test(lost) => lost.load(std::sync::atomic::Ordering::SeqCst),
         }
@@ -98,9 +104,74 @@ pub(super) struct FenceRegistration {
 #[derive(Default)]
 pub(crate) struct BucketFenceRegistry {
     entries: Mutex<HashMap<String, FenceEntry>>,
+    reservation_slots: Mutex<HashMap<(String, Uuid), Weak<ReservationFenceSlot>>>,
+}
+
+#[derive(Default)]
+pub(super) struct ReservationFenceSlot {
+    pub(super) owner: tokio::sync::Mutex<Weak<ReservationFenceGuard>>,
+}
+
+/// Shared by short bursts of reservations, but never kept alive by the cache.
+pub(super) struct ReservationFenceGuard {
+    publication: NamespaceLockGuard,
+    lifecycle: BucketIncarnationFenceGuard,
+    created_at: tokio::time::Instant,
+    _slot: Arc<ReservationFenceSlot>,
+}
+
+impl ReservationFenceGuard {
+    pub(super) fn new(
+        publication: NamespaceLockGuard,
+        lifecycle: BucketIncarnationFenceGuard,
+        slot: Arc<ReservationFenceSlot>,
+    ) -> Self {
+        Self {
+            publication,
+            lifecycle,
+            created_at: tokio::time::Instant::now(),
+            _slot: slot,
+        }
+    }
+
+    pub(super) fn is_reusable(&self) -> bool {
+        // Stop admitting new reservations through this shared reader so a
+        // queued bucket writer can progress after the existing tails drain.
+        self.created_at.elapsed() < Duration::from_secs(1) && self.is_held()
+    }
+
+    fn is_held(&self) -> bool {
+        !self.publication.is_lock_lost()
+            && !self.publication.is_released()
+            && !self.lifecycle.is_lock_lost()
+            && self
+                .lifecycle
+                .namespace_lock_guard()
+                .is_some_and(|guard| !guard.is_released())
+    }
+}
+
+impl crate::disk::os::MetadataReservationFence for ReservationFenceGuard {
+    fn is_valid(&self) -> bool {
+        self.is_held()
+    }
 }
 
 impl BucketFenceRegistry {
+    pub(super) fn reservation_slot(&self, bucket: &str, incarnation: Uuid) -> Arc<ReservationFenceSlot> {
+        let mut slots = self.reservation_slots.lock().expect("reservation fence registry poisoned");
+        let key = (bucket.to_owned(), incarnation);
+        if let Some(slot) = slots.get(&key).and_then(Weak::upgrade) {
+            return slot;
+        }
+        if slots.len() >= 1024 {
+            slots.retain(|_, slot| slot.strong_count() != 0);
+        }
+        let slot = Arc::new(ReservationFenceSlot::default());
+        slots.insert(key, Arc::downgrade(&slot));
+        slot
+    }
+
     /// Register a new live guard for `bucket` and return the memoized
     /// incarnation id if one is valid for the current coverage window.
     fn enter(&self, bucket: &str, loss_probe: LockLossProbe) -> FenceRegistration {
@@ -234,7 +305,9 @@ impl BucketIncarnationFenceGuard {
     }
 
     pub fn is_lock_lost(&self) -> bool {
-        self.inner.as_ref().is_some_and(NamespaceLockGuard::is_lock_lost)
+        self.inner
+            .as_ref()
+            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
     }
 
     pub(crate) fn namespace_lock_guard(&self) -> Option<&NamespaceLockGuard> {
@@ -350,6 +423,67 @@ mod tests {
         reg.exit("b", second.token, false);
         reg.exit("b", third.token, false);
         reg.exit("b", fourth.token, false);
+    }
+
+    #[tokio::test]
+    async fn disabled_local_lock_does_not_add_a_namespace_fence() {
+        let manager = Arc::new(rustfs_lock::GlobalLockManager::Disabled(
+            rustfs_lock::fast_lock::DisabledLockManager::new(),
+        ));
+        let lock = NamespaceLock::with_local_manager("disabled-fence".into(), manager);
+        let guard = lock
+            .get_read_lock(ObjectKey::new("b", "object"), "owner", Duration::from_secs(1))
+            .await
+            .expect("disabled lock");
+        let mut opts = crate::object_api::ObjectOptions::default();
+        opts.add_namespace_lock_guard(&guard);
+        assert!(opts.namespace_lock_fence.is_none());
+    }
+
+    #[tokio::test]
+    async fn forced_local_fence_loss_invalidates_live_incarnation_memo() {
+        let manager = Arc::new(rustfs_lock::FastObjectLockManager::new());
+        let global = Arc::new(rustfs_lock::GlobalLockManager::Enabled(manager.clone()));
+        let lock = NamespaceLock::with_local_manager("forced-fence".into(), global);
+        let key = ObjectKey::new("b", "lifecycle");
+        let registry = Arc::new(BucketFenceRegistry::default());
+        let inner = lock
+            .get_read_lock(key.clone(), "first", Duration::from_secs(1))
+            .await
+            .expect("first lock");
+        let mut first = BucketIncarnationFenceGuard::new(registry.clone(), "b", inner, true);
+        first.validate(true, || async { Ok(uuid(7)) }).await.expect("seed memo");
+        let mut opts = crate::object_api::ObjectOptions::default();
+        first.attach_to_object_options(&mut opts);
+        opts.add_namespace_lock_guard(first.namespace_lock_guard().expect("local guard"));
+        assert!(
+            !opts
+                .bucket_lifecycle_lock_fence
+                .as_ref()
+                .expect("lifecycle fence")
+                .is_lock_lost()
+        );
+        assert!(!opts.namespace_lock_fence.as_ref().expect("namespace fence").is_lock_lost());
+        assert_eq!(manager.force_unlock(&key), 1);
+        assert!(
+            opts.bucket_lifecycle_lock_fence
+                .as_ref()
+                .expect("attached fence")
+                .is_lock_lost()
+        );
+        assert!(opts.namespace_lock_fence.as_ref().expect("namespace fence").is_lock_lost());
+        let writer = lock
+            .get_write_lock(key.clone(), "writer", Duration::from_secs(1))
+            .await
+            .expect("writer");
+        drop(writer);
+        let inner = lock
+            .get_read_lock(key, "second", Duration::from_secs(1))
+            .await
+            .expect("second lock");
+        let mut second = BucketIncarnationFenceGuard::new(registry.clone(), "b", inner, true);
+        assert_eq!(second.validate(true, || async { Ok(uuid(8)) }).await.expect("reload"), uuid(8));
+        assert!(first.validate(true, || async { Ok(uuid(7)) }).await.is_err());
     }
 
     #[tokio::test]

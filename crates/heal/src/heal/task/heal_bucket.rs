@@ -14,13 +14,26 @@
 /// bucket/cluster/prefix heal: the recursive bucket-objects sweep and the erasure-set usage baseline
 use super::*;
 use crate::heal::progress::{add_bytes, increment_counter, stable_generation};
-use crate::heal::storage::HealListItem;
+use crate::heal::storage::{HealListItem, HealStorageObjectResult};
 use crate::heal::utils::format_set_disk_id;
+use futures::{StreamExt, stream::FuturesUnordered};
+use std::collections::HashSet;
 
 const MAX_DEFERRED_OBJECTS: usize = 256;
 const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 const MAX_DEFERRED_FORWARD_PAGES: u64 = 2;
 const MAX_DEFERRED_AGE: Duration = Duration::from_secs(30);
+const MAX_INFLIGHT_REPAIRS: usize = 8;
+
+#[cfg(test)]
+pub(super) fn deferred_payload_budget_for_test() -> usize {
+    MAX_DEFERRED_BYTES - MAX_DEFERRED_OBJECTS * size_of::<DeferredObject>()
+}
+// A recovered pool can become writable just after the ordinary retry budget.
+// Keep this extra attempt inside the existing deferred age and backoff caps.
+const MAX_SLOWDOWN_OBJECT_RETRIES: u32 = MAX_BUCKET_OBJECT_HEAL_RETRIES + 1;
+
+type HealListingPage = (Vec<HealListItem>, Option<String>, bool);
 
 struct DeferredObject {
     name: String,
@@ -57,7 +70,11 @@ impl DeferredObject {
         let now = tokio::time::Instant::now();
         let first = *self.first_failure.get_or_insert(now);
         self.attempt += 1;
-        self.due = (now + delay).min(first + MAX_DEFERRED_AGE);
+        let remaining = (first + MAX_DEFERRED_AGE).saturating_duration_since(now);
+        // Scheduling exactly at the deadline guarantees the retry will be
+        // rejected as expired without making the storage attempt.
+        let delay = if delay >= remaining { remaining / 2 } else { delay };
+        self.due = now + delay;
     }
 }
 
@@ -89,16 +106,23 @@ impl DeferredWindow {
         Ok(())
     }
 
-    fn pop_due(&mut self) -> Option<DeferredObject> {
+    fn pop_due(&mut self, in_flight: &HashSet<String>) -> Option<DeferredObject> {
         let now = tokio::time::Instant::now();
-        let index = self.objects.iter().position(|item| item.due <= now)?;
+        let index = self
+            .objects
+            .iter()
+            .position(|item| item.due <= now && !in_flight.contains(&item.name))?;
         let item = self.objects.remove(index)?;
         self.bytes -= item.payload_bytes();
         Some(item)
     }
 
-    fn next_due(&self) -> Option<tokio::time::Instant> {
-        self.objects.iter().map(|item| item.due).min()
+    fn next_due(&self, in_flight: &HashSet<String>) -> Option<tokio::time::Instant> {
+        self.objects
+            .iter()
+            .filter(|item| !in_flight.contains(&item.name))
+            .map(|item| item.due)
+            .min()
     }
 
     fn can_advance(&self, page: u64) -> bool {
@@ -132,6 +156,32 @@ fn unavailable_recreate_error(result: &HealResultItem, opts: &HealOpts) -> Optio
 }
 
 impl HealTask {
+    async fn heal_bucket_storage_object(
+        &self,
+        bucket: &str,
+        item: DeferredObject,
+        incarnation: Option<Uuid>,
+        opts: &HealOpts,
+    ) -> (DeferredObject, Result<HealStorageObjectResult>) {
+        let result = self
+            .await_with_control(async {
+                match incarnation {
+                    Some(expected) => {
+                        self.storage
+                            .heal_object_at_incarnation(bucket, &item.name, item.version_id.as_deref(), expected, opts)
+                            .await
+                    }
+                    None => {
+                        self.storage
+                            .heal_object_with_receipt(bucket, &item.name, item.version_id.as_deref(), opts)
+                            .await
+                    }
+                }
+            })
+            .await;
+        (item, result)
+    }
+
     async fn recover_bucket_delete_transactions(&self, bucket: &str, opts: &HealOpts) -> Result<bool> {
         if let Some(result) = self
             .await_with_control(
@@ -649,56 +699,168 @@ impl HealTask {
             };
             let mut continuation_token: Option<String> = None;
             let mut deferred = DeferredWindow::default();
-            let mut inline_retry: Option<DeferredObject> = None;
+            // Only already-admitted operations can overflow the deferred byte
+            // budget. Stop listing and page advancement while these drain.
+            let mut inline_retry = VecDeque::<DeferredObject>::new();
             let mut page_number = 0_u64;
             let mut aborted_progress_unknown = false;
             let mut pending = Vec::<HealListItem>::new().into_iter();
             let mut listing_finished = false;
             let mut listing_attempt = 0;
             let mut listing_due = tokio::time::Instant::now();
+            let mut listing_inflight: Option<futures::future::BoxFuture<'static, Result<HealListingPage>>> = None;
+            let mut in_flight = HashSet::new();
+            let repairs_aborted = Arc::new(AtomicBool::new(false));
+            let mut repairs: FuturesUnordered<
+                futures::future::BoxFuture<'_, (DeferredObject, Result<HealStorageObjectResult>, bool)>,
+            > = FuturesUnordered::new();
             let scope_result: Result<()> = async {
                 loop {
                     self.check_control_flags().await?;
-                    if listing_finished && pending.as_slice().is_empty() && deferred.objects.is_empty() && inline_retry.is_none()
+                    if listing_finished
+                        && pending.as_slice().is_empty()
+                        && deferred.objects.is_empty()
+                        && inline_retry.is_empty()
+                        && repairs.is_empty()
                     {
                         break;
                     }
-                    self.pace_mainline().await?;
                     // Listing and object retries share this safe boundary. A
                     // failed listing never hides an already-due object retry.
-                    let item = deferred.pop_due().or_else(|| {
-                        if inline_retry
-                            .as_ref()
-                            .is_some_and(|item| item.due <= tokio::time::Instant::now())
-                        {
-                            inline_retry.take()
-                        } else if inline_retry.is_none() {
+                    let item = if repairs.len() < MAX_INFLIGHT_REPAIRS {
+                        let due = inline_retry
+                            .iter()
+                            .position(|item| item.due <= tokio::time::Instant::now() && !in_flight.contains(&item.name));
+                        due.and_then(|index| inline_retry.remove(index))
+                            .or_else(|| deferred.pop_due(&in_flight))
+                    } else {
+                        None
+                    }
+                    .or_else(|| {
+                        if inline_retry.is_empty() && repairs.is_empty() {
                             pending.next().map(|item| DeferredObject::new(item, page_number))
                         } else {
                             None
                         }
                     });
-                    let Some(mut item) = item else {
-                        let can_list = !listing_finished && inline_retry.is_none() && deferred.can_advance(page_number);
+                    let (mut item, storage_result, age_exhausted) = if let Some(item) = item {
+                        if item.expired() {
+                            (item, Err(Error::other("heal object retry age exhausted")), true)
+                        } else {
+                            in_flight.insert(item.name.clone());
+                            let opts = &heal_opts;
+                            let aborted = Arc::clone(&repairs_aborted);
+                            repairs.push(Box::pin(async move {
+                                if aborted.load(Ordering::Acquire) {
+                                    return (item, Err(Error::TaskCancelled), false);
+                                }
+                                if let Err(error) = self.pace_mainline().await {
+                                    return (item, Err(error), false);
+                                }
+                                if aborted.load(Ordering::Acquire) {
+                                    return (item, Err(Error::TaskCancelled), false);
+                                }
+                                let (item, result) = self
+                                    .heal_bucket_storage_object(bucket, item, traversal_incarnation_id, opts)
+                                    .await;
+                                (item, result, true)
+                            }));
+                            continue;
+                        }
+                    } else if !repairs.is_empty() {
+                        let next_retry = if repairs.len() < MAX_INFLIGHT_REPAIRS {
+                            deferred
+                                .next_due(&in_flight)
+                                .into_iter()
+                                .chain(
+                                    inline_retry
+                                        .iter()
+                                        .filter(|item| !in_flight.contains(&item.name))
+                                        .map(|item| item.due),
+                                )
+                                .min()
+                        } else {
+                            None
+                        };
+                        let completed = if let Some(due) = next_retry {
+                            tokio::select! {
+                                biased;
+                                _ = tokio::time::sleep_until(due) => None,
+                                completed = repairs.next() => completed,
+                            }
+                        } else {
+                            repairs.next().await
+                        };
+                        let Some((item, result, attempted)) = completed else {
+                            continue;
+                        };
+                        in_flight.remove(&item.name);
+                        if !attempted && item.attempt == 0 {
+                            return Err(result.expect_err("an unstarted repair must have a control error"));
+                        }
+                        (item, result, false)
+                    } else {
+                        self.pace_mainline().await?;
+                        let can_list = !listing_finished && inline_retry.is_empty() && deferred.can_advance(page_number);
                         if can_list && listing_due <= tokio::time::Instant::now() {
-                            let page = if let Some(set_disk_id) = set_disk_id.as_deref() {
-                                self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
-                                    set_disk_id,
-                                    bucket,
-                                    prefix,
-                                    continuation_token.as_deref(),
-                                    false,
-                                ))
-                                .await
-                            } else {
-                                self.await_with_control(self.storage.list_objects_for_heal_page(
-                                    bucket,
-                                    prefix,
-                                    continuation_token.as_deref(),
-                                    false,
-                                ))
-                                .await
+                            if listing_inflight.is_none() {
+                                let storage = Arc::clone(&self.storage);
+                                let listing_set = set_disk_id.clone();
+                                let listing_bucket = bucket.to_owned();
+                                let listing_prefix = prefix.to_owned();
+                                let cursor = continuation_token.clone();
+                                listing_inflight = Some(Box::pin(async move {
+                                    if let Some(set_id) = listing_set.as_deref() {
+                                        storage
+                                            .list_versions_for_heal_page_disk_walk(
+                                                set_id,
+                                                &listing_bucket,
+                                                &listing_prefix,
+                                                cursor.as_deref(),
+                                                false,
+                                            )
+                                            .await
+                                    } else {
+                                        storage
+                                            .list_objects_for_heal_page(
+                                                &listing_bucket,
+                                                &listing_prefix,
+                                                cursor.as_deref(),
+                                                false,
+                                            )
+                                            .await
+                                    }
+                                }));
+                            }
+                            let next_retry = deferred
+                                .next_due(&in_flight)
+                                .into_iter()
+                                .chain(inline_retry.iter().map(|item| item.due))
+                                .min();
+                            let Some(listing) = listing_inflight.as_mut() else {
+                                return Err(Error::other("heal listing future is unavailable"));
                             };
+                            // Keep the same listing future alive while an earlier retry runs.
+                            // Restarting a disk walk here would duplicate work and may change its snapshot.
+                            let result = self
+                                .await_with_control(async {
+                                    if let Some(due) = next_retry {
+                                        tokio::select! {
+                                            biased;
+                                            _ = tokio::time::sleep_until(due) => Ok(None),
+                                            result = listing => Ok(Some(result)),
+                                        }
+                                    } else {
+                                        Ok(Some(listing.await))
+                                    }
+                                })
+                                .await;
+                            let page = match result {
+                                Ok(Some(page)) => page,
+                                Ok(None) => continue,
+                                Err(error) => Err(error),
+                            };
+                            listing_inflight = None;
                             match page {
                                 Ok((objects, next_token, is_truncated)) => {
                                     page_number = page_number.saturating_add(1);
@@ -727,9 +889,9 @@ impl HealTask {
                             continue;
                         } else {
                             let due = deferred
-                                .next_due()
+                                .next_due(&in_flight)
                                 .into_iter()
-                                .chain(inline_retry.as_ref().map(|item| item.due))
+                                .chain(inline_retry.iter().map(|item| item.due))
                                 .chain(can_list.then_some(listing_due))
                                 .min();
                             if let Some(due) = due {
@@ -761,89 +923,74 @@ impl HealTask {
                     }
 
                     let mut terminal_outcome = true;
-                    let age_exhausted = item.expired();
-                    let error = if age_exhausted {
-                        Some(Error::other("heal object retry age exhausted"))
-                    } else {
-                        match self
-                            .await_with_control(async {
-                                match traversal_incarnation_id {
-                                    Some(expected) => {
-                                        self.storage
-                                            .heal_object_at_incarnation(
-                                                bucket,
-                                                object,
-                                                item.version_id.as_deref(),
-                                                expected,
-                                                &heal_opts,
-                                            )
-                                            .await
-                                    }
-                                    None => {
-                                        self.storage
-                                            .heal_object_with_receipt(bucket, object, item.version_id.as_deref(), &heal_opts)
-                                            .await
-                                    }
-                                }
-                            })
-                            .await
-                        {
-                            Ok(storage_result) if storage_result.error.is_none() => {
-                                match unavailable_recreate_error(&storage_result.item, &heal_opts) {
-                                    Some(error) => Some(error),
-                                    None => {
-                                        #[cfg(test)]
-                                        super::pause_storage_receipt(&self.id).await;
-                                        recorded_authoritative_outcome =
-                                            self.record_verified_storage_receipt(&identity, storage_result.receipt).await;
-                                        if !recorded_authoritative_outcome && self.cancel_token.is_cancelled() {
-                                            Some(Error::TaskCancelled)
-                                        } else {
-                                            telemetry_unknown |= !increment_counter(&mut healed);
-                                            telemetry_unknown |= !add_bytes(
-                                                &mut bytes,
-                                                u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
-                                            );
-                                            if !recorded_authoritative_outcome
-                                                && !heal_opts.dry_run
-                                                && !storage_result.item.detail.is_empty()
-                                            {
-                                                detail = Some(storage_result.item.detail.clone());
-                                            }
-                                            self.record_result_item(storage_result.item).await;
-                                            None
+                    let object = item.name.as_str();
+                    let error = match storage_result {
+                        Ok(storage_result) if storage_result.error.is_none() => {
+                            match unavailable_recreate_error(&storage_result.item, &heal_opts) {
+                                Some(error) => Some(error),
+                                None => {
+                                    #[cfg(test)]
+                                    super::pause_storage_receipt(&self.id).await;
+                                    recorded_authoritative_outcome =
+                                        self.record_verified_storage_receipt(&identity, storage_result.receipt).await;
+                                    if !recorded_authoritative_outcome && self.cancel_token.is_cancelled() {
+                                        Some(Error::TaskCancelled)
+                                    } else {
+                                        telemetry_unknown |= !increment_counter(&mut healed);
+                                        telemetry_unknown |= !add_bytes(
+                                            &mut bytes,
+                                            u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX),
+                                        );
+                                        if !recorded_authoritative_outcome
+                                            && !heal_opts.dry_run
+                                            && !storage_result.item.detail.is_empty()
+                                        {
+                                            detail = Some(storage_result.item.detail.clone());
                                         }
+                                        self.record_result_item(storage_result.item).await;
+                                        None
                                     }
                                 }
                             }
-                            Ok(storage_result)
-                                if storage_result
-                                    .error
-                                    .as_ref()
-                                    .is_some_and(|err| is_missing_object_dir_heal_result(object, err)) =>
-                            {
-                                telemetry_unknown |= !increment_counter(&mut healed);
-                                debug!(
-                                    target: "rustfs::heal::task",
-                                    event = EVENT_HEAL_BUCKET_RESULT,
-                                    component = LOG_COMPONENT_HEAL,
-                                    subsystem = LOG_SUBSYSTEM_TASK,
-                                    task_id = %self.id,
-                                    bucket,
-                                    object,
-                                    result = "object_dir_not_found_skipped",
-                                    "Heal bucket object-dir candidate skipped after not-found result"
-                                );
-                                None
-                            }
-                            Ok(storage_result) => storage_result.error,
-                            Err(err) => Some(err),
                         }
+                        Ok(storage_result)
+                            if storage_result
+                                .error
+                                .as_ref()
+                                .is_some_and(|err| is_missing_object_dir_heal_result(object, err)) =>
+                        {
+                            telemetry_unknown |= !increment_counter(&mut healed);
+                            debug!(
+                                target: "rustfs::heal::task",
+                                event = EVENT_HEAL_BUCKET_RESULT,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_TASK,
+                                task_id = %self.id,
+                                bucket,
+                                object,
+                                result = "object_dir_not_found_skipped",
+                                "Heal bucket object-dir candidate skipped after not-found result"
+                            );
+                            None
+                        }
+                        Ok(storage_result) => storage_result.error,
+                        Err(err) => Some(err),
                     };
 
                     if let Some(err) = error {
                         match err {
-                            Error::StaleBucketIncarnation { .. } => return Err(err),
+                            Error::StaleBucketIncarnation { .. } => {
+                                self.outcome.write().await.record(HealObjectOutcome {
+                                    deep_check_observed: false,
+                                    quorum_selected_data_dir: None,
+                                    identity,
+                                    disposition: HealObjectDisposition::Unknown,
+                                    detail: None,
+                                });
+                                aborted_progress_unknown |= !increment_counter(&mut scanned);
+                                aborted_progress_unknown |= !increment_counter(&mut skipped);
+                                return Err(err);
+                            }
                             Error::TaskCancelled | Error::TaskTimeout => {
                                 let disposition = if matches!(err, Error::TaskCancelled) {
                                     HealObjectDisposition::Cancelled
@@ -912,7 +1059,12 @@ impl HealTask {
                             );
                         } else if !age_exhausted
                             && err.is_recoverable_object_heal()
-                            && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES
+                            && retry_attempt
+                                < if matches!(&err, Error::Storage(crate::heal::StorageError::SlowDown)) {
+                                    MAX_SLOWDOWN_OBJECT_RETRIES
+                                } else {
+                                    MAX_BUCKET_OBJECT_HEAL_RETRIES
+                                }
                         {
                             terminal_outcome = false;
                             debug!(
@@ -930,7 +1082,7 @@ impl HealTask {
                             );
                             item.defer(Self::bucket_object_retry_delay(&self.id, retry_attempt + 1));
                             if let Err(item) = deferred.push(item) {
-                                inline_retry = Some(item);
+                                inline_retry.push_back(item);
                             }
                         } else {
                             disposition = HealObjectDisposition::Failed(if age_exhausted || err.is_recoverable_object_heal() {
@@ -947,17 +1099,24 @@ impl HealTask {
                             first_failed_object.get_or_insert_with(|| object.to_string());
                             first_error.get_or_insert_with(|| err.to_string());
                             if take_failure_log_sample(&mut failure_samples_logged) {
+                                let retry_age_ms = item
+                                    .first_failure
+                                    .map(|first| u64::try_from(first.elapsed().as_millis()).unwrap_or(u64::MAX));
+                                let retry_due_lag_ms =
+                                    age_exhausted.then(|| u64::try_from(item.due.elapsed().as_millis()).unwrap_or(u64::MAX));
                                 warn!(
                                     target: "rustfs::heal::task",
                                     event = EVENT_HEAL_BUCKET_RESULT,
                                     component = LOG_COMPONENT_HEAL,
                                     subsystem = LOG_SUBSYSTEM_TASK,
+                                    result = "object_failed",
                                     task_id = %self.id,
                                     bucket,
                                     object,
                                     retry_attempt,
+                                    retry_age_ms = ?retry_age_ms,
+                                    retry_due_lag_ms = ?retry_due_lag_ms,
                                     error = %err,
-                                    result = "object_failed",
                                     "Heal bucket object repair failed"
                                 );
                             }
@@ -998,6 +1157,7 @@ impl HealTask {
             }
             .await;
             if let Err(error) = scope_result {
+                repairs_aborted.store(true, Ordering::Release);
                 let disposition = match error {
                     Error::TaskCancelled => HealObjectDisposition::Cancelled,
                     Error::TaskTimeout => HealObjectDisposition::Deferred {
@@ -1006,20 +1166,51 @@ impl HealTask {
                     },
                     _ => HealObjectDisposition::Unknown,
                 };
+                // Keep issued replacement I/O alive until it reaches its storage
+                // boundary, even when another operation aborts this traversal.
+                while let Some((item, result, attempted)) = repairs.next().await {
+                    if !attempted && item.attempt == 0 {
+                        continue;
+                    }
+                    let mut identity =
+                        self.outcome_identity(bucket, &item.name, item.version_id.as_deref(), heal_opts.pool, heal_opts.set);
+                    identity.bucket_incarnation_id = bucket_incarnation_id;
+                    let mut recorded = false;
+                    if let Ok(storage_result) = result
+                        && storage_result.error.is_none()
+                        && unavailable_recreate_error(&storage_result.item, &heal_opts).is_none()
+                    {
+                        recorded = self.record_verified_storage_receipt(&identity, storage_result.receipt).await;
+                        if recorded {
+                            aborted_progress_unknown |= !increment_counter(&mut healed);
+                            aborted_progress_unknown |=
+                                !add_bytes(&mut bytes, u64::try_from(storage_result.item.object_size).unwrap_or(u64::MAX));
+                            self.record_result_item(storage_result.item).await;
+                        }
+                    }
+                    if !recorded {
+                        self.outcome.write().await.record(HealObjectOutcome {
+                            deep_check_observed: false,
+                            quorum_selected_data_dir: None,
+                            identity,
+                            disposition: disposition.clone(),
+                            detail: None,
+                        });
+                        aborted_progress_unknown |= !increment_counter(&mut skipped);
+                    }
+                    aborted_progress_unknown |= !increment_counter(&mut scanned);
+                }
                 // Only attempted identities have terminal outcomes. Unstarted
                 // page tails remain unprocessed under the task's partial coverage.
                 // No detached sleepers survive abort.
                 for item in deferred.objects.into_iter().chain(inline_retry) {
+                    let mut identity =
+                        self.outcome_identity(bucket, &item.name, item.version_id.as_deref(), heal_opts.pool, heal_opts.set);
+                    identity.bucket_incarnation_id = bucket_incarnation_id;
                     self.outcome.write().await.record(HealObjectOutcome {
                         deep_check_observed: false,
                         quorum_selected_data_dir: None,
-                        identity: self.outcome_identity(
-                            bucket,
-                            &item.name,
-                            item.version_id.as_deref(),
-                            heal_opts.pool,
-                            heal_opts.set,
-                        ),
+                        identity,
                         disposition: disposition.clone(),
                         detail: None,
                     });

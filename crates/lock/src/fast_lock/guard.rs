@@ -19,8 +19,8 @@ use crate::fast_lock::{
 use rustfs_io_metrics::{
     record_read_lock_held_acquire, record_read_lock_held_release, record_write_lock_held_acquire, record_write_lock_held_release,
 };
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 
 /// Global counter for guard IDs to prevent double-release
 static GUARD_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -39,8 +39,23 @@ pub struct FastLockGuard {
     shard: Option<Arc<LockShard>>, // None when locks are disabled
     released: bool,
     disabled: bool, // True when locks are disabled globally
+    committed_tail: bool,
+    sealed_for_commit: bool,
     /// Unique ID for this guard instance to prevent double-release
     guard_id: u64,
+}
+
+/// A non-owning check of one local acquisition, including forced release.
+#[derive(Clone)]
+pub struct FastLockGuardProbe {
+    shard: Weak<LockShard>,
+    guard_id: u64,
+}
+
+impl FastLockGuardProbe {
+    pub fn is_lost(&self) -> bool {
+        self.shard.upgrade().is_none_or(|shard| !shard.is_guard_active(self.guard_id))
+    }
 }
 
 impl FastLockGuard {
@@ -54,6 +69,8 @@ impl FastLockGuard {
             shard: Some(shard),
             released: false,
             disabled: false,
+            committed_tail: false,
+            sealed_for_commit: false,
             guard_id,
         }
     }
@@ -68,6 +85,8 @@ impl FastLockGuard {
             shard: None,
             released: false,
             disabled: true,
+            committed_tail: false,
+            sealed_for_commit: false,
             guard_id,
         }
     }
@@ -85,6 +104,83 @@ impl FastLockGuard {
     /// Get the lock owner
     pub fn owner(&self) -> &Arc<str> {
         &self.owner
+    }
+
+    /// The physical acquisition was force-released before registration.
+    pub(crate) fn abandon_unregistered(&mut self) {
+        if !self.released {
+            self.released = true;
+            record_lock_held_release(self.mode);
+        }
+    }
+
+    /// Keep excluding writers while permitting reads of the committed version.
+    pub fn downgrade_committed_tail(&mut self) -> bool {
+        if self.released || self.sealed_for_commit {
+            return false;
+        }
+        if self.committed_tail {
+            return true;
+        }
+        if self.mode != LockMode::Exclusive {
+            return false;
+        }
+        if self.disabled {
+            self.mode = LockMode::Shared;
+            self.committed_tail = true;
+            return true;
+        }
+        let Some(shard) = &self.shard else { return false };
+        if !shard.downgrade_committed_tail(&self.key, &self.owner, self.guard_id) {
+            return false;
+        }
+        record_lock_held_release(LockMode::Exclusive);
+        record_lock_held_acquire(LockMode::Shared);
+        self.mode = LockMode::Shared;
+        self.committed_tail = true;
+        true
+    }
+
+    /// Try to restore exclusive ownership without releasing the writer fence.
+    pub fn try_upgrade_committed_tail(&mut self) -> bool {
+        if self.released || (!self.committed_tail && self.mode != LockMode::Exclusive) {
+            return false;
+        }
+        if !self.disabled {
+            let Some(shard) = &self.shard else { return false };
+            if !shard.try_upgrade_committed_tail(&self.key, &self.owner, self.guard_id) {
+                return false;
+            }
+        }
+        if self.committed_tail {
+            record_lock_held_release(LockMode::Shared);
+            record_lock_held_acquire(LockMode::Exclusive);
+        }
+        self.mode = LockMode::Exclusive;
+        self.committed_tail = false;
+        self.sealed_for_commit = true;
+        true
+    }
+
+    /// Observe writers waiting on this guard's exact object key.
+    pub fn waiting_writer(&self) -> Option<bool> {
+        if self.released {
+            return None;
+        }
+        if self.disabled {
+            return Some(false);
+        }
+        self.shard
+            .as_ref()?
+            .waiting_writer_for_guard(&self.key, &self.owner, self.guard_id)
+    }
+
+    fn release_physical(&self, shard: &LockShard) -> bool {
+        if self.committed_tail {
+            shard.release_committed_tail_with_guard(&self.key, &self.owner, self.guard_id)
+        } else {
+            shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id)
+        }
     }
 
     /// Manually release the lock early
@@ -106,7 +202,7 @@ impl FastLockGuard {
         }
 
         if let Some(shard) = &self.shard {
-            let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
+            let success = self.release_physical(shard);
             if success {
                 self.released = true;
                 record_lock_held_release(self.mode);
@@ -138,9 +234,17 @@ impl FastLockGuard {
         );
     }
 
-    /// Check if the lock has been released
+    /// Check if the lock has been released, including by an administrator.
     pub fn is_released(&self) -> bool {
-        self.released
+        self.released || self.shard.as_ref().is_some_and(|shard| !shard.is_guard_active(self.guard_id))
+    }
+
+    /// Observe this acquisition without extending the lock's lifetime.
+    pub fn release_probe(&self) -> Option<FastLockGuardProbe> {
+        self.shard.as_ref().map(|shard| FastLockGuardProbe {
+            shard: Arc::downgrade(shard),
+            guard_id: self.guard_id,
+        })
     }
 
     /// Check if this guard represents a disabled lock
@@ -169,7 +273,7 @@ impl Drop for FastLockGuard {
     fn drop(&mut self) {
         if let Some(shard) = &self.shard {
             if !self.released && !self.disabled {
-                let success = shard.release_lock_with_guard(&self.key, &self.owner, self.mode, self.guard_id);
+                let success = self.release_physical(shard);
                 if !success {
                     // For high-concurrency scenarios, this is likely due to:
                     // 1. Lock was already released by another thread

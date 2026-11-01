@@ -1172,7 +1172,7 @@ impl ECStore {
         Ok(())
     }
 
-    async fn check_write_precondition(
+    pub(crate) async fn check_write_precondition(
         &self,
         bucket: &str,
         object: &str,
