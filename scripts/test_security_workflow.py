@@ -261,6 +261,47 @@ class SecurityWorkflowTests(WorkflowSteps, unittest.TestCase):
                 if missing:
                     self.assertIn(f"missing required STS field: {missing}", result.stderr)
 
+    def test_oidc_docker_access_and_cleanup_use_the_same_privileges(self):
+        tools = self.directory / "docker-tools"
+        tools.mkdir()
+        (tools / "docker").write_text(
+            '#!/bin/bash\n'
+            'printf "%s %s\\n" "${DOCKER_PRIVILEGED:-no}" "$*" >> "$DOCKER_CALLS"\n'
+            'case "$1" in\n'
+            '  info) [ "$DOCKER_MODE" = direct ] || '
+            '{ [ "$DOCKER_MODE" = sudo ] && [ "${DOCKER_PRIVILEGED:-no}" = yes ]; } ;;\n'
+            '  run) exit 43 ;;\n'
+            '  *) exit 0 ;;\n'
+            'esac\n'
+        )
+        (tools / "sudo").write_text(
+            '#!/bin/bash\n[ "$1" = -n ] || exit 92\nshift\n'
+            'export DOCKER_PRIVILEGED=yes\nexec "$@"\n'
+        )
+        for name in ("docker", "sudo"):
+            (tools / name).chmod(0o755)
+        (tools / "python3").symlink_to(sys.executable)
+        for name in ("aws", "curl"):
+            (tools / name).symlink_to("/usr/bin/true")
+        for mode in ("direct", "sudo", "unavailable"):
+            with self.subTest(mode=mode):
+                calls = self.directory / f"docker-{mode}.log"
+                result = subprocess.run(
+                    ["bash", str(ROOT / "scripts/test/oidc_keycloak_live.sh"), "/usr/bin/true"],
+                    env={**os.environ, "PATH": f"{tools}:/usr/bin:/bin", "RUNNER_TEMP": str(self.directory),
+                         "DOCKER_MODE": mode, "DOCKER_CALLS": str(calls)},
+                    capture_output=True, text=True, timeout=10,
+                )
+                log = calls.read_text()
+                if mode == "unavailable":
+                    self.assertNotEqual(result.returncode, 0)
+                    self.assertNotIn(" run ", log)
+                else:
+                    self.assertEqual(result.returncode, 43, result.stderr)
+                    privilege = "yes" if mode == "sudo" else "no"
+                    for command in ("run", "logs", "rm -f"):
+                        self.assertIn(f"{privilege} {command} ", log)
+
     def test_existing_evidence_directory_is_rejected(self) -> None:
         for suffix in ("", "-scratch"):
             self.setUp()
