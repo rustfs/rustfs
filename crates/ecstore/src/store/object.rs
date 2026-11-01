@@ -10376,6 +10376,75 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn forced_capacity_probe_cannot_publish_after_a_new_pool_writer() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(async {
+                        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+                        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+                        let (_dirs, first) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let (_other_dirs, second) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
+                        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[first, second], Arc::clone(&ctx)).await);
+                        crate::bucket::metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+                        let bucket = "forced-capacity-probe";
+                        let object = "object";
+                        store
+                            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("create bucket");
+                        let barrier = PutObjectCommitBarrier::install(bucket, object, PutObjectCommitPause::BeforeQuotaRename);
+                        let put_store = Arc::clone(&store);
+                        let put = tokio::spawn(async move {
+                            put_store
+                                .handle_put_object(
+                                    bucket,
+                                    object,
+                                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                                    &ObjectOptions::default(),
+                                )
+                                .await
+                        });
+                        barrier.wait_until_paused().await;
+                        let manager = ctx.lock_manager().as_fast_lock_manager().expect("local lock manager");
+                        let key = rustfs_lock::ObjectKey::new(RUSTFS_META_BUCKET, crate::core::pools::POOL_META_NAME);
+                        assert_eq!(manager.force_unlock(&key), 1, "force release capacity probe");
+                        let lock = store.pools[0]
+                            .new_ns_lock(RUSTFS_META_BUCKET, crate::core::pools::POOL_META_NAME)
+                            .await
+                            .expect("pool lock");
+                        let writer = lock.get_write_lock(Duration::from_secs(5)).await.expect("new pool writer");
+                        barrier.release();
+                        let result = tokio::time::timeout(Duration::from_secs(30), put)
+                            .await
+                            .expect("PUT finishes")
+                            .expect("PUT task");
+                        assert!(
+                            matches!(&result, Err(StorageError::NamespaceLockQuorumUnavailable { .. })),
+                            "a PUT must reject a lost capacity probe: {result:?}"
+                        );
+                        drop(writer);
+                        assert!(
+                            matches!(
+                                store.handle_get_object_info(bucket, object, &ObjectOptions::default()).await,
+                                Err(StorageError::ObjectNotFound(..))
+                            ),
+                            "the rejected PUT must not publish an object"
+                        );
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test completes");
+    }
+
     #[tokio::test]
     async fn force_released_local_bucket_fence_cannot_activate_a_prepared_reservation() {
         for released in ["publication", "lifecycle"] {

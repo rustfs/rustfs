@@ -5481,7 +5481,7 @@ impl SetDisks {
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_capacity_guard
                             .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
+                            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
@@ -5555,7 +5555,7 @@ impl SetDisks {
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_capacity_guard
                             .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
+                            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
