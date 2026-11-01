@@ -16,9 +16,10 @@ use super::{
     transport::{DiscoveryRequest, OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs, oidc_http_error_diagnostics},
 };
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
-use openidconnect::core::{CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
+use openidconnect::core::{CoreIdToken, CoreIdTokenClaims, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
 use openidconnect::{
-    AsyncHttpClient, ClientId, ClientSecret, DiscoveryError, IssuerUrl, JsonWebKeySetUrl, ProviderMetadataWithLogout, TokenUrl,
+    AsyncHttpClient, ClaimsVerificationError, ClientId, ClientSecret, DiscoveryError, IssuerUrl, JsonWebKeySetUrl, NonceVerifier,
+    ProviderMetadataWithLogout, SignatureVerificationError, TokenUrl,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -210,6 +211,35 @@ impl DiscoveredProviderMetadata {
         };
         verifier.set_allowed_algs(algorithms.clone())
     }
+}
+
+pub(super) fn verify_id_token_claims<'a, N: NonceVerifier>(
+    token: &'a CoreIdToken,
+    verifier: &CoreIdTokenVerifier<'_>,
+    nonce_verifier: N,
+) -> Result<&'a CoreIdTokenClaims, ClaimsVerificationError> {
+    let expected_length = match token.signing_alg().map_err(ClaimsVerificationError::SignatureVerification)? {
+        CoreJwsSigningAlgorithm::HmacSha256 => 32,
+        CoreJwsSigningAlgorithm::HmacSha384 => 48,
+        CoreJwsSigningAlgorithm::HmacSha512 => 64,
+        _ => return token.claims(verifier, nonce_verifier),
+    };
+    // RUSTFS_COMPAT_TODO(openidconnect-hmac-signature-width): Reject widths that upstream converts to fixed-size arrays. Remove after upstream returns verification errors for arbitrary HMAC signature lengths.
+    // openidconnect 4.1.0 converts HMAC signatures to fixed-size arrays before verifying them.
+    let invalid_length = || {
+        ClaimsVerificationError::SignatureVerification(SignatureVerificationError::CryptoError(
+            "invalid HMAC signature length".to_owned(),
+        ))
+    };
+    let compact = token.to_string();
+    let (_, signature) = compact.rsplit_once('.').ok_or_else(invalid_length)?;
+    let signature = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(signature)
+        .map_err(|_| invalid_length())?;
+    if signature.len() != expected_length {
+        return Err(invalid_length());
+    }
+    token.claims(verifier, nonce_verifier)
 }
 
 // This adapter is used only for discovery/JWKS fetches, never token exchange.

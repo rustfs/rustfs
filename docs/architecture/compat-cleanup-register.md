@@ -11,6 +11,8 @@
 
 ## Open Items
 
+- `openidconnect-hmac-signature-width` ID token verification guard: openidconnect 4.1.0 converts decoded HMAC signatures to fixed-size arrays, which panic on unexpected lengths. Check HS256, HS384, and HS512 signature widths before delegating all cryptographic, issuer, audience, expiry, and nonce checks to the upstream verifier. Remove the guard after a supported upstream release returns verification errors for arbitrary HMAC signature lengths.
+
 - `zstd-013-fixed-backend` dependency constraint bridge: Avro, Arrow IPC, Parquet, and Kafka still require zstd 0.13. The local adapter re-exports the fixed registry zstd 0.14.3 implementation and its zstd-safe types. Remove the adapter and Cargo patch after every dependency accepts the fixed zstd line without the 0.13 bridge.
 
 - `8565` historical rebalance replacement recovery: older schema-seven intents can exhaust their retry budget before format repair when retained rebalance metadata describes removed pools. After validating blank targets, terminal historical topology, and ownership, grant one durable handoff and one rebuild attempt. Remove after supported direct upgrades no longer admit snapshots lacking replacement_preformat_handoff_retry_done and all retained affected intents have been resolved.

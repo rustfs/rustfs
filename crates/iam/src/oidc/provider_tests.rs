@@ -242,7 +242,7 @@ fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let payload = serde_json::json!({
         "iss": config.config_url, "sub": "synthetic-subject", "aud": config.client_id,
-        "iat": now, "exp": now + 300,
+        "iat": now, "exp": now + 300, "nonce": "synthetic-nonce",
     });
 
     for (algorithm, name, signature_length) in [
@@ -275,22 +275,28 @@ fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
                 .expect("parse configured provider metadata");
             let verifier = metadata.verifier(&config);
             assert!(
-                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                verify_id_token_claims(&valid, &verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
                 "valid {name} token must pass for workload={workload}"
             );
+            assert!(verify_id_token_claims(&valid, &verifier, &Nonce::new("synthetic-nonce".into())).is_ok());
+            assert!(verify_id_token_claims(&valid, &verifier, &Nonce::new("wrong-nonce".into())).is_err());
 
             for length in [1, 0, signature_length - 1, signature_length, signature_length + 1, 128] {
                 let signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(vec![0_u8; length]);
                 let malformed: CoreIdToken = format!("{signing_input}.{signature}")
                     .parse()
-                    .expect("invalid signature length must still reach cryptographic verification");
+                    .expect("invalid signature length must remain parseable before verification");
                 assert!(
-                    malformed.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_err(),
+                    verify_id_token_claims(&malformed, &verifier, |_: Option<&Nonce>| Ok(())).is_err(),
                     "{name} signature length {length} must return an error for workload={workload}"
+                );
+                assert!(
+                    verify_id_token_claims(&malformed, &verifier, &Nonce::new("synthetic-nonce".into())).is_err(),
+                    "{name} signature length {length} must return an error with a nonce for workload={workload}"
                 );
             }
             assert!(
-                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                verify_id_token_claims(&valid, &verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
                 "invalid inputs must not prevent later valid {name} verification"
             );
         }
