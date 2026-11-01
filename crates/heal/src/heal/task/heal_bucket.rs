@@ -21,6 +21,9 @@ const MAX_DEFERRED_OBJECTS: usize = 256;
 const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 const MAX_DEFERRED_FORWARD_PAGES: u64 = 2;
 const MAX_DEFERRED_AGE: Duration = Duration::from_secs(30);
+// A recovered pool can become writable just after the ordinary retry budget.
+// Keep this extra attempt inside the existing deferred age and backoff caps.
+const MAX_SLOWDOWN_OBJECT_RETRIES: u32 = MAX_BUCKET_OBJECT_HEAL_RETRIES + 1;
 
 struct DeferredObject {
     name: String,
@@ -912,7 +915,12 @@ impl HealTask {
                             );
                         } else if !age_exhausted
                             && err.is_recoverable_object_heal()
-                            && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES
+                            && retry_attempt
+                                < if matches!(&err, Error::Storage(crate::heal::StorageError::SlowDown)) {
+                                    MAX_SLOWDOWN_OBJECT_RETRIES
+                                } else {
+                                    MAX_BUCKET_OBJECT_HEAL_RETRIES
+                                }
                         {
                             terminal_outcome = false;
                             debug!(

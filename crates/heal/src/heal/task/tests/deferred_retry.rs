@@ -221,6 +221,29 @@ async fn full_window_abort_accounts_inline_once_and_leaves_unstarted_tail_unproc
 }
 
 #[tokio::test(start_paused = true)]
+async fn slowdown_can_recover_within_existing_deferred_age_budget() {
+    let storage = Arc::new(pages_storage(&[&["a"]]));
+    storage
+        .heal_object_outcomes
+        .lock()
+        .expect("outcomes")
+        .insert("a".to_string(), (0..4).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
+    let task = bucket_task(storage.clone());
+    let started = tokio::time::Instant::now();
+    task.execute()
+        .await
+        .expect("transient slowdown recovers within the deferred age budget");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 5);
+    let outcome = task.get_outcome().await;
+    assert_eq!(
+        (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
+        (1, 0, 4)
+    );
+    assert_eq!(outcome.objects.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
     let storage = Arc::new(pages_storage(&[&["a"], &["b"], &["c"], &["d"]]));
     for name in ["a", "b", "c", "d"] {
@@ -228,7 +251,7 @@ async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
             .heal_object_outcomes
             .lock()
             .expect("outcomes")
-            .insert(name.to_string(), (0..4).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
+            .insert(name.to_string(), (0..5).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
     }
     let task = bucket_task(storage.clone());
     let execution = task.execute();
@@ -239,9 +262,9 @@ async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
     let outcome = task.get_outcome().await;
     assert_eq!(
         (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
-        (4, 4, 16)
+        (4, 4, 20)
     );
-    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 16);
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 20);
     for name in ["a", "b", "c", "d"] {
         assert_eq!(outcome.objects.iter().filter(|item| item.identity.object == name).count(), 1);
     }
