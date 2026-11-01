@@ -12537,20 +12537,22 @@ async fn batch_shard_pread_blocking(requests: Vec<(std::path::PathBuf, usize, us
                         metrics.as_deref(),
                         LocalBatchReadStage::Read,
                         || {
-                            // `with_capacity` reserves exactly `length` bytes, so each
-                            // positioned read fills only the remaining requested span
-                            // without zero-initializing it first.
-                            while total < length {
-                                let position = u64::try_from(offset + total).map_err(|_| DiskError::FileCorrupt)?;
-                                let nbytes = match rustix::io::pread(&file, rustix::buffer::spare_capacity(&mut buf), position) {
-                                    Ok(nbytes) => nbytes,
-                                    Err(rustix::io::Errno::INTR) => continue,
-                                    Err(err) => return Err(DiskError::from(std::io::Error::from(err))),
-                                };
-                                if nbytes == 0 {
-                                    return Err(DiskError::FileCorrupt);
-                                }
-                                total += nbytes;
+                            use std::io::{Read as _, Seek as _, SeekFrom};
+
+                            // `read_to_end` fills uninitialized spare capacity with
+                            // growing sequential reads, which keeps kernel readahead
+                            // pipelined on cold pages; a single window-sized read waits
+                            // on each readahead chunk in turn. The descriptor is private
+                            // to this request, so moving its file offset is safe.
+                            let mut reader = &file;
+                            if offset > 0 {
+                                let start = u64::try_from(offset).map_err(|_| DiskError::FileCorrupt)?;
+                                reader.seek(SeekFrom::Start(start)).map_err(DiskError::from)?;
+                            }
+                            let limit = u64::try_from(length).map_err(|_| DiskError::FileCorrupt)?;
+                            total = reader.take(limit).read_to_end(&mut buf).map_err(DiskError::from)?;
+                            if total < length {
+                                return Err(DiskError::FileCorrupt);
                             }
                             Ok::<_, DiskError>(())
                         }

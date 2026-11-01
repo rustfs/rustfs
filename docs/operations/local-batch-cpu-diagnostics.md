@@ -2,7 +2,7 @@
 
 **Use this when:** separating sampled local EC batch allocation and filesystem wall time from worker CPU time in a default-off diagnostic build.
 
-This diagnostic build separates allocation, metadata, open and positioned-read elapsed time from Linux thread CPU time. It preserves offsets, integrity checks and error handling. Windows below 512 KiB share one blocking dispatch per batch; when every window is at least 512 KiB, each shard is a separate dispatch and appears as its own diagnostic batch. Shard bytes are read with positioned reads into uninitialized buffer capacity, so the allocation stage contains no buffer initialization. The build does not qualify observation overhead.
+This diagnostic build separates allocation, metadata, open and positioned-read elapsed time from Linux thread CPU time. It preserves offsets, integrity checks and error handling. Windows below 512 KiB share one blocking dispatch per batch; when every window is at least 512 KiB, each shard is a separate dispatch and appears as its own diagnostic batch. Shard bytes are read with sequential reads into uninitialized buffer capacity, so the allocation stage contains no buffer initialization. The build does not qualify observation overhead.
 
 Build separately from any frozen performance binary:
 
