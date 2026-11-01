@@ -874,7 +874,7 @@ pub(crate) fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-pub(super) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
+pub(in crate::app) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
@@ -997,7 +997,7 @@ pub(crate) async fn object_lock_checks_required(bucket: &str) -> bool {
         .map_or(true, |metadata| metadata.object_lock_checks_required())
 }
 
-pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
+pub(in crate::app) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
     match state {
         metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
         metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,

@@ -747,6 +747,16 @@ async fn list_path_raw_inner(
             // Start every missing head read in the same round so one stalled
             // disk cannot multiply the wait budget by the erasure-set width.
             // Outcomes are still consumed below in stable disk-index order.
+            if !revjob_rx.is_cancelled() {
+                for (i, reader) in readers.iter_mut().enumerate() {
+                    if errs[i].is_none()
+                        && pending_entries[i].is_none()
+                        && let Some(Ok(Some(entry))) = reader.try_peek_buffered()
+                    {
+                        pending_entries[i] = Some(entry);
+                    }
+                }
+            }
             let concurrent_peeks = readers.iter_mut().enumerate().filter_map(|(i, reader)| {
                 if errs[i].is_some() || pending_entries[i].is_some() {
                     return None;
@@ -878,7 +888,7 @@ async fn list_path_raw_inner(
                 }
                 if entry.name == current.name {
                     // If exact match, we agree.
-                    if current.matches_strict(&entry) {
+                    if current.matches_strict_borrowed(&entry) {
                         top_entries[i] = Some(entry);
                         agree += 1;
                     } else {
@@ -986,7 +996,9 @@ async fn list_path_raw_inner(
 
             if agree == readers.len() && !opts.preserve_replica_metadata {
                 for r in readers.iter_mut() {
-                    let _ = r.skip(1).await;
+                    if !r.skip_current() {
+                        let _ = r.skip(1).await;
+                    }
                 }
 
                 if let Some(agreed_fn) = opts.agreed.as_ref() {
@@ -1009,7 +1021,7 @@ async fn list_path_raw_inner(
             }
 
             for (i, r) in readers.iter_mut().enumerate() {
-                if top_entries[i].is_some() {
+                if top_entries[i].is_some() && !r.skip_current() {
                     let _ = r.skip(1).await;
                 }
             }
