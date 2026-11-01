@@ -566,6 +566,29 @@ pub trait ListOperations: Send + Sync + fmt::Debug {
     ) -> Result<(), Self::Error>;
 }
 
+/// Quorum-backed enumeration for decisions that require proving object absence.
+///
+/// Consumers must drain the result stream and await successful completion before
+/// trusting the scan. An error or cancellation can follow partial results and
+/// leaves absence unproven. Callers coordinate concurrent mutations separately;
+/// this capability does not provide a snapshot or retain a mutation lock.
+#[async_trait::async_trait]
+pub trait AuthoritativeListOperations: ListOperations {
+    /// Resolves every set at its version read quorum, including reserved prefixes.
+    ///
+    /// # Errors
+    /// Returns an error when a set cannot establish quorum, metadata cannot be
+    /// resolved, or enumeration is interrupted. Retry starts a new scan.
+    async fn walk_authoritative(
+        self: Arc<Self>,
+        rx: Self::WalkCancellation,
+        bucket: &str,
+        prefix: &str,
+        result: Self::WalkResultSender,
+        opts: Self::WalkOptions,
+    ) -> Result<(), Self::Error>;
+}
+
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait MultipartOperations: Send + Sync + fmt::Debug {

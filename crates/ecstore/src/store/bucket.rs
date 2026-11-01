@@ -523,7 +523,22 @@ impl ECStore {
     where
         F: FnOnce() -> Result<()> + Send,
     {
-        metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, validate).await
+        metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, None, validate).await
+    }
+
+    /// Validate an external fence and the bucket incarnation in one metadata transaction.
+    pub async fn update_bucket_metadata_config_for_incarnation_validated<F>(
+        &self,
+        bucket: &str,
+        config_file: &str,
+        data: Vec<u8>,
+        expected_incarnation_id: Uuid,
+        validate: F,
+    ) -> Result<OffsetDateTime>
+    where
+        F: FnOnce() -> Result<()> + Send,
+    {
+        metadata_sys::update_validated_in(&self.ctx, bucket, config_file, data, Some(expected_incarnation_id), validate).await
     }
 
     pub async fn bucket_incarnation_id(&self, bucket: &str) -> Result<Uuid> {

@@ -411,6 +411,7 @@ pub(crate) struct TestCatalogObjectBackend {
     pub(crate) state: Arc<tokio::sync::Mutex<TestCatalogObjectState>>,
     pub(crate) locks: TestCatalogObjectLocks,
     pub(crate) strong_runtime: Option<StrongTableCatalogRuntime>,
+    pub(crate) registration_cache: TableCatalogRegistrationCache,
     // One-shot, path-keyed injection knobs from the admin handler tests'
     // former TestTableCatalogObjectBackend (backlog#1837 PR2): each fires
     // once for the named object and clears itself, mirroring the original
@@ -543,8 +544,11 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) write_lock_acquisitions: BTreeMap<(String, String), usize>,
     pub(crate) read_lock_acquisitions: BTreeMap<(String, String), usize>,
     pub(crate) read_calls: usize,
+    pub(crate) read_bytes: usize,
     pub(crate) metadata_calls: usize,
     pub(crate) list_calls: usize,
+    pub(crate) failed_inventory_prefixes: BTreeSet<String>,
+    pub(crate) inventory_overrides: BTreeMap<String, Vec<TableCatalogCleanupObject>>,
     pub(crate) next_etag: u64,
 }
 
@@ -608,6 +612,7 @@ impl TestCatalogObjectBackend {
     pub(crate) async fn reset_call_counts(&self) {
         let mut state = self.state.lock().await;
         state.read_calls = 0;
+        state.read_bytes = 0;
         state.metadata_calls = 0;
         state.list_calls = 0;
     }
@@ -955,6 +960,10 @@ impl TestCatalogObjectState {
 
 #[async_trait::async_trait]
 impl TableCatalogObjectBackend for TestCatalogObjectBackend {
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        Some(self.registration_cache.clone())
+    }
+
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         self.strong_runtime.clone()
     }
@@ -1018,6 +1027,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
                 etag: (!etagless).then(|| record.etag.clone()),
                 mod_time: record.mod_time,
             });
+            state.read_bytes += result.as_ref().map_or(0, |object| object.data.len());
             let pause = state
                 .pause_read_attempts
                 .get_mut(&key)
@@ -1142,6 +1152,17 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .await
     }
 
+    async fn delete_object_if_match_fenced_for_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        _expected_incarnation_id: Uuid,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.delete_object_if_match_fenced(bucket, object, expected_etag, fence).await
+    }
+
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>> {
         let mut state = self.state.lock().await;
         state.list_calls += 1;
@@ -1151,6 +1172,38 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .filter(|(entry_bucket, object)| entry_bucket == bucket && object.starts_with(prefix))
             .map(|(_, object)| object.clone())
             .collect())
+    }
+
+    async fn list_objects_for_cleanup(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogCleanupObject>> {
+        let mut state = self.state.lock().await;
+        state.list_calls += 1;
+        if state.failed_inventory_prefixes.contains(prefix) {
+            return Err(TableCatalogStoreError::Unavailable(
+                "injected authoritative inventory failure".to_string(),
+            ));
+        }
+        if let Some(objects) = state.inventory_overrides.get(prefix) {
+            return Ok(objects.clone());
+        }
+        Ok(state
+            .objects
+            .iter()
+            .filter(|((entry_bucket, object), _)| entry_bucket == bucket && object.starts_with(prefix))
+            .map(|(key, record)| TableCatalogCleanupObject {
+                key: key.1.clone(),
+                version_id: None,
+                etag: (!state.etagless_objects.contains(key)).then(|| record.etag.clone()),
+                delete_marker: false,
+            })
+            .collect())
+    }
+
+    async fn ensure_no_multipart_uploads(&self, _bucket: &str) -> TableCatalogStoreResult<()> {
+        Ok(())
     }
 
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
