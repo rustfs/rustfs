@@ -20565,6 +20565,107 @@ mod test {
         assert_eq!(delete_err, DiskError::VolumeNotEmpty);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_fence_during_publication_cannot_survive_bucket_recreation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        struct Fence(AtomicBool);
+        impl os::MetadataReservationFence for Fence {
+            fn is_valid(&self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("disk"));
+        let bucket = "lost-fence-recreate-bucket";
+        let object = "object";
+        let temporary = "lost-fence-stage";
+        let data_dir = Uuid::new_v4();
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let staged = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{temporary}/{data_dir}/part.1"))
+            .expect("staged path");
+        fs::create_dir_all(staged.parent().expect("staged parent"))
+            .await
+            .expect("create staging");
+        fs::write(&staged, b"old generation").await.expect("write staged data");
+
+        let key = disk.get_object_path(bucket, object).expect("object path");
+        let registry = disk.metadata_reservation_registry();
+        let fence = Arc::new(Fence(AtomicBool::new(true)));
+        let token = registry
+            .prepare_with_owner(&key, disk.reservation_instance, Some(fence.clone()))
+            .expect("prepare");
+        registry
+            .activate(token, &key, disk.reservation_instance)
+            .await
+            .expect("activate");
+        let reservation = registry
+            .claim(token, &key, disk.reservation_instance)
+            .expect("claim")
+            .wait()
+            .await;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
+            entered_tx.send(()).expect("publication entered");
+            release_rx.recv().expect("release publication");
+        });
+        let writer = Arc::clone(&disk);
+        let rename = tokio::spawn(async move {
+            let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            writer
+                .rename_data_observed_with_reservation(
+                    RUSTFS_META_TMP_BUCKET,
+                    temporary,
+                    &fi,
+                    bucket,
+                    object,
+                    (None, Some(reservation)),
+                )
+                .await
+                .result
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("wait task")
+            .expect("publication entered");
+        fence.0.store(false, Ordering::Release);
+        let deleter = Arc::clone(&disk);
+        let mut delete = tokio::spawn(async move { deleter.delete_volume(bucket, true).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            "delete waits for physical publication"
+        );
+        assert!(
+            matches!(disk.make_volume(bucket).await, Err(DiskError::VolumeExists)),
+            "old volume cannot be recreated while publication runs"
+        );
+        release_tx.send(()).expect("release publication");
+        let result = tokio::time::timeout(Duration::from_secs(10), rename)
+            .await
+            .expect("rename terminates")
+            .expect("rename task");
+        assert!(
+            result.is_ok() || matches!(result, Err(DiskError::DiskOngoingReq)),
+            "unexpected rename result: {result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("delete terminates")
+            .expect("delete task")
+            .expect("delete volume");
+        disk.make_volume(bucket).await.expect("recreate volume");
+        assert!(!key.exists(), "the recreated volume must not retain the old object");
+    }
+
     #[tokio::test]
     #[serial_test::serial(rename_data_deleted_bucket)]
     async fn windows_and_unix_rename_data_non_inline_does_not_recreate_bucket_deleted_before_commit() {
