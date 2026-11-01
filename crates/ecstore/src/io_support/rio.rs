@@ -429,6 +429,7 @@ impl WritePlan {
         let checksum = reader.content_hash().clone();
         let trailer = reader.get_trailer().cloned();
 
+        let delegate_inner_etag = self.compression.is_none() && reader.is_etag_reader();
         let encrypted = self.encryption.is_some();
         if let Some(algorithm) = self.compression {
             reader = HashReader::from_reader(
@@ -448,7 +449,8 @@ impl WritePlan {
                 }
                 WriteEncryptionMode::SinglepartObjectKey | WriteEncryptionMode::MultipartObjectKey { .. } => [0u8; 12],
             };
-            let protected_reader = rustfs_rio::EtagReader::new_encrypted(reader, encryption.key_bytes, etag_nonce)?;
+            let protected_reader = rustfs_rio::EtagReader::new_encrypted(reader, encryption.key_bytes, etag_nonce)?
+                .with_inner_etag_delegation(delegate_inner_etag);
             reader = match encryption.mode {
                 WriteEncryptionMode::SinglepartObjectKey => HashReader::from_reader(
                     #[cfg(feature = "rio-v2")]
