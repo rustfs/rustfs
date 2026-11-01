@@ -57,7 +57,7 @@ fn legacy_constraints_resolve_only_to_the_fixed_registry_implementation() {
         let version = Version::parse(package["version"].as_str().expect("package version")).expect("valid package semver");
         if name == "zstd" && package.get("source").is_none() {
             adapters += 1;
-            assert_eq!(version, Version::new(0, 13, 3));
+            assert_eq!(version, Version::new(0, 13, 4));
             let runtime = package["dependencies"].as_array().expect("adapter dependency edges");
             assert!(runtime.iter().any(|value| value.as_str() == Some("zstd 0.14.3")));
         } else {

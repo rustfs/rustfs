@@ -36,10 +36,6 @@ allow-git = [
     # Official s3s repository pinned for Iceberg SigV4 path encoding support.
     # owner: GatewayJ  review: 2026-10
     "https://github.com/s3s-project/s3s",
-    # Upstream OIDC/OAuth2 crypto migrations, pinned to reviewed PR commits.
-    # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/ramosbugs/openidconnect-rs",
-    "https://github.com/ramosbugs/oauth2-rs",
     # Completion ownership patch fixed to rustfs/uring#20.
     # owner: overtrue  review: 2026-10
     "https://github.com/rustfs/uring.git",
