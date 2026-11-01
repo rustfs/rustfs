@@ -16904,6 +16904,14 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
     async fn list_objects(&self, bucket: &str, prefix: &str) -> crate::table_catalog::TableCatalogStoreResult<Vec<String>> {
         self.inner.list_objects(bucket, prefix).await
     }
+
+    async fn list_objects_for_cleanup(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableCatalogCleanupObject>> {
+        self.inner.list_objects_for_cleanup(bucket, prefix).await
+    }
 }
 
 #[tokio::test]
