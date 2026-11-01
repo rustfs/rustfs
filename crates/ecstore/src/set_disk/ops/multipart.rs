@@ -3291,6 +3291,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                     bucket,
                     object,
                     !write_context.acquires_namespace() || object_lock_guard.is_some(),
+                    false,
                     DecommissionCapacityAdmission::ExistingMultipart,
                 )
                 .await?;

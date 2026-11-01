@@ -262,6 +262,8 @@ pub struct DistributedLockGuard {
     /// All underlying leases that should be refreshed and released with the guard.
     entries: Vec<HeldLockEntry>,
     lock_type: LockType,
+    /// Shared and exclusive quorums must intersect before a tail may convert.
+    committed_tail_quorums_intersect: bool,
     /// If true, Drop will not try to release (used if user manually released).
     disarmed: bool,
     /// Background lease task for renewable leases.
@@ -277,7 +279,13 @@ impl DistributedLockGuard {
     /// - `entries` is the full list of underlying leases that should be refreshed and released
     ///   with this guard.
     /// - `heartbeat`: lease TTL, optional renewal cadence, quorum, and diagnostics.
-    fn new(lock_id: LockId, entries: Vec<HeldLockEntry>, lock_type: LockType, heartbeat: LockHeartbeatConfig) -> Self {
+    fn new(
+        lock_id: LockId,
+        entries: Vec<HeldLockEntry>,
+        lock_type: LockType,
+        heartbeat: LockHeartbeatConfig,
+        committed_tail_quorums_intersect: bool,
+    ) -> Self {
         record_lock_held_acquire(lock_type);
         let lock_lost = Arc::new(LockLostSignal::default());
         match Self::quorum_valid_until(&entries, heartbeat.refresh_quorum) {
@@ -296,6 +304,7 @@ impl DistributedLockGuard {
             lock_id,
             entries,
             lock_type,
+            committed_tail_quorums_intersect,
             disarmed: false,
             refresh_task,
             lock_lost,
@@ -410,6 +419,70 @@ impl DistributedLockGuard {
     /// Get the lock id associated with this guard
     pub fn lock_id(&self) -> &LockId {
         &self.lock_id
+    }
+
+    /// Convert retained peer leases without ever releasing writer exclusion.
+    /// A peer without conversion support keeps its exclusive lease. Partial
+    /// conversion is safe: both lease modes continue to exclude writers.
+    pub async fn downgrade_committed_tail(&mut self) -> bool {
+        if self.disarmed || self.lock_type != LockType::Exclusive || !self.committed_tail_quorums_intersect || self.is_lock_lost()
+        {
+            return false;
+        }
+        let results = futures::future::join_all(
+            self.entries
+                .iter()
+                .map(|entry| entry.client.downgrade_committed_tail(&entry.lock_id)),
+        )
+        .await;
+        !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
+    }
+
+    /// Require every retained lease to confirm exclusivity before committing.
+    pub async fn try_upgrade_committed_tail(&mut self) -> bool {
+        if self.disarmed || self.lock_type != LockType::Exclusive || self.is_lock_lost() {
+            return false;
+        }
+        let results = futures::future::join_all(
+            self.entries
+                .iter()
+                .map(|entry| entry.client.try_upgrade_committed_tail(&entry.lock_id)),
+        )
+        .await;
+        !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
+    }
+
+    pub async fn supports_heal_lock_transition(&self) -> bool {
+        if self.disarmed || self.lock_type != LockType::Exclusive || !self.committed_tail_quorums_intersect || self.is_lock_lost()
+        {
+            return false;
+        }
+        let results = futures::future::join_all(
+            self.entries
+                .iter()
+                .map(|entry| entry.client.supports_heal_lock_transition(&entry.lock_id)),
+        )
+        .await;
+        !self.is_lock_lost() && results.iter().all(|result| matches!(result, Ok(true)))
+    }
+
+    /// Observe contention on every held lease. Unknown peers prevent a false idle result.
+    pub async fn waiting_writer(&self) -> Option<bool> {
+        if self.disarmed || self.is_lock_lost() {
+            return None;
+        }
+        let results =
+            futures::future::join_all(self.entries.iter().map(|entry| entry.client.waiting_writer(&entry.lock_id))).await;
+        if self.is_lock_lost() {
+            return None;
+        }
+        if results.iter().any(|result| matches!(result, Ok(Some(true)))) {
+            return Some(true);
+        }
+        results
+            .iter()
+            .all(|result| matches!(result, Ok(Some(false))))
+            .then_some(false)
     }
 
     /// Actual granted peer identities, which may differ from the logical guard ID.
@@ -599,6 +672,7 @@ impl DistributedLock {
                 individual_locks,
                 request.lock_type,
                 heartbeat,
+                self.read_quorum().saturating_add(required_quorum) > self.clients.len(),
             )))
         } else {
             // Check if it's a timeout or quorum failure

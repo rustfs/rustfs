@@ -41,7 +41,7 @@ async fn count_cap_and_next_item_preserve_ownership() {
     assert_eq!(window.objects.len(), MAX_DEFERRED_OBJECTS);
     assert!(window.bytes <= MAX_DEFERRED_BYTES);
     assert!(!window.can_advance(1));
-    assert!(window.pop_due().is_some());
+    assert!(window.pop_due(&HashSet::new()).is_some());
     assert!(window.push(rejected).is_ok());
 }
 
@@ -56,9 +56,23 @@ async fn byte_cap_counts_key_version_and_reserved_slots() {
     assert_eq!(window.bytes, MAX_DEFERRED_BYTES);
     assert!(!window.can_advance(1));
     assert!(window.push(item("x".to_string(), None)).is_err());
-    assert!(window.pop_due().is_some());
+    assert!(window.pop_due(&HashSet::new()).is_some());
     assert_eq!(window.bytes, MAX_DEFERRED_OBJECTS * size_of::<DeferredObject>());
     assert!(window.push(item("x".to_string(), None)).is_ok());
+}
+
+#[tokio::test(start_paused = true)]
+async fn due_retry_excludes_inflight_keys_without_hiding_other_keys() {
+    let mut window = DeferredWindow::default();
+    assert!(window.push(item("same".to_owned(), Some("v1".to_owned()))).is_ok());
+    assert!(window.push(item("other".to_owned(), None)).is_ok());
+    let mut in_flight = HashSet::from(["same".to_owned()]);
+    assert_eq!(window.pop_due(&in_flight).expect("unblocked retry").name, "other");
+    assert!(window.next_due(&in_flight).is_none());
+    assert!(window.pop_due(&in_flight).is_none());
+    in_flight.clear();
+    assert!(window.next_due(&in_flight).is_some());
+    assert_eq!(window.pop_due(&in_flight).expect("released retry").name, "same");
 }
 
 #[tokio::test(start_paused = true)]
@@ -66,10 +80,11 @@ async fn retry_age_caps_due_time_and_is_not_reset_by_rescheduling() {
     let mut entry = item("a".to_string(), None);
     entry.defer(Duration::from_secs(2));
     let first = entry.first_failure.expect("first failure");
+    assert_eq!(entry.due, first + Duration::from_secs(2));
     tokio::time::advance(Duration::from_secs(29)).await;
     entry.defer(Duration::from_secs(8));
     assert_eq!(entry.first_failure, Some(first));
-    assert_eq!(entry.due, first + MAX_DEFERRED_AGE);
+    assert_eq!(entry.due, first + Duration::from_millis(29_500));
     assert!(!entry.expired());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(entry.expired());

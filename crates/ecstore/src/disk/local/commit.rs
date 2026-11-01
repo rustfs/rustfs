@@ -444,10 +444,27 @@ async fn prepare_rename_commit_and_destination_metadata(
 #[derive(Debug)]
 pub(in crate::disk) struct LocalRenamePreflightRejection(());
 
+impl LocalRenamePreflightRejection {
+    pub(in crate::disk) fn not_dispatched() -> Self {
+        Self(())
+    }
+}
+
 #[derive(Default)]
 pub(super) struct RenameDataState {
     namespace_owner: Option<Arc<dyn Send + Sync>>,
+    metadata_reservation: Option<os::MetadataMutationReservation>,
     preflight_rejection: Option<LocalRenamePreflightRejection>,
+}
+
+#[cfg(test)]
+impl RenameDataState {
+    pub(super) fn with_metadata_reservation(reservation: os::MetadataMutationReservation) -> Self {
+        Self {
+            metadata_reservation: Some(reservation),
+            ..Default::default()
+        }
+    }
 }
 
 // Keep optional native MPU state machines out of ordinary rename frames.
@@ -491,6 +508,15 @@ impl LocalDisk {
             wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;
         }
         let mut fi = fi;
+        // Pre-acquired metadata must never reverse quota or multipart-source
+        // lock order. These paths need their own reservation protocol.
+        if state.metadata_reservation.is_some()
+            && (src_volume == super::super::RUSTFS_META_MULTIPART_BUCKET
+                || rustfs_utils::http::metadata_compat::contains_key_str(&fi.metadata, QUOTA_MUTATION_FENCE_METADATA_SUFFIX))
+        {
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+            return Err(DiskError::DiskOngoingReq);
+        }
         let pool_meta_condition = if super::pool_meta_native::is_object(&self.root, dst_volume, dst_path) {
             Some(super::pool_meta_native::PoolMetaNativeCasCondition::take(&mut fi).inspect_err(|_| {
                 state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
@@ -586,7 +612,27 @@ impl LocalDisk {
             Some(staging) => Some(Arc::new((state.namespace_owner.take(), staging.lease.clone()))),
             None => state.namespace_owner.take(),
         };
-        let metadata_lease = os::acquire_metadata_mutation_lease(&root_destination_object_path, metadata_owner).await;
+        // A reserved lease is single-use and bound to the exact disk path.
+        // Keep the independent namespace/source owner alongside it; a pre-held
+        // mutex cannot be acquired again without deadlocking.
+        let reservation_fence = state
+            .metadata_reservation
+            .as_ref()
+            .and_then(|reservation| reservation.fence());
+        let metadata_owner: Arc<dyn Send + Sync> = if let Some(reservation) = state.metadata_reservation.take() {
+            if multipart_staging.is_some() || quota_fence_claim.is_some() {
+                state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+                return Err(DiskError::DiskOngoingReq);
+            }
+            let lease = reservation
+                .into_lease_for(&root_destination_object_path, self.reservation_instance)
+                .inspect_err(|_| {
+                    state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+                })?;
+            Arc::new((lease, metadata_owner))
+        } else {
+            os::acquire_metadata_mutation_lease(&root_destination_object_path, metadata_owner).await
+        };
         drop(metadata_wait);
         #[cfg(unix)]
         let parent_receipt = if native_timing {
@@ -600,17 +646,23 @@ impl LocalDisk {
         };
         #[cfg(unix)]
         let mut receipt_mutation = native_timing
-            .then(|| super::pool_meta_native::ReceiptMutationGuard::new(&self.pool_meta_durable_head, metadata_lease.clone()));
+            .then(|| super::pool_meta_native::ReceiptMutationGuard::new(&self.pool_meta_durable_head, metadata_owner.clone()));
         let namespace_wait = os::StageTimer::new(native_timing, "pool_meta_native_namespace_lease_wait");
         let mutation_lease = os::acquire_rename_data_mutation_lease_with_owner(
             &self.root,
             dst_volume,
             &root_destination_object_path,
             staging_prefix.as_deref(),
-            Some(metadata_lease),
+            Some(metadata_owner),
         )
         .await;
         drop(namespace_wait);
+        // The volume read lease prevents deletion of this disk's bucket until
+        // publication finishes. Recheck after its wait, before any mutation.
+        if reservation_fence.as_ref().is_some_and(|fence| !fence.is_valid()) {
+            state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
+            return Err(DiskError::DiskOngoingReq);
+        }
         if let Some(claim) = quota_fence_claim {
             mutation_lease.attach_external_guard(claim);
         }
@@ -2549,8 +2601,23 @@ impl LocalDisk {
         dst_path: &str,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> super::super::RenameDataObservation {
+        self.rename_data_observed_with_reservation(src_volume, src_path, fi, dst_volume, dst_path, (namespace_owner, None))
+            .await
+    }
+
+    pub(in crate::disk) async fn rename_data_observed_with_reservation(
+        &self,
+        src_volume: &str,
+        src_path: &str,
+        fi: &FileInfo,
+        dst_volume: &str,
+        dst_path: &str,
+        owners: (Option<Arc<dyn Send + Sync>>, Option<os::MetadataMutationReservation>),
+    ) -> super::super::RenameDataObservation {
+        let (namespace_owner, metadata_reservation) = owners;
         let mut state = RenameDataState {
             namespace_owner,
+            metadata_reservation,
             ..Default::default()
         };
         let result = self

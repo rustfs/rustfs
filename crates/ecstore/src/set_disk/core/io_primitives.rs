@@ -2538,6 +2538,8 @@ pub(in crate::set_disk) struct RenameDataCommit {
     pub(in crate::set_disk) old_current_source: Option<FileInfo>,
     pub(in crate::set_disk) committed_file_info: FileInfo,
     pub(in crate::set_disk) tail_drain: Option<tokio::task::JoinHandle<Option<RenameTailOutcome>>>,
+    pub(in crate::set_disk) tail_has_metadata_reservations: bool,
+    pub(in crate::set_disk) tail_has_owned_bucket_fences: bool,
 }
 
 pub(in crate::set_disk) struct RenameTailCleanup {
@@ -3468,6 +3470,8 @@ pub(in crate::set_disk) struct RenameDataFenceOptions<'a> {
     rollback_receipt: Option<RenameRollbackReceipt>,
     multipart_proof_authority: Option<crate::disk::multipart_source::ProofVerificationContext>,
     multipart_commit_owner: Option<Arc<MultipartLogicalGuards>>,
+    reservation_ctx: Option<Arc<crate::runtime::instance::InstanceContext>>,
+    prepared_reservations: Option<Vec<Option<RenameMetadataReservation>>>,
 }
 
 impl<'a> RenameDataFenceOptions<'a> {
@@ -3483,6 +3487,8 @@ impl<'a> RenameDataFenceOptions<'a> {
             rollback_receipt: None,
             multipart_proof_authority: None,
             multipart_commit_owner: None,
+            reservation_ctx: None,
+            prepared_reservations: None,
         }
     }
 
@@ -3519,6 +3525,415 @@ impl<'a> RenameDataFenceOptions<'a> {
         self.namespace_commit_guard = namespace_commit_guard;
         self
     }
+
+    pub(in crate::set_disk) fn with_reservation_context(
+        mut self,
+        ctx: Option<Arc<crate::runtime::instance::InstanceContext>>,
+        reservations: Option<Vec<Option<RenameMetadataReservation>>>,
+    ) -> Self {
+        self.reservation_ctx = ctx;
+        self.prepared_reservations = reservations;
+        self
+    }
+}
+
+#[derive(Clone)]
+struct MetadataRenewalTarget {
+    disk: DiskStore,
+    token: Uuid,
+    renewed_at: Arc<parking_lot::Mutex<tokio::time::Instant>>,
+}
+
+struct MetadataRenewalGroup {
+    targets: Arc<parking_lot::Mutex<HashMap<usize, MetadataRenewalTarget>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MetadataRenewalGroup {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+
+pub(crate) struct RenameMetadataReservation {
+    disk: DiskStore,
+    token: Option<Uuid>,
+    // Remote reservation protocol v2 and the local owned path both retain
+    // bucket publication and lifecycle guards until the physical write drains.
+    owns_bucket_fence: bool,
+    short: bool,
+    renewed_at: Arc<parking_lot::Mutex<tokio::time::Instant>>,
+    renewal: Option<(Arc<MetadataRenewalGroup>, usize)>,
+}
+
+impl RenameMetadataReservation {
+    fn stop_renewal(&mut self) {
+        if let Some((group, index)) = self.renewal.take() {
+            let mut targets = group.targets.lock();
+            targets.remove(&index);
+            if targets.is_empty() {
+                group.task.abort();
+            }
+        }
+    }
+
+    async fn cancel(&mut self) -> disk::error::Result<()> {
+        self.stop_renewal();
+        let Some(token) = self.token else { return Ok(()) };
+        match tokio::time::timeout(Duration::from_secs(5), self.disk.cancel_object_metadata_reservation(token)).await {
+            Ok(Ok(true)) => {
+                self.token = None;
+                Ok(())
+            }
+            Ok(Ok(false)) => Err(DiskError::DiskOngoingReq),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(DiskError::Timeout),
+        }
+    }
+}
+
+impl Drop for RenameMetadataReservation {
+    fn drop(&mut self) {
+        self.stop_renewal();
+        let Some(token) = self.token.take() else { return };
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let disk = self.disk.clone();
+            runtime.spawn(async move {
+                let _ = disk.cancel_object_metadata_reservation(token).await;
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum RenameReservationMode {
+    Ownerless,
+    Owned,
+    ShortOwned,
+}
+
+pub(crate) async fn prepare_rename_metadata_reservations(
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    incarnation: Uuid,
+    ctx: &Arc<crate::runtime::instance::InstanceContext>,
+    owns_bucket_fence: bool,
+) -> disk::error::Result<Option<Vec<Option<RenameMetadataReservation>>>> {
+    prepare_rename_metadata_reservations_until_abandoned(
+        disks,
+        bucket,
+        object,
+        incarnation,
+        ctx,
+        if owns_bucket_fence {
+            RenameReservationMode::Owned
+        } else {
+            RenameReservationMode::Ownerless
+        },
+        std::future::pending(),
+    )
+    .await
+}
+
+pub(crate) async fn prepare_rename_metadata_reservations_until_abandoned(
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    incarnation: Uuid,
+    ctx: &Arc<crate::runtime::instance::InstanceContext>,
+    mode: RenameReservationMode,
+    abandoned: impl std::future::Future<Output = ()>,
+) -> disk::error::Result<Option<Vec<Option<RenameMetadataReservation>>>> {
+    let owns_bucket_fence = !matches!(mode, RenameReservationMode::Ownerless);
+    let short = matches!(mode, RenameReservationMode::ShortOwned);
+    let mut abandoned = Box::pin(abandoned);
+    let discarded = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut pending: FuturesUnordered<_> = disks
+        .iter()
+        .enumerate()
+        .map(|(_index, disk)| {
+            let discarded = Arc::clone(&discarded);
+            async move {
+                let result: disk::error::Result<Option<RenameMetadataReservation>> = async {
+                    if discarded.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let Some(disk) = disk else { return Ok(None) };
+                    #[cfg(test)]
+                    rename_fanout_barrier::checkpoint(object, _index, rename_fanout_barrier::PHASE_RESERVATION_BEFORE).await;
+                    if disk.is_local() {
+                        crate::store::admit_local_disk(ctx, disk, None, false).await?;
+                    }
+                    if discarded.load(std::sync::atomic::Ordering::Acquire) {
+                        return Ok(None);
+                    }
+                    let prepared_at = tokio::time::Instant::now();
+                    let token = if disk.is_local() && owns_bucket_fence {
+                        let store = crate::bucket::metadata_sys::object_store_if_initialized_in(ctx)
+                            .await
+                            .ok_or(DiskError::DiskOngoingReq)?;
+                        if short {
+                            store
+                                .reserve_local_object_metadata_short(
+                                    &disk.endpoint().to_string(),
+                                    bucket,
+                                    object,
+                                    incarnation,
+                                    Duration::from_millis(50),
+                                )
+                                .await?
+                        } else {
+                            store
+                                .reserve_local_object_metadata_at_incarnation(
+                                    &disk.endpoint().to_string(),
+                                    bucket,
+                                    object,
+                                    incarnation,
+                                    Duration::from_secs(5),
+                                )
+                                .await?
+                        }
+                    } else if short {
+                        let crate::disk::Disk::Remote(remote) = disk.as_ref() else {
+                            return Err(DiskError::InvalidPath);
+                        };
+                        remote
+                            .reserve_object_metadata_short(bucket, object, incarnation, Duration::from_millis(50))
+                            .await?
+                    } else {
+                        disk.prepare_object_metadata(bucket, object, incarnation, Duration::from_secs(5))
+                            .await?
+                    };
+                    // No await separates receipt from installing the cancellation owner.
+                    let reservation = RenameMetadataReservation {
+                        disk: disk.clone(),
+                        token: Some(token),
+                        owns_bucket_fence: !disk.is_local() || owns_bucket_fence,
+                        short,
+                        renewed_at: Arc::new(parking_lot::Mutex::new(prepared_at)),
+                        renewal: None,
+                    };
+                    if short {
+                        // Install the cancellation owner before extending the short token.
+                        // A dropped renew response still leaves us the token to cancel.
+                        disk.renew_object_metadata(bucket, object, token, Duration::from_millis(50))
+                            .await?;
+                    }
+                    #[cfg(test)]
+                    rename_fanout_barrier::checkpoint(object, _index, rename_fanout_barrier::PHASE_RESERVATION_AFTER).await;
+                    Ok(Some(reservation))
+                }
+                .await;
+                (_index, result)
+            }
+        })
+        .collect();
+    let mut reservations: Vec<Option<RenameMetadataReservation>> = (0..disks.len()).map(|_| None).collect();
+    let mut discard = false;
+    while !pending.is_empty() {
+        tokio::select! {
+            biased;
+            _ = &mut abandoned, if !discard => {
+                discard = true;
+                discarded.store(true, std::sync::atomic::Ordering::Release);
+                reservations.clear();
+            }
+            result = pending.next() => {
+                let Some((index, result)) = result else { break };
+                if discard {
+                    drop(result);
+                } else {
+                    match result {
+                        Ok(reservation) => reservations[index] = reservation,
+                        Err(_) => {
+                            discard = true;
+                            discarded.store(true, std::sync::atomic::Ordering::Release);
+                            reservations.clear();
+                        }
+                    }
+                }
+            }
+        }
+    }
+    if discard {
+        // Drain all in-flight preparations so late tokens get a cancellation owner.
+        return Ok(None);
+    }
+    let targets = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    for (index, reservation) in reservations.iter().enumerate() {
+        if let Some(reservation) = reservation {
+            let token = reservation.token.ok_or(DiskError::Unexpected)?;
+            targets.lock().insert(
+                index,
+                MetadataRenewalTarget {
+                    disk: reservation.disk.clone(),
+                    token,
+                    renewed_at: Arc::clone(&reservation.renewed_at),
+                },
+            );
+        }
+    }
+    if !targets.lock().is_empty() {
+        let renewal_targets = Arc::clone(&targets);
+        let renewal_ctx = Arc::clone(ctx);
+        let renewal_bucket = bucket.to_owned();
+        let renewal_object = object.to_owned();
+        // Short leases remain short even after renewal, so a lost renewal and
+        // cancellation cannot strand a bucket fence for the legacy lease time.
+        let task = tokio::spawn(async move {
+            let interval = if short {
+                Duration::from_millis(500)
+            } else {
+                Duration::from_secs(20)
+            };
+            let retry = if short {
+                Duration::from_millis(250)
+            } else {
+                Duration::from_secs(5)
+            };
+            let lifetime = if short {
+                Duration::from_secs(2)
+            } else {
+                Duration::from_secs(60)
+            };
+            let mut delay = interval;
+            loop {
+                tokio::time::sleep(delay).await;
+                let current: Vec<_> = renewal_targets.lock().values().cloned().collect();
+                if current.is_empty() {
+                    break;
+                }
+                // Once any acknowledgment is too old, the complete fanout can
+                // no longer be safely activated. Stop retrying stale peers;
+                // their receiver-side tokens still expire on their own.
+                if current.iter().any(|target| target.renewed_at.lock().elapsed() >= lifetime) {
+                    break;
+                }
+                let results = join_all(current.into_iter().map(|target| {
+                    let ctx = Arc::clone(&renewal_ctx);
+                    let bucket = &renewal_bucket;
+                    let object = &renewal_object;
+                    async move {
+                        let started = tokio::time::Instant::now();
+                        let admitted = !target.disk.is_local()
+                            || crate::store::admit_local_disk(&ctx, &target.disk, None, false).await.is_ok();
+                        if admitted
+                            && target
+                                .disk
+                                .renew_object_metadata(bucket, object, target.token, retry)
+                                .await
+                                .is_ok()
+                        {
+                            *target.renewed_at.lock() = started;
+                            true
+                        } else {
+                            false
+                        }
+                    }
+                }))
+                .await;
+                delay = if results.into_iter().all(|success| success) {
+                    interval
+                } else {
+                    retry
+                };
+            }
+        });
+        let group = Arc::new(MetadataRenewalGroup { targets, task });
+        for (index, reservation) in reservations.iter_mut().enumerate() {
+            if let Some(reservation) = reservation {
+                reservation.renewal = Some((Arc::clone(&group), index));
+            }
+        }
+    }
+    Ok(Some(reservations))
+}
+
+pub(crate) fn align_rename_metadata_reservations(
+    mut reservations: Vec<Option<RenameMetadataReservation>>,
+    disks: &[Option<DiskStore>],
+) -> Option<Vec<Option<RenameMetadataReservation>>> {
+    if reservations.len() != disks.len() {
+        return None;
+    }
+    let mut aligned = Vec::with_capacity(disks.len());
+    for disk in disks {
+        let Some(disk) = disk else {
+            aligned.push(None);
+            continue;
+        };
+        let index = reservations
+            .iter()
+            .position(|candidate| candidate.as_ref().is_some_and(|candidate| Arc::ptr_eq(&candidate.disk, disk)))?;
+        aligned.push(reservations[index].take());
+    }
+    // Disks lost while staging need no activation; dropping their still-inert
+    // reservations schedules cancellation without blocking the commit.
+    Some(aligned)
+}
+
+async fn activate_rename_metadata_reservations(
+    mut reservations: Vec<Option<RenameMetadataReservation>>,
+    bucket: &str,
+    object: &str,
+    ctx: &Arc<crate::runtime::instance::InstanceContext>,
+) -> disk::error::Result<Option<Vec<Option<RenameMetadataReservation>>>> {
+    // Short tokens continue renewing during activation; an activated token
+    // can otherwise expire while another disk's activation is still pending.
+    // Long tokens retain their existing non-renewable queued behavior.
+    for reservation in reservations.iter_mut().flatten() {
+        if !reservation.short {
+            reservation.stop_renewal();
+        }
+    }
+    if reservations.iter().flatten().any(|reservation| {
+        let max_age = if reservation.short {
+            Duration::from_secs(1)
+        } else {
+            Duration::from_secs(50)
+        };
+        reservation.renewed_at.lock().elapsed() >= max_age
+    }) {
+        return Ok(None);
+    }
+    #[cfg(test)]
+    let test_reservations = &reservations;
+    let activated = join_all(reservations.iter().flatten().map(|reservation| async move {
+        if reservation.disk.is_local() {
+            crate::store::admit_local_disk(ctx, &reservation.disk, None, false).await?;
+        }
+        let token = reservation.token.ok_or(DiskError::Unexpected)?;
+        let result = reservation
+            .disk
+            .activate_object_metadata(bucket, object, token, Duration::from_secs(5))
+            .await;
+        #[cfg(test)]
+        if result.is_ok() {
+            let index = test_reservations
+                .iter()
+                .position(|candidate| {
+                    candidate
+                        .as_ref()
+                        .is_some_and(|candidate| std::ptr::eq(candidate, reservation))
+                })
+                .expect("activated reservation belongs to the fanout");
+            rename_fanout_barrier::checkpoint(object, index, rename_fanout_barrier::PHASE_RESERVATION_ACTIVATED).await;
+        }
+        result
+    }))
+    .await;
+    for reservation in reservations.iter_mut().flatten() {
+        reservation.stop_renewal();
+    }
+    if activated.into_iter().any(|result| result.is_err()) {
+        let cancelled = join_all(reservations.iter_mut().flatten().map(RenameMetadataReservation::cancel)).await;
+        if cancelled.into_iter().any(|result| result.is_err()) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        return Ok(None);
+    }
+    Ok(Some(reservations))
 }
 
 #[allow(dead_code, reason = "asserted by this file's tests (backlog#1823)")]
@@ -3530,7 +3945,7 @@ type RenameDataLegacyTuple = (
     Option<OldCurrentSize>,
 );
 
-fn put_rename_early_ack_enabled() -> bool {
+pub(crate) fn put_rename_early_ack_enabled() -> bool {
     rustfs_utils::get_env_bool(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, true)
 }
 
@@ -3896,6 +4311,8 @@ impl SetDisks {
             old_current_source,
             committed_file_info,
             tail_drain: None,
+            tail_has_metadata_reservations: false,
+            tail_has_owned_bucket_fences: false,
         })
     }
 
@@ -3992,6 +4409,8 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority: _,
             multipart_commit_owner: _,
+            reservation_ctx,
+            prepared_reservations,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4007,6 +4426,21 @@ impl SetDisks {
 
         let disk_count = disks.len();
         let fanout_disks = disks.to_vec();
+        let mut reservations = match (reservation_ctx.as_ref(), prepared_reservations) {
+            (Some(ctx), Some(prepared)) => activate_rename_metadata_reservations(prepared, dst_bucket, dst_object, ctx).await?,
+            (_, _) => None,
+        };
+        let tail_has_metadata_reservations = reservations.is_some();
+        let tail_has_owned_bucket_fences = reservations.as_ref().is_some_and(|reservations| {
+            reservations.len() == disks.len()
+                && disks.iter().any(Option::is_some)
+                && disks.iter().zip(reservations).all(|(disk, reservation)| match disk {
+                    Some(disk) => reservation
+                        .as_ref()
+                        .is_some_and(|owner| owner.owns_bucket_fence && Arc::ptr_eq(&owner.disk, disk)),
+                    None => true,
+                })
+        });
         let fanout_fence_tokens = Self::scanner_publication_lease_tokens_for_disks(disks, scanner_publication_lease_tokens)?;
         let coordinator_disks = fanout_disks.clone();
         let src_bucket = Arc::new(src_bucket.to_string());
@@ -4039,6 +4473,11 @@ impl SetDisks {
                     let file_info = file_info.clone();
                     let successful_rename_completion_rank = successful_rename_completion_rank.clone();
                     let namespace_commit_guard = namespace_commit_guard.clone();
+                    let reservation = reservations
+                        .as_mut()
+                        .and_then(|entries| entries.get_mut(i))
+                        .and_then(Option::take);
+                    let reservation_ctx = reservation_ctx.clone();
                     tasks.spawn(async move {
                         let _namespace_commit_guard = namespace_commit_guard.clone();
                         let mut dispatch_state = RenameDispatchState::NotDispatched;
@@ -4048,6 +4487,17 @@ impl SetDisks {
 
                             let Some(disk) = disk else {
                                 return Err(DiskError::DiskNotFound);
+                            };
+                            let disk_admission = if reservation.is_some() && disk.is_local() {
+                                let ctx = reservation_ctx.as_ref().ok_or(DiskError::Unexpected)?;
+                                // The fanout owner already covers this instance through
+                                // physical completion; only add a disk owner when it does not.
+                                let covered = namespace_commit_guard
+                                    .as_ref()
+                                    .is_some_and(|guard| guard.covers_instance(ctx));
+                                crate::store::admit_local_disk(ctx, &disk, None, !covered).await?
+                            } else {
+                                None
                             };
                             let disk_wait_location_stage = if disk.is_local() {
                                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_DISK_WAIT_LOCAL
@@ -4074,6 +4524,11 @@ impl SetDisks {
                             let disk_wait_started = rustfs_io_metrics::put_stage_timer();
                             dispatch_state = RenameDispatchState::MayHavePublished;
                             let _foreground_active_guard = rename_foreground_active_guard(i);
+                            let namespace_owner: Option<Arc<dyn Send + Sync>> = if disk_admission.is_some() {
+                                Some(Arc::new((namespace_commit_guard.clone(), disk_admission)))
+                            } else {
+                                namespace_commit_guard.clone().map(|owner| owner as Arc<dyn Send + Sync>)
+                            };
                             let observed = disk
                                 .rename_data_borrowed_with_fence_observed(
                                     &src_bucket,
@@ -4083,9 +4538,8 @@ impl SetDisks {
                                     &dst_object,
                                     disk::RenameDataGuards {
                                         scanner_publication_lease_token,
-                                        namespace_owner: namespace_commit_guard
-                                            .clone()
-                                            .map(|owner| owner as Arc<dyn Send + Sync>),
+                                        metadata_reservation_token: reservation.as_ref().and_then(|owner| owner.token),
+                                        namespace_owner,
                                         ..Default::default()
                                     },
                                 )
@@ -4363,6 +4817,8 @@ impl SetDisks {
         let attach_tail_owner_started = rustfs_io_metrics::put_stage_timer();
         commit.map(|mut commit| {
             commit.tail_drain = Some(tail_drain);
+            commit.tail_has_metadata_reservations = tail_has_metadata_reservations;
+            commit.tail_has_owned_bucket_fences = tail_has_owned_bucket_fences;
             rustfs_io_metrics::record_put_object_stage_duration_from(
                 rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_EARLY_ACK_ATTACH_TAIL_OWNER,
                 attach_tail_owner_started,
@@ -4432,6 +4888,8 @@ impl SetDisks {
             rollback_receipt,
             multipart_proof_authority,
             multipart_commit_owner,
+            reservation_ctx: _,
+            prepared_reservations: _,
         } = fence_options;
         if let Some(file_info) = disks
             .iter()
@@ -4901,6 +5359,8 @@ impl SetDisks {
             old_current_source,
             committed_file_info,
             tail_drain: None,
+            tail_has_metadata_reservations: false,
+            tail_has_owned_bucket_fences: false,
         })
     }
 
@@ -7358,6 +7818,9 @@ pub(crate) mod rename_fanout_barrier {
         MetadataSlowtailFault,
         NonInlineHedgeTimer,
         LateMetadataRefresh,
+        ReservationBefore,
+        ReservationAfter,
+        ReservationActivated,
     }
 
     impl From<&'static str> for Phase {
@@ -7380,6 +7843,9 @@ pub(crate) mod rename_fanout_barrier {
     pub const PHASE_ROLLBACK: Phase = Phase::Rollback;
     pub const PHASE_READ_VERSION: Phase = Phase::ReadVersion;
     pub const PHASE_METADATA_SLOWTAIL_FAULT: Phase = Phase::MetadataSlowtailFault;
+    pub const PHASE_RESERVATION_BEFORE: Phase = Phase::ReservationBefore;
+    pub const PHASE_RESERVATION_AFTER: Phase = Phase::ReservationAfter;
+    pub const PHASE_RESERVATION_ACTIVATED: Phase = Phase::ReservationActivated;
 
     /// Object-scoped hedge timer checkpoint; slot zero identifies the timer, not a disk.
     pub const PHASE_NON_INLINE_HEDGE_TIMER: Phase = Phase::NonInlineHedgeTimer;
@@ -7454,6 +7920,18 @@ pub(crate) mod rename_fanout_barrier {
     }
 
     impl BarrierHandle {
+        /// Keep the current task parked without intercepting later tasks.
+        pub fn disarm(&self) {
+            let mut reg = lock();
+            if reg
+                .armed
+                .get(&self.key)
+                .is_some_and(|armed| Arc::ptr_eq(&armed.release, &self.release))
+            {
+                reg.armed.remove(&self.key);
+            }
+        }
+
         /// Await until the armed fan-out task has parked at the checkpoint. Uses a
         /// stored-permit `Notify`, so this is race-free regardless of whether the
         /// task reaches the checkpoint before or after this call — no sleeps.
@@ -7618,6 +8096,45 @@ mod tests {
     use std::io::Cursor;
     use tempfile::TempDir;
     use tokio::io::AsyncReadExt;
+
+    #[tokio::test]
+    async fn renewal_stops_after_the_disk_loses_admission_and_token_expires() {
+        let (_dir, disk) = read_multiple_test_disk("bucket", &[]).await;
+        let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
+        let endpoint = disk.endpoint().to_string();
+        ctx.local_disk_map()
+            .write()
+            .await
+            .insert(endpoint.clone(), Some(disk.clone()));
+        let reservations = prepare_rename_metadata_reservations(&[Some(disk)], "bucket", "object", Uuid::new_v4(), &ctx, false)
+            .await
+            .expect("prepare")
+            .expect("complete fanout");
+        let group = Arc::clone(
+            &reservations[0]
+                .as_ref()
+                .expect("reservation")
+                .renewal
+                .as_ref()
+                .expect("renewal")
+                .0,
+        );
+        ctx.local_disk_map().write().await.remove(&endpoint);
+        tokio::task::yield_now().await;
+        tokio::time::pause();
+        tokio::time::advance(Duration::from_secs(21)).await;
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(41)).await;
+        for _ in 0..10 {
+            if group.task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        tokio::time::resume();
+        assert!(group.task.is_finished(), "stale tokens must not cause indefinite renewal attempts");
+        drop(reservations);
+    }
 
     #[tokio::test]
     async fn commit_fault_schedule_keeps_multiple_disk_phases_independent() {
