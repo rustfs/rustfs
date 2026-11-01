@@ -333,6 +333,34 @@ struct ProofCache {
     preferred: usize,
 }
 
+type VerifiedStripeKey = (uuid::Uuid, [u8; 32], u32);
+
+static VERIFIED_STRIPE_RECORDS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<VerifiedStripeKey, Bytes>>> =
+    std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+fn get_verified_stripe_record(part: &PartIntegrity, stripe: u32) -> Option<Bytes> {
+    VERIFIED_STRIPE_RECORDS
+        .lock()
+        .get(&(part.generation, part.root, stripe))
+        .cloned()
+}
+
+fn put_verified_stripe_record(part: &PartIntegrity, stripe: u32, record: Bytes) {
+    let mut map = VERIFIED_STRIPE_RECORDS.lock();
+    if map.len() >= 4096
+        && let Some(evict_key) = map.keys().next().copied()
+    {
+        map.remove(&evict_key);
+    }
+    map.insert((part.generation, part.root, stripe), record);
+}
+
+pub(crate) fn invalidate_verified_stripe_records(generation: uuid::Uuid) {
+    VERIFIED_STRIPE_RECORDS
+        .lock()
+        .retain(|(stored_gen, _, _), _| *stored_gen != generation);
+}
+
 impl PartProofReader {
     pub(crate) async fn reconstruction_proof(
         &self,
@@ -410,6 +438,9 @@ impl PartProofReader {
 
     pub(crate) async fn record(&self, stripe: u32) -> io::Result<Bytes> {
         let offset = self.part.record_offset(stripe).map_err(|_| corrupt())?;
+        if let Some(bytes) = get_verified_stripe_record(&self.part, stripe) {
+            return Ok(bytes);
+        }
         let mut cached = self.cached.lock().await;
         if let Some((_, bytes)) = cached.records.iter().find(|(number, _)| *number == stripe) {
             return Ok(bytes.clone());
@@ -465,6 +496,9 @@ impl PartProofReader {
             bytes
         };
         self.part.verify_record(stripe, &record).map_err(|_| corrupt())?;
+        if self.part.stripes <= 4 {
+            put_verified_stripe_record(&self.part, stripe, record.clone());
+        }
         if cached.records.len() == 2 {
             cached.records.pop_front();
         }
@@ -862,5 +896,42 @@ mod tests {
                 .expect("proof");
             prepared.part.verify_shard(stripe, 15, b"x", &record).expect("spilled proof");
         }
+    }
+
+    #[tokio::test]
+    async fn verified_stripe_record_cache_serves_verified_record_and_still_verifies_payload() {
+        let layout = IntegrityLayout::new(2, 2, 8, false).expect("layout");
+        let mut builder = IntegrityBuilder::new(layout, 1).expect("builder");
+        let shards = [b"ABCD".as_slice(), b"EFGH", b"IJKL", b"MNOP"];
+        builder.push(shards.into_iter()).await.expect("stripe");
+        let prepared = builder.finish(8).await.expect("index");
+        let inline_bytes = prepared.inline_bytes().expect("inline bytes");
+        let part = prepared.part;
+
+        let warm_reader = PartProofReader {
+            part: part.clone(),
+            sources: Vec::new(),
+            volume: "bucket".to_owned(),
+            inline: Some(inline_bytes),
+            cached: Mutex::new(ProofCache::default()),
+        };
+        warm_reader.verify(0, 0, shards[0]).await.expect("warm verify");
+        assert!(
+            get_verified_stripe_record(&part, 0).is_some(),
+            "small verified stripe record should populate the verified stripe cache"
+        );
+
+        let cached_reader = Arc::new(PartProofReader {
+            part,
+            sources: Vec::new(),
+            volume: "bucket".to_owned(),
+            inline: None,
+            cached: Mutex::new(ProofCache::default()),
+        });
+        cached_reader.verify(0, 0, shards[0]).await.expect("cached verify");
+        assert!(
+            cached_reader.verify(0, 0, shards[1]).await.is_err(),
+            "cached record must still reject corrupt or mismatched shard payloads"
+        );
     }
 }

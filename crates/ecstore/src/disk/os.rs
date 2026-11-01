@@ -1668,7 +1668,7 @@ fn clear_file_fdatasync_group_commit_for_test() {
 
 // Small object directories are cheaper to flush in one blocking task. Multipart
 // directories fan out only once enough files can amortize per-task scheduling.
-const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
+pub(crate) const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
 pub(crate) const MAX_PARALLEL_FILE_SYNCS: usize = 16;
 // Scale aggregate fan-out for wider nodes while reserving at least half of the
 // configured Tokio blocking pool for unrelated filesystem work.
@@ -1782,10 +1782,13 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
     limiter
 }
 
-// Keep one warm draining worker per disk/lane and spin briefly in user space
+// Keep warm draining workers per disk/lane and spin briefly in user space
 // before exiting `spawn_blocking` so back-to-back stages of `PUT` and `DELETE`
-// on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`).
+// on the same drive do not thrash Tokio's `BlockingPool` (`futex_wake`/`futex_wait`),
+// while allowing concurrent fsync callers to enter the kernel simultaneously and
+// coalesce in the filesystem journal (`jbd2`/`xfs` group commit).
 const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 1;
+pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
@@ -1813,6 +1816,7 @@ impl DiskBlockingLane {
 struct DiskBlockingQueueState {
     jobs: VecDeque<Box<dyn FnOnce() + Send>>,
     active_workers: usize,
+    idle_workers: usize,
     #[cfg(any(test, feature = "test-util"))]
     paused_workers: usize,
 }
@@ -1856,6 +1860,7 @@ impl Drop for DiskBlockingWorkerGuard {
             let cancelled = {
                 let mut state = self.queue.lane(self.lane).state.lock();
                 state.active_workers = state.active_workers.saturating_sub(1);
+                state.idle_workers = state.idle_workers.saturating_sub(1);
                 if state.active_workers == 0 {
                     self.queue
                         .lane(self.lane)
@@ -1874,9 +1879,10 @@ impl Drop for DiskBlockingWorkerGuard {
         let should_respawn = {
             let mut state = self.queue.lane(self.lane).state.lock();
             state.active_workers = state.active_workers.saturating_sub(1);
-            let max_workers = self.queue.effective_max_workers(&state);
-            if !state.jobs.is_empty() && state.active_workers < max_workers {
+            let max_workers = self.queue.effective_max_workers(self.lane, &state);
+            if state.jobs.len() > state.idle_workers && state.active_workers < max_workers {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -1901,15 +1907,23 @@ impl DiskBlockingQueue {
     }
 
     #[inline]
-    fn effective_max_workers(&self, state: &DiskBlockingQueueState) -> usize {
+    fn lane_max_workers(&self, lane: DiskBlockingLane) -> usize {
+        match lane {
+            DiskBlockingLane::Foreground | DiskBlockingLane::Isolated => MAX_NAMESPACE_WORKERS_PER_DISK,
+            DiskBlockingLane::Fsync => MAX_FSYNC_WORKERS_PER_DISK,
+        }
+    }
+
+    #[inline]
+    fn effective_max_workers(&self, lane: DiskBlockingLane, state: &DiskBlockingQueueState) -> usize {
         #[cfg(any(test, feature = "test-util"))]
         {
-            MAX_NAMESPACE_WORKERS_PER_DISK.saturating_add(state.paused_workers)
+            self.lane_max_workers(lane).saturating_add(state.paused_workers)
         }
         #[cfg(not(any(test, feature = "test-util")))]
         {
             let _ = state;
-            MAX_NAMESPACE_WORKERS_PER_DISK
+            self.lane_max_workers(lane)
         }
     }
 
@@ -1918,8 +1932,9 @@ impl DiskBlockingQueue {
             let mut state = self.lane(lane).state.lock();
             state.jobs.push_back(job);
             self.lane(lane).ready.store(true, std::sync::atomic::Ordering::Relaxed);
-            if state.active_workers < self.effective_max_workers(&state) {
+            if state.jobs.len() > state.idle_workers && state.active_workers < self.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -1962,13 +1977,19 @@ impl DiskBlockingQueue {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
-            guard.state = DiskBlockingWorkerState::Running;
             let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
             let mut idle_polled = false;
+            let mut counted_idle = true;
             loop {
                 let job = {
                     let mut state = queue.lane(lane).state.lock();
-                    if state.active_workers > queue.effective_max_workers(&state) || (idle_polled && state.jobs.is_empty()) {
+                    if counted_idle {
+                        state.idle_workers = state.idle_workers.saturating_sub(1);
+                        counted_idle = false;
+                    }
+                    guard.state = DiskBlockingWorkerState::Running;
+                    if state.active_workers > queue.effective_max_workers(lane, &state) || (idle_polled && state.jobs.is_empty())
+                    {
                         state.active_workers = state.active_workers.saturating_sub(1);
                         guard.state = DiskBlockingWorkerState::Retired;
                         return;
@@ -1978,6 +1999,15 @@ impl DiskBlockingQueue {
                         .lane(lane)
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
+                    if job.is_none() {
+                        if state.idle_workers > 0 {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.state = DiskBlockingWorkerState::Retired;
+                            return;
+                        }
+                        state.idle_workers += 1;
+                        counted_idle = true;
+                    }
                     job
                 };
                 if let Some(job) = job {
@@ -1988,15 +2018,11 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
-                    for i in 0..WORKER_IDLE_SPIN_ITERS {
+                    for _ in 0..WORKER_IDLE_SPIN_ITERS {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        if i & 15 == 15 {
-                            std::thread::yield_now();
-                        } else {
-                            std::hint::spin_loop();
-                        }
+                        std::hint::spin_loop();
                     }
                     // Recheck and retire under the same mutex used by enqueue.
                     idle_polled = true;
@@ -2106,8 +2132,9 @@ pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
         let should_spawn = {
             let mut state = queue.lane(lane).state.lock();
             state.paused_workers = state.paused_workers.saturating_add(1);
-            if !state.jobs.is_empty() && state.active_workers < queue.effective_max_workers(&state) {
+            if state.jobs.len() > state.idle_workers && state.active_workers < queue.effective_max_workers(lane, &state) {
                 state.active_workers += 1;
+                state.idle_workers += 1;
                 true
             } else {
                 false
@@ -2569,7 +2596,7 @@ fn sync_files(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::with_capacity(PARALLEL_FILE_SYNC_THRESHOLD);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -3742,14 +3769,19 @@ impl PreparedRenameSource {
         #[cfg(not(windows))]
         std::io::Write::write_all(&mut self.source, data)?;
         if sync {
-            #[cfg(test)]
-            multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
-            let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
-            #[cfg(windows)]
-            self.source.as_file().sync_data()?;
-            #[cfg(not(windows))]
-            self.source.sync_data()?;
+            self.sync_data()?;
         }
+        Ok(())
+    }
+
+    pub(crate) fn sync_data(&self) -> io::Result<()> {
+        #[cfg(test)]
+        multipart_source_syscall_failures::check(multipart_source_syscall_failures::Stage::FileSync, &self.test_destination)?;
+        let _sync = StageTimer::new(true, "disk_prepared_metadata_fdatasync");
+        #[cfg(windows)]
+        self.source.as_file().sync_data()?;
+        #[cfg(not(windows))]
+        self.source.sync_data()?;
         Ok(())
     }
 }
@@ -5413,6 +5445,34 @@ impl RenameCommitGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub(crate) fn multipart_payload_commit_guard_std(
+    metadata_guard: &RenameCommitGuard,
+    source_parent: &Path,
+) -> io::Result<RenameCommitGuard> {
+    let original = &metadata_guard.directories;
+    original.validate()?;
+    let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
+    let destination = original.prepare_destination()?;
+    // Clone the pinned file identity, never recapture the target pathname
+    // between payload and canonical-head publication.
+    let destination = LinuxCommitDirectory {
+        file: Arc::clone(&destination.file),
+        device: destination.device,
+        inode: destination.inode,
+    };
+    Ok(RenameCommitGuard {
+        directories: Arc::new(LinuxCommitDirectories {
+            root: original.root.clone(),
+            source_path: source_parent.to_path_buf(),
+            destination_path: original.destination_path.clone(),
+            source,
+            destination: std::sync::OnceLock::from(destination),
+            destination_base: original.destination_base.clone(),
+        }),
+    })
+}
+
 /// Native MPU metadata and payload have distinct source parents. Reuse the
 /// exact target identity already held by the metadata transaction, while
 /// independently pinning the private payload source under the same root.
@@ -5424,30 +5484,7 @@ pub(crate) async fn multipart_payload_commit_guard(
 ) -> io::Result<RenameCommitGuard> {
     let metadata_guard = metadata_guard.clone();
     let source_parent = source_parent.to_path_buf();
-    run_blocking_namespace_operation(lease, move || {
-        let original = &metadata_guard.directories;
-        original.validate()?;
-        let source = LinuxCommitDirectory::new(original.root.open_directory(&source_parent)?)?;
-        let destination = original.prepare_destination()?;
-        // Clone the pinned file identity, never recapture the target pathname
-        // between payload and canonical-head publication.
-        let destination = LinuxCommitDirectory {
-            file: Arc::clone(&destination.file),
-            device: destination.device,
-            inode: destination.inode,
-        };
-        Ok(RenameCommitGuard {
-            directories: Arc::new(LinuxCommitDirectories {
-                root: original.root.clone(),
-                source_path: source_parent,
-                destination_path: original.destination_path.clone(),
-                source,
-                destination: std::sync::OnceLock::from(destination),
-                destination_base: original.destination_base.clone(),
-            }),
-        })
-    })
-    .await
+    run_blocking_namespace_operation(lease, move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent)).await
 }
 
 pub(crate) fn prepare_rename_commit_guard(
@@ -6630,6 +6667,17 @@ pub(crate) fn sync_multipart_owned_record_parents(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
+    sync_multipart_owned_record_parents_options(source, record_parent, include_leaf, true, base, publication_root)
+}
+
+pub(crate) fn sync_multipart_owned_record_parents_options(
+    source: &Path,
+    record_parent: &Path,
+    include_leaf: bool,
+    sync_source_root: bool,
+    base: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<()> {
     let relative = record_parent
         .strip_prefix(source)
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "native record escaped source"))?;
@@ -6651,6 +6699,9 @@ pub(crate) fn sync_multipart_owned_record_parents(
     for _ in 0..=2 {
         if !directory.starts_with(source) {
             return Err(io::Error::new(io::ErrorKind::InvalidInput, "native record barrier escaped source"));
+        }
+        if directory == source && !sync_source_root {
+            return Ok(());
         }
         #[cfg_attr(not(unix), allow(unused_mut))]
         let mut pinned = pin_multipart_source_directory(directory, base, publication_root)?;
@@ -11392,19 +11443,24 @@ mod tests {
             let queue = register_disk_blocking_queue(root.path(), root.path());
             std::fs::write(root.path().join("intermediate"), b"backup").expect("backup");
             std::fs::write(root.path().join("receipt"), b"committed").expect("receipt");
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let blocker_queue = Arc::clone(&queue);
-            let blocker = tokio::spawn(async move {
-                blocker_queue
-                    .run_fsync_cancellable(move |_| {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.blocking_recv();
-                        Ok(())
-                    })
-                    .await
-            });
-            started_rx.await.expect("fsync lane blocked");
+            let mut release_txs = Vec::new();
+            let mut blockers = Vec::new();
+            for _ in 0..MAX_FSYNC_WORKERS_PER_DISK {
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let blocker_queue = Arc::clone(&queue);
+                blockers.push(tokio::spawn(async move {
+                    blocker_queue
+                        .run_fsync_cancellable(move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("fsync worker blocked");
+                release_txs.push(release_tx);
+            }
             let mut cleanup = std::pin::pin!(remove_files_and_fsync_with_owner(
                 root.path(),
                 &["intermediate"],
@@ -11415,8 +11471,12 @@ mod tests {
             assert!(futures::FutureExt::now_or_never(&mut cleanup).is_none());
             let foreground = tokio::time::timeout(Duration::from_secs(5), queue.run(|| Ok(()))).await;
             let retained = root.path().join("receipt").exists();
-            release_tx.send(()).expect("release fsync lane");
-            blocker.await.expect("blocker joined").expect("blocker completed");
+            for release_tx in release_txs {
+                release_tx.send(()).expect("release fsync worker");
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocker joined").expect("blocker completed");
+            }
             cleanup.await.expect("cleanup completed");
             foreground.expect("foreground must progress").expect("foreground operation");
             assert_eq!(retained, sync, "only durable cleanup must wait for the fsync lane");
@@ -11638,6 +11698,25 @@ mod tests {
 
         for lane in [DiskBlockingLane::Foreground, DiskBlockingLane::Fsync] {
             let queue = DiskBlockingQueue::new();
+            let max_workers = queue.lane_max_workers(lane);
+            let mut hold_txs = Vec::new();
+            let mut hold_tasks = Vec::new();
+            for _ in 1..max_workers {
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let hold_queue = Arc::clone(&queue);
+                hold_tasks.push(tokio::spawn(async move {
+                    hold_queue
+                        .run_on_lane(lane, "hold operation failed", DiskBlockingQueue::test_stages_for_lane(lane), move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("hold worker started");
+                hold_txs.push(release_tx);
+            }
             let gate = AdaptiveAdmission::new(NonZeroU16::new(1).expect("one unit"), 1);
             let (first_started_tx, first_started_rx) = oneshot::channel();
             let (first_release_tx, first_release_rx) = oneshot::channel();
@@ -11671,8 +11750,89 @@ mod tests {
             let retained = gate.snapshot().active;
             second_release_tx.send(()).expect("release second producer");
             second.await.expect("second producer completed");
+            for tx in hold_txs {
+                let _ = tx.send(());
+            }
+            for task in hold_tasks {
+                task.await.expect("hold task joined").expect("hold task completed");
+            }
             assert_eq!(retained, 0, "shared worker must not retain a completed producer's unit");
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn disk_blocking_queue_fsync_lane_scales_workers_and_retires_idle() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let queue = DiskBlockingQueue::new();
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let (all_entered_tx, all_entered_rx) = oneshot::channel();
+        let all_entered_tx = Arc::new(Mutex::new(Some(all_entered_tx)));
+        let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
+
+        let mut handles = Vec::new();
+        for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
+            let q = Arc::clone(&queue);
+            let active = Arc::clone(&active);
+            let max_seen = Arc::clone(&max_seen);
+            let entered = Arc::clone(&entered);
+            let all_entered_tx = Arc::clone(&all_entered_tx);
+            let mut release_rx = release_tx.subscribe();
+            handles.push(tokio::spawn(async move {
+                use_current_runtime_for_fsync();
+                q.run_on_lane(
+                    DiskBlockingLane::Fsync,
+                    "fsync scale test failed",
+                    DiskBlockingQueue::test_stages_for_lane(DiskBlockingLane::Fsync),
+                    move |_| {
+                        let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        max_seen.fetch_max(cur, Ordering::SeqCst);
+                        let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
+                        if ord == MAX_FSYNC_WORKERS_PER_DISK
+                            && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
+                        {
+                            let _ = tx.send(());
+                        }
+                        if ord <= MAX_FSYNC_WORKERS_PER_DISK {
+                            let _ = release_rx.blocking_recv();
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(i)
+                    },
+                )
+                .await
+            }));
+        }
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
+            .await
+            .expect("all fsync workers should enter within timeout")
+            .expect("all_entered channel");
+        let _ = release_tx.send(());
+        for (i, handle) in handles.into_iter().enumerate() {
+            assert_eq!(handle.await.expect("task join").expect("fsync job"), i);
+        }
+        assert_eq!(
+            max_seen.load(Ordering::SeqCst),
+            MAX_FSYNC_WORKERS_PER_DISK,
+            "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                {
+                    let state = queue.lane(DiskBlockingLane::Fsync).state.lock();
+                    if state.active_workers == 0 && state.idle_workers == 0 {
+                        assert!(state.jobs.is_empty());
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("all fsync workers must retire with zero idle count");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -11682,6 +11842,7 @@ mod tests {
         let queue = DiskBlockingQueue::new();
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
         let barrier = Arc::new(std::sync::Barrier::new(MAX_NAMESPACE_WORKERS_PER_DISK + 1));
 
         let mut handles = Vec::new();
@@ -11689,12 +11850,13 @@ mod tests {
             let q = Arc::clone(&queue);
             let active = Arc::clone(&active);
             let max_seen = Arc::clone(&max_seen);
+            let entered = Arc::clone(&entered);
             let barrier = Arc::clone(&barrier);
             handles.push(tokio::spawn(async move {
                 q.run(move || {
                     let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                     max_seen.fetch_max(cur, Ordering::SeqCst);
-                    if i < MAX_NAMESPACE_WORKERS_PER_DISK {
+                    if entered.fetch_add(1, Ordering::SeqCst) < MAX_NAMESPACE_WORKERS_PER_DISK {
                         barrier.wait();
                     }
                     std::thread::sleep(std::time::Duration::from_millis(5));

@@ -207,6 +207,12 @@ pub(super) struct MultipartSourceAdmission {
     initial: bool,
 }
 impl MultipartSourceAdmission {
+    pub(super) fn source(&self) -> &Path {
+        &self.source
+    }
+    pub(super) fn is_initial(&self) -> bool {
+        self.initial
+    }
     pub(super) fn precondition(&self) -> Arc<dyn Fn() -> std::io::Result<()> + Send + Sync> {
         let admission = self.clone();
         Arc::new(move || admission.validate())
@@ -250,6 +256,8 @@ pub(super) struct MultipartCommitStaging {
     logical_path: PathBuf,
     io_path: PathBuf,
     owner: Option<Arc<dyn Send + Sync>>,
+    cleaned: Arc<std::sync::atomic::AtomicBool>,
+    fresh_source_head: Option<bytes::Bytes>,
 }
 
 impl MultipartCommitStaging {
@@ -259,10 +267,19 @@ impl MultipartCommitStaging {
     pub(super) fn private_directory(&self, directory: Uuid) -> PathBuf {
         self.io_path.join(directory.to_string())
     }
+    pub(super) fn cleanup_handle(&self) -> (PathBuf, Arc<std::sync::atomic::AtomicBool>) {
+        (self.io_path.clone(), Arc::clone(&self.cleaned))
+    }
+    pub(super) fn fresh_source_head(&self) -> Option<bytes::Bytes> {
+        self.fresh_source_head.clone()
+    }
 }
 
 impl Drop for MultipartCommitStaging {
     fn drop(&mut self) {
+        if self.cleaned.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
         let logical_path = self.logical_path.clone();
         let io_path = self.io_path.clone();
         let owner = self.owner.clone();
@@ -285,6 +302,14 @@ impl Drop for MultipartCommitStaging {
 }
 
 impl LocalDisk {
+    pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        let root = upload_scope_root(upload_or_part_path, part_path);
+        let Ok(source) = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, root) else {
+            return false;
+        };
+        super::multipart_source_state::has_clean_active_multipart_source(&source)
+    }
+
     pub(super) fn multipart_source_admission(
         &self,
         volume: &str,
@@ -356,12 +381,14 @@ impl LocalDisk {
         let io_path = self.io_get_object_path(RUSTFS_META_TMP_BUCKET, &attempt)?;
         // The attempt root is exactly the namespace used by the tmp sweeper.
         let lease = os::acquire_namespace_mutation_lease_with_owner(&logical_path, owner.clone()).await;
-        let staging = MultipartCommitStaging {
+        let mut staging = MultipartCommitStaging {
             path: attempt,
             lease,
             logical_path,
             io_path,
             owner,
+            cleaned: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            fresh_source_head: None,
         };
         let canonical_metadata = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &format!("{source_path}/xl.meta"))?;
         let source_object = self.io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, source_path)?;
@@ -371,31 +398,37 @@ impl LocalDisk {
         let source_path = source_path.to_owned();
         let incoming = incoming.clone();
         let sync_directory = effective_durability(destination_volume).syncs_data_shards();
-        os::run_cancellable_blocking_namespace_operation(Arc::clone(&staging.lease), move |cancelled| {
+        let fresh_head = os::run_cancellable_blocking_namespace_operation(Arc::clone(&staging.lease), move |cancelled| {
             if cancelled() {
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
             }
-            let raw = os::read_multipart_source_metadata(&canonical_metadata, &base, &publication_root).map_err(|error| {
-                // A retired source has no authority for this delayed completion.
-                // Preserve confinement and other I/O failures as their real errors.
-                if error.kind() == std::io::ErrorKind::NotFound {
-                    DiskError::FileNotFound.into()
-                } else {
-                    error
-                }
-            })?;
-            let source = get_file_info(
-                &raw,
-                RUSTFS_META_MULTIPART_BUCKET,
-                &source_path,
-                "",
-                FileInfoOpts {
-                    data: false,
-                    include_free_versions: false,
-                    include_part_checksums: true,
-                },
-            )
-            .map_err(std::io::Error::other)?;
+            let cached_head = super::multipart_source_state::get_active_multipart_source_head(&source_object);
+            let (raw, source, from_active_cache) = if let Some((raw, source)) = cached_head {
+                (raw, source, true)
+            } else {
+                let raw = os::read_multipart_source_metadata(&canonical_metadata, &base, &publication_root).map_err(|error| {
+                    // A retired source has no authority for this delayed completion.
+                    // Preserve confinement and other I/O failures as their real errors.
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        DiskError::FileNotFound.into()
+                    } else {
+                        error
+                    }
+                })?;
+                let source = get_file_info(
+                    &raw,
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    &source_path,
+                    "",
+                    FileInfoOpts {
+                        data: false,
+                        include_free_versions: false,
+                        include_part_checksums: true,
+                    },
+                )
+                .map_err(std::io::Error::other)?;
+                (bytes::Bytes::from(raw), source, false)
+            };
             let source_dir = source
                 .data_dir
                 .filter(|dir| !dir.is_nil())
@@ -412,23 +445,31 @@ impl LocalDisk {
             let _attempt = os::mkdir_all_below_existing_base_std(&private_object, &base, &publication_root)?;
             if incoming.data.is_none() && !incoming.is_remote() {
                 let source_data_dir = source_object.join(source_dir.to_string());
-                let pinned_source_data = (!incoming.parts.is_empty())
-                    .then(|| os::pin_multipart_source_directory(&source_data_dir, &base, &publication_root))
-                    .transpose()?;
+                let mut pinned_source_data = None;
                 let mut names = Vec::with_capacity(incoming.parts.len().saturating_mul(3));
                 for part in &incoming.parts {
                     if cancelled() {
                         return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
                     }
                     let meta_name = format!("part.{}.meta", part.number);
-                    let bytes = os::read_multipart_source_metadata_in_pinned(
-                        pinned_source_data.as_ref().expect("pinned source data directory"),
-                        &source_data_dir,
-                        std::ffi::OsStr::new(&meta_name),
-                        &base,
-                        &publication_root,
-                    )?;
-                    let actual = rustfs_filemeta::ObjectPartInfo::unmarshal(&bytes).map_err(std::io::Error::other)?;
+                    let actual = if let Some(cached_part) =
+                        super::multipart_source_state::get_active_multipart_source_part(&source_object, part.number)
+                    {
+                        cached_part
+                    } else {
+                        if pinned_source_data.is_none() {
+                            pinned_source_data =
+                                Some(os::pin_multipart_source_directory(&source_data_dir, &base, &publication_root)?);
+                        }
+                        let bytes = os::read_multipart_source_metadata_in_pinned(
+                            pinned_source_data.as_ref().expect("pinned source data directory"),
+                            &source_data_dir,
+                            std::ffi::OsStr::new(&meta_name),
+                            &base,
+                            &publication_root,
+                        )?;
+                        rustfs_filemeta::ObjectPartInfo::unmarshal(&bytes).map_err(std::io::Error::other)?
+                    };
                     let normalized = i64::try_from(actual.size)
                         .map_err(std::io::Error::other)?
                         .max(actual.actual_size);
@@ -464,10 +505,15 @@ impl LocalDisk {
                     cancelled,
                 )?;
             }
-            Ok(())
+            let has_state = !from_active_cache
+                && (source_object.join(".mpu-source-state").exists()
+                    || source_object.join(".mpu-recovery").exists()
+                    || source_object.join(".mpu-completions").exists());
+            Ok((!has_state).then_some(raw))
         })
         .await
         .map_err(DiskError::from)?;
+        staging.fresh_source_head = fresh_head;
         Ok(staging)
     }
 }
@@ -1218,5 +1264,212 @@ mod tests {
             .await
             .expect("non-part empty hash cleanup must remain supported");
         assert!(!directory.exists(), "a per-upload safety guard must not strand empty hash directories");
+    }
+
+    #[tokio::test]
+    async fn multipart_source_active_head_cache_populates_and_invalidates_across_part_and_delete_paths() {
+        use crate::disk::{DiskAPI as _, PartTransactionAction, ReadOptions};
+        let (_root, disk, completed, _) = fixture().await;
+        std::fs::create_dir_all(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path")).expect("TMP bucket");
+        let upload = format!("{}/{}", "c".repeat(64), Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        let mut init_fi = FileInfo::new(&upload, 2, 2);
+        init_fi.erasure.index = 1;
+        init_fi.data_dir = Some(data_dir);
+        init_fi.fresh = true;
+        init_fi.mod_time = Some(time::OffsetDateTime::now_utc());
+
+        disk.write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &upload, init_fi.clone())
+            .await
+            .expect("fresh multipart upload metadata");
+        assert!(disk.has_clean_active_multipart_source(&upload, false));
+
+        let read_fi = disk
+            .read_version("", RUSTFS_META_MULTIPART_BUCKET, &upload, "", &ReadOptions::default())
+            .await
+            .expect("cached read_version");
+        assert_eq!(read_fi.data_dir, Some(data_dir));
+
+        let destination = format!("{upload}/{data_dir}/part.1");
+        let part_meta = bytes::Bytes::from(completed.parts[0].marshal_msg().expect("part meta"));
+        disk.write_all(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.1",
+            bytes::Bytes::from_static(b"immutable shard"),
+        )
+        .await
+        .expect("stage tmp part");
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination,
+            part_meta.clone(),
+        )
+        .await
+        .expect("prepare part transaction");
+        assert!(
+            !disk.has_clean_active_multipart_source(&upload, false),
+            "in-flight part transaction must mark active source as having unsettled part txn"
+        );
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.1",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination,
+            part_meta,
+        )
+        .await
+        .expect("rename part");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination, PartTransactionAction::Commit)
+            .await
+            .expect("settle part transaction");
+        assert!(
+            disk.has_clean_active_multipart_source(&upload, false),
+            "settled commit must restore clean active multipart source status"
+        );
+        let read_parts = disk
+            .read_parts(RUSTFS_META_MULTIPART_BUCKET, &[format!("{destination}.meta")])
+            .await
+            .expect("cached read_parts");
+        assert_eq!(read_parts.len(), 1);
+        assert_eq!(read_parts[0].number, 1);
+
+        // Prepare part 2, then replay Commit for already-settled part 1: part 2's
+        // pending transaction must keep the upload marked as having unsettled part txns.
+        let destination2 = format!("{upload}/{data_dir}/part.2");
+        let mut part2_info = completed.parts[0].clone();
+        part2_info.number = 2;
+        let part2_meta = bytes::Bytes::from(part2_info.marshal_msg().expect("part 2 meta"));
+        disk.write_all(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.2",
+            bytes::Bytes::from_static(b"immutable shard"),
+        )
+        .await
+        .expect("stage tmp part 2");
+        disk.prepare_part_transaction(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.2",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination2,
+            part2_meta.clone(),
+        )
+        .await
+        .expect("prepare part 2 transaction");
+        assert!(!disk.has_clean_active_multipart_source(&upload, false));
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination, PartTransactionAction::Commit)
+            .await
+            .expect("replayed part 1 commit settlement");
+        assert!(
+            !disk.has_clean_active_multipart_source(&upload, false),
+            "replayed settlement for part 1 must not clear part 2's pending transaction"
+        );
+        disk.rename_part(
+            RUSTFS_META_TMP_BUCKET,
+            "cache-test-part/part.2",
+            RUSTFS_META_MULTIPART_BUCKET,
+            &destination2,
+            part2_meta,
+        )
+        .await
+        .expect("rename part 2");
+        disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &destination2, PartTransactionAction::Commit)
+            .await
+            .expect("settle part 2 transaction");
+        assert!(disk.has_clean_active_multipart_source(&upload, false));
+
+        // Deleting {upload}/xl.meta through delete_paths must invalidate the canonical {upload} cache key.
+        disk.delete_paths(RUSTFS_META_MULTIPART_BUCKET, &[format!("{upload}/xl.meta")])
+            .await
+            .expect("delete xl.meta via delete_paths");
+        assert!(
+            !disk.has_clean_active_multipart_source(&upload, false),
+            "per-file head deletion must invalidate the canonical upload cache key"
+        );
+        assert!(matches!(
+            disk.read_version("", RUSTFS_META_MULTIPART_BUCKET, &upload, "", &ReadOptions::default())
+                .await,
+            Err(DiskError::FileNotFound)
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_source_cache_publication_holds_source_lock_against_concurrent_retirement() {
+        use crate::disk::{DiskAPI as _, disk_store::LocalDiskWrapper, os::prepared_publication_test_hooks as hooks};
+
+        let (_root, disk, _, _) = fixture().await;
+        std::fs::create_dir_all(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path")).expect("TMP bucket");
+        let disk = Arc::new(disk);
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        let upload = format!("{}/{}", "d".repeat(64), Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        let mut init_fi = FileInfo::new(&upload, 2, 2);
+        init_fi.erasure.index = 1;
+        init_fi.data_dir = Some(data_dir);
+        init_fi.fresh = true;
+        init_fi.mod_time = Some(time::OffsetDateTime::now_utc());
+
+        let source_dir = disk
+            .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &upload)
+            .expect("source dir");
+        let base_dir = disk
+            .io_get_bucket_path(RUSTFS_META_MULTIPART_BUCKET)
+            .expect("multipart bucket path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _hook = hooks::install_at(hooks::Stage::DirFsync, &source_dir, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        let init_wrapper = wrapper.clone();
+        let init_upload = upload.clone();
+        let init_task = tokio::spawn(async move {
+            init_wrapper
+                .write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &init_upload, init_fi)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("initial write_metadata reaches parent dir fsync")
+            .expect("entered channel");
+
+        let retire_wrapper = wrapper.clone();
+        let retire_path = format!("{upload}/xl.meta");
+        let mut retire_fut = Box::pin(async move {
+            retire_wrapper
+                .delete_paths(RUSTFS_META_MULTIPART_BUCKET, &[retire_path])
+                .await
+        });
+        assert!(
+            futures::poll!(tokio::task::unconstrained(retire_fut.as_mut())).is_pending(),
+            "concurrent retirement must block on SourceRW while initial head publication is in flight"
+        );
+
+        let _ = release_tx.send(());
+        init_task.await.expect("init join").expect("initial write_metadata succeeds");
+        retire_fut
+            .await
+            .expect("concurrent retirement completes after SourceRW release");
+
+        assert!(
+            !super::super::multipart_source_state::has_active_multipart_source_head(&source_dir),
+            "retired source must not remain active in cache after interleaved initial publication"
+        );
+        assert!(
+            matches!(
+                super::super::multipart_source_state::validate_source_mutation(
+                    &source_dir,
+                    &base_dir,
+                    &disk.publication_root,
+                    false
+                ),
+                Err(DiskError::FileNotFound)
+            ),
+            "validate_source_mutation must reject non-initial mutation on retired source"
+        );
     }
 }
