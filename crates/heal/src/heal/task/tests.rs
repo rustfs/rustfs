@@ -1659,6 +1659,7 @@ struct MockStorage {
     retry_test_pages: Option<Vec<Vec<HealListItem>>>,
     retry_test_delays: HashMap<String, Duration>,
     retry_test_listing_delays: Mutex<VecDeque<Duration>>,
+    retry_test_disk_walk_pages: bool,
     retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
     list_each_bucket: bool,
@@ -2913,6 +2914,11 @@ impl HealStorageAPI for MockStorage {
         _include_lifecycle_object_info: bool,
     ) -> Result<(Vec<HealListItem>, Option<String>, bool)> {
         self.disk_walk_calls.lock().unwrap().push(set_disk_id.to_string());
+        if self.retry_test_disk_walk_pages {
+            return self
+                .list_objects_for_heal_page(_bucket, _prefix, continuation_token, _include_lifecycle_object_info)
+                .await;
+        }
         if continuation_token.is_some() {
             return Ok((Vec::new(), None, false));
         }

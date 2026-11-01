@@ -52,7 +52,89 @@ fn fail_once(storage: &MockStorage, name: &str) {
 }
 
 #[tokio::test(start_paused = true)]
-async fn slow_listing_retry_services_due_object_then_age_before_next_listing() {
+async fn slow_listing_does_not_starve_due_object_retry() {
+    let storage = Arc::new(MockStorage {
+        recoverable_second_page_failures: Mutex::new(Some(1)),
+        retry_test_listing_delays: Mutex::new(VecDeque::from([Duration::ZERO, Duration::from_secs(31)])),
+        ..Default::default()
+    });
+    fail_once(&storage, "object-a");
+    let task = bucket_task(storage.clone());
+    let execution = task.execute();
+    tokio::pin!(execution);
+    assert!(tokio::time::timeout(Duration::from_secs(10), &mut execution).await.is_err());
+    assert_eq!(
+        storage.retry_test_events.lock().expect("events").as_slice(),
+        ["list:first", "heal:object-a", "list:second", "heal:object-a"],
+        "the object retry must run while the slow listing remains in flight"
+    );
+    assert_eq!(task.get_outcome().await.counters.failed, 0);
+    execution.await.expect("the resumed listing and retried object complete");
+    assert_eq!(
+        storage.retry_test_events.lock().expect("events").as_slice(),
+        [
+            "list:first",
+            "heal:object-a",
+            "list:second",
+            "heal:object-a",
+            "list:second",
+            "heal:object-b"
+        ]
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_set_disk_walk_does_not_starve_due_object_retry() {
+    let storage = Arc::new(MockStorage {
+        erasure_set_scopes: Mutex::new(vec![(0, 0)]),
+        retry_test_disk_walk_pages: true,
+        retry_test_pages: Some(vec![vec![heal_item("a")], vec![heal_item("b")]]),
+        retry_test_listing_delays: Mutex::new(VecDeque::from([Duration::ZERO, Duration::from_secs(31)])),
+        ..Default::default()
+    });
+    fail_once(&storage, "a");
+    let task = bucket_task(storage.clone());
+    let execution = task.execute();
+    tokio::pin!(execution);
+    assert!(tokio::time::timeout(Duration::from_secs(10), &mut execution).await.is_err());
+    assert_eq!(
+        storage.retry_test_events.lock().expect("events").as_slice(),
+        ["list:first", "heal:a", "list:1", "heal:a"]
+    );
+    assert_eq!(storage.disk_walk_calls.lock().expect("walks").len(), 2);
+    execution.await.expect("the same disk walk resumes and both objects heal");
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["a", "a", "b"]);
+    assert_eq!(storage.disk_walk_calls.lock().expect("walks").len(), 2);
+    assert_eq!(task.get_outcome().await.counters.failed, 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn cancelling_an_inflight_listing_keeps_deferred_outcome_cancelled() {
+    let storage = Arc::new(MockStorage {
+        recoverable_second_page_failures: Mutex::new(Some(1)),
+        retry_test_listing_delays: Mutex::new(VecDeque::from([Duration::ZERO, Duration::from_secs(31)])),
+        ..Default::default()
+    });
+    fail_once(&storage, "object-a");
+    let task = bucket_task(storage.clone());
+    let execution = task.execute();
+    tokio::pin!(execution);
+    assert!(tokio::time::timeout(Duration::from_secs(1), &mut execution).await.is_err());
+    assert_eq!(
+        storage.retry_test_events.lock().expect("events").as_slice(),
+        ["list:first", "heal:object-a", "list:second"]
+    );
+    task.cancel().await.expect("cancel");
+    assert!(matches!(execution.await, Err(Error::TaskCancelled)));
+    tokio::time::advance(Duration::from_secs(60)).await;
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["object-a"]);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.objects.len(), 1);
+    assert_eq!(outcome.objects[0].disposition, HealObjectDisposition::Cancelled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn slow_listing_services_multiple_retries_without_restarting_walk() {
     let storage = Arc::new(MockStorage {
         recoverable_second_page_failures: Mutex::new(Some(1)),
         retry_test_listing_delays: Mutex::new(VecDeque::from([Duration::ZERO, Duration::from_secs(29)])),
@@ -68,22 +150,17 @@ async fn slow_listing_retry_services_due_object_then_age_before_next_listing() {
     let task = bucket_task(storage.clone());
     let execution = task.execute();
     tokio::pin!(execution);
-    assert!(
-        tokio::time::timeout(Duration::from_millis(30_500), &mut execution)
-            .await
-            .is_err()
-    );
+    assert!(tokio::time::timeout(Duration::from_secs(10), &mut execution).await.is_err());
     assert_eq!(
         storage.retry_test_events.lock().expect("events").as_slice(),
-        ["list:first", "heal:object-a", "list:second", "heal:object-a"]
+        ["list:first", "heal:object-a", "list:second", "heal:object-a", "heal:object-a"]
     );
     let outcome = task.get_outcome().await;
-    assert_eq!(outcome.counters.processed, 1);
     assert_eq!(
-        outcome.objects[0].disposition,
-        HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)
+        (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
+        (1, 0, 2)
     );
-    execution.await.expect_err("age exhausted object must remain a batch failure");
+    execution.await.expect("object and resumed listing complete");
     assert_eq!(
         storage.retry_test_events.lock().expect("events").as_slice(),
         [
@@ -91,22 +168,25 @@ async fn slow_listing_retry_services_due_object_then_age_before_next_listing() {
             "heal:object-a",
             "list:second",
             "heal:object-a",
+            "heal:object-a",
             "list:second",
             "heal:object-b"
         ]
     );
-    let outcome = task.get_outcome().await;
-    assert_eq!((outcome.counters.processed, outcome.counters.attempt_failures), (2, 3));
 }
 
 #[tokio::test(start_paused = true)]
-async fn listing_return_after_age_expires_does_not_start_another_heal_attempt() {
+async fn slow_listing_preserves_retry_limit_and_failure() {
     let storage = Arc::new(MockStorage {
         recoverable_second_page_failures: Mutex::new(Some(1)),
         retry_test_listing_delays: Mutex::new(VecDeque::from([Duration::ZERO, Duration::from_secs(31)])),
         ..Default::default()
     });
-    fail_once(&storage, "object-a");
+    storage
+        .heal_object_outcomes
+        .lock()
+        .expect("outcomes")
+        .insert("object-a".to_string(), (0..5).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
     let task = bucket_task(storage.clone());
     let execution = task.execute();
     tokio::pin!(execution);
@@ -115,15 +195,20 @@ async fn listing_return_after_age_expires_does_not_start_another_heal_attempt() 
             .await
             .is_err()
     );
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["object-a"; 5]);
+    let outcome = task.get_outcome().await;
     assert_eq!(
-        storage.retry_test_events.lock().expect("events").as_slice(),
-        ["list:first", "heal:object-a", "list:second"]
+        (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
+        (1, 1, 6) // Five object failures and one listing failure.
     );
-    assert_eq!(task.get_outcome().await.counters.failed, 1);
-    execution.await.expect_err("age exhaustion remains a failure");
     assert_eq!(
-        storage.retry_test_events.lock().expect("events").as_slice(),
-        ["list:first", "heal:object-a", "list:second", "list:second", "heal:object-b"]
+        outcome.objects[0].disposition,
+        HealObjectDisposition::Failed(HealFailureClass::RetryExhausted)
+    );
+    execution.await.expect_err("exhausted object must remain a batch failure");
+    assert_eq!(
+        storage.heal_object_calls.lock().expect("calls").last().map(String::as_str),
+        Some("object-b")
     );
 }
 
@@ -221,6 +306,29 @@ async fn full_window_abort_accounts_inline_once_and_leaves_unstarted_tail_unproc
 }
 
 #[tokio::test(start_paused = true)]
+async fn slowdown_can_recover_within_existing_deferred_age_budget() {
+    let storage = Arc::new(pages_storage(&[&["a"]]));
+    storage
+        .heal_object_outcomes
+        .lock()
+        .expect("outcomes")
+        .insert("a".to_string(), (0..4).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
+    let task = bucket_task(storage.clone());
+    let started = tokio::time::Instant::now();
+    task.execute()
+        .await
+        .expect("transient slowdown recovers within the deferred age budget");
+    assert!(started.elapsed() < Duration::from_secs(30));
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 5);
+    let outcome = task.get_outcome().await;
+    assert_eq!(
+        (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
+        (1, 0, 4)
+    );
+    assert_eq!(outcome.objects.len(), 1);
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
     let storage = Arc::new(pages_storage(&[&["a"], &["b"], &["c"], &["d"]]));
     for name in ["a", "b", "c", "d"] {
@@ -228,7 +336,7 @@ async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
             .heal_object_outcomes
             .lock()
             .expect("outcomes")
-            .insert(name.to_string(), (0..4).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
+            .insert(name.to_string(), (0..5).map(|_| MockHealObjectOutcome::RetryableSlowDown).collect());
     }
     let task = bucket_task(storage.clone());
     let execution = task.execute();
@@ -239,9 +347,9 @@ async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
     let outcome = task.get_outcome().await;
     assert_eq!(
         (outcome.counters.processed, outcome.counters.failed, outcome.counters.attempt_failures),
-        (4, 4, 16)
+        (4, 4, 20)
     );
-    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 16);
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 20);
     for name in ["a", "b", "c", "d"] {
         assert_eq!(outcome.objects.iter().filter(|item| item.identity.object == name).count(), 1);
     }
@@ -291,6 +399,21 @@ async fn due_retry_runs_before_next_object_in_a_slow_healthy_page() {
     let storage = Arc::new(storage);
     bucket_task(storage.clone()).execute().await.expect("all objects complete");
     assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["a", "b", "a", "c"]);
+}
+
+#[tokio::test(start_paused = true)]
+async fn retry_uses_remaining_time_before_age_limit() {
+    let mut storage = pages_storage(&[&["a", "b"]]);
+    storage.retry_test_delays.insert("b".to_string(), Duration::from_secs(27));
+    storage.heal_object_outcomes.lock().expect("outcomes").insert(
+        "a".to_string(),
+        VecDeque::from([MockHealObjectOutcome::RetryableLock, MockHealObjectOutcome::RetryableLock]),
+    );
+    let storage = Arc::new(storage);
+    let task = bucket_task(storage.clone());
+    task.execute().await.expect("the last retry can run before the age limit");
+    assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["a", "b", "a", "a"]);
+    assert_eq!(task.get_outcome().await.counters.failed, 0);
 }
 
 #[tokio::test(start_paused = true)]

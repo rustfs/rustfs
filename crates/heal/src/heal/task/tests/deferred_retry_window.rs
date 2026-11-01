@@ -66,10 +66,11 @@ async fn retry_age_caps_due_time_and_is_not_reset_by_rescheduling() {
     let mut entry = item("a".to_string(), None);
     entry.defer(Duration::from_secs(2));
     let first = entry.first_failure.expect("first failure");
+    assert_eq!(entry.due, first + Duration::from_secs(2));
     tokio::time::advance(Duration::from_secs(29)).await;
     entry.defer(Duration::from_secs(8));
     assert_eq!(entry.first_failure, Some(first));
-    assert_eq!(entry.due, first + MAX_DEFERRED_AGE);
+    assert_eq!(entry.due, first + Duration::from_millis(29_500));
     assert!(!entry.expired());
     tokio::time::advance(Duration::from_secs(1)).await;
     assert!(entry.expired());

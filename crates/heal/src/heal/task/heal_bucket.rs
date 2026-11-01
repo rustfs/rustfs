@@ -21,6 +21,9 @@ const MAX_DEFERRED_OBJECTS: usize = 256;
 const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 const MAX_DEFERRED_FORWARD_PAGES: u64 = 2;
 const MAX_DEFERRED_AGE: Duration = Duration::from_secs(30);
+// A recovered pool can become writable just after the ordinary retry budget.
+// Keep this extra attempt inside the existing deferred age and backoff caps.
+const MAX_SLOWDOWN_OBJECT_RETRIES: u32 = MAX_BUCKET_OBJECT_HEAL_RETRIES + 1;
 
 struct DeferredObject {
     name: String,
@@ -57,7 +60,11 @@ impl DeferredObject {
         let now = tokio::time::Instant::now();
         let first = *self.first_failure.get_or_insert(now);
         self.attempt += 1;
-        self.due = (now + delay).min(first + MAX_DEFERRED_AGE);
+        let remaining = (first + MAX_DEFERRED_AGE).saturating_duration_since(now);
+        // Scheduling exactly at the deadline guarantees the retry will be
+        // rejected as expired without making the storage attempt.
+        let delay = if delay >= remaining { remaining / 2 } else { delay };
+        self.due = now + delay;
     }
 }
 
@@ -656,6 +663,9 @@ impl HealTask {
             let mut listing_finished = false;
             let mut listing_attempt = 0;
             let mut listing_due = tokio::time::Instant::now();
+            let mut listing_inflight: Option<
+                std::pin::Pin<Box<dyn std::future::Future<Output = Result<(Vec<HealListItem>, Option<String>, bool)>> + Send>>,
+            > = None;
             let scope_result: Result<()> = async {
                 loop {
                     self.check_control_flags().await?;
@@ -681,24 +691,64 @@ impl HealTask {
                     let Some(mut item) = item else {
                         let can_list = !listing_finished && inline_retry.is_none() && deferred.can_advance(page_number);
                         if can_list && listing_due <= tokio::time::Instant::now() {
-                            let page = if let Some(set_disk_id) = set_disk_id.as_deref() {
-                                self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
-                                    set_disk_id,
-                                    bucket,
-                                    prefix,
-                                    continuation_token.as_deref(),
-                                    false,
-                                ))
-                                .await
-                            } else {
-                                self.await_with_control(self.storage.list_objects_for_heal_page(
-                                    bucket,
-                                    prefix,
-                                    continuation_token.as_deref(),
-                                    false,
-                                ))
-                                .await
+                            if listing_inflight.is_none() {
+                                let storage = Arc::clone(&self.storage);
+                                let listing_set = set_disk_id.clone();
+                                let listing_bucket = bucket.to_owned();
+                                let listing_prefix = prefix.to_owned();
+                                let cursor = continuation_token.clone();
+                                listing_inflight = Some(Box::pin(async move {
+                                    if let Some(set_id) = listing_set.as_deref() {
+                                        storage
+                                            .list_versions_for_heal_page_disk_walk(
+                                                set_id,
+                                                &listing_bucket,
+                                                &listing_prefix,
+                                                cursor.as_deref(),
+                                                false,
+                                            )
+                                            .await
+                                    } else {
+                                        storage
+                                            .list_objects_for_heal_page(
+                                                &listing_bucket,
+                                                &listing_prefix,
+                                                cursor.as_deref(),
+                                                false,
+                                            )
+                                            .await
+                                    }
+                                }));
+                            }
+                            let next_retry = deferred
+                                .next_due()
+                                .into_iter()
+                                .chain(inline_retry.as_ref().map(|item| item.due))
+                                .min();
+                            let Some(listing) = listing_inflight.as_mut() else {
+                                return Err(Error::other("heal listing future is unavailable"));
                             };
+                            // Keep the same listing future alive while an earlier retry runs.
+                            // Restarting a disk walk here would duplicate work and may change its snapshot.
+                            let result = self
+                                .await_with_control(async {
+                                    if let Some(due) = next_retry {
+                                        tokio::select! {
+                                            biased;
+                                            _ = tokio::time::sleep_until(due) => Ok(None),
+                                            result = listing => Ok(Some(result)),
+                                        }
+                                    } else {
+                                        Ok(Some(listing.await))
+                                    }
+                                })
+                                .await;
+                            let page = match result {
+                                Ok(Some(page)) => page,
+                                Ok(None) => continue,
+                                Err(error) => Err(error),
+                            };
+                            listing_inflight = None;
                             match page {
                                 Ok((objects, next_token, is_truncated)) => {
                                     page_number = page_number.saturating_add(1);
@@ -912,7 +962,12 @@ impl HealTask {
                             );
                         } else if !age_exhausted
                             && err.is_recoverable_object_heal()
-                            && retry_attempt < MAX_BUCKET_OBJECT_HEAL_RETRIES
+                            && retry_attempt
+                                < if matches!(&err, Error::Storage(crate::heal::StorageError::SlowDown)) {
+                                    MAX_SLOWDOWN_OBJECT_RETRIES
+                                } else {
+                                    MAX_BUCKET_OBJECT_HEAL_RETRIES
+                                }
                         {
                             terminal_outcome = false;
                             debug!(

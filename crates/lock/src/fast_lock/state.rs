@@ -23,6 +23,11 @@ use crate::fast_lock::types::{LockMode, LockPriority};
 /// Optimized atomic lock state encoding in u64
 /// Bits: [63:48] reserved | [47:32] writers_waiting | [31:16] readers_waiting | [15:8] readers_count | [7:1] flags | [0] writer_flag
 const WRITER_FLAG_MASK: u64 = 0x1;
+// A committed write tail is a reader-compatible owner that still excludes writers.
+const COMMITTED_TAIL_FLAG: u64 = 0x2;
+const TAIL_UPGRADE_PENDING_FLAG: u64 = 0x4;
+const TAIL_WRITER_OBSERVED_FLAG: u64 = 0x8;
+const TAIL_TRACK_WRITERS_FLAG: u64 = 0x10;
 const READERS_SHIFT: u8 = 8;
 const READERS_MASK: u64 = 0xFF << READERS_SHIFT; // Support up to 255 concurrent readers
 const READERS_WAITING_SHIFT: u8 = 16;
@@ -31,7 +36,6 @@ const WRITERS_WAITING_SHIFT: u8 = 32;
 const WRITERS_WAITING_MASK: u64 = 0xFFFF << WRITERS_WAITING_SHIFT;
 
 // Fast path check masks
-const NO_WRITER_AND_NO_WAITING_WRITERS: u64 = WRITER_FLAG_MASK | WRITERS_WAITING_MASK;
 const COMPLETELY_UNLOCKED: u64 = 0;
 
 /// Fast atomic lock state for single version
@@ -66,8 +70,8 @@ impl AtomicLockState {
         let state = self.state.load(Ordering::Relaxed); // Use Relaxed for better performance
         match mode {
             LockMode::Shared => {
-                // No writer and no waiting writers
-                (state & NO_WRITER_AND_NO_WAITING_WRITERS) == 0
+                (state & (WRITER_FLAG_MASK | TAIL_UPGRADE_PENDING_FLAG)) == 0
+                    && ((state & WRITERS_WAITING_MASK) == 0 || (state & COMMITTED_TAIL_FLAG) != 0)
             }
             LockMode::Exclusive => {
                 // Completely unlocked
@@ -83,8 +87,11 @@ impl AtomicLockState {
         loop {
             let current = self.state.load(Ordering::Acquire);
 
-            // Fast path check - cannot acquire if there's a writer or writers waiting
-            if (current & NO_WRITER_AND_NO_WAITING_WRITERS) != 0 {
+            // While a committed tail owns a shared slot, let reads through
+            // even if a subsequent writer is waiting for that tail to drain.
+            if (current & (WRITER_FLAG_MASK | TAIL_UPGRADE_PENDING_FLAG)) != 0
+                || ((current & WRITERS_WAITING_MASK) != 0 && (current & COMMITTED_TAIL_FLAG) == 0)
+            {
                 return false;
             }
 
@@ -137,6 +144,78 @@ impl AtomicLockState {
         }
     }
 
+    /// Atomically retain writer exclusion while allowing reads of a committed tail.
+    fn downgrade_committed_tail(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            if (current & WRITER_FLAG_MASK) == 0 || (current & (READERS_MASK | COMMITTED_TAIL_FLAG)) != 0 {
+                return false;
+            }
+            let next = (current & !WRITER_FLAG_MASK)
+                | COMMITTED_TAIL_FLAG
+                | (1 << READERS_SHIFT)
+                | if current & WRITERS_WAITING_MASK != 0 {
+                    TAIL_WRITER_OBSERVED_FLAG
+                } else {
+                    0
+                };
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.update_access_time();
+                return true;
+            }
+        }
+    }
+
+    /// Restore exclusive ownership only after every other reader has left.
+    fn try_upgrade_committed_tail(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            if (current & COMMITTED_TAIL_FLAG) == 0 || (current & TAIL_WRITER_OBSERVED_FLAG) != 0 {
+                return false;
+            }
+            let readers_drained = (current & READERS_MASK) == (1 << READERS_SHIFT);
+            let next = if readers_drained {
+                (current & !(COMMITTED_TAIL_FLAG | TAIL_UPGRADE_PENDING_FLAG | TAIL_WRITER_OBSERVED_FLAG | READERS_MASK))
+                    | WRITER_FLAG_MASK
+                    | TAIL_TRACK_WRITERS_FLAG
+            } else {
+                current | TAIL_UPGRADE_PENDING_FLAG
+            };
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.update_access_time();
+                return readers_drained;
+            }
+        }
+    }
+
+    /// Release the committed tail's own shared slot and restore ordinary fairness.
+    fn release_committed_tail(&self) -> bool {
+        loop {
+            let current = self.state.load(Ordering::Acquire);
+            if (current & COMMITTED_TAIL_FLAG) == 0 || self.readers_count(current) == 0 {
+                return false;
+            }
+            let next =
+                (current & !(COMMITTED_TAIL_FLAG | TAIL_UPGRADE_PENDING_FLAG | TAIL_WRITER_OBSERVED_FLAG)) - (1 << READERS_SHIFT);
+            if self
+                .state
+                .compare_exchange_weak(current, next, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+            {
+                self.update_access_time();
+                return true;
+            }
+        }
+    }
+
     /// Release shared lock
     pub fn release_shared(&self) -> bool {
         loop {
@@ -169,7 +248,7 @@ impl AtomicLockState {
                 return false; // No exclusive lock to release
             }
 
-            let new_state = current & !WRITER_FLAG_MASK;
+            let new_state = current & !(WRITER_FLAG_MASK | TAIL_TRACK_WRITERS_FLAG | TAIL_WRITER_OBSERVED_FLAG);
 
             if self
                 .state
@@ -236,7 +315,10 @@ impl AtomicLockState {
                 return false; // Max waiting writers
             }
 
-            let new_state = current + (1 << WRITERS_WAITING_SHIFT);
+            let mut new_state = current + (1 << WRITERS_WAITING_SHIFT);
+            if current & (COMMITTED_TAIL_FLAG | TAIL_TRACK_WRITERS_FLAG) != 0 {
+                new_state |= TAIL_WRITER_OBSERVED_FLAG;
+            }
 
             if self
                 .state
@@ -321,9 +403,14 @@ impl AtomicLockState {
     }
 
     #[cfg(test)]
-    pub fn writers_waiting_count(&self) -> u16 {
+    pub(crate) fn writers_waiting_count(&self) -> u16 {
         let state = self.state.load(Ordering::Acquire);
         self.writers_waiting(state)
+    }
+
+    pub(crate) fn writer_observed_during_tail(&self) -> bool {
+        let state = self.state.load(Ordering::Acquire);
+        self.writers_waiting(state) > 0 || state & TAIL_WRITER_OBSERVED_FLAG != 0
     }
 }
 
@@ -334,6 +421,8 @@ pub struct ObjectLockState {
     // First cache line: Most frequently accessed data
     /// Atomic state for fast operations
     pub atomic_state: AtomicLockState,
+    /// Changes whenever an administrator force-releases this state.
+    pub(crate) force_epoch: AtomicU64,
 
     // Second cache line: Notification mechanisms
     /// Notification for readers (traditional)
@@ -377,6 +466,7 @@ impl ObjectLockState {
     pub fn new() -> Self {
         Self {
             atomic_state: AtomicLockState::new(),
+            force_epoch: AtomicU64::new(0),
             read_notify: Notify::new(),
             write_notify: Notify::new(),
             optimized_notify: OptimizedNotify::new(),
@@ -422,6 +512,70 @@ impl ObjectLockState {
             acquired_at: SystemTime::now(),
             lock_timeout,
         });
+        true
+    }
+
+    /// Convert the current exclusive owner into the committed-tail owner.
+    pub(crate) fn downgrade_committed_tail(&self, owner: &Arc<str>) -> bool {
+        let mut current = self.current_owner.write();
+        let Some(info) = current.as_ref().filter(|info| info.owner.as_ref() == owner.as_ref()).cloned() else {
+            return false;
+        };
+        let mut shared = self.shared_owners.write();
+        if !shared.is_empty() || !self.atomic_state.downgrade_committed_tail() {
+            return false;
+        }
+        shared.push(SharedOwnerEntry {
+            owner: info.owner,
+            count: 1,
+            acquired_at: info.acquired_at,
+            lock_timeout: info.lock_timeout,
+        });
+        *current = None;
+        drop(shared);
+        drop(current);
+        self.optimized_notify.notify_readers();
+        true
+    }
+
+    pub(crate) fn try_upgrade_committed_tail(&self, owner: &Arc<str>) -> bool {
+        let mut current = self.current_owner.write();
+        let mut shared = self.shared_owners.write();
+        let Some(pos) = shared.iter().position(|entry| entry.owner.as_ref() == owner.as_ref()) else {
+            return false;
+        };
+        if current.is_some() || !self.atomic_state.try_upgrade_committed_tail() {
+            return false;
+        }
+        let info = shared.remove(pos);
+        *current = Some(ExclusiveOwnerInfo {
+            owner: info.owner,
+            acquired_at: info.acquired_at,
+            lock_timeout: info.lock_timeout,
+        });
+        true
+    }
+
+    /// Release the committed-tail owner's shared slot without releasing readers.
+    pub(crate) fn release_committed_tail(&self, owner: &Arc<str>) -> bool {
+        let mut shared = self.shared_owners.write();
+        let Some(pos) = shared.iter().position(|entry| entry.owner.as_ref() == owner.as_ref()) else {
+            return false;
+        };
+        if !self.atomic_state.release_committed_tail() {
+            return false;
+        }
+        if shared[pos].count > 1 {
+            shared[pos].count -= 1;
+        } else {
+            shared.remove(pos);
+        }
+        let no_readers = shared.is_empty();
+        drop(shared);
+        if no_readers {
+            self.optimized_notify.notify_writer();
+        }
+        self.optimized_notify.notify_readers();
         true
     }
 
@@ -553,6 +707,24 @@ mod tests {
 
         assert!(state.release_exclusive());
         assert!(!state.release_exclusive());
+    }
+
+    #[test]
+    fn committed_tail_allows_reads_but_preserves_writer_exclusion() {
+        let state = AtomicLockState::new();
+        assert!(state.try_acquire_exclusive());
+        assert!(state.inc_writers_waiting());
+        assert!(state.downgrade_committed_tail());
+        assert!(!state.try_acquire_exclusive(), "the tail must still exclude writers");
+        assert!(state.try_acquire_shared(), "a queued writer must not block reads of the committed tail");
+        assert!(state.release_committed_tail());
+        assert!(!state.try_acquire_shared(), "writer preference resumes when the tail ends");
+        assert!(!state.try_acquire_exclusive(), "an outstanding reader must still exclude writers");
+        assert!(state.release_shared());
+        assert!(state.try_acquire_exclusive());
+        assert!(state.release_exclusive());
+        state.dec_writers_waiting();
+        assert!(state.is_free());
     }
 
     // Regression for the waiter-preserving exclusive CAS.

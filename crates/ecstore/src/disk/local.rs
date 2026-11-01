@@ -6880,6 +6880,8 @@ async fn build_local_io_backend(
 )]
 pub struct LocalDisk {
     pub root: PathBuf,
+    reservation_instance: Uuid,
+    metadata_reservations: OnceLock<Arc<os::MetadataReservationRegistry>>,
     publication_root: os::PublicationRoot,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
     /// I/O root pinned to the mount instance that was opened while the disk
@@ -7428,6 +7430,8 @@ impl LocalDisk {
             root: root.clone(),
             publication_root,
             multipart_proof_authority: OnceLock::new(),
+            reservation_instance: Uuid::new_v4(),
+            metadata_reservations: OnceLock::new(),
             io_root: io_root.clone(),
             #[cfg(target_os = "linux")]
             mount_lease: mount_lease.clone(),
@@ -7993,6 +7997,96 @@ impl LocalDisk {
     // Get the absolute path of an object
     pub fn get_object_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         local_disk_object_path(&self.root, bucket, key)
+    }
+
+    fn metadata_reservation_registry(&self) -> &Arc<os::MetadataReservationRegistry> {
+        self.metadata_reservations
+            .get_or_init(|| os::MetadataReservationRegistry::new(1024))
+    }
+
+    pub(in crate::disk) async fn reserve_object_metadata(&self, bucket: &str, object: &str, timeout: Duration) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservation_registry()
+            .reserve(&key, self.reservation_instance, timeout.min(Duration::from_secs(5)), None)
+            .await
+    }
+
+    pub(in crate::disk) async fn enqueue_object_metadata(&self, bucket: &str, object: &str) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(DiskError::DiskOngoingReq);
+        }
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservation_registry()
+            .enqueue(&key, self.reservation_instance)
+            .await
+    }
+
+    pub(in crate::disk) fn prepare_object_metadata_with_owner(
+        &self,
+        bucket: &str,
+        object: &str,
+        owner: Option<Arc<dyn os::MetadataReservationFence>>,
+    ) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(DiskError::InvalidPath);
+        }
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservation_registry()
+            .prepare_with_owner(&key, self.reservation_instance, owner)
+    }
+
+    pub(in crate::disk) fn prepare_object_metadata_with_owner_ttl(
+        &self,
+        bucket: &str,
+        object: &str,
+        owner: Option<Arc<dyn os::MetadataReservationFence>>,
+        ttl: Duration,
+    ) -> Result<Uuid> {
+        if crate::bucket::utils::is_meta_bucketname(bucket) {
+            return Err(DiskError::InvalidPath);
+        }
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservation_registry()
+            .prepare_with_owner_ttl(&key, self.reservation_instance, owner, ttl)
+    }
+
+    pub(in crate::disk) fn renew_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservations
+            .get()
+            .ok_or(DiskError::DiskOngoingReq)?
+            .renew(token, &key, self.reservation_instance)
+    }
+
+    pub(in crate::disk) async fn activate_object_metadata(&self, bucket: &str, object: &str, token: Uuid) -> Result<()> {
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservations
+            .get()
+            .ok_or(DiskError::DiskOngoingReq)?
+            .activate(token, &key, self.reservation_instance)
+            .await
+    }
+
+    pub(in crate::disk) fn claim_object_metadata_reservation(
+        &self,
+        token: Uuid,
+        bucket: &str,
+        object: &str,
+    ) -> Result<os::MetadataMutationReservation> {
+        let key = self.get_object_path(bucket, object)?;
+        self.metadata_reservations
+            .get()
+            .ok_or(DiskError::DiskOngoingReq)?
+            .claim(token, &key, self.reservation_instance)
+    }
+
+    pub(in crate::disk) fn cancel_object_metadata_reservation(&self, token: Uuid) -> bool {
+        self.metadata_reservations
+            .get()
+            .is_some_and(|registry| registry.cancel(token))
     }
 
     // Get the absolute path of a bucket
@@ -20866,6 +20960,107 @@ mod test {
         assert_eq!(delete_err, DiskError::VolumeNotEmpty);
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lost_fence_during_publication_cannot_survive_bucket_recreation() {
+        use std::sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        };
+
+        struct Fence(AtomicBool);
+        impl os::MetadataReservationFence for Fence {
+            fn is_valid(&self) -> bool {
+                self.0.load(Ordering::Acquire)
+            }
+        }
+
+        let dir = tempfile::tempdir().expect("disk directory");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+        let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("disk"));
+        let bucket = "lost-fence-recreate-bucket";
+        let object = "object";
+        let temporary = "lost-fence-stage";
+        let data_dir = Uuid::new_v4();
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+        let staged = disk
+            .get_object_path(RUSTFS_META_TMP_BUCKET, &format!("{temporary}/{data_dir}/part.1"))
+            .expect("staged path");
+        fs::create_dir_all(staged.parent().expect("staged parent"))
+            .await
+            .expect("create staging");
+        fs::write(&staged, b"old generation").await.expect("write staged data");
+
+        let key = disk.get_object_path(bucket, object).expect("object path");
+        let registry = disk.metadata_reservation_registry();
+        let fence = Arc::new(Fence(AtomicBool::new(true)));
+        let token = registry
+            .prepare_with_owner(&key, disk.reservation_instance, Some(fence.clone()))
+            .expect("prepare");
+        registry
+            .activate(token, &key, disk.reservation_instance)
+            .await
+            .expect("activate");
+        let reservation = registry
+            .claim(token, &key, disk.reservation_instance)
+            .expect("claim")
+            .wait()
+            .await;
+        let (entered_tx, entered_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        set_rename_data_after_first_publication(&disk.root, bucket, object, move || {
+            entered_tx.send(()).expect("publication entered");
+            release_rx.recv().expect("release publication");
+        });
+        let writer = Arc::clone(&disk);
+        let rename = tokio::spawn(async move {
+            let fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
+            writer
+                .rename_data_observed_with_reservation(
+                    RUSTFS_META_TMP_BUCKET,
+                    temporary,
+                    &fi,
+                    bucket,
+                    object,
+                    (None, Some(reservation)),
+                )
+                .await
+                .result
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv_timeout(Duration::from_secs(10)))
+            .await
+            .expect("wait task")
+            .expect("publication entered");
+        fence.0.store(false, Ordering::Release);
+        let deleter = Arc::clone(&disk);
+        let mut delete = tokio::spawn(async move { deleter.delete_volume(bucket, true).await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
+            "delete waits for physical publication"
+        );
+        assert!(
+            matches!(disk.make_volume(bucket).await, Err(DiskError::VolumeExists)),
+            "old volume cannot be recreated while publication runs"
+        );
+        release_tx.send(()).expect("release publication");
+        let result = tokio::time::timeout(Duration::from_secs(10), rename)
+            .await
+            .expect("rename terminates")
+            .expect("rename task");
+        assert!(
+            result.is_ok() || matches!(result, Err(DiskError::DiskOngoingReq)),
+            "unexpected rename result: {result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(10), delete)
+            .await
+            .expect("delete terminates")
+            .expect("delete task")
+            .expect("delete volume");
+        disk.make_volume(bucket).await.expect("recreate volume");
+        assert!(!key.exists(), "the recreated volume must not retain the old object");
+    }
+
     #[tokio::test]
     #[serial_test::serial(rename_data_deleted_bucket)]
     async fn windows_and_unix_rename_data_non_inline_does_not_recreate_bucket_deleted_before_commit() {
@@ -21778,6 +21973,1115 @@ mod test {
                 .expect("inline rename_data should commit");
 
             assert_eq!(resp.old_current_size, Some(OldCurrentSize::Absent));
+        }
+
+        #[tokio::test]
+        async fn metadata_lease_blocks_only_its_own_disk_publication() {
+            use std::time::Duration;
+
+            let dirs: Vec<_> = (0..4).map(|_| tempdir().expect("disk directory")).collect();
+            let mut disks = Vec::new();
+            for dir in &dirs {
+                disks.push(test_disk(dir).await);
+            }
+            let key = disks[0].get_object_path("bucket", "object").expect("object key");
+            let reservation = os::acquire_metadata_mutation_lease(&key, None).await;
+            // A physical operation can retain the lease after its caller drops.
+            let physical_owner = Arc::clone(&reservation);
+            let inline_info = || {
+                let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"next")));
+                fi.set_inline_data();
+                fi
+            };
+            let mut blocked =
+                Box::pin(disks[0].rename_data(RUSTFS_META_TMP_BUCKET, "tmp-blocked", inline_info(), "bucket", "object"));
+            assert!(tokio::time::timeout(Duration::from_millis(100), &mut blocked).await.is_err());
+            for disk in &disks[1..] {
+                tokio::time::timeout(
+                    Duration::from_secs(5),
+                    disk.rename_data(RUSTFS_META_TMP_BUCKET, "tmp-ready", inline_info(), "bucket", "object"),
+                )
+                .await
+                .expect("independent disk publication must not wait")
+                .expect("independent disk publication succeeds");
+            }
+            drop(reservation);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut blocked).await.is_err(),
+                "an in-flight physical owner must retain the disk lease"
+            );
+            drop(physical_owner);
+            tokio::time::timeout(Duration::from_secs(5), blocked)
+                .await
+                .expect("publication proceeds after physical owner releases")
+                .expect("publication succeeds");
+            for disk in &disks {
+                let fi = disk
+                    .read_version(
+                        "",
+                        "bucket",
+                        "object",
+                        "",
+                        &ReadOptions {
+                            read_data: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("committed metadata");
+                assert_eq!(fi.data.as_deref(), Some(b"next".as_slice()));
+            }
+        }
+
+        #[tokio::test]
+        async fn reserved_metadata_lease_can_publish_and_rejects_wrong_object() {
+            use crate::disk::{RenameDataGuards, disk_store::LocalDiskWrapper};
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let reservation = os::reserve_metadata_mutation_lease(&key, disk.reservation_instance, None).await;
+            let mut state = commit::RenameDataState::with_metadata_reservation(reservation);
+            let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"reserved")));
+            fi.set_inline_data();
+            tokio::time::timeout(
+                Duration::from_secs(5),
+                disk.rename_data_inner(RUSTFS_META_TMP_BUCKET, "reserved", fi, "bucket", "object", &mut state),
+            )
+            .await
+            .expect("reserved publication must not reacquire its own mutex")
+            .expect("reserved publication succeeds");
+            let stored = disk
+                .read_version(
+                    "",
+                    "bucket",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("published metadata");
+            assert_eq!(stored.data.as_deref(), Some(b"reserved".as_slice()));
+
+            let reservation = os::reserve_metadata_mutation_lease(&key, disk.reservation_instance, None).await;
+            let mut fi = test_file_info("other", Uuid::nil(), None, Some(Bytes::from_static(b"wrong")));
+            fi.set_inline_data();
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let observed = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "wrong",
+                    &fi,
+                    "bucket",
+                    "other",
+                    RenameDataGuards {
+                        metadata_reservation: Some(reservation),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                observed.rejected_before_publication(),
+                "mismatch must remain a proven preflight rejection"
+            );
+            assert!(matches!(observed.result, Err(DiskError::InvalidPath)));
+            assert!(
+                matches!(
+                    disk.read_version("", "bucket", "other", "", &ReadOptions::default()).await,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ),
+                "mismatched reservation must not publish data"
+            );
+
+            let other_dir = tempdir().expect("other disk directory");
+            let other_disk = test_disk(&other_dir).await;
+            let reservation = os::reserve_metadata_mutation_lease(&key, disk.reservation_instance, None).await;
+            let mut state = commit::RenameDataState::with_metadata_reservation(reservation);
+            let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"wrong-disk")));
+            fi.set_inline_data();
+            let error = other_disk
+                .rename_data_inner(RUSTFS_META_TMP_BUCKET, "wrong-disk", fi, "bucket", "object", &mut state)
+                .await
+                .expect_err("a reservation from another disk must be rejected");
+            assert!(matches!(error, DiskError::InvalidPath));
+            assert!(
+                matches!(
+                    other_disk
+                        .read_version("", "bucket", "object", "", &ReadOptions::default())
+                        .await,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ),
+                "a reservation for another disk must not publish data"
+            );
+        }
+
+        #[tokio::test]
+        async fn reserved_metadata_lease_rejects_a_reopened_disk_at_the_same_path() {
+            let dir = tempdir().expect("disk directory");
+            let old_disk = test_disk(&dir).await;
+            let key = old_disk.get_object_path("bucket", "same-path-object").expect("object path");
+            let reservation = os::reserve_metadata_mutation_lease(&key, old_disk.reservation_instance, None).await;
+            let new_disk = test_disk(&dir).await;
+            let mut state = commit::RenameDataState::with_metadata_reservation(reservation);
+            let mut fi = test_file_info("same-path-object", Uuid::nil(), None, Some(Bytes::from_static(b"stale")));
+            fi.set_inline_data();
+            let result = new_disk
+                .rename_data_inner(RUSTFS_META_TMP_BUCKET, "same-path", fi, "bucket", "same-path-object", &mut state)
+                .await;
+            assert!(
+                matches!(result, Err(DiskError::InvalidPath)),
+                "old instance reservation must not authorize a reopened disk"
+            );
+            assert!(
+                matches!(
+                    new_disk
+                        .read_version("", "bucket", "same-path-object", "", &ReadOptions::default())
+                        .await,
+                    Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                ),
+                "rejected reservation must not publish on the reopened disk"
+            );
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn metadata_reservation_tokens_are_bounded_single_use_and_expire() {
+            use crate::disk::{RenameDataGuards, disk_store::LocalDiskWrapper};
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            assert!(
+                disk.metadata_reservations
+                    .set(os::MetadataReservationRegistry::new(1))
+                    .is_ok()
+            );
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let token = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("first reservation");
+            assert!(matches!(
+                wrapper
+                    .reserve_object_metadata("bucket", "other", Duration::from_secs(5))
+                    .await,
+                Err(DiskError::DiskOngoingReq)
+            ));
+            let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"reserved")));
+            fi.set_inline_data();
+            let observed = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "token-staging",
+                    &fi,
+                    "bucket",
+                    "object",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            observed.result.expect("token authorizes one publication");
+            assert!(!wrapper.cancel_object_metadata_reservation(token), "consumed token cannot be reused");
+            let reused = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "reused",
+                    &fi,
+                    "bucket",
+                    "object",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                !reused.rejected_before_publication(),
+                "a consumed token may still have an in-flight publisher"
+            );
+            assert!(matches!(reused.result, Err(DiskError::DiskOngoingReq)));
+
+            let token = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("reservation for path mismatch");
+            let mismatch = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "mismatch",
+                    &fi,
+                    "bucket",
+                    "other",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(mismatch.rejected_before_publication());
+            assert!(matches!(mismatch.result, Err(DiskError::InvalidPath)));
+
+            let token = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("capacity is released after claim");
+            assert!(wrapper.cancel_object_metadata_reservation(token));
+            assert!(!wrapper.cancel_object_metadata_reservation(token));
+
+            let token = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("reservation after cancel");
+            tokio::time::advance(Duration::from_secs(61)).await;
+            let expired = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "expired",
+                    &fi,
+                    "bucket",
+                    "object",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            let expired_preflight = expired.rejected_before_publication();
+            match expired.result {
+                Err(DiskError::DiskOngoingReq) => assert!(!expired_preflight),
+                Err(DiskError::Timeout) => assert!(expired_preflight),
+                result => panic!("expired reservation returned an unexpected result: {result:?}"),
+            }
+            let next = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("expired reservation releases the lock and capacity");
+            assert!(wrapper.cancel_object_metadata_reservation(next));
+        }
+
+        #[tokio::test]
+        async fn prepared_metadata_token_is_inert_and_cancel_blocks_late_enqueue() {
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let registry = disk.metadata_reservation_registry();
+            let prepared = registry.prepare(&key, disk.reservation_instance).expect("prepare token");
+            let other = disk
+                .enqueue_object_metadata("bucket", "object")
+                .await
+                .expect("prepared token holds no lease");
+            let held = disk
+                .claim_object_metadata_reservation(other, "bucket", "object")
+                .expect("claim")
+                .wait()
+                .await;
+            assert!(registry.cancel(prepared));
+            assert!(matches!(
+                registry.activate(prepared, &key, disk.reservation_instance).await,
+                Err(DiskError::DiskOngoingReq)
+            ));
+            drop(held);
+
+            let token = registry.prepare(&key, disk.reservation_instance).expect("prepare next token");
+            let other_key = disk.get_object_path("bucket", "other").expect("other path");
+            assert!(matches!(
+                registry.activate(token, &other_key, disk.reservation_instance).await,
+                Err(DiskError::InvalidPath)
+            ));
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("activate");
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("repeat activation");
+            let claimed = registry
+                .claim(token, &key, disk.reservation_instance)
+                .expect("claim")
+                .wait()
+                .await;
+            assert!(!registry.cancel(token), "claimed token cannot be cancelled");
+            drop(claimed);
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn short_unclaimed_reservation_releases_its_owner_after_expiry() {
+            struct Fence;
+            impl os::MetadataReservationFence for Fence {
+                fn is_valid(&self) -> bool {
+                    true
+                }
+            }
+            let registry = os::MetadataReservationRegistry::new(1);
+            let key = std::path::Path::new("bucket/object");
+            let disk_id = Uuid::new_v4();
+            let owner = Arc::new(Fence);
+            let weak = Arc::downgrade(&owner);
+            let token = registry
+                .prepare_with_owner_ttl(key, disk_id, Some(owner.clone()), Duration::from_secs(2))
+                .expect("short preparation");
+            drop(owner);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            assert!(weak.upgrade().is_some(), "unexpired reservation owns its fence");
+            tokio::time::advance(Duration::from_secs(2)).await;
+            let next = registry.prepare(key, disk_id).expect("expired reservation frees capacity");
+            assert!(weak.upgrade().is_none(), "expired reservation releases its fence");
+            assert!(matches!(registry.activate(token, key, disk_id).await, Err(DiskError::DiskOngoingReq)));
+            assert!(registry.cancel(next));
+
+            let regular = registry.prepare_with_owner(key, disk_id, None).expect("ordinary preparation");
+            tokio::time::advance(Duration::from_secs(3)).await;
+            registry
+                .renew(regular, key, disk_id)
+                .expect("ordinary reservation retains its existing lifetime");
+            assert!(registry.cancel(regular));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn short_reservation_lost_renew_and_cancel_responses_expires_promptly() {
+            struct Fence;
+            impl os::MetadataReservationFence for Fence {
+                fn is_valid(&self) -> bool {
+                    true
+                }
+            }
+            let registry = os::MetadataReservationRegistry::new(1);
+            let key = std::path::Path::new("bucket/object");
+            let disk_id = Uuid::new_v4();
+            let owner = Arc::new(Fence);
+            let weak = Arc::downgrade(&owner);
+            let token = registry
+                .prepare_with_owner_ttl(key, disk_id, Some(owner.clone()), Duration::from_secs(2))
+                .expect("short preparation");
+            drop(owner);
+            tokio::time::advance(Duration::from_secs(1)).await;
+            registry.renew(token, key, disk_id).expect("server accepted renewal");
+            // Model loss of both the renewal response and the subsequent cancel.
+            tokio::time::advance(Duration::from_secs(3)).await;
+            let next = registry.prepare(key, disk_id).expect("short lease releases capacity");
+            assert!(weak.upgrade().is_none(), "short lease releases its publication fence");
+            assert!(matches!(registry.activate(token, key, disk_id).await, Err(DiskError::DiskOngoingReq)));
+            assert!(registry.cancel(next));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn short_reservation_can_be_renewed_during_long_staging() {
+            let registry = os::MetadataReservationRegistry::new(1);
+            let key = std::path::Path::new("bucket/object");
+            let disk_id = Uuid::new_v4();
+            let token = registry
+                .prepare_with_owner_ttl(key, disk_id, None, Duration::from_secs(2))
+                .expect("short preparation");
+            for _ in 0..10 {
+                tokio::time::advance(Duration::from_secs(1)).await;
+                registry.renew(token, key, disk_id).expect("renew while staging");
+            }
+            registry.activate(token, key, disk_id).await.expect("activate after staging");
+            assert!(registry.cancel(token));
+        }
+
+        #[tokio::test(start_paused = true)]
+        async fn prepared_metadata_renewal_never_revives_cancelled_or_activated_tokens() {
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let other = disk.get_object_path("bucket", "other").expect("other path");
+            let registry = disk.metadata_reservation_registry();
+            let token = registry.prepare(&key, disk.reservation_instance).expect("prepare");
+            tokio::time::advance(Duration::from_secs(40)).await;
+            assert!(matches!(
+                registry.renew(token, &other, disk.reservation_instance),
+                Err(DiskError::InvalidPath)
+            ));
+            registry.renew(token, &key, disk.reservation_instance).expect("renew");
+            tokio::time::advance(Duration::from_secs(30)).await;
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("renewed token activates after original expiry");
+            assert!(matches!(
+                registry.renew(token, &key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+            assert!(registry.cancel(token));
+            assert!(matches!(
+                registry.renew(token, &key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+            let expired = registry
+                .prepare(&key, disk.reservation_instance)
+                .expect("prepare expiring token");
+            tokio::time::advance(Duration::from_secs(61)).await;
+            assert!(matches!(
+                registry.renew(expired, &key, disk.reservation_instance),
+                Err(DiskError::Timeout | DiskError::DiskOngoingReq)
+            ));
+        }
+
+        #[tokio::test]
+        async fn prepared_metadata_owner_survives_activation_and_claim() {
+            struct Owner;
+            impl os::MetadataReservationFence for Owner {
+                fn is_valid(&self) -> bool {
+                    true
+                }
+            }
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let registry = disk.metadata_reservation_registry();
+            let owner = Arc::new(Owner);
+            let weak = Arc::downgrade(&owner);
+            let token = registry
+                .prepare_with_owner(&key, disk.reservation_instance, Some(owner.clone()))
+                .expect("prepare owned token");
+            drop(owner);
+            assert!(weak.upgrade().is_some(), "prepared token retains its owner");
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("activate");
+            let claimed = registry
+                .claim(token, &key, disk.reservation_instance)
+                .expect("claim")
+                .wait()
+                .await;
+            assert!(!registry.cancel(token), "claimed token cannot be cancelled");
+            assert!(weak.upgrade().is_some(), "claimed lease retains its owner");
+            drop(claimed);
+            assert!(weak.upgrade().is_none(), "owner releases with the claimed lease");
+        }
+
+        #[tokio::test]
+        async fn lost_metadata_fence_rejects_claim_and_commit() {
+            struct Fence(std::sync::atomic::AtomicBool);
+            impl os::MetadataReservationFence for Fence {
+                fn is_valid(&self) -> bool {
+                    self.0.load(std::sync::atomic::Ordering::Acquire)
+                }
+            }
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let registry = disk.metadata_reservation_registry();
+            let fence = Arc::new(Fence(std::sync::atomic::AtomicBool::new(true)));
+            let token = registry
+                .prepare_with_owner(&key, disk.reservation_instance, Some(fence.clone()))
+                .expect("prepare");
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("activate");
+            fence.0.store(false, std::sync::atomic::Ordering::Release);
+            assert!(matches!(
+                registry.claim(token, &key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+            fence.0.store(true, std::sync::atomic::Ordering::Release);
+            let token = registry
+                .prepare_with_owner(&key, disk.reservation_instance, Some(fence.clone()))
+                .expect("prepare again");
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("activate again");
+            let claimed = registry
+                .claim(token, &key, disk.reservation_instance)
+                .expect("claim")
+                .wait()
+                .await;
+            fence.0.store(false, std::sync::atomic::Ordering::Release);
+            assert!(matches!(
+                claimed.into_lease_for(&key, disk.reservation_instance),
+                Err(DiskError::DiskOngoingReq)
+            ));
+        }
+
+        #[tokio::test]
+        async fn queued_metadata_reservation_registers_when_task_budget_is_exhausted() {
+            use std::{future::Future, task::Poll};
+
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let first = disk.enqueue_object_metadata("bucket", "object").await.expect("first token");
+            let first = disk
+                .claim_object_metadata_reservation(first, "bucket", "object")
+                .expect("first claim")
+                .wait()
+                .await;
+            let mut enqueue = Box::pin(disk.enqueue_object_metadata("bucket", "object"));
+            let second = std::future::poll_fn(|cx| {
+                let mut exhausted = false;
+                for _ in 0..1024 {
+                    let mut consume = Box::pin(tokio::task::consume_budget());
+                    if consume.as_mut().poll(cx).is_pending() {
+                        exhausted = true;
+                        break;
+                    }
+                }
+                assert!(exhausted, "test must exhaust the cooperative budget");
+                match enqueue.as_mut().poll(cx) {
+                    Poll::Ready(result) => Poll::Ready(result.expect("enqueue must register immediately")),
+                    Poll::Pending => panic!("enqueue must not acknowledge before registering"),
+                }
+            })
+            .await;
+            let third = disk.enqueue_object_metadata("bucket", "object").await.expect("third token");
+            tokio::task::yield_now().await;
+            let mut second = Box::pin(
+                disk.claim_object_metadata_reservation(second, "bucket", "object")
+                    .expect("second")
+                    .wait(),
+            );
+            let mut third = Box::pin(
+                disk.claim_object_metadata_reservation(third, "bucket", "object")
+                    .expect("third")
+                    .wait(),
+            );
+            assert!(futures::poll!(third.as_mut()).is_pending());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            drop(first);
+            let second = tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .expect("second acquires first");
+            assert!(futures::poll!(third.as_mut()).is_pending(), "third cannot overtake second");
+            drop(second);
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), third)
+                    .await
+                    .expect("third acquires next"),
+            );
+        }
+
+        #[tokio::test]
+        async fn queued_metadata_reservations_preserve_order_and_cancel() {
+            let dir = tempdir().expect("disk directory");
+            let disk = test_disk(&dir).await;
+            let first = disk.enqueue_object_metadata("bucket", "object").await.expect("first token");
+            let second = disk.enqueue_object_metadata("bucket", "object").await.expect("second token");
+            let third = disk.enqueue_object_metadata("bucket", "object").await.expect("third token");
+            let first = disk
+                .claim_object_metadata_reservation(first, "bucket", "object")
+                .expect("first claim")
+                .wait()
+                .await;
+            let second = disk
+                .claim_object_metadata_reservation(second, "bucket", "object")
+                .expect("second claim");
+            let third = disk
+                .claim_object_metadata_reservation(third, "bucket", "object")
+                .expect("third claim");
+            let mut second = Box::pin(second.wait());
+            let mut third = Box::pin(third.wait());
+            assert!(futures::poll!(second.as_mut()).is_pending());
+            assert!(futures::poll!(third.as_mut()).is_pending());
+            drop(first);
+            let second = tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .expect("second acquires first");
+            assert!(futures::poll!(third.as_mut()).is_pending(), "third cannot overtake second");
+            drop(second);
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), third)
+                    .await
+                    .expect("third acquires next"),
+            );
+
+            let first = disk.enqueue_object_metadata("bucket", "object").await.expect("first token");
+            let cancelled = disk
+                .enqueue_object_metadata("bucket", "object")
+                .await
+                .expect("cancelled token");
+            let next = disk.enqueue_object_metadata("bucket", "object").await.expect("next token");
+            let first = disk
+                .claim_object_metadata_reservation(first, "bucket", "object")
+                .expect("first claim")
+                .wait()
+                .await;
+            assert!(disk.cancel_object_metadata_reservation(cancelled));
+            let mut next = Box::pin(
+                disk.claim_object_metadata_reservation(next, "bucket", "object")
+                    .expect("next claim")
+                    .wait(),
+            );
+            assert!(futures::poll!(next.as_mut()).is_pending());
+            drop(first);
+            drop(
+                tokio::time::timeout(Duration::from_secs(5), next)
+                    .await
+                    .expect("cancelled waiter does not block next"),
+            );
+        }
+
+        #[tokio::test]
+        async fn cancelled_pending_metadata_reservation_releases_capacity() {
+            use crate::disk::disk_store::LocalDiskWrapper;
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            assert!(
+                disk.metadata_reservations
+                    .set(os::MetadataReservationRegistry::new(2))
+                    .is_ok()
+            );
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let first = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("first reservation");
+            let mut waiting = Box::pin(wrapper.reserve_object_metadata("bucket", "object", Duration::from_secs(5)));
+            assert!(futures::poll!(waiting.as_mut()).is_pending(), "same-key reservation must wait");
+            assert!(matches!(
+                wrapper
+                    .reserve_object_metadata("bucket", "other", Duration::from_secs(5))
+                    .await,
+                Err(DiskError::DiskOngoingReq)
+            ));
+            drop(waiting);
+            let other = wrapper
+                .reserve_object_metadata("bucket", "other", Duration::from_secs(5))
+                .await
+                .expect("cancellation releases the waiting reservation's capacity");
+            assert!(wrapper.cancel_object_metadata_reservation(other));
+            assert!(wrapper.cancel_object_metadata_reservation(first));
+            let next = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("cancelled waiter did not retain the key");
+            assert!(wrapper.cancel_object_metadata_reservation(next));
+        }
+
+        #[cfg(not(windows))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn queued_metadata_rename_publishes_in_admission_order() {
+            use crate::disk::{
+                RenameDataGuards,
+                disk_store::LocalDiskWrapper,
+                os::prepared_publication_test_hooks::{Stage, install_at},
+            };
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let metadata = disk
+                .io_get_object_path("bucket", "object")
+                .expect("object path")
+                .join(STORAGE_FORMAT_FILE);
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let _hook = install_at(Stage::PreparedRename, &metadata, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let first_token = wrapper
+                .enqueue_object_metadata("bucket", "object")
+                .await
+                .expect("first token");
+            let first = wrapper.clone();
+            let first_task = tokio::spawn(async move {
+                let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"first")));
+                fi.set_inline_data();
+                first
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        "first",
+                        &fi,
+                        "bucket",
+                        "object",
+                        RenameDataGuards {
+                            metadata_reservation_token: Some(first_token),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .result
+            });
+            tokio::time::timeout(Duration::from_secs(10), entered_rx)
+                .await
+                .expect("first publication pauses")
+                .expect("hook");
+            let second_token = wrapper
+                .enqueue_object_metadata("bucket", "object")
+                .await
+                .expect("second token");
+            let second = wrapper.clone();
+            let mut second_task = tokio::spawn(async move {
+                let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"second")));
+                fi.set_inline_data();
+                second
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        "second",
+                        &fi,
+                        "bucket",
+                        "object",
+                        RenameDataGuards {
+                            metadata_reservation_token: Some(second_token),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .result
+            });
+            assert!(futures::poll!(&mut second_task).is_pending(), "second write must wait behind first");
+            release_tx.send(()).expect("release first publication");
+            tokio::time::timeout(Duration::from_secs(10), first_task)
+                .await
+                .expect("first finishes")
+                .expect("first joins")
+                .expect("first commits");
+            tokio::time::timeout(Duration::from_secs(10), second_task)
+                .await
+                .expect("second finishes")
+                .expect("second joins")
+                .expect("second commits");
+            let current = disk
+                .read_version(
+                    "",
+                    "bucket",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read latest object");
+            assert_eq!(current.data.as_deref(), Some(b"second".as_slice()));
+        }
+
+        #[cfg(not(windows))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn replayed_reservation_is_indeterminate_while_original_publishes() {
+            use crate::disk::{
+                RenameDataGuards,
+                disk_store::LocalDiskWrapper,
+                os::prepared_publication_test_hooks::{Stage, install_at},
+            };
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            assert!(
+                disk.metadata_reservations
+                    .set(os::MetadataReservationRegistry::new(1))
+                    .is_ok()
+            );
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let token = wrapper
+                .reserve_object_metadata("bucket", "object", Duration::from_secs(5))
+                .await
+                .expect("reserve object");
+            let metadata = disk
+                .io_get_object_path("bucket", "object")
+                .expect("physical object path")
+                .join(STORAGE_FORMAT_FILE);
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let _hook = install_at(Stage::PreparedRename, &metadata, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"original")));
+            fi.set_inline_data();
+            let first = wrapper.clone();
+            let first_fi = fi.clone();
+            let mut publication = tokio::spawn(async move {
+                first
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        "first",
+                        &first_fi,
+                        "bucket",
+                        "object",
+                        RenameDataGuards {
+                            metadata_reservation_token: Some(token),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    entered = entered_rx => entered.expect("physical rename hook"),
+                    _ = &mut publication => panic!("original publication returned before hook"),
+                }
+            })
+            .await
+            .expect("original publisher reaches physical rename");
+            let replay = wrapper
+                .rename_data_observed_with_guards(
+                    RUSTFS_META_TMP_BUCKET,
+                    "replay",
+                    &fi,
+                    "bucket",
+                    "object",
+                    RenameDataGuards {
+                        metadata_reservation_token: Some(token),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(!replay.rejected_before_publication(), "the original request may still publish");
+            assert!(matches!(replay.result, Err(DiskError::DiskOngoingReq)));
+            assert!(
+                matches!(
+                    wrapper
+                        .reserve_object_metadata("bucket", "other", Duration::from_secs(5))
+                        .await,
+                    Err(DiskError::DiskOngoingReq)
+                ),
+                "in-flight physical work must continue to count against the reservation limit"
+            );
+            release_tx.send(()).expect("release original publisher");
+            tokio::time::timeout(Duration::from_secs(10), publication)
+                .await
+                .expect("original publisher completes")
+                .expect("publisher task")
+                .result
+                .expect("original publication succeeds");
+            let next = wrapper
+                .reserve_object_metadata("bucket", "other", Duration::from_secs(5))
+                .await
+                .expect("capacity is released after physical completion");
+            assert!(wrapper.cancel_object_metadata_reservation(next));
+            let stored = disk
+                .read_version(
+                    "",
+                    "bucket",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("original metadata");
+            assert_eq!(stored.data.as_deref(), Some(b"original".as_slice()));
+        }
+
+        #[tokio::test]
+        async fn reserved_metadata_lease_rejects_quota_and_multipart_before_mutation() {
+            use crate::disk::{RenameDataGuards, disk_store::LocalDiskWrapper};
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            for quota in [true, false] {
+                let object = if quota { "quota-object" } else { "multipart-object" };
+                let key = disk.get_object_path("bucket", object).expect("object path");
+                let reservation = os::reserve_metadata_mutation_lease(&key, disk.reservation_instance, None).await;
+                let mut fi = test_file_info(object, Uuid::nil(), None, Some(Bytes::from_static(b"data")));
+                fi.set_inline_data();
+                if quota {
+                    rustfs_utils::http::metadata_compat::insert_str(
+                        &mut fi.metadata,
+                        crate::disk::QUOTA_MUTATION_FENCE_METADATA_SUFFIX,
+                        Uuid::new_v4().to_string(),
+                    );
+                }
+                let source = if quota {
+                    RUSTFS_META_TMP_BUCKET
+                } else {
+                    RUSTFS_META_MULTIPART_BUCKET
+                };
+                let observed = tokio::time::timeout(
+                    Duration::from_secs(5),
+                    wrapper.rename_data_observed_with_guards(
+                        source,
+                        "staging",
+                        &fi,
+                        "bucket",
+                        object,
+                        RenameDataGuards {
+                            metadata_reservation: Some(reservation),
+                            ..Default::default()
+                        },
+                    ),
+                )
+                .await
+                .expect("unsupported lock order must be rejected without waiting");
+                assert!(observed.rejected_before_publication());
+                assert!(matches!(observed.result, Err(DiskError::DiskOngoingReq)));
+                assert!(
+                    matches!(
+                        disk.read_version("", "bucket", object, "", &ReadOptions::default()).await,
+                        Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                    ),
+                    "unsupported reservation must not publish"
+                );
+                drop(
+                    tokio::time::timeout(Duration::from_secs(5), os::acquire_metadata_mutation_lease(&key, None))
+                        .await
+                        .expect("rejected reservation releases its lease"),
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn lost_reservation_while_waiting_for_volume_does_not_publish() {
+            use crate::disk::{RenameDataGuards, disk_store::LocalDiskWrapper};
+            use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+            struct Fence {
+                valid: AtomicBool,
+                checks: AtomicUsize,
+                validated: tokio::sync::Notify,
+            }
+            impl os::MetadataReservationFence for Fence {
+                fn is_valid(&self) -> bool {
+                    if self.checks.fetch_add(1, Ordering::AcqRel) == 2 {
+                        self.validated.notify_one();
+                    }
+                    self.valid.load(Ordering::Acquire)
+                }
+            }
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let registry = disk.metadata_reservation_registry();
+            let fence = Arc::new(Fence {
+                valid: AtomicBool::new(true),
+                checks: AtomicUsize::new(0),
+                validated: tokio::sync::Notify::new(),
+            });
+            let token = registry
+                .prepare_with_owner(&key, disk.reservation_instance, Some(fence.clone()))
+                .expect("prepare");
+            registry
+                .activate(token, &key, disk.reservation_instance)
+                .await
+                .expect("activate");
+            let volume_guard = os::disk_volume_mutation_lock(&disk.root, "bucket").write_owned().await;
+            let publisher = tokio::spawn(async move {
+                let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"stale")));
+                fi.set_inline_data();
+                wrapper
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        "stale",
+                        &fi,
+                        "bucket",
+                        "object",
+                        RenameDataGuards {
+                            metadata_reservation_token: Some(token),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), fence.validated.notified())
+                .await
+                .expect("metadata lease validated");
+            fence.valid.store(false, Ordering::Release);
+            drop(volume_guard);
+            let result = tokio::time::timeout(Duration::from_secs(10), publisher)
+                .await
+                .expect("publisher drains")
+                .expect("publisher task");
+            assert!(
+                matches!(&result.result, Err(DiskError::DiskOngoingReq)),
+                "lost fence must reject before publication: {:?}",
+                result.result
+            );
+            assert!(
+                !disk
+                    .io_get_object_path("bucket", "object")
+                    .expect("object path")
+                    .join(STORAGE_FORMAT_FILE)
+                    .exists()
+            );
+        }
+
+        #[cfg(not(windows))]
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn reserved_metadata_lease_survives_cancelled_physical_publication() {
+            use crate::disk::{
+                RenameDataGuards,
+                disk_store::LocalDiskWrapper,
+                os::prepared_publication_test_hooks::{Stage, install_at},
+            };
+            use std::time::Duration;
+
+            let dir = tempdir().expect("disk directory");
+            let disk = Arc::new(test_disk(&dir).await);
+            let key = disk.get_object_path("bucket", "object").expect("object path");
+            let metadata = disk
+                .io_get_object_path("bucket", "object")
+                .expect("physical object path")
+                .join(STORAGE_FORMAT_FILE);
+            let reservation = os::reserve_metadata_mutation_lease(&key, disk.reservation_instance, None).await;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let _hook = install_at(Stage::PreparedRename, &metadata, move || {
+                let _ = entered_tx.send(());
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+            });
+            let publisher = LocalDiskWrapper::new(Arc::clone(&disk), false);
+            let mut rename = tokio::spawn(async move {
+                let mut fi = test_file_info("object", Uuid::nil(), None, Some(Bytes::from_static(b"first")));
+                fi.set_inline_data();
+                publisher
+                    .rename_data_observed_with_guards(
+                        RUSTFS_META_TMP_BUCKET,
+                        "first",
+                        &fi,
+                        "bucket",
+                        "object",
+                        RenameDataGuards {
+                            metadata_reservation: Some(reservation),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                tokio::select! {
+                    entered = entered_rx => entered.expect("physical rename hook"),
+                    _ = &mut rename => panic!("publication returned before hook"),
+                }
+            })
+            .await
+            .expect("publication must enter physical rename");
+            rename.abort();
+            assert!(matches!(rename.await, Err(error) if error.is_cancelled()), "publisher must be cancelled");
+            let mut successor = Box::pin(os::acquire_metadata_mutation_lease(&key, None));
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut successor)
+                    .await
+                    .is_err(),
+                "cancelled physical work must retain its pre-acquired metadata lease"
+            );
+            release_tx.send(()).expect("release physical rename");
+            let successor = tokio::time::timeout(Duration::from_secs(10), successor)
+                .await
+                .expect("successor obtains lease after physical publication");
+            drop(successor);
+            let stored = disk
+                .read_version(
+                    "",
+                    "bucket",
+                    "object",
+                    "",
+                    &ReadOptions {
+                        read_data: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("published metadata");
+            assert_eq!(stored.data.as_deref(), Some(b"first".as_slice()));
         }
 
         #[tokio::test]

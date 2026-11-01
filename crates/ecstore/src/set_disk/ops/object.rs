@@ -4184,7 +4184,19 @@ impl SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
-        self.put_object_with_old_current_size_boxed(bucket, object, data, opts, None)
+        self.put_object_with_old_current_size_boxed(bucket, object, data, opts, None, None)
+            .await
+    }
+
+    pub(crate) async fn put_object_with_prepared_reservations(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &mut PutObjReader,
+        opts: &ObjectOptions,
+        reservations: Option<Vec<Option<crate::set_disk::RenameMetadataReservation>>>,
+    ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
+        self.put_object_with_old_current_size_boxed(bucket, object, data, opts, None, reservations)
             .await
     }
 
@@ -4203,7 +4215,7 @@ impl SetDisks {
         // The owned publication capability supplies the exact target write
         // domain at commit time; the generic PUT path must not reacquire it.
         opts.no_lock = true;
-        self.put_object_with_old_current_size_boxed(bucket, object, data, &opts, Some(publication_fence))
+        self.put_object_with_old_current_size_boxed(bucket, object, data, &opts, Some(publication_fence), None)
             .await
     }
 
@@ -4214,8 +4226,9 @@ impl SetDisks {
         data: &'a mut PutObjReader,
         opts: &'a ObjectOptions,
         publication_fence: Option<RemoteTuplePublicationFence>,
+        reservations: Option<Vec<Option<crate::set_disk::RenameMetadataReservation>>>,
     ) -> impl Future<Output = Result<(ObjectInfo, Option<OldCurrentSize>)>> + Send + 'a {
-        Box::pin(self.put_object_with_old_current_size_inner(bucket, object, data, opts, publication_fence))
+        Box::pin(self.put_object_with_old_current_size_inner(bucket, object, data, opts, publication_fence, reservations))
     }
 
     async fn put_object_with_old_current_size_inner(
@@ -4225,6 +4238,7 @@ impl SetDisks {
         data: &mut PutObjReader,
         opts: &ObjectOptions,
         mut publication_fence: Option<RemoteTuplePublicationFence>,
+        reservations: Option<Vec<Option<crate::set_disk::RenameMetadataReservation>>>,
     ) -> Result<(ObjectInfo, Option<OldCurrentSize>)> {
         let write_context = WriteCommitContext::from_options(opts, bucket, object, publication_fence.is_some())?;
         let protect_write = opts.shard_integrity_write_enabled();
@@ -4789,6 +4803,83 @@ impl SetDisks {
                 .await?;
             }
 
+            // A new version has no outer bucket snapshot. Prepare its remote
+            // owners after staging, before taking lifecycle or object locks.
+            let prepare_new_version = reservations.is_none()
+                && !opts.overwrites_existing_version()
+                && !self.ctx.lock_manager().is_disabled()
+                && crate::set_disk::put_rename_early_ack_enabled()
+                && write_context.acquires_namespace()
+                && write_context.allows_early_ack(opts.write_completion)
+                && publication_fence.is_none()
+                && opts.scanner_publication_commit_scope.is_none()
+                && opts.decommission_capacity_admission.is_none()
+                && opts.decommission_capacity.is_none()
+                && opts.quota_admission.is_none()
+                && opts.object_lock_config_snapshot.is_none()
+                && opts.bucket_lifecycle_lock_fence.is_none()
+                && opts.namespace_lock_fence.is_none()
+                && !opts.data_movement
+                && !is_meta_bucketname(bucket)
+                && opts
+                    .put_object_cancellation
+                    .as_ref()
+                    .is_none_or(|token| !token.is_cancelled())
+                && rustfs_utils::path::object_name_disk_identity(object).as_ref()
+                    != rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH
+                && crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx)
+                    .await
+                    .is_some();
+            #[cfg(any(test, feature = "test-util"))]
+            if prepare_new_version {
+                pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+            }
+
+            // Destructive writes prepare before the bucket snapshot. Local-only
+            // fixtures without a metadata store can prepare before the object lock.
+            let prepared_metadata_reservations = if !self.ctx.lock_manager().is_disabled()
+                && crate::set_disk::put_rename_early_ack_enabled()
+                && write_context.acquires_namespace()
+                && write_context.allows_early_ack(opts.write_completion)
+                && publication_fence.is_none()
+                && opts.scanner_publication_commit_scope.is_none()
+                && (opts.decommission_capacity_admission.is_none() || reservations.is_some())
+                && !opts.data_movement
+                && !is_meta_bucketname(bucket)
+            {
+                if let Some(prepared) = reservations {
+                    crate::set_disk::align_rename_metadata_reservations(prepared, &shuffle_disks)
+                } else if prepare_new_version && let Some(incarnation) = source_bucket_incarnation_id.filter(|id| !id.is_nil()) {
+                    crate::set_disk::core::io_primitives::prepare_rename_metadata_reservations(
+                        &shuffle_disks,
+                        bucket,
+                        object,
+                        incarnation,
+                        &self.ctx,
+                        true,
+                    )
+                    .await?
+                } else if shuffle_disks.iter().flatten().all(|disk| disk.is_local())
+                    && crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx)
+                        .await
+                        .is_none()
+                    && let Some(incarnation) = source_bucket_incarnation_id.filter(|id| !id.is_nil())
+                {
+                    crate::set_disk::core::io_primitives::prepare_rename_metadata_reservations(
+                        &shuffle_disks,
+                        bucket,
+                        object,
+                        incarnation,
+                        &self.ctx,
+                        false,
+                    )
+                    .await?
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 #[cfg(test)]
                 {
@@ -4812,7 +4903,9 @@ impl SetDisks {
                 || (write_context.acquires_namespace() && object_lock_guard.is_none() && !decommission_target_lock_covered)
             {
                 #[cfg(any(test, feature = "test-util"))]
-                pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+                if !prepare_new_version {
+                    pause_put_object_commit(bucket, object, PutObjectCommitPause::BeforeNamespace).await;
+                }
                 if let Some(expected_incarnation_id) = source_bucket_incarnation_id
                     && opts.bucket_lifecycle_lock_fence.is_none()
                 {
@@ -5268,6 +5361,11 @@ impl SetDisks {
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
             let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
+            let commit_object_lock_snapshot = opts
+                .object_lock_config_snapshot
+                .as_ref()
+                .filter(|snapshot| snapshot.owns_lifecycle_guard())
+                .cloned();
             // A scanner publication scope owns the movement permit until the
             // complete rename fan-out drains. Keep this path synchronous so
             // its terminal state is known before the coordinator releases
@@ -5281,6 +5379,26 @@ impl SetDisks {
                 && !(opts.data_movement && opts.has_decommission_capacity_reservation())
                 && commit_owns_namespace_guard
                 && commit_scanner_publication_scope.is_none();
+            let lifecycle_owned = commit_bucket_lifecycle_guard.is_some()
+                || commit_object_lock_snapshot
+                    .as_ref()
+                    .is_some_and(|snapshot| snapshot.owns_lifecycle_guard_for(bucket, source_bucket_incarnation_id));
+            let reservation_ctx = (commit_allows_early_ack
+                && write_context.acquires_namespace()
+                && commit_object_lock_guard.is_some()
+                && commit_decommission_object_lock_guard.is_none()
+                && (commit_decommission_capacity_guard.is_none() || prepared_metadata_reservations.is_some())
+                && commit_publication_guard.is_none()
+                && !quota_mutation_fence
+                && !opts.data_movement
+                && !is_meta_bucketname(bucket)
+                && lifecycle_owned)
+                .then(|| Arc::clone(&self.ctx));
+            let prepared_metadata_reservations = if reservation_ctx.is_some() {
+                prepared_metadata_reservations
+            } else {
+                None
+            };
             // Full-tail callers also transfer owned guards to the coordinator:
             // cancelling their ACK waiter must not cancel an in-flight rename.
             let detach_commit_owner = commit_scanner_publication_scope.is_some()
@@ -5363,7 +5481,7 @@ impl SetDisks {
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_capacity_guard
                             .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
+                            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
@@ -5437,7 +5555,7 @@ impl SetDisks {
                         || _bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                         || _decommission_capacity_guard
                             .as_ref()
-                            .is_some_and(|guard| guard.is_lock_lost())
+                            .is_some_and(|guard| guard.is_lock_lost() || guard.is_released())
                     {
                         return Err(StorageError::NamespaceLockQuorumUnavailable {
                             mode: "quota_reservation",
@@ -5604,6 +5722,7 @@ impl SetDisks {
                     )
                     .with_publication_scope(commit_scanner_publication_scope.clone())
                     .with_rollback_receipt(commit_rollback_receipt.clone())
+                    .with_reservation_context(reservation_ctx, prepared_metadata_reservations)
                     .with_namespace_commit_guard(
                         (!is_meta_bucketname(&commit_bucket)).then(|| commit_set.ctx.begin_namespace_commit()),
                     ),
@@ -5627,6 +5746,7 @@ impl SetDisks {
                     pause_put_object_commit(&commit_bucket, &commit_object, PutObjectCommitPause::AfterRenameQuorum).await;
                 }
                 let mut rename_guard_release = None;
+                let mut committed_tail_guard = None;
                 let mut needs_immediate_heal = false;
                 let mut tail_owns_tmp_cleanup = false;
                 rustfs_io_metrics::record_put_object_stage_duration_from(
@@ -5658,11 +5778,27 @@ impl SetDisks {
                             .or_else(|| commit_version_suspended.then(Uuid::nil))
                             .map(|version_id| version_id.to_string());
                         request.expected_bucket_incarnation_id = source_bucket_incarnation_id;
-                        let object_lock_guard = _object_lock_guard.take();
+                        let object_lock_guard = if rename_commit.tail_has_metadata_reservations {
+                            None
+                        } else {
+                            _object_lock_guard
+                                .take()
+                                .map(|guard| Arc::new(tokio::sync::Mutex::new(guard)))
+                        };
+                        committed_tail_guard = object_lock_guard.clone();
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
                         let decommission_capacity_guard = _decommission_capacity_guard.take();
+                        // The quorum committed this snapshot. Receiver-owned
+                        // fences keep its bucket generation protected while
+                        // the remaining ordered disk writes drain.
+                        let object_lock_snapshot = if rename_commit.tail_has_owned_bucket_fences {
+                            drop(commit_object_lock_snapshot);
+                            None
+                        } else {
+                            commit_object_lock_snapshot
+                        };
                         let cleanup_bucket = commit_bucket.clone();
                         let cleanup_object = commit_object.clone();
                         let heal_set = commit_set.clone();
@@ -5683,6 +5819,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                object_lock_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -5704,6 +5841,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                object_lock_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -5717,6 +5855,7 @@ impl SetDisks {
                                 drop(write_context);
                                 drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
+                                drop(object_lock_snapshot);
                                 cleanup_runtime::run(cleanup_reservation, async move {
                                     let zero_target_cleanup = targets.is_empty();
                                     rustfs_io_metrics::record_put_object_stage_duration(
@@ -5972,6 +6111,13 @@ impl SetDisks {
                     lock_held_post_rename_started,
                 );
                 let lock_held_guard_release_started = rustfs_io_metrics::put_stage_timer();
+                if let Some(guard) = committed_tail_guard.take() {
+                    // The committed tail still owns every physical rename. Convert
+                    // only after metadata invalidation and before acknowledging PUT.
+                    // Unsupported peers keep their exclusive leases and the tail
+                    // retains ownership until its physical work has drained.
+                    let _ = guard.lock().await.downgrade_committed_tail().await;
+                }
                 if let Some(release) = rename_guard_release.take() {
                     let _ = release.send(true);
                 }
@@ -8071,6 +8217,8 @@ fn transaction_fencing_gate_requested_for(requested: bool, fleet_confirmed: bool
 #[cfg(any(test, feature = "test-util"))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PutObjectCommitPause {
+    #[cfg(test)]
+    BeforeBucketSnapshot,
     BeforeNamespace,
     AfterNamespace,
     AfterQuotaReservation,
@@ -8165,7 +8313,7 @@ impl Drop for PutObjectCommitBarrier {
 }
 
 #[cfg(any(test, feature = "test-util"))]
-async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
+pub(crate) async fn pause_put_object_commit(bucket: &str, object: &str, pause: PutObjectCommitPause) {
     let barrier = {
         let mut slot = PUT_OBJECT_COMMIT_BARRIER
             .get_or_init(|| std::sync::Mutex::new(Vec::new()))
@@ -22183,6 +22331,117 @@ mod put_object_tmp_cleanup_tests {
 
     #[tokio::test]
     #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_tail_retains_owned_bucket_lifecycle_fence() {
+        use rustfs_lock::{LocalClient, NamespaceLock, ObjectKey};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "put-tail-lifecycle";
+            let object = "object";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create volume");
+            }
+            let lock = NamespaceLock::new("tail-lifecycle".to_string(), Arc::new(LocalClient::new()));
+            let lifecycle = lock
+                .get_read_lock(ObjectKey::new(bucket, "lifecycle"), "lifecycle", Duration::from_secs(5))
+                .await
+                .expect("lifecycle read lock");
+            let metadata = lock
+                .get_read_lock(ObjectKey::new(bucket, "metadata"), "metadata", Duration::from_secs(5))
+                .await
+                .expect("metadata read lock");
+            let snapshot = Arc::new(crate::object_api::ObjectLockConfigSnapshot::for_guarded_store_bucket(
+                Uuid::new_v4(),
+                bucket,
+                Uuid::new_v4(),
+                OffsetDateTime::now_utc(),
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                lifecycle,
+                metadata,
+            ));
+            let opts = ObjectOptions {
+                object_lock_config_snapshot: Some(snapshot),
+                ..Default::default()
+            };
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let writer_set = Arc::clone(&set);
+            let put = tokio::spawn(async move {
+                writer_set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]), &opts)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("rename tail pauses");
+            put.await.expect("PUT joins").expect("PUT acknowledged");
+            let mut bucket_delete =
+                Box::pin(lock.get_write_lock(ObjectKey::new(bucket, "lifecycle"), "delete", Duration::from_secs(10)));
+            let early = tokio::time::timeout(Duration::from_secs(2), &mut bucket_delete).await;
+            barrier.release();
+            drop(barrier);
+            let guard = match early {
+                Ok(result) => {
+                    drop(result.expect("early bucket lock result"));
+                    panic!("bucket lifecycle owner must outlive the acknowledged physical tail");
+                }
+                Err(_) => tokio::time::timeout(Duration::from_secs(15), bucket_delete)
+                    .await
+                    .expect("lifecycle lock released after tail")
+                    .expect("bucket delete acquires lock"),
+            };
+            drop(guard);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_tail_drain_allows_read_after_acknowledged_put() {
+        temp_env::async_with_vars(
+            [
+                (ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true")),
+                (rustfs_config::ENV_OBJECT_LOCK_ACQUIRE_TIMEOUT, Some("1")),
+            ],
+            async {
+                let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+                let bucket = "put-early-ack-tail-read";
+                let object = "early-ack-tail-read-object";
+                for disk in &disk_stores {
+                    disk.make_volume(bucket).await.expect("bucket volume should be created");
+                }
+                let rename_barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+                let put_set = Arc::clone(&set_disks);
+                let put = tokio::spawn(async move {
+                    let mut reader = PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]);
+                    put_set
+                        .put_object(bucket, object, &mut reader, &ObjectOptions::default())
+                        .await
+                });
+                tokio::time::timeout(Duration::from_secs(30), rename_barrier.wait_until_paused())
+                    .await
+                    .expect("tail disk should pause during rename");
+                put.await
+                    .expect("PUT task should join")
+                    .expect("PUT should be acknowledged at quorum");
+                let result = set_disks
+                    .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                    .await;
+                let mut reader = result.expect("acknowledged object should remain readable while tail drains");
+                let mut body = Vec::new();
+                tokio::time::timeout(Duration::from_secs(5), reader.stream.read_to_end(&mut body))
+                    .await
+                    .expect("object body should not wait for the tail")
+                    .expect("object body should drain");
+                assert_eq!(body, vec![b'1'; TEST_OBJECT_SIZE]);
+                rename_barrier.release();
+                drop(rename_barrier);
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
     async fn early_ack_tail_drain_retains_namespace_lock_until_background_rename_finishes() {
         temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
@@ -22249,6 +22508,200 @@ mod put_object_tmp_cleanup_tests {
             let mut body = Vec::new();
             reader.stream.read_to_end(&mut body).await.expect("latest body should drain");
             assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_tail_does_not_timeout_the_next_put() {
+        use rustfs_lock::{LocalClient, NamespaceLock, ObjectKey};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "put-early-ack-next-writer";
+            let object = "object";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create volume");
+            }
+            {
+                let map = set.ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            let lifecycle_lock = NamespaceLock::new("next-put-lifecycle".to_string(), Arc::new(LocalClient::new()));
+            let lifecycle = lifecycle_lock
+                .get_read_lock(ObjectKey::new(bucket, "lifecycle"), "lifecycle", Duration::from_secs(5))
+                .await
+                .expect("lifecycle read lock");
+            let metadata = lifecycle_lock
+                .get_read_lock(ObjectKey::new(bucket, "metadata"), "metadata", Duration::from_secs(5))
+                .await
+                .expect("metadata read lock");
+            let incarnation = Uuid::new_v4();
+            let snapshot = Arc::new(crate::object_api::ObjectLockConfigSnapshot::for_guarded_store_bucket(
+                Uuid::new_v4(),
+                bucket,
+                incarnation,
+                OffsetDateTime::now_utc(),
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                lifecycle,
+                metadata,
+            ));
+            let mut opts = ObjectOptions {
+                expected_bucket_incarnation_id: Some(incarnation),
+                object_lock_config_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            snapshot.add_lock_fences(&mut opts);
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let first_set = Arc::clone(&set);
+            let first_opts = opts.clone();
+            let first = tokio::spawn(async move {
+                first_set
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]), &first_opts)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("first rename paused");
+            first.await.expect("first PUT joins").expect("first PUT acknowledged");
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                set.put_object(bucket, object, &mut PutObjReader::from_vec(vec![b'2'; TEST_OBJECT_SIZE]), &opts),
+            )
+            .await;
+            barrier.release();
+            drop(barrier);
+            let second = second.expect("second PUT finishes").expect("second PUT must not time out");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("both rename tails must drain");
+            let mut reader = set
+                .get_object_reader(bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+                .await
+                .expect("read newest object");
+            let mut body = Vec::new();
+            reader.stream.read_to_end(&mut body).await.expect("read full body");
+            assert_eq!(body, vec![b'2'; TEST_OBJECT_SIZE]);
+            let expected_etag = second.etag.as_ref().expect("second PUT ETag");
+            for disk in &disks {
+                let info = disk
+                    .read_version("", bucket, object, "", &ReadOptions::default())
+                    .await
+                    .expect("each disk must retain the latest version");
+                assert_eq!(info.metadata.get("etag"), Some(expected_etag), "late rename must not restore an old copy");
+                let parts = disk.check_parts(bucket, object, &info).await.expect("check latest shards");
+                assert!(parts.results.iter().all(|result| *result == crate::disk::CHECK_PART_SUCCESS));
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(capacity_dirty_scope)]
+    async fn early_ack_tail_cannot_restore_a_deleted_version() {
+        use rustfs_lock::{LocalClient, NamespaceLock, ObjectKey};
+
+        temp_env::async_with_vars([(ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, disks, set) = hermetic_set_disks(4).await;
+            let bucket = "put-tail-version-delete";
+            let object = "object";
+            for disk in &disks {
+                disk.make_volume(bucket).await.expect("create volume");
+            }
+            {
+                let map = set.ctx.local_disk_map();
+                let mut active = map.write().await;
+                for disk in &disks {
+                    active.insert(disk.endpoint().to_string(), Some(disk.clone()));
+                }
+            }
+            let lock = NamespaceLock::new("version-delete-lifecycle".to_string(), Arc::new(LocalClient::new()));
+            let lifecycle = lock
+                .get_read_lock(ObjectKey::new(bucket, "lifecycle"), "lifecycle", Duration::from_secs(5))
+                .await
+                .expect("lifecycle read lock");
+            let metadata = lock
+                .get_read_lock(ObjectKey::new(bucket, "metadata"), "metadata", Duration::from_secs(5))
+                .await
+                .expect("metadata read lock");
+            let incarnation = Uuid::new_v4();
+            let snapshot = Arc::new(crate::object_api::ObjectLockConfigSnapshot::for_guarded_store_bucket(
+                Uuid::new_v4(),
+                bucket,
+                incarnation,
+                OffsetDateTime::now_utc(),
+                crate::bucket::metadata_sys::ObjectLockConfigState::ConfirmedAbsent,
+                lifecycle,
+                metadata,
+            ));
+            let mut opts = ObjectOptions {
+                versioned: true,
+                expected_bucket_incarnation_id: Some(incarnation),
+                object_lock_config_snapshot: Some(snapshot.clone()),
+                ..Default::default()
+            };
+            snapshot.add_lock_fences(&mut opts);
+            let rename_tasks = rename_fanout_barrier::observe_tasks(object);
+            let barrier = rename_fanout_barrier::arm(object, 0, rename_fanout_barrier::PHASE_RENAME);
+            let writer = Arc::clone(&set);
+            let put_opts = opts.clone();
+            let put = tokio::spawn(async move {
+                writer
+                    .put_object(bucket, object, &mut PutObjReader::from_vec(vec![b'1'; TEST_OBJECT_SIZE]), &put_opts)
+                    .await
+            });
+            tokio::time::timeout(Duration::from_secs(30), barrier.wait_until_paused())
+                .await
+                .expect("rename pauses");
+            let version = put
+                .await
+                .expect("PUT joins")
+                .expect("PUT succeeds")
+                .version_id
+                .expect("version ID")
+                .to_string();
+            let delete_barrier = DeleteObjectCommitBarrier::install_before_namespace(bucket, object);
+            let delete_set = Arc::clone(&set);
+            let mut delete_opts = opts;
+            delete_opts.version_id = Some(version.clone());
+            let delete = tokio::spawn(async move { delete_set.delete_object(bucket, object, delete_opts).await });
+            delete_barrier.wait_until_paused().await;
+            delete_barrier.release();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while !delete_barrier.namespace_acquired() {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("version delete acquires namespace while old tail is paused");
+            barrier.release();
+            drop(barrier);
+            delete.await.expect("delete joins").expect("version delete succeeds");
+            tokio::time::timeout(Duration::from_secs(30), async {
+                while rename_tasks.running() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("rename tails drain");
+            for disk in &disks {
+                assert!(
+                    matches!(
+                        disk.read_version("", bucket, object, &version, &ReadOptions::default()).await,
+                        Err(DiskError::FileNotFound | DiskError::FileVersionNotFound)
+                    ),
+                    "late tail must not restore the deleted version"
+                );
+            }
         })
         .await;
     }

@@ -339,6 +339,32 @@ message RenameDataResponse {
   bytes rename_data_resp_bin = 4;
 }
 
+message MetadataReservationRequest {
+  string disk = 1;
+  string bucket = 2;
+  string object = 3;
+  uint64 timeout_ms = 4;
+  bytes bucket_incarnation_id = 5;
+}
+
+message MetadataReservationCancelRequest {
+  string disk = 1;
+  bytes token = 2;
+}
+
+message MetadataReservationActivateRequest {
+  string disk = 1;
+  string bucket = 2;
+  string object = 3;
+  bytes token = 4;
+  bool renew_only = 5;
+}
+
+message ReservedRenameDataRequest {
+  RenameDataRequest rename = 1;
+  bytes token = 2;
+}
+
 // Fixed-scope native pool.bin recovery. The typed MessagePack payload never
 // accepts an arbitrary volume or object path.
 message PoolMetaNativeRecoveryRequest {
@@ -1314,6 +1340,11 @@ service NodeService {
   rpc ListDir(ListDirRequest) returns (ListDirResponse) {}; // auth-policy: read-only
   rpc WalkDir(WalkDirRequest) returns (stream WalkDirResponse) {}; // auth-policy: streaming
   rpc RenameData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
+  rpc ReserveObjectMetadata(MetadataReservationRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc ReserveObjectMetadataShort(MetadataReservationRequest) returns (SnapshotLeaseResponse) {}; // auth-policy: body-bound
+  rpc ActivateObjectMetadataReservation(MetadataReservationActivateRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
+  rpc CancelObjectMetadataReservation(MetadataReservationCancelRequest) returns (SnapshotLeaseMutationResponse) {}; // auth-policy: body-bound
+  rpc RenameReservedData(ReservedRenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   // The method itself requires source-preserving multipart publication on every peer.
   rpc RenameMultipartData(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound
   rpc RenameDataAtIncarnation(RenameDataRequest) returns (RenameDataResponse) {}; // auth-policy: body-bound

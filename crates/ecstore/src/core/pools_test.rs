@@ -4804,6 +4804,459 @@ mod decommission_lock_order_tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn abandoned_reservation_does_not_hold_bucket_fence_behind_slow_peer() {
+        use crate::set_disk::rename_fanout_barrier::{self, PHASE_RESERVATION_AFTER, PHASE_RESERVATION_BEFORE};
+
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, store, other_store) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("abandoned-preparation");
+            let object = "object.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store.pools[2]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed object");
+            let slow = rename_fanout_barrier::arm(object, 0, PHASE_RESERVATION_BEFORE);
+            let ready = rename_fanout_barrier::arm(object, 1, PHASE_RESERVATION_AFTER);
+            let worker = Arc::clone(&other_store);
+            let task_bucket = bucket.clone();
+            let put = tokio::spawn(async move {
+                worker
+                    .put_object(
+                        &task_bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![2; 8193]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            slow.wait_until_paused_before(deadline).await;
+            ready.wait_until_paused_before(deadline).await;
+            tokio::time::timeout(Duration::from_secs(3), put)
+                .await
+                .expect("PUT fallback finishes")
+                .expect("PUT task")
+                .expect("PUT succeeds");
+            ready.release();
+            drop(ready);
+            let lock = store
+                .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+                .await
+                .expect("publication lock");
+            let writer = tokio::time::timeout(Duration::from_secs(2), lock.get_write_lock(Duration::from_secs(5))).await;
+            slow.release();
+            drop(slow);
+            assert!(
+                matches!(writer, Ok(Ok(_))),
+                "abandoned completed tokens must not hold publication behind a slow peer"
+            );
+        })
+        .await;
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn saturated_budget_keeps_following_same_key_puts_available() {
+        std::thread::Builder::new()
+            .stack_size(32 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(async {
+                        use crate::set_disk::rename_fanout_barrier::{self, PHASE_RENAME};
+
+                        temp_env::async_with_vars(
+                            [(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))],
+                            async {
+                                let (_dirs, store, other_store) =
+                                    test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+                                let bucket = test_bucket("speculative-budget-tail");
+                                let object = "object.bin";
+                                store
+                                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                                    .await
+                                    .expect("create bucket");
+                                store.pools[2]
+                                    .put_object(
+                                        &bucket,
+                                        object,
+                                        &mut PutObjReader::from_vec(vec![1; 8193]),
+                                        &ObjectOptions {
+                                            write_completion: crate::object_api::WriteCompletion::TailDrained,
+                                            ..Default::default()
+                                        },
+                                    )
+                                    .await
+                                    .expect("seed object");
+                                let barrier = rename_fanout_barrier::arm(object, 0, PHASE_RENAME);
+                                let worker = Arc::clone(&other_store);
+                                let task_bucket = bucket.clone();
+                                let first = tokio::spawn(async move {
+                                    worker
+                                        .put_object(
+                                            &task_bucket,
+                                            object,
+                                            &mut PutObjReader::from_vec(vec![2; 8193]),
+                                            &ObjectOptions::default(),
+                                        )
+                                        .await
+                                });
+                                barrier
+                                    .wait_until_paused_before(tokio::time::Instant::now() + Duration::from_secs(10))
+                                    .await;
+                                tokio::time::timeout(Duration::from_secs(5), first)
+                                    .await
+                                    .expect("first PUT acknowledges")
+                                    .expect("first task")
+                                    .expect("first PUT succeeds");
+                                let _permits = (0..crate::runtime::instance::SPECULATIVE_RESERVATION_LIMIT)
+                                    .map(|_| other_store.ctx.try_acquire_speculative_reservation().expect("fill budget"))
+                                    .collect::<Vec<_>>();
+                                let staging = crate::set_disk::PutObjectCommitBarrier::install(
+                                    &bucket,
+                                    object,
+                                    crate::set_disk::PutObjectCommitPause::BeforeBucketSnapshot,
+                                );
+                                let worker = Arc::clone(&other_store);
+                                let task_bucket = bucket.clone();
+                                let second_task = tokio::spawn(async move {
+                                    worker
+                                        .put_object(
+                                            &task_bucket,
+                                            object,
+                                            &mut PutObjReader::from_vec(vec![3; 8193]),
+                                            &ObjectOptions::default(),
+                                        )
+                                        .await
+                                });
+                                tokio::time::timeout(Duration::from_secs(5), staging.wait_until_paused())
+                                    .await
+                                    .expect("short reservation completes before staging");
+                                tokio::time::sleep(Duration::from_secs(3)).await;
+                                staging.release();
+                                drop(staging);
+                                let second = tokio::time::timeout(Duration::from_secs(7), second_task)
+                                    .await
+                                    .map(|result| result.expect("second task"));
+                                let third = if matches!(second, Ok(Ok(_))) {
+                                    Some(
+                                        tokio::time::timeout(
+                                            Duration::from_secs(7),
+                                            other_store.put_object(
+                                                &bucket,
+                                                object,
+                                                &mut PutObjReader::from_vec(vec![4; 8193]),
+                                                &ObjectOptions::default(),
+                                            ),
+                                        )
+                                        .await,
+                                    )
+                                } else {
+                                    None
+                                };
+                                barrier.release();
+                                tokio::task::yield_now().await;
+                                barrier.release();
+                                drop(barrier);
+                                second.expect("second PUT completes").expect("second PUT succeeds");
+                                third
+                                    .expect("third PUT was attempted")
+                                    .expect("third PUT completes")
+                                    .expect("third PUT succeeds");
+                            },
+                        )
+                        .await;
+                    });
+            })
+            .expect("test thread")
+            .join()
+            .expect("test thread must not panic");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn saturated_speculative_budget_falls_back_then_readmits() {
+        use crate::set_disk::rename_fanout_barrier::{self, PHASE_RESERVATION_BEFORE};
+
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, store, other_store) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("speculative-budget");
+            let object = "object.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store.pools[2]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![1; 8193]),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed object");
+            let mut permits = (0..crate::runtime::instance::SPECULATIVE_RESERVATION_LIMIT)
+                .map(|_| other_store.ctx.try_acquire_speculative_reservation().expect("fill budget"))
+                .collect::<Vec<_>>();
+            let barrier = rename_fanout_barrier::arm(object, 0, PHASE_RESERVATION_BEFORE);
+            tokio::time::timeout(
+                Duration::from_secs(3),
+                other_store.put_object(&bucket, object, &mut PutObjReader::from_vec(vec![2; 8193]), &ObjectOptions::default()),
+            )
+            .await
+            .expect("saturated preparation must not block")
+            .expect("fallback PUT succeeds");
+            assert!(barrier.is_paused(), "saturation must use the bounded short-lease path");
+            drop(barrier);
+            drop(permits.pop());
+            let barrier = rename_fanout_barrier::arm(object, 0, PHASE_RESERVATION_BEFORE);
+            let worker = Arc::clone(&other_store);
+            let task_bucket = bucket.clone();
+            let put = tokio::spawn(async move {
+                worker
+                    .put_object(
+                        &task_bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![3; 8193]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            barrier
+                .wait_until_paused_before(tokio::time::Instant::now() + Duration::from_secs(5))
+                .await;
+            barrier.release();
+            drop(barrier);
+            tokio::time::timeout(Duration::from_secs(5), put)
+                .await
+                .expect("readmitted PUT completes")
+                .expect("PUT task")
+                .expect("PUT succeeds");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn tentative_reservation_does_not_block_on_bucket_publication_writer() {
+        let (_dirs, store, other_store) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+        let bucket = test_bucket("reservation-bucket-writer");
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for key in ["baseline", "candidate"] {
+            store.pools[2]
+                .put_object(
+                    &bucket,
+                    key,
+                    &mut PutObjReader::from_vec(vec![1; 256 * 1024]),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed target pool");
+        }
+        let lock = store
+            .new_ns_lock(&bucket, rustfs_common::table_catalog::TABLE_BUCKET_PUBLICATION_LOCK_PATH)
+            .await
+            .expect("publication lock");
+        let guard = lock
+            .get_write_lock(Duration::from_secs(5))
+            .await
+            .expect("hold publication writer");
+        let baseline =
+            temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("false"))], async {
+                tokio::time::timeout(
+                    Duration::from_secs(2),
+                    other_store.put_object(
+                        &bucket,
+                        "baseline",
+                        &mut PutObjReader::from_vec(vec![2; 8193]),
+                        &ObjectOptions::default(),
+                    ),
+                )
+                .await
+            })
+            .await;
+        let baseline = match baseline {
+            Ok(Ok(result)) => result,
+            result => {
+                drop(guard);
+                panic!("baseline did not complete with publication writer: {result:?}");
+            }
+        };
+        assert!(baseline.etag.is_some());
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let mut data = PutObjReader::from_vec(vec![3; 8193]);
+            let opts = ObjectOptions::default();
+            let candidate = other_store.put_object(&bucket, "candidate", &mut data, &opts);
+            tokio::pin!(candidate);
+            let before = tokio::time::timeout(Duration::from_secs(2), &mut candidate).await;
+            drop(guard);
+            match before {
+                Ok(result) => {
+                    result.expect("candidate PUT succeeds");
+                }
+                Err(_) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(15), &mut candidate).await;
+                    panic!("tentative reservations blocked the PUT behind a bucket publication writer");
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unrelated_pool_lock_does_not_double_put_selection_wait() {
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, store, other_store) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("unrelated-pool-lock");
+            let object = "object.bin";
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store.pools[2]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![1; 256 * 1024]),
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed healthy pool");
+            let unrelated_set = other_store.pools[1].get_disks_by_key(object);
+            let lock = unrelated_set.new_ns_lock(&bucket, object).await.expect("unrelated pool lock");
+            let guard = lock
+                .get_write_lock(Duration::from_secs(5))
+                .await
+                .expect("hold unrelated pool lock");
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                other_store.pools[2].get_object_info(&bucket, object, &ObjectOptions::default()),
+            )
+            .await
+            .expect("healthy pool uses a separate lock")
+            .expect("healthy object exists");
+            let worker = Arc::clone(&other_store);
+            let put_bucket = bucket.clone();
+            let mut put = tokio::spawn(async move {
+                worker
+                    .put_object(
+                        &put_bucket,
+                        object,
+                        &mut PutObjReader::from_vec(vec![2; 256 * 1024]),
+                        &ObjectOptions::default(),
+                    )
+                    .await
+            });
+            let before = tokio::time::timeout(Duration::from_secs(7), &mut put).await;
+            drop(guard);
+            match before {
+                Ok(result) => {
+                    result.expect("PUT task").expect("PUT succeeds in healthy pool");
+                }
+                Err(_) => {
+                    let _ = tokio::time::timeout(Duration::from_secs(20), put).await;
+                    panic!("the unrelated pool caused a second lock wait");
+                }
+            }
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn active_decommission_orders_following_put_without_timeout() {
+        temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
+            let (_dirs, store, other_store) = test_three_pool_stores_with_three_disk_sets_with_isolated_node_contexts(None).await;
+            let bucket = test_bucket("active-following-put");
+            let object = "object.bin";
+            let body = vec![0x71; 256 * 1024];
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            store.pools[2]
+                .put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![0x69; body.len()]),
+                    &ObjectOptions::default(),
+                )
+                .await
+                .expect("seed target");
+            let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+            let total = body.len().saturating_mul(4);
+            set_decommission_capacity_info_overrides_for_test(
+                store.id,
+                vec![vec![
+                    DecommissionPoolCapacityInfo::for_test(0, layout, 0, body.len(), body.len()),
+                    DecommissionPoolCapacityInfo::for_test(1, layout, total, total, 0),
+                    DecommissionPoolCapacityInfo::for_test(2, layout, total, total, 0),
+                ]],
+            );
+            store
+                .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+                .await
+                .expect("activate decommission");
+            *other_store.pool_meta.write().await = store.pool_meta.read().await.clone();
+            let barrier =
+                crate::set_disk::rename_fanout_barrier::arm(object, 0, crate::set_disk::rename_fanout_barrier::PHASE_RENAME);
+            let first_store = Arc::clone(&other_store);
+            let first_bucket = bucket.clone();
+            let first = tokio::spawn(async move {
+                first_store
+                    .put_object(&first_bucket, object, &mut PutObjReader::from_vec(body), &ObjectOptions::default())
+                    .await
+            });
+            barrier.wait_until_paused().await;
+            first.await.expect("first task").expect("first PUT");
+            let second = tokio::time::timeout(
+                Duration::from_secs(7),
+                other_store.put_object(
+                    &bucket,
+                    object,
+                    &mut PutObjReader::from_vec(vec![0x72; 256 * 1024]),
+                    &ObjectOptions::default(),
+                ),
+            )
+            .await;
+            barrier.release();
+            drop(barrier);
+            second
+                .expect("second PUT completes")
+                .expect("second PUT succeeds during decommission");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn public_put_holds_decommission_capacity_through_early_ack_tail() {
         temp_env::async_with_vars([(crate::set_disk::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE, Some("true"))], async {
             let (_temp_dirs, store, other_store) =
@@ -4875,8 +5328,33 @@ mod decommission_lock_order_tests {
                 "public PUT early-ACK tail must retain its staged capacity read fence"
             );
 
+            // Migration first takes a fixed-domain read anchor before copying
+            // the source. It must not observe a partly drained foreground PUT.
+            let source_lock = store
+                .new_ns_lock(&bucket, object)
+                .await
+                .expect("create migration source probe");
+            let (started, waiting) = tokio::sync::oneshot::channel();
+            let mut source_probe = tokio::spawn(async move {
+                let _ = started.send(());
+                source_lock.get_read_lock(Duration::from_secs(30)).await
+            });
+            waiting.await.expect("migration source probe started");
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), &mut source_probe)
+                    .await
+                    .is_err(),
+                "migration source read must wait for the acknowledged PUT tail"
+            );
+
             tail_barrier.release();
             drop(tail_barrier);
+            let source_guard = tokio::time::timeout(Duration::from_secs(30), source_probe)
+                .await
+                .expect("migration source probe should finish after the tail")
+                .expect("migration source probe should not panic")
+                .expect("migration source probe should acquire after the tail");
+            drop(source_guard);
             let capacity_guard = tokio::time::timeout(Duration::from_secs(30), capacity_probe)
                 .await
                 .expect("public PUT capacity probe should finish after its tail")
