@@ -1576,7 +1576,6 @@ where
                 "table rename recovery requires a table-bucket publication fence".to_string(),
             ));
         }
-        let mutation_fence = publication.object_mutation_fence().unwrap_or_default();
         let bucket_object = self.paths.table_bucket_entry_path(table_bucket);
         let Some((observed_bucket, _)) = self
             .read_entry::<TableBucketEntry>(self.catalog_bucket(), &bucket_object)
@@ -5609,6 +5608,7 @@ where
                 &entry.table_bucket,
                 Some(TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS),
                 None,
+                1,
             )
             .await?
         };

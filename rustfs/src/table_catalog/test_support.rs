@@ -509,7 +509,7 @@ impl TestCatalogObjectBackend {
                 .await?,
             self.acquire_read_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_fence_lock_path(table_bucket))
                 .await?,
-            self.acquire_write_lock(table_bucket, &default_table_bucket_publication_lock_path(table_bucket))
+            self.acquire_write_lock(table_bucket, &default_table_bucket_publication_lock_path())
                 .await?,
         ];
         Ok(Self {
@@ -941,10 +941,6 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         self.cleanup_publication
             .as_ref()
             .is_some_and(|publication| publication.table_bucket == table_bucket && publication.is_held())
-    }
-
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        self.cleanup_publication.is_some()
     }
 
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
