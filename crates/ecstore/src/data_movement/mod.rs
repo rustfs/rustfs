@@ -605,6 +605,7 @@ fn resolve_data_movement_abort_result(
 #[derive(Debug)]
 struct DataMovementStageError {
     rendered: String,
+    stage: Option<String>,
     source: Box<dyn std::error::Error + Send + Sync>,
 }
 
@@ -626,6 +627,7 @@ where
 {
     Error::other(DataMovementStageError {
         rendered,
+        stage: None,
         source: Box::new(err),
     })
 }
@@ -634,7 +636,21 @@ fn data_movement_stage_error<E>(op_label: &str, stage: &str, bucket: &str, objec
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    data_movement_context_error(format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"), err)
+    Error::other(DataMovementStageError {
+        rendered: format!("{op_label}: {stage} failed for {bucket}/{object}: {err}"),
+        stage: Some(stage.to_owned()),
+        source: Box::new(err),
+    })
+}
+
+pub(crate) fn data_movement_error_is_stage(err: &Error, stage: &str) -> bool {
+    let Error::Io(io_err) = err else {
+        return false;
+    };
+    io_err
+        .get_ref()
+        .and_then(|source| source.downcast_ref::<DataMovementStageError>())
+        .is_some_and(|source| source.stage.as_deref() == Some(stage))
 }
 
 #[cfg(test)]

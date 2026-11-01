@@ -3720,33 +3720,45 @@ fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
     data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
-/// The storage error of a version copy that kept timing out on a namespace
-/// lock through its in-place retries, kept typed so the entry failure policy
-/// defers it.
+/// A copy whose object namespace lock remained unavailable through its
+/// in-place retries, retained as a typed deferral.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-struct DecommissionCopyLockTimeout(#[source] Error);
+struct DecommissionCopyLockUnavailable(#[source] Error);
 
-fn is_decommission_copy_lock_timeout_error(err: &Error) -> bool {
-    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
-    matches!(err, Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+fn is_decommission_copy_lock_unavailable_error(err: &Error, bucket: &str, object: &str) -> bool {
+    let source = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    match source {
+        Error::Lock(rustfs_lock::LockError::Timeout { .. }) => true,
+        Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: lock_bucket,
+            object: lock_object,
+            ..
+        } => {
+            data_movement::data_movement_error_is_stage(err, "prepare_put_object")
+                && lock_bucket == bucket
+                && lock_object == object
+        }
+        _ => false,
+    }
 }
 
-/// A version copy that timed out acquiring a namespace lock leaves the source
+/// A version copy that could not acquire its namespace lock leaves the source
 /// in place; the next attempt copies the version again or finds an equivalent
 /// committed target. The lock is held by another mutation of the key or, when
 /// this node restarted mid-copy, by its previous incarnation until that lock's
 /// lease expires on the peers. Either clears by waiting, so the entry is
 /// deferred instead of being counted as a permanent per-object failure.
-fn decommission_copy_lock_timeout_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+fn decommission_copy_lock_unavailable_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
     data_movement::data_movement_context_error(
-        format!("decommission {stage} timed out on a namespace lock for {bucket}/{object}: {err}"),
-        DecommissionCopyLockTimeout(err),
+        format!("decommission {stage} could not acquire a namespace lock for {bucket}/{object}: {err}"),
+        DecommissionCopyLockUnavailable(err),
     )
 }
 
-fn is_decommission_copy_lock_timeout_deferral(err: &Error) -> bool {
-    data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(err).is_some()
+fn is_decommission_copy_lock_unavailable_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(err).is_some()
 }
 
 /// The deferral of a version copy whose in-place retries ended on `error`, if
@@ -3756,8 +3768,8 @@ fn take_decommission_copy_deferral(stage: &str, bucket: &str, object: &str, erro
         return Some(decommission_copy_quorum_deferral(stage, bucket, object, err));
     }
     error
-        .take_if(|err| is_decommission_copy_lock_timeout_error(err))
-        .map(|err| decommission_copy_lock_timeout_deferral(stage, bucket, object, err))
+        .take_if(|err| is_decommission_copy_lock_unavailable_error(err, bucket, object))
+        .map(|err| decommission_copy_lock_unavailable_deferral(stage, bucket, object, err))
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5822,13 +5834,13 @@ enum DecommissionEntryOutcome {
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
 /// in place and the next attempt cleans it up again. So is a version copy that
-/// lost drive quorum or timed out on a namespace lock through its in-place
+/// lost drive quorum or could not acquire an object namespace lock through its in-place
 /// retries: the source still holds the version and the next attempt copies it
 /// again. Every other failure stays terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
     if is_decommission_source_cleanup_retryable_error(&err)
         || is_decommission_copy_quorum_deferral(&err)
-        || is_decommission_copy_lock_timeout_deferral(&err)
+        || is_decommission_copy_lock_unavailable_deferral(&err)
     {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
@@ -28353,7 +28365,7 @@ mod tests {
             "one version must commit before the next version times out"
         );
         assert!(
-            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
             "{outcome:?}"
         );
         assert_eq!(
@@ -28365,6 +28377,88 @@ mod tests {
             0,
             "a deferred entry must not be counted as a permanent failure"
         );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    /// A target lookup that loses its read-lock quorum must retain the source
+    /// and resume an entry after an earlier version has already committed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_read_lock_quorum_and_resumes() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    stage == "before_target_commit"
+                        && faulted == object
+                        && success
+                        && attempted.fetch_add(1, Ordering::SeqCst) > 0
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::NamespaceLockQuorumUnavailable {
+                        mode: "read",
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        required: 1,
+                        achieved: 0,
+                    },
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
+            "{outcome:?}"
+        );
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("first version committed")
+                .versions
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0
+        );
+
         drop(fault);
         let (outcome, _) = fixture.run_entry().await;
         assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
@@ -28429,7 +28523,7 @@ mod tests {
 
             let (outcome, _) = fixture.run_entry().await;
             assert!(
-                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
                 "{outcome:?}"
             );
             assert_eq!(
@@ -28838,17 +28932,17 @@ mod tests {
             timeout(),
         );
         for err in [timeout(), prepare] {
-            assert!(is_decommission_copy_lock_timeout_error(&err), "{err}");
+            assert!(is_decommission_copy_lock_unavailable_error(&err, "bucket-a", "object-a"), "{err}");
             assert!(!is_decommission_copy_quorum_error(&err), "{err}");
             let mut error = Some(err);
             let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
                 .expect("a lock timeout copy must be deferred");
             assert!(error.is_none());
-            assert!(is_decommission_copy_lock_timeout_deferral(&deferred));
+            assert!(is_decommission_copy_lock_unavailable_deferral(&deferred));
             assert!(!is_decommission_copy_quorum_deferral(&deferred));
-            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(&deferred)
+            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(&deferred)
                 .expect("the deferred error must keep its lock-timeout origin");
-            assert!(is_decommission_copy_lock_timeout_error(&failure.0));
+            assert!(is_decommission_copy_lock_unavailable_error(&failure.0, "bucket-a", "object-a"));
             assert!(matches!(
                 resolve_decommission_entry_failure(deferred),
                 Ok(DecommissionEntryOutcome::Deferred(_))
@@ -28870,6 +28964,43 @@ mod tests {
                 "{error:?}"
             );
             assert!(error.is_some(), "a per-object failure keeps its error");
+        }
+    }
+
+    #[test]
+    fn decommission_copy_defers_only_the_matching_object_read_lock_quorum() {
+        let quorum = |mode, bucket: &str, object: &str| Error::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required: 1,
+            achieved: 0,
+        };
+        let wrap = |stage, err| {
+            data_movement::data_movement_stage_error_for_test("decommission_object", stage, "bucket-a", "object-a", err)
+        };
+        let mut error = Some(wrap("prepare_put_object", quorum("read", "bucket-a", "object-a")));
+        let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
+            .expect("matching read-lock quorum must defer");
+        assert!(error.is_none());
+        assert!(matches!(
+            resolve_decommission_entry_failure(deferred),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
+        for err in [
+            quorum("read", "bucket-a", "object-a"),
+            wrap("source_recheck", quorum("read", "bucket-a", "object-a")),
+            wrap("prepare_put_object", quorum("write", "bucket-a", "object-a")),
+            wrap(
+                "prepare_put_object",
+                quorum("exact_delete_capacity_reconciliation", "bucket-a", "object-a"),
+            ),
+            wrap("prepare_put_object", quorum("read", "other-bucket", "object-a")),
+            wrap("prepare_put_object", quorum("read", "bucket-a", "other-object")),
+        ] {
+            let mut error = Some(err);
+            assert!(take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error).is_none());
+            assert!(error.is_some(), "unrelated lock failures must stay terminal");
         }
     }
 
