@@ -373,6 +373,8 @@ enum FusedCommitAttempt {
     CommitErr(DiskError),
     RestoreDataSource(os::RenameCommitGuard, DiskError),
     Fallback(os::RenameCommitGuard, Option<Bytes>, Box<FileInfo>),
+    #[cfg(test)]
+    ResumePanic(Box<dyn std::any::Any + Send + 'static>),
 }
 
 async fn prepare_rename_commit_and_destination_metadata(
@@ -907,8 +909,12 @@ impl LocalDisk {
                     return Err(err);
                 }
 
-                if !no_inline && is_cancelled() {
-                    return Err(std::io::Error::new(ErrorKind::Interrupted, "inline commit cancelled"));
+                if is_cancelled() {
+                    drop(prepared_metadata_source);
+                    if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                        let _ = remove_file_if_exists(backup_path);
+                    }
+                    return Err(std::io::Error::new(ErrorKind::Interrupted, "commit cancelled"));
                 }
 
                 let guard = match super::remove_dst_base_before_commit_std(
@@ -946,8 +952,12 @@ impl LocalDisk {
                         return Ok(FusedCommitAttempt::RestoreDataSource(guard, err));
                     }
                     #[cfg(test)]
-                    if has_data_dir_path_owned.is_some() {
-                        run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                    if has_data_dir_path_owned.is_some()
+                        && let Err(panic_payload) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                        }))
+                    {
+                        return Ok(FusedCommitAttempt::ResumePanic(panic_payload));
                     }
                     if crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, &dst_path_str) {
                         return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
@@ -1013,10 +1023,13 @@ impl LocalDisk {
                         &guard,
                     )
                 {
-                    if no_inline && let Some((_, new_data_path)) = has_data_dir_path_owned.as_ref() {
-                        remove_dir_all_if_exists(new_data_path)?;
+                    if no_inline {
+                        if let Some((_, new_data_path)) = has_data_dir_path_owned.as_ref() {
+                            remove_dir_all_if_exists(new_data_path)?;
+                        }
+                        return Ok(FusedCommitAttempt::CommitErr(to_file_error(err).into()));
                     }
-                    return Ok(FusedCommitAttempt::CommitErr(to_file_error(err).into()));
+                    return Ok(FusedCommitAttempt::CommitErr(DiskError::from(err)));
                 }
 
                 if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
@@ -1079,6 +1092,10 @@ impl LocalDisk {
                         self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
                     }
                     return Err(err);
+                }
+                #[cfg(test)]
+                Ok(FusedCommitAttempt::ResumePanic(panic_payload)) => {
+                    std::panic::resume_unwind(panic_payload);
                 }
                 Ok(FusedCommitAttempt::Fallback(guard, dst_buf, restored_fi)) => {
                     fi = *restored_fi;

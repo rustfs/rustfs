@@ -1977,7 +1977,7 @@ impl DiskBlockingQueue {
             CURRENT_DISK_BLOCKING_QUEUE.with(|slot| {
                 *slot.borrow_mut() = Some((Arc::clone(&queue), lane));
             });
-            let mut remaining_jobs = (MAX_BLOCKING_JOBS_PER_WORKER / queue.lane_max_workers(lane)).max(1);
+            let mut remaining_jobs = MAX_BLOCKING_JOBS_PER_WORKER;
             let mut idle_polled = false;
             let mut counted_idle = true;
             loop {
@@ -2000,6 +2000,11 @@ impl DiskBlockingQueue {
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
                     if job.is_none() {
+                        if state.idle_workers > 0 {
+                            state.active_workers = state.active_workers.saturating_sub(1);
+                            guard.state = DiskBlockingWorkerState::Retired;
+                            return;
+                        }
                         state.idle_workers += 1;
                         counted_idle = true;
                     }
@@ -2013,15 +2018,11 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
-                    for i in 0..WORKER_IDLE_SPIN_ITERS {
+                    for _ in 0..WORKER_IDLE_SPIN_ITERS {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
-                        if i & 15 == 15 {
-                            std::thread::yield_now();
-                        } else {
-                            std::hint::spin_loop();
-                        }
+                        std::hint::spin_loop();
                     }
                     // Recheck and retire under the same mutex used by enqueue.
                     idle_polled = true;

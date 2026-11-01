@@ -296,45 +296,50 @@ pub(super) fn put_active_multipart_source_head(source: PathBuf, raw: Bytes, fi: 
     );
 }
 
-fn entry_matches_disk(source: &Path, entry: &ActiveMultipartSourceEntry) -> bool {
-    FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(entry.head_stamp)
+fn stamp_matches_active_disk(source: &Path, expected_head_stamp: FileStamp) -> bool {
+    FileStamp::from_path(&source.join(STORAGE_FORMAT_FILE)) == Some(expected_head_stamp)
         && !source.join(STATE).exists()
         && !source.join(crate::disk::MULTIPART_RECOVERY_DIR).exists()
         && !source.join(".mpu-completions").exists()
 }
 
 pub(super) fn get_active_multipart_source_head(source: &Path) -> Option<(Bytes, FileInfo)> {
-    let mut map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
-    let entry = map.get(source)?;
-    if !entry_matches_disk(source, entry) {
-        map.remove(source);
+    let (raw, fi, head_stamp) = {
+        let map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
+        let entry = map.get(source)?;
+        (entry.raw.clone(), entry.fi.clone(), entry.head_stamp)
+    };
+    if !stamp_matches_active_disk(source, head_stamp) {
+        ACTIVE_MULTIPART_SOURCE_HEADS.lock().remove(source);
         return None;
     }
-    Some((entry.raw.clone(), entry.fi.clone()))
+    Some((raw, fi))
 }
 
 pub(super) fn has_active_multipart_source_head(source: &Path) -> bool {
-    let mut map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
-    let Some(entry) = map.get(source) else {
+    let Some(head_stamp) = ACTIVE_MULTIPART_SOURCE_HEADS.lock().get(source).map(|entry| entry.head_stamp) else {
         return false;
     };
-    if !entry_matches_disk(source, entry) {
-        map.remove(source);
+    if !stamp_matches_active_disk(source, head_stamp) {
+        ACTIVE_MULTIPART_SOURCE_HEADS.lock().remove(source);
         return false;
     }
     true
 }
 
 pub(super) fn has_clean_active_multipart_source(source: &Path) -> bool {
-    let mut map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
-    let Some(entry) = map.get(source) else {
+    let Some((head_stamp, clean)) = ACTIVE_MULTIPART_SOURCE_HEADS
+        .lock()
+        .get(source)
+        .map(|entry| (entry.head_stamp, entry.unsettled_parts.is_empty()))
+    else {
         return false;
     };
-    if !entry_matches_disk(source, entry) {
-        map.remove(source);
+    if !stamp_matches_active_disk(source, head_stamp) {
+        ACTIVE_MULTIPART_SOURCE_HEADS.lock().remove(source);
         return false;
     }
-    entry.unsettled_parts.is_empty()
+    clean
 }
 
 pub(super) fn begin_active_multipart_part_transaction(source: &Path, part_number: usize) {
@@ -345,18 +350,21 @@ pub(super) fn begin_active_multipart_part_transaction(source: &Path, part_number
 }
 
 pub(super) fn record_active_multipart_part_committed(source: &Path, part: rustfs_filemeta::ObjectPartInfo) {
-    let mut map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
-    let Some(entry) = map.get_mut(source) else {
-        return;
-    };
-    let Some(data_dir) = entry.fi.data_dir.filter(|dir| !dir.is_nil()) else {
+    let Some(data_dir) = ACTIVE_MULTIPART_SOURCE_HEADS
+        .lock()
+        .get(source)
+        .and_then(|entry| entry.fi.data_dir)
+        .filter(|dir| !dir.is_nil())
+    else {
         return;
     };
     let part_meta_path = source.join(data_dir.to_string()).join(format!("part.{}.meta", part.number));
     let Some(part_stamp) = FileStamp::from_path(&part_meta_path) else {
         return;
     };
-    entry.parts.insert(part.number, (part_stamp, part));
+    if let Some(entry) = ACTIVE_MULTIPART_SOURCE_HEADS.lock().get_mut(source) {
+        entry.parts.insert(part.number, (part_stamp, part));
+    }
 }
 
 pub(super) fn finish_active_multipart_part_transaction(
@@ -381,18 +389,25 @@ pub(super) fn finish_active_multipart_part_transaction(
 }
 
 pub(super) fn get_active_multipart_source_part(source: &Path, part_number: usize) -> Option<rustfs_filemeta::ObjectPartInfo> {
-    let map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
-    let entry = map.get(source)?;
-    if !entry.unsettled_parts.is_empty() || !entry_matches_disk(source, entry) {
+    let (head_stamp, data_dir, expected_stamp, part) = {
+        let map = ACTIVE_MULTIPART_SOURCE_HEADS.lock();
+        let entry = map.get(source)?;
+        if !entry.unsettled_parts.is_empty() {
+            return None;
+        }
+        let data_dir = entry.fi.data_dir.filter(|dir| !dir.is_nil())?;
+        let (expected_stamp, part) = entry.parts.get(&part_number)?;
+        (entry.head_stamp, data_dir, *expected_stamp, part.clone())
+    };
+    if !stamp_matches_active_disk(source, head_stamp) {
+        ACTIVE_MULTIPART_SOURCE_HEADS.lock().remove(source);
         return None;
     }
-    let data_dir = entry.fi.data_dir.filter(|dir| !dir.is_nil())?;
-    let (expected_stamp, part) = entry.parts.get(&part_number)?;
     let part_meta_path = source.join(data_dir.to_string()).join(format!("part.{part_number}.meta"));
-    if FileStamp::from_path(&part_meta_path).as_ref() != Some(expected_stamp) {
+    if FileStamp::from_path(&part_meta_path) != Some(expected_stamp) {
         return None;
     }
-    Some(part.clone())
+    Some(part)
 }
 
 pub(super) fn invalidate_active_multipart_source_head(source: &Path) {

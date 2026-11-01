@@ -14273,6 +14273,7 @@ impl DiskAPI for LocalDisk {
         let probe_active = false;
         let sync_on_close = cfg!(target_os = "linux")
             && !origvolume.is_empty()
+            && origvolume != RUSTFS_META_MULTIPART_BUCKET
             && is_tmp_part_or_proof
             && effective_durability(origvolume).syncs_data_shards()
             && !os::file_fdatasync_group_commit_enabled()
