@@ -421,6 +421,7 @@ impl LocalDisk {
                     return Err(DiskError::ConditionalDeleteConflict);
                 }
                 let permit = AbortDeletePermit::new(&store, &expected, certificate.clone())?;
+                super::multipart_source_state::invalidate_active_multipart_source_head(&store.source);
                 let destination = self.io_get_object_path(RUSTFS_META_TMP_DELETED_BUCKET, &Uuid::new_v4().to_string())?;
                 let source = store.source.clone();
                 let base = store.base.clone();
@@ -618,6 +619,9 @@ pub(super) struct OrdinaryMultipartDeleteCheck {
     root: os::PublicationRoot,
 }
 impl OrdinaryMultipartDeleteCheck {
+    pub(super) fn source(&self) -> &Path {
+        &self.source
+    }
     pub(super) fn validate(&self) -> Result<()> {
         let pinned = match os::pin_multipart_source_directory(&self.source, &self.base, &self.root) {
             Ok(pinned) => pinned,

@@ -41,8 +41,8 @@ use super::super::{
     SUFFIX_REPLICATION_SSEC_CRC, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks, SmallWritePath, StorageError,
     Uuid, WriteLayout, check_object_lock_for_deletion_with_state, classify_multipart_part_write_path, coding,
     complete_multipart_part_error, complete_multipart_part_error_result, complete_part_checksum, contains_key_str,
-    create_bitrot_writer, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5, get_header_map,
-    get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
+    create_bitrot_writer_with_orig_volume, debug, disk, error, file_info_is_valid_for_metadata, get_complete_multipart_md5,
+    get_header_map, get_str, insert_str, is_err_object_not_found, is_err_version_not_found, is_min_allowed_part_size,
     log_multipart_write_quorum_failure, multipart_part_logical_size, parts_after_marker, path_join_buf,
     prepare_complete_multipart_parts, record_compression_total_memory, record_multipart_write_quorum_failure,
     reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
@@ -124,9 +124,10 @@ async fn create_part_writers(
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
-        match create_bitrot_writer(
+        match create_bitrot_writer_with_orig_volume(
             false,
             Some(disk),
+            RUSTFS_META_MULTIPART_BUCKET,
             RUSTFS_META_TMP_BUCKET,
             path,
             length,
@@ -2436,7 +2437,16 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             }
 
             let part_integrity = if let Some(integrity) = integrity {
-                Some(integrity.write(&mut shuffle_disks, bucket, RUSTFS_META_TMP_BUCKET, &tmp_part).await?)
+                Some(
+                    integrity
+                        .write(
+                            &mut shuffle_disks,
+                            RUSTFS_META_MULTIPART_BUCKET,
+                            RUSTFS_META_TMP_BUCKET,
+                            &tmp_part,
+                        )
+                        .await?,
+                )
             } else { None };
             if shuffle_disks.iter().filter(|disk| disk.is_some()).count() < write_quorum {
                 return Err(Error::ErasureWriteQuorum);
@@ -4458,7 +4468,13 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts; deleting them before the commit would strand the upload
             // permanently. This mirrors the "clean up only after commit" pattern
             // already used for the old data-dir GC and the upload-dir delete_all below.
-            commit_set.cleanup_multipart_path(&parts).await;
+            let can_skip_part_cleanup = !needs_upgrade
+                && commit_disks
+                    .iter()
+                    .all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local()));
+            if !can_skip_part_cleanup {
+                commit_set.cleanup_multipart_path(&parts).await;
+            }
 
             if let Some(old_dir) = op_old_dir {
                 // backlog#898: best-effort reclaim of the dereferenced old data dir.
