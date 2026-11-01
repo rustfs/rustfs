@@ -2373,7 +2373,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             let multipart_part_size = data.size();
             let stream = mem::replace(
                 &mut data.stream,
-                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, true)?,
             );
 
             let write_path = classify_multipart_part_write_path(multipart_part_size, fi.erasure.block_size);

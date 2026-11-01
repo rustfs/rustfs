@@ -15,8 +15,8 @@
 use crate::compress_index::{Index, TryGetIndex};
 use crate::{BadDigest, EtagResolvable, HashReaderDetector, HashReaderMut};
 use hmac::{Hmac, KeyInit, Mac};
-use md5::{Digest, Md5};
 use pin_project_lite::pin_project;
+use rustfs_utils::FastMd5;
 use sha2::Sha256;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -27,11 +27,12 @@ pin_project! {
     pub struct  EtagReader<R> {
         #[pin]
         pub inner: R,
-        pub md5: Md5,
+        pub md5: FastMd5,
         pub finished: bool,
         pub checksum: Option<String>,
         resolved_etag: Option<String>,
         encrypted_etag_mac: Option<Hmac<Sha256>>,
+        delegate_inner_etag: bool,
     }
 }
 
@@ -39,11 +40,12 @@ impl<R> EtagReader<R> {
     pub fn new(inner: R, checksum: Option<String>) -> Self {
         Self {
             inner,
-            md5: Md5::new(),
+            md5: FastMd5::new(),
             finished: false,
             checksum,
             resolved_etag: None,
             encrypted_etag_mac: None,
+            delegate_inner_etag: false,
         }
     }
 
@@ -58,6 +60,17 @@ impl<R> EtagReader<R> {
         Ok(reader)
     }
 
+    /// Reuse the inner reader's plaintext ETag when deriving an encrypted ETag,
+    /// avoiding a redundant second MD5 pass over the same plaintext stream.
+    pub fn with_inner_etag_delegation(mut self, delegate: bool) -> Self
+    where
+        R: EtagResolvable,
+    {
+        self.delegate_inner_etag =
+            delegate && self.encrypted_etag_mac.is_some() && self.checksum.is_none() && self.inner.is_etag_reader();
+        self
+    }
+
     /// Get the final md5 value (etag) as a hex string, only compute once.
     /// Can be called multiple times, always returns the same result after finished.
     pub fn get_etag(&mut self) -> String {
@@ -65,8 +78,8 @@ impl<R> EtagReader<R> {
             return etag.clone();
         }
 
-        let etag = self.md5.clone().finalize().to_vec();
-        let etag = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
+        let digest = self.md5.finalize_bytes();
+        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
         self.resolved_etag = Some(etag.clone());
         etag
     }
@@ -87,30 +100,32 @@ where
         if let Poll::Ready(Ok(())) = &poll {
             let filled = &buf.filled()[orig_filled..];
             if !filled.is_empty() {
-                this.md5.update(filled);
+                if !*this.delegate_inner_etag {
+                    this.md5.update(filled);
+                }
             } else {
                 // EOF
                 *this.finished = true;
-                let etag = if let Some(etag) = this.resolved_etag.as_ref() {
-                    etag.clone()
-                } else {
-                    let etag = this.md5.clone().finalize().to_vec();
-                    let etag = hex_simd::encode_to_string(etag, hex_simd::AsciiCase::Lower);
-                    *this.resolved_etag = Some(etag.clone());
-                    etag
-                };
+                if let Some(checksum) = this.checksum {
+                    let etag = if let Some(etag) = this.resolved_etag.as_ref() {
+                        etag.clone()
+                    } else {
+                        let digest = this.md5.finalize_bytes();
+                        let etag = hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower);
+                        *this.resolved_etag = Some(etag.clone());
+                        etag
+                    };
 
-                if let Some(checksum) = this.checksum
-                    && *checksum != etag
-                {
-                    error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
-                    return Poll::Ready(Err(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        BadDigest {
-                            expected_md5: checksum.clone(),
-                            calculated_md5: etag,
-                        },
-                    )));
+                    if *checksum != etag {
+                        error!("Checksum mismatch, expected={:?}, actual={:?}", checksum, etag);
+                        return Poll::Ready(Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            BadDigest {
+                                expected_md5: checksum.clone(),
+                                calculated_md5: etag,
+                            },
+                        )));
+                    }
                 }
             }
         }
@@ -118,16 +133,24 @@ where
     }
 }
 
-impl<R> EtagResolvable for EtagReader<R> {
+impl<R> EtagResolvable for EtagReader<R>
+where
+    R: EtagResolvable,
+{
     fn is_etag_reader(&self) -> bool {
-        true
+        !self.delegate_inner_etag || self.inner.is_etag_reader()
     }
     fn try_resolve_etag(&mut self) -> Option<String> {
         if let Some(mut mac) = self.encrypted_etag_mac.clone() {
             if !self.finished {
                 return None;
             }
-            mac.update(self.get_etag().as_bytes());
+            let plaintext_etag = if self.delegate_inner_etag {
+                self.inner.try_resolve_etag()?
+            } else {
+                self.get_etag()
+            };
+            mac.update(plaintext_etag.as_bytes());
             let protected = mac.finalize().into_bytes();
             return Some(hex_simd::encode_to_string(&protected[..16], hex_simd::AsciiCase::Lower));
         }
@@ -167,6 +190,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use md5::{Digest, Md5};
     use rand::RngExt;
     use std::io::Cursor;
     use tokio::io::{AsyncReadExt, BufReader};
@@ -339,5 +363,55 @@ mod tests {
             .expect("checksum mismatch should preserve the BadDigest type");
         assert_eq!(digest.expected_md5, wrong_checksum);
         assert_eq!(digest.calculated_md5, calculated_md5);
+    }
+
+    #[tokio::test]
+    async fn encrypted_etag_reader_with_inner_delegation_matches_standalone() {
+        let data = b"delegated encrypted etag payload across multiple 64-byte MD5 blocks for verification";
+        let key = [0x42; 32];
+        let nonce = [0x24; 12];
+
+        let mut standalone =
+            EtagReader::new_encrypted(Cursor::new(data.as_slice()), key, nonce).expect("standalone encrypted EtagReader");
+        let mut out_standalone = Vec::new();
+        standalone.read_to_end(&mut out_standalone).await.expect("read standalone");
+        let expected_tag = standalone.try_resolve_etag().expect("standalone etag");
+
+        let inner =
+            crate::HashReader::from_stream(Cursor::new(data.as_slice()), data.len() as i64, data.len() as i64, None, None, false)
+                .expect("inner HashReader");
+        assert!(inner.is_etag_reader(), "HashReader with diskable_md5=false must report is_etag_reader");
+        let mut delegated = EtagReader::new_encrypted(inner, key, nonce)
+            .expect("delegated encrypted EtagReader")
+            .with_inner_etag_delegation(true);
+        let mut out_delegated = Vec::new();
+        delegated.read_to_end(&mut out_delegated).await.expect("read delegated");
+        assert_eq!(out_delegated, data);
+        assert_eq!(
+            delegated.try_resolve_etag().as_deref(),
+            Some(expected_tag.as_str()),
+            "delegated encrypted EtagReader must produce identical HMAC ETag without re-hashing plaintext"
+        );
+
+        let truncated = crate::LimitReader::new(
+            crate::HashReader::from_stream(Cursor::new(data.as_slice()), data.len() as i64, data.len() as i64, None, None, false)
+                .expect("inner HashReader for limit"),
+            16,
+        );
+        assert!(
+            !truncated.is_etag_reader(),
+            "truncating LimitReader must not advertise inner ETag delegation"
+        );
+
+        let mut non_etag_inner = EtagReader::new_encrypted(Cursor::new(data.as_slice()), key, nonce)
+            .expect("encrypted EtagReader over Cursor")
+            .with_inner_etag_delegation(true);
+        let mut out_cursor = Vec::new();
+        non_etag_inner.read_to_end(&mut out_cursor).await.expect("read cursor");
+        assert_eq!(
+            non_etag_inner.try_resolve_etag().as_deref(),
+            Some(expected_tag.as_str()),
+            "delegation request on non-EtagResolvable inner must keep outer MD5 hashing active"
+        );
     }
 }

@@ -4534,7 +4534,7 @@ impl SetDisks {
 
             let stream = mem::replace(
                 &mut data.stream,
-                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, true)?,
             );
 
             let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
