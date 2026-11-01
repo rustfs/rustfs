@@ -16888,6 +16888,31 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
             .await
     }
 
+    async fn put_object_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        fence: &crate::table_catalog::TableCatalogObjectMutationFence,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner.put_object_fenced(bucket, object, data, precondition, fence).await
+    }
+
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        guards: Vec<crate::admin::storage_api::object::WriteCommitGuard>,
+        fence: &crate::table_catalog::TableCatalogObjectMutationFence,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner
+            .put_object_unlocked_fenced(bucket, object, data, precondition, guards, fence)
+            .await
+    }
+
     async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.inner.delete_object(bucket, object).await
     }
