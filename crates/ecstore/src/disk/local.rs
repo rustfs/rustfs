@@ -3013,6 +3013,46 @@ fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
 }
 
 #[cfg(test)]
+pub(super) fn remove_dst_base_before_commit_std(
+    dst_path: &str,
+    guard: os::RenameCommitGuard,
+    source_parent: &Path,
+    destination_parent: &Path,
+    destination_base: &Path,
+    publication_root: &os::PublicationRoot,
+) -> Result<os::RenameCommitGuard> {
+    let base = {
+        let mut target = RENAME_DATA_REMOVE_DST_BASE_BEFORE_COMMIT
+            .lock()
+            .expect("test failpoint lock should not be poisoned");
+        if target.as_ref().is_some_and(|(target_path, _)| target_path == dst_path) {
+            target.take().map(|(_, base)| base)
+        } else {
+            None
+        }
+    };
+    let Some(base) = base else {
+        return Ok(guard);
+    };
+
+    #[cfg(windows)]
+    drop(guard);
+    std::fs::remove_dir_all(base).map_err(to_file_error)?;
+    let result =
+        os::prepare_rename_commit_guard(source_parent, destination_parent, destination_base, publication_root).map_err(|err| {
+            match std::fs::symlink_metadata(destination_base) {
+                Err(base_err) if base_err.kind() == ErrorKind::NotFound => base_err,
+                _ => err,
+            }
+        });
+    #[cfg(all(test, windows))]
+    if result.is_ok() {
+        run_destination_commit_directory_preparation(destination_parent);
+    }
+    result.map_err(to_file_error).map_err(DiskError::from)
+}
+
+#[cfg(test)]
 async fn remove_dst_base_before_commit(
     dst_path: &str,
     guard: os::RenameCommitGuard,
@@ -3248,6 +3288,18 @@ fn should_remove_staged_meta_before_commit(_dst_path: &str) -> bool {
 #[cfg(all(not(test), not(windows)))]
 fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
     false
+}
+
+#[cfg(not(test))]
+pub(super) fn remove_dst_base_before_commit_std(
+    _dst_path: &str,
+    guard: os::RenameCommitGuard,
+    _source_parent: &Path,
+    _destination_parent: &Path,
+    _destination_base: &Path,
+    _publication_root: &os::PublicationRoot,
+) -> Result<os::RenameCommitGuard> {
+    Ok(guard)
 }
 
 #[cfg(not(test))]
@@ -4127,6 +4179,11 @@ fn mark_presynced_tmp_data_dir(dir: PathBuf) {
 
 fn unmark_presynced_tmp_data_dir(dir: &Path) -> bool {
     PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+}
+
+#[cfg(target_os = "linux")]
+pub(in crate::disk) fn is_presynced_tmp_data_dir(dir: &Path) -> bool {
+    PRESYNCED_TMP_DATA_DIRS.lock().contains(dir)
 }
 
 #[cfg(target_os = "linux")]
@@ -7229,6 +7286,8 @@ impl LocalDisk {
         let io_root = Self::open_mount_lease(&root)?;
 
         Self::check_startup_writable(&publication_root, &root).await?;
+        multipart_source_state::invalidate_active_multipart_sources_under(&io_root);
+        multipart_source_state::invalidate_active_multipart_sources_under(&root);
 
         ensure_data_usage_layout(&io_root)
             .await
@@ -8246,14 +8305,13 @@ impl LocalDisk {
             format!("{path}/{STORAGE_FORMAT_FILE}").as_str(),
             fm_bytes.clone(),
             true,
-            namespace_owner,
+            namespace_owner.clone(),
             source_admission.clone(),
         )
         .await?;
 
         if initial_source
             && let Some(admission) = source_admission
-            && multipart_source_state::active_multipart_source_cache_enabled()
             && let Ok(cached_fi) = get_file_info(
                 &fm_bytes,
                 volume,
@@ -8268,6 +8326,7 @@ impl LocalDisk {
         {
             multipart_source_state::put_active_multipart_source_head(admission.source().to_path_buf(), fm_bytes, cached_fi);
         }
+        drop(namespace_owner);
 
         Ok(())
     }
@@ -8972,6 +9031,12 @@ impl LocalDisk {
         immediate_purge: bool,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<()> {
+        if let Some(name) = delete_path.file_name().and_then(|n| n.to_str())
+            && let Some((_, gen_str)) = name.split_once(".integrity.")
+            && let Ok(generation) = Uuid::parse_str(gen_str)
+        {
+            crate::io_support::shard_integrity::invalidate_verified_stripe_records(generation);
+        }
         #[cfg(unix)]
         if !immediate_purge
             && !delete_path.to_string_lossy().ends_with(SLASH_SEPARATOR)
@@ -9051,10 +9116,6 @@ impl LocalDisk {
                         Some(callback.as_ref()),
                         false,
                     )?;
-                    #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                    if let Some(parent) = delete_path_owned.parent() {
-                        let _ = std::fs::remove_dir(parent);
-                    }
                     Ok(())
                 })
                 .await
@@ -9126,6 +9187,11 @@ impl LocalDisk {
     ) -> Result<()> {
         if volume == RUSTFS_META_BUCKET {
             crate::bucket::metadata_sys::bump_local_meta_mutation_gen();
+        }
+        if let Some((_, gen_str)) = path.rsplit_once(".integrity.")
+            && let Ok(generation) = Uuid::parse_str(gen_str)
+        {
+            crate::io_support::shard_integrity::invalidate_verified_stripe_records(generation);
         }
         if volume == RUSTFS_META_MULTIPART_BUCKET
             && let Ok(source_dir) = self.io_get_object_path(volume, multipart_staging::upload_scope_root(path, true))
@@ -13098,13 +13164,6 @@ impl DiskAPI for LocalDisk {
         }
 
         let p = self.io_get_object_open_path(volume, path)?;
-        #[cfg(not(test))]
-        if volume == super::RUSTFS_META_MULTIPART_BUCKET
-            && path.ends_with("/new.meta")
-            && matches!(std::fs::symlink_metadata(&p), Err(ref err) if err.kind() == ErrorKind::NotFound)
-        {
-            return Err(DiskError::FileNotFound);
-        }
 
         let (data, _) = read_file_all(&p, &self.publication_root).await?;
 
@@ -13397,10 +13456,7 @@ impl DiskAPI for LocalDisk {
 
     #[tracing::instrument(level = "trace", skip_all)]
     async fn read_parts(&self, bucket: &str, paths: &[String]) -> Result<Vec<ObjectPartInfo>> {
-        if bucket == RUSTFS_META_MULTIPART_BUCKET
-            && !paths.is_empty()
-            && multipart_source_state::active_multipart_source_cache_enabled()
-        {
+        if bucket == RUSTFS_META_MULTIPART_BUCKET && !paths.is_empty() {
             let mut cached_parts = Vec::with_capacity(paths.len());
             let mut all_cached = true;
             for path_str in paths {
@@ -13626,10 +13682,7 @@ impl DiskAPI for LocalDisk {
                     Ok(false) => return Ok(Err(DiskError::FileCorrupt)),
                     Err(err) => return Ok(Err(to_file_error(err).into())),
                 }
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 let precondition = admission.as_ref().map(|check| check.precondition());
-                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                let precondition: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>> = None;
                 // Publish the immutable generation before preparing the part switch.
                 // Rollback retains the old generation; an unreferenced new index is
                 // reclaimed with the upload directory if preparation is interrupted.
@@ -13993,10 +14046,7 @@ impl DiskAPI for LocalDisk {
                     os::sync_file(&src_file_path).map_err(to_file_error)?;
                 }
 
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 let precondition = admission.as_ref().map(|check| check.precondition());
-                #[cfg(not(all(any(test, feature = "test-util"), not(windows))))]
-                let precondition: Option<Arc<dyn Fn() -> std::io::Result<()> + Send + Sync>> = None;
 
                 os::rename_all_with_precondition_and_parent_sync_std(
                     &src_file_path,
@@ -14066,8 +14116,8 @@ impl DiskAPI for LocalDisk {
             }
         };
 
-        if !published_transaction_meta {
-            if let Err(err) = self
+        if !published_transaction_meta
+            && let Err(err) = self
                 .write_all_meta_with_namespace_owner(
                     dst_volume,
                     &format!("{dst_path}.meta"),
@@ -14076,12 +14126,11 @@ impl DiskAPI for LocalDisk {
                     source_owner.clone(),
                 )
                 .await
-            {
-                if let Some(ref source) = admission_source {
-                    multipart_source_state::invalidate_active_multipart_source_head(source);
-                }
-                return Err(err);
+        {
+            if let Some(ref source) = admission_source {
+                multipart_source_state::invalidate_active_multipart_source_head(source);
             }
+            return Err(err);
         }
         if !src_is_dir
             && let Some(ref source) = admission_source
@@ -28698,19 +28747,24 @@ mod test {
         let metadata = dir.path().join("existing-metadata");
         fs::write(&metadata, b"existing").await.expect("metadata fixture");
         for sync in [SyncMode::None, SyncMode::FileOnly, SyncMode::FileAndDir] {
-            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
-            let queue = Arc::clone(&disk.blocking_queue);
-            let blocker = tokio::spawn(async move {
-                queue
-                    .run_fsync_cancellable(move |_| {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.blocking_recv();
-                        Ok(())
-                    })
-                    .await
-            });
-            started_rx.await.expect("fsync lane blocked");
+            let mut release_txs = Vec::new();
+            let mut blockers = Vec::new();
+            for _ in 0..os::MAX_FSYNC_WORKERS_PER_DISK {
+                let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+                let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+                let queue = Arc::clone(&disk.blocking_queue);
+                blockers.push(tokio::spawn(async move {
+                    queue
+                        .run_fsync_cancellable(move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("fsync worker blocked");
+                release_txs.push(release_tx);
+            }
             let path = dir.path().join("new-metadata");
             let mut write = std::pin::pin!(disk.write_all_internal(&path, Bytes::from_static(b"new"), sync, dir.path(),));
             assert!(futures::FutureExt::now_or_never(&mut write).is_none());
@@ -28725,8 +28779,12 @@ mod test {
             )
             .await;
             let published_before_sync = path.exists();
-            release_tx.send(()).expect("release fsync lane");
-            blocker.await.expect("blocker joined").expect("blocker completed");
+            for release_tx in release_txs {
+                release_tx.send(()).expect("release fsync worker");
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocker joined").expect("blocker completed");
+            }
             write.await.expect("write completed");
             assert_eq!(
                 read.expect("metadata read must progress")

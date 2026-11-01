@@ -1000,7 +1000,7 @@ pub(super) fn inspection_with_markers(
     Ok((inspection, has_physical_data_dirs_or_markers))
 }
 
-type PreparedDeleteReceiptEntry = (DeleteRecoveryJournal, bool, bool);
+type PreparedDeleteReceiptEntry = (DeleteRecoveryJournal, bool);
 
 static PREPARED_DELETE_RECEIPTS: std::sync::LazyLock<parking_lot::Mutex<HashMap<PathBuf, PreparedDeleteReceiptEntry>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
@@ -2323,10 +2323,7 @@ impl LocalDisk {
                     return Err(err);
                 }
                 let old_data_path = old_dir.map(|uuid| file_path.join(uuid.to_string())).filter(|p| p.is_dir());
-                if sync
-                    && old_data_path.is_some()
-                    && let Err(err) = os::fsync_dir_std(&file_path)
-                {
+                if sync && let Err(err) = os::fsync_dir_std(&file_path) {
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
                 }
@@ -2387,7 +2384,6 @@ impl LocalDisk {
                 if sync {
                     os::fsync_dir_std(&file_path)?;
                 }
-                let has_physical_data_dirs = reserved_data_path.is_some();
                 if let Some((old_path, reserved_marker)) = reserved_data_path {
                     let recovery_marker = old_path.join(format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
                     match std::fs::rename(&reserved_marker, &recovery_marker) {
@@ -2397,7 +2393,7 @@ impl LocalDisk {
                         Err(err) => return Err(err),
                     }
                 }
-                put_prepared_delete_receipt(destination, (journal, sole_transaction, !has_physical_data_dirs));
+                put_prepared_delete_receipt(destination, (journal, sole_transaction));
                 Ok(Ok(Some(old_dir)))
             },
         )
@@ -2443,12 +2439,12 @@ impl LocalDisk {
             lease,
             sync,
             move || -> std::io::Result<Result<Option<(DeleteRecoveryJournal, bool, bool)>>> {
-                if let Some((journal, sole_transaction, finished)) = take_prepared_delete_receipt(&rollback)
+                if let Some((journal, sole_transaction)) = take_prepared_delete_receipt(&rollback)
                     && rollback.join(PREPARED).is_file()
                 {
                     let receipt = CommitReceipt {
                         journal: journal.clone(),
-                        finished,
+                        finished: false,
                     };
                     let receipt_bytes = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
                     std::fs::create_dir_all(&staging_root)?;
@@ -2524,13 +2520,9 @@ impl LocalDisk {
                         Err(err) => return Err(err),
                     }
                 }
-                let has_physical_data_dirs = journal
-                    .data_dirs
-                    .iter()
-                    .any(|data_dir| root.join(data_dir.to_string()).exists() || rollback.join(data_dir.to_string()).exists());
                 let receipt = CommitReceipt {
                     journal: journal.clone(),
-                    finished: !has_physical_data_dirs,
+                    finished: false,
                 };
                 let receipt_bytes = serde_json::to_vec(&receipt).map_err(std::io::Error::other)?;
                 std::fs::create_dir_all(&staging_root)?;
@@ -2601,6 +2593,7 @@ impl LocalDisk {
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
         let sync = effective_durability(volume).syncs_commit_metadata();
         let data_dirs = journal.data_dirs.clone();
+        let has_target = journal.target_digest.is_some();
         let journal_for_receipt = journal.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
         let prune_paths: Vec<_> = rollback
@@ -2666,7 +2659,7 @@ impl LocalDisk {
             for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
                 ignore_not_found(std::fs::remove_file(rollback.join(name)))?;
             }
-            if had_physical_data_dirs {
+            if has_target || had_physical_data_dirs {
                 let finished_receipt = CommitReceipt {
                     journal: journal_for_receipt,
                     finished: true,
@@ -2685,13 +2678,20 @@ impl LocalDisk {
                 }
             }
             for name in [TARGET, PREPARED, FINISHED] {
-                ignore_not_found(std::fs::remove_file(rollback.join(name)))?;
+                let path = rollback.join(name);
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
+                ignore_not_found(std::fs::remove_file(path))?;
             }
             if sync {
                 os::fsync_dir_std(&rollback)?;
             }
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &receipt_path);
             ignore_not_found(std::fs::remove_file(&receipt_path))?;
             for dir_path in &prune_paths {
+                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, dir_path);
                 if let Err(err) = std::fs::remove_dir(dir_path) {
                     if is_dir_not_empty_error(&err) {
                         break;

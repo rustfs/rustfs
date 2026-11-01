@@ -264,21 +264,8 @@ impl PreparedIntegrity {
         .map(Result::ok)
         .map(Option::flatten)
         .collect::<Vec<_>>();
-        let mut cacheable_records = Vec::new();
         let mut source: Box<dyn tokio::io::AsyncRead + Unpin + Send> = match self.index {
-            Spool::Memory(bytes) => {
-                if verified_stripe_cache_enabled() && self.part.stripes <= 4 {
-                    let record_size = self.part.record_size();
-                    for stripe in 0..self.part.stripes {
-                        if let Ok(offset) = self.part.record_offset(stripe)
-                            && let Some(slice) = bytes.get(offset..offset + record_size)
-                        {
-                            cacheable_records.push((stripe, Bytes::copy_from_slice(slice)));
-                        }
-                    }
-                }
-                Box::new(std::io::Cursor::new(bytes))
-            }
+            Spool::Memory(bytes) => Box::new(std::io::Cursor::new(bytes)),
             Spool::File(mut file) => {
                 // The file has a single owner; duplicated descriptors share offsets.
                 file = tokio::task::spawn_blocking(move || {
@@ -325,11 +312,6 @@ impl PreparedIntegrity {
             }
         }))
         .await;
-        if disks.iter().any(Option::is_some) {
-            for (stripe, record) in cacheable_records {
-                put_verified_stripe_record(&self.part, stripe, record);
-            }
-        }
         Ok(self.part)
     }
 }
@@ -356,43 +338,7 @@ type VerifiedStripeKey = (uuid::Uuid, [u8; 32], u32);
 static VERIFIED_STRIPE_RECORDS: std::sync::LazyLock<parking_lot::Mutex<std::collections::HashMap<VerifiedStripeKey, Bytes>>> =
     std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-#[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
-static FORCE_VERIFIED_STRIPE_CACHE_IN_TEST: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-#[cfg(test)]
-struct VerifiedStripeCacheTestGuard;
-
-#[cfg(test)]
-impl Drop for VerifiedStripeCacheTestGuard {
-    fn drop(&mut self) {
-        FORCE_VERIFIED_STRIPE_CACHE_IN_TEST.store(false, Ordering::Release);
-        VERIFIED_STRIPE_RECORDS.lock().clear();
-    }
-}
-
-#[cfg(test)]
-fn enable_verified_stripe_cache_for_test() -> VerifiedStripeCacheTestGuard {
-    VERIFIED_STRIPE_RECORDS.lock().clear();
-    FORCE_VERIFIED_STRIPE_CACHE_IN_TEST.store(true, Ordering::Release);
-    VerifiedStripeCacheTestGuard
-}
-
-#[inline]
-fn verified_stripe_cache_enabled() -> bool {
-    #[cfg(any(test, feature = "test-util", feature = "e2e-test-hooks"))]
-    {
-        FORCE_VERIFIED_STRIPE_CACHE_IN_TEST.load(Ordering::Acquire)
-    }
-    #[cfg(not(any(test, feature = "test-util", feature = "e2e-test-hooks")))]
-    {
-        true
-    }
-}
-
 fn get_verified_stripe_record(part: &PartIntegrity, stripe: u32) -> Option<Bytes> {
-    if !verified_stripe_cache_enabled() {
-        return None;
-    }
     VERIFIED_STRIPE_RECORDS
         .lock()
         .get(&(part.generation, part.root, stripe))
@@ -400,9 +346,6 @@ fn get_verified_stripe_record(part: &PartIntegrity, stripe: u32) -> Option<Bytes
 }
 
 fn put_verified_stripe_record(part: &PartIntegrity, stripe: u32, record: Bytes) {
-    if !verified_stripe_cache_enabled() {
-        return;
-    }
     let mut map = VERIFIED_STRIPE_RECORDS.lock();
     if map.len() >= 4096
         && let Some(evict_key) = map.keys().next().copied()
@@ -410,6 +353,12 @@ fn put_verified_stripe_record(part: &PartIntegrity, stripe: u32, record: Bytes) 
         map.remove(&evict_key);
     }
     map.insert((part.generation, part.root, stripe), record);
+}
+
+pub(crate) fn invalidate_verified_stripe_records(generation: uuid::Uuid) {
+    VERIFIED_STRIPE_RECORDS
+        .lock()
+        .retain(|(stored_gen, _, _), _| *stored_gen != generation);
 }
 
 impl PartProofReader {
@@ -951,7 +900,6 @@ mod tests {
 
     #[tokio::test]
     async fn verified_stripe_record_cache_serves_verified_record_and_still_verifies_payload() {
-        let _guard = enable_verified_stripe_cache_for_test();
         let layout = IntegrityLayout::new(2, 2, 8, false).expect("layout");
         let mut builder = IntegrityBuilder::new(layout, 1).expect("builder");
         let shards = [b"ABCD".as_slice(), b"EFGH", b"IJKL", b"MNOP"];

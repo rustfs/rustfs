@@ -184,6 +184,8 @@ pub(super) fn create_local_inline_rollback_backup(
     remove_file_if_exists(&backup_path)?;
     if should_fail_local_inline_rollback_hardlink(dst_file_path) || std::fs::hard_link(dst_file_path, &backup_path).is_err() {
         let write_res = (|| -> std::io::Result<()> {
+            #[cfg(test)]
+            run_owned_file_before_open(&backup_path);
             let mut file = std::fs::File::create(&backup_path)?;
             std::io::Write::write_all(&mut file, old_metadata)?;
             if sync && !old_metadata.is_empty() {
@@ -367,9 +369,10 @@ fn prepare_rename_commit_and_destination_metadata_std(
 
 #[cfg(target_os = "linux")]
 enum FusedCommitAttempt {
-    Committed(RenameDataResp),
+    Committed(Box<RenameDataResp>),
     CommitErr(DiskError),
-    Fallback(os::RenameCommitGuard, Option<Bytes>, FileInfo),
+    RestoreDataSource(os::RenameCommitGuard, DiskError),
+    Fallback(os::RenameCommitGuard, Option<Bytes>, Box<FileInfo>),
 }
 
 async fn prepare_rename_commit_and_destination_metadata(
@@ -754,11 +757,6 @@ impl LocalDisk {
             && !fi_healing
             && !os::dst_dir_fsync_group_commit_enabled()
             && !os::file_fdatasync_group_commit_enabled()
-            && !super::has_rename_data_test_failpoints(dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterDataRename, dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterMetaCommit, dst_path)
-            && !super::has_delete_version_test_failpoints()
         {
             #[cfg(test)]
             if !no_inline {
@@ -802,7 +800,7 @@ impl LocalDisk {
                 // requires a rollback directory; appending a new version keeps
                 // an inline rollback backup for post-rename directory sync errors.
                 if is_cancelled() {
-                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
+                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, Box::new(fi_moved)));
                 }
                 let mut xlmeta = FileMeta::new();
                 let mut dst_meta_unparsable = false;
@@ -825,7 +823,19 @@ impl LocalDisk {
                     }
                 });
                 if rollback_data_dir.is_some() {
-                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, fi_moved));
+                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, Box::new(fi_moved)));
+                }
+                #[cfg(test)]
+                let probe_active = os::file_sync_probe::is_active();
+                #[cfg(not(test))]
+                let probe_active = false;
+                if no_inline
+                    && sync_data_shards
+                    && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
+                    && (probe_active || !super::is_presynced_tmp_data_dir(src_data_path))
+                    && os::regular_files(src_data_path).is_ok_and(|files| files.len() >= os::PARALLEL_FILE_SYNC_THRESHOLD)
+                {
+                    return Ok(FusedCommitAttempt::Fallback(guard, has_dst_buf, Box::new(fi_moved)));
                 }
                 let (old_current_size, old_current_source_checked, old_current_source) = observe_old_current(
                     has_dst_buf.is_some(),
@@ -844,20 +854,31 @@ impl LocalDisk {
                     skip_parent = dst_parent_owned.clone();
                 }
 
+                #[cfg(test)]
+                run_owned_file_before_open(&src_file_path_owned);
                 let mut prepared_metadata_source =
                     os::create_prepared_rename_source_with_commit_guard(&src_file_path_owned, &dst_file_path_owned, &guard)?;
                 prepared_metadata_source.write_all(&new_dst_buf, false)?;
+                if !no_inline {
+                    run_inline_preparation_before_backup(&dst_path_str);
+                }
 
                 let mut staged_rollback_path = None;
-                if sync_commit_metadata && let Some(ref old_metadata) = has_dst_buf {
-                    let backup_path =
-                        create_local_inline_rollback_backup(&dst_file_path_owned, &src_file_path_owned, old_metadata, true)?;
+                if let Some(ref old_metadata) = has_dst_buf
+                    && (sync_commit_metadata || cfg!(test))
+                {
+                    let backup_path = create_local_inline_rollback_backup(
+                        &dst_file_path_owned,
+                        &src_file_path_owned,
+                        old_metadata,
+                        sync_commit_metadata,
+                    )?;
                     staged_rollback_path = Some(StagedRollbackBackup(backup_path));
                 }
 
                 if no_inline {
                     if sync_data_shards && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref() {
-                        let sync_result = if super::take_presynced_tmp_data_dir(src_data_path) {
+                        let sync_result = if !probe_active && super::take_presynced_tmp_data_dir(src_data_path) {
                             // The payload was synced, but its part.1 directory entry
                             // must also be persisted before moving the data directory.
                             os::fsync_dir_std(src_data_path)
@@ -879,18 +900,6 @@ impl LocalDisk {
                         }
                         return Err(err);
                     }
-                    if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref()
-                        && let Err(err) = os::rename_all_with_commit_guard_on_thread(src_data_path, dst_data_path, &guard)
-                    {
-                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
-                            let _ = remove_file_if_exists(backup_path);
-                        }
-                        return Ok(FusedCommitAttempt::CommitErr(err));
-                    }
-                    #[cfg(test)]
-                    if has_data_dir_path_owned.is_some() {
-                        run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
-                    }
                 } else if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                         let _ = remove_file_if_exists(backup_path);
@@ -898,21 +907,101 @@ impl LocalDisk {
                     return Err(err);
                 }
 
-                if let Err(err) = os::rename_prepared_source_on_thread(
-                    prepared_metadata_source,
-                    &src_file_path_owned,
-                    &dst_file_path_owned,
-                    &skip_parent,
+                if !no_inline && is_cancelled() {
+                    return Err(std::io::Error::new(ErrorKind::Interrupted, "inline commit cancelled"));
+                }
+
+                let guard = match super::remove_dst_base_before_commit_std(
+                    &dst_path_str,
+                    guard,
+                    &src_parent_owned,
+                    &dst_parent_owned,
+                    &dst_volume_dir_owned,
                     &publication_root_owned,
-                    &guard,
                 ) {
+                    Ok(guard) => guard,
+                    Err(err) => {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Ok(FusedCommitAttempt::CommitErr(err));
+                    }
+                };
+                if should_remove_staged_meta_before_commit(&dst_path_str) {
+                    drop(prepared_metadata_source);
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                         let _ = remove_file_if_exists(backup_path);
                     }
-                    if no_inline && let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
-                        let _ = std::fs::rename(dst_data_path, src_data_path);
+                    std::fs::remove_file(&src_file_path_owned)?;
+                    return Ok(FusedCommitAttempt::CommitErr(DiskError::FileNotFound));
+                }
+
+                if no_inline {
+                    if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref()
+                        && let Err(err) = os::rename_all_with_commit_guard_on_thread(src_data_path, dst_data_path, &guard)
+                    {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Ok(FusedCommitAttempt::RestoreDataSource(guard, err));
+                    }
+                    #[cfg(test)]
+                    if has_data_dir_path_owned.is_some() {
+                        run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                    }
+                    if crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, &dst_path_str) {
+                        return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
+                    }
+                    if should_fail_before_old_metadata_backup(&dst_path_str) {
+                        if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                            let _ = remove_file_if_exists(backup_path);
+                        }
+                        return Ok(FusedCommitAttempt::RestoreDataSource(guard, DiskError::Unexpected));
+                    }
+                    if crash_inject::should_crash_at(CrashPoint::RenameAfterBackupBeforeMetaCommit, &dst_path_str) {
+                        return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
+                    }
+                }
+
+                let rename_res = if should_fail_commit_rename(&dst_path_str) {
+                    drop(prepared_metadata_source);
+                    Err(DiskError::other("test fail during metadata commit rename"))
+                } else {
+                    os::rename_prepared_source_on_thread(
+                        prepared_metadata_source,
+                        &src_file_path_owned,
+                        &dst_file_path_owned,
+                        &skip_parent,
+                        &publication_root_owned,
+                        &guard,
+                    )
+                };
+                if let Err(err) = rename_res {
+                    if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
+                        let _ = remove_file_if_exists(backup_path);
+                    }
+                    if no_inline {
+                        return Ok(FusedCommitAttempt::RestoreDataSource(guard, err));
                     }
                     return Ok(FusedCommitAttempt::CommitErr(err));
+                }
+
+                if should_fail_after_metadata_commit(&dst_path_str) {
+                    if no_inline {
+                        rollback_inline_metadata_std(&dst_file_path_owned, None, staged_rollback_path.as_ref())?;
+                        if let Some((_, new_data_path)) = has_data_dir_path_owned.as_ref() {
+                            remove_dir_all_if_exists(new_data_path)?;
+                        }
+                        return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
+                    }
+                    let err = rollback_inline_metadata_std(&dst_file_path_owned, None, staged_rollback_path.as_ref())
+                        .err()
+                        .unwrap_or_else(|| std::io::Error::other("test fail after metadata commit"));
+                    return Ok(FusedCommitAttempt::CommitErr(DiskError::from(err)));
+                }
+
+                if crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, &dst_path_str) {
+                    return Ok(FusedCommitAttempt::CommitErr(DiskError::Unexpected));
                 }
 
                 if sync_commit_metadata
@@ -924,10 +1013,10 @@ impl LocalDisk {
                         &guard,
                     )
                 {
-                    if no_inline && let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
-                        let _ = std::fs::rename(dst_data_path, src_data_path);
+                    if no_inline && let Some((_, new_data_path)) = has_data_dir_path_owned.as_ref() {
+                        remove_dir_all_if_exists(new_data_path)?;
                     }
-                    return Ok(FusedCommitAttempt::CommitErr(DiskError::from(err)));
+                    return Ok(FusedCommitAttempt::CommitErr(to_file_error(err).into()));
                 }
 
                 if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
@@ -938,7 +1027,7 @@ impl LocalDisk {
                     let _ = std::fs::remove_dir(parent);
                 }
 
-                Ok(FusedCommitAttempt::Committed(RenameDataResp {
+                Ok(FusedCommitAttempt::Committed(Box::new(RenameDataResp {
                     multipart_source: None,
                     old_data_dir: None,
                     rollback_data_dir: None,
@@ -947,7 +1036,7 @@ impl LocalDisk {
                     old_current_size,
                     old_current_source_checked,
                     old_current_source,
-                }))
+                })))
             };
 
             let attempt_res = if let Some(admission) = file_sync_admission.as_ref() {
@@ -967,7 +1056,23 @@ impl LocalDisk {
                     if let Some(receipt_mutation) = receipt_mutation.as_mut() {
                         receipt_mutation.complete();
                     }
-                    return Ok(resp);
+                    return Ok(*resp);
+                }
+                Ok(FusedCommitAttempt::RestoreDataSource(directory_guard, err)) => {
+                    let commit = RenameCommitContext {
+                        directory_guard,
+                        publication_root: &self.publication_root,
+                        mutation_lease,
+                        source_metadata: &src_file_path,
+                        destination_metadata: &dst_file_path,
+                        source_volume_dir: &src_volume_dir,
+                        data_paths: has_data_dir_path.as_ref(),
+                    };
+                    commit.restore_published_data_source().await?;
+                    for part_path in &invalidate_part_paths {
+                        self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
+                    }
+                    return Err(err);
                 }
                 Ok(FusedCommitAttempt::CommitErr(err)) | Err(err) => {
                     for part_path in &invalidate_part_paths {
@@ -976,7 +1081,7 @@ impl LocalDisk {
                     return Err(err);
                 }
                 Ok(FusedCommitAttempt::Fallback(guard, dst_buf, restored_fi)) => {
-                    fi = restored_fi;
+                    fi = *restored_fi;
                     (guard, dst_buf)
                 }
             }
@@ -986,23 +1091,9 @@ impl LocalDisk {
             && !publication.legacy
             && !fi_healing
             && !os::dst_dir_fsync_group_commit_enabled()
-            && !super::has_rename_data_test_failpoints(dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterDataRename, dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterBackupBeforeMetaCommit, dst_path)
-            && !crash_inject::is_armed(CrashPoint::RenameAfterMetaCommit, dst_path)
-            && !{
-                #[cfg(test)]
-                {
-                    os::file_sync_probe::is_active()
-                }
-                #[cfg(not(test))]
-                {
-                    false
-                }
-            }
         {
             enum MultipartFusedCommitOutcome {
-                Committed(RenameDataResp),
+                Committed(Box<RenameDataResp>),
                 AbortBeforeDataRename(DiskError),
                 RestoreDataSource(os::RenameCommitGuard, DiskError),
                 RestoreTargetAfterError(DiskError, bool),
@@ -1086,16 +1177,38 @@ impl LocalDisk {
                         Ok(source) => source,
                         Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(err)),
                     };
+                    #[cfg(test)]
+                    let probe_active = os::file_sync_probe::is_active();
+                    #[cfg(not(test))]
+                    let probe_active = false;
                     // When presynced, shard payloads were synced during UploadPart and
                     // prepare_and_install_head_on_thread just fsynced src_data_path after
                     // writing RETIREMENT_ANCHOR.
                     if sync_data_shards
                         && let Some((src_data_path, _)) = has_data_dir_path_owned.as_ref()
-                        && !super::take_presynced_tmp_data_dir(src_data_path)
+                        && (probe_active || !super::take_presynced_tmp_data_dir(src_data_path))
                         && let Err(err) = os::sync_dir_files_std(src_data_path)
                         && err.kind() != ErrorKind::NotFound
                     {
                         return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(to_file_error(err).into()));
+                    }
+                    let directory_guard_owned = match super::remove_dst_base_before_commit_std(
+                        &dst_path_str,
+                        directory_guard_owned,
+                        &src_parent_owned,
+                        &dst_parent_owned,
+                        &dst_volume_dir_owned,
+                        &publication_root_owned,
+                    ) {
+                        Ok(guard) => guard,
+                        Err(err) => return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(err)),
+                    };
+                    if should_remove_staged_meta_before_commit(&dst_path_str) {
+                        drop(prepared_metadata_source);
+                        if let Err(err) = std::fs::remove_file(&src_file_path_owned) {
+                            return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(to_file_error(err).into()));
+                        }
+                        return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::FileNotFound));
                     }
                     if let Some((src_data_path, dst_data_path)) = has_data_dir_path_owned.as_ref() {
                         let Some(src_parent) = src_data_path.parent() else {
@@ -1111,16 +1224,40 @@ impl LocalDisk {
                         }
                         #[cfg(test)]
                         run_rename_data_after_first_publication(&root_owned, &dst_volume_str, &dst_path_str);
+                        if crash_inject::should_crash_at(CrashPoint::RenameAfterDataRename, &dst_path_str) {
+                            return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::Unexpected));
+                        }
+                        if should_fail_before_old_metadata_backup(&dst_path_str) {
+                            return Ok(MultipartFusedCommitOutcome::RestoreDataSource(
+                                directory_guard_owned,
+                                DiskError::Unexpected,
+                            ));
+                        }
+                        if crash_inject::should_crash_at(CrashPoint::RenameAfterBackupBeforeMetaCommit, &dst_path_str) {
+                            return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::Unexpected));
+                        }
                     }
-                    if let Err(err) = os::rename_prepared_source_on_thread(
-                        prepared_metadata_source,
-                        &src_file_path_owned,
-                        &dst_file_path_owned,
-                        &skip_parent_owned,
-                        &publication_root_owned,
-                        &directory_guard_owned,
-                    ) {
+                    let rename_res = if should_fail_commit_rename(&dst_path_str) {
+                        drop(prepared_metadata_source);
+                        Err(DiskError::other("test fail during metadata commit rename"))
+                    } else {
+                        os::rename_prepared_source_on_thread(
+                            prepared_metadata_source,
+                            &src_file_path_owned,
+                            &dst_file_path_owned,
+                            &skip_parent_owned,
+                            &publication_root_owned,
+                            &directory_guard_owned,
+                        )
+                    };
+                    if let Err(err) = rename_res {
                         return Ok(MultipartFusedCommitOutcome::RestoreDataSource(directory_guard_owned, err));
+                    }
+                    if should_fail_after_metadata_commit(&dst_path_str) {
+                        return Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(DiskError::Unexpected, false));
+                    }
+                    if crash_inject::should_crash_at(CrashPoint::RenameAfterMetaCommit, &dst_path_str) {
+                        return Ok(MultipartFusedCommitOutcome::AbortBeforeDataRename(DiskError::Unexpected));
                     }
                     if sync_commit_metadata {
                         if let Some(parent) = dst_file_path_owned.parent()
@@ -1148,7 +1285,7 @@ impl LocalDisk {
                         }
                     }
                     match publication_owned.finish_on_thread(sync_commit_metadata, staging_cleanup) {
-                        Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(RenameDataResp {
+                        Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(Box::new(RenameDataResp {
                             multipart_source: Some(Box::new(result)),
                             old_data_dir: has_old_data_dir,
                             rollback_data_dir: None,
@@ -1157,7 +1294,7 @@ impl LocalDisk {
                             old_current_size,
                             old_current_source_checked,
                             old_current_source,
-                        })),
+                        }))),
                         Err(err) => Ok(MultipartFusedCommitOutcome::RestoreTargetAfterError(err, false)),
                     }
                 },
@@ -1171,7 +1308,7 @@ impl LocalDisk {
                     for part_path in &invalidate_part_paths {
                         self.io_backend.invalidate_cached_fd(dst_volume, part_path).await;
                     }
-                    return Ok(resp);
+                    return Ok(*resp);
                 }
                 MultipartFusedCommitOutcome::AbortBeforeDataRename(err) => return Err(err),
                 MultipartFusedCommitOutcome::RestoreDataSource(directory_guard, err) => {

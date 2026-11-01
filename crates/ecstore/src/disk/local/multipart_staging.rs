@@ -397,11 +397,7 @@ impl LocalDisk {
         let publication_root = self.publication_root.clone();
         let source_path = source_path.to_owned();
         let incoming = incoming.clone();
-        // Production commits write RETIREMENT_ANCHOR into this staged directory via
-        // replace_multipart_source_metadata, which fsyncs the directory before rename.
-        let sync_directory = cfg!(test) && effective_durability(destination_volume).syncs_data_shards();
-        #[cfg(not(test))]
-        let _ = destination_volume;
+        let sync_directory = effective_durability(destination_volume).syncs_data_shards();
         let fresh_head = os::run_cancellable_blocking_namespace_operation(Arc::clone(&staging.lease), move |cancelled| {
             if cancelled() {
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
@@ -1273,7 +1269,6 @@ mod tests {
     #[tokio::test]
     async fn multipart_source_active_head_cache_populates_and_invalidates_across_part_and_delete_paths() {
         use crate::disk::{DiskAPI as _, PartTransactionAction, ReadOptions};
-        let _cache_guard = super::super::multipart_source_state::enable_active_multipart_source_cache_for_test();
         let (_root, disk, completed, _) = fixture().await;
         std::fs::create_dir_all(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path")).expect("TMP bucket");
         let upload = format!("{}/{}", "c".repeat(64), Uuid::new_v4());
@@ -1397,5 +1392,84 @@ mod tests {
                 .await,
             Err(DiskError::FileNotFound)
         ));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn multipart_source_cache_publication_holds_source_lock_against_concurrent_retirement() {
+        use crate::disk::{DiskAPI as _, disk_store::LocalDiskWrapper, os::prepared_publication_test_hooks as hooks};
+
+        let (_root, disk, _, _) = fixture().await;
+        std::fs::create_dir_all(disk.io_get_bucket_path(RUSTFS_META_TMP_BUCKET).expect("TMP path")).expect("TMP bucket");
+        let disk = Arc::new(disk);
+        let wrapper = LocalDiskWrapper::new(Arc::clone(&disk), false);
+        let upload = format!("{}/{}", "d".repeat(64), Uuid::new_v4());
+        let data_dir = Uuid::new_v4();
+        let mut init_fi = FileInfo::new(&upload, 2, 2);
+        init_fi.erasure.index = 1;
+        init_fi.data_dir = Some(data_dir);
+        init_fi.fresh = true;
+        init_fi.mod_time = Some(time::OffsetDateTime::now_utc());
+
+        let source_dir = disk
+            .io_get_object_path(RUSTFS_META_MULTIPART_BUCKET, &upload)
+            .expect("source dir");
+        let base_dir = disk
+            .io_get_bucket_path(RUSTFS_META_MULTIPART_BUCKET)
+            .expect("multipart bucket path");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let _hook = hooks::install_at(hooks::Stage::DirFsync, &source_dir, move || {
+            let _ = entered_tx.send(());
+            let _ = release_rx.recv();
+        });
+
+        let init_wrapper = wrapper.clone();
+        let init_upload = upload.clone();
+        let init_task = tokio::spawn(async move {
+            init_wrapper
+                .write_metadata("", RUSTFS_META_MULTIPART_BUCKET, &init_upload, init_fi)
+                .await
+        });
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+            .await
+            .expect("initial write_metadata reaches parent dir fsync")
+            .expect("entered channel");
+
+        let retire_wrapper = wrapper.clone();
+        let retire_path = format!("{upload}/xl.meta");
+        let mut retire_fut = Box::pin(async move {
+            retire_wrapper
+                .delete_paths(RUSTFS_META_MULTIPART_BUCKET, &[retire_path])
+                .await
+        });
+        assert!(
+            futures::poll!(tokio::task::unconstrained(retire_fut.as_mut())).is_pending(),
+            "concurrent retirement must block on SourceRW while initial head publication is in flight"
+        );
+
+        let _ = release_tx.send(());
+        init_task.await.expect("init join").expect("initial write_metadata succeeds");
+        retire_fut
+            .await
+            .expect("concurrent retirement completes after SourceRW release");
+
+        assert!(
+            !super::super::multipart_source_state::has_active_multipart_source_head(&source_dir),
+            "retired source must not remain active in cache after interleaved initial publication"
+        );
+        assert!(
+            matches!(
+                super::super::multipart_source_state::validate_source_mutation(
+                    &source_dir,
+                    &base_dir,
+                    &disk.publication_root,
+                    false
+                ),
+                Err(DiskError::FileNotFound)
+            ),
+            "validate_source_mutation must reject non-initial mutation on retired source"
+        );
     }
 }

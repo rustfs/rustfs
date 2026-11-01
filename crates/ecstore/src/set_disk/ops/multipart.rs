@@ -4468,8 +4468,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             // parts; deleting them before the commit would strand the upload
             // permanently. This mirrors the "clean up only after commit" pattern
             // already used for the old data-dir GC and the upload-dir delete_all below.
-            let can_skip_part_cleanup = !cfg!(test)
-                && !needs_upgrade
+            let can_skip_part_cleanup = !needs_upgrade
                 && commit_disks
                     .iter()
                     .all(|disk| disk.as_ref().is_some_and(|disk| disk.is_local()));

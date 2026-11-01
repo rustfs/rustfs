@@ -1668,7 +1668,7 @@ fn clear_file_fdatasync_group_commit_for_test() {
 
 // Small object directories are cheaper to flush in one blocking task. Multipart
 // directories fan out only once enough files can amortize per-task scheduling.
-const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
+pub(crate) const PARALLEL_FILE_SYNC_THRESHOLD: usize = 16;
 pub(crate) const MAX_PARALLEL_FILE_SYNCS: usize = 16;
 // Scale aggregate fan-out for wider nodes while reserving at least half of the
 // configured Tokio blocking pool for unrelated filesystem work.
@@ -1788,10 +1788,7 @@ pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
 // while allowing concurrent fsync callers to enter the kernel simultaneously and
 // coalesce in the filesystem journal (`jbd2`/`xfs` group commit).
 const MAX_NAMESPACE_WORKERS_PER_DISK: usize = 1;
-#[cfg(any(test, feature = "test-util"))]
-const MAX_FSYNC_WORKERS_PER_DISK: usize = 1;
-#[cfg(not(any(test, feature = "test-util")))]
-const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
+pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
@@ -1833,7 +1830,6 @@ struct DiskBlockingQueueLane {
 
 pub(crate) struct DiskBlockingQueue {
     lanes: [DiskBlockingQueueLane; 3],
-    fsync_max_workers: usize,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1902,15 +1898,6 @@ impl DiskBlockingQueue {
     fn new() -> Arc<Self> {
         Arc::new(Self {
             lanes: std::array::from_fn(|_| DiskBlockingQueueLane::default()),
-            fsync_max_workers: MAX_FSYNC_WORKERS_PER_DISK,
-        })
-    }
-
-    #[cfg(test)]
-    fn new_with_fsync_workers_for_test(fsync_max_workers: usize) -> Arc<Self> {
-        Arc::new(Self {
-            lanes: std::array::from_fn(|_| DiskBlockingQueueLane::default()),
-            fsync_max_workers: fsync_max_workers.max(1),
         })
     }
 
@@ -1923,7 +1910,7 @@ impl DiskBlockingQueue {
     fn lane_max_workers(&self, lane: DiskBlockingLane) -> usize {
         match lane {
             DiskBlockingLane::Foreground | DiskBlockingLane::Isolated => MAX_NAMESPACE_WORKERS_PER_DISK,
-            DiskBlockingLane::Fsync => self.fsync_max_workers,
+            DiskBlockingLane::Fsync => MAX_FSYNC_WORKERS_PER_DISK,
         }
     }
 
@@ -2608,7 +2595,7 @@ fn sync_files(paths: &[PathBuf]) -> io::Result<()> {
     Ok(())
 }
 
-fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
+pub(crate) fn regular_files(dir: &Path) -> io::Result<Vec<PathBuf>> {
     let mut files = Vec::with_capacity(PARALLEL_FILE_SYNC_THRESHOLD);
     for entry in std::fs::read_dir(dir)? {
         let entry = entry?;
@@ -11455,19 +11442,24 @@ mod tests {
             let queue = register_disk_blocking_queue(root.path(), root.path());
             std::fs::write(root.path().join("intermediate"), b"backup").expect("backup");
             std::fs::write(root.path().join("receipt"), b"committed").expect("receipt");
-            let (started_tx, started_rx) = oneshot::channel();
-            let (release_tx, release_rx) = oneshot::channel();
-            let blocker_queue = Arc::clone(&queue);
-            let blocker = tokio::spawn(async move {
-                blocker_queue
-                    .run_fsync_cancellable(move |_| {
-                        let _ = started_tx.send(());
-                        let _ = release_rx.blocking_recv();
-                        Ok(())
-                    })
-                    .await
-            });
-            started_rx.await.expect("fsync lane blocked");
+            let mut release_txs = Vec::new();
+            let mut blockers = Vec::new();
+            for _ in 0..MAX_FSYNC_WORKERS_PER_DISK {
+                let (started_tx, started_rx) = oneshot::channel();
+                let (release_tx, release_rx) = oneshot::channel();
+                let blocker_queue = Arc::clone(&queue);
+                blockers.push(tokio::spawn(async move {
+                    blocker_queue
+                        .run_fsync_cancellable(move |_| {
+                            let _ = started_tx.send(());
+                            let _ = release_rx.blocking_recv();
+                            Ok(())
+                        })
+                        .await
+                }));
+                started_rx.await.expect("fsync worker blocked");
+                release_txs.push(release_tx);
+            }
             let mut cleanup = std::pin::pin!(remove_files_and_fsync_with_owner(
                 root.path(),
                 &["intermediate"],
@@ -11478,8 +11470,12 @@ mod tests {
             assert!(futures::FutureExt::now_or_never(&mut cleanup).is_none());
             let foreground = tokio::time::timeout(Duration::from_secs(5), queue.run(|| Ok(()))).await;
             let retained = root.path().join("receipt").exists();
-            release_tx.send(()).expect("release fsync lane");
-            blocker.await.expect("blocker joined").expect("blocker completed");
+            for release_tx in release_txs {
+                release_tx.send(()).expect("release fsync worker");
+            }
+            for blocker in blockers {
+                blocker.await.expect("blocker joined").expect("blocker completed");
+            }
             cleanup.await.expect("cleanup completed");
             foreground.expect("foreground must progress").expect("foreground operation");
             assert_eq!(retained, sync, "only durable cleanup must wait for the fsync lane");
@@ -11767,7 +11763,7 @@ mod tests {
     async fn disk_blocking_queue_fsync_lane_scales_workers_and_retires_idle() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let queue = DiskBlockingQueue::new_with_fsync_workers_for_test(4);
+        let queue = DiskBlockingQueue::new();
         let active = Arc::new(AtomicUsize::new(0));
         let max_seen = Arc::new(AtomicUsize::new(0));
         let entered = Arc::new(AtomicUsize::new(0));
@@ -11776,7 +11772,7 @@ mod tests {
         let (release_tx, _) = tokio::sync::broadcast::channel::<()>(1);
 
         let mut handles = Vec::new();
-        for i in 0..8 {
+        for i in 0..(MAX_FSYNC_WORKERS_PER_DISK + 4) {
             let q = Arc::clone(&queue);
             let active = Arc::clone(&active);
             let max_seen = Arc::clone(&max_seen);
@@ -11793,12 +11789,12 @@ mod tests {
                         let cur = active.fetch_add(1, Ordering::SeqCst) + 1;
                         max_seen.fetch_max(cur, Ordering::SeqCst);
                         let ord = entered.fetch_add(1, Ordering::SeqCst) + 1;
-                        if ord == 4
-                            && let Some(tx) = all_entered_tx.lock().take()
+                        if ord == MAX_FSYNC_WORKERS_PER_DISK
+                            && let Some(tx) = all_entered_tx.lock().expect("lock completion sender").take()
                         {
                             let _ = tx.send(());
                         }
-                        if ord <= 4 {
+                        if ord <= MAX_FSYNC_WORKERS_PER_DISK {
                             let _ = release_rx.blocking_recv();
                         }
                         active.fetch_sub(1, Ordering::SeqCst);
@@ -11811,7 +11807,7 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(5), all_entered_rx)
             .await
-            .expect("four fsync workers should enter within timeout")
+            .expect("all fsync workers should enter within timeout")
             .expect("all_entered channel");
         let _ = release_tx.send(());
         for (i, handle) in handles.into_iter().enumerate() {
@@ -11819,8 +11815,8 @@ mod tests {
         }
         assert_eq!(
             max_seen.load(Ordering::SeqCst),
-            4,
-            "fsync lane must run 4 concurrent workers up to its configured bound"
+            MAX_FSYNC_WORKERS_PER_DISK,
+            "fsync lane must run MAX_FSYNC_WORKERS_PER_DISK concurrent workers up to its configured bound"
         );
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
