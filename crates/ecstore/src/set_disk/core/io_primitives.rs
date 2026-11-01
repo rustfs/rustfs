@@ -5645,6 +5645,14 @@ impl SetDisks {
         }
 
         let disks = self.get_disks_internal().await;
+        if disks.len() == self.set_drive_count
+            && disks.iter().all(|disk| {
+                disk.as_ref()
+                    .is_some_and(|disk| disk.has_clean_active_multipart_source(dst_object, true))
+            })
+        {
+            return Ok(false);
+        }
         let transaction_path = part_transaction_path(dst_object);
         let transaction_meta_path = format!("{transaction_path}/{PART_TRANSACTION_NEW_META}");
 
@@ -5844,6 +5852,14 @@ impl SetDisks {
         write_quorum: usize,
     ) -> disk::error::Result<()> {
         let disks = self.get_disks_internal().await;
+        if disks.len() == self.set_drive_count
+            && disks.iter().all(|disk| {
+                disk.as_ref()
+                    .is_some_and(|disk| disk.has_clean_active_multipart_source(part_path, false))
+            })
+        {
+            return Ok(());
+        }
         let listings = join_all(disks.iter().map(|disk| {
             let disk = disk.clone();
             async move {
@@ -6051,7 +6067,7 @@ impl SetDisks {
         let all_prepared_succeeded = errs
             .iter()
             .zip(prepared_disks.iter())
-            .all(|(err, disk)| disk.is_none() || err.is_none());
+            .all(|(err, disk)| err.is_none() && disk.as_ref().is_some_and(|d| d.is_local()));
         let committed = if all_prepared_succeeded {
             let settles = prepared_disks.iter().map(|disk| {
                 let disk = disk.clone();

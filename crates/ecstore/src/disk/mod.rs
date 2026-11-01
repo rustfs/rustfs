@@ -486,6 +486,13 @@ impl Disk {
         }
     }
 
+    pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        match self {
+            Self::Local(disk) => disk.has_clean_active_multipart_source(upload_or_part_path, part_path),
+            Self::Remote(_) => false,
+        }
+    }
+
     pub(crate) async fn try_publish_prepared_delete_local(
         &self,
         volume: &str,
