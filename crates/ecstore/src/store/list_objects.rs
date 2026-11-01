@@ -1307,6 +1307,37 @@ impl ECStore {
         );
 
         let rx = rx.child_token();
+        if self.pools.len() == 1 && self.pools[0].disk_set.len() == 1 {
+            rustfs_io_metrics::record_list_objects_merge(LIST_OBJECTS_SOURCE_WALKER, 1, 1);
+            let res = self.pools[0].disk_set[0].list_path(rx, opts, sender).await;
+            let mut outcome = ListPathRawOutcome::default();
+            let err = match res {
+                Ok(set_outcome) => {
+                    outcome.limit_reached = set_outcome.limit_reached;
+                    None
+                }
+                Err(err) => Some(err),
+            };
+            let errs = [err];
+            if is_all_not_found(&errs) {
+                return Ok(outcome);
+            }
+            if let Some(err) = errs.into_iter().flatten().next() {
+                return Err(err);
+            }
+            rustfs_io_metrics::record_stage_duration(
+                "store_list_objects_list_merged",
+                merge_started.elapsed().as_secs_f64() * 1000.0,
+            );
+            debug!(
+                set_pair_count = 1,
+                limit_reached = outcome.limit_reached,
+                error_count = 0,
+                "store list_merged finished"
+            );
+            return Ok(outcome);
+        }
+
         let mut futures = Vec::new();
 
         let mut inputs = Vec::new();
@@ -1877,7 +1908,7 @@ async fn gather_results(
         if opts.versioned
             && is_object
             && entry
-                .xl_meta()
+                .xl_meta_ref()
                 .is_ok_and(|meta| !meta.versions.is_empty() && meta.versions.iter().all(|version| version.header.free_version()))
         {
             continue;

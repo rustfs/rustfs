@@ -5598,9 +5598,10 @@ impl SetDisks {
         write_quorum: usize,
         quorum_context: Option<MultipartWriteQuorumContext<'_>>,
     ) -> disk::error::Result<Vec<Option<DiskStore>>> {
-        self.recover_part_transaction(dst_object, write_quorum).await?;
         let part = ObjectPartInfo::unmarshal(&meta)?;
         let integrity = part.integrity.map(Arc::new);
+
+        self.recover_part_transaction(dst_object, write_quorum).await?;
 
         let src_bucket = Arc::new(src_bucket.to_string());
         let src_object = Arc::new(src_object.to_string());
@@ -5623,7 +5624,9 @@ impl SetDisks {
                 if let Err(error) = prepared {
                     return Some(Err(error));
                 }
-                if let Some(integrity) = integrity {
+                if let Some(integrity) = integrity
+                    && !disk.is_local()
+                {
                     let Some((directory, _)) = dst_object.rsplit_once('/') else {
                         return Some(Err(DiskError::FileCorrupt));
                     };
@@ -5740,7 +5743,36 @@ impl SetDisks {
             return Err(err);
         }
 
-        let committed = self.recover_part_transaction(&dst_object, write_quorum).await?;
+        let all_prepared_succeeded = errs
+            .iter()
+            .zip(prepared_disks.iter())
+            .all(|(err, disk)| disk.is_none() || err.is_none());
+        let committed = if all_prepared_succeeded {
+            let settles = prepared_disks.iter().map(|disk| {
+                let disk = disk.clone();
+                let dst_object = dst_object.clone();
+                async move {
+                    let Some(disk) = disk else {
+                        return Err(DiskError::DiskNotFound);
+                    };
+                    disk.settle_part_transaction(RUSTFS_META_MULTIPART_BUCKET, &dst_object, PartTransactionAction::Commit)
+                        .await
+                }
+            });
+            let settle_results = join_all(settles).await;
+            if settle_results.iter().filter(|res| res.is_ok()).count() >= write_quorum
+                && settle_results
+                    .iter()
+                    .zip(prepared_disks.iter())
+                    .all(|(res, disk)| disk.is_none() || res.is_ok())
+            {
+                true
+            } else {
+                self.recover_part_transaction(&dst_object, write_quorum).await?
+            }
+        } else {
+            self.recover_part_transaction(&dst_object, write_quorum).await?
+        };
         if !committed {
             let err = DiskError::ErasureWriteQuorum;
             if let Some(context) = quorum_context {
@@ -6737,9 +6769,7 @@ impl SetDisks {
                         object,
                     );
                 }
-                let if_none_match = http_preconditions.if_none_match_value().map(str::to_owned);
-                let if_match = http_preconditions.if_match_value().map(str::to_owned);
-                if should_prevent_write(&oi, if_none_match, if_match)
+                if should_prevent_write(&oi, http_preconditions.if_none_match_value(), http_preconditions.if_match_value())
                     && !crate::data_movement::can_replace_stale_data_movement_target(&oi, opts)
                 {
                     return Some(StorageError::PreconditionFailed);

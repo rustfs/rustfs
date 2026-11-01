@@ -41,20 +41,6 @@ fn reset_recovery_status() {
     .expect("test must be able to reset the local recovery observation");
 }
 
-async fn wait_for_recovery_attempt(attempt: u32) -> ScannerCycleRecoveryStatus {
-    tokio::time::timeout(WAIT_BUDGET, async {
-        loop {
-            let status = scanner_cycle_recovery_status();
-            if status.retry_count >= u64::from(attempt) {
-                return status;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .unwrap_or_else(|_| panic!("recovery attempt {attempt} was never recorded: {:?}", scanner_cycle_recovery_status()))
-}
-
 async fn wait_for_recovery_state(state: &str) -> ScannerCycleRecoveryStatus {
     tokio::time::timeout(WAIT_BUDGET, async {
         loop {
@@ -130,20 +116,19 @@ fn started_rebalance() -> EcstoreRebalanceMeta {
     }
 }
 
-/// rustfs/rustfs#8670: a usage floor that is present but untrusted must not
-/// drive the supervisor into a terminal `paused, retryable=false` observation.
-/// Every attempt stays retryable with a bounded backoff, and repairing the
-/// floor recovers the scanner without a process restart.
+/// rustfs/rustfs#8670 + backlog#2918: a usage floor that is present but
+/// untrusted must not stop the scanner. The unreadable floor is reported and
+/// rebuilt through a CAS overwrite so the scanner recovers without a process
+/// restart or a terminal `paused, retryable=false` observation.
 #[tokio::test]
 #[serial]
-async fn usage_floor_load_failure_backs_off_and_recovers_without_restart() {
+async fn usage_floor_load_failure_rebuilds_and_recovers_without_restart() {
     temp_env::async_with_vars(SUPERVISOR_ENV, async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();
         crate::scanner_io::clear_dirty_usage_buckets_for_tests();
         reset_recovery_status();
         let (_dir, store) = setup_scanner_cycle_store().await;
-        // Present but without a baseline identity: the shape #8670 reported,
-        // whose error points the operator at the usage-state reset.
+        // Present but without a baseline identity: the shape #8670 reported.
         save_config(
             store.clone(),
             DATA_USAGE_OBJ_NAME_PATH.as_str(),
@@ -156,41 +141,11 @@ async fn usage_floor_load_failure_backs_off_and_recovers_without_restart() {
         let _cancel_on_drop = ctx.clone().drop_guard();
         init_data_scanner_with_storage(ctx.clone(), store.clone(), ScannerRuntimeGuard::new()).await;
 
-        let attempts = MAX_SCANNER_CYCLE_RECOVERY_RETRIES + 2;
-        let mut first_detected = None;
-        for attempt in 1..=attempts {
-            let status = wait_for_recovery_attempt(attempt).await;
-            assert_eq!(status.classification.as_deref(), Some("usage_floor_load_failed"), "attempt {attempt}");
-            assert!(status.retryable, "attempt {attempt} must stay retryable: {status:?}");
-            assert_ne!(status.state, "paused", "attempt {attempt} must not report a terminal pause");
-            if attempt >= MAX_SCANNER_CYCLE_RECOVERY_RETRIES {
-                assert_eq!(status.state, "backoff", "attempt {attempt}: {status:?}");
-            } else {
-                assert_eq!(status.state, "usage_floor_load_failed", "attempt {attempt}: {status:?}");
-            }
-            assert!(
-                status
-                    .reason
-                    .as_deref()
-                    .is_some_and(|reason| reason.contains("usage-state/reset") && reason.contains("next automatic attempt")),
-                "the operator hint and the next attempt must both be visible: {status:?}"
-            );
-            assert!(status.next_attempt_at_unix_secs.is_some(), "attempt {attempt}: {status:?}");
-            match first_detected {
-                None => first_detected = status.first_detected_at_unix_secs,
-                Some(first) => assert_eq!(status.first_detected_at_unix_secs, Some(first), "attempt {attempt}"),
-            }
-            if attempt == attempts {
-                save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), valid_usage_floor(0, 0))
-                    .await
-                    .expect("repaired usage floor should persist");
-            }
-            notify_scanner_cycle_recovery_wake();
-        }
-
+        // backlog#2918: the unreadable floor is rebuilt automatically; the
+        // scanner must reach healthy without a manual repair or terminal pause.
         let healthy = wait_for_recovery_state("healthy").await;
-        assert_eq!(healthy.retry_count, 0, "a successful attempt clears the retry budget: {healthy:?}");
-        assert!(!healthy.retryable);
+        assert!(!healthy.retryable, "rebuild must clear the retry budget: {healthy:?}");
+        assert_ne!(healthy.state, "paused", "rebuild must not report a terminal pause");
         wait_for_persisted_cycle(&store, |cycle, _| cycle.next >= 1).await;
         assert_eq!(scanner_cycle_schedule_status().execution_role, "leader");
         stop_supervisor(ctx).await;

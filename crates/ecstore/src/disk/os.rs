@@ -2752,22 +2752,114 @@ pub(crate) fn read_dir_probe(path: impl AsRef<Path>, entry_limit: usize) -> io::
     })
 }
 
+#[cfg(test)]
 pub(crate) fn has_non_data_dir_entry(path: impl AsRef<Path>, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    match has_non_data_dir_entry_inner(path.as_ref(), data_dirs) {
-        Ok(res) => Ok(res),
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(err),
-    }
+    has_non_data_dir_entry_lazy(path, || data_dirs.to_vec()).map(|(_, res)| res)
 }
 
-fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Result<bool> {
-    let mut dir = std::fs::read_dir(path)?;
-    let entry_limit = data_dirs.len().saturating_add(2);
+#[cfg(target_os = "linux")]
+pub(crate) fn has_non_data_dir_entry_lazy_from_fd(
+    dir_fd: &std::fs::File,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    use rustix::fs::{AtFlags, FileType, RawDir, statat};
+
+    let mut raw_buf = [std::mem::MaybeUninit::<u8>::uninit(); 1024];
+    let mut dir = RawDir::new(dir_fd, &mut raw_buf);
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
     let mut valid_entries = 0usize;
 
     for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
         let Some(entry) = dir.next() else {
-            return Ok(false);
+            return Ok((data_dirs.unwrap_or_default(), false));
+        };
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(rustix::io::Errno::NOENT) => return Ok((data_dirs.unwrap_or_default(), false)),
+            Err(err) => return Err(io::Error::from(err)),
+        };
+        let c_name = entry.file_name();
+        let name_bytes = c_name.to_bytes();
+        if name_bytes.is_empty() || name_bytes == b"." || name_bytes == b".." {
+            continue;
+        }
+
+        let file_type = match entry.file_type() {
+            FileType::Unknown => match statat(dir_fd, c_name, AtFlags::SYMLINK_NOFOLLOW) {
+                Ok(st) => FileType::from_raw_mode(st.st_mode),
+                Err(rustix::io::Errno::NOENT) => continue,
+                Err(err) => return Err(io::Error::from(err)),
+            },
+            ft => ft,
+        };
+        if file_type == FileType::Directory {
+            let parsed_uuid = if name_bytes.len() == uuid::fmt::Hyphenated::LENGTH {
+                std::str::from_utf8(name_bytes).ok().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
+            }
+            valid_entries += 1;
+        } else if file_type == FileType::RegularFile {
+            valid_entries += 1;
+        } else {
+            continue;
+        }
+
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
+        if valid_entries == entry_limit {
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
+        }
+    }
+
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+pub(crate) fn has_non_data_dir_entry_lazy(
+    path: impl AsRef<Path>,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    match has_non_data_dir_entry_lazy_inner(path.as_ref(), load_data_dirs) {
+        Ok(res) => Ok(res),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok((Vec::new(), false)),
+        Err(err) => Err(err),
+    }
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
+fn has_non_data_dir_entry_lazy_inner(
+    path: &Path,
+    load_data_dirs: impl FnOnce() -> Vec<uuid::Uuid>,
+) -> io::Result<(Vec<uuid::Uuid>, bool)> {
+    let mut dir = std::fs::read_dir(path)?;
+    let mut data_dirs: Option<Vec<uuid::Uuid>> = None;
+    let mut load = Some(load_data_dirs);
+    let mut valid_entries = 0usize;
+
+    for _ in 0..READ_DIR_PROBE_RAW_LIMIT {
+        let Some(entry) = dir.next() else {
+            return Ok((data_dirs.unwrap_or_default(), false));
         };
         let entry = entry?;
         let file_name = entry.file_name();
@@ -2777,18 +2869,24 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
 
         let file_type = entry.file_type()?;
         if file_type.is_dir() {
-            let is_data_dir = file_name.len() == uuid::fmt::Hyphenated::LENGTH
-                && file_name
-                    .to_str()
-                    .and_then(|s| {
-                        let parsed = uuid::Uuid::try_parse(s).ok()?;
-                        let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
-                        (parsed.hyphenated().encode_lower(&mut buf) == s && data_dirs.binary_search(&parsed).is_ok())
-                            .then_some(())
-                    })
-                    .is_some();
-            if !is_data_dir {
-                return Ok(true);
+            let parsed_uuid = if file_name.len() == uuid::fmt::Hyphenated::LENGTH {
+                file_name.to_str().and_then(|s| {
+                    let parsed = uuid::Uuid::try_parse(s).ok()?;
+                    let mut buf = [0u8; uuid::fmt::Hyphenated::LENGTH];
+                    (parsed.hyphenated().encode_lower(&mut buf) == s).then_some(parsed)
+                })
+            } else {
+                None
+            };
+            let Some(parsed) = parsed_uuid else {
+                let dirs = data_dirs
+                    .take()
+                    .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+                return Ok((dirs, true));
+            };
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if dirs.binary_search(&parsed).is_err() {
+                return Ok((std::mem::take(dirs), true));
             }
             valid_entries += 1;
         } else if file_type.is_file() {
@@ -2797,12 +2895,19 @@ fn has_non_data_dir_entry_inner(path: &Path, data_dirs: &[uuid::Uuid]) -> io::Re
             continue;
         }
 
+        let entry_limit = data_dirs.as_ref().map_or(2, |dirs| dirs.len().saturating_add(2));
         if valid_entries == entry_limit {
-            return Ok(true);
+            let dirs = data_dirs.get_or_insert_with(|| (load.take().expect("load_data_dirs called once"))());
+            if valid_entries == dirs.len().saturating_add(2) {
+                return Ok((std::mem::take(dirs), true));
+            }
         }
     }
 
-    Ok(true)
+    let dirs = data_dirs
+        .take()
+        .unwrap_or_else(|| (load.take().expect("load_data_dirs called once"))());
+    Ok((dirs, true))
 }
 
 // read_dir  count read limit. when count == 0 unlimit.
@@ -4830,6 +4935,17 @@ impl PublicationRoot {
             rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::DIRECTORY,
             rustix::fs::Mode::empty(),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open_directory_and_readonly_child(
+        &self,
+        dir_path: &Path,
+        child_name: &str,
+    ) -> io::Result<(std::fs::File, std::fs::File)> {
+        let dir = self.open_directory(dir_path)?;
+        let child = open_linux_relative(&dir, Path::new(child_name), rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty())?;
+        Ok((dir, child))
     }
 
     #[cfg(target_os = "linux")]
@@ -10983,6 +11099,54 @@ mod tests {
 
         let err = sync_dir_files(&missing).await.expect_err("missing dir must fail");
         assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+
+    #[test]
+    fn has_non_data_dir_entry_lazy_skips_loader_when_only_xl_meta_exists() {
+        let temp_dir = tempdir().expect("create temp dir");
+        std::fs::write(temp_dir.path().join("xl.meta"), b"meta").expect("write xl.meta");
+        let mut called = 0usize;
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![uuid::Uuid::new_v4()]
+        })
+        .expect("lazy check must succeed");
+        assert_eq!(called, 0, "inline object dir without subdirs must not invoke loader");
+        assert!(dirs.is_empty());
+        assert!(!has_child);
+
+        #[cfg(target_os = "linux")]
+        {
+            let pub_root = PublicationRoot::new(temp_dir.path()).expect("open pub root");
+            let (dir_fd, _meta) = pub_root
+                .open_directory_and_readonly_child(temp_dir.path(), "xl.meta")
+                .expect("open dir and child");
+            let mut fd_called = 0usize;
+            let (fd_dirs, fd_has_child) = has_non_data_dir_entry_lazy_from_fd(&dir_fd, || {
+                fd_called += 1;
+                vec![uuid::Uuid::new_v4()]
+            })
+            .expect("fd lazy check must succeed");
+            assert_eq!(fd_called, 0);
+            assert!(fd_dirs.is_empty());
+            assert!(!fd_has_child);
+        }
+
+        let data_dir = uuid::Uuid::new_v4();
+        std::fs::create_dir(temp_dir.path().join(data_dir.to_string())).expect("create data dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || {
+            called += 1;
+            vec![data_dir]
+        })
+        .expect("lazy check with data dir must succeed");
+        assert_eq!(called, 1, "data dir presence must invoke loader once");
+        assert_eq!(dirs, vec![data_dir]);
+        assert!(!has_child);
+
+        std::fs::create_dir(temp_dir.path().join("nested-key")).expect("create nested child dir");
+        let (dirs, has_child) = has_non_data_dir_entry_lazy(temp_dir.path(), || vec![data_dir]).expect("lazy check child");
+        assert_eq!(dirs, vec![data_dir], "child presence must still return data_dirs for skip set");
+        assert!(has_child);
     }
 
     #[tokio::test]
