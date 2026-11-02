@@ -8033,6 +8033,14 @@ impl LocalDisk {
     fn io_get_object_open_path(&self, bucket: &str, key: &str) -> Result<PathBuf> {
         #[cfg(target_os = "linux")]
         {
+            if is_clean_relative_segment(bucket) && is_clean_relative_segment(key) {
+                let root = self.io_root();
+                let mut path = PathBuf::with_capacity(root.as_os_str().len() + bucket.len() + key.len() + 2);
+                path.push(root);
+                path.push(bucket);
+                path.push(key);
+                return Ok(path);
+            }
             let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
             check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
             Ok(path)
@@ -8047,6 +8055,11 @@ impl LocalDisk {
     fn io_get_bucket_and_object_open_path(&self, bucket: &str, key: &str) -> Result<(PathBuf, PathBuf)> {
         #[cfg(target_os = "linux")]
         {
+            if is_clean_relative_segment(bucket) && is_clean_relative_segment(key) {
+                let bucket_path = self.io_root().join(bucket);
+                let path = bucket_path.join(key);
+                return Ok((bucket_path, path));
+            }
             let (bucket_path, path) = build_local_disk_object_path(self.io_root(), bucket, key);
             let normalized = check_local_disk_object_path_components(self.io_root(), &bucket_path, &path)?;
             if matches!(normalized, std::borrow::Cow::Owned(_)) {
@@ -12027,8 +12040,7 @@ fn local_disk_object_path(root: &Path, bucket: &str, key: &str) -> Result<PathBu
 #[cfg(not(windows))]
 #[inline]
 fn is_clean_relative_segment(s: &str) -> bool {
-    let b = s.as_bytes();
-    !matches!(b.first(), None | Some(b'/' | b'.')) && !b.ends_with(b"/") && !b.windows(2).any(|w| matches!(w, b"//" | b"/."))
+    !s.starts_with('/') && rustfs_utils::path::unix_is_canonical_ascii_path(s.as_bytes())
 }
 
 fn build_local_disk_object_path(root: &Path, bucket: &str, key: &str) -> (PathBuf, PathBuf) {
@@ -12075,10 +12087,26 @@ fn build_local_disk_bucket_path(root: &Path, bucket: &str) -> PathBuf {
     bucket_path
 }
 
+#[inline]
+fn disk_path_starts_with_normalized(path: &Path, base: &Path) -> bool {
+    #[cfg(not(windows))]
+    return rustfs_utils::path::unix_normalized_path_starts_with(path, base);
+    #[cfg(windows)]
+    path.starts_with(base)
+}
+
+#[inline]
+fn disk_path_strip_prefix_normalized<'a>(path: &'a Path, base: &Path) -> Result<&'a Path> {
+    #[cfg(not(windows))]
+    return rustfs_utils::path::unix_normalized_path_strip_prefix(path, base).ok_or(DiskError::InvalidPath);
+    #[cfg(windows)]
+    path.strip_prefix(base).map_err(|_| DiskError::InvalidPath)
+}
+
 fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Path) -> Result<()> {
     let bucket_path = normalize_path_cow(bucket_path);
     let path = normalize_path_cow(path);
-    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+    if !disk_path_starts_with_normalized(&bucket_path, root) || !disk_path_starts_with_normalized(&path, &bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -12087,7 +12115,7 @@ fn check_local_disk_valid_object_path(root: &Path, bucket_path: &Path, path: &Pa
 
 fn check_local_disk_valid_path(root: &Path, path: impl AsRef<Path>) -> Result<()> {
     let path = normalize_path_cow(path.as_ref());
-    if !path.starts_with(root) {
+    if !disk_path_starts_with_normalized(&path, root) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -12108,7 +12136,7 @@ fn check_local_disk_object_path_components<'a>(
 ) -> Result<std::borrow::Cow<'a, Path>> {
     let bucket_path = normalize_path_cow(bucket_path);
     let path = normalize_path_cow(path);
-    if !bucket_path.starts_with(root) || !path.starts_with(&bucket_path) {
+    if !disk_path_starts_with_normalized(&bucket_path, root) || !disk_path_starts_with_normalized(&path, &bucket_path) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -12118,7 +12146,7 @@ fn check_local_disk_object_path_components<'a>(
 #[cfg(target_os = "linux")]
 fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: impl AsRef<Path>) -> Result<()> {
     let path = normalize_path_cow(path.as_ref());
-    if !path.starts_with(root) {
+    if !disk_path_starts_with_normalized(&path, root) {
         return Err(DiskError::InvalidPath);
     }
 
@@ -12127,7 +12155,7 @@ fn check_local_disk_valid_path_at(root: &Path, root_fd: &std::fs::File, path: im
 
 #[cfg(target_os = "linux")]
 fn reject_local_disk_symlink_components_at(root: &Path, root_fd: &std::fs::File, path: &Path) -> Result<()> {
-    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let relative = disk_path_strip_prefix_normalized(path, root)?;
     match validate_existing_local_disk_prefix_at(root_fd, relative) {
         Ok(()) => Ok(()),
         Err(LocalDiskPathValidationAtError::Unsupported) => reject_local_disk_symlink_components(root, path),
@@ -12155,11 +12183,11 @@ fn validate_existing_local_disk_prefix_at(
         return Ok(());
     }
 
-    let mut candidate = relative.to_path_buf();
+    let mut candidate = relative;
     loop {
         match openat2(
             root_fd,
-            &candidate,
+            candidate,
             OFlags::PATH | OFlags::CLOEXEC,
             Mode::empty(),
             ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS,
@@ -12168,10 +12196,12 @@ fn validate_existing_local_disk_prefix_at(
             Err(Errno::NOSYS) => return Err(LocalDiskPathValidationAtError::Unsupported),
             Err(Errno::LOOP | Errno::XDEV) => return Err(LocalDiskPathValidationAtError::InvalidPath),
             Err(Errno::NOENT) => {
-                let Some(parent) = candidate.parent().filter(|parent| !parent.as_os_str().is_empty()) else {
+                let Some(parent) =
+                    rustfs_utils::path::unix_path_parent(candidate).filter(|parent| !parent.as_os_str().is_empty())
+                else {
                     return Ok(());
                 };
-                candidate = parent.to_path_buf();
+                candidate = parent;
             }
             Err(err) => return Err(LocalDiskPathValidationAtError::Io(err.into())),
         }
@@ -12179,7 +12209,7 @@ fn validate_existing_local_disk_prefix_at(
 }
 
 fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> {
-    let relative = path.strip_prefix(root).map_err(|_| DiskError::InvalidPath)?;
+    let relative = disk_path_strip_prefix_normalized(path, root)?;
     let mut current = root.to_path_buf();
 
     for component in relative.components() {
@@ -12203,12 +12233,11 @@ fn reject_local_disk_symlink_components(root: &Path, path: &Path) -> Result<()> 
 fn normalize_path_cow(path: &Path) -> std::borrow::Cow<'_, Path> {
     // Windows prefixes retain the existing PathBuf reconstruction semantics.
     #[cfg(not(windows))]
-    if !path.as_os_str().as_encoded_bytes().contains(&b'.')
-        || !path
-            .components()
-            .any(|c| matches!(c, std::path::Component::ParentDir | std::path::Component::CurDir))
     {
-        return std::borrow::Cow::Borrowed(path);
+        let bytes = path.as_os_str().as_encoded_bytes();
+        if bytes != b"." && !bytes.starts_with(b"./") && !rustfs_utils::path::unix_path_has_dotdot_segment(bytes) {
+            return std::borrow::Cow::Borrowed(path);
+        }
     }
     std::borrow::Cow::Owned(normalize_path_components(path))
 }

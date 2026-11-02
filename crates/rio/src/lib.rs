@@ -201,10 +201,31 @@ where
     boxed_reader(WarpReader::new(reader))
 }
 
+impl<T> EtagResolvable for std::io::Cursor<T> {}
+
+impl EtagResolvable for &[u8] {}
+
+impl<R> EtagResolvable for tokio::io::BufReader<R>
+where
+    R: tokio::io::AsyncRead + EtagResolvable,
+{
+    fn is_etag_reader(&self) -> bool {
+        self.get_ref().is_etag_reader()
+    }
+
+    fn try_resolve_etag(&mut self) -> Option<String> {
+        self.get_mut().try_resolve_etag()
+    }
+}
+
 impl<T> EtagResolvable for Box<T>
 where
     T: EtagResolvable + ?Sized,
 {
+    fn is_etag_reader(&self) -> bool {
+        self.as_ref().is_etag_reader()
+    }
+
     fn try_resolve_etag(&mut self) -> Option<String> {
         self.as_mut().try_resolve_etag()
     }

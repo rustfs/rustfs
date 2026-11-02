@@ -297,6 +297,32 @@
       "alert_contract": "scheduled-validation"
     },
     {
+      "workflow": ".github/workflows/rustfs-validation-sweep.yml",
+      "name": "RustFS Validation Sweep",
+      "roles": [
+        "periodic",
+        "manual"
+      ],
+      "events": [
+        "schedule",
+        "workflow_dispatch"
+      ],
+      "cadence": "nightly",
+      "timezone": "UTC",
+      "schedule": [
+        "30 19 * * *"
+      ],
+      "owner": "@overtrue",
+      "policy": "active",
+      "monitor": "workflow",
+      "max_age_hours": 60,
+      "result_owner": "rustfs-validation-sweep.yml",
+      "disposition": "canonical validation cases executed in rotating batches",
+      "failure_owner": "workflow",
+      "origin": "baseline",
+      "alert_contract": "scheduled-validation"
+    },
+    {
       "workflow": ".github/workflows/btf-prototype-reference.yml",
       "name": "BTF prototype reference",
       "roles": [

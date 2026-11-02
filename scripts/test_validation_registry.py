@@ -22,7 +22,7 @@ class RegistryTests(unittest.TestCase):
     def test_all_workflow_responsibilities_and_suite_exits_are_wired(self):
         self.assertTrue(registry.check_wiring(self.registry))
         self.assertEqual(len(self.registry["suites"]), 12)
-        self.assertEqual(sum(item["origin"] == "baseline" for item in self.registry["workflows"]), 60)
+        self.assertEqual(sum(item["origin"] == "baseline" for item in self.registry["workflows"]), 61)
         self.assertEqual(len(self.registry["workflows"]), len(list((registry.ROOT / ".github/workflows").glob("*.yml"))))
 
     def test_manual_and_periodic_plan_choose_identical_responsibilities(self):

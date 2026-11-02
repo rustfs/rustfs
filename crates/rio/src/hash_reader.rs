@@ -630,6 +630,10 @@ impl AsyncRead for HashReader {
 }
 
 impl EtagResolvable for HashReader {
+    fn is_etag_reader(&self) -> bool {
+        !self.diskable_md5 && self.inner.is_etag_reader()
+    }
+
     fn try_resolve_etag(&mut self) -> Option<String> {
         if self.diskable_md5 {
             return None;
