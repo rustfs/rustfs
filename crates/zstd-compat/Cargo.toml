@@ -1,6 +1,6 @@
 [package]
 name = "zstd"
-version = "0.13.3"
+version = "0.13.4"
 publish = false
 edition.workspace = true
 license.workspace = true
