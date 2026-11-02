@@ -18,6 +18,7 @@ use crate::storage_api_contracts::namespace::NamespaceLocking as _;
 use codec::{fixture_inline_pool_meta_replicas as replicas, fixture_split_inline_pool_meta_replicas as split};
 use std::path::PathBuf;
 use tokio::fs;
+use uuid::Uuid;
 
 struct PhysicalFixture {
     _directories: Vec<tempfile::TempDir>,
@@ -627,4 +628,560 @@ async fn pool_meta_native_physical_three_plus_one_checkpoint_converges_all_shard
             vec![Bytes::copy_from_slice(&canonical)]
         );
     }
+}
+
+async fn owner_repair_no_backups_fixture() -> PhysicalFixture {
+    let fixture = fixture(0).await;
+    for pool in disks(&fixture.store).await {
+        for disk in pool {
+            let object = object_path(&disk);
+            let mut entries = fs::read_dir(&object).await.expect("fixture metadata directory");
+            while let Some(entry) = entries.next_entry().await.expect("fixture directory entry") {
+                if entry.file_type().await.expect("fixture entry type").is_dir() {
+                    fs::remove_dir_all(entry.path())
+                        .await
+                        .expect("remove task-owned fixture rollback directory");
+                }
+            }
+        }
+    }
+    fixture
+}
+
+async fn owner_repair_identity_heads(store: &ECStore) -> Vec<Vec<(Uuid, Bytes)>> {
+    let mut all = Vec::new();
+    for pool in &store.pools {
+        let set = pool.get_disks_by_key(POOL_META_IDENTITY_NAME);
+        let members = set
+            .disks
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .map(|disk| disk.expect("identity fixture disk must be online"))
+            .collect::<Vec<_>>();
+        let mut heads = Vec::new();
+        for disk in members {
+            match disk
+                .pool_meta_native_recovery(Request::InspectIdentity {})
+                .await
+                .expect("physical identity inspection")
+            {
+                Response::IdentityInspected { disk_id, raw } => heads.push((disk_id, raw)),
+                _ => panic!("identity inspection must return its physical head"),
+            }
+        }
+        all.push(heads);
+    }
+    all
+}
+
+async fn legacy_native_owner_fixture(version: u16, stale: bool) -> (PhysicalFixture, Vec<u8>) {
+    let fixture = owner_repair_no_backups_fixture().await;
+    let mut meta = match decode_pool_meta_replica(fixture.canonical.clone()) {
+        PoolMetaReplica::Valid {
+            meta, committed: true, ..
+        } => meta,
+        _ => panic!("fixture must provide valid committed pool metadata"),
+    };
+    meta.version = version;
+    let raw = meta
+        .encode_config_data_for_v2_gate(version == POOL_META_VERSION)
+        .expect("legacy fixture should encode in its original version");
+    assert_eq!(u16::from_le_bytes([raw[2], raw[3]]), version);
+    let all = disks(&fixture.store).await;
+    let now = OffsetDateTime::now_utc();
+    for pool in &all {
+        let heads = replicas(&raw, now).await;
+        for (index, disk) in pool.iter().enumerate() {
+            fs::write(object_path(disk).join("xl.meta"), &heads[index])
+                .await
+                .expect("install exact legacy head");
+        }
+    }
+    if stale {
+        let old = replicas(&raw, now - Duration::seconds(10)).await;
+        fs::write(object_path(&all[0][0]).join("xl.meta"), &old[0])
+            .await
+            .expect("install stale same-raw legacy head");
+    }
+    (fixture, raw)
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_v1_with_all_upgrade_gates_disabled_keeps_exact_raw() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            let (fixture, raw) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
+            let guard = owner(&fixture.store).await;
+            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                fixture.store.heal_pool_meta_replica_under_fence(0, guard, &mut state),
+            )
+            .await
+            .expect("legacy native heal must terminate");
+            assert!(result.is_ok(), "fully online legacy native heal should succeed: {result:?}");
+            drop(state);
+            let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+            for read in &reads {
+                assert!(
+                    matches!(&read.replica, PoolMetaReplica::Valid { raw: bytes, revision, .. }
+                    if bytes == &raw && revision.version == POOL_META_V1_VERSION),
+                    "native heal must not upgrade a V1 raw payload when both upgrade gates are disabled"
+                );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_rejects_legacy_source_with_trailing_bytes_without_writes() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            for version in [POOL_META_V1_VERSION, POOL_META_VERSION] {
+                let (fixture, raw) = legacy_native_owner_fixture(version, false).await;
+                let mut source_raw = raw.clone();
+                // A second MessagePack value is readable by legacy decoding but
+                // must not be copied as part of an unverified repair payload.
+                source_raw.push(0xc0);
+                assert!(
+                    matches!(decode_pool_meta_replica(source_raw.clone()), PoolMetaReplica::Valid { raw, .. } if raw == source_raw),
+                    "ordinary legacy reads must remain compatible with trailing bytes"
+                );
+                let all_disks = disks(&fixture.store).await;
+                let source_heads = replicas(&source_raw, OffsetDateTime::now_utc() + Duration::seconds(1)).await;
+                for (index, disk) in all_disks[0].iter().enumerate() {
+                    fs::write(object_path(disk).join("xl.meta"), &source_heads[index])
+                        .await
+                        .expect("install readable legacy source with trailing bytes");
+                }
+                let selection = load_pool_meta_replicas(fixture.store.pools.clone(), true)
+                    .await
+                    .expect("legacy semantic selection must remain readable");
+                assert_eq!(selection.legacy_raw.as_deref(), Some(source_raw.as_slice()));
+                let before = snapshots(&fixture.store).await;
+                let identities = owner_repair_identity_heads(&fixture.store).await;
+                let guard = owner(&fixture.store).await;
+                let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),
+                )
+                .await
+                .expect("legacy native heal must terminate");
+                drop(state);
+                assert!(result.is_err(), "version {version}: unparsed trailing source bytes must not be republished");
+                assert_eq!(snapshots(&fixture.store).await, before, "version {version}: no pool.bin head or backup may change");
+                assert_eq!(
+                    owner_repair_identity_heads(&fixture.store).await,
+                    identities,
+                    "version {version}: no identity shard may change"
+                );
+                let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+                assert!(matches!(&reads[0].replica, PoolMetaReplica::Valid { raw, .. } if raw == &source_raw));
+                assert!(matches!(&reads[1].replica, PoolMetaReplica::Valid { raw: target, .. } if target == &raw));
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_mixed_v1_v2_preserves_observed_format_floor() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            for first_version in [POOL_META_V1_VERSION, POOL_META_VERSION] {
+                for target_pool in [0, 1] {
+                    let (fixture, raw_v1) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
+                    let mut meta = match decode_pool_meta_replica(raw_v1.clone()) {
+                        PoolMetaReplica::Valid { meta, committed: true, .. } => meta,
+                        _ => panic!("initial V1 metadata must decode"),
+                    };
+                    meta.version = POOL_META_VERSION;
+                    let raw_v2 = meta.encode_config_data_for_v2_gate(true).expect("equivalent V2 payload must encode");
+                    assert_eq!(u16::from_le_bytes([raw_v1[2], raw_v1[3]]), POOL_META_V1_VERSION);
+                    assert_eq!(u16::from_le_bytes([raw_v2[2], raw_v2[3]]), POOL_META_VERSION);
+                    let semantic_v1 = match decode_pool_meta_replica(raw_v1.clone()) {
+                        PoolMetaReplica::Valid { canonical, .. } => canonical,
+                        _ => panic!("V1 payload must remain valid"),
+                    };
+                    let semantic_v2 = match decode_pool_meta_replica(raw_v2.clone()) {
+                        PoolMetaReplica::Valid { canonical, .. } => canonical,
+                        _ => panic!("V2 payload must remain valid"),
+                    };
+                    assert_eq!(semantic_v1, semantic_v2, "the two formats must carry equivalent metadata");
+                    let other_version = if first_version == POOL_META_V1_VERSION { POOL_META_VERSION } else { POOL_META_V1_VERSION };
+                    // Pool two follows pool zero; pools zero and one cover both
+                    // orderings and both target formats in separate runs.
+                    let versions = [first_version, other_version, first_version];
+                    let physical = disks(&fixture.store).await;
+                    let timestamp = OffsetDateTime::now_utc();
+                    for (pool_index, pool) in physical.iter().enumerate() {
+                        let raw = if versions[pool_index] == POOL_META_V1_VERSION { &raw_v1 } else { &raw_v2 };
+                        let heads = replicas(raw, timestamp).await;
+                        for (index, disk) in pool.iter().enumerate() {
+                            fs::write(object_path(disk).join("xl.meta"), &heads[index]).await.expect("install mixed legacy pool head");
+                        }
+                    }
+                    let before = snapshots(&fixture.store).await;
+                    let selection = load_pool_meta_replicas(fixture.store.pools.clone(), true)
+                        .await.expect("equivalent legacy pools should be selectable");
+                    assert_eq!(selection.revision.version, POOL_META_VERSION, "the observed V2 format floor must be retained");
+                    assert_eq!(selection.canonical.as_deref(), Some(semantic_v2.as_slice()));
+                    let guard = owner(&fixture.store).await;
+                    let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                    tokio::time::timeout(std::time::Duration::from_secs(30),
+                        fixture.store.heal_pool_meta_replica_under_fence(target_pool, guard, &mut state))
+                        .await.expect("mixed legacy heal must terminate")
+                        .expect("equivalent legacy metadata should heal without downgrading the format floor");
+                    drop(state);
+                    let after = snapshots(&fixture.store).await;
+                    let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+                    for (pool_index, read) in reads.iter().enumerate() {
+                        let expected_version = if pool_index == target_pool { POOL_META_VERSION } else { versions[pool_index] };
+                        let expected_raw = if expected_version == POOL_META_V1_VERSION { &raw_v1 } else { &raw_v2 };
+                        assert!(matches!(&read.replica,
+                            PoolMetaReplica::Valid { raw, canonical, revision, committed: true, .. }
+                                if raw == expected_raw && canonical == &semantic_v2 && revision.version == expected_version
+                        ), "pool {pool_index}, first={first_version}, target={target_pool}: preserve equivalent payload and expected legacy version");
+                        for (index, snapshot) in after[pool_index].iter().enumerate() {
+                            codec::validate_inline_pool_meta_shard(snapshot.current.as_ref().expect("physical head"), index, expected_raw)
+                                .await.expect("every physical shard must match its selected legacy payload");
+                        }
+                        if pool_index != target_pool {
+                            assert_eq!(after[pool_index], before[pool_index], "healing one pool must not modify other pools");
+                        }
+                    }
+                }
+            }
+        },
+    ).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_rejects_v1_and_v3_prepare_in_either_pool_order() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            for prepare_pool in [0, 1] {
+                let (fixture, raw_v1) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
+                let (legacy_meta, legacy_canonical) = match decode_pool_meta_replica(raw_v1.clone()) {
+                    PoolMetaReplica::Valid {
+                        meta,
+                        canonical,
+                        revision,
+                        committed: true,
+                        ..
+                    } if revision.version == POOL_META_V1_VERSION => (meta, canonical),
+                    _ => panic!("baseline V1 metadata must be committed and readable"),
+                };
+                let previous = PoolMetaCommittedCandidate {
+                    canonical: legacy_canonical,
+                    meta: legacy_meta.clone(),
+                    revision: PoolMetaRevision::legacy(POOL_META_V1_VERSION),
+                };
+                let mut next = legacy_meta;
+                next.version = POOL_META_GENERATION_VERSION;
+                next.pools[0].last_update += Duration::seconds(1);
+                let revision = PoolMetaRevision {
+                    version: POOL_META_GENERATION_VERSION,
+                    cluster_id: fixture.revision.cluster_id,
+                    epoch: fixture.revision.epoch,
+                    generation: 1,
+                    transaction_id: Some(Uuid::new_v4()),
+                };
+                let pending = encode_pool_meta_v3_envelope(&next, revision, false, Some(&previous))
+                    .expect("V3 PREPARE with V1 predecessor must encode");
+                assert!(matches!(decode_pool_meta_replica(pending.clone()),
+                    PoolMetaReplica::Valid { committed: false, revision: actual, .. } if actual == revision));
+                let heads = replicas(&pending, OffsetDateTime::now_utc() + Duration::seconds(1)).await;
+                let physical = disks(&fixture.store).await;
+                for (index, disk) in physical[prepare_pool].iter().enumerate() {
+                    fs::write(object_path(disk).join("xl.meta"), &heads[index])
+                        .await
+                        .expect("install task-owned V3 PREPARE evidence");
+                }
+                let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+                assert!(matches!(&reads[prepare_pool].replica,
+                    PoolMetaReplica::Valid { raw, committed: false, revision: actual, .. }
+                        if raw == &pending && *actual == revision));
+                let other_pool = 1 - prepare_pool;
+                assert!(matches!(&reads[other_pool].replica,
+                    PoolMetaReplica::Valid { raw, committed: true, revision: actual, .. }
+                        if raw == &raw_v1 && actual.version == POOL_META_V1_VERSION));
+                let before = snapshots(&fixture.store).await;
+                let identities = owner_repair_identity_heads(&fixture.store).await;
+                let guard = owner(&fixture.store).await;
+                let mut state = fixture.store.pool_meta_save_gate.lock().await;
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    fixture
+                        .store
+                        .heal_pool_meta_replica_under_fence(prepare_pool, guard, &mut state),
+                )
+                .await
+                .expect("mixed V1/V3 PREPARE heal must terminate");
+                drop(state);
+                assert!(
+                    result.is_err(),
+                    "pool {prepare_pool}: native heal must not overwrite a V3 PREPARE with legacy data"
+                );
+                assert_eq!(
+                    snapshots(&fixture.store).await,
+                    before,
+                    "pool {prepare_pool}: rejection must retain all physical head and backup evidence"
+                );
+                assert_eq!(
+                    owner_repair_identity_heads(&fixture.store).await,
+                    identities,
+                    "pool {prepare_pool}: rejection must not mutate identity evidence"
+                );
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_rejects_v1_legacy_dont_save_true_without_writes() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            let (fixture, safe_v1) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
+            let meta = match decode_pool_meta_replica(safe_v1.clone()) {
+                PoolMetaReplica::Valid {
+                    meta, committed: true, ..
+                } => meta,
+                _ => panic!("baseline V1 metadata must decode"),
+            };
+            let statuses = meta
+                .pools
+                .iter()
+                .map(|pool| {
+                    assert!(pool.decommission.is_none(), "this regression fixture does not inject decommission state");
+                    LegacyPoolStatus {
+                        id: pool.id,
+                        cmd_line: pool.cmd_line.clone(),
+                        last_update: pool.last_update,
+                        decommission: None,
+                    }
+                })
+                .collect();
+            let legacy = LegacyPoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: statuses,
+                dont_save: true,
+            };
+            let mut dangerous_raw = Vec::new();
+            dangerous_raw.extend_from_slice(&POOL_META_FORMAT.to_le_bytes());
+            dangerous_raw.extend_from_slice(&POOL_META_V1_VERSION.to_le_bytes());
+            dangerous_raw.extend_from_slice(&rmp_serde::to_vec(&legacy).expect("legacy three-field tuple must serialize"));
+            let old_reader: LegacyPoolMeta =
+                rmp_serde::from_slice(&dangerous_raw[4..]).expect("legacy reader must decode source");
+            assert!(old_reader.dont_save, "the old reader would treat this source as permanently do-not-save");
+            assert_eq!(rmp::decode::read_array_len(&mut &dangerous_raw[4..]).expect("tuple length"), 3);
+            let source = match decode_pool_meta_replica(dangerous_raw.clone()) {
+                PoolMetaReplica::Valid {
+                    canonical,
+                    revision,
+                    committed: true,
+                    ..
+                } => {
+                    assert_eq!(revision.version, POOL_META_V1_VERSION);
+                    canonical
+                }
+                _ => panic!("current reader must recognize the legacy source"),
+            };
+            assert!(matches!(decode_pool_meta_replica(safe_v1.clone()),
+                PoolMetaReplica::Valid { canonical, revision, committed: true, .. }
+                    if canonical == source && revision.version == POOL_META_V1_VERSION));
+            let physical = disks(&fixture.store).await;
+            let source_heads = replicas(&dangerous_raw, OffsetDateTime::now_utc() + Duration::seconds(1)).await;
+            for (index, disk) in physical[0].iter().enumerate() {
+                fs::write(object_path(disk).join("xl.meta"), &source_heads[index])
+                    .await
+                    .expect("install legacy source on pool zero");
+            }
+            let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+            assert!(matches!(&reads[0].replica, PoolMetaReplica::Valid { raw, committed: true, .. } if raw == &dangerous_raw));
+            assert!(matches!(&reads[1].replica, PoolMetaReplica::Valid { raw, committed: true, .. } if raw == &safe_v1));
+            let before = snapshots(&fixture.store).await;
+            let identities = owner_repair_identity_heads(&fixture.store).await;
+            let guard = owner(&fixture.store).await;
+            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),
+            )
+            .await
+            .expect("unsafe legacy heal must terminate");
+            drop(state);
+            let error = result.expect_err("native heal must reject a source whose old-reader dont_save is true");
+            assert!(
+                error.to_string().contains("dont_save"),
+                "rejection must identify the unsafe legacy field: {error}"
+            );
+            assert_eq!(
+                snapshots(&fixture.store).await,
+                before,
+                "rejection must preserve every original head and backup"
+            );
+            assert_eq!(
+                owner_repair_identity_heads(&fixture.store).await,
+                identities,
+                "rejection must not write identity shards"
+            );
+            let after = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+            assert!(matches!(&after[0].replica, PoolMetaReplica::Valid { raw, .. } if raw == &dangerous_raw));
+            assert!(
+                matches!(&after[1].replica, PoolMetaReplica::Valid { raw, .. } if raw == &safe_v1),
+                "the dangerous source bytes must not be copied into the target pool"
+            );
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_heal_rejects_target_v1_dont_save_true_without_writes() {
+    temp_env::async_with_vars(
+        [
+            (rustfs_config::ENV_POOL_META_V2_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V2_FLEET_CONFIRMED, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_WRITE, Some("false")),
+            (rustfs_config::ENV_POOL_META_V3_FLEET_CONFIRMED, Some("false")),
+        ],
+        async {
+            let (fixture, safe_v1) = legacy_native_owner_fixture(POOL_META_V1_VERSION, false).await;
+            let meta = match decode_pool_meta_replica(safe_v1.clone()) {
+                PoolMetaReplica::Valid {
+                    meta, committed: true, ..
+                } => meta,
+                _ => panic!("baseline V1 metadata must decode"),
+            };
+            let statuses = meta
+                .pools
+                .iter()
+                .map(|pool| {
+                    assert!(pool.decommission.is_none(), "this regression fixture does not inject decommission state");
+                    LegacyPoolStatus {
+                        id: pool.id,
+                        cmd_line: pool.cmd_line.clone(),
+                        last_update: pool.last_update,
+                        decommission: None,
+                    }
+                })
+                .collect();
+            let legacy = LegacyPoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: statuses,
+                dont_save: true,
+            };
+            let mut dangerous_raw = Vec::new();
+            dangerous_raw.extend_from_slice(&POOL_META_FORMAT.to_le_bytes());
+            dangerous_raw.extend_from_slice(&POOL_META_V1_VERSION.to_le_bytes());
+            dangerous_raw.extend_from_slice(&rmp_serde::to_vec(&legacy).expect("legacy three-field tuple must serialize"));
+            let old_reader: LegacyPoolMeta =
+                rmp_serde::from_slice(&dangerous_raw[4..]).expect("legacy reader must decode target");
+            assert!(old_reader.dont_save, "the old reader interprets the target as do-not-save");
+            assert_eq!(rmp::decode::read_array_len(&mut &dangerous_raw[4..]).expect("tuple length"), 3);
+            let source_canonical = match decode_pool_meta_replica(safe_v1.clone()) {
+                PoolMetaReplica::Valid {
+                    canonical,
+                    revision,
+                    committed: true,
+                    ..
+                } => {
+                    assert_eq!(revision.version, POOL_META_V1_VERSION);
+                    canonical
+                }
+                _ => panic!("safe pool-zero source must decode"),
+            };
+            assert!(
+                matches!(decode_pool_meta_replica(dangerous_raw.clone()),
+                PoolMetaReplica::Valid { canonical, revision, committed: true, .. }
+                    if canonical == source_canonical && revision.version == POOL_META_V1_VERSION),
+                "the dangerous target must remain semantically equivalent to the safe source"
+            );
+            let physical = disks(&fixture.store).await;
+            let target_heads = replicas(&dangerous_raw, OffsetDateTime::now_utc() + Duration::seconds(1)).await;
+            for (index, disk) in physical[1].iter().enumerate() {
+                fs::write(object_path(disk).join("xl.meta"), &target_heads[index])
+                    .await
+                    .expect("install legacy dangerous target head");
+            }
+            let reads = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+            assert!(matches!(&reads[0].replica, PoolMetaReplica::Valid { raw, committed: true, .. } if raw == &safe_v1));
+            assert!(matches!(&reads[1].replica, PoolMetaReplica::Valid { raw, committed: true, .. } if raw == &dangerous_raw));
+            let before = snapshots(&fixture.store).await;
+            let identities = owner_repair_identity_heads(&fixture.store).await;
+            let guard = owner(&fixture.store).await;
+            let mut state = fixture.store.pool_meta_save_gate.lock().await;
+            let result = tokio::time::timeout(
+                std::time::Duration::from_secs(30),
+                fixture.store.heal_pool_meta_replica_under_fence(1, guard, &mut state),
+            )
+            .await
+            .expect("unsafe legacy target heal must terminate");
+            drop(state);
+            let error = result.expect_err("native heal must reject a target whose old-reader dont_save is true");
+            assert!(
+                error.to_string().contains("dont_save"),
+                "rejection must identify the unsafe legacy field: {error}"
+            );
+            assert_eq!(
+                snapshots(&fixture.store).await,
+                before,
+                "rejection must preserve all physical heads and backups"
+            );
+            assert_eq!(
+                owner_repair_identity_heads(&fixture.store).await,
+                identities,
+                "rejection must not write identity shards"
+            );
+            let after = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+            assert!(matches!(&after[0].replica, PoolMetaReplica::Valid { raw, .. } if raw == &safe_v1));
+            assert!(
+                matches!(&after[1].replica, PoolMetaReplica::Valid { raw, .. } if raw == &dangerous_raw),
+                "unsafe target evidence must not be overwritten by the safe source"
+            );
+        },
+    )
+    .await;
 }

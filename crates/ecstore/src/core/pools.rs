@@ -94,7 +94,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-#[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
 use std::path::PathBuf;
@@ -6839,11 +6838,48 @@ impl Drop for PoolMetaTransactionArm {
     }
 }
 
+fn ensure_legacy_pool_meta_republish_safe(data: &[u8]) -> Result<()> {
+    if data.len() >= 4
+        && LittleEndian::read_u16(&data[2..4]) == POOL_META_V1_VERSION
+        // The selection already validates the payload. The runtime-only
+        // flag can only appear in the legacy three-field sequence or map.
+        && rmp::decode::read_array_len(&mut &data[4..])
+            .or_else(|_| rmp::decode::read_map_len(&mut &data[4..]))
+            .ok()
+            == Some(3)
+        && let Ok(legacy) = rmp_serde::from_slice::<LegacyPoolMeta>(&data[4..])
+        && legacy.dont_save
+    {
+        return Err(Error::other("pool metadata legacy source contains dont_save=true"));
+    }
+    Ok(())
+}
+
+// Ordinary legacy reads retain their compatibility behavior, but bytes that
+// will be copied to another pool must not contain an unparsed extension.
+fn ensure_legacy_pool_meta_payload_complete(data: &[u8]) -> Result<()> {
+    let payload = data
+        .get(4..)
+        .ok_or_else(|| Error::other("pool metadata legacy source is too short"))?;
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(payload));
+    serde::de::IgnoredAny::deserialize(&mut decoder)
+        .map_err(|error| Error::other(format!("pool metadata legacy source is invalid: {error}")))?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| Error::other("pool metadata legacy source is too large"))?;
+    if decoder.get_ref().position() != payload_len {
+        return Err(Error::other("pool metadata legacy source has trailing bytes"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PoolMetaSelection {
     meta: PoolMeta,
     revision: PoolMetaRevision,
     canonical: Option<Vec<u8>>,
+    // Legacy semantic comparison canonicalizes to V2; a heal must instead
+    // preserve verified raw bytes at the highest observed format floor.
+    legacy_raw: Option<Vec<u8>>,
+    legacy_has_unsafe_flag: bool,
     replica_state: PoolMetaReplicaState,
     cas_tokens: Vec<PoolMetaCasToken>,
     absent: bool,
@@ -7234,6 +7270,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: PoolMeta::default(),
             revision: PoolMetaRevision::legacy(0),
             canonical: None,
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair: false,
                 repair_write_safe: true,
@@ -7288,6 +7326,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: selected.meta.clone(),
             revision: selected.revision,
             canonical: Some(selected.canonical.clone()),
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair,
                 repair_write_safe,
@@ -7301,6 +7341,10 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
 
     // Legacy V1/V2 has no durable generation. Pool zero remains the commit
     // record; divergent backups without it are ambiguous and fail closed.
+    let legacy_has_unsafe_flag = committed
+        .iter()
+        .any(|(_, raw, _)| ensure_legacy_pool_meta_republish_safe(raw).is_err());
+    let mut floor_raw = None;
     let mut selected: Option<(usize, Vec<u8>, PoolMetaCommittedCandidate)> = None;
     for (idx, raw, candidate) in committed {
         if let Some((selected_idx, selected_raw, selected_candidate)) = selected.as_ref() {
@@ -7314,19 +7358,36 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
                 }
             } else {
                 needs_repair |= selected_raw != &raw;
+                if floor_raw.is_none()
+                    && candidate.revision.version == observed_version
+                    && raw
+                        .get(2..4)
+                        .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+                {
+                    floor_raw = Some(raw);
+                }
             }
         } else {
             selected = Some((idx, raw, candidate));
         }
     }
-    let (_, _, mut selected) =
+    let (_, selected_raw, mut selected) =
         selected.ok_or_else(|| Error::other("pool metadata recovery required: no valid legacy replica is available"))?;
+    if selected.revision.version == observed_version
+        && selected_raw
+            .get(2..4)
+            .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+    {
+        floor_raw = Some(selected_raw);
+    }
     selected.meta.version = observed_version;
     selected.revision.version = observed_version;
     Ok(PoolMetaSelection {
         meta: selected.meta,
         revision: selected.revision,
         canonical: Some(selected.canonical),
+        legacy_raw: floor_raw,
+        legacy_has_unsafe_flag,
         replica_state: PoolMetaReplicaState {
             needs_repair,
             repair_write_safe,
@@ -14546,6 +14607,23 @@ impl ECStore {
             .canonical
             .as_ref()
             .ok_or_else(|| Error::other("pool metadata heal has no committed source"))?;
+        if selection.generation_protocol_observed && !selection.revision.is_generation_protocol() {
+            return Err(Error::other("pool metadata heal requires recovery of the observed generation protocol"));
+        }
+        if selection.legacy_has_unsafe_flag {
+            return Err(Error::other("pool metadata legacy replica contains dont_save=true"));
+        }
+        let repair_data = if selection.revision.is_generation_protocol() {
+            canonical.clone()
+        } else {
+            let raw = selection
+                .legacy_raw
+                .clone()
+                .ok_or_else(|| Error::other("pool metadata heal cannot prove the legacy format floor"))?;
+            ensure_legacy_pool_meta_payload_complete(&raw)?;
+            raw
+        };
+        ensure_legacy_pool_meta_republish_safe(&repair_data)?;
         let pool = self
             .pools
             .get(pool_index)
@@ -14556,10 +14634,10 @@ impl ECStore {
             .get(pool_index)
             .ok_or_else(|| Error::other("pool metadata heal has no target revision"))?;
         let mut arm = state.arm_transaction();
-        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, canonical.clone(), token, &fence, "native_heal", &mut arm)
+        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, repair_data.clone(), token, &fence, "native_heal", &mut arm)
             .await?;
         let (confirmed, _) = read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME).await?;
-        if confirmed != *canonical {
+        if confirmed != repair_data {
             return Err(Error::other("pool metadata native heal readback diverged"));
         }
         fence.ensure_held()?;
@@ -29480,6 +29558,53 @@ mod tests {
             decommission.terminal_reload_failures,
             vec!["complete_decommission: peer node-a failed".to_string()]
         );
+    }
+
+    #[test]
+    fn legacy_republish_guard_checks_only_three_field_sequence_or_map() {
+        let frame = |payload: Vec<u8>| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&POOL_META_FORMAT.to_le_bytes());
+            data.extend_from_slice(&POOL_META_V1_VERSION.to_le_bytes());
+            data.extend_from_slice(&payload);
+            data
+        };
+        let two_fields = PersistedPoolMetaV1 {
+            version: POOL_META_V1_VERSION,
+            pools: Vec::new(),
+        };
+        for payload in [rmp_serde::to_vec(&two_fields), rmp_serde::to_vec_named(&two_fields)] {
+            let data = frame(payload.expect("two-field V1 payload must serialize"));
+            assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+            assert!(ensure_legacy_pool_meta_republish_safe(&data).is_ok());
+            assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+            let mut trailing = data;
+            trailing.push(0xc0);
+            assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+        }
+        for dont_save in [false, true] {
+            let legacy = LegacyPoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: Vec::new(),
+                dont_save,
+            };
+            for payload in [rmp_serde::to_vec(&legacy), rmp_serde::to_vec_named(&legacy)] {
+                let data = frame(payload.expect("three-field V1 payload must serialize"));
+                assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+                assert_eq!(ensure_legacy_pool_meta_republish_safe(&data).is_err(), dont_save);
+                assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+                let mut trailing = data;
+                trailing.push(0xc0);
+                assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+            }
+        }
+        // This guard is only called for already-decoded replicas; malformed
+        // containers must fail selection rather than becoming repair sources.
+        let truncated = frame(vec![0x93, 0x01]);
+        assert!(matches!(
+            decode_pool_meta_replica(truncated),
+            PoolMetaReplica::Corrupt(_) | PoolMetaReplica::Incompatible(_)
+        ));
     }
 
     #[test]

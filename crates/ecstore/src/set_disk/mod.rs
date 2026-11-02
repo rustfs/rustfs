@@ -4696,6 +4696,17 @@ pub(crate) fn same_distributed_lock_domain(left: &[Arc<dyn LockClient>], right: 
             .all(|right_client| left.iter().any(|left_client| Arc::ptr_eq(left_client, right_client)))
 }
 
+// Reusing a held writer additionally requires the same quorum, so repeated
+// clients must not give different weight to an otherwise identical domain.
+fn same_distributed_lock_quorum(left: &[Arc<dyn LockClient>], right: &[Arc<dyn LockClient>]) -> bool {
+    !left.is_empty()
+        && left.len() == right.len()
+        && left.iter().all(|client| {
+            left.iter().filter(|other| Arc::ptr_eq(client, other)).count() == 1
+                && right.iter().filter(|other| Arc::ptr_eq(client, other)).count() == 1
+        })
+}
+
 const ERASURE_CACHE_MAX_ENTRIES: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -5645,9 +5656,9 @@ impl SetDisks {
     pub(crate) async fn shares_namespace_lock_domain(&self, other: &Self) -> bool {
         match (self.ctx.is_dist_erasure().await, other.ctx.is_dist_erasure().await) {
             (false, false) => Arc::ptr_eq(&self.local_lock_manager, &other.local_lock_manager),
-            (true, true) => {
-                self.set_lock_namespace == other.set_lock_namespace && same_distributed_lock_domain(&self.lockers, &other.lockers)
-            }
+            // Distributed lock clients receive the raw ObjectKey; the pool
+            // namespace is not part of the key stored by their backends.
+            (true, true) => same_distributed_lock_quorum(&self.lockers, &other.lockers),
             _ => false,
         }
     }
@@ -9882,7 +9893,7 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     #[serial]
-    async fn namespace_lock_domain_includes_pool_namespace() {
+    async fn distributed_namespace_lock_domain_follows_backend_not_pool_name() {
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
 
         let first: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
@@ -9921,9 +9932,23 @@ mod tests {
             "sets in the same pool share the object namespace lock domain"
         );
         assert!(
-            !same_pool_first_set.shares_namespace_lock_domain(&other_pool_set).await,
-            "different pool namespaces must not be deduplicated solely by identical clients"
+            same_pool_first_set.shares_namespace_lock_domain(&other_pool_set).await,
+            "different pools using identical backends lock the same raw object key"
         );
+    }
+
+    #[test]
+    fn distributed_lock_domain_rejects_partial_or_duplicate_backends() {
+        let a: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let b: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        let c: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new())));
+        assert!(same_distributed_lock_quorum(&[a.clone(), b.clone()], &[b.clone(), a.clone()]));
+        assert!(!same_distributed_lock_quorum(&[a.clone(), b.clone()], &[a.clone(), c]));
+        assert!(!same_distributed_lock_quorum(
+            &[a.clone(), a.clone(), b.clone()],
+            &[a.clone(), b.clone(), b]
+        ));
+        assert!(!same_distributed_lock_quorum(&[], &[]));
     }
 
     #[tokio::test(flavor = "multi_thread")]
