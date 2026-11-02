@@ -92,6 +92,17 @@ jobs:
           CHAIN_OUTPUT: ${{ runner.temp }}/validation-sweep-candidate.json
         run: |
           set -euo pipefail
+          # Scheduled runs carry no inputs and the resolver only derives a
+          # build from a workflow_run payload (which a schedule cannot
+          # provide), so resolve the newest successful nightly build
+          # explicitly before invoking it.
+          if [ -z "${BUILD_RUN_ID:-}" ]; then
+            LATEST="$(gh api "repos/rustfs/rustfs/actions/workflows/nightly-gnu.yml/runs?branch=main&status=success&per_page=1" --jq '.workflow_runs[0]')"
+            BUILD_RUN_ID="$(printf '%s' "${LATEST}" | jq -r '.id')"
+            BUILD_RUN_ATTEMPT="$(printf '%s' "${LATEST}" | jq -r '.run_attempt')"
+            export BUILD_RUN_ID BUILD_RUN_ATTEMPT
+            echo "scheduled sweep pinned to nightly ${BUILD_RUN_ID} attempt ${BUILD_RUN_ATTEMPT}"
+          fi
           python3 scripts/resolve_functional_candidate.py
           python3 - <<'PY'
           import json
@@ -351,7 +362,9 @@ jobs:
             ${{ runner.temp }}/validation-sweep/sweep-cases.txt
             ${{ runner.temp }}/validation-sweep/candidate.json
             ${{ runner.temp }}/validation-sweep/results/
-          if-no-files-found: error
+          # warn (not error): an early infra failure legitimately leaves no
+          # per-case evidence, and the failing step is already red.
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Cleanup environment (after)
