@@ -1,7 +1,7 @@
 # Cryptographic compliance positioning
 
 **Use this when:** writing README, CHANGELOG, release notes, marketing, RFP, or security-questionnaire text that touches FIPS, or reasoning about the `rustfs` / `rustfs-tls-runtime` / `rustfs-crypto` `fips` features and algorithm deprecation.
-**Source of truth:** `scripts/check_fips_wording.sh` (the enforced guard); `rustfs/Cargo.toml` and `crates/tls-runtime/Cargo.toml` (`fips` feature); `crates/crypto/Cargo.toml` (`fips` feature); `crates/crypto/src/encdec/id.rs` (`ID` algorithm bytes); `rustfs/src/startup_runtime_hooks.rs` (`install_default_crypto_provider`).
+**Source of truth:** `scripts/check_fips_wording.sh` (the enforced guard); the `fips` features in `rustfs/Cargo.toml` and the affected library manifests; `crates/tls-runtime/src/provider.rs` (provider policy); `crates/crypto/Cargo.toml` (`fips` feature); `crates/crypto/src/encdec/id.rs` (`ID` algorithm bytes).
 
 This document records where RustFS stands on cryptographic module validation and what may and may not be said about it, so the question is answered once, from the code. For where master key material lives per backend, see [KMS backend security properties](kms-backend-security.md).
 
@@ -52,18 +52,22 @@ Boilerplate when the topic cannot be avoided:
 
 ## The `rustfs` and `rustfs-tls-runtime` `fips` feature
 
-`rustfs/Cargo.toml` (`fips = ["rustls/fips", "tokio-rustls/fips", "rustfs-tls-runtime/fips"]`) and `crates/tls-runtime/Cargo.toml` (`fips = ["rustls/fips"]`) define an opt-in Cargo feature (disabled by default) for builds that require the `aws-lc-fips-sys` cryptographic module on the `aws-lc-rs` / `rustls` path:
+`rustfs/Cargo.toml` and the TLS runtime, protocols, targets, S3 client, and ECStore library manifests define opt-in `fips` features (disabled by default) for the `aws-lc-fips-sys` / `rustls` path. The RustFS feature propagates the policy to these libraries; when enabling a protocol library independently, also enable the required protocol feature.
+
+Cargo's `--all-features` also enables `fips`, including for these individual libraries. Such builds inherit the FIPS backend's target and native-tool requirements; select supported feature combinations deliberately rather than assuming every all-features build is supported.
 
 ```bash
 cargo build --release --locked -p rustfs --bin rustfs --features fips
 ```
 
 - **What it enables:** Activates `rustls/fips` and `tokio-rustls/fips`, which pull in `aws-lc-rs/fips` (`aws-lc-fips-sys`) and `rustls-webpki/aws-lc-rs-fips`. Cargo unifies features for the same dependency version in a build graph; consumers of that `aws-lc-rs` instance use its FIPS backend, but this does not establish approval for every operation or cover independent dependency versions.
-- **Runtime provider installation:** `rustfs/src/startup_runtime_hooks.rs` attempts to install `rustls::crypto::default_fips_provider()` and checks the actual process-wide provider before observability initialization in both standalone and embedded startup. A FIPS build fails startup if an embedded host has already installed a provider that does not pass rustls `CryptoProvider::fips()`; the host must install a compatible provider before starting RustFS. The check does not inspect clients that use their own provider or a different TLS implementation.
+- **Runtime provider installation:** `rustfs-tls-runtime` installs or reuses the process-wide provider and checks the actual provider in FIPS builds. RustFS performs this check before observability initialization in standalone and embedded startup. FTPS, WebDAV, transition clients, and relevant notification TLS clients also invoke the shared policy before using the process-wide provider. An incompatible host provider causes a configuration error. The check does not inspect clients that use their own provider or a different TLS implementation.
 - **Build requirements:** The FIPS backend requires a C/C++ toolchain, CMake, and Go; targets without suitable pre-generated bindings also require bindgen and Clang/`libclang`. Check the locked dependency version and target platform for their exact requirements.
 - **What it does not change:** It does not alter the object data-path AEAD (`crates/kms`, `crates/rio`, `crates/rio-v2`) or `rustfs-crypto` config/IAM blob encryption, which continue to use pure-Rust `RustCrypto` crates.
 
-The RustFS server TLS configuration uses the process-wide rustls provider. FTPS, WebDAV, tier clients, and notification targets have their own provider initialization paths; the remote replication client also explicitly selects an AWS-LC TLS provider. Feature unification affects the same dependency version in a build graph, but independent builds, explicit providers, and third-party TLS stacks require separate verification. No complete outbound TLS or platform validation matrix is asserted here.
+The RustFS server TLS configuration uses the process-wide rustls provider. The Kafka notification client and remote replication SDK explicitly select AWS-LC, so their providers are independent of the process default; for the locked rustls version, the unified `rustls/fips` feature restricts that provider's suites and groups. ECStore's insecure replication-client path still uses the process default: an application using ECStore independently must directly depend on `rustfs-tls-runtime` with its `fips` feature and call `rustfs_tls_runtime::ensure_crypto_provider()` before constructing that client when it requires the FIPS policy. Skipping TLS certificate verification does not authenticate the remote target, regardless of provider selection. Feature unification applies only to the same dependency version in a build graph; independent builds and third-party TLS stacks require separate verification. No complete outbound TLS or platform validation matrix is asserted here.
+
+NATS can upgrade a connection to TLS based on the server's response, so the targets library checks the process provider before connecting in a FIPS build, including for a plaintext-looking NATS URL. Webhook targets construct a TLS-capable HTTP client even for an HTTP endpoint and also check the provider when built with `fips`. An incompatible host provider therefore prevents these initializations even if a particular connection would not use TLS.
 
 A provider check or linked FIPS backend does not establish CMVP validation for a deployment or approval of every operation. Verify the specific module version, certificate status, security policy, build, operating environment, and approved services against the [CMVP validated modules list](https://csrc.nist.gov/projects/cryptographic-module-validation-program/validated-modules). The feature is opt-in; before enabling it, test client algorithms, certificates, TLS versions, rolling upgrades, and rollback in the target environment.
 

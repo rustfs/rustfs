@@ -536,6 +536,15 @@ jobs:
           if [[ '${{ matrix.mode }}' == 'fips' ]]; then
             args+=(--features fips)
           fi
+          cargo nextest run --locked -p rustfs-tls-runtime --lib "${args[@]}" --no-tests fail -E 'test(provider_policy_isolated)'
+          cargo nextest run --locked -p rustfs-s3-client --lib "${args[@]}" --no-tests fail -E 'test(overflowing_closed_range_is_rejected_before_network_io)'
+          cargo nextest run --locked -p rustfs-targets --lib "${args[@]}" --no-tests fail -E 'test(validate_pulsar)'
+          cargo nextest run --locked -p rustfs-targets --lib "${args[@]}" --no-tests fail -E 'test(webhook_provider_policy_isolated)'
+          if [[ '${{ matrix.mode }}' == 'fips' ]]; then
+            cargo nextest run --locked -p rustfs-protocols --lib --features ftps,webdav,fips --no-tests fail -E 'test(protocols_reject_incompatible_host_provider)'
+            cargo nextest run --locked -p rustfs-targets --lib --features fips --no-tests fail -E 'test(fips_postgres_rejects_incompatible_host_provider)'
+            cargo nextest run --locked -p rustfs-s3-client --lib --features fips --no-tests fail -E 'test(fips_transition_rejects_incompatible_host_provider)'
+          fi
           tests=(provider_installation_isolated prepared_generation_shares_crypto_and_serves_sni_with_mtls)
           if [[ '${{ matrix.mode }}' == 'fips' ]]; then
             tests+=(fips_provider_builds_fips_tls_configs fips_provider_tls_handshake_accepts_and_rejects_algorithms)

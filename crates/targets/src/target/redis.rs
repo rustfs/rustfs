@@ -766,7 +766,7 @@ pub(crate) fn build_redis_client(args: &RedisArgs) -> Result<Client, TargetError
 
     let secure_scheme = matches!(args.url.scheme(), "rediss" | "valkeys");
     if secure_scheme {
-        super::ensure_rustls_provider_installed();
+        super::ensure_rustls_provider_installed()?;
         let tls_certs = TlsCertificates {
             client_tls: read_client_tls(&args.tls)?,
             root_cert: read_root_cert(&args.tls)?,

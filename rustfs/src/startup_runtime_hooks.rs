@@ -14,10 +14,7 @@
 
 use crate::license::license_status;
 use crate::startup_runtime_sources;
-#[cfg(not(feature = "fips"))]
-use rustls::crypto::aws_lc_rs::default_provider;
-#[cfg(feature = "fips")]
-use rustls::crypto::default_fips_provider as default_provider;
+use rustfs_tls_runtime::{CryptoProviderStatus, ensure_crypto_provider};
 use std::future::Future;
 use std::io::Result;
 use tracing::{debug, info, warn};
@@ -108,25 +105,8 @@ where
     shutdown();
 }
 
-fn build_default_crypto_provider() -> rustls::crypto::CryptoProvider {
-    default_provider()
-}
-
-fn ensure_default_crypto_provider() -> Result<bool> {
-    // The process-wide provider is write-once, so an existing provider needs no replacement.
-    let already_installed =
-        rustls::crypto::CryptoProvider::get_default().is_some() || build_default_crypto_provider().install_default().is_err();
-    #[cfg(feature = "fips")]
-    if !rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips()) {
-        return Err(std::io::Error::other(
-            "FIPS TLS requested, but the process-wide rustls crypto provider is not FIPS compatible; configure the host to install a FIPS provider before starting RustFS",
-        ));
-    }
-    Ok(already_installed)
-}
-
 pub(crate) fn install_default_crypto_provider() -> Result<()> {
-    if ensure_default_crypto_provider()? {
+    if ensure_crypto_provider().map_err(std::io::Error::other)? == CryptoProviderStatus::AlreadyInstalled {
         debug!(
             target: "rustfs::main",
             event = EVENT_CRYPTO_PROVIDER_STATE,
@@ -177,7 +157,7 @@ pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<
 }
 
 fn install_embedded_default_crypto_provider() -> Result<()> {
-    if ensure_default_crypto_provider()? {
+    if ensure_crypto_provider().map_err(std::io::Error::other)? == CryptoProviderStatus::AlreadyInstalled {
         debug!(
             event = EVENT_CRYPTO_PROVIDER_STATE,
             component = LOG_COMPONENT_EMBEDDED,
@@ -192,9 +172,10 @@ fn install_embedded_default_crypto_provider() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_default_crypto_provider, init_profiling_runtime_with, install_default_crypto_provider,
-        install_embedded_default_crypto_provider, shutdown_profiling_runtime_with,
+        init_profiling_runtime_with, install_default_crypto_provider, install_embedded_default_crypto_provider,
+        shutdown_profiling_runtime_with,
     };
+    use rustfs_tls_runtime::default_crypto_provider as build_default_crypto_provider;
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
