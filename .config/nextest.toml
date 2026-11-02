@@ -827,7 +827,7 @@ slow-timeout = { period = "120s", terminate-after = 12, grace-period = "10s" }
 # ---------------------------------------------------------------------------
 # e2e-distributed profile — 4-node 4-disk Actions suite
 # ---------------------------------------------------------------------------
-# Storage-sensitive PR / nightly / dispatch lane owned by
+# Nightly and manual-dispatch lane owned by
 # .github/workflows/e2e-distributed.yml.
 # Each case starts four rustfs processes (and for site replication, two
 # clusters). Upgrade cases also require RUSTFS_UPGRADE_SOURCE_BINARY.
