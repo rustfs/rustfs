@@ -769,12 +769,10 @@
       "workflow": ".github/workflows/e2e-distributed.yml",
       "name": "e2e-distributed",
       "roles": [
-        "pr",
         "periodic",
         "manual"
       ],
       "events": [
-        "pull_request",
         "workflow_dispatch",
         "schedule"
       ],
@@ -849,12 +847,11 @@
       "workflow": ".github/workflows/e2e-upgrade.yml",
       "name": "Upgrade Compatibility",
       "roles": [
-        "pr",
         "periodic",
-        "manual"
+        "manual",
+        "release"
       ],
       "events": [
-        "pull_request",
         "push",
         "schedule",
         "workflow_dispatch"
