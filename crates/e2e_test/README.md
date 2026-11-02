@@ -26,7 +26,7 @@ Registered in [`src/lib.rs`](src/lib.rs). Grouped by concern:
 | **protocols** | [`src/protocols/`](src/protocols) | FTPS, WebDAV, SFTP compliance. Fixed ports, own guide: [`src/protocols/README.md`](src/protocols/README.md) |
 | **reliant** | [`src/reliant/`](src/reliant) | Tests that reuse an **externally started** server (SQL/select, conditional writes, lifecycle, deleted-object reads, node-interact). Run via [`scripts/run_e2e_tests.sh`](../../scripts/run_e2e_tests.sh); see [`src/reliant/README.md`](src/reliant/README.md) |
 | **cluster** | `cluster_concurrency_test`, `stale_multipart_cleanup_cluster_test`, `namespace_lock_quorum_test`, `admin_timeout_regression_test`, `object_lambda_test`, `replication_extension_test`, `tier_stats_cluster_test` | Multi-node scenarios via `RustFSTestClusterEnvironment` |
-| **distributed 4×4** | [`src/distributed/`](src/distributed) | Storage-sensitive PR and nightly `e2e-distributed` lane: S3, object lock/WORM, versioning, bucket/site replication, quota, expand/decommission/rebalance, concurrency, chaos, 4-node upgrade of historical data and IAM AK/SK. Map: [`docs/testing/distributed-e2e.md`](../../docs/testing/distributed-e2e.md) |
+| **distributed 4×4** | [`src/distributed/`](src/distributed) | Nightly `e2e-distributed` lane: S3, object lock/WORM, versioning, bucket/site replication, quota, expand/decommission/rebalance, concurrency, chaos, 4-node upgrade of historical data and IAM AK/SK. Map: [`docs/testing/distributed-e2e.md`](../../docs/testing/distributed-e2e.md) |
 | **chaos / reliability** | [`src/chaos.rs`](src/chaos.rs), `reliability_disk_fault_test`, `heal_erasure_disk_rebuild_test`, `server_startup_failfast_test` | Disk offline/replace/corrupt, EC rebuild, heal, fail-fast startup |
 | **upgrade compatibility** | `upgrade_compatibility_test` | Pinned previous-release writes followed by current-build reads on the same data directory |
 
@@ -194,9 +194,9 @@ the same profile for membership and execution with one nightly worker.
 | `s3s-e2e` black-box | `e2e-tests` + `e2e-tests-rio-v2` jobs | **Active** (external conformance tool) |
 | ILM / lifecycle (ignored) | `test-ilm-integration-serial` lane, `-j1` | **Active** (backlog#1148 ilm-1) |
 | KMS suite | `e2e-full` job, merge queue + main | **Active** |
-| Direct and mixed-version rolling upgrades from pinned previous release | `e2e-upgrade.yml`, storage-sensitive PRs + release tags + weekly | **Active** |
+| Direct and mixed-version rolling upgrades from pinned previous release | `e2e-upgrade.yml`, release tags + weekly schedule + manual dispatch | **Active** |
 | Cluster faults (`e2e-nightly` profile) | consolidated nightly workflow | **Active** (backlog#1149 ci-7) |
-| Distributed 4-node 4-disk (`e2e-distributed` profile) | `.github/workflows/e2e-distributed.yml` | **Active** (storage-sensitive PR / nightly / dispatch) |
+| Distributed 4-node 4-disk (`e2e-distributed` profile) | `.github/workflows/e2e-distributed.yml` | **Active** (nightly / dispatch) |
 | Protocols (FTPS/WebDAV/SFTP) | consolidated nightly workflow, serial | **Active** (backlog#1149 ci-7) |
 | Replication (fast subset) | `e2e-smoke` profile, `e2e-tests` job, every PR | **Active** (backlog#1147 repl-1) |
 | Replication (slow + multi-node) | `e2e-repl-nightly` profile, consolidated nightly workflow | **Active** (backlog#1147 repl-1) |

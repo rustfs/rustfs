@@ -318,6 +318,21 @@ fn is_rebalance_transient_lock_error(err: &rustfs_lock::LockError) -> bool {
     }
 }
 
+fn is_rebalance_metadata_admission_retryable(err: &Error) -> bool {
+    match rebalance_error_source(err) {
+        Error::Lock(err) => is_rebalance_transient_lock_error(err),
+        // No metadata was written when lock admission failed. Each attempt
+        // must acquire its quorum again before loading or saving this run.
+        Error::NamespaceLockQuorumUnavailable {
+            mode: "write",
+            bucket,
+            object,
+            ..
+        } => bucket == crate::disk::RUSTFS_META_BUCKET && object == REBAL_META_NAME,
+        _ => false,
+    }
+}
+
 fn is_rebalance_transient_io_error(err: &std::io::Error) -> bool {
     if err.kind() == std::io::ErrorKind::TimedOut {
         return true;
@@ -385,9 +400,7 @@ where
         match result {
             Ok(value) => return Ok(value),
             Err(err) => {
-                if attempt.saturating_add(1) >= max_attempts.max(1)
-                    || !matches!(rebalance_error_source(&err), Error::Lock(lock_err) if is_rebalance_transient_lock_error(lock_err))
-                {
+                if attempt.saturating_add(1) >= max_attempts.max(1) || !is_rebalance_metadata_admission_retryable(&err) {
                     return Err(err);
                 }
                 #[cfg(test)]
@@ -719,6 +732,82 @@ mod error_source_tests {
         }
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn rebalance_metadata_retry_recovers_after_write_quorum_failure() {
+        let mut attempts = 0;
+        retry_rebalance_metadata_access(None, 3, || {
+            attempts += 1;
+            std::future::ready(if attempts == 1 {
+                resolve_rebalance_meta_save_result(
+                    Err(rebalance_meta_lock_error(
+                        rustfs_lock::LockError::QuorumNotReached {
+                            required: 1,
+                            achieved: 0,
+                        },
+                        "write",
+                    )),
+                    "stop_rebalance",
+                )
+            } else {
+                Ok(())
+            })
+        })
+        .await
+        .expect("a later quorum-protected admission must be allowed to succeed");
+        assert_eq!(attempts, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebalance_metadata_retry_retains_persistent_write_quorum_failure() {
+        for max_attempts in [0, 1, 3] {
+            let mut attempts = 0;
+            let result = retry_rebalance_metadata_access(None, max_attempts, || {
+                attempts += 1;
+                std::future::ready(Err::<(), _>(rebalance_meta_lock_error(
+                    rustfs_lock::LockError::QuorumNotReached {
+                        required: 1,
+                        achieved: 0,
+                    },
+                    "write",
+                )))
+            })
+            .await;
+            let error = result.expect_err("exhausted admission attempts must never acknowledge a write");
+            assert_eq!(attempts, max_attempts.max(1));
+            assert!(matches!(
+                rebalance_error_source(&error),
+                Error::NamespaceLockQuorumUnavailable {
+                    mode: "write",
+                    required: 1,
+                    achieved: 0,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn rebalance_metadata_retry_stops_after_admission_is_cancelled() {
+        let mut attempts = 0;
+        let result = retry_rebalance_metadata_access(None, 3, || {
+            attempts += 1;
+            std::future::ready(Err::<(), _>(if attempts == 1 {
+                rebalance_meta_lock_error(
+                    rustfs_lock::LockError::QuorumNotReached {
+                        required: 1,
+                        achieved: 0,
+                    },
+                    "write",
+                )
+            } else {
+                Error::OperationCanceled
+            }))
+        })
+        .await;
+        assert_eq!(attempts, 2, "a stale or cancelled run cannot enter another admission attempt");
+        assert!(matches!(result, Err(Error::OperationCanceled)));
+    }
+
     #[tokio::test]
     async fn rebalance_metadata_retry_does_not_retry_permanent_or_untyped_errors() {
         for err in [
@@ -730,6 +819,20 @@ mod error_source_tests {
                 object: REBAL_META_NAME.to_string(),
                 required: 3,
                 achieved: 2,
+            },
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: "data-bucket".to_string(),
+                object: REBAL_META_NAME.to_string(),
+                required: 1,
+                achieved: 0,
+            },
+            Error::NamespaceLockQuorumUnavailable {
+                mode: "write",
+                bucket: crate::disk::RUSTFS_META_BUCKET.to_string(),
+                object: "other-metadata.bin".to_string(),
+                required: 1,
+                achieved: 0,
             },
             Error::other("stale rebalance run rejected: lock acquisition timed out"),
             Error::other("rebalance distributed run fence lost"),

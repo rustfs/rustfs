@@ -58,6 +58,7 @@ required-features = ["swift"]
 
 [features]
 default = ["ftps", "webdav", "gcs"]
+fips = ["rustls/fips", "tokio-rustls/fips", "rustfs-tls-runtime/fips"]
 gcs = ["rustfs-ecstore/gcs", "dep:google-cloud-auth"]
 metrics-gpu = ["rustfs-obs/gpu"]
 ftps = ["rustfs-protocols/ftps"]

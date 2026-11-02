@@ -16,7 +16,7 @@ use super::{
         OidcConfigQuery, OidcConfigSnapshot, OidcProviderConfig, OidcProviderSummary, OidcSiteReplicationSnapshot,
         SourcedOidcProviderConfig, load_oidc_config_snapshot,
     },
-    provider::{ProviderRuntime, discover_provider_for_recovery},
+    provider::{ProviderRuntime, discover_provider_for_recovery, verify_id_token_claims},
     state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
     transport::{OidcExtraRootCaProvider, ReqwestHttpClient, inspect_token_response_body, oidc_http_error_diagnostics},
 };
@@ -535,7 +535,7 @@ impl OidcSys {
         let verifier = client
             .id_token_verifier()
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
-        let verified = id_token.claims(&verifier, &Nonce::new(session.nonce.clone()));
+        let verified = verify_id_token_claims(id_token, &verifier, &Nonce::new(session.nonce.clone()));
         if let Err(e) = verified {
             let verification_error = e.to_string();
             warn!(
@@ -583,8 +583,7 @@ impl OidcSys {
             let verifier = client
                 .id_token_verifier()
                 .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
-            id_token
-                .claims(&verifier, &Nonce::new(session.nonce.clone()))
+            verify_id_token_claims(id_token, &verifier, &Nonce::new(session.nonce.clone()))
                 .map_err(|retry_err| {
                     error!(
                         event = EVENT_OIDC_DIAGNOSTICS,
@@ -767,7 +766,7 @@ impl OidcSys {
             .metadata
             .verifier(&config)
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
-        if let Err(e) = id_token.claims(&verifier, |_: Option<&Nonce>| Ok(())) {
+        if let Err(e) = verify_id_token_claims(&id_token, &verifier, |_: Option<&Nonce>| Ok(())) {
             state = self
                 .provider_runtime
                 .refresh_provider_state(&provider_id, &config)
@@ -780,8 +779,7 @@ impl OidcSys {
                 .metadata
                 .verifier(&config)
                 .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
-            id_token
-                .claims(&verifier, |_: Option<&Nonce>| Ok(()))
+            verify_id_token_claims(&id_token, &verifier, |_: Option<&Nonce>| Ok(()))
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
         }
 
