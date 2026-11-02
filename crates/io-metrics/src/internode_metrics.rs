@@ -1411,6 +1411,28 @@ pub fn record_peer_reachable(addr: &str) {
     publish_offline_gauge(&peers);
 }
 
+/// Record a successful interaction with a cluster peer, but only when the peer is currently
+/// marked offline. This is the fast recovery path for cached-channel RPCs, recovery probes,
+/// and lock-path successes that do not go through a fresh dial.
+///
+/// Fast path (peer unknown or already online): a shared read lock, no write, no gauge
+/// republish — the overwhelmingly common case on a healthy cluster. Slow path (offline →
+/// online transition): upgrades to the write lock and delegates to [`record_peer_reachable`].
+pub fn record_peer_reachable_if_offline(addr: &str) {
+    let key = normalize_peer_key(addr);
+    // Fast path: read lock to check whether the peer is currently offline.
+    {
+        let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match peers.get(key) {
+            None => return,
+            Some(entry) if entry.online => return,
+            Some(_) => {} // offline: fall through to the write path
+        }
+    }
+    // Slow path: the peer is offline, so flip it back online and republish the gauge.
+    record_peer_reachable(addr);
+}
+
 /// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
 /// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
 pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
@@ -2186,6 +2208,34 @@ mod tests {
     #[test]
     fn cluster_servers_offline_total_name_is_stable() {
         assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_recovers_stale_offline_state() {
+        let addr = "http://cluster-peer-recover-if-offline-test:9000";
+
+        // Mark the peer offline.
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // A successful cached-channel RPC (no fresh dial) clears the offline state.
+        record_peer_reachable_if_offline(addr);
+        assert!(!cluster_peer_is_offline(addr));
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_no_op_for_online_peer() {
+        let addr = "http://cluster-peer-recover-noop-test:9000";
+
+        record_peer_reachable(addr);
+        // Should not panic or change state for an already-online peer.
+        record_peer_reachable_if_offline(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        // Should also be a no-op for unknown peers.
+        record_peer_reachable_if_offline("http://cluster-peer-recover-unknown-test:9000");
+        assert_eq!(cluster_peer_observed_online_status("http://cluster-peer-recover-unknown-test:9000"), None);
     }
 
     #[test]
