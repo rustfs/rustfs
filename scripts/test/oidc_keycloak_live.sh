@@ -8,6 +8,7 @@ KEYCLOAK_IMAGE="${KEYCLOAK_IMAGE:-quay.io/keycloak/keycloak@sha256:6a7217a100bd3
 WORK_DIR="${RUNNER_TEMP:-/tmp}/rustfs-keycloak-live-${$}"
 KEYCLOAK_CONTAINER="rustfs-keycloak-live-${$}"
 RUSTFS_PID=""
+DOCKER=(docker)
 mkdir -p "${WORK_DIR}"
 
 cleanup() {
@@ -17,10 +18,10 @@ cleanup() {
     wait "${RUSTFS_PID}" 2>/dev/null || true
   fi
   if [[ "${status}" -ne 0 ]]; then
-    docker logs "${KEYCLOAK_CONTAINER}" >"${WORK_DIR}/keycloak.log" 2>&1 || true
+    "${DOCKER[@]}" logs "${KEYCLOAK_CONTAINER}" >"${WORK_DIR}/keycloak.log" 2>&1 || true
     echo "live-gate logs retained in ${WORK_DIR}" >&2
   fi
-  docker rm -f "${KEYCLOAK_CONTAINER}" >/dev/null 2>&1 || true
+  "${DOCKER[@]}" rm -f "${KEYCLOAK_CONTAINER}" >/dev/null 2>&1 || true
   if [[ "${status}" -eq 0 ]]; then
     rm -rf "${WORK_DIR}"
   fi
@@ -33,6 +34,10 @@ for command in curl docker python3 aws; do
     exit 1
   }
 done
+if ! docker info >/dev/null 2>&1; then
+  DOCKER=(sudo -n docker)
+  "${DOCKER[@]}" info >/dev/null
+fi
 [[ -x "${RUSTFS_BINARY}" ]] || {
   echo "RustFS binary is not executable: ${RUSTFS_BINARY}" >&2
   exit 1
@@ -59,7 +64,7 @@ ISSUER="${KEYCLOAK_ORIGIN}/realms/rustfs-ci"
 DISCOVERY_URL="${ISSUER}/.well-known/openid-configuration"
 RUSTFS_ORIGIN="http://127.0.0.1:${RUSTFS_PORT}"
 
-docker run --detach --rm \
+"${DOCKER[@]}" run --detach --rm \
   --name "${KEYCLOAK_CONTAINER}" \
   --memory 1g \
   --publish "127.0.0.1:${KEYCLOAK_PORT}:8080" \
@@ -74,8 +79,8 @@ for _ in $(seq 1 120); do
   if curl --noproxy '*' -fsS "${DISCOVERY_URL}" >"${WORK_DIR}/discovery.json" 2>/dev/null; then
     break
   fi
-  if [[ "$(docker inspect -f '{{.State.Running}}' "${KEYCLOAK_CONTAINER}" 2>/dev/null || true)" != "true" ]]; then
-    docker logs "${KEYCLOAK_CONTAINER}" >&2 || true
+  if [[ "$("${DOCKER[@]}" inspect -f '{{.State.Running}}' "${KEYCLOAK_CONTAINER}" 2>/dev/null || true)" != "true" ]]; then
+    "${DOCKER[@]}" logs "${KEYCLOAK_CONTAINER}" >&2 || true
     echo "Keycloak exited before discovery became ready" >&2
     exit 1
   fi

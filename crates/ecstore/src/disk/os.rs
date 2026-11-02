@@ -4439,12 +4439,18 @@ fn prepare_destination_parent_with_retry(
     base_dir: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<ExistingBaseDirectoryGuard> {
-    let prune_budget = parent_prune_budget(parent, base_dir);
+    let mut prune_budget = None;
     let mut attempt = 0;
     loop {
         match mkdir_all_below_existing_base_std(parent, base_dir, publication_root) {
             Ok(preparation) => return Ok(preparation),
-            Err(err) if should_retry_prepare(&err, attempt, prune_budget) => {
+            Err(err)
+                if should_retry_prepare(
+                    &err,
+                    attempt,
+                    *prune_budget.get_or_insert_with(|| parent_prune_budget(parent, base_dir)),
+                ) =>
+            {
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -4936,13 +4942,9 @@ impl PublicationRoot {
         #[cfg(target_os = "linux")]
         {
             use rustix::fs::{Mode, OFlags};
-            let parent = self.open_directory(
-                path.parent()
-                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file parent"))?,
-            )?;
-            let name = path
-                .file_name()
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))?;
+            let (parent_path, name) = rustfs_utils::path::unix_split_parent_and_file_name(path)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file parent or name"))?;
+            let parent = self.open_directory(parent_path)?;
             let file = open_linux_relative(
                 &parent,
                 Path::new(name),
@@ -4982,9 +4984,9 @@ impl PublicationRoot {
 
     #[cfg(target_os = "linux")]
     fn relative_path<'a>(&self, path: &'a Path) -> io::Result<&'a Path> {
-        path.strip_prefix(self.io_path.as_path())
-            .or_else(|_| path.strip_prefix(self.path.as_path()))
-            .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
+        rustfs_utils::path::unix_normalized_path_strip_prefix(path, self.io_path.as_path())
+            .or_else(|| rustfs_utils::path::unix_normalized_path_strip_prefix(path, self.path.as_path()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
 
     #[cfg(windows)]
@@ -4994,6 +4996,13 @@ impl PublicationRoot {
             .or_else(|_| path.strip_prefix(self.configured_path.as_path()))
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "path must remain below its publication root"))
     }
+}
+
+#[cfg(target_os = "linux")]
+#[inline]
+fn linux_relative_path_has_invalid_component(relative: &Path) -> bool {
+    let bytes = relative.as_os_str().as_encoded_bytes();
+    bytes.starts_with(b"/") || rustfs_utils::path::unix_path_has_dotdot_segment(bytes)
 }
 
 /// Open the actual IO handle with the same containment policy as path validation.
@@ -5006,10 +5015,7 @@ fn open_linux_relative(
     mode: rustix::fs::Mode,
 ) -> io::Result<std::fs::File> {
     use rustix::fs::{OFlags, ResolveFlags, openat2};
-    if relative
-        .components()
-        .any(|component| !matches!(component, Component::Normal(_) | Component::CurDir))
-    {
+    if linux_relative_path_has_invalid_component(relative) {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid relative disk path"));
     }
     let relative = if relative.as_os_str().is_empty() {
@@ -5180,11 +5186,8 @@ impl LinuxCommitDirectories {
 
     fn file_name<'a>(&self, path: &'a Path, source: bool) -> io::Result<&'a std::ffi::OsStr> {
         let parent = if source { &self.source_path } else { &self.destination_path };
-        if path.parent() != Some(parent) {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"));
-        }
-        path.file_name()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "missing file name"))
+        rustfs_utils::path::unix_direct_child_file_name(path, parent)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"))
     }
 
     fn validate(&self) -> io::Result<()> {
@@ -5196,8 +5199,8 @@ impl LinuxCommitDirectories {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if self.source_path != self.destination_path
-            || (self.source.device, self.source.inode) != (destination.device, destination.inode)
+        if (self.source.device, self.source.inode) != (destination.device, destination.inode)
+            || self.source_path.as_os_str() != self.destination_path.as_os_str()
         {
             let current = self.root.open_directory(&self.destination_path)?.metadata()?;
             if (current.dev(), current.ino()) != (destination.device, destination.inode) {
@@ -5216,7 +5219,10 @@ impl LinuxCommitDirectories {
         loop {
             if let Some(prepared) = prepared {
                 let metadata = rustix::fs::statat(&*self.source.file, source_name, rustix::fs::AtFlags::SYMLINK_NOFOLLOW)?;
-                if prepared.path != source || metadata.st_dev != prepared.device || metadata.st_ino != prepared.inode {
+                if (prepared.path.as_os_str() != source.as_os_str() && prepared.path != source)
+                    || metadata.st_dev != prepared.device
+                    || metadata.st_ino != prepared.inode
+                {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
                         "rename source identity changed while publication was prepared",
@@ -6354,19 +6360,35 @@ fn windows_rename_source_is_allowed(attributes: u32, reparse_tag: u32) -> bool {
 }
 
 fn existing_base_directory_suffix<'a>(dir_path: &'a Path, base_dir: &Path) -> io::Result<&'a Path> {
-    let relative = dir_path
-        .strip_prefix(base_dir)
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory"))?;
-    for component in relative.components() {
-        if !matches!(component, Component::Normal(_) | Component::CurDir) {
+    #[cfg(target_os = "linux")]
+    {
+        let relative = rustfs_utils::path::unix_normalized_path_strip_prefix(dir_path, base_dir).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory")
+        })?;
+        if linux_relative_path_has_invalid_component(relative) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "rename destination contains an invalid path component",
             ));
         }
+        Ok(relative)
     }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let relative = dir_path.strip_prefix(base_dir).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "rename destination must remain below its base directory")
+        })?;
+        for component in relative.components() {
+            if !matches!(component, Component::Normal(_) | Component::CurDir) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "rename destination contains an invalid path component",
+                ));
+            }
+        }
 
-    Ok(relative)
+        Ok(relative)
+    }
 }
 
 /// Missing state never downgrades surviving native control records to legacy.
