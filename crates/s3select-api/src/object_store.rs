@@ -640,12 +640,12 @@ fn http_range_spec_from_get_range(range: &GetRange) -> HTTPRangeSpec {
         GetRange::Bounded(range) => http_range_spec_from_range(range.clone()),
         GetRange::Offset(start) => HTTPRangeSpec {
             is_suffix_length: false,
-            start: *start as i64,
+            start: i64::try_from(*start).unwrap_or(i64::MAX),
             end: -1,
         },
         GetRange::Suffix(length) => HTTPRangeSpec {
             is_suffix_length: true,
-            start: *length as i64,
+            start: i64::try_from(*length).unwrap_or(i64::MAX),
             end: -1,
         },
     }
@@ -654,15 +654,15 @@ fn http_range_spec_from_get_range(range: &GetRange) -> HTTPRangeSpec {
 fn http_range_spec_from_range(range: Range<u64>) -> HTTPRangeSpec {
     HTTPRangeSpec {
         is_suffix_length: false,
-        start: range.start as i64,
-        end: range.end.saturating_sub(1) as i64,
+        start: i64::try_from(range.start).unwrap_or(i64::MAX),
+        end: i64::try_from(range.end.saturating_sub(1)).unwrap_or(i64::MAX),
     }
 }
 
 fn http_range_spec_from_start(start: u64) -> HTTPRangeSpec {
     HTTPRangeSpec {
         is_suffix_length: false,
-        start: start as i64,
+        start: i64::try_from(start).unwrap_or(i64::MAX),
         end: -1,
     }
 }
@@ -2474,6 +2474,48 @@ mod test {
         assert!(!range.is_suffix_length);
         assert_eq!(range.start, 10);
         assert_eq!(range.end, 19);
+    }
+
+    #[test]
+    fn test_get_range_conversion_for_suffix_ranges() {
+        // Normal suffix: last 100 bytes.
+        let range = http_range_spec_from_get_range(&GetRange::Suffix(100));
+        assert!(range.is_suffix_length);
+        assert_eq!(range.start, 100);
+        assert_eq!(range.end, -1);
+
+        // Overflowing suffix: `u64::MAX` previously wrapped to `-1` via `as i64`
+        // and was misread as "last 1 byte". It now clamps to `i64::MAX`, which
+        // `get_length` treats as "the whole object".
+        let range = http_range_spec_from_get_range(&GetRange::Suffix(u64::MAX));
+        assert!(range.is_suffix_length);
+        assert_eq!(range.start, i64::MAX);
+        assert_eq!(range.end, -1);
+    }
+
+    #[test]
+    fn test_get_range_conversion_for_offset_overflow() {
+        // Normal offset.
+        let range = http_range_spec_from_get_range(&GetRange::Offset(42));
+        assert!(!range.is_suffix_length);
+        assert_eq!(range.start, 42);
+        assert_eq!(range.end, -1);
+
+        // Overflowing offset clamps to `i64::MAX`, which is then rejected as
+        // out-of-range (416) by `get_offset_length`.
+        let range = http_range_spec_from_get_range(&GetRange::Offset(u64::MAX));
+        assert!(!range.is_suffix_length);
+        assert_eq!(range.start, i64::MAX);
+        assert_eq!(range.end, -1);
+    }
+
+    #[test]
+    fn test_get_range_conversion_for_bounded_overflow() {
+        // Overflowing bounded range clamps start/end to `i64::MAX`.
+        let range = http_range_spec_from_get_range(&GetRange::Bounded(u64::MAX - 10..u64::MAX));
+        assert!(!range.is_suffix_length);
+        assert_eq!(range.start, i64::MAX);
+        assert_eq!(range.end, i64::MAX);
     }
 
     #[tokio::test]
