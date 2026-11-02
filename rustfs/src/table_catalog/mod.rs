@@ -21,7 +21,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     num::NonZeroUsize,
-    ops::Bound,
     sync::Arc,
     time::{Duration as StdDuration, Instant},
 };
@@ -112,11 +111,7 @@ pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
-pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2: &str = "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2";
-pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED: &str =
-    "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED";
 pub(crate) const TABLE_CATALOG_BACKING_OBJECT: &str = "object";
-pub(crate) const TABLE_CATALOG_BACKING_DURABLE_STRONG: &str = "durable-strong";
 pub(crate) const TABLE_METADATA_DIGEST_REQUIREMENT_TYPE: &str = "assert-rustfs-metadata-sha256";
 pub(crate) const TABLE_METADATA_FILE_NAME_MAX_LEN: usize = 128;
 pub(crate) const TABLE_METADATA_JSON_MAX_SIZE: usize = 50 * 1024 * 1024;
@@ -184,7 +179,6 @@ const MAINTENANCE_JOB_ALIAS_LATEST: &str = "latest";
 const MAINTENANCE_JOB_ALIAS_CURRENT: &str = "current";
 const TABLE_CATALOG_LIST_MAX_KEYS: usize = 1000;
 const OBJECT_CATALOG_LIST_CURSOR_PREFIX: &str = "object:";
-const STRONG_CATALOG_LIST_CURSOR_PREFIX: &str = "strong:";
 const TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS: i64 = 15 * 60;
 const TABLE_MAINTENANCE_RETRY_BACKOFF_MAX_SECONDS: u64 = 24 * 60 * 60;
 const TABLE_MAINTENANCE_WORKER_LEASE_TIMEOUT_DEFAULT_SECONDS: u64 = 15 * 60;
@@ -199,24 +193,8 @@ const ICEBERG_MAX_REF_AGE_MS_PROPERTY: &str = "history.expire.max-ref-age-ms";
 const ICEBERG_REF_MIN_SNAPSHOTS_TO_KEEP_FIELD: &str = "min-snapshots-to-keep";
 const ICEBERG_REF_MAX_SNAPSHOT_AGE_MS_FIELD: &str = "max-snapshot-age-ms";
 const ICEBERG_REF_MAX_REF_AGE_MS_FIELD: &str = "max-ref-age-ms";
-const STRONG_TABLE_CATALOG_SNAPSHOT_MIN_READ_VERSION: u16 = 1;
-const STRONG_TABLE_CATALOG_SNAPSHOT_VERSION: u16 = 2;
-const STRONG_TABLE_CATALOG_BACKING_ROOT: &str = "strong-backing";
-const STRONG_TABLE_CATALOG_SNAPSHOT_FILE: &str = "snapshot.json";
-const TABLE_CATALOG_MIGRATION_MIN_READ_VERSION: u16 = 1;
-const TABLE_CATALOG_MIGRATION_VERSION: u16 = 2;
-const TABLE_CATALOG_MIGRATION_ROOT: &str = "backing-migration";
-const TABLE_CATALOG_MIGRATION_FENCE_FILE: &str = "durable-strong-fence.json";
-const TABLE_CATALOG_MIGRATION_FENCE_LOCK: &str = "durable-strong-fence.lock";
-const TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_FILE: &str = "durable-strong-global-fence.json";
-const TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK: &str = "durable-strong-global-fence.lock";
-pub(crate) const TABLE_CATALOG_BACKUP_VERSION: u16 = 2;
 const TABLE_CATALOG_BACKUP_ROOT: &str = "backups";
-const TABLE_CATALOG_BACKUP_RESTORE_ROOT: &str = "restore-intents";
-const TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE: &str = "intent.json";
 const TABLE_CATALOG_BACKUP_MAX_SIZE: usize = 64 * 1024 * 1024;
-const TABLE_CATALOG_BACKUP_MAX_OBJECTS: usize = 1_000_000;
-const TABLE_CATALOG_BACKUP_HASH_MAX_SIZE: u64 = 16 * 1024 * 1024;
 const TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_OBJECT_SIZE: usize = 4 * 1024 * 1024;
 const TABLE_CATALOG_BACKUP_MAX_MAINTENANCE_BYTES: usize = 32 * 1024 * 1024;
 
@@ -288,7 +266,6 @@ impl<T> TableCatalogStorage for T where
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TableCatalogBackingMode {
     ObjectBacked,
-    DurableStrong,
 }
 
 impl TableCatalogBackingMode {
@@ -305,9 +282,8 @@ impl TableCatalogBackingMode {
     fn parse(value: &str) -> TableCatalogStoreResult<Self> {
         match value.trim() {
             "" | TABLE_CATALOG_BACKING_OBJECT => Ok(Self::ObjectBacked),
-            TABLE_CATALOG_BACKING_DURABLE_STRONG => Ok(Self::DurableStrong),
             value => Err(TableCatalogStoreError::Invalid(format!(
-                "unsupported table catalog backing {value}; expected {TABLE_CATALOG_BACKING_OBJECT} or {TABLE_CATALOG_BACKING_DURABLE_STRONG}"
+                "unsupported table catalog backing {value}; expected {TABLE_CATALOG_BACKING_OBJECT}"
             ))),
         }
     }
@@ -315,7 +291,6 @@ impl TableCatalogBackingMode {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::ObjectBacked => TABLE_CATALOG_BACKING_OBJECT,
-            Self::DurableStrong => TABLE_CATALOG_BACKING_DURABLE_STRONG,
         }
     }
 }

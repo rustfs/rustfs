@@ -16,8 +16,8 @@ use super::periodic::PeriodicMaintenanceScheduler;
 use crate::storage_api::startup::services::ServerContextSlot;
 use crate::storage_api::table::check_valid_bucket_name_strict;
 use crate::table_catalog::{
-    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, StrongTableCatalogStore,
-    TableCatalogBackingMode, TableCatalogStoreError, TableCatalogStoreResult,
+    ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, TableCatalogBackingMode,
+    TableCatalogStoreError, TableCatalogStoreResult,
 };
 use std::{collections::BTreeSet, future::Future, sync::Arc, time::Duration};
 use tokio::{task::JoinHandle, time::Instant};
@@ -166,16 +166,10 @@ async fn run(config: PeriodicMaintenanceConfig, server: Arc<ServerContextSlot>, 
             let Some(context) = server.installed_app_context() else {
                 continue;
             };
-            let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-                context.object_store(),
-                context.table_catalog_strong_runtime(),
-            );
+            let backend = EcStoreTableCatalogObjectBackend::new(context.object_store());
             let store = match config.backing {
                 TableCatalogBackingMode::ObjectBacked => {
                     ConfiguredTableCatalogStore::ObjectBacked(ObjectTableCatalogStore::new(backend))
-                }
-                TableCatalogBackingMode::DurableStrong => {
-                    ConfiguredTableCatalogStore::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
                 }
             };
             scheduler = Some(PeriodicMaintenanceScheduler::new(store, config.buckets.clone(), config.interval));
@@ -225,7 +219,7 @@ mod tests {
                     .find(|(name, _)| *name == key)
                     .map(|(_, value)| value.to_string()))
             },
-            || Ok(TableCatalogBackingMode::DurableStrong),
+            || Ok(TableCatalogBackingMode::ObjectBacked),
         )
     }
 
