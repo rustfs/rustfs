@@ -364,6 +364,13 @@ mod tests {
                     .block_on(super::init_embedded_runtime_hooks(String::new()))
                     .unwrap_err();
                 assert!(error.to_string().contains("process-wide rustls crypto provider"));
+                let config = crate::config::Config::new("127.0.0.1:9000", Vec::new());
+                let report = rustfs_utils::ExternalEnvCompatReport::default();
+                let error = runtime
+                    .block_on(crate::startup_preflight::init_startup_server_preflight(&config, &report))
+                    .unwrap_err();
+                assert!(error.to_string().contains("process-wide rustls crypto provider"));
+                assert!(rustfs_obs::get_global_guard().is_err(), "observability must not initialize first");
             }
             assert_eq!(install_embedded_default_crypto_provider().is_ok(), !cfg!(feature = "fips") || actual_fips);
             return;
