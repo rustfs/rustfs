@@ -17,8 +17,13 @@ use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
 mod backup;
+mod cleanup;
 mod migration;
 mod object;
+mod registration_cache;
+#[cfg(test)]
+mod registration_cache_tests;
+pub(crate) use registration_cache::TableCatalogRegistrationCache;
 mod strong;
 
 pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
@@ -776,6 +781,14 @@ pub(crate) struct TableCatalogObjectListPage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TableCatalogCleanupObject {
+    pub key: String,
+    pub version_id: Option<String>,
+    pub etag: Option<String>,
+    pub delete_marker: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableCatalogPutPrecondition {
     Any,
     IfAbsent,
@@ -803,6 +816,10 @@ pub(in crate::table_catalog) fn catalog_list_next_continuation(
 
 #[async_trait::async_trait]
 pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        None
+    }
+
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         None
     }
@@ -918,6 +935,30 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         fence.ensure_held()
     }
 
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        _write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object_fenced(bucket, object, data, precondition, fence).await
+    }
+
+    async fn delete_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        _write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.delete_object_unlocked(bucket, object).await?;
+        fence.ensure_held()
+    }
+
     async fn delete_object(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()>;
 
     async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()>;
@@ -934,11 +975,40 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         fence.ensure_held()
     }
 
+    async fn delete_object_if_match_fenced_for_incarnation(
+        &self,
+        _bucket: &str,
+        _object: &str,
+        _expected_etag: &str,
+        _expected_incarnation_id: Uuid,
+        _fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        Err(TableCatalogStoreError::Unsupported(
+            "incarnation-checked cleanup is not supported by this backend".to_string(),
+        ))
+    }
+
     async fn delete_object_unlocked(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<()> {
         self.delete_object(bucket, object).await
     }
 
     async fn list_objects(&self, bucket: &str, prefix: &str) -> TableCatalogStoreResult<Vec<String>>;
+
+    async fn list_objects_for_cleanup(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogCleanupObject>> {
+        Err(TableCatalogStoreError::Unsupported(
+            "authoritative cleanup listing is not supported by this backend".to_string(),
+        ))
+    }
+
+    async fn ensure_no_multipart_uploads(&self, _bucket: &str) -> TableCatalogStoreResult<()> {
+        Err(TableCatalogStoreError::Unsupported(
+            "multipart cleanup validation is not supported by this backend".to_string(),
+        ))
+    }
 
     async fn list_objects_page(
         &self,
@@ -2204,6 +2274,7 @@ where
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
     strong_runtime: StrongTableCatalogRuntime,
+    registration_cache: TableCatalogRegistrationCache,
 }
 
 impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
@@ -2211,6 +2282,7 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
         Self {
             store: self.store.clone(),
             strong_runtime: self.strong_runtime.clone(),
+            registration_cache: self.registration_cache.clone(),
         }
     }
 }
@@ -2220,7 +2292,19 @@ where
     S: TableCatalogStorage,
 {
     pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
-        Self { store, strong_runtime }
+        Self::new_with_runtimes(store, strong_runtime, TableCatalogRegistrationCache::default())
+    }
+
+    pub fn new_with_runtimes(
+        store: Arc<S>,
+        strong_runtime: StrongTableCatalogRuntime,
+        registration_cache: TableCatalogRegistrationCache,
+    ) -> Self {
+        Self {
+            store,
+            strong_runtime,
+            registration_cache,
+        }
     }
 }
 
@@ -2231,6 +2315,10 @@ impl<S> TableCatalogObjectBackend for EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
+    fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
+        Some(self.registration_cache.clone())
+    }
+
     fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
         Some(self.strong_runtime.clone())
     }
@@ -2390,6 +2478,46 @@ where
             .await
     }
 
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        self.put_object_with_options(bucket, object, data, precondition, Some(write_guards), Some(fence))
+            .await
+    }
+
+    async fn delete_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        write_guards: Vec<WriteCommitGuard>,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
+        if write_guards.is_empty() {
+            return Err(TableCatalogStoreError::Internal("catalog delete has no namespace owner".to_string()));
+        }
+        let mut options = ObjectOptions {
+            no_lock: true,
+            ..Default::default()
+        };
+        fence.add_to_object_options(&mut options);
+        for guard in &write_guards {
+            options.add_write_commit_guard(guard);
+        }
+        match self.store.delete_object(bucket, object, options).await {
+            Ok(_) => fence.ensure_held(),
+            Err(err) if is_missing_storage_error(&err) => fence.ensure_held(),
+            Err(err) => Err(storage_error_to_catalog("delete fenced catalog object", err)),
+        }
+    }
+
     async fn put_object_fenced(
         &self,
         bucket: &str,
@@ -2412,7 +2540,7 @@ where
     }
 
     async fn delete_object_if_match(&self, bucket: &str, object: &str, expected_etag: &str) -> TableCatalogStoreResult<()> {
-        self.delete_object_if_match_with_fence(bucket, object, expected_etag, None)
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, None, None)
             .await
     }
 
@@ -2424,7 +2552,25 @@ where
         fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<()> {
         fence.ensure_held()?;
-        self.delete_object_if_match_with_fence(bucket, object, expected_etag, Some(fence))
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, Some(fence), None)
+            .await
+    }
+
+    async fn delete_object_if_match_fenced_for_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        expected_etag: &str,
+        expected_incarnation_id: Uuid,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        if expected_incarnation_id.is_nil() {
+            return Err(TableCatalogStoreError::Invalid(
+                "cleanup requires a non-nil bucket incarnation".to_string(),
+            ));
+        }
+        fence.ensure_held()?;
+        self.delete_object_if_match_with_fence(bucket, object, expected_etag, Some(fence), Some(expected_incarnation_id))
             .await
     }
 
@@ -2498,6 +2644,57 @@ where
         })
     }
 
+    async fn list_objects_for_cleanup(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> TableCatalogStoreResult<Vec<TableCatalogCleanupObject>> {
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let _cancel_on_drop = cancel.clone().drop_guard();
+        let (sender, mut receiver) = tokio::sync::mpsc::channel::<CatalogObjectInfoOrErr>(100);
+        let walk = self.store.clone().walk_authoritative(
+            cancel,
+            bucket,
+            prefix,
+            sender,
+            CatalogWalkOptions {
+                include_free_versions: true,
+                ..Default::default()
+            },
+        );
+        let collect = async move {
+            let mut objects = Vec::new();
+            while let Some(result) = receiver.recv().await {
+                if let Some(err) = result.err {
+                    return Err(storage_error_to_catalog("inspect cleanup object versions", err));
+                }
+                let object = result.item.ok_or_else(|| {
+                    TableCatalogStoreError::Internal("cleanup object walk returned an empty result".to_string())
+                })?;
+                objects.push(TableCatalogCleanupObject {
+                    key: object.name,
+                    version_id: object.version_id.filter(|id| !id.is_nil()).map(|id| id.to_string()),
+                    etag: object.etag,
+                    delete_marker: object.delete_marker,
+                });
+            }
+            Ok(objects)
+        };
+        let (walk_result, objects) = tokio::join!(walk, collect);
+        let objects = objects?;
+        walk_result.map_err(|err| storage_error_to_catalog("list cleanup object versions", err))?;
+        Ok(objects)
+    }
+
+    async fn ensure_no_multipart_uploads(&self, bucket: &str) -> TableCatalogStoreResult<()> {
+        self.store.ensure_no_multipart_uploads(bucket).await.map_err(|err| match err {
+            StorageError::BucketNotEmpty(_) => {
+                TableCatalogStoreError::Conflict(format!("table bucket {bucket} contains unfinished multipart uploads"))
+            }
+            other => storage_error_to_catalog("inspect unfinished multipart uploads", other),
+        })
+    }
+
     async fn acquire_write_lock(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<TableCatalogLockGuard> {
         let lock = self
             .store
@@ -2534,12 +2731,14 @@ where
         object: &str,
         expected_etag: &str,
         fence: Option<&TableCatalogObjectMutationFence>,
+        expected_incarnation_id: Option<Uuid>,
     ) -> TableCatalogStoreResult<()> {
         let mut options = ObjectOptions {
             http_preconditions: Some(HTTPPreconditions {
                 if_match: Some(expected_etag.to_string()),
                 ..Default::default()
             }),
+            expected_bucket_incarnation_id: expected_incarnation_id,
             ..Default::default()
         };
         if let Some(fence) = fence {

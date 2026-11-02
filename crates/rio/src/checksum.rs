@@ -1081,7 +1081,7 @@ impl ChecksumHasher for Sha512Hasher {
 /// MD5 hasher for the ADDITIONAL checksum (x-amz-checksum-md5). Separate from the
 /// legacy Content-MD5 / ETag machinery — this only serves the flexible-checksum path.
 pub struct Md5Hasher {
-    hasher: md5::Md5,
+    hasher: rustfs_utils::FastMd5,
 }
 
 impl Default for Md5Hasher {
@@ -1092,14 +1092,14 @@ impl Default for Md5Hasher {
 
 impl Md5Hasher {
     pub fn new() -> Self {
-        use md5::Digest as _;
-        Self { hasher: md5::Md5::new() }
+        Self {
+            hasher: rustfs_utils::FastMd5::new(),
+        }
     }
 }
 
 impl Write for Md5Hasher {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        use md5::Digest as _;
         self.hasher.update(buf);
         Ok(buf.len())
     }
@@ -1111,13 +1111,11 @@ impl Write for Md5Hasher {
 
 impl ChecksumHasher for Md5Hasher {
     fn finalize(&mut self) -> Vec<u8> {
-        use md5::Digest as _;
-        self.hasher.clone().finalize().to_vec()
+        self.hasher.finalize_bytes().to_vec()
     }
 
     fn reset(&mut self) {
-        use md5::Digest as _;
-        self.hasher = md5::Md5::new();
+        self.hasher.reset();
     }
 }
 

@@ -9038,6 +9038,13 @@ mod tests {
             "constructing an object lock must not clone each client Arc"
         );
 
+        // Check shared ownership before acquisition can spawn pending cleanup.
+        let read_lock = set
+            .new_ns_lock("bucket", "read-object")
+            .await
+            .expect("second namespace lock should be created");
+        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
+
         let write_error = write_lock
             .get_write_lock(Duration::from_millis(500))
             .await
@@ -9052,11 +9059,6 @@ mod tests {
             ),
             "the shared client representation must preserve the exact write quorum result: {write_error}"
         );
-        let read_lock = set
-            .new_ns_lock("bucket", "read-object")
-            .await
-            .expect("second namespace lock should be created");
-        assert_eq!(Arc::strong_count(&set.shared_lockers), clients_before + 2);
         let read_guard = read_lock
             .get_read_lock(Duration::from_millis(500))
             .await

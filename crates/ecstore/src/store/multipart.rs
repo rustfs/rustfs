@@ -19,9 +19,27 @@ use crate::set_disk::get_lock_acquire_timeout;
 use crate::storage_api_contracts::multipart::MultipartOperations as _;
 use crate::storage_api_contracts::object::ObjectOperations as _;
 use futures::{StreamExt, stream};
+use rustfs_utils::path::encode_dir_object_ref;
 use std::collections::HashSet;
 
 const MULTIPART_LIST_SET_CONCURRENCY: usize = 4;
+
+#[async_trait::async_trait]
+impl crate::storage_api_contracts::multipart::MultipartUploadInspection for ECStore {
+    type Error = Error;
+
+    async fn ensure_no_multipart_uploads(&self, bucket: &str) -> Result<()> {
+        let (_, lifecycle_guard) = self
+            .guard_multipart_bucket_incarnation(bucket, &ObjectOptions::default())
+            .await?;
+        for pool in &self.pools {
+            for set in &pool.disk_set {
+                set.ensure_no_multipart_uploads(bucket).await?;
+            }
+        }
+        ensure_multipart_bucket_lifecycle_guard_held(lifecycle_guard.as_ref(), bucket, "")
+    }
+}
 
 #[cfg(test)]
 static DATA_MOVEMENT_MULTIPART_DISCOVERY_COUNTS: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Uuid, usize>>> =
@@ -1168,11 +1186,9 @@ impl ECStore {
         let oi = if require_all_pools {
             lookup_opts.metadata_cache_safe = false;
             lookup_opts.suppress_read_repair = true;
-            if let Err(err) = check_object_args(bucket, object) {
-                return Some(err);
-            }
-            let encoded_object = encode_dir_object(object);
-            self.get_latest_object_info_for_conditional_write(bucket, &encoded_object, &lookup_opts)
+            // Only completion uses this branch, after validating bucket and object.
+            let encoded_object = encode_dir_object_ref(object);
+            self.get_latest_object_info_for_conditional_write(bucket, encoded_object.as_ref(), &lookup_opts)
                 .await
                 .and_then(|(info, _)| {
                     lookup_opts.precondition_check(&info)?;

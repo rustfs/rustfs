@@ -28,9 +28,11 @@ use std::{
 
 use crate::storage_api::table::contract::http::HTTPPreconditions;
 use crate::storage_api::table::contract::list::{
-    ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-    ListOperations as StorageListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
+    AuthoritativeListOperations as StorageAuthoritativeListOperations, ListObjectVersionsInfo as StorageListObjectVersionsInfo,
+    ListObjectsV2Info as StorageListObjectsV2Info, ListOperations as StorageListOperations,
+    ObjectInfoOrErr as StorageObjectInfoOrErr, WalkOptions as StorageWalkOptions,
 };
+use crate::storage_api::table::contract::multipart::MultipartUploadInspection as StorageMultipartUploadInspection;
 use crate::storage_api::table::contract::namespace::NamespaceLocking as StorageNamespaceLocking;
 use crate::storage_api::table::contract::object::{ObjectIO as StorageObjectIO, ObjectOperations as StorageObjectOperations};
 use crate::storage_api::table::contract::range::HTTPRangeSpec;
@@ -58,6 +60,7 @@ use crate::storage_api::table::{
     StorageObjectOptions as ObjectOptions, StorageObjectToDelete as ObjectToDelete, StoragePutObjReader as PutObjReader,
 };
 
+mod cleanup_metadata;
 mod error;
 mod iceberg;
 mod identifier;
@@ -246,7 +249,9 @@ pub(crate) trait TableCatalogStorage:
         WalkOptions = CatalogWalkOptions,
         WalkCancellation = tokio_util::sync::CancellationToken,
         WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
-    > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+    > + StorageAuthoritativeListOperations
+    + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+    + StorageMultipartUploadInspection<Error = EcstoreError>
 {
 }
 
@@ -274,7 +279,9 @@ impl<T> TableCatalogStorage for T where
             WalkOptions = CatalogWalkOptions,
             WalkCancellation = tokio_util::sync::CancellationToken,
             WalkResultSender = tokio::sync::mpsc::Sender<CatalogObjectInfoOrErr>,
-        > + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+        > + StorageAuthoritativeListOperations
+        + StorageNamespaceLocking<Error = EcstoreError, NamespaceLock = rustfs_lock::NamespaceLockWrapper>
+        + StorageMultipartUploadInspection<Error = EcstoreError>
 {
 }
 

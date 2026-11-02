@@ -4534,7 +4534,7 @@ impl SetDisks {
 
             let stream = mem::replace(
                 &mut data.stream,
-                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, false)?,
+                HashReader::from_stream(Cursor::new(Vec::new()), 0, 0, None, None, true)?,
             );
 
             let small_size_hint = if matches!(write_path, SmallWritePath::Inline | SmallWritePath::SingleBlockNonInline) {
@@ -6129,7 +6129,11 @@ impl SetDisks {
                     );
                 }
 
-                if !tail_owns_tmp_cleanup {
+                let all_local_disks_cleaned_tmp = all_commit_disks_local
+                    && online_disks.len() == commit_set.set_drive_count
+                    && online_disks.iter().all(Option::is_some)
+                    && !issue3031_diag_enabled();
+                if !tail_owns_tmp_cleanup && !all_local_disks_cleaned_tmp {
                     let cleanup_set = commit_set.clone();
                     let cleanup_tmp_dir = commit_tmp_dir.clone();
                     cleanup_runtime::spawn(commit_cleanup_reservation.clone(), async move {

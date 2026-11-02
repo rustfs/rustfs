@@ -91,6 +91,26 @@ Use `GET /iceberg/v1/buckets/{warehouse}` to check `enabled` and `disable-suppor
 
 Review the bucket lifecycle configuration before disabling: clearing table-bucket protection allows existing object expiration rules to run again. Objects are preserved by the disable operation itself. Catalog disablement requires no namespaces, retained table/view resources, or objects under `.rustfs-table/`; an active rename or backing migration also blocks it. Clean up through supported catalog operations; do not manually delete internal metadata to bypass these checks.
 
-The server persists an inactive catalog entry before clearing the bucket marker. If marker publication fails, retry the same DELETE; the marker retains object protections until the retry succeeds. A subsequent PUT explicitly enables the bucket again. Stale requests cannot initialize an inactive catalog entry. No table metadata or object data is deleted by either state change.
+The server persists an inactive catalog entry before clearing the bucket marker. If marker publication fails, retry the same DELETE; the marker retains object protections until the retry succeeds. A subsequent PUT explicitly enables the bucket again. Stale requests cannot initialize an inactive catalog entry. A plain DELETE and a subsequent PUT preserve table metadata and object data.
+
+### Clean Up Deleted Empty Tables
+
+For the object-backed catalog, `DELETE /iceberg/v1/buckets/{warehouse}?cleanup=true` removes the metadata and internal records left by deleted empty tables, then disables the table catalog. Ordinary table deletion continues to preserve files. Cleanup preserves existing table record formats and can process empty tables deleted before the server upgrade.
+
+Complete the server upgrade across all serving nodes and set the existing `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` setting before requesting cleanup. Delete the empty tables and their namespaces through the catalog APIs, then send the cleanup request with `admin:SetTableBucket` and `s3:GetObject`/`s3:DeleteObject` permissions for the target metadata objects. The `/_iceberg/v1` alias accepts the same option. Omitting `cleanup` or setting it to `false` keeps the ordinary disable behavior; repeated or invalid values are rejected.
+
+Cleanup accepts only recognized empty-table metadata in the default managed warehouse. Active catalog resources, snapshots or other data references, user objects, object versions, incomplete multipart uploads, corrupt or unknown metadata, and unfinished catalog operations block cleanup. The server validates the complete cleanup plan and object permissions before deleting any object. Durable-strong catalogs retain their existing disable procedure.
+
+If a storage operation fails during cleanup, retry the same request. The server checks the remaining objects again and keeps the bucket's table protection enabled until cleanup and catalog disablement complete. No separate cleanup task file is created. After a successful response with `enabled: false`, delete the empty bucket through the normal S3 `DeleteBucket` operation.
+
+## Object-Backed Registration Reads
+
+Table registration checks table ID uniqueness and warehouse directory overlap using the existing catalog and warehouse index records. Each registration obtains a complete inventory under the existing publication and migration guards. System-bucket inventory records must satisfy the same metadata commit checks as ordinary catalog reads. An incomplete or failed inventory rejects registration.
+
+Each server keeps a bounded memory cache of validated ownership records. A record can be reused only when its object identity and ETag match the current inventory. New or changed records are read and validated again. Cache eviction and process restarts cause additional reads; catalog state continues to come from the existing persisted records. The cache is automatic and requires no additional configuration or stored objects.
+
+Registration still enumerates the namespace and warehouse index prefixes, so enumeration work grows with catalog size. Cache hits reduce object-body reads and JSON parsing. A cache hit verifies the current metadata identity and reuses previously validated content; it does not re-read the current body to check its physical readability. Conditional writes, rollback, and lock-loss fencing continue to control publication.
+
+Existing catalog formats and Console and Iceberg client request formats are preserved. Concurrent writers must follow the existing publication, migration, and storage fencing protocol; the memory cache does not provide synchronization for writers that bypass those guards.
 
 Before rolling back to a server version without this endpoint, re-enable disabled catalogs with PUT while the supporting version is running. Older enable handlers do not reactivate inactive catalog entries. Complete the server upgrade across the cluster before using disablement.

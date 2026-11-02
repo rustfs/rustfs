@@ -44,15 +44,16 @@ pub(crate) mod lifecycle {
 
 pub(crate) mod list {
     pub(crate) use rustfs_storage_api::{
-        ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo, ListObjectsV2Info as StorageListObjectsV2Info,
-        ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, VersionMarker, WalkOptions as StorageWalkOptions,
-        WalkVersionsSortOrder,
+        AuthoritativeListOperations, ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsInfo,
+        ListObjectsV2Info as StorageListObjectsV2Info, ListOperations, ObjectInfoOrErr as StorageObjectInfoOrErr, VersionMarker,
+        WalkOptions as StorageWalkOptions, WalkVersionsSortOrder,
     };
 }
 
 pub(crate) mod multipart {
     pub(crate) use rustfs_storage_api::{
-        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadResult, PartInfo,
+        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadInspection,
+        MultipartUploadResult, PartInfo,
     };
 }
 

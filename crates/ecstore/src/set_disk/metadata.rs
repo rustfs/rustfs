@@ -161,7 +161,7 @@ impl SetDisks {
             )
         });
         let mut metadata = FileMeta::new();
-        for parts in versions.into_values() {
+        for (version_id, parts) in versions {
             let errors = parts
                 .iter()
                 .zip(&missing)
@@ -173,15 +173,25 @@ impl SetDisks {
                     }
                 })
                 .collect::<Vec<_>>();
-            let read_quorum = match Self::object_quorum_from_meta(&parts, &errors, default_parity) {
-                Ok((quorum, _)) => usize::try_from(quorum).map_err(|_| DiskError::FileCorrupt)?,
+            let (read_quorum, write_quorum) = match Self::object_quorum_from_meta(&parts, &errors, default_parity) {
+                Ok((read, write)) => (
+                    usize::try_from(read).map_err(|_| DiskError::FileCorrupt)?,
+                    usize::try_from(write).map_err(|_| DiskError::FileCorrupt)?,
+                ),
                 Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) if complete => continue,
                 Err(DiskError::FileNotFound | DiskError::FileVersionNotFound) => return Err(DiskError::ErasureReadQuorum),
                 Err(DiskError::ErasureReadQuorum) if complete => continue,
                 Err(error) => return Err(error),
             };
-            let mod_time = Self::common_time(&Self::list_object_modtimes(&parts, &errors), read_quorum);
-            let selected = Self::pick_valid_fileinfo(&parts, mod_time, None, read_quorum)?;
+            let selected = if crate::bucket::utils::is_meta_bucketname(bucket) && version_id.is_none() {
+                // A null-version system record must carry the same commit proof
+                // as GET. Listing only needs the selected metadata, so no disk
+                // handles are retained from the shared read selector.
+                Self::select_committed_fileinfo(&vec![None; disk_count], &parts, &errors, "", read_quorum, write_quorum)?.1
+            } else {
+                let mod_time = Self::common_time(&Self::list_object_modtimes(&parts, &errors), read_quorum);
+                Self::pick_valid_fileinfo(&parts, mod_time, None, read_quorum)?
+            };
             metadata.add_version(selected)?;
         }
         if metadata.versions.is_empty() {

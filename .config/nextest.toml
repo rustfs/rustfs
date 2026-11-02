@@ -234,7 +234,7 @@ test-group = 'embedded-test-ports'
 # processes cannot exhaust those budgets. Keep deadlines and assertions intact.
 # The short HTTP fixtures are tracked in rustfs/backlog#2714.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|oversized_response_is_rejected_without_buffering_it)$/)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|cleanup_accepts_missing_object_and_still_deletes_the_bucket|cleanup_diagnostics_identify_each_disconnected_transport_stage|cleanup_diagnostics_identify_each_failed_http_stage_without_private_context|cleanup_diagnostics_identify_timeouts_without_resetting_the_shared_deadline|oversized_response_is_rejected_without_buffering_it)$/)))'
 threads-required = "num-test-threads"
 
 # This cancellation probe hashes the serving executable before acquiring its
@@ -548,7 +548,7 @@ filter = 'package(rustfs) & (binary(/^embedded.*_test$/) | binary(admin_diagnost
 test-group = 'embedded-test-ports'
 
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|oversized_response_is_rejected_without_buffering_it)$/)))'
+filter = 'package(rustfs) & (binary(/^connect_registration$/) | binary(connect_inventory) | binary(connect_perf_drive) | (binary(connect_perf_client) & test(=configured_proxy_and_direct_endpoint_failures_are_distinct)) | (binary(connect_perf_object) & test(/^(real_rustfs_endpoint_and_production_cli_support_bounded_get_and_put|cleanup_uses_a_budget_independent_of_the_measurement_window|cleanup_accepts_missing_object_and_still_deletes_the_bucket|cleanup_diagnostics_identify_each_disconnected_transport_stage|cleanup_diagnostics_identify_each_failed_http_stage_without_private_context|cleanup_diagnostics_identify_timeouts_without_resetting_the_shared_deadline|oversized_response_is_rejected_without_buffering_it)$/)))'
 threads-required = "num-test-threads"
 
 # Preserve the cancellation probe's startup budget and assertions in CI too.
@@ -974,6 +974,12 @@ test-group = 'e2e-vault'
 # start multiple server fixtures and issue many sequential S3 operations.
 [[profile.e2e-full.overrides]]
 filter = 'package(e2e_test) & (test(/^list_objects_v2_pagination_test::tests::(test_list_objects_v2_delimiter_small_page_traverses_all|test_list_objects_v2_max_keys_above_limit_returns_token|test_list_objects_v2_maxkeys_above_limit_with_delimiter)$/) | test(=reliant::tiering::test_hermetic_transition_restore_failure_expiry_and_retry))'
+threads-required = "num-test-threads"
+
+# The mc fixture uploads hundreds of objects concurrently before measuring listing.
+# Reserve the runner so other server fixtures do not starve its disk operations.
+[[profile.e2e-full.overrides]]
+filter = 'package(e2e_test) & test(=mc_mirror_small_bucket_test::test_mc_mirror_small_bucket_completes_without_list_timeout)'
 threads-required = "num-test-threads"
 
 # Fixed, small contract for every executable server change. These existing
