@@ -132,6 +132,13 @@ jobs:
           path: auto-testing
           persist-credentials: false
 
+      - name: Prepare validation Python runtime
+        # The pool / ilm / replication validation runners require a managed
+        # Python, exactly like the chain's validation job provides.
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+
       - name: Select sweep cases
         id: select
         env:
@@ -235,7 +242,8 @@ jobs:
             # topology, this purge guarantees the next case starts clean even
             # when the previous one died mid-run.
             for node in ${RUSTFS_NODES}; do
-              ssh -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
+              # -n keeps ssh from consuming the case list this loop reads from stdin
+              ssh -n -o BatchMode=yes -o ConnectTimeout=10 "${RUSTFS_SSH_USER}@${node}" '
                 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo -n"
                 ${SUDO} systemctl stop rustfs 2>/dev/null || true
                 if ${SUDO} dpkg -l rustfs 2>/dev/null | grep -q "^ii"; then
@@ -254,6 +262,7 @@ jobs:
           SWEEP_ROOT: ${{ runner.temp }}/validation-sweep
           PACKAGE_URL: ${{ steps.candidate.outputs.package_url }}
           SOURCE_SHA: ${{ steps.candidate.outputs.source_sha }}
+          AUTO_TESTING_SHA: ${{ steps.candidate.outputs.testing_sha }}
         run: |
           set -euo pipefail
           python3 - <<'PY'
@@ -362,6 +371,7 @@ jobs:
             ${{ runner.temp }}/validation-sweep/sweep-cases.txt
             ${{ runner.temp }}/validation-sweep/candidate.json
             ${{ runner.temp }}/validation-sweep/results/
+            ${{ runner.temp }}/validation-sweep/run/
           # warn (not error): an early infra failure legitimately leaves no
           # per-case evidence, and the failing step is already red.
           if-no-files-found: warn
