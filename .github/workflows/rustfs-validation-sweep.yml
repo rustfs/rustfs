@@ -139,6 +139,19 @@ jobs:
         with:
           python-version: "3.12"
 
+      - name: Install validation Python requirements
+        # Case scripts call python3 and import boto3 at startup. Install the
+        # functional chain's client into a per-run env so that interpreter
+        # sees it without changing the runner's shared Python.
+        run: |
+          set -euo pipefail
+          validation_python="${RUNNER_TEMP}/rustfs-validation-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          test ! -e "${validation_python}"
+          python3 -m venv "${validation_python}"
+          "${validation_python}/bin/python" -m pip install \
+            -r auto-testing/scripts/validation_ilm/requirements.txt
+          printf '%s\n' "${validation_python}/bin" >> "${GITHUB_PATH}"
+
       - name: Select sweep cases
         id: select
         env:
