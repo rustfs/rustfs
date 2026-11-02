@@ -6003,18 +6003,47 @@ pub(crate) fn multipart_payload_commit_guard_std(
     })
 }
 
+#[cfg(windows)]
+fn multipart_payload_commit_guard_std(
+    metadata_guard: &RenameCommitGuard,
+    source_parent: &Path,
+    publication_root: &PublicationRoot,
+) -> io::Result<RenameCommitGuard> {
+    // Pin the payload staging tree like a distinct-tree metadata source; the
+    // target stays the exact parent handle the metadata transaction holds.
+    let source_parent_guard = lock_windows_directory_tree(source_parent, Some(source_parent), publication_root)?;
+    Ok(RenameCommitGuard {
+        source_parent: source_parent.to_path_buf(),
+        destination_parent: metadata_guard.destination_parent.clone(),
+        source_parent_guard,
+        destination_parent_guard: metadata_guard.destination_parent_guard.clone(),
+    })
+}
+
 /// Native MPU metadata and payload have distinct source parents. Reuse the
 /// exact target identity already held by the metadata transaction, while
 /// independently pinning the private payload source under the same root.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) async fn multipart_payload_commit_guard(
     metadata_guard: &RenameCommitGuard,
     source_parent: &Path,
+    publication_root: &PublicationRoot,
     lease: Arc<NamespaceMutationLease>,
 ) -> io::Result<RenameCommitGuard> {
     let metadata_guard = metadata_guard.clone();
     let source_parent = source_parent.to_path_buf();
-    run_blocking_namespace_operation(lease, move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent)).await
+    #[cfg(target_os = "linux")]
+    let operation = {
+        // The Linux guard already carries its publication root.
+        let _ = publication_root;
+        move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent)
+    };
+    #[cfg(windows)]
+    let operation = {
+        let publication_root = publication_root.clone();
+        move || multipart_payload_commit_guard_std(&metadata_guard, &source_parent, &publication_root)
+    };
+    run_blocking_namespace_operation(lease, operation).await
 }
 
 pub(crate) fn prepare_rename_commit_guard(
@@ -7125,12 +7154,31 @@ pub(crate) fn rename_multipart_source_owned_std(
     {
         let _ = &guard;
         let source_guard = pin_multipart_source_directory(source_parent, base, root)?;
+        // The prepared Windows source holds DELETE access and shares only
+        // read, so the precondition's own opens of that entry (or, for a
+        // directory, of its guarded tree) would fail with a sharing violation.
+        // Check it first under a non-exclusive identity anchor, then require
+        // the exclusive handle to name the same file.
+        #[cfg(windows)]
+        let (_source_identity_anchor, expected_source_identity) = {
+            let anchor = open_windows_rename_source_identity(source, &source_guard)?;
+            precondition()?;
+            anchor
+        };
         let preparation = prepare_rename_with_retry(source, destination, base, root)?;
+        #[cfg(windows)]
+        if windows_file_identity(&preparation.source)? != expected_source_identity {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "rename source identity changed after its precondition",
+            ));
+        }
         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         {
             prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
             prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
         }
+        #[cfg(not(windows))]
         precondition()?;
         #[cfg(unix)]
         validate_prepared_rename_source(&pinned_source, source)?;
@@ -7717,7 +7765,7 @@ mod multipart_source_preservation_tests {
         let metadata_guard =
             prepare_rename_commit_guard(&canonical, &target, &bucket, &publication).expect("canonical metadata guard");
         let lease = acquire_namespace_mutation_lease(&target).await;
-        let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, lease.clone())
+        let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, &publication, lease.clone())
             .await
             .expect("distinct pinned payload source");
         assert!(
@@ -7752,6 +7800,61 @@ mod multipart_source_preservation_tests {
         );
     }
 
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_multipart_payload_guard_publishes_distinct_source_into_metadata_target() {
+        // Build paths from the configured root: the resolved handle path may
+        // be verbatim, where `/` in a joined key is not a separator.
+        let (root, publication, _source, _destination) = fixture();
+        let root = root.path();
+        let canonical = root.join("multipart/upload");
+        let temporary = root.join("tmp/attempt");
+        let bucket = root.join("bucket");
+        let target = bucket.join("object");
+        for directory in [&canonical, &temporary, &target] {
+            std::fs::create_dir_all(directory).expect("two-source guard directories");
+        }
+        let payload = temporary.join("payload");
+        std::fs::create_dir(&payload).expect("private payload DD");
+        std::fs::write(payload.join("part.1"), b"native selected shard").expect("private payload shard");
+        let head = canonical.join("xl.meta");
+        let destination = target.join("xl.meta");
+        let metadata_guard =
+            prepare_rename_commit_guard(&canonical, &target, &bucket, &publication).expect("canonical metadata guard");
+        let lease = acquire_namespace_mutation_lease(&target).await;
+        assert!(
+            rename_all_with_commit_guard(&payload, target.join("payload"), &bucket, &publication, &metadata_guard, lease.clone())
+                .await
+                .is_err(),
+            "the metadata guard does not pin the private payload parent"
+        );
+        assert!(
+            payload.join("part.1").exists(),
+            "a rejected payload rename must leave its source in place"
+        );
+        let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, &publication, lease.clone())
+            .await
+            .expect("distinct pinned payload source");
+        let mut prepared = create_prepared_rename_source_with_commit_guard(&head, &destination, &metadata_guard)
+            .expect("canonical prepared metadata");
+        prepared
+            .write_all(b"prepared native metadata", true)
+            .expect("durable canonical metadata");
+        rename_all_with_commit_guard(&payload, target.join("payload"), &bucket, &publication, &payload_guard, lease.clone())
+            .await
+            .expect("payload rename uses its own pinned TMP parent");
+        assert!(head.exists(), "payload publication must not consume the canonical head");
+        rename_all_with_prepared_source(prepared, &head, &destination, &bucket, &publication, &metadata_guard, lease)
+            .await
+            .expect("metadata rename keeps its canonical parent");
+        assert!(!head.exists());
+        assert_eq!(std::fs::read(&destination).expect("published metadata"), b"prepared native metadata");
+        assert_eq!(
+            std::fs::read(target.join("payload/part.1")).expect("published selected shard"),
+            b"native selected shard"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn multipart_payload_guard_rejects_replaced_private_source_or_shared_destination() {
@@ -7773,7 +7876,7 @@ mod multipart_source_preservation_tests {
             let metadata_guard =
                 prepare_rename_commit_guard(&canonical, &target, &bucket, &publication).expect("canonical metadata guard");
             let lease = acquire_namespace_mutation_lease(&target).await;
-            let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, lease.clone())
+            let payload_guard = multipart_payload_commit_guard(&metadata_guard, &temporary, &publication, lease.clone())
                 .await
                 .expect("pin payload and shared target");
             let replaced = if replace_source { &temporary } else { &target };

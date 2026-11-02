@@ -107,6 +107,21 @@ jobs:
         shell: pwsh
         run: cargo test -p rustfs-ecstore --lib multipart_owned_record_parent_barriers_ -- --nocapture
 
+      # Native multipart completion publishes its payload from a different
+      # parent than its metadata, and abort renames under a precondition; both
+      # need their own Windows handle discipline.
+      - name: Test native multipart complete and abort publication
+        shell: pwsh
+        run: >-
+          cargo test -p rustfs-ecstore --lib --
+          native_abort_missing_state_with_actual_owned_records_never_becomes_legacy_or_missing
+          native_abort_pending_intent_is_not_a_delete_certificate_and_raw_cleanup_preserves_exact_evidence
+          --nocapture
+
+      - name: Test directory removal fallback
+        shell: pwsh
+        run: "cargo test -p rustfs-ecstore --lib disk::fs::tests::test_remove -- --nocapture"
+
       - name: Test Windows path conversion
         shell: pwsh
         run: "cargo test -p rustfs-utils --no-default-features --features path --lib dunce:: -- --nocapture"
