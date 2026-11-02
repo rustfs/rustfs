@@ -113,7 +113,9 @@ fn build_default_crypto_provider() -> rustls::crypto::CryptoProvider {
 }
 
 fn ensure_default_crypto_provider() -> Result<bool> {
-    let already_installed = build_default_crypto_provider().install_default().is_err();
+    // The process-wide provider is write-once, so an existing provider needs no replacement.
+    let already_installed =
+        rustls::crypto::CryptoProvider::get_default().is_some() || build_default_crypto_provider().install_default().is_err();
     #[cfg(feature = "fips")]
     if !rustls::crypto::CryptoProvider::get_default().is_some_and(|provider| provider.fips()) {
         return Err(std::io::Error::other(
