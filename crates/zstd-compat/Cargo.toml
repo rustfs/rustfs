@@ -33,10 +33,10 @@ zstd-safe = { version = "8.2.0", features = ["seekable"] }
 toml = "1.1.8"
 semver = "1.0.28"
 apache-avro.workspace = true
-arrow-array = "59.3.2"
-arrow-ipc = { version = "59.3.2", features = ["zstd"] }
-arrow-schema = "59.3.2"
-parquet = { version = "59.3.2", default-features = false, features = ["arrow", "zstd"] }
+arrow-array = "60.1.0"
+arrow-ipc = { version = "60.1.0", features = ["zstd"] }
+arrow-schema = "60.1.0"
+parquet = { version = "60.1.0", default-features = false, features = ["arrow", "zstd"] }
 kafka-protocol = { version = "0.18.0", default-features = false, features = ["zstd"] }
 bytes.workspace = true
 

@@ -147,7 +147,7 @@ rustfs-zip = { path = "./crates/zip", version = "1.0.2" }
 async-channel = "2.5.0"
 async_zip = { default-features = false, version = "0.0.19" }
 mysql_async = { default-features = false, version = "0.37.1" }
-async-compression = { version = "0.4.51" }
+async-compression = { version = "0.4.52" }
 async-trait = "0.1.92"
 async-nats = { version = "0.51.0", default-features = false }
 axum = "0.8.9"
@@ -337,7 +337,7 @@ strum = { version = "0.28.0" }
 sysinfo = "0.40.1"
 temp-env = "0.3.6"
 tempfile = "3.27.0"
-test-case = "3.4.0"
+test-case = "3.4.1"
 thiserror = "2.0.21"
 tracing = { version = "0.1.44" }
 tracing-appender = "0.2.5"
@@ -356,7 +356,7 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.2.1"
+zip = "9.2.2"
 zstd = "0.14.3"
 
 # Observability and Metrics
@@ -384,7 +384,7 @@ russh-sftp = "3.0.1"
 dav-server = "0.11.0"
 
 # Performance Analysis and Memory Profiling
-rustfs-mimalloc = { version = "0.7.2" }
+rustfs-mimalloc = { version = "0.7.3" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
 hotpath = { version = "0.30.3", default-features = false }
 # Snapshot testing for output format regression detection
