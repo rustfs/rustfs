@@ -925,6 +925,13 @@ impl MetaCacheEntriesSorted {
 
 const METACACHE_STREAM_VERSION: u8 = 2;
 const METACACHE_READ_CHUNK_SIZE: usize = 64 << 10;
+/// Upper bound on one incremental reservation while accumulating a single
+/// metacache element. Read rounds double from [`METACACHE_READ_CHUNK_SIZE`]
+/// up to this bound so a legitimately large xl.meta does not pay one small
+/// read per chunk, while a corrupt length prefix still cannot force a
+/// reservation larger than the payload that has already arrived (see
+/// rustfs/rustfs#2715 and rustfs/rustfs#9120).
+const METACACHE_READ_MAX_CHUNK_SIZE: usize = 4 << 20;
 /// msgpack `false`: the entry-stream terminator, and the only byte a legacy
 /// reader accepts after it (see `MetacacheWriter::close_with_limit_reached`).
 const METACACHE_TERMINATOR: u8 = 0xc2;
@@ -1157,13 +1164,14 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
         // A whole xl.meta can legitimately exceed the limit on its individual
         // msgpack values. Grow only as payload arrives, so a corrupt length
         // prefix cannot cause a speculative allocation of the advertised size.
+        let mut chunk = METACACHE_READ_CHUNK_SIZE;
         while self.buf.len() < read_size {
             let start = self.buf.len();
             let extra = if lookahead {
                 let min_chunk = METACACHE_READ_CHUNK_SIZE.saturating_sub(start);
-                (read_size - start).clamp(min_chunk, METACACHE_READ_CHUNK_SIZE)
+                (read_size - start).clamp(min_chunk, chunk)
             } else {
-                (read_size - start).min(METACACHE_READ_CHUNK_SIZE)
+                (read_size - start).min(chunk)
             };
             if let Err(e) = self.buf.try_reserve(extra) {
                 let err = Error::other(format!("metacache stream: buffer allocation of {extra} bytes failed: {e}"));
@@ -1194,6 +1202,7 @@ impl<R: AsyncRead + Unpin> MetacacheReader<R> {
                     return Err(err);
                 }
             }
+            chunk = chunk.saturating_mul(2).min(METACACHE_READ_MAX_CHUNK_SIZE);
         }
 
         self.pos = read_size;
@@ -2153,6 +2162,76 @@ mod tests {
             reader.skip(1).await.expect("consume current entry without reading another");
             assert!(reader.peek().await.expect("stream must terminate").is_none());
         }
+    }
+
+    /// rustfs/rustfs#9120: a listing stream made of many ordinary entries must
+    /// decode completely even when the aggregate stream exceeds the per-value
+    /// `MAX_MSGP_ELEMENT_SIZE` bound that release 1.0.4 applied to every
+    /// element.
+    #[tokio::test]
+    async fn test_reader_wide_listing_aggregate_exceeds_per_value_limit() {
+        // ~2.9 KiB of metadata per entry matches the per-entry cost observed in
+        // the #9120 production report; 6,000 entries push the stream past 16 MiB.
+        const ENTRIES: usize = 6_000;
+        let metadata = vec![0xab; 2_880];
+        let entries: Vec<MetaCacheEntry> = (0..ENTRIES)
+            .map(|i| MetaCacheEntry {
+                name: format!("bigdir/object-{i:05}"),
+                metadata: metadata.clone(),
+                ..Default::default()
+            })
+            .collect();
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("wide listing must encode");
+        writer.close().await.expect("stream must close");
+        let bytes = output.into_inner();
+        assert!(
+            bytes.len() > 16 << 20,
+            "fixture must exceed the per-value limit, got {} bytes",
+            bytes.len()
+        );
+        let mut reader = MetacacheReader::new(Cursor::new(bytes));
+        let decoded = reader.read_all().await.expect("wide listing must decode");
+        assert_eq!(decoded, entries);
+    }
+
+    /// The #9120 failure shape seen in production: one entry whose metadata is
+    /// an xl.meta that grew past 16 MiB with its version history, listed among
+    /// ordinary neighbors and skipped past without losing the framing.
+    #[tokio::test]
+    async fn test_reader_oversized_entry_among_ordinary_neighbors_stays_listable() {
+        let small = |i: u8| MetaCacheEntry {
+            name: format!("bigdir/object-{i}"),
+            metadata: vec![i; 64],
+            ..Default::default()
+        };
+        let oversized = MetaCacheEntry {
+            name: "bigdir/huge-versions".to_string(),
+            metadata: vec![0xcd; (16 << 20) + 12_345],
+            ..Default::default()
+        };
+        let entries = vec![small(0), small(1), oversized.clone(), small(2), small(3)];
+        let mut output = Cursor::new(Vec::new());
+        let mut writer = MetacacheWriter::new(&mut output);
+        writer.write(&entries).await.expect("mixed listing must encode");
+        writer.close().await.expect("stream must close");
+
+        let mut reader = MetacacheReader::new(Cursor::new(output.into_inner()));
+        assert_eq!(
+            reader.peek().await.expect("first entry").expect("present"),
+            entries[0],
+            "an ordinary entry before the oversized one must decode"
+        );
+        reader.skip(1).await.expect("skip the first entry");
+        assert_eq!(reader.peek().await.expect("second entry").expect("present"), entries[1]);
+        assert_eq!(
+            reader.peek().await.expect("oversized entry").expect("present"),
+            oversized,
+            "an entry past the per-value limit must round-trip whole"
+        );
+        reader.skip(1).await.expect("skipping the oversized entry must stay aligned");
+        assert_eq!(reader.read_all().await.expect("tail must decode"), entries[3..]);
     }
 
     #[test]
