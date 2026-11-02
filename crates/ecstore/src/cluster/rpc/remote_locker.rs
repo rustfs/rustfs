@@ -445,6 +445,10 @@ impl RemoteClient {
                 }
             }
         });
+        // A successful lock RPC over a cached or fresh channel proves the peer is
+        // reachable; reconcile the internode peer-health gauge so it does not stay
+        // stale when no fresh dial fires (issue #9119).
+        rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
     }
 
     fn admit_late_release(&self) -> bool {
@@ -672,6 +676,7 @@ impl RemoteClient {
                     with_lock_peer_health(&addr, |health| {
                         health.last_success = Some(Instant::now());
                     });
+                    rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&addr);
                     rustfs_io_metrics::lock_metrics::record_remote_lock_rpc_late_completion(op, "success");
                     if let Some(late) = late {
                         late(response).await;

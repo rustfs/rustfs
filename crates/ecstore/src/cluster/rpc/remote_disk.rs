@@ -1637,6 +1637,7 @@ impl RemoteDisk {
         let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
         if initial_probe_ok {
             health.record_operation_success(&endpoint, "connectivity_probe_success");
+            rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&addr);
         } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!(
                 event = EVENT_REMOTE_DISK_HEALTH,
@@ -1708,6 +1709,7 @@ impl RemoteDisk {
                     // Perform basic connectivity check
                     if Self::perform_connectivity_check(&addr).await.is_ok() {
                         health.record_operation_success(&endpoint, "connectivity_probe_success");
+                        rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&addr);
                     } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!(
                             event = EVENT_REMOTE_DISK_HEALTH,
@@ -1778,6 +1780,7 @@ impl RemoteDisk {
                 }
                 _ = interval.tick() => {
                     if Self::perform_recovery_probe(&addr, &endpoint).await.is_ok() {
+                        rustfs_io_metrics::internode_metrics::record_peer_reachable(&addr);
                         let became_online = health.mark_recovery_success(&endpoint, "disk_info_probe_success");
                         debug!(
                             event = EVENT_REMOTE_DISK_HEALTH,
@@ -2009,6 +2012,7 @@ impl RemoteDisk {
             let operation_result = operation().await;
             if operation_result.is_ok() {
                 self.health.record_operation_success(&self.endpoint, "operation_success");
+                rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
             }
             self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                 .await;
@@ -2023,6 +2027,7 @@ impl RemoteDisk {
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint, "operation_success");
+                    rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
                 }
                 self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                     .await;
