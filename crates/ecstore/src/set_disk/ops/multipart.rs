@@ -10060,7 +10060,7 @@ mod tests {
 
         // Real disk callbacks and health probes must share wall-clock deadlines.
         // Advancing Tokio time can expire unrelated healthy-drive probes.
-        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, Some("2"))], async {
+        temp_env::async_with_vars([(rustfs_config::ENV_DRIVE_MAX_TIMEOUT_DURATION, None::<&str>)], async {
             let (dirs, store) = crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks().await;
             crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
             let bucket = "mpu-quorum-success-physical";
@@ -10087,6 +10087,8 @@ mod tests {
                 local.observe_multipart_cleanup_for_test(&upload_path)
             }).collect::<Vec<_>>();
             let disk::Disk::Local(paused_local) = disks[3].as_ref() else { panic!("actual local physical tail") };
+            // Fault only the held leg; healthy disks keep their normal I/O budgets.
+            let _paused_timeout = paused_local.override_operation_timeout_for_test(Duration::from_secs(2));
             let io_target = paused_local.get_disk().get_object_path_for_io(bucket, object).expect("real IO target");
             let mutation_key = paused_local.get_disk().get_object_path(bucket, object).expect("logical native mutation key");
             let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
@@ -10243,7 +10245,15 @@ mod tests {
                 let size = copy_info.get_actual_size().expect("actual source size");
                 copy_info.put_object_reader = Some(PutObjReader::new(HashReader::from_stream(reader.stream, size, size, None, None, false).expect("actual Copy body stream")));
                 tokio::time::timeout(Duration::from_secs(5), store.copy_object(bucket, object, bucket, copy_object, &mut copy_info, &ObjectOptions::default(), &ObjectOptions::default()))
-                    .await.expect("cross-key Copy cannot wait on the old successful logical owner").expect("actual CopyObject");
+                    .await.expect("cross-key Copy cannot wait on the old successful logical owner")
+                    .unwrap_or_else(|error| {
+                        let health = disks.iter().enumerate().map(|(slot, disk)| {
+                            let disk::Disk::Local(local) = disk.as_ref() else { panic!("actual local Copy backend") };
+                            let metrics = local.metrics_snapshot();
+                            (slot, disk.runtime_state(), metrics.total_errors_timeout, metrics.total_errors_availability, metrics.total_waiting, metrics.api_calls)
+                        }).collect::<Vec<_>>();
+                        panic!("actual CopyObject: {error:?}; drive health (slot, state, timeouts, unavailable, waiting, calls): {health:?}");
+                    });
                 drop(copy_info);
                 let mut copied = store.get_object_reader(bucket, copy_object, None, HeaderMap::new(), &ObjectOptions::default()).await.expect("actual copied body");
                 let mut actual = Vec::new();
