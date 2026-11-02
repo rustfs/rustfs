@@ -456,3 +456,258 @@ async fn restored_receipts_replay_and_completed_restore_never_rolls_back_a_later
         1
     );
 }
+
+struct SupersededBackupFixture {
+    backend: TestCatalogObjectBackend,
+    loser: TableCommitRequest,
+    winner: TableCommitRequest,
+    committed: TableCommitResult,
+}
+
+async fn superseded_backup_fixture() -> SupersededBackupFixture {
+    let (backend, _, _) = backup_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let loser = backup_recovery_commit_request(&backend, &store, "losing-backup-cas", "00002.metadata.json").await;
+    let table_path = TableCatalogObjectPaths::default().table_entry_path(
+        "analytics",
+        &Namespace::parse("sales").unwrap(),
+        &IdentifierSegment::parse("orders").unwrap(),
+    );
+    backend.fail_next_put(RUSTFS_META_BUCKET, &table_path).await;
+    assert!(matches!(
+        store.commit_table(loser.clone()).await,
+        Err(TableCatalogStoreError::Internal(_))
+    ));
+    let winner = backup_recovery_commit_request(&backend, &store, "winning-backup-cas", "00003.metadata.json").await;
+    let committed = store.commit_table(winner.clone()).await.unwrap();
+    let report = store.recover_table_commits("analytics", "sales", "orders").await.unwrap();
+    assert_eq!(report.manual_review_count, 0);
+    assert_eq!(report.finalized_count, 0);
+    assert_eq!(
+        report
+            .commits
+            .iter()
+            .find(|entry| entry.commit_id == loser.commit_id)
+            .unwrap()
+            .recovery_state,
+        TableCommitRecoveryState::Superseded
+    );
+    SupersededBackupFixture {
+        backend,
+        loser,
+        winner,
+        committed,
+    }
+}
+
+#[tokio::test]
+async fn backup_seals_proven_losers_without_changing_their_staged_receipts_or_the_winner() {
+    let SupersededBackupFixture {
+        backend,
+        loser,
+        winner,
+        committed,
+    } = superseded_backup_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let paths = TableCatalogObjectPaths::default();
+    let protected = [
+        paths.table_entry_path(
+            "analytics",
+            &Namespace::parse("sales").unwrap(),
+            &IdentifierSegment::parse("orders").unwrap(),
+        ),
+        paths.commit_log_entry_path("analytics", &committed.table.table_id, &loser.commit_id),
+        paths.commit_idempotency_entry_path("analytics", &committed.table.table_id, loser.idempotency_key.as_deref().unwrap()),
+        paths.commit_log_entry_path("analytics", &committed.table.table_id, &winner.commit_id),
+        paths.commit_idempotency_entry_path("analytics", &committed.table.table_id, winner.idempotency_key.as_deref().unwrap()),
+    ];
+    let mut before = Vec::new();
+    for path in &protected {
+        before.push(backend.read_object(RUSTFS_META_BUCKET, path).await.unwrap().unwrap());
+    }
+    let backup = store
+        .create_object_catalog_backup("analytics", None)
+        .await
+        .expect("proven losers are sealable");
+    for (path, original) in protected.iter().zip(&before) {
+        assert_eq!(
+            backend.read_object(RUSTFS_META_BUCKET, path).await.unwrap().as_ref(),
+            Some(original),
+            "backup rewrote {path}"
+        );
+    }
+    let bytes = store
+        .export_object_catalog_backup("analytics", &backup.backup_id)
+        .await
+        .unwrap();
+    let artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let archived = artifact["objects"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|object| object["object"].as_str() == Some(protected[1].as_str()))
+        .unwrap();
+    let staged_bytes: Vec<u8> = serde_json::from_value(archived["data"].clone()).unwrap();
+    assert_eq!(staged_bytes, before[1].data);
+    let staged: CommitLogEntry = serde_json::from_slice(&staged_bytes).unwrap();
+    assert_eq!(staged.status, CommitLogStatus::Staged);
+    assert_eq!(staged.idempotency_key, loser.idempotency_key);
+    assert!(matches!(store.commit_table(loser).await, Err(TableCatalogStoreError::Conflict(_))));
+    assert_eq!(store.load_table("analytics", "sales", "orders").await.unwrap(), Some(committed.table));
+}
+
+#[tokio::test]
+async fn isolated_restore_retains_loser_proof_retry_conflicts_and_later_commits() {
+    let SupersededBackupFixture {
+        backend: source,
+        loser,
+        winner,
+        committed,
+    } = superseded_backup_fixture().await;
+    let source_store = ObjectTableCatalogStore::new(source.clone());
+    let backup = source_store.create_object_catalog_backup("analytics", None).await.unwrap();
+    let bytes = source_store
+        .export_object_catalog_backup("analytics", &backup.backup_id)
+        .await
+        .unwrap();
+    let source_before = maintenance_test_object_versions(&source).await;
+    let loser_path =
+        TableCatalogObjectPaths::default().commit_log_entry_path("analytics", &committed.table.table_id, &loser.commit_id);
+    let original_loser = source.read_object(RUSTFS_META_BUCKET, &loser_path).await.unwrap().unwrap();
+    let target = TestCatalogObjectBackend::default();
+    let target_store = ObjectTableCatalogStore::new(target.clone());
+    target_store
+        .import_object_catalog_backup("analytics", bytes.clone())
+        .await
+        .unwrap();
+    let mut receipt = target_store
+        .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some("restore-superseded-proof"))
+        .await
+        .unwrap();
+    assert_eq!(receipt.status, TableCatalogRestoreStatus::Restored);
+    assert_eq!(
+        target_store.load_table("analytics", "sales", "orders").await.unwrap(),
+        Some(committed.table.clone())
+    );
+    let restored_loser = target.read_object(RUSTFS_META_BUCKET, &loser_path).await.unwrap().unwrap();
+    assert_eq!(restored_loser.data, original_loser.data);
+    let restarted = ObjectTableCatalogStore::new(target.clone());
+    let recovery = restarted.recover_table_commits("analytics", "sales", "orders").await.unwrap();
+    assert_eq!(recovery.manual_review_count, 0);
+    assert_eq!(recovery.finalized_count, 0);
+    assert_eq!(
+        recovery
+            .commits
+            .iter()
+            .find(|entry| entry.commit_id == loser.commit_id)
+            .unwrap()
+            .recovery_state,
+        TableCommitRecoveryState::Superseded
+    );
+    assert!(matches!(
+        restarted.commit_table(loser.clone()).await,
+        Err(TableCatalogStoreError::Conflict(_))
+    ));
+    let replay = restarted.commit_table(winner).await.unwrap();
+    assert_eq!(replay.table, committed.table);
+    assert_eq!(replay.commit_log, committed.commit_log);
+    assert_eq!(
+        target.read_object(RUSTFS_META_BUCKET, &loser_path).await.unwrap(),
+        Some(restored_loser.clone())
+    );
+    let indexed = restarted
+        .get_commit_by_idempotency_key("analytics", &committed.table.table_id, loser.idempotency_key.as_deref().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(indexed.status, CommitLogStatus::Staged);
+    assert_eq!(indexed.commit_id, loser.commit_id);
+
+    let next_request = backup_recovery_commit_request(&target, &restarted, "reloaded-after-restore", "00004.metadata.json").await;
+    let next = restarted.commit_table(next_request.clone()).await.unwrap();
+    assert_eq!(next.table.generation, committed.table.generation + 1);
+    assert_eq!(restarted.commit_table(next_request).await.unwrap().table, next.table);
+    let versions = maintenance_test_object_versions(&target).await;
+    receipt.status = TableCatalogRestoreStatus::AlreadyRestored;
+    assert_eq!(
+        restarted
+            .restore_object_catalog_backup_with_id("analytics", &backup.backup_id, None, false, Some("restore-superseded-proof"))
+            .await
+            .unwrap(),
+        receipt
+    );
+    assert_eq!(
+        maintenance_test_object_versions(&target).await,
+        versions,
+        "Completed replay republished old state"
+    );
+    let restarted = ObjectTableCatalogStore::new(target.clone());
+    assert_eq!(restarted.load_table("analytics", "sales", "orders").await.unwrap(), Some(next.table));
+    assert_eq!(
+        restarted
+            .diagnose_table_catalog("analytics", "sales", "orders", 0)
+            .await
+            .unwrap()
+            .recovery_status,
+        TableCatalogRecoveryStatus::Healthy
+    );
+    assert_eq!(target.read_object(RUSTFS_META_BUCKET, &loser_path).await.unwrap(), Some(restored_loser));
+    restarted
+        .create_object_catalog_backup("analytics", None)
+        .await
+        .expect("historical winner proof remains sealable after a later commit");
+    assert_eq!(
+        restarted
+            .export_object_catalog_backup("analytics", &backup.backup_id)
+            .await
+            .unwrap(),
+        bytes
+    );
+    assert_eq!(
+        maintenance_test_object_versions(&source).await,
+        source_before,
+        "isolated target changed the source"
+    );
+}
+
+#[tokio::test]
+async fn raw_v1_restore_rejects_a_loser_whose_winner_proof_is_missing_without_writes() {
+    let SupersededBackupFixture {
+        backend: source,
+        winner,
+        committed,
+        ..
+    } = superseded_backup_fixture().await;
+    let source_store = ObjectTableCatalogStore::new(source);
+    let backup = source_store.create_object_catalog_backup("analytics", None).await.unwrap();
+    let bytes = source_store
+        .export_object_catalog_backup("analytics", &backup.backup_id)
+        .await
+        .unwrap();
+    let mut artifact: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let paths = TableCatalogObjectPaths::default();
+    let winner_log = paths.commit_log_entry_path("analytics", &committed.table.table_id, &winner.commit_id);
+    let winner_index =
+        paths.commit_idempotency_entry_path("analytics", &committed.table.table_id, winner.idempotency_key.as_deref().unwrap());
+    artifact["objects"].as_array_mut().unwrap().retain(|object| {
+        object["object"].as_str() != Some(winner_log.as_str()) && object["object"].as_str() != Some(winner_index.as_str())
+    });
+    let (backup_id, malformed) = reseal_recovery_legacy_artifact(artifact);
+    let target = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(target.clone());
+    store
+        .import_object_catalog_backup("analytics", malformed.clone())
+        .await
+        .unwrap();
+    let before = maintenance_test_object_versions(&target).await;
+    let attempts = target.state.lock().await.put_attempts.clone();
+    let error = store
+        .restore_object_catalog_backup_with_id("analytics", &backup_id, None, false, Some("missing-loser-proof"))
+        .await
+        .unwrap_err();
+    assert_backup_recovery_conflict(&error, "ManualReview");
+    assert_eq!(maintenance_test_object_versions(&target).await, before);
+    assert_eq!(target.state.lock().await.put_attempts, attempts);
+    assert!(store.get_table_bucket("analytics").await.unwrap().is_none());
+    assert_eq!(store.export_object_catalog_backup("analytics", &backup_id).await.unwrap(), malformed);
+}

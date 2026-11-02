@@ -328,3 +328,57 @@ fn backup_commit_policy_checks_both_receipt_directions_even_without_an_active_ta
         assert_recovery(store.validate_backup_commit_recovery("analytics", &objects), "receipt");
     }
 }
+
+#[test]
+fn backup_commit_policy_preserves_proven_superseded_receipts_without_rewriting_them() {
+    for idempotent in [false, true] {
+        let (store, mut objects, entry) = fixture();
+        let winner = current_commit(&entry);
+        let loser = CommitLogEntry {
+            commit_id: "superseded-commit".to_string(),
+            idempotency_key: idempotent.then(|| "superseded-request".to_string()),
+            new_version_token: "superseded-token".to_string(),
+            new_metadata_location: "tables/table-id/metadata/loser.metadata.json".to_string(),
+            status: CommitLogStatus::Staged,
+            ..winner.clone()
+        };
+        publish(&mut objects, &winner);
+        publish(&mut objects, &loser);
+        let before = objects.clone();
+        store
+            .validate_backup_commit_recovery("analytics", &objects)
+            .expect("a proven losing request is not pending recovery");
+        assert_eq!(objects, before, "sealing must retain the original STAGED audit bytes");
+    }
+}
+
+#[test]
+fn backup_commit_policy_never_accepts_a_loser_without_intact_winner_and_index_proof() {
+    for failure in ["missing-winner", "wrong-base", "conflicting-index"] {
+        let (store, mut objects, entry) = fixture();
+        let winner = current_commit(&entry);
+        let mut loser = CommitLogEntry {
+            commit_id: "superseded-commit".to_string(),
+            idempotency_key: Some("superseded-request".to_string()),
+            new_version_token: "superseded-token".to_string(),
+            new_metadata_location: "tables/table-id/metadata/loser.metadata.json".to_string(),
+            status: CommitLogStatus::Staged,
+            ..winner.clone()
+        };
+        if failure == "wrong-base" {
+            loser.expected_version_token = "unknown-base-token".to_string();
+        }
+        publish(&mut objects, &winner);
+        publish(&mut objects, &loser);
+        if failure == "missing-winner" {
+            objects.retain(|object| object.object != log_path(&winner) && object.object != index_path(&winner));
+        } else if failure == "conflicting-index" {
+            let mut conflicting = loser.clone();
+            conflicting.operation = "overwrite".to_string();
+            put_record(&mut objects, index_path(&loser), &conflicting);
+        }
+        let before = objects.clone();
+        assert_recovery(store.validate_backup_commit_recovery("analytics", &objects), "ManualReview");
+        assert_eq!(objects, before);
+    }
+}

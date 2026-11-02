@@ -102,8 +102,11 @@ where
                     .idempotency_key
                     .as_ref()
                     .and_then(|key| indexes.get(table_id).and_then(|records| records.get(key)));
-                let recovery = table_commit_recovery_entry(entry, commit, indexed, history.proves_committed(commit));
-                if recovery.recovery_state != TableCommitRecoveryState::Committed {
+                let recovery = table_commit_recovery_entry_from_history(entry, commit, indexed, &history);
+                if !matches!(
+                    recovery.recovery_state,
+                    TableCommitRecoveryState::Committed | TableCommitRecoveryState::Superseded
+                ) {
                     return Err(TableCatalogStoreError::Conflict(format!(
                         "commit recovery required before backup or restore: {}/{}/{} commit {} is {:?}: {}",
                         entry.table_bucket,
