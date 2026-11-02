@@ -134,13 +134,15 @@ jobs:
 
       - name: Prepare validation Python runtime
         # The pool / ilm / replication validation runners require a managed
-        # Python with their client requirements, exactly like the chain's
-        # validation job provides (boto3 et al).
+        # Python, exactly like the chain's validation job provides.
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: "3.12"
 
-      - name: Install validation Python client
+      - name: Install validation Python requirements
+        # Case scripts call python3 and import boto3 at startup. Install the
+        # functional chain's client into a per-run env so that interpreter
+        # sees it without changing the runner's shared Python.
         run: |
           set -euo pipefail
           validation_python="${RUNNER_TEMP}/rustfs-validation-python-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
