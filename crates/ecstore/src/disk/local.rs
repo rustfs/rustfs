@@ -34645,8 +34645,32 @@ mod test {
             }
         }
 
-        // Invalidating by the object prefix drops the cached descriptor.
+        let key = FdKey {
+            volume: volume.into(),
+            path: object.into(),
+            direct: false,
+        };
+        let released = {
+            let entry = cache
+                .get(&key)
+                .await
+                .expect("repeated reads must retain the cached descriptor");
+            Arc::downgrade(&entry.file)
+        };
+
+        // Reads reject invalidated entries immediately; maintenance releases the descriptor.
         backend.invalidate_cached_fds_under(volume, "obj/abc");
+        assert!(
+            cache.get(&key).await.is_none(),
+            "prefix invalidation must immediately reject the cached descriptor"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while released.upgrade().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("prefix invalidation must release the descriptor without further cache operations");
         assert_eq!(cache.entry_count().await, 0, "prefix invalidation must drop the cached descriptor");
     }
 
