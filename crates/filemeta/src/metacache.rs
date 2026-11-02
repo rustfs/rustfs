@@ -3776,6 +3776,74 @@ mod tests {
     }
 
     #[test]
+    fn scanner_and_list_select_same_non_free_version_after_cleanup_record() {
+        let mut fm = FileMeta::load(&crate::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta"))
+            .expect("load realistic xl.meta");
+        let object = fm.versions[0].into_fileinfo("bucket", "object", true).expect("decode object");
+        let mut free_meta_sys = HashMap::new();
+        rustfs_utils::http::insert_bytes(&mut free_meta_sys, rustfs_utils::http::SUFFIX_FREE_VERSION, Vec::new());
+        let free = FileMetaShallowVersion::try_from(FileMetaVersion {
+            version_type: VersionType::Delete,
+            delete_marker: Some(MetaDeleteMarker {
+                version_id: Some(Uuid::from_u128(42)),
+                mod_time: Some(OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("free timestamp")),
+                meta_sys: free_meta_sys,
+            }),
+            write_version: 1,
+            ..Default::default()
+        })
+        .expect("encode cleanup record");
+        fm.versions.insert(0, free);
+        let entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("encode metadata"),
+            cached: None,
+            reusable: false,
+        };
+        let scanned = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("scanner version decode");
+        assert_eq!(scanned.free_versions.len(), 1);
+        assert_eq!(scanned.versions.len(), 1);
+        assert!(!scanned.versions[0].is_latest, "free record occupies the original first position");
+        assert!(!entry.clone().is_latest_delete_marker(), "cleanup record is not a visible delete marker");
+        let listed = entry.to_fileinfo("bucket").expect("LIST version decode");
+        assert_eq!(listed.version_id, object.version_id);
+        assert_eq!(listed.version_id, scanned.versions[0].version_id);
+        assert_eq!(listed.mod_time, scanned.versions[0].mod_time);
+        assert_eq!(listed.size, scanned.versions[0].size);
+        assert!(!listed.deleted);
+
+        let marker_id = Uuid::from_u128(43);
+        fm.add_version(FileInfo {
+            volume: "bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(marker_id),
+            deleted: true,
+            mod_time: Some(OffsetDateTime::from_unix_timestamp(2_100_000_000).expect("marker timestamp")),
+            ..Default::default()
+        })
+        .expect("add current delete marker");
+        let mut marker_entry = MetaCacheEntry {
+            name: "object".to_string(),
+            metadata: fm.marshal_msg().expect("encode marker metadata"),
+            cached: None,
+            reusable: false,
+        };
+        let scanned = fm
+            .get_file_info_versions("bucket", "object", false)
+            .expect("scan marker stack");
+        assert_eq!(scanned.versions.len(), 2);
+        assert_eq!(scanned.versions[0].version_id, Some(marker_id));
+        assert!(scanned.versions[0].deleted);
+        assert!(!scanned.versions[1].deleted, "older object must remain hidden by the current marker");
+        assert!(marker_entry.is_latest_delete_marker());
+        let listed = marker_entry.to_fileinfo("bucket").expect("LIST marker version");
+        assert_eq!(listed.version_id, scanned.versions[0].version_id);
+        assert!(listed.deleted);
+    }
+
+    #[test]
     fn file_info_versions_and_borrowed_slice_decode_match_cached_and_full_decoders() {
         let mut fm = FileMeta::load(&crate::test_data::create_realistic_object_xlmeta().expect("realistic xl.meta"))
             .expect("load realistic xl.meta");
