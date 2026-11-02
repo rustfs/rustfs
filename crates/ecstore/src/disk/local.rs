@@ -3012,7 +3012,7 @@ fn should_fail_local_inline_rollback_hardlink(dst_path: &Path) -> bool {
         .remove(dst_path)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn remove_dst_base_before_commit_std(
     dst_path: &str,
     guard: os::RenameCommitGuard,
@@ -3290,7 +3290,7 @@ fn should_fail_local_inline_rollback_hardlink(_dst_path: &Path) -> bool {
     false
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 pub(super) fn remove_dst_base_before_commit_std(
     _dst_path: &str,
     guard: os::RenameCommitGuard,

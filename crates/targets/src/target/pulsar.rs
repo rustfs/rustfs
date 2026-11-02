@@ -90,7 +90,7 @@ impl PulsarArgs {
             return Ok(());
         }
 
-        validate_pulsar_broker(&self.broker)?;
+        let parsed = validate_pulsar_broker(&self.broker)?;
 
         if self.topic.trim().is_empty() {
             return Err(TargetError::Configuration("Pulsar topic cannot be empty".to_string()));
@@ -116,8 +116,6 @@ impl PulsarArgs {
             return Err(TargetError::Configuration("Pulsar queue directory must be an absolute path".to_string()));
         }
 
-        let parsed = Url::parse(&self.broker)
-            .map_err(|e| TargetError::Configuration(format!("Invalid Pulsar broker URL: {e} (value: '{}')", self.broker)))?;
         let tls_enabled = parsed.scheme() == "pulsar+ssl";
         // A CA bundle is TLS trust material a plaintext `pulsar://` broker
         // silently ignores, so treat it as a genuine misconfiguration. The
@@ -173,6 +171,10 @@ fn pulsar_producer_name(target_id: &TargetID, target_type: TargetType, nonce: Uu
 
 pub async fn connect_pulsar(args: &PulsarArgs) -> Result<Pulsar<TokioExecutor>, TargetError> {
     args.validate()?;
+    #[cfg(feature = "fips")]
+    if Url::parse(&args.broker).is_ok_and(|url| url.scheme() == "pulsar+ssl") {
+        super::ensure_rustls_provider_installed()?;
+    }
 
     let mut builder = Pulsar::builder(args.broker.clone(), TokioExecutor);
 

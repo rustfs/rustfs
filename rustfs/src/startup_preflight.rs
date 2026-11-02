@@ -63,6 +63,9 @@ pub(crate) async fn init_startup_server_preflight(
     config: &Config,
     env_compat_report: &ExternalEnvCompatReport,
 ) -> std::result::Result<(), StartupServerPreflightError> {
+    #[cfg(feature = "fips")]
+    crate::startup_runtime_hooks::install_default_crypto_provider().map_err(StartupServerPreflightError::Other)?;
+
     crate::config::init_config_snapshot(config);
     init_license(config.license.clone());
     init_startup_observability(config.obs_endpoint.clone()).await?;

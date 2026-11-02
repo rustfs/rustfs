@@ -81,7 +81,7 @@ use time::Duration;
 use time::OffsetDateTime;
 use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, error, trace, warn};
+use tracing::{error, trace, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -448,16 +448,7 @@ impl TransitionClient {
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
     ) -> Result<TransitionClient, std::io::Error> {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            // No default provider is set yet; try to install aws-lc-rs.
-            // `install_default` can only fail if another thread races us and installs a provider
-            // between our check and this call, which is still safe to ignore.
-            if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
-                debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
-            }
-        } else {
-            debug!("rustls crypto provider already installed, skipping aws-lc-rs install");
-        }
+        rustfs_tls_runtime::ensure_crypto_provider().map_err(std::io::Error::other)?;
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
         let timeouts = timeouts.validate()?;
@@ -1862,21 +1853,36 @@ mod tests {
         assert!(outcome.is_ok(), "TLS config creation should not panic");
     }
 
-    /// Installing the rustls crypto provider when one is already set must not panic or return
-    /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
+    #[cfg(feature = "fips")]
     #[test]
-    fn provider_install_is_idempotent() {
-        // Install once (may already be set by another test in this binary — that's fine).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        // A second install attempt on an already-set provider must not panic.
-        let outcome = std::panic::catch_unwind(|| {
-            if rustls::crypto::CryptoProvider::get_default().is_none() {
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            }
-            // If a default is already present, the branch above is simply skipped.
-        });
-        assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    fn fips_transition_rejects_incompatible_host_provider() {
+        const CHILD: &str = "RUSTFS_TEST_TRANSITION_FIPS_PROVIDER";
+        if std::env::var_os(CHILD).is_some() {
+            let mut provider = rustfs_tls_runtime::default_crypto_provider();
+            provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+            provider.install_default().expect("install incompatible host provider");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let error = runtime
+                .block_on(super::TransitionClient::new("127.0.0.1:0", super::Options::default(), ""))
+                .expect_err("transition client must reject the incompatible provider");
+            assert!(error.to_string().contains("process-wide rustls crypto provider"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("fips_transition_rejects_incompatible_host_provider")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated transition TLS test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

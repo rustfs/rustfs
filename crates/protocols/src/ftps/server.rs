@@ -110,6 +110,9 @@ where
             ftps_required = self.config.ftps_required,
             "FTPS server starting"
         );
+        if self.config.tls_enabled && self.config.cert_dir.is_some() {
+            rustfs_tls_runtime::ensure_crypto_provider().map_err(|err| FtpsInitError::InvalidConfig(err.to_string()))?;
+        }
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
@@ -191,8 +194,6 @@ where
                 );
 
                 // Build ServerConfig with SNI support
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
                 let server_config = rustls::ServerConfig::builder()
                     .with_no_client_auth()
                     .with_cert_resolver(resolver);

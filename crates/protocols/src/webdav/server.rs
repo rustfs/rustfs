@@ -118,6 +118,10 @@ where
             "WebDAV server starting"
         );
 
+        if self.config.tls_enabled && self.config.cert_dir.is_some() {
+            rustfs_tls_runtime::ensure_crypto_provider().map_err(|err| WebDavInitError::Tls(err.to_string()))?;
+        }
+
         let listener = TcpListener::bind(self.config.bind_addr).await?;
         self.serve(listener, shutdown_rx).await
     }
@@ -154,8 +158,6 @@ where
                     Self::tls_reload_options(),
                     reload_shutdown_rx.clone(),
                 );
-
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
 
                 let server_config = ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver);
 

@@ -1936,6 +1936,7 @@ impl NativeMultipartPublication {
         *self.validated_prepared.lock() = Some(validated);
         Ok(())
     }
+    #[cfg(target_os = "linux")]
     pub(super) fn prepare_and_install_head_on_thread(
         &self,
         new_metadata: &[u8],

@@ -881,7 +881,7 @@ async fn build_mysql_pool_from_args(args: &MySqlArgs) -> Result<(Pool, bool), Ta
         .db_name(Some(dsn.database.clone()));
 
     if dsn.tls {
-        super::ensure_rustls_provider_installed();
+        super::ensure_rustls_provider_installed()?;
         let mut ssl_opts = SslOpts::default();
         if !args.tls_ca.is_empty() {
             let _ =

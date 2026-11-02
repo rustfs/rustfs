@@ -241,7 +241,7 @@ fn build_root_store(ca_path: &str, trust_leaf_as_ca: bool) -> Result<rustls::Roo
 }
 
 fn build_mqtt_tls_transport(broker: &Url, tls: &MQTTTlsConfig) -> Result<Transport, TargetError> {
-    super::ensure_rustls_provider_installed();
+    super::ensure_rustls_provider_installed()?;
 
     let client_config = match tls
         .policy
