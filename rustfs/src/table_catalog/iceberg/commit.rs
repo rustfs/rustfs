@@ -44,45 +44,58 @@ pub(crate) fn table_matches_staged_base(table: &TableEntry, commit_log: &CommitL
 pub(crate) struct TableCommitHistoryIndex<'a> {
     table_id: &'a str,
     reachable_states: BTreeSet<(&'a str, &'a str)>,
+    reachable_version_tokens: BTreeSet<&'a str>,
+    committed_successors: BTreeMap<(&'a str, &'a str), &'a CommitLogEntry>,
     ambiguous_states: BTreeSet<(&'a str, &'a str)>,
     cycle_detected: bool,
+    version_token_reused: bool,
 }
 
 impl<'a> TableCommitHistoryIndex<'a> {
     pub(crate) fn new(table: &'a TableEntry, commits: impl IntoIterator<Item = &'a CommitLogEntry>) -> Self {
-        let mut by_new_state = BTreeMap::<(&str, &str), Option<(&str, &str)>>::new();
+        let mut by_new_state = BTreeMap::<(&str, &str), Option<&CommitLogEntry>>::new();
         let mut ambiguous_states = BTreeSet::new();
         for commit in commits
             .into_iter()
             .filter(|commit| commit.table_id == table.table_id && !matches!(commit.status, CommitLogStatus::Failed))
         {
             let key = (commit.new_metadata_location.as_str(), commit.new_version_token.as_str());
-            let previous = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
             by_new_state
                 .entry(key)
                 .and_modify(|candidate| {
                     *candidate = None;
                     ambiguous_states.insert(key);
                 })
-                .or_insert(Some(previous));
+                .or_insert(Some(commit));
         }
 
         let mut reachable_states = BTreeSet::new();
+        let mut reachable_version_tokens = BTreeSet::new();
+        let mut committed_successors = BTreeMap::new();
+        let mut version_token_reused = false;
         let mut state = (table.metadata_location.as_str(), table.version_token.as_str());
         let cycle_detected = loop {
             if !reachable_states.insert(state) {
                 break true;
             }
-            let Some(Some(previous)) = by_new_state.get(&state) else {
+            version_token_reused |= !reachable_version_tokens.insert(state.1);
+            let Some(commit) = by_new_state.get(&state).copied().flatten() else {
                 break false;
             };
-            state = *previous;
+            let previous = (commit.previous_metadata_location.as_str(), commit.expected_version_token.as_str());
+            if matches!(commit.status, CommitLogStatus::Committed) {
+                committed_successors.insert(previous, commit);
+            }
+            state = previous;
         };
         Self {
             table_id: &table.table_id,
             reachable_states,
+            reachable_version_tokens,
+            committed_successors,
             ambiguous_states,
             cycle_detected,
+            version_token_reused,
         }
     }
 
@@ -97,6 +110,49 @@ impl<'a> TableCommitHistoryIndex<'a> {
                 .reachable_states
                 .contains(&(target.new_metadata_location.as_str(), target.new_version_token.as_str()))
     }
+
+    fn proven_superseding_commit(&self, target: &CommitLogEntry) -> Option<&CommitLogEntry> {
+        if self.cycle_detected
+            || self.version_token_reused
+            || !self.ambiguous_states.is_empty()
+            || self.table_id != target.table_id
+            || !matches!(target.status, CommitLogStatus::Staged)
+            || self.reachable_version_tokens.contains(target.new_version_token.as_str())
+        {
+            return None;
+        }
+        let base = (target.previous_metadata_location.as_str(), target.expected_version_token.as_str());
+        self.committed_successors
+            .get(&base)
+            .copied()
+            .filter(|winner| winner.commit_id != target.commit_id)
+    }
+}
+
+/// Classifies an object-backed staged loser without rewriting its receipt.
+///
+/// A reachable finalized successor from the same pointer/token base proves that
+/// the old request lost CAS. Its STAGED record and idempotency binding remain
+/// available, and replay of that old request must still conflict. Missing or
+/// contradictory proof remains a manual-review state.
+pub(crate) fn table_commit_recovery_entry_from_history(
+    table: &TableEntry,
+    commit_log: &CommitLogEntry,
+    idempotency_commit: Option<&CommitLogEntry>,
+    history: &TableCommitHistoryIndex<'_>,
+) -> TableCommitRecoveryEntry {
+    let mut entry = table_commit_recovery_entry(table, commit_log, idempotency_commit, history.proves_committed(commit_log));
+    if entry.recovery_state == TableCommitRecoveryState::ManualReview
+        && matches!(
+            entry.idempotency_index_status,
+            TableCommitIdempotencyIndexStatus::NotRequired | TableCommitIdempotencyIndexStatus::Matches
+        )
+        && let Some(winner) = history.proven_superseding_commit(commit_log)
+    {
+        entry.recovery_state = TableCommitRecoveryState::Superseded;
+        entry.reason = format!("staged request lost CAS to reachable committed successor {}", winner.commit_id);
+    }
+    entry
 }
 
 pub(crate) fn table_catalog_recovery_summary(
