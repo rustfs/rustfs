@@ -18,7 +18,7 @@ use crate::admin::runtime_sources::current_federated_identity_service;
 use crate::admin::service::federated_identity::DefaultFederatedSessionBinding;
 use crate::admin::service::oidc_config;
 use crate::admin::utils::json_response;
-use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, console_prefix};
+use crate::server::{ADMIN_PREFIX, MINIO_ADMIN_PREFIX, api_prefix, console_prefix};
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -605,7 +605,12 @@ fn derive_callback_uri_with_redirect_policy(
 }
 
 fn oidc_callback_path(provider_id: &str) -> String {
-    format!("{ADMIN_PREFIX}{OIDC_CALLBACK_SUFFIX}{provider_id}")
+    oidc_callback_path_under(api_prefix().unwrap_or(""), provider_id)
+}
+
+// The identity provider redirects the browser, so the callback must carry the external API prefix.
+fn oidc_callback_path_under(api_prefix: &str, provider_id: &str) -> String {
+    format!("{api_prefix}{ADMIN_PREFIX}{OIDC_CALLBACK_SUFFIX}{provider_id}")
 }
 
 /// Extract a query parameter from the URI.
@@ -1229,6 +1234,16 @@ mod tests {
         assert_eq!(
             derive_callback_uri(&req, "default").expect("admin callback URL"),
             "https://console.example.com/rustfs/admin/v3/oidc/callback/default"
+        );
+    }
+
+    #[test]
+    fn test_oidc_callback_path_includes_api_prefix() {
+        assert_eq!(oidc_callback_path_under("", "default"), "/rustfs/admin/v3/oidc/callback/default");
+        assert_eq!(oidc_callback_path("default"), "/rustfs/admin/v3/oidc/callback/default");
+        assert_eq!(
+            oidc_callback_path_under("/tools/rustfs/api", "default"),
+            "/tools/rustfs/api/rustfs/admin/v3/oidc/callback/default"
         );
     }
 
