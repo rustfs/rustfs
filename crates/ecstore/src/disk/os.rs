@@ -1677,8 +1677,230 @@ const MAX_GLOBAL_FILE_SYNCS: usize = 512;
 #[cfg(test)]
 const TEST_GLOBAL_FILE_SYNCS: usize = 64;
 
+const PATH_LOCK_SHARDS: usize = 64;
+const PATH_LOCK_INITIAL_GC_THRESHOLD: usize = 64;
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Default)]
+struct Xxh3SliceHasher(u64);
+
+#[cfg(unix)]
+impl std::hash::Hasher for Xxh3SliceHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, _i: usize) {}
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+#[cfg(unix)]
+type Xxh3SliceBuildHasher = std::hash::BuildHasherDefault<Xxh3SliceHasher>;
+
+#[cfg(unix)]
+#[inline]
+fn is_canonical_unix_key_bytes(bytes: &[u8]) -> bool {
+    if bytes.starts_with(b"./") {
+        return !bytes[1..].windows(2).any(|w| w == b"//") && !bytes[1..].windows(3).any(|w| w == b"/./");
+    }
+    const SLASH_MASK: u64 = 0x2f2f_2f2f_2f2f_2f2f;
+    const LOW_BITS: u64 = 0x0101_0101_0101_0101;
+    const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+
+    let mut i = 0usize;
+    let len = bytes.len();
+    let mut prev_s = 0u64;
+    while i + 8 <= len {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&bytes[i..i + 8]);
+        let w = u64::from_le_bytes(buf);
+        let x = w ^ SLASH_MASK;
+        let s = (x.wrapping_sub(LOW_BITS)) & !x & HIGH_BITS;
+        let s_prev1 = (s << 8) | (prev_s >> 56);
+        let s_prev2 = (s << 16) | (prev_s >> 48);
+        if (s & (s_prev1 | s_prev2)) != 0 {
+            let start = i.saturating_sub(2);
+            let window = &bytes[start..i + 8];
+            if window.windows(2).any(|pair| pair == b"//") || window.windows(3).any(|triple| triple == b"/./") {
+                return false;
+            }
+        }
+        prev_s = s;
+        i += 8;
+    }
+    let tail_start = i.saturating_sub(2);
+    let tail = &bytes[tail_start..];
+    !tail.windows(2).any(|pair| pair == b"//") && !tail.windows(3).any(|triple| triple == b"/./")
+}
+
+#[cfg(unix)]
+#[cold]
+fn canonical_unix_path_key_slow(path: &Path) -> std::borrow::Cow<'static, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut out = Vec::with_capacity(path.as_os_str().len());
+    for comp in path.components() {
+        match comp {
+            Component::RootDir => {
+                out.clear();
+                out.push(b'/');
+            }
+            Component::CurDir => {
+                if out.is_empty() {
+                    out.push(b'.');
+                }
+            }
+            Component::ParentDir => {
+                if out.len() > 1 || (out.len() == 1 && out[0] != b'/') {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(b"..");
+            }
+            Component::Normal(part) => {
+                if out.len() > 1 || (out.len() == 1 && out[0] != b'/') {
+                    out.push(b'/');
+                }
+                out.extend_from_slice(part.as_bytes());
+            }
+            Component::Prefix(_) => {}
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+#[cfg(unix)]
+#[inline]
+fn canonical_unix_path_key(path: &Path) -> std::borrow::Cow<'_, [u8]> {
+    use std::os::unix::ffi::OsStrExt;
+    let mut bytes = path.as_os_str().as_bytes();
+    while bytes.len() > 1 {
+        if bytes[bytes.len() - 1] == b'/' {
+            bytes = &bytes[..bytes.len() - 1];
+        } else if bytes.len() >= 2 && bytes[bytes.len() - 2] == b'/' && bytes[bytes.len() - 1] == b'.' {
+            bytes = if bytes.len() == 2 { b"/" } else { &bytes[..bytes.len() - 2] };
+        } else {
+            break;
+        }
+    }
+    if is_canonical_unix_key_bytes(bytes) {
+        return std::borrow::Cow::Borrowed(bytes);
+    }
+    canonical_unix_path_key_slow(path)
+}
+
+#[cfg(unix)]
+#[inline]
+fn unix_canonical_key_starts_with(path_key: &[u8], root_key: &[u8]) -> bool {
+    if root_key.is_empty() {
+        return true;
+    }
+    if root_key == b"/" {
+        return path_key.starts_with(b"/");
+    }
+    path_key.starts_with(root_key) && (path_key.len() == root_key.len() || path_key.get(root_key.len()) == Some(&b'/'))
+}
+
+struct PathLockShard<L> {
+    #[cfg(unix)]
+    entries: HashMap<Box<[u8]>, Weak<L>, Xxh3SliceBuildHasher>,
+    #[cfg(not(unix))]
+    entries: HashMap<PathBuf, Weak<L>>,
+    next_gc_threshold: usize,
+}
+
+impl<L> Default for PathLockShard<L> {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            next_gc_threshold: PATH_LOCK_INITIAL_GC_THRESHOLD,
+        }
+    }
+}
+
+struct ShardedPathLockRegistry<L> {
+    shards: [Mutex<PathLockShard<L>>; PATH_LOCK_SHARDS],
+}
+
+impl<L> ShardedPathLockRegistry<L> {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(PathLockShard::default())),
+        }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    fn get_or_create_by_key(&self, key: &[u8], init: impl FnOnce() -> L) -> Arc<L> {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        let shard_idx = ((hash >> 32) as usize) & (PATH_LOCK_SHARDS - 1);
+        let mut shard = self.shards[shard_idx].lock();
+        if let Some(existing) = shard.entries.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let created = Arc::new(init());
+        let weak = Arc::downgrade(&created);
+        if let Some(slot) = shard.entries.get_mut(key) {
+            *slot = weak;
+            return created;
+        }
+        if shard.entries.len() >= shard.next_gc_threshold {
+            shard.entries.retain(|_, entry| entry.strong_count() > 0);
+            shard.next_gc_threshold = shard
+                .entries
+                .len()
+                .saturating_add(1)
+                .saturating_mul(2)
+                .max(PATH_LOCK_INITIAL_GC_THRESHOLD);
+        }
+        shard.entries.insert(key.into(), weak);
+        created
+    }
+
+    #[inline]
+    fn get_or_create(&self, path: &Path, init: impl FnOnce() -> L) -> Arc<L> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            self.get_or_create_by_key(key.as_ref(), init)
+        }
+        #[cfg(not(unix))]
+        {
+            use std::hash::{Hash, Hasher};
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            path.hash(&mut hasher);
+            let shard_idx = ((hasher.finish() >> 32) as usize) & (PATH_LOCK_SHARDS - 1);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(existing) = shard.entries.get(path).and_then(Weak::upgrade) {
+                return existing;
+            }
+            let created = Arc::new(init());
+            let weak = Arc::downgrade(&created);
+            if let Some(slot) = shard.entries.get_mut(path) {
+                *slot = weak;
+                return created;
+            }
+            if shard.entries.len() >= shard.next_gc_threshold {
+                shard.entries.retain(|_, entry| entry.strong_count() > 0);
+                shard.next_gc_threshold = shard
+                    .entries
+                    .len()
+                    .saturating_add(1)
+                    .saturating_mul(2)
+                    .max(PATH_LOCK_INITIAL_GC_THRESHOLD);
+            }
+            shard.entries.insert(path.to_path_buf(), weak);
+            created
+        }
+    }
+}
+
 static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(global_file_sync_limit()));
-static DISK_FILE_SYNC_LIMITERS: LazyLock<Mutex<HashMap<PathBuf, Weak<Semaphore>>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_FILE_SYNC_LIMITERS: LazyLock<ShardedPathLockRegistry<Semaphore>> = LazyLock::new(ShardedPathLockRegistry::new);
 
 /// Dedicated tokio runtime for fsync/fdatasync blocking operations. When
 /// configured with >1 threads, isolates device-bound fsync from the main
@@ -1742,12 +1964,10 @@ fn fsync_spawn_blocking<T: Send + 'static>(f: impl FnOnce() -> T + Send + 'stati
         f()
     })
 }
-static DISK_VOLUME_MUTATION_LOCKS: LazyLock<Mutex<HashMap<PathBuf, Weak<RwLock<()>>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_VOLUME_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<RwLock<()>>> = LazyLock::new(ShardedPathLockRegistry::new);
 type NamespaceMutationLock = AsyncMutex<()>;
-type NamespaceMutationLockRegistry = HashMap<PathBuf, Weak<NamespaceMutationLock>>;
-static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+static DISK_NAMESPACE_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
+    LazyLock::new(ShardedPathLockRegistry::new);
 
 fn default_global_file_sync_limit(cpu_count: usize, max_blocking_threads: usize) -> usize {
     let cpu_scaled = cpu_count
@@ -1771,15 +1991,7 @@ fn global_file_sync_limit() -> usize {
 
 /// Reuse a disk's limiter across reconnects while detached sync calls still hold it.
 pub(crate) fn disk_file_sync_limiter(root: &Path) -> Arc<Semaphore> {
-    let mut limiters = DISK_FILE_SYNC_LIMITERS.lock();
-    limiters.retain(|_, limiter| limiter.strong_count() > 0);
-    if let Some(limiter) = limiters.get(root).and_then(Weak::upgrade) {
-        return limiter;
-    }
-
-    let limiter = Arc::new(Semaphore::new(MAX_PARALLEL_FILE_SYNCS));
-    limiters.insert(root.to_path_buf(), Arc::downgrade(&limiter));
-    limiter
+    DISK_FILE_SYNC_LIMITERS.get_or_create(root, || Semaphore::new(MAX_PARALLEL_FILE_SYNCS))
 }
 
 // Keep warm draining workers per disk/lane and spin briefly in user space
@@ -2147,45 +2359,131 @@ pub(crate) fn enter_blocking_test_hook() -> BlockingTestHookGuard {
     BlockingTestHookGuard { queue }
 }
 
-static DISK_BLOCKING_QUEUES: LazyLock<Mutex<HashMap<PathBuf, Weak<DiskBlockingQueue>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+struct RegisteredDiskBlockingQueue {
+    #[cfg(not(unix))]
+    root: PathBuf,
+    #[cfg(unix)]
+    canonical_root: Box<[u8]>,
+    queue: Weak<DiskBlockingQueue>,
+}
+
+static DISK_BLOCKING_QUEUES: LazyLock<parking_lot::RwLock<Vec<RegisteredDiskBlockingQueue>>> =
+    LazyLock::new(|| parking_lot::RwLock::new(Vec::new()));
 static FALLBACK_BLOCKING_QUEUES: LazyLock<[Arc<DiskBlockingQueue>; FALLBACK_NAMESPACE_QUEUE_SHARDS]> =
     LazyLock::new(|| std::array::from_fn(|_| DiskBlockingQueue::new()));
 
 pub(crate) fn register_disk_blocking_queue(root: &Path, io_root: &Path) -> Arc<DiskBlockingQueue> {
-    let mut queues = DISK_BLOCKING_QUEUES.lock();
-    queues.retain(|_, q| q.strong_count() > 0);
-    let queue = queues.get(root).and_then(Weak::upgrade).unwrap_or_else(|| {
-        let queue = DiskBlockingQueue::new();
-        queues.insert(root.to_path_buf(), Arc::downgrade(&queue));
-        queue
-    });
-    if io_root != root {
-        queues.insert(io_root.to_path_buf(), Arc::downgrade(&queue));
+    #[cfg(unix)]
+    let root_key = canonical_unix_path_key(root);
+    #[cfg(unix)]
+    let io_root_key = canonical_unix_path_key(io_root);
+
+    let mut queues = DISK_BLOCKING_QUEUES.write();
+    queues.retain(|entry| entry.queue.strong_count() > 0);
+    let queue = queues
+        .iter()
+        .find_map(|entry| {
+            #[cfg(unix)]
+            let matches = entry.canonical_root.as_ref() == root_key.as_ref();
+            #[cfg(not(unix))]
+            let matches = entry.root == root;
+            matches.then(|| entry.queue.upgrade()).flatten()
+        })
+        .unwrap_or_else(|| {
+            let queue = DiskBlockingQueue::new();
+            queues.push(RegisteredDiskBlockingQueue {
+                #[cfg(not(unix))]
+                root: root.to_path_buf(),
+                #[cfg(unix)]
+                canonical_root: root_key.as_ref().into(),
+                queue: Arc::downgrade(&queue),
+            });
+            queue
+        });
+    #[cfg(unix)]
+    let io_matches_root = io_root_key.as_ref() == root_key.as_ref();
+    #[cfg(not(unix))]
+    let io_matches_root = io_root == root;
+    if !io_matches_root {
+        let weak = Arc::downgrade(&queue);
+        if let Some(existing) = queues.iter_mut().find(|entry| {
+            #[cfg(unix)]
+            {
+                entry.canonical_root.as_ref() == io_root_key.as_ref()
+            }
+            #[cfg(not(unix))]
+            {
+                entry.root == io_root
+            }
+        }) {
+            existing.queue = weak;
+        } else {
+            queues.push(RegisteredDiskBlockingQueue {
+                #[cfg(not(unix))]
+                root: io_root.to_path_buf(),
+                #[cfg(unix)]
+                canonical_root: io_root_key.as_ref().into(),
+                queue: weak,
+            });
+        }
     }
     queue
 }
 
 fn disk_blocking_queue_for_root(root: &Path) -> Arc<DiskBlockingQueue> {
-    register_disk_blocking_queue(root, root)
-}
-
-fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    #[cfg(unix)]
+    let root_key = canonical_unix_path_key(root);
     {
-        let queues = DISK_BLOCKING_QUEUES.lock();
-        for (root, weak) in queues.iter() {
-            if path.starts_with(root)
-                && let Some(queue) = weak.upgrade()
-            {
+        let queues = DISK_BLOCKING_QUEUES.read();
+        for entry in queues.iter() {
+            #[cfg(unix)]
+            let matches = entry.canonical_root.as_ref() == root_key.as_ref();
+            #[cfg(not(unix))]
+            let matches = entry.root == root;
+            if matches && let Some(queue) = entry.queue.upgrade() {
                 return queue;
             }
         }
     }
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    path.hash(&mut hasher);
-    let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
-    Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    register_disk_blocking_queue(root, root)
+}
+
+fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
+    #[cfg(unix)]
+    {
+        let path_key = canonical_unix_path_key(path);
+        {
+            let queues = DISK_BLOCKING_QUEUES.read();
+            for entry in queues.iter() {
+                if unix_canonical_key_starts_with(path_key.as_ref(), entry.canonical_root.as_ref())
+                    && let Some(queue) = entry.queue.upgrade()
+                {
+                    return queue;
+                }
+            }
+        }
+        let hash = xxhash_rust::xxh3::xxh3_64(path_key.as_ref());
+        let idx = usize::try_from(hash % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+        Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    }
+    #[cfg(not(unix))]
+    {
+        {
+            let queues = DISK_BLOCKING_QUEUES.read();
+            for entry in queues.iter() {
+                if path.starts_with(&entry.root)
+                    && let Some(queue) = entry.queue.upgrade()
+                {
+                    return queue;
+                }
+            }
+        }
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        let idx = usize::try_from(hasher.finish() % (FALLBACK_NAMESPACE_QUEUE_SHARDS as u64)).unwrap_or(0);
+        Arc::clone(&FALLBACK_BLOCKING_QUEUES[idx])
+    }
 }
 
 /// Serialize a bucket's local metadata commits with physical bucket removal.
@@ -2194,32 +2492,46 @@ fn disk_blocking_queue_for_path(path: &Path) -> Arc<DiskBlockingQueue> {
 /// [`LocalDisk`](super::local::LocalDisk) instances share the same lock while
 /// disconnected disks do not keep the registry alive.
 pub(crate) fn disk_volume_mutation_lock(root: &Path, volume: &str) -> Arc<RwLock<()>> {
-    let key = root.join(volume);
-    let mut locks = DISK_VOLUME_MUTATION_LOCKS.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
+    #[cfg(unix)]
+    {
+        let vol_bytes = volume.as_bytes();
+        if !vol_bytes.is_empty()
+            && vol_bytes[0] != b'/'
+            && vol_bytes != b"."
+            && !vol_bytes.starts_with(b"./")
+            && !vol_bytes.ends_with(b"/")
+            && !vol_bytes.ends_with(b"/.")
+            && is_canonical_unix_key_bytes(vol_bytes)
+            && let std::borrow::Cow::Borrowed(root_bytes) = canonical_unix_path_key(root)
+            && !root_bytes.is_empty()
+            && root_bytes != b"/"
+        {
+            let total_len = root_bytes.len() + 1 + vol_bytes.len();
+            if total_len <= 512 {
+                let mut stack_key = [0u8; 512];
+                stack_key[..root_bytes.len()].copy_from_slice(root_bytes);
+                stack_key[root_bytes.len()] = b'/';
+                stack_key[root_bytes.len() + 1..total_len].copy_from_slice(vol_bytes);
+                return DISK_VOLUME_MUTATION_LOCKS.get_or_create_by_key(&stack_key[..total_len], || RwLock::new(()));
+            }
+        }
     }
-
-    let lock = Arc::new(RwLock::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
+    let key = root.join(volume);
+    DISK_VOLUME_MUTATION_LOCKS.get_or_create(&key, || RwLock::new(()))
 }
 
 fn disk_namespace_mutation_lock(path: &Path) -> Arc<NamespaceMutationLock> {
-    let mut locks = DISK_NAMESPACE_MUTATION_LOCKS.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(path).and_then(Weak::upgrade) {
-        return lock;
-    }
-
-    let lock = Arc::new(AsyncMutex::new(()));
-    locks.insert(path.to_path_buf(), Arc::downgrade(&lock));
-    lock
+    DISK_NAMESPACE_MUTATION_LOCKS.get_or_create(path, || AsyncMutex::new(()))
 }
 
-static DISK_METADATA_MUTATION_LOCKS: LazyLock<Mutex<NamespaceMutationLockRegistry>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+#[cfg(unix)]
+#[inline]
+fn disk_namespace_mutation_lock_by_key(key: &[u8]) -> Arc<NamespaceMutationLock> {
+    DISK_NAMESPACE_MUTATION_LOCKS.get_or_create_by_key(key, || AsyncMutex::new(()))
+}
+
+static DISK_METADATA_MUTATION_LOCKS: LazyLock<ShardedPathLockRegistry<NamespaceMutationLock>> =
+    LazyLock::new(ShardedPathLockRegistry::new);
 
 /// Serializes the complete xl.meta read/modify/commit transaction. This domain
 /// precedes namespace/volume publication locks, whose narrower syscall leases
@@ -2233,17 +2545,7 @@ pub(crate) async fn acquire_metadata_mutation_lease(
     object: &Path,
     owner: Option<Arc<dyn Send + Sync>>,
 ) -> Arc<MetadataMutationLease> {
-    let lock = {
-        let mut locks = DISK_METADATA_MUTATION_LOCKS.lock();
-        locks.retain(|_, lock| lock.strong_count() > 0);
-        if let Some(lock) = locks.get(object).and_then(Weak::upgrade) {
-            lock
-        } else {
-            let lock = Arc::new(AsyncMutex::new(()));
-            locks.insert(object.to_path_buf(), Arc::downgrade(&lock));
-            lock
-        }
-    };
+    let lock = DISK_METADATA_MUTATION_LOCKS.get_or_create(object, || AsyncMutex::new(()));
     Arc::new(MetadataMutationLease {
         _guard: lock.lock_owned().await,
         _owner: owner,
@@ -2306,17 +2608,45 @@ pub(crate) async fn acquire_rename_data_mutation_lease_with_owner(
 ) -> Arc<NamespaceMutationLease> {
     // Metadata ownership precedes namespace paths in lexical order, then volume
     // ownership. Deduplicate identical keys so TMP-to-TMP publication cannot self-lock.
-    let destination_lock = disk_namespace_mutation_lock(destination_object);
-    let (namespace_guard, staging_guard) = match staging_prefix {
-        Some(source) if source < destination_object => {
-            let staging = disk_namespace_mutation_lock(source).lock_owned().await;
-            (destination_lock.lock_owned().await, Some(staging))
+    #[cfg(unix)]
+    let (namespace_guard, staging_guard) = {
+        let dst_key = canonical_unix_path_key(destination_object);
+        let destination_lock = disk_namespace_mutation_lock_by_key(dst_key.as_ref());
+        match staging_prefix {
+            Some(source) => {
+                let src_key = canonical_unix_path_key(source);
+                match src_key.as_ref().cmp(dst_key.as_ref()) {
+                    std::cmp::Ordering::Less => {
+                        let staging = disk_namespace_mutation_lock_by_key(src_key.as_ref()).lock_owned().await;
+                        (destination_lock.lock_owned().await, Some(staging))
+                    }
+                    std::cmp::Ordering::Greater => {
+                        let destination = destination_lock.lock_owned().await;
+                        (
+                            destination,
+                            Some(disk_namespace_mutation_lock_by_key(src_key.as_ref()).lock_owned().await),
+                        )
+                    }
+                    std::cmp::Ordering::Equal => (destination_lock.lock_owned().await, None),
+                }
+            }
+            None => (destination_lock.lock_owned().await, None),
         }
-        Some(source) if source > destination_object => {
-            let destination = destination_lock.lock_owned().await;
-            (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+    };
+    #[cfg(not(unix))]
+    let (namespace_guard, staging_guard) = {
+        let destination_lock = disk_namespace_mutation_lock(destination_object);
+        match staging_prefix {
+            Some(source) if source < destination_object => {
+                let staging = disk_namespace_mutation_lock(source).lock_owned().await;
+                (destination_lock.lock_owned().await, Some(staging))
+            }
+            Some(source) if source > destination_object => {
+                let destination = destination_lock.lock_owned().await;
+                (destination, Some(disk_namespace_mutation_lock(source).lock_owned().await))
+            }
+            _ => (destination_lock.lock_owned().await, None),
         }
-        _ => (destination_lock.lock_owned().await, None),
     };
     let volume_guard = disk_volume_mutation_lock(root, volume).read_owned().await;
     let blocking_queue = disk_blocking_queue_for_root(root);
@@ -11991,6 +12321,121 @@ mod tests {
             "directory in place of file must fail intermediate remove_file"
         );
         assert!(preserved_final.exists(), "final file must remain when intermediate removal fails");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_unix_path_key_preserves_std_path_equality_and_prefix_semantics() {
+        let samples = [
+            "",
+            "/",
+            "///",
+            "/.",
+            "/./.",
+            ".",
+            "./",
+            "./.",
+            "./a",
+            "././a/",
+            ".//a/.",
+            "a",
+            "a/",
+            "a/.",
+            "a/b/c",
+            "a/b/c/",
+            "a//b/./c/.",
+            "/tmp/d0/bucket/obj",
+            "/tmp/d0/bucket/obj/",
+            "/tmp/d0//bucket/./obj/.",
+            "/tmp/d0/.rustfs.sys/multipart/sha/upload",
+            "/proc/self/fd/12/.",
+            "/proc/self/fd/12",
+            "/proc/self/fd/12/./bucket/obj",
+            "/proc/self/fd/12/bucket/obj",
+            "/tmp/d1",
+            "/tmp/d10",
+            "a/../b",
+            "a/../b/",
+            "/utf8/\u{00af}/segment/",
+        ];
+        for s in samples {
+            let p = Path::new(s);
+            let fast = canonical_unix_path_key(p);
+            let slow = canonical_unix_path_key_slow(p);
+            assert_eq!(fast.as_ref(), slow.as_ref(), "fast and slow key mismatch for {s:?}");
+        }
+        for a in samples {
+            for b in samples {
+                let pa = Path::new(a);
+                let pb = Path::new(b);
+                let ka = canonical_unix_path_key(pa);
+                let kb = canonical_unix_path_key(pb);
+                assert_eq!(
+                    pa == pb,
+                    ka.as_ref() == kb.as_ref(),
+                    "Path::eq vs canonical key mismatch for {a:?} and {b:?}"
+                );
+                assert_eq!(
+                    pa.starts_with(pb),
+                    unix_canonical_key_starts_with(ka.as_ref(), kb.as_ref()),
+                    "Path::starts_with vs canonical key prefix mismatch for {a:?} and {b:?}"
+                );
+            }
+        }
+
+        let dir = tempdir().expect("tempdir");
+        let p_clean = dir.path().join("bucket/object");
+        let p_trailing = PathBuf::from(format!("{}/", p_clean.display()));
+        let p_redundant = PathBuf::from(format!("{}//bucket/./object/.", dir.path().display()));
+        let lock1 = disk_namespace_mutation_lock(&p_clean);
+        let lock2 = disk_namespace_mutation_lock(&p_trailing);
+        let lock3 = disk_namespace_mutation_lock(&p_redundant);
+        assert!(Arc::ptr_eq(&lock1, &lock2));
+        assert!(Arc::ptr_eq(&lock1, &lock3));
+
+        let vlock1 = disk_volume_mutation_lock(dir.path(), "bucket");
+        let vlock2 = disk_volume_mutation_lock(&PathBuf::from(format!("{}/.", dir.path().display())), "bucket/");
+        assert!(Arc::ptr_eq(&vlock1, &vlock2));
+
+        let io_root = dir.path().join("io_root/.");
+        let q_reg = register_disk_blocking_queue(dir.path(), &io_root);
+        let q_root = disk_blocking_queue_for_root(dir.path());
+        let q_path = disk_blocking_queue_for_path(&dir.path().join("io_root/bucket/key"));
+        assert!(Arc::ptr_eq(&q_reg, &q_root));
+        assert!(Arc::ptr_eq(&q_reg, &q_path));
+    }
+
+    #[test]
+    fn sharded_path_lock_registry_reuses_slots_and_bounds_dead_weak_entries() {
+        let registry: ShardedPathLockRegistry<AsyncMutex<()>> = ShardedPathLockRegistry::new();
+        let target = Path::new("/tmp/sharded-lock-test/persistent-key");
+        let held = registry.get_or_create(target, || AsyncMutex::new(()));
+        let held_again = registry.get_or_create(target, || AsyncMutex::new(()));
+        assert!(Arc::ptr_eq(&held, &held_again), "live lock must be shared");
+
+        // Re-acquiring a key after drop must reuse the existing slot in-place.
+        let transient = Path::new("/tmp/sharded-lock-test/reused-slot");
+        drop(registry.get_or_create(transient, || AsyncMutex::new(())));
+        let reused = registry.get_or_create(transient, || AsyncMutex::new(()));
+        drop(reused);
+
+        // Flood transient keys across shards and verify `held` is never evicted
+        // and total dead entries remain bounded by the amortized GC threshold.
+        for i in 0..(PATH_LOCK_SHARDS * PATH_LOCK_INITIAL_GC_THRESHOLD * 3) {
+            let p = PathBuf::from(format!("/tmp/sharded-lock-test/ephemeral-{i}"));
+            drop(registry.get_or_create(&p, || AsyncMutex::new(())));
+        }
+        let still_held = registry.get_or_create(target, || AsyncMutex::new(()));
+        assert!(Arc::ptr_eq(&held, &still_held), "GC must never evict a live lock");
+        for shard in &registry.shards {
+            let guard = shard.lock();
+            assert!(
+                guard.entries.len() <= guard.next_gc_threshold,
+                "shard entries ({}) exceeded GC threshold ({})",
+                guard.entries.len(),
+                guard.next_gc_threshold
+            );
+        }
     }
 }
 
