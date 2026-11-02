@@ -759,9 +759,9 @@ dependencies = [
 
 [[package]]
 name = "async-compression"
-version = "0.4.51"
+version = "0.4.52"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d5755640120b24961f8231e05892e4a4f7e0d04e8aeca161508c9c397946970"
+checksum = "6ad47a740fb906fffdd891e8b6d5fde2511600f7bfaebd68939fa08a14999459"
 dependencies = [
  "compression-codecs",
  "compression-core",
@@ -2083,9 +2083,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.10.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "86e055fa6e3e40ad6187ba25b6855eeb635d5271f8e0f0e1e9a5826b8d75bea0"
+checksum = "375989decec1a0fa424442bed520fa12ede43a48475ce8c7417d2c69b32b5f6b"
 dependencies = [
  "find-msvc-tools",
  "jobserver",
@@ -2341,9 +2341,9 @@ dependencies = [
 
 [[package]]
 name = "compression-codecs"
-version = "0.4.46"
+version = "0.4.47"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cae36683101b2899f48bd31f8db9839437356188e3b1ff23096e73dab09ba8fe"
+checksum = "84f840cff84d10085260e460023934d0af699e71212b09b2a41452e8bd9cda43"
 dependencies = [
  "brotli 9.1.1",
  "bzip2",
@@ -2589,9 +2589,9 @@ dependencies = [
 
 [[package]]
 name = "crc32fast"
-version = "1.5.3"
+version = "1.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0ba106e844045ddc02c20768ac4b0b7cb45f2cc2ecbd833ac9f5dacb183c2055"
+checksum = "5f97d3416d5337d15c4b0d78c8c91df922ca143f57ec20e2d1c188333047ef04"
 dependencies = [
  "cfg-if",
 ]
@@ -8503,9 +8503,9 @@ dependencies = [
 
 [[package]]
 name = "pulsar"
-version = "6.9.1"
+version = "6.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e764221c5f6dfd98f7456ea8c5c341a88ebfb6f15fc9e2da902f74afca370c6d"
+checksum = "5a56d908fe26714fbd8dffbe6a69b39ea09fb28af14fdd8f971548d2906346b3"
 dependencies = [
  "async-channel",
  "async-trait",
@@ -9092,9 +9092,9 @@ dependencies = [
 
 [[package]]
 name = "reflink-copy"
-version = "0.1.31"
+version = "0.1.32"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dd31f458a66eeda05a9e837fc5f0effbaacbe8565868ecae5b37bf0544c19f5"
+checksum = "1ad64f61357bcf16105a0f353f9783733409c8bd889bc326ad857959605ea927"
 dependencies = [
  "cfg-if",
  "libc",
@@ -10330,18 +10330,18 @@ dependencies = [
 
 [[package]]
 name = "rustfs-mimalloc"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8301a578772fc9823d68e083e42c3b414613d588a0eac594c1ca6bc0bbe0653f"
+checksum = "216ecfc9341b5d6e2506d47ce57c9232ae1b8020bb10264ea05286fb234286e7"
 dependencies = [
  "rustfs-mimalloc-sys",
 ]
 
 [[package]]
 name = "rustfs-mimalloc-sys"
-version = "0.7.2"
+version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6eb4082853043cb29556b4b776b05f28c3146706f43c53869dbf1ef262e00e91"
+checksum = "fb16ad68f96883407a75cdb88252b43dc2ea592428f0fc54ff7885756de4b814"
 dependencies = [
  "cc",
 ]
@@ -12536,18 +12536,18 @@ dependencies = [
 
 [[package]]
 name = "test-case"
-version = "3.4.0"
+version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "124953e7f67cb0b2fcfb87e899e4ae5a64fb68e2e160767933cc67b646fb0042"
+checksum = "ae6e80608d2037173d7d59a09089d249e43352c182f6dde6b00d138bcb7cfdbe"
 dependencies = [
  "test-case-macros",
 ]
 
 [[package]]
 name = "test-case-core"
-version = "3.4.0"
+version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd097615b407247e102046ba34426bb594923ab3554cf0f3cdfed050f1a5a3e8"
+checksum = "29b8e1f65819001927b8cdcbb5560f2428212f2e5ab5684e3c6815a4d80e72db"
 dependencies = [
  "cfg-if",
  "proc-macro2",
@@ -12557,9 +12557,9 @@ dependencies = [
 
 [[package]]
 name = "test-case-macros"
-version = "3.4.0"
+version = "3.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f4ce35ece947bccac166e1ded639133827a953f69a48ba134d17f91108333082"
+checksum = "802d6165a14df1598b7290a8c546df402940d3cfbe82d15c0fd35de176771693"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -14198,9 +14198,9 @@ dependencies = [
 
 [[package]]
 name = "zip"
-version = "9.2.1"
+version = "9.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "848dad21639597378c3be94c59fd4de683f0f6d8a5387575896e1245737d4f37"
+checksum = "e408c6cc4699dd017d53dc080cd51c2cea2b5354af57a1479bd265ed42911487"
 dependencies = [
  "aes 0.9.3",
  "bzip2",
@@ -14211,6 +14211,7 @@ dependencies = [
  "getrandom 0.4.3",
  "hmac 0.13.0",
  "indexmap 2.14.2",
+ "libc",
  "lzma-rust2",
  "memchr",
  "nix 0.31.3",
