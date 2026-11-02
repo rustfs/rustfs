@@ -110,15 +110,15 @@ jobs:
           from pathlib import Path
           root = Path(os.environ["RUNNER_TEMP"]) / "validation-sweep"
           root.mkdir(parents=True, exist_ok=True)
-          candidate = json.loads((Path(os.environ["RUNNER_TEMP"]) / "validation-sweep-candidate.json").read_text())
-          manifest = candidate["manifest"]
+          chain = json.loads((Path(os.environ["RUNNER_TEMP"]) / "validation-sweep-candidate.json").read_text())
+          manifest = chain["candidate"]["manifest"]
           (root / "candidate.json").write_text(json.dumps({
               "package_url": manifest["package_url"],
               "package_sha256": manifest["package_sha256"],
               "source_sha": manifest["source_sha"],
           }, sort_keys=True) + "\n")
           with open(os.environ["GITHUB_OUTPUT"], "a") as output:
-              output.write("testing_sha=" + candidate["testing_sha"] + "\n")
+              output.write("testing_sha=" + chain["testing_sha"] + "\n")
               output.write("package_url=" + manifest["package_url"] + "\n")
               output.write("source_sha=" + manifest["source_sha"] + "\n")
           PY
