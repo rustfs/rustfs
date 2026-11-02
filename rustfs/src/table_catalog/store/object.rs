@@ -3229,11 +3229,11 @@ where
                 }
                 None => None,
             };
-            commits.push(table_commit_recovery_entry(
+            commits.push(table_commit_recovery_entry_from_history(
                 entry,
                 commit_log,
                 idempotency_commit.as_ref(),
-                history.proves_committed(commit_log),
+                &history,
             ));
         }
         commits.sort_by(|left, right| left.commit_id.cmp(&right.commit_id));
@@ -3335,12 +3335,8 @@ where
                 }
                 None => None,
             };
-            let recovery_entry = table_commit_recovery_entry(
-                &entry,
-                commit_log,
-                idempotency_commit.as_ref(),
-                history.proves_committed(commit_log),
-            );
+            let recovery_entry =
+                table_commit_recovery_entry_from_history(&entry, commit_log, idempotency_commit.as_ref(), &history);
             if matches!(
                 recovery_entry.recovery_state,
                 TableCommitRecoveryState::FinalizationRequired | TableCommitRecoveryState::IdempotencyIndexRepairRequired

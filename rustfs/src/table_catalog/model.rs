@@ -1271,6 +1271,7 @@ pub(crate) struct TableCatalogDiagnosticsReport {
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum TableCommitRecoveryState {
     Committed,
+    Superseded,
     StagedBeforeTableUpdate,
     FinalizationRequired,
     IdempotencyIndexRepairRequired,

@@ -16,6 +16,9 @@ use datafusion::{
 use std::assert_matches;
 use std::sync::Arc;
 
+#[path = "tests/superseded_commit_recovery.rs"]
+mod superseded_commit_recovery;
+
 const TABLE_CATALOG_TEST_TIMEOUT: StdDuration = StdDuration::from_secs(30);
 
 #[path = "tests/object_backup_validation.rs"]
