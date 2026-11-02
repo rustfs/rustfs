@@ -21,6 +21,7 @@ pub mod fingerprint;
 pub mod material;
 pub mod metrics;
 pub mod outbound;
+pub mod provider;
 pub mod server;
 pub mod source;
 pub mod state;
@@ -45,6 +46,7 @@ pub use outbound::{
     GlobalOutboundTlsStateSummary, GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation,
     load_global_outbound_tls_state, publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
 };
+pub use provider::{CryptoProviderError, CryptoProviderStatus, default_crypto_provider, ensure_crypto_provider};
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
 pub use source::{TlsFileLayout, TlsSource, TlsSourceKind, TlsSourceSnapshot};
 pub use state::OutboundOnlySnapshotArgs;

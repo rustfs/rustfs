@@ -30,6 +30,7 @@ workspace = true
 
 [features]
 default = []
+fips = ["rustfs-tls-runtime?/fips"]
 hotpath = [
     "hotpath/hotpath",
     "hotpath/tokio",

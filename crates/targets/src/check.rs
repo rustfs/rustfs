@@ -162,7 +162,7 @@ pub async fn check_mysql_server_available(args: &crate::target::mysql::MySqlArgs
         .db_name(Some(dsn.database.clone()));
 
     if dsn.tls {
-        ensure_rustls_provider_installed();
+        ensure_rustls_provider_installed()?;
         let mut ssl_opts = SslOpts::default();
         if !args.tls_ca.is_empty() {
             ssl_opts = ssl_opts.with_root_certs(vec![PathBuf::from(args.tls_ca.clone()).into()]);

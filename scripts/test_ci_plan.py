@@ -234,7 +234,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         values = dict(line.split('=', 1) for line in output.read_text().splitlines())
         self.assertEqual(set(values), {'mode', 'plan', 'connect', 'packages', 'full_validation', 'rehearse_shards', 'plan_contract'})
-        self.assertEqual(values['plan_contract'], '2')
+        self.assertEqual(values['plan_contract'], gate.PLAN_CONTRACT)
         plan = json.loads(values['plan'])
         self.assertEqual(plan['policy']['revision'], self.repo.base)
         self.assertEqual(plan['policy']['rollout'], 'shadow')
@@ -242,6 +242,15 @@ class PlannerTests(unittest.TestCase):
 
 
 class GateTests(unittest.TestCase):
+    def test_fips_provider_is_required_at_nightly_and_skipped_on_pr(self):
+        self.assertEqual(gate.expected_results('full', 'schedule', 'refs/heads/main')['fips-provider'], 'success')
+        self.assertEqual(gate.expected_results('full', 'pull_request', 'refs/heads/main')['fips-provider'], 'skipped')
+        plan = self.plan('schedule')
+        good = self.needs(plan)
+        self.assertEqual(gate.verify_results(good, 'schedule', plan['ref'], plan['head'], plan['tree']), [])
+        good['fips-provider']['result'] = 'skipped'
+        self.assertTrue(gate.verify_results(good, 'schedule', plan['ref']))
+
     def plan(self, event='pull_request', mode='full', connect=True):
         jobs = gate.expected_results(mode, event, 'refs/heads/main', connect)
         return {'schema_version': 1, 'event': event, 'ref': 'refs/heads/main', 'head': 'a' * 40, 'tree': 'b' * 40,

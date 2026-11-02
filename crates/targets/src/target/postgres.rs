@@ -462,7 +462,7 @@ pub fn table_probe_sql(schema: &str, table: &str) -> String {
 /// When `tls_client_cert` and `tls_client_key` are both set the connection
 /// uses mTLS authentication; otherwise no client cert is sent.
 pub fn build_tls_config(args: &PostgresArgs) -> Result<rustls::ClientConfig, TargetError> {
-    super::ensure_rustls_provider_installed();
+    super::ensure_rustls_provider_installed()?;
 
     let mut root_store = rustls::RootCertStore::empty();
 
@@ -937,6 +937,32 @@ mod tests {
             queue_limit: 100_000,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[cfg(feature = "fips")]
+    #[test]
+    fn fips_postgres_rejects_incompatible_host_provider() {
+        const CHILD: &str = "RUSTFS_TEST_POSTGRES_FIPS_PROVIDER";
+        if std::env::var_os(CHILD).is_some() {
+            let mut provider = rustfs_tls_runtime::default_crypto_provider();
+            provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+            provider.install_default().expect("install incompatible host provider");
+            let error = build_tls_config(&base_args()).expect_err("Postgres must reject the incompatible provider");
+            assert!(error.to_string().contains("process-wide rustls crypto provider"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("fips_postgres_rejects_incompatible_host_provider")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated Postgres TLS test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread_local;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tracing::{debug, warn};
+use tracing::warn;
 
 pub mod amqp;
 pub mod kafka;
@@ -947,16 +947,12 @@ pub(crate) fn encode_failed_entry(
 
 /// Ensures a rustls crypto provider is installed before any TLS operation.
 ///
-/// Multiple target modules (MySQL, Redis, Postgres, MQTT) need this because
-/// each may be the first to perform a TLS handshake. Idempotent: if a
-/// provider is already registered, returns immediately.
-pub(crate) fn ensure_rustls_provider_installed() {
-    if rustls::crypto::CryptoProvider::get_default().is_some() {
-        return;
-    }
-    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
-        debug!("rustls provider already installed or unavailable: {err:?}");
-    }
+/// Target modules may be the first to construct a TLS client. In a FIPS build,
+/// an incompatible provider installed by the host is rejected.
+pub(crate) fn ensure_rustls_provider_installed() -> Result<(), TargetError> {
+    rustfs_tls_runtime::ensure_crypto_provider()
+        .map(|_| ())
+        .map_err(|err| TargetError::Configuration(err.to_string()))
 }
 
 #[cfg(test)]

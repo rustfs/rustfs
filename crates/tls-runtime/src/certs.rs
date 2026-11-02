@@ -610,10 +610,12 @@ pub fn validate_certified_key(
             }
         }
     }
-    let certified = CertifiedKey::from_der(certs.to_vec(), key.clone_key(), &rustls::crypto::aws_lc_rs::default_provider())
-        .map_err(|source| TlsRuntimeError::InvalidCertifiedKey {
-            name: name.to_string(),
-            source,
+    let certified =
+        CertifiedKey::from_der(certs.to_vec(), key.clone_key(), &crate::default_crypto_provider()).map_err(|source| {
+            TlsRuntimeError::InvalidCertifiedKey {
+                name: name.to_string(),
+                source,
+            }
         })?;
     certified
         .keys_match()

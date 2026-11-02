@@ -305,6 +305,8 @@ where
         args: &WebhookArgs,
         resolver: impl reqwest::dns::Resolve + 'static,
     ) -> Result<Client, TargetError> {
+        #[cfg(feature = "fips")]
+        super::ensure_rustls_provider_installed()?;
         let mut client_builder = Client::builder()
             .no_proxy()
             .dns_resolver(resolver)
@@ -846,6 +848,51 @@ mod tests {
             skip_tls_verify: false,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn webhook_provider_policy_isolated() {
+        const CHILD: &str = "RUSTFS_TEST_WEBHOOK_PROVIDER_POLICY";
+        if std::env::var_os(CHILD).is_some() {
+            if cfg!(feature = "fips") {
+                let mut provider = rustfs_tls_runtime::default_crypto_provider();
+                provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+                provider.install_default().expect("install incompatible host provider");
+            } else {
+                assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+            }
+            let args = WebhookArgs {
+                skip_tls_verify: true,
+                ..base_args()
+            };
+            let result = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(
+                &args,
+                StaticResolver("127.0.0.1".parse().expect("loopback IP")),
+            );
+            if cfg!(feature = "fips") {
+                let error = result.expect_err("FIPS webhook must reject the incompatible provider");
+                assert!(error.to_string().contains("process-wide rustls crypto provider"));
+            } else {
+                result.expect("default webhook client should build");
+                assert!(
+                    rustls::crypto::CryptoProvider::get_default().is_none(),
+                    "building a default webhook must not install a process-wide provider"
+                );
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("webhook_provider_policy_isolated")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated webhook provider test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     async fn http_status_url(status: u16) -> Url {

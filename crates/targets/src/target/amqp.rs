@@ -293,6 +293,10 @@ fn map_lapin_error(err: lapin::Error, context: &str) -> TargetError {
 
 pub async fn connect_amqp(args: &AMQPArgs) -> Result<AMQPConnection, TargetError> {
     args.validate()?;
+    #[cfg(feature = "fips")]
+    if args.url.scheme() == "amqps" {
+        super::ensure_rustls_provider_installed()?;
+    }
     tokio::time::timeout(Duration::from_secs(5), async {
         let url = connection_url(args)?;
         // Reconnect explicitly so every new channel enables publisher confirms below.

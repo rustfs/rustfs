@@ -204,6 +204,8 @@ fn nats_sends_credentials_without_tls(args: &NATSArgs) -> bool {
 
 pub async fn connect_nats(args: &NATSArgs) -> Result<async_nats::Client, TargetError> {
     args.validate()?;
+    #[cfg(feature = "fips")]
+    super::ensure_rustls_provider_installed()?;
 
     let mut options = async_nats::ConnectOptions::new().require_tls(args.tls_required);
 
