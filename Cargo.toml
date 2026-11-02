@@ -217,7 +217,7 @@ chacha20poly1305 = { version = "0.11.0" }
 crc-fast = "1.10.0"
 hmac = { version = "0.13.0" }
 jsonwebtoken = { version = "11.1.0" }
-openidconnect = { default-features = false, version = "4.0" }
+openidconnect = { default-features = false, version = "4.1.0" }
 pbkdf2 = "0.13.0"
 p256 = { version = "0.14.0", features = ["ecdsa", "pkcs8"] }
 rsa = { version = "=0.10.0-rc.18" }
@@ -253,9 +253,9 @@ atoi = "3.1.1"
 atomic_enum = "0.3.0"
 aws-config = { version = "1.13.0" }
 aws-credential-types = { version = "1.3.1" }
-aws-sdk-kms = { default-features = false, version = "1.128.0" }
-aws-sdk-s3 = { default-features = false, version = "1.156.0" }
-aws-sdk-sts = { default-features = false, version = "1.123.0" }
+aws-sdk-kms = { default-features = false, version = "1.129.0" }
+aws-sdk-s3 = { default-features = false, version = "1.157.0" }
+aws-sdk-sts = { default-features = false, version = "1.124.0" }
 aws-smithy-async = { version = "1.3.1" }
 aws-smithy-http-client = { default-features = false, version = "1.5.2" }
 aws-smithy-runtime-api = { version = "1.19.2" }
@@ -356,7 +356,7 @@ winapi-util = "0.1.11"
 windows = { version = "0.62.2" }
 windows-sys = "0.61.2"
 xxhash-rust = { version = "0.8.19" }
-zip = "9.1.3"
+zip = "9.2.1"
 zstd = "0.14.3"
 
 # Observability and Metrics
@@ -386,7 +386,7 @@ dav-server = "0.11.0"
 # Performance Analysis and Memory Profiling
 rustfs-mimalloc = { version = "0.7.2" }
 # Preserve Unicode focus filters until rustfs/backlog#2302 is resolved.
-hotpath = { version = "0.30.2", default-features = false }
+hotpath = { version = "0.30.3", default-features = false }
 # Snapshot testing for output format regression detection
 insta = { version = "1.49" }
 
@@ -427,7 +427,3 @@ strip = "none"
 # Pin upstream fixes until compatible crates.io releases are available.
 [patch.crates-io]
 zstd = { path = "crates/zstd-compat" }
-# Preserve RustFS OIDC flows while migrating the old elliptic-curve dependency chain.
-# Upstream: openidconnect-rs#244 and oauth2-rs#352.
-openidconnect = { git = "https://github.com/ramosbugs/openidconnect-rs", rev = "2f77ee73bc4554e1cb6279adb386005429fb4e41" }
-oauth2 = { git = "https://github.com/ramosbugs/oauth2-rs", rev = "89585f4a280afd7b285eaf1c9be0068874e03d22" }
