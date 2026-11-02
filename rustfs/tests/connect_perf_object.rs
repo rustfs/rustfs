@@ -540,7 +540,7 @@ struct CleanupObservation {
     elapsed: Duration,
 }
 
-async fn observe_cleanup(replies: [CleanupReply; 2]) -> CleanupObservation {
+async fn observe_cleanup(replies: [CleanupReply; 2], measurement_delay: Duration) -> CleanupObservation {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     const PRIVATE_BODY: &str = "private-cleanup-response-body";
@@ -583,6 +583,12 @@ async fn observe_cleanup(replies: [CleanupReply; 2]) -> CleanupObservation {
                 .to_owned();
             let reply = if index < 2 {
                 assert!(request_line.starts_with("PUT "));
+                if index == 1 && !measurement_delay.is_zero() {
+                    // Model descheduling during the measured PUT without a wall-clock sleep.
+                    tokio::time::pause();
+                    tokio::time::advance(measurement_delay).await;
+                    tokio::time::resume();
+                }
                 CleanupReply::Status(200)
             } else {
                 assert!(request_line.starts_with("DELETE "));
@@ -616,6 +622,8 @@ async fn observe_cleanup(replies: [CleanupReply; 2]) -> CleanupObservation {
     )
     .expect("cleanup probe");
     let mut request = request(ObjectOperation::PutObject);
+    // Status fixtures must reach cleanup independently of short measurement deadlines.
+    request.duration = REAL_SERVER_MEASUREMENT_BUDGET;
     request.traffic_bytes = 4;
     let log = CleanupLog::default();
     let writer = log.clone();
@@ -707,7 +715,7 @@ async fn cleanup_diagnostics_identify_each_failed_http_stage_without_private_con
         ([CleanupReply::Status(204), CleanupReply::Status(403)], "bucket_delete", 403),
         ([CleanupReply::Status(204), CleanupReply::Status(404)], "bucket_delete", 404),
     ] {
-        let observed = observe_cleanup(replies).await;
+        let observed = observe_cleanup(replies, Duration::ZERO).await;
         assert_cleanup_failure(&observed, stage, "CleanupFailed", Some(status));
         assert_eq!(observed.deletes.len(), if stage == "object_delete" { 1 } else { 2 });
     }
@@ -720,7 +728,7 @@ async fn cleanup_diagnostics_identify_each_disconnected_transport_stage() {
         ([CleanupReply::Disconnect, CleanupReply::Status(204)], "object_delete"),
         ([CleanupReply::Status(204), CleanupReply::Disconnect], "bucket_delete"),
     ] {
-        let observed = observe_cleanup(replies).await;
+        let observed = observe_cleanup(replies, Duration::ZERO).await;
         assert_cleanup_failure(&observed, stage, "ProtocolFailure", None);
     }
 }
@@ -728,13 +736,21 @@ async fn cleanup_diagnostics_identify_each_disconnected_transport_stage() {
 #[tokio::test]
 async fn cleanup_accepts_missing_object_and_still_deletes_the_bucket() {
     let _guard = TEST_LOCK.lock().await;
-    let observed = observe_cleanup([CleanupReply::Status(404), CleanupReply::Status(204)]).await;
-    assert_eq!(observed.measurement.result.outcome(), ObjectOutcome::Succeeded);
-    assert_eq!(observed.measurement.target.reason_code, ObjectTargetReasonCode::Complete);
-    assert_eq!(observed.deletes.len(), 2);
-    assert!(observed.deletes[0].ends_with("/synthetic-object HTTP/1.1"));
-    assert!(observed.deletes[1].ends_with("/ HTTP/1.1"));
-    assert!(!observed.log.contains("connect_object_cleanup_failed"));
+    for measurement_delay in [Duration::ZERO, Duration::from_secs(2)] {
+        let observed = observe_cleanup([CleanupReply::Status(404), CleanupReply::Status(204)], measurement_delay).await;
+        assert_eq!(
+            observed.measurement.result.outcome(),
+            ObjectOutcome::Succeeded,
+            "target result: {:?}; cleanup diagnostics: {}",
+            observed.measurement.target,
+            observed.log
+        );
+        assert_eq!(observed.measurement.target.reason_code, ObjectTargetReasonCode::Complete);
+        assert_eq!(observed.deletes.len(), 2);
+        assert!(observed.deletes[0].ends_with("/synthetic-object HTTP/1.1"));
+        assert!(observed.deletes[1].ends_with("/ HTTP/1.1"));
+        assert!(!observed.log.contains("connect_object_cleanup_failed"));
+    }
 }
 
 #[tokio::test]
@@ -750,7 +766,7 @@ async fn cleanup_diagnostics_identify_timeouts_without_resetting_the_shared_dead
             "bucket_delete",
         ),
     ] {
-        let observed = observe_cleanup(replies).await;
+        let observed = observe_cleanup(replies, Duration::ZERO).await;
         assert_cleanup_failure(&observed, stage, "TimedOut", None);
         assert!(observed.elapsed >= Duration::from_secs(5));
         assert!(observed.log.contains("remaining_ms=0"), "{}", observed.log);
