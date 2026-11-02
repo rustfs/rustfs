@@ -14,7 +14,10 @@
 
 use crate::license::license_status;
 use crate::startup_runtime_sources;
+#[cfg(not(feature = "fips"))]
 use rustls::crypto::aws_lc_rs::default_provider;
+#[cfg(feature = "fips")]
+use rustls::crypto::default_fips_provider as default_provider;
 use std::future::Future;
 use std::io::Result;
 use tracing::{debug, info, warn};
@@ -105,8 +108,18 @@ where
     shutdown();
 }
 
+fn build_default_crypto_provider() -> rustls::crypto::CryptoProvider {
+    let provider = default_provider();
+    #[cfg(feature = "fips")]
+    assert!(
+        provider.fips(),
+        "FIPS crypto provider requested via `fips` feature, but AWS-LC FIPS mode is not active"
+    );
+    provider
+}
+
 pub(crate) fn install_default_crypto_provider() {
-    if default_provider().install_default().is_err() {
+    if build_default_crypto_provider().install_default().is_err() {
         debug!(
             target: "rustfs::main",
             event = EVENT_CRYPTO_PROVIDER_STATE,
@@ -155,7 +168,7 @@ pub(crate) async fn init_embedded_runtime_hooks(obs_endpoint: String) -> Result<
 }
 
 fn install_embedded_default_crypto_provider() {
-    if let Err(err) = default_provider().install_default() {
+    if let Err(err) = build_default_crypto_provider().install_default() {
         debug!(
             component = LOG_COMPONENT_EMBEDDED,
             subsystem = LOG_SUBSYSTEM_EMBEDDED,
@@ -169,11 +182,17 @@ fn install_embedded_default_crypto_provider() {
 
 #[cfg(test)]
 mod tests {
-    use super::{init_profiling_runtime_with, shutdown_profiling_runtime_with};
+    use super::{build_default_crypto_provider, init_profiling_runtime_with, shutdown_profiling_runtime_with};
     use std::sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
     };
+
+    #[test]
+    fn default_crypto_provider_matches_fips_feature() {
+        let provider = build_default_crypto_provider();
+        assert_eq!(provider.fips(), cfg!(feature = "fips"));
+    }
 
     #[tokio::test]
     async fn init_profiling_runtime_invokes_registered_hook() {
