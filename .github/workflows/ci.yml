@@ -501,7 +501,8 @@ jobs:
     name: FIPS provider boundaries
     if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
-    runs-on: ubuntu-latest
+    # This builds the RustFS library test target, which exceeds hosted-runner disk capacity.
+    runs-on: sm-standard-4
     timeout-minutes: 90
     strategy:
       fail-fast: false
@@ -523,6 +524,10 @@ jobs:
           cache-shared-key: ci-fips-provider
           cache-save-if: 'false'
           install-build-packaging-tools: 'false'
+
+      - name: Install FIPS build tools
+        if: matrix.mode == 'fips'
+        run: sudo apt-get install -y cmake golang clang libclang-dev
 
       - name: Verify provider installation
         shell: bash
