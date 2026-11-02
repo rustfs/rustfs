@@ -25,7 +25,7 @@ pub(crate) async fn init_startup_runtime_foundation(config: &Config) -> Result<(
     log_startup_runtime_diagnostics();
     init_profiling_runtime().await;
     rustfs_trusted_proxies::init();
-    install_default_crypto_provider();
+    install_default_crypto_provider()?;
     init_object_max_versions_config()?;
     init_outbound_tls_material(config).await
 }
