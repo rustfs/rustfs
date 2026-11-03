@@ -970,20 +970,38 @@ pub(crate) mod bucket {
         /// pending-purge version before its own delivery state is written back,
         /// and duplicates it to every other peer (rustfs#9121). MinIO never
         /// re-replicates a replication request at all.
+        ///
+        /// Rule ids and target ARN shapes are not reserved: an ordinary bucket
+        /// target ARN also carries a target id, so an operator rule can match
+        /// the derived shape. Only a rule naming a current remote peer in
+        /// `site_peer_deployment_ids` is skipped; with site replication
+        /// disabled the set is empty and every rule forwards.
         pub(crate) fn replica_delete_fanout_state_from_config(
             config: &s3s::dto::ReplicationConfiguration,
             obj_info: &crate::storage::storage_api::StorageObjectInfo,
             version_id: Option<Uuid>,
+            site_peer_deployment_ids: &HashSet<String>,
         ) -> Option<replication_contracts::ReplicationState> {
-            let is_site_replication_rule =
-                |rule: &s3s::dto::ReplicationRule| replication_contracts::site_replication_rule_deployment_id(rule).is_some();
-            if !config.rules.iter().any(is_site_replication_rule) {
+            let is_site_peer_rule = |rule: &s3s::dto::ReplicationRule| {
+                replication_contracts::site_replication_rule_deployment_id(rule)
+                    .is_some_and(|deployment_id| site_peer_deployment_ids.contains(deployment_id))
+            };
+            if !config.rules.iter().any(is_site_peer_rule) {
                 return delete_replication_state_from_config(config, obj_info, version_id, true);
             }
 
             let mut operator_config = config.clone();
-            operator_config.rules.retain(|rule| !is_site_replication_rule(rule));
+            operator_config.rules.retain(|rule| !is_site_peer_rule(rule));
             delete_replication_state_from_config(&operator_config, obj_info, version_id, true)
+        }
+
+        /// Whether `config` has a rule with the derived site-replication shape,
+        /// so the replica-delete fan-out needs the current peer set.
+        pub(crate) fn has_site_replication_shaped_rule(config: &s3s::dto::ReplicationConfiguration) -> bool {
+            config
+                .rules
+                .iter()
+                .any(|rule| replication_contracts::site_replication_rule_deployment_id(rule).is_some())
         }
 
         pub(crate) fn replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> HashSet<String> {
