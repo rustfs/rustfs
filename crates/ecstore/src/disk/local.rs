@@ -15729,7 +15729,7 @@ mod test {
                 assert!(slots[0][0][1].is_some());
                 drop(slots);
                 drop(entries);
-                let (disks, errors) = crate::store::init_format::init_disks(&endpoints, &options).await;
+                let (disks, errors) = crate::store::init_format::init_disks(&ctx, &endpoints, &options).await;
                 assert!(disks[0].is_none());
                 assert!(disks[1].is_some());
                 assert_eq!(errors[0], Some(DiskError::FileAccessDenied));
