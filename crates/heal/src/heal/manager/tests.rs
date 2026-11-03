@@ -117,6 +117,453 @@ async fn process_manager_queue_once(manager: &HealManager) {
 
 struct MockStorage;
 
+fn incarnation_bound_mrf_fallback(incarnation: Uuid) -> HealRequest {
+    let mut request = HealRequest::object("mrf-recreated-bucket".to_owned(), "object".to_owned(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(incarnation);
+    request.options.pool_index = Some(0);
+    request.options.set_index = Some(0);
+    request
+}
+
+async fn assert_recreated_bucket_fallback_has_its_own_owner(existing_state: &str) {
+    let storage: Arc<dyn HealStorageAPI> = Arc::new(MockStorage);
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::clone(&storage), None);
+    let old_incarnation = Uuid::new_v4();
+    let new_incarnation = Uuid::new_v4();
+    let old_request = incarnation_bound_mrf_fallback(old_incarnation);
+    let old_id = old_request.id.clone();
+    match existing_state {
+        "queued" => {
+            let receipt = manager
+                .submit_heal_request_with_receipt(old_request)
+                .await
+                .expect("old fallback must be admitted");
+            assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+        }
+        "active" => {
+            manager
+                .active_heals
+                .lock()
+                .await
+                .insert(old_id.clone(), Arc::new(HealTask::from_request(old_request, Arc::clone(&storage))));
+        }
+        "retrying" => {
+            manager.retrying_heals.lock().await.insert(
+                old_id.clone(),
+                RetryingHeal {
+                    request: old_request,
+                    error: "retry pending".to_owned(),
+                    cancel_token: CancellationToken::new(),
+                },
+            );
+        }
+        other => panic!("unknown fixture state: {other}"),
+    }
+
+    let new_request = incarnation_bound_mrf_fallback(new_incarnation);
+    let new_id = new_request.id.clone();
+    assert_ne!(new_id, old_id, "the fallback must use a new request ID");
+    let receipt = manager
+        .submit_heal_request_with_receipt(new_request)
+        .await
+        .expect("new incarnation admission must be decided");
+    assert_eq!(
+        receipt.result,
+        HealAdmissionResult::Accepted,
+        "a {existing_state} fallback for an older bucket incarnation cannot own the new repair"
+    );
+    assert_eq!(receipt.task_id, new_id, "the new incarnation must retain its own task identity");
+    let queue = manager.heal_queue.lock().await;
+    assert!(
+        queue
+            .requests()
+            .any(|request| { request.id == new_id && request.expected_mrf_bucket_incarnation_id == Some(new_incarnation) })
+    );
+    if existing_state == "queued" {
+        assert!(
+            queue
+                .requests()
+                .any(|request| { request.id == old_id && request.expected_mrf_bucket_incarnation_id == Some(old_incarnation) })
+        );
+    }
+}
+
+#[tokio::test]
+async fn mrf_fallback_recreated_bucket_does_not_merge_into_queued_old_incarnation() {
+    assert_recreated_bucket_fallback_has_its_own_owner("queued").await;
+}
+
+#[tokio::test]
+async fn mrf_fallback_recreated_bucket_does_not_merge_into_active_old_incarnation() {
+    assert_recreated_bucket_fallback_has_its_own_owner("active").await;
+}
+
+#[tokio::test]
+async fn mrf_fallback_recreated_bucket_does_not_merge_into_retrying_old_incarnation() {
+    assert_recreated_bucket_fallback_has_its_own_owner("retrying").await;
+}
+
+fn incarnation_bound_mrf_fallback_for_version(incarnation: Uuid, version_id: Option<&str>) -> HealRequest {
+    let mut request = incarnation_bound_mrf_fallback(incarnation);
+    if let HealType::Object { version_id: id, .. } = &mut request.heal_type {
+        *id = version_id.map(str::to_owned);
+    } else {
+        unreachable!("fallback fixture must be an object request");
+    }
+    request
+}
+
+#[tokio::test]
+async fn versioned_mrf_fallbacks_merge_into_queued_owner() {
+    for version in [Uuid::nil(), Uuid::new_v4()] {
+        let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+        let incarnation = Uuid::new_v4();
+        let version_id = version.to_string();
+        let original = incarnation_bound_mrf_fallback_for_version(incarnation, Some(&version_id));
+        let original_id = original.id.clone();
+        let accepted = manager
+            .submit_heal_request_with_receipt(original)
+            .await
+            .expect("first queued fallback");
+        assert_eq!(accepted.result, HealAdmissionResult::Accepted);
+        let merged = manager
+            .submit_heal_request_with_receipt(incarnation_bound_mrf_fallback_for_version(incarnation, Some(&version_id)))
+            .await
+            .expect("duplicate queued fallback");
+        assert_eq!(merged.result, HealAdmissionResult::Merged);
+        assert_eq!(merged.task_id, original_id);
+        assert_eq!(manager.heal_queue.lock().await.len(), 1);
+    }
+}
+
+#[tokio::test]
+async fn mrf_fallback_same_incarnation_merges_but_version_and_scope_remain_distinct() {
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let incarnation = Uuid::new_v4();
+    let original = incarnation_bound_mrf_fallback(incarnation);
+    let original_id = original.id.clone();
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(original)
+            .await
+            .expect("first fallback")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+    let same = manager
+        .submit_heal_request_with_receipt(incarnation_bound_mrf_fallback(incarnation))
+        .await
+        .expect("same-incarnation fallback");
+    assert_eq!(same.result, HealAdmissionResult::Merged);
+    assert_eq!(same.task_id, original_id);
+
+    let mut versioned = incarnation_bound_mrf_fallback(incarnation);
+    versioned.heal_type = HealType::Object {
+        bucket: "mrf-recreated-bucket".to_owned(),
+        object: "object".to_owned(),
+        version_id: Some(Uuid::new_v4().to_string()),
+    };
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(versioned)
+            .await
+            .expect("different version")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+    let mut other_scope = incarnation_bound_mrf_fallback(incarnation);
+    other_scope.options.pool_index = Some(1);
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(other_scope)
+            .await
+            .expect("different pool")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+    let mut same_id_other_incarnation = incarnation_bound_mrf_fallback(Uuid::new_v4());
+    same_id_other_incarnation.id = original_id;
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(same_id_other_incarnation)
+            .await
+            .expect("same-ID conflict must be decided")
+            .result,
+        HealAdmissionResult::Dropped(HealAdmissionDropReason::AlreadyRunning)
+    );
+}
+
+#[test]
+fn mrf_bound_dedup_keys_separate_incarnation_source_and_untrusted_components() {
+    let incarnation = Uuid::new_v4();
+    let bound = incarnation_bound_mrf_fallback(incarnation);
+    let mut unbound = bound.clone();
+    unbound.expected_mrf_bucket_incarnation_id = None;
+    let mut non_mrf = bound.clone();
+    non_mrf.source = HealRequestSource::ReadRepair;
+    assert_ne!(PriorityHealQueue::make_dedup_key(&bound), PriorityHealQueue::make_dedup_key(&unbound));
+    assert_eq!(
+        PriorityHealQueue::make_dedup_key(&non_mrf),
+        PriorityHealQueue::make_dedup_key_for_scope(&non_mrf.heal_type, &non_mrf.options),
+        "an unrelated source retains its previous scope key even if the MRF-only field is set"
+    );
+    assert_eq!(PriorityHealQueue::make_dedup_key(&non_mrf), PriorityHealQueue::make_dedup_key(&unbound));
+
+    let mut left = bound.clone();
+    left.heal_type = HealType::Object {
+        bucket: "mrf-recreated-bucket".to_owned(),
+        object: "part:a".to_owned(),
+        version_id: Some("b".to_owned()),
+    };
+    let mut right = bound.clone();
+    right.heal_type = HealType::Object {
+        bucket: "mrf-recreated-bucket".to_owned(),
+        object: "part".to_owned(),
+        version_id: Some("a:b".to_owned()),
+    };
+    assert_eq!(
+        PriorityHealQueue::make_dedup_key_for_scope(&left.heal_type, &left.options),
+        PriorityHealQueue::make_dedup_key_for_scope(&right.heal_type, &right.options),
+        "the legacy delimiter-only key demonstrates the collision"
+    );
+    assert_ne!(
+        PriorityHealQueue::make_dedup_key(&left),
+        PriorityHealQueue::make_dedup_key(&right),
+        "length-prefixed object and version components must not alias"
+    );
+    let mut forged = unbound;
+    forged.heal_type = HealType::Object {
+        bucket: "mrf-recreated-bucket".to_owned(),
+        object: PriorityHealQueue::make_dedup_key(&bound),
+        version_id: None,
+    };
+    assert_ne!(PriorityHealQueue::make_dedup_key(&bound), PriorityHealQueue::make_dedup_key(&forged));
+}
+
+#[test]
+fn mrf_bound_optional_versions_do_not_alias_empty_or_forged_components() {
+    let incarnation = Uuid::new_v4();
+    for decode in [false, true] {
+        let make_request = |object: &str, version_id: Option<&str>| {
+            let mut request = incarnation_bound_mrf_fallback(incarnation);
+            let bucket = "mrf-recreated-bucket".to_owned();
+            let object = object.to_owned();
+            let version_id = version_id.map(str::to_owned);
+            request.heal_type = if decode {
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                }
+            } else {
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                }
+            };
+            request
+        };
+        let absent = make_request("object", None);
+        let empty = make_request("object", Some(""));
+        let forged_object = make_request("object4:some0:", None);
+        let forged_version = make_request("object", Some("4:none"));
+        let keys = [&absent, &empty, &forged_object, &forged_version].map(PriorityHealQueue::make_dedup_key);
+        for (index, key) in keys.iter().enumerate() {
+            assert!(keys.iter().skip(index + 1).all(|other| key != other));
+        }
+
+        let mut queue = PriorityHealQueue::new();
+        assert_eq!(queue.push(absent.clone()), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(empty.clone()), QueuePushOutcome::Accepted);
+        assert_eq!(queue.push(make_request("object", None)), QueuePushOutcome::Merged);
+        assert_eq!(queue.push(make_request("object", Some(""))), QueuePushOutcome::Merged);
+        assert_eq!(queue.len(), 2);
+
+        for source in [HealRequestSource::Mrf, HealRequestSource::ReadRepair] {
+            let mut legacy_absent = absent.clone();
+            let mut legacy_empty = empty.clone();
+            legacy_absent.source = source;
+            legacy_empty.source = source;
+            if source == HealRequestSource::Mrf {
+                legacy_absent.expected_mrf_bucket_incarnation_id = None;
+                legacy_empty.expected_mrf_bucket_incarnation_id = None;
+            }
+            assert_eq!(
+                PriorityHealQueue::make_dedup_key(&legacy_absent),
+                PriorityHealQueue::make_dedup_key(&legacy_empty),
+                "unbound and non-MRF work retain the legacy empty-version key"
+            );
+        }
+    }
+}
+
+#[test]
+fn mrf_bound_queue_releases_each_incarnation_representative_independently() {
+    let mut queue = PriorityHealQueue::new();
+    let old = incarnation_bound_mrf_fallback(Uuid::new_v4());
+    let old_id = old.id.clone();
+    let old_key = PriorityHealQueue::make_dedup_key(&old);
+    let new = incarnation_bound_mrf_fallback(Uuid::new_v4());
+    let new_id = new.id.clone();
+    let new_key = PriorityHealQueue::make_dedup_key(&new);
+    let mut forced_old = old.clone();
+    forced_old.id = Uuid::new_v4().to_string();
+    forced_old.force_start = true;
+    let forced_id = forced_old.id.clone();
+
+    assert_eq!(queue.push(old), QueuePushOutcome::Accepted);
+    assert_eq!(queue.push(new), QueuePushOutcome::Accepted);
+    assert_eq!(queue.push(forced_old), QueuePushOutcome::Accepted);
+    assert_eq!(queue.queued_request_id_for_dedup_key(&old_key), Some(old_id.as_str()));
+    assert_eq!(queue.queued_request_id_for_dedup_key(&new_key), Some(new_id.as_str()));
+    queue
+        .remove_request_id(&old_id)
+        .expect("remove the old incarnation representative");
+    assert_eq!(queue.queued_request_id_for_dedup_key(&old_key), Some(forced_id.as_str()));
+    assert_eq!(queue.queued_request_id_for_dedup_key(&new_key), Some(new_id.as_str()));
+    assert_eq!(queue.pop_next().expect("new incarnation stays queued").id, new_id);
+    assert!(queue.queued_request_id_for_dedup_key(&new_key).is_none());
+    assert_eq!(queue.pop_next().expect("forced old owner stays queued").id, forced_id);
+    assert!(queue.queued_request_id_for_dedup_key(&old_key).is_none());
+}
+
+#[tokio::test]
+async fn durable_mrf_recreated_bucket_is_not_merged_into_queued_old_fallback() {
+    use rustfs_common::mrf_channel::{MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent};
+
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let old = incarnation_bound_mrf_fallback(Uuid::new_v4());
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(old)
+            .await
+            .expect("old fallback")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+    let incarnation = Uuid::new_v4();
+    let request = incarnation_bound_mrf_fallback(incarnation);
+    let request_id = request.id.clone();
+    let mut intent = MrfIntent {
+        bucket: Arc::from("mrf-recreated-bucket"),
+        object: Arc::from("object"),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        }),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, incarnation).expect("durable identity");
+    let target = MrfRepairNoticeTarget {
+        bucket: Arc::clone(&intent.bucket),
+        object: Arc::clone(&intent.object),
+        version_id: intent.version_id,
+        kind: intent.kind,
+        scope: intent.scope,
+        delete_marker_purge: None,
+        lease: intent.lease,
+        durable_anchor: Some(anchor.clone()),
+    };
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt_and_identity(request, target)
+        .await
+        .expect("durable admission must be decided");
+    assert_eq!(
+        receipt.result,
+        HealAdmissionResult::Accepted,
+        "a durable new incarnation needs its own owner"
+    );
+    assert_eq!(receipt.task_id, request_id);
+    assert!(
+        manager
+            .heal_queue
+            .lock()
+            .await
+            .requests()
+            .any(|queued| { queued.id == request_id && queued.expected_mrf_bucket_incarnation_id == Some(incarnation) })
+    );
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("stable owner snapshot")
+            .contains(&anchor)
+    );
+}
+
+#[tokio::test]
+async fn durable_mrf_same_incarnation_merge_retains_the_durable_anchor() {
+    use rustfs_common::mrf_channel::{MrfIngressResult, MrfIntent, MrfKind, MrfScope, try_rearm_mrf_replay_intent};
+
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let incarnation = Uuid::new_v4();
+    let object = format!("same-generation-{}", Uuid::new_v4());
+    let make_request = || {
+        let mut request = incarnation_bound_mrf_fallback(incarnation);
+        request.heal_type = HealType::Object {
+            bucket: "mrf-recreated-bucket".to_owned(),
+            object: object.clone(),
+            version_id: None,
+        };
+        request
+    };
+    let old = make_request();
+    let old_id = old.id.clone();
+    assert_eq!(
+        manager
+            .submit_heal_request_with_receipt(old)
+            .await
+            .expect("old fallback")
+            .result,
+        HealAdmissionResult::Accepted
+    );
+    let mut intent = MrfIntent {
+        bucket: Arc::from("mrf-recreated-bucket"),
+        object: Arc::from(object.as_str()),
+        version_id: None,
+        kind: MrfKind::PartialWrite,
+        delete_marker_purge: None,
+        scope: Some(MrfScope {
+            pool_index: 0,
+            set_index: 0,
+        }),
+        lease: None,
+        enqueued_at_ms: 1,
+        attempts: 0,
+    };
+    assert_eq!(try_rearm_mrf_replay_intent(&mut intent), MrfIngressResult::Enqueued);
+    let anchor = rustfs_common::mrf_channel::MrfDurableRepairAnchor::from_intent(&intent, incarnation).expect("durable identity");
+    let target = MrfRepairNoticeTarget {
+        bucket: Arc::clone(&intent.bucket),
+        object: Arc::clone(&intent.object),
+        version_id: intent.version_id,
+        kind: intent.kind,
+        scope: intent.scope,
+        delete_marker_purge: None,
+        lease: intent.lease,
+        durable_anchor: Some(anchor.clone()),
+    };
+    let merged = manager
+        .submit_mrf_heal_request_with_receipt_and_identity(make_request(), target)
+        .await
+        .expect("durable same-incarnation admission");
+    assert_eq!(merged.result, HealAdmissionResult::Merged);
+    assert_eq!(merged.task_id, old_id);
+    assert!(
+        manager
+            .try_in_flight_durable_mrf_anchors()
+            .expect("stable owner snapshot")
+            .contains(&anchor)
+    );
+}
+
 fn completed_retention_fixture(completed_at: SystemTime) -> CompletedHealStatus {
     CompletedHealStatus {
         task_id: "fixture-token".to_string(),

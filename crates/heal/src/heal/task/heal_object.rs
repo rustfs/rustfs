@@ -480,8 +480,9 @@ impl HealTask {
                 message: format!("Missing source bucket incarnation for durable MRF repair {bucket}/{object}"),
             })?;
         if current_bucket_incarnation_id != bucket_incarnation_id {
-            return Err(Error::TaskExecutionFailed {
-                message: format!("Bucket incarnation changed before durable MRF repair {bucket}/{object}"),
+            return Err(Error::StaleBucketIncarnation {
+                bucket: bucket.to_owned(),
+                expected: Some(bucket_incarnation_id),
             });
         }
         expected.bucket_incarnation_id = Some(bucket_incarnation_id);

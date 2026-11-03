@@ -3692,6 +3692,177 @@ mod tests {
         );
     }
 
+    // The RPC lock service uses the raw ObjectKey and one backend per node,
+    // even when the requesting sets carry different pool namespace strings.
+    async fn pool_meta_heal_store_with_lock_domains(source: &Arc<ECStore>, shared: bool) -> Arc<ECStore> {
+        use rustfs_lock::client::{LockClient, local::LocalClient};
+
+        let clients = || {
+            (0..2)
+                .map(|_| {
+                    Arc::new(LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::new()))) as Arc<dyn LockClient>
+                })
+                .collect::<Vec<_>>()
+        };
+        let first = clients();
+        let second = if shared { first.clone() } else { clients() };
+        let mut pools = source.pools.clone();
+        for (pool, lockers) in pools.iter_mut().zip([first, second]) {
+            for set in &mut Arc::make_mut(pool).disk_set {
+                Arc::make_mut(set).lockers = lockers.clone();
+            }
+        }
+        let endpoints: EndpointServerPools = pools.iter().map(|pool| pool.endpoints.clone()).collect::<Vec<_>>().into();
+        let state = source.pool_meta_save_gate.lock().await.independent_clone_for_test();
+        Arc::new(ECStore {
+            id: Uuid::new_v4(),
+            disk_map: Default::default(),
+            pools,
+            peer_sys: crate::cluster::rpc::S3PeerSys::new_with_instance_ctx(&endpoints, Arc::clone(&source.ctx)),
+            pool_meta: tokio::sync::RwLock::new(source.pool_meta.read().await.clone()),
+            rebalance_meta: tokio::sync::RwLock::new(None),
+            decommission_cancelers: tokio::sync::RwLock::new(vec![None; 2]),
+            start_gate: tokio::sync::Mutex::new(()),
+            pool_meta_save_gate: tokio::sync::Mutex::new(state),
+            ctx: Arc::clone(&source.ctx),
+            bucket_fence_registry: Arc::default(),
+        })
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_same_distributed_backend_has_one_raw_lock_across_pools() {
+        let (_dirs, source, _peer) = test_two_pool_stores(None).await;
+        let store = pool_meta_heal_store_with_lock_domains(&source, true).await;
+        let first = store.pools[0].get_disks_by_key(POOL_META_NAME);
+        let second = store.pools[1].get_disks_by_key(POOL_META_NAME);
+        let first_lock = first
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("first pool lock");
+        let second_lock = second
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("second pool lock");
+        let guard = first_lock
+            .get_write_lock(std::time::Duration::from_secs(2))
+            .await
+            .expect("first writer");
+        assert!(
+            second_lock
+                .get_write_lock(std::time::Duration::from_millis(150))
+                .await
+                .is_err(),
+            "different pool namespaces still conflict on the same backend and object key"
+        );
+        drop(guard);
+        second_lock
+            .get_write_lock(std::time::Duration::from_secs(3))
+            .await
+            .expect("second writer should acquire after the first releases");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_reuses_same_distributed_backend_across_pools() {
+        let (_dirs, source, _peer) = test_two_pool_stores(None).await;
+        let store = pool_meta_heal_store_with_lock_domains(&source, true).await;
+        let (item, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    dry_run: true,
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("inspection must reuse the fixed pool's writer when the lock backend is shared")
+        .expect("pool metadata heal inspection should return a result");
+        assert!(error.is_none(), "inspection should succeed: {error:?}");
+        assert_eq!(item.object, POOL_META_NAME);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_repairs_other_pool_with_shared_distributed_backend() {
+        let (_dirs, source, _peer) = test_two_pool_stores(None).await;
+        let store = pool_meta_heal_store_with_lock_domains(&source, true).await;
+        let missing = remove_pool_meta_shard(&store, 1).await;
+        let (item, error) = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            store.handle_heal_object(
+                RUSTFS_META_BUCKET,
+                POOL_META_NAME,
+                "",
+                &HealOpts {
+                    pool: Some(1),
+                    ..Default::default()
+                },
+            ),
+        )
+        .await
+        .expect("cross-pool repair must not reenter the shared writer")
+        .expect("pool metadata repair should return a result");
+        assert!(error.is_none(), "cross-pool repair should complete: {error:?}");
+        assert_eq!(item.object, POOL_META_NAME);
+        assert!(
+            missing.read_xl(RUSTFS_META_BUCKET, POOL_META_NAME, false).await.is_ok(),
+            "the selected missing shard must be restored"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_heal_keeps_target_lock_for_independent_distributed_backend() {
+        let (_dirs, source, _peer) = test_two_pool_stores(None).await;
+        let store = pool_meta_heal_store_with_lock_domains(&source, false).await;
+        let target = store.pools[1].get_disks_by_key(POOL_META_NAME);
+        let lock = target
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
+            .await
+            .expect("target lock");
+        let guard = lock
+            .get_write_lock(std::time::Duration::from_secs(2))
+            .await
+            .expect("hold target lock");
+        let barrier = DecommissionCapacityLockOrderBarrier::install(store.id, store.id);
+        let heal_store = Arc::clone(&store);
+        let mut heal = tokio::spawn(async move {
+            heal_store
+                .handle_heal_object(
+                    RUSTFS_META_BUCKET,
+                    POOL_META_NAME,
+                    "",
+                    &HealOpts {
+                        pool: Some(1),
+                        dry_run: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            barrier.wait_until_external_heal_target_lock_attempted(),
+        )
+        .await
+        .expect("inspection must attempt the independent target lock");
+        assert!(!heal.is_finished(), "inspection must wait while the target writer is held");
+        drop(guard);
+        let (item, error) = tokio::time::timeout(std::time::Duration::from_secs(3), &mut heal)
+            .await
+            .expect("inspection should progress after target lock release")
+            .expect("heal task should not panic")
+            .expect("pool metadata heal inspection should return a result");
+        assert!(error.is_none(), "inspection should succeed: {error:?}");
+        assert_eq!(item.object, POOL_META_NAME);
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn pool_meta_heal_cas_repairs_only_the_requested_pool() {

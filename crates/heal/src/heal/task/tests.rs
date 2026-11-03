@@ -3375,8 +3375,65 @@ async fn durable_mrf_heal_rejects_a_recreated_bucket_before_storage_heal() {
 
     let result = task.heal_object("bucket", "object", None).await;
 
-    assert!(matches!(result, Err(Error::TaskExecutionFailed { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::StaleBucketIncarnation { expected: Some(id), .. }) if id == original_incarnation
+    ));
     assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_mrf_stale_incarnation_object_name_cannot_change_retry_classification() {
+    for object in ["timed out", "network error", "ordinary"] {
+        let original_incarnation = Uuid::new_v4();
+        let recreated_incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(recreated_incarnation)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::object("bucket".to_owned(), object.to_owned(), None);
+        request.source = HealRequestSource::Mrf;
+        request.expected_mrf_bucket_incarnation_id = Some(original_incarnation);
+        request.options.pool_index = Some(0);
+        request.options.set_index = Some(1);
+        let task = HealTask::from_request(request, storage.clone());
+
+        let error = task
+            .execute()
+            .await
+            .expect_err("a recreated bucket must reject the old MRF responsibility");
+        assert!(
+            !error.is_recoverable_heal(),
+            "user-controlled object names must not make a stale incarnation retryable: {object}"
+        );
+        assert!(
+            matches!(
+                &error,
+                Error::StaleBucketIncarnation { bucket, expected }
+                    if bucket == "bucket" && *expected == Some(original_incarnation)
+            ),
+            "the failure must retain the original bucket incarnation: {error:?}"
+        );
+        assert!(
+            matches!(crate::error::classify_heal_error(&error), crate::error::HealErrorClass::Aborted),
+            "stale responsibility must be classified independently of the object name"
+        );
+        assert!(
+            storage.heal_object_calls.lock().expect("object heal calls").is_empty(),
+            "an old responsibility must not reach storage repair in the recreated bucket"
+        );
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.healed, 0, "a stale task cannot claim a repair");
+        assert!(
+            outcome.objects.iter().all(|item| !matches!(
+                &item.disposition,
+                HealObjectDisposition::Repaired
+                    | HealObjectDisposition::VerifiedHealthy
+                    | HealObjectDisposition::AuthoritativelyAbsent
+            )),
+            "the stale task must not produce a positive repair proof"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]

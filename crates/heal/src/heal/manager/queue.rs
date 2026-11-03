@@ -611,7 +611,104 @@ impl PriorityHealQueue {
 
     /// Create a deduplication key from a heal request
     pub(super) fn make_dedup_key(request: &HealRequest) -> String {
-        Self::make_dedup_key_for_scope(&request.heal_type, &request.options)
+        Self::make_dedup_key_for_owner(
+            &request.heal_type,
+            &request.options,
+            request.source,
+            request.expected_mrf_bucket_incarnation_id,
+        )
+    }
+
+    /// Bound MRF work can only merge with work for the same bucket lifetime.
+    /// Length-prefix user-controlled components so a key cannot forge another
+    /// version, scope, or incarnation through delimiter characters.
+    pub(super) fn make_dedup_key_for_owner(
+        heal_type: &HealType,
+        options: &HealOptions,
+        source: HealRequestSource,
+        incarnation: Option<Uuid>,
+    ) -> String {
+        if source == HealRequestSource::Mrf
+            && let Some(incarnation) = incarnation
+        {
+            use std::fmt::Write as _;
+
+            let (pool, set) = heal_scope_indices(heal_type, options);
+            let mut key = format!("mrf-bound-v1:{incarnation}:{pool:?}:{set:?}:");
+            let mut part = |value: &str| {
+                // Formatting into a String is infallible.
+                let _ = write!(key, "{}:{value}", value.len());
+            };
+            match heal_type {
+                HealType::Object {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    part("object");
+                    part(bucket);
+                    part(object);
+                    match version_id {
+                        None => part("none"),
+                        Some(version_id) => {
+                            part("some");
+                            part(version_id);
+                        }
+                    }
+                }
+                HealType::Metadata { bucket, object } => {
+                    part("metadata");
+                    part(bucket);
+                    part(object);
+                }
+                HealType::ECDecode {
+                    bucket,
+                    object,
+                    version_id,
+                } => {
+                    part("ecdecode");
+                    part(bucket);
+                    part(object);
+                    match version_id {
+                        None => part("none"),
+                        Some(version_id) => {
+                            part("some");
+                            part(version_id);
+                        }
+                    }
+                }
+                HealType::DeleteMarkerPurge {
+                    bucket,
+                    object,
+                    version_id,
+                    purge,
+                } => {
+                    part("delete-marker-purge");
+                    part(bucket);
+                    part(object);
+                    part(version_id);
+                    part(&purge.bucket_incarnation_id.to_string());
+                    part(&purge.marker_incarnation_id.to_string());
+                    part(&base64_simd::URL_SAFE_NO_PAD.encode_to_string(purge.marker_identity));
+                }
+                HealType::Bucket { bucket } => {
+                    part("bucket");
+                    part(bucket);
+                }
+                HealType::Prefix { bucket, prefix } => {
+                    part("prefix");
+                    part(bucket);
+                    part(prefix);
+                }
+                // Cluster and erasure-set work are not bucket-bound; preserve
+                // their existing keys, including contains_erasure_set lookups.
+                HealType::Cluster | HealType::ErasureSet { .. } => {
+                    return Self::make_dedup_key_for_scope(heal_type, options);
+                }
+            }
+            return key;
+        }
+        Self::make_dedup_key_for_scope(heal_type, options)
     }
 
     pub(super) fn make_dedup_key_for_scope(heal_type: &HealType, options: &HealOptions) -> String {
