@@ -50,10 +50,9 @@ use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, Ha
 use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
 use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
 use super::storage_api::multipart_usecase::options::{
-    copy_src_opts, extract_metadata_from_mime, extract_user_metadata_from_query,
-    get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
-    has_replication_retention_update, namespace_reserved_user_metadata, parse_copy_source_range,
-    put_opts_with_replication_authorization, validate_archive_content_encoding,
+    copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
+    get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
+    parse_copy_source_range, put_opts_with_replication_authorization, validate_archive_content_encoding,
 };
 use super::storage_api::multipart_usecase::request_context::spawn_traced_join;
 use super::storage_api::multipart_usecase::s3_api::multipart::{
@@ -259,15 +258,11 @@ fn complete_part_from_s3(value: CompletedPart) -> CompletePart {
 fn create_multipart_upload_metadata(
     input_metadata: Option<HashMap<String, String>>,
     headers: &HeaderMap,
-    query: Option<&str>,
     tagging: Option<String>,
     storage_class: Option<&s3s::dto::StorageClass>,
-) -> S3Result<HashMap<String, String>> {
+) -> HashMap<String, String> {
     let mut metadata = input_metadata.unwrap_or_default();
     namespace_reserved_user_metadata(&mut metadata);
-    // Hoisted `x-amz-meta-*` query parameters fill in what the headers did not
-    // carry; the header pass below wins on conflicts.
-    extract_user_metadata_from_query(headers, query, &mut metadata)?;
     extract_metadata_from_mime(headers, &mut metadata);
 
     if let Some(tags) = tagging {
@@ -277,7 +272,7 @@ fn create_multipart_upload_metadata(
         metadata.insert(AMZ_STORAGE_CLASS.to_owned(), storage_class.as_str().to_owned());
     }
 
-    Ok(metadata)
+    metadata
 }
 
 fn multipart_max_total_object_size(metadata: &HashMap<String, String>) -> S3Result<Option<u64>> {
@@ -1055,8 +1050,7 @@ impl DefaultMultipartUsecase {
             req.headers.get("content-encoding").and_then(|value| value.to_str().ok()),
         )?;
 
-        let mut metadata =
-            create_multipart_upload_metadata(input_metadata, &req.headers, req.uri.query(), tagging, storage_class.as_ref())?;
+        let mut metadata = create_multipart_upload_metadata(input_metadata, &req.headers, tagging, storage_class.as_ref());
         if let Some(limit) = multipart_max_total_object_size {
             insert_str(&mut metadata, SUFFIX_MAX_TOTAL_OBJECT_SIZE, limit.to_string());
         }
@@ -2732,10 +2726,8 @@ mod tests {
             None,
             &HeaderMap::new(),
             None,
-            None,
             Some(&StorageClass::from_static("REDUCED_REDUNDANCY")),
-        )
-        .unwrap();
+        );
 
         assert_eq!(metadata.get(AMZ_STORAGE_CLASS), Some(&"REDUCED_REDUNDANCY".to_string()));
     }
@@ -2753,11 +2745,9 @@ mod tests {
         let metadata = create_multipart_upload_metadata(
             Some(input_metadata),
             &headers,
-            None,
             Some("project=rustfs".to_string()),
             Some(&StorageClass::from_static("REDUCED_REDUNDANCY")),
-        )
-        .unwrap();
+        );
 
         assert_eq!(metadata.get("content-type"), Some(&"application/octet-stream".to_string()));
         assert_eq!(metadata.get("x-amz-meta-content-type"), Some(&"user-content-type".to_string()));

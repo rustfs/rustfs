@@ -980,34 +980,48 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
 /// the signature itself), so a SigV4 request's query parameters are as
 /// trustworthy as its headers — the AWS SDK presigners rely on this when they
 /// hoist `x-amz-*` headers into the query (`@smithy/signature-v4`
-/// `moveHeadersToQuery`). SigV2's string-to-sign covers headers plus a fixed
-/// subresource list only, so honoring its query would let the holder of a
-/// presigned URL add object properties the presigner never authorized (for
-/// example `x-amz-meta-snowball-auto-extract`).
+/// `moveHeadersToQuery`).
 ///
-/// Detection is by request shape and deliberately stricter than
-/// [`get_request_auth_type_with_query`]: either the `Authorization` header
-/// carries SigV4 (all header-signed SigV4 variants, streaming included), or the
-/// query itself carries the SigV4 presign parameters. A bare `x-amz-credential`
-/// header — what [`is_request_presigned_signature_v4_with_query`] falls back
-/// on — is not proof of presigning and does not qualify, so an unauthenticated
-/// request cannot talk its way into reading query properties. Callers reach
-/// this only after s3s has verified the signature, so shape detection agrees
-/// with verification for genuine SigV4 traffic.
+/// SigV2 is ruled out first and must stay ruled out. Its string-to-sign covers
+/// headers plus a fixed subresource list rather than arbitrary query parameters,
+/// so a SigV2 presigned URL keeps validating after `X-Amz-Algorithm` and
+/// `X-Amz-Signature` markers are appended to it. Those markers would otherwise
+/// talk this predicate into trusting a query the SigV2 signature never covered,
+/// which is how a URL holder could turn on `x-amz-meta-snowball-auto-extract`
+/// and have a plain upload untarred.
+///
+/// After that, the request must carry SigV4 the way the verifier authenticates
+/// it: an `Authorization: AWS4-HMAC-SHA256` header (all header-signed variants,
+/// streaming included), or the complete presign marker set in the query. A bare
+/// `x-amz-credential` header — what
+/// [`is_request_presigned_signature_v4_with_query`] falls back on — is not
+/// proof of presigning and does not qualify. A forged marker set on a request
+/// with no signature at all (anonymous, JWT) is accepted here and is not a
+/// widening: such a request may already send the same `x-amz-*` headers, and
+/// the hoisted form is checked into the same place. It does not survive a
+/// verifier that rejects it either.
+///
+/// [`is_request_presigned_signature_v4_with_query`]: crate::auth::is_request_presigned_signature_v4_with_query
 pub(crate) fn query_string_is_signed(header: &HeaderMap, query: &str) -> bool {
+    if is_request_signature_v2(header) || is_request_presigned_signature_v2(header, Some(query)) {
+        return false;
+    }
     if is_request_signature_v4(header) {
         return true;
     }
     let mut algorithm = false;
+    let mut credential = false;
     let mut signature = false;
     for (name, value) in form_urlencoded::parse(query.as_bytes()) {
         if name.eq_ignore_ascii_case("x-amz-algorithm") {
             algorithm = value == SIGN_V4_ALGORITHM;
+        } else if name.eq_ignore_ascii_case("x-amz-credential") {
+            credential = !value.is_empty();
         } else if name.eq_ignore_ascii_case("x-amz-signature") {
             signature = !value.is_empty();
         }
     }
-    algorithm && signature
+    algorithm && credential && signature
 }
 
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
@@ -1282,20 +1296,45 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
         if !name.starts_with("x-amz-") || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name) {
             continue;
         }
-        if !signed.iter().any(|signed_name| signed_name == name) {
-            warn!(
-                event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_REQUEST,
-                reason = "unsigned_amz_header",
-                header = name,
-                "Presigned request rejected"
-            );
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        if signed.iter().any(|signed_name| signed_name == name) {
+            continue;
         }
+        // The query-hoist layer restores a signed `x-amz-*` query parameter as
+        // a header before this rule runs a second time at the access boundary.
+        // Such a header carries exactly the value the signature covers, so it
+        // is as signed as the parameter itself; a header the signer did not
+        // sign cannot match one.
+        if header_as_signed_query_value(header, query, name) {
+            continue;
+        }
+        warn!(
+            event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_REQUEST,
+            reason = "unsigned_amz_header",
+            header = name,
+            "Presigned request rejected"
+        );
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
     }
 
     Ok(())
+}
+
+/// True when `name` is a single-valued header whose value is exactly the value
+/// of a same-named query parameter.
+///
+/// The SigV4 canonical query string covers every parameter except the signature
+/// itself, so a match proves the value the header carries is authorized. Only
+/// a single-valued header can match: the query-hoist layer never produces a
+/// multi-valued one, and a second value would be unsigned.
+fn header_as_signed_query_value(header: &HeaderMap, query: &str, name: &str) -> bool {
+    let mut values = header.get_all(name).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    form_urlencoded::parse(query.as_bytes())
+        .any(|(param, param_value)| param.eq_ignore_ascii_case(name) && param_value.as_bytes() == value.as_bytes())
 }
 
 /// Parse the RustFS presigned PutObject size capability after authentication.

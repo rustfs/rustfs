@@ -227,9 +227,9 @@ pub(crate) mod options_consumer {
     pub(crate) use super::super::options::VERSIONING_CONFIG_LOOKUPS;
     pub(crate) use super::super::options::{
         copy_dst_opts_with_replication_authorization, copy_src_opts, del_opts_with_versioning, extract_metadata,
-        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, extract_user_metadata_from_query,
-        filter_object_metadata, get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query,
-        get_opts, has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
+        extract_metadata_from_mime, extract_metadata_from_mime_with_object_name, filter_object_metadata,
+        get_complete_multipart_upload_opts_with_replication_authorization, get_content_sha256_with_query, get_opts,
+        has_replication_retention_update, namespace_reserved_user_metadata, normalize_content_encoding_for_storage,
         parse_copy_source_range, preserve_unclassified_user_metadata, put_opts_with_replication_authorization,
         validate_archive_content_encoding,
     };

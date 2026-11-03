@@ -26,7 +26,8 @@ use crate::server::{
         BodylessStatusFixLayer, ConditionalCorsLayer, DoubleSlashListBucketsCompatLayer, EmptyBodyContentLengthCompatLayer,
         ExternalRequestContextLayer, HeadRequestBodyFixLayer, IcebergRestErrorCompatLayer, ObjectAttributesEtagFixLayer,
         PublicHealthEndpointLayer, RedirectLayer, RequestContextLayer, RequestLoggingLayer, S3ErrorMessageCompatLayer,
-        SigV4HeaderGuardLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer, redact_sensitive_uri_query,
+        SigV4HeaderGuardLayer, SignedQueryHoistLayer, StsQueryApiCompatLayer, VirtualHostStyleHintLayer,
+        redact_sensitive_uri_query,
     },
     rate_limit::{RateLimitLayer, api_rate_limit_layer_from_env, rate_limit_vh_domain_hosts},
     ssec_transport::SsecTransportLayer,
@@ -1649,6 +1650,7 @@ macro_rules! external_service_stack {
             .layer(PublicHealthEndpointLayer::new(server_ctx, readiness))
             .option_layer((!server_domains_configured && !is_console).then_some(VirtualHostStyleHintLayer))
             .layer(DoubleSlashListBucketsCompatLayer)
+            .layer(SignedQueryHoistLayer)
             .layer(SigV4HeaderGuardLayer)
             .service($service)
     }};
