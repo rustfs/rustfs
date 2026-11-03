@@ -256,6 +256,9 @@ impl DefaultObjectUsecase {
             validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
             let mut replacement_metadata = metadata.unwrap_or_default();
             namespace_reserved_user_metadata(&mut replacement_metadata);
+            // Hoisted `x-amz-meta-*` query parameters fill in what the s3s input
+            // (headers only) did not carry; header-provided metadata wins.
+            extract_user_metadata_from_query(&req.headers, req.uri.query(), &mut replacement_metadata)?;
             apply_standard_object_metadata(
                 &mut replacement_metadata,
                 cache_control.as_deref(),

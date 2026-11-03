@@ -859,6 +859,7 @@ async fn wait_for_put_post_store_test_hook(bucket: &str) {
 pub(super) fn apply_put_request_metadata(
     metadata: &mut HashMap<String, String>,
     headers: &HeaderMap,
+    query: Option<&str>,
     object_name: &str,
     cache_control: Option<CacheControl>,
     content_disposition: Option<ContentDisposition>,
@@ -871,6 +872,10 @@ pub(super) fn apply_put_request_metadata(
     storage_class: Option<StorageClass>,
 ) -> S3Result<()> {
     namespace_reserved_user_metadata(metadata);
+    // Hoisted `x-amz-meta-*` query parameters (AWS SDK presigner) fill in
+    // whatever the headers did not carry; the header pass below wins on
+    // conflicts. Must run after `namespace_reserved_user_metadata`.
+    extract_user_metadata_from_query(headers, query, metadata)?;
     let expires = parse_expires_header(expires.as_deref())?;
     apply_standard_object_metadata(
         metadata,
@@ -1266,14 +1271,14 @@ impl DefaultObjectUsecase {
         // historical user metadata as a request to untar the member again.
         let inbound_replication_put = replication_request_authorized(&req)
             && get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true");
-        if max_content_length.is_some() && is_put_object_extract_requested(&req.headers) {
+        if max_content_length.is_some() && is_put_object_extract_requested(&req.headers, req.uri.query()) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
                 format!("{RUSTFS_MAX_CONTENT_LENGTH_QUERY} is not supported for archive extraction"),
             ));
         }
         reject_veeam_sosapi_mutation(|| self.object_store(), req.input.bucket.as_str(), req.input.key.as_str()).await?;
-        if is_put_object_extract_requested(&req.headers) && !inbound_replication_put {
+        if is_put_object_extract_requested(&req.headers, req.uri.query()) && !inbound_replication_put {
             return Box::pin(self.execute_put_object_extract(req)).await;
         }
         // SSE-C ciphertext passthrough (authorized replication only): the body
@@ -1669,6 +1674,7 @@ impl DefaultObjectUsecase {
         apply_put_request_metadata(
             &mut metadata,
             headers,
+            query,
             &key,
             content.cache_control,
             content.content_disposition,
@@ -2615,6 +2621,7 @@ mod tests {
         apply_put_request_metadata(
             &mut metadata,
             &HeaderMap::new(),
+            None,
             "object",
             None,
             None,

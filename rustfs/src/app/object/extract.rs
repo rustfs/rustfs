@@ -1135,8 +1135,26 @@ fn extract_notification_version_id(version_id: Option<Uuid>, versioned: bool, ve
     }
 }
 
-pub(super) fn is_put_object_extract_requested(headers: &HeaderMap) -> bool {
-    header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT)
+/// Stored-metadata key of [`AMZ_SNOWBALL_EXTRACT`] after the `x-amz-meta-`
+/// prefix is stripped (see `stored_user_metadata_key`).
+const SNOWBALL_AUTO_EXTRACT_STORED_KEY: &str = "snowball-auto-extract";
+
+pub(super) fn is_put_object_extract_requested(headers: &HeaderMap, query: Option<&str>) -> bool {
+    if header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT) || header_value_is_true(headers, AMZ_SNOWBALL_EXTRACT_COMPAT) {
+        return true;
+    }
+    // The same flag hoisted into the query string by the AWS SDK presigner
+    // (rustfs/rustfs#9142) must keep triggering extraction, or the fix would
+    // store the flag while silently ignoring what it asks for. A query the
+    // extractor rejects is not a request to extract; the write path surfaces
+    // the error.
+    let mut query_metadata = HashMap::new();
+    if extract_user_metadata_from_query(headers, query, &mut query_metadata).is_err() {
+        return false;
+    }
+    query_metadata
+        .get(SNOWBALL_AUTO_EXTRACT_STORED_KEY)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
 }
 
 fn trimmed_header_value(headers: &HeaderMap, key: &str) -> Option<String> {
@@ -2038,6 +2056,9 @@ impl DefaultObjectUsecase {
         } = input;
 
         let outer_version_id = version_id;
+        // Snowball members inherit the outer request's user metadata (see
+        // `snowball_member_headers`), so they inherit its hoisted query form too.
+        let outer_query = req.uri.query().map(str::to_owned);
         let (h_algo, h_key, h_md5) = extract_ssec_params_from_headers(&req.headers)?;
         let sse_customer_algorithm = sse_customer_algorithm.or(h_algo);
         let sse_customer_key = sse_customer_key.or(h_key);
@@ -2336,6 +2357,7 @@ impl DefaultObjectUsecase {
             extract_try!(apply_put_request_metadata(
                 &mut metadata,
                 &member_request_headers,
+                outer_query.as_deref(),
                 &fpath,
                 cache_control.clone(),
                 content_disposition.clone(),
@@ -2347,6 +2369,11 @@ impl DefaultObjectUsecase {
                 tagging.clone(),
                 storage_class.clone(),
             ));
+            // Members must never carry snowball transport keys: they instruct
+            // the extractor, not the member object. Mirrors
+            // `snowball_member_headers`, which strips the same keys from the
+            // headers a member inherits, and now the hoisted query form too.
+            metadata.retain(|key, _| !is_snowball_transport_header(key));
             extract_try!(apply_bucket_default_lock_retention(
                 &bucket,
                 object_lock_config_state,
@@ -4438,7 +4465,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("true"));
 
-        assert!(is_put_object_extract_requested(&headers));
+        assert!(is_put_object_extract_requested(&headers, None));
     }
 
     #[test]
@@ -4446,16 +4473,37 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(AMZ_SNOWBALL_EXTRACT_COMPAT, HeaderValue::from_static(" TRUE "));
 
-        assert!(is_put_object_extract_requested(&headers));
+        assert!(is_put_object_extract_requested(&headers, None));
     }
 
     #[test]
     fn is_put_object_extract_requested_rejects_missing_or_false_value() {
         let mut headers = HeaderMap::new();
-        assert!(!is_put_object_extract_requested(&headers));
+        assert!(!is_put_object_extract_requested(&headers, None));
 
         headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
-        assert!(!is_put_object_extract_requested(&headers));
+        assert!(!is_put_object_extract_requested(&headers, None));
+    }
+
+    #[test]
+    fn is_put_object_extract_requested_accepts_presigned_query_meta() {
+        // `x-amz-credential` classifies the query as SigV4-presigned, whose
+        // parameters are covered by the signature (rustfs/rustfs#9142).
+        let headers = HeaderMap::new();
+        let query = "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID&X-Amz-Signature=deadbeef&x-amz-meta-snowball-auto-extract=true";
+        assert!(is_put_object_extract_requested(&headers, Some(query)));
+    }
+
+    #[test]
+    fn is_put_object_extract_requested_ignores_unsigned_query_meta() {
+        // SigV2 does not sign arbitrary query parameters; the holder of a
+        // presigned URL must not be able to flip extraction on.
+        let headers = HeaderMap::new();
+        let query = "AWSAccessKeyId=AKID&Signature=deadbeef&x-amz-meta-snowball-auto-extract=true";
+        assert!(!is_put_object_extract_requested(&headers, Some(query)));
+
+        let query = "x-amz-meta-snowball-auto-extract=true";
+        assert!(!is_put_object_extract_requested(&headers, Some(query)));
     }
 
     #[test]

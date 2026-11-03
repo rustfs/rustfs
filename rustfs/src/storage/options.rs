@@ -14,7 +14,7 @@
 
 use super::{BucketVersioningSys, ReplicationStatusType, Result, StorageError};
 use crate::storage::storage_api::options_consumer::contract::{object::HTTPPreconditions, range::HTTPRangeSpec};
-use http::header::{IF_MATCH, IF_NONE_MATCH};
+use http::header::{HeaderName, IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderValue};
 use rustfs_utils::http::{
     AMZ_BUCKET_REPLICATION_STATUS, SUFFIX_OBJECTLOCK_LEGALHOLD_TIMESTAMP, SUFFIX_OBJECTLOCK_RETENTION_TIMESTAMP,
@@ -43,12 +43,14 @@ use s3s::{S3Error, S3ErrorCode, S3Result, s3_error};
 use std::collections::HashMap;
 use std::sync::LazyLock;
 use tracing::error;
+use url::form_urlencoded;
 use uuid::Uuid;
 
 use crate::auth::AuthType;
 use crate::auth::get_query_param;
 use crate::auth::get_request_auth_type_with_query;
 use crate::auth::is_request_presigned_signature_v4_with_query;
+use crate::auth::query_string_is_signed;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
 use s3s::dto::VersioningConfiguration;
@@ -810,6 +812,71 @@ pub(crate) fn preserve_unclassified_user_metadata(metadata: &mut HashMap<String,
     metadata.insert(stored_user_metadata_key(key), value.to_owned());
 }
 
+/// Extracts user metadata a request carried as query parameters.
+///
+/// The AWS SDK presigners hoist signable `x-amz-*` headers into the query
+/// string (`@smithy/signature-v4` `moveHeadersToQuery`), and AWS S3 accepts the
+/// hoisted form as the header it came from (rustfs/rustfs#9142). Mirror the
+/// header path exactly: the same [`USER_METADATA_PREFIXES`], the same
+/// [`stored_user_metadata_key`] normalization, and the same lowercasing the
+/// `http` crate applies to header names, so `?x-amz-meta-user-id=u1` and the
+/// `x-amz-meta-user-id: u1` header land on disk identically.
+///
+/// Only a signature-covered query is honored (see [`query_string_is_signed`]):
+/// on SigV2 the query is not signed, so honoring it would let the holder of a
+/// presigned URL add object properties the presigner never authorized. Values
+/// never overwrite what `metadata` already holds, so header metadata wins over
+/// the hoisted form of the same key.
+///
+/// Must run after [`namespace_reserved_user_metadata`]: that pass applies
+/// [`stored_user_metadata_key`] to every key it sees, so feeding it already
+/// normalized keys would double-prefix reserved names.
+pub fn extract_user_metadata_from_query(
+    headers: &HeaderMap,
+    query: Option<&str>,
+    metadata: &mut HashMap<String, String>,
+) -> S3Result<()> {
+    let Some(query) = query else { return Ok(()) };
+    if !query_string_is_signed(headers, query) {
+        return Ok(());
+    }
+    let mut seen = std::collections::HashSet::new();
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        let Some(prefix) = USER_METADATA_PREFIXES
+            .iter()
+            .find(|prefix| starts_with_ignore_ascii_case(&name, prefix))
+        else {
+            continue;
+        };
+        let key = name[prefix.len()..].to_ascii_lowercase();
+        if key.is_empty() {
+            continue;
+        }
+        let stored_key = stored_user_metadata_key(&key);
+        // The read path rebuilds `x-amz-meta-<key>` as a header name and the
+        // value as a header value (s3s `add_opt_metadata`); a key or value that
+        // could not have arrived as a header would 500 every Head/Get of the
+        // object, so reject it here instead of storing it.
+        if HeaderName::from_bytes(format!("{CANONICAL_USER_METADATA_PREFIX}{stored_key}").as_bytes()).is_err()
+            || HeaderValue::try_from(value.as_ref()).is_err()
+        {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "Metadata keys and values must be valid HTTP header names and values".to_owned(),
+            ));
+        }
+        if !seen.insert(stored_key.clone()) {
+            // Ambiguous request; s3s rejects duplicate query parameters too.
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "Duplicate metadata keys in the request query string".to_owned(),
+            ));
+        }
+        metadata.entry(stored_key).or_insert_with(|| value.into_owned());
+    }
+    Ok(())
+}
+
 /// Extracts metadata from headers and returns it as a HashMap with object name for MIME type detection.
 pub fn extract_metadata_from_mime_with_object_name(
     headers: &HeaderMap<HeaderValue>,
@@ -1189,9 +1256,9 @@ mod tests {
     use super::{
         ENV_REJECT_ARCHIVE_CONTENT_ENCODING, ReplicationStatusType, SUPPORTED_HEADERS, copy_dst_opts, copy_src_opts, del_opts,
         del_opts_with_versioning, detect_content_type_from_object_name, extract_metadata, extract_metadata_from_mime,
-        extract_metadata_from_mime_with_object_name, filter_object_metadata, get_complete_multipart_upload_opts,
-        get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts, get_opts,
-        has_replication_retention_update, is_reserved_user_metadata_key, namespace_reserved_user_metadata,
+        extract_metadata_from_mime_with_object_name, extract_user_metadata_from_query, filter_object_metadata,
+        get_complete_multipart_upload_opts, get_complete_multipart_upload_opts_with_replication_authorization, get_default_opts,
+        get_opts, has_replication_retention_update, is_reserved_user_metadata_key, namespace_reserved_user_metadata,
         parse_copy_source_range, put_opts, put_opts_from_headers, put_opts_from_headers_with_replication_authorization,
         put_opts_with_replication_authorization, should_skip_object_metadata_key, validate_archive_content_encoding,
     };
@@ -1221,6 +1288,194 @@ mod tests {
         metadata.insert("key1".to_string(), "value1".to_string());
         metadata.insert("key2".to_string(), "value2".to_string());
         metadata
+    }
+
+    /// A SigV4 presigned query: `x-amz-credential` is what classifies it as
+    /// `AuthType::Presigned`, and every parameter is covered by the signature.
+    fn presigned_sigv4_query(extra: &str) -> String {
+        format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20260101%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Signature=deadbeef&{extra}"
+        )
+    }
+
+    fn header_signed_sigv4_headers() -> HeaderMap<HeaderValue> {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "authorization",
+            HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef",
+            ),
+        );
+        headers
+    }
+
+    #[test]
+    fn query_user_metadata_is_stored_for_presigned_sigv4() {
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&HeaderMap::new(), Some(&presigned_sigv4_query("x-amz-meta-user-id=u1")), &mut metadata)
+            .unwrap();
+        assert_eq!(metadata.get("user-id").map(String::as_str), Some("u1"));
+    }
+
+    #[test]
+    fn query_user_metadata_is_stored_for_header_signed_sigv4() {
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&header_signed_sigv4_headers(), Some("x-amz-meta-user-id=u1"), &mut metadata).unwrap();
+        assert_eq!(metadata.get("user-id").map(String::as_str), Some("u1"));
+    }
+
+    #[test]
+    fn query_user_metadata_matches_the_header_path_exactly() {
+        let mut from_query = HashMap::new();
+        extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("x-amz-meta-user-id=u1&x-amz-meta-content-type=custom")),
+            &mut from_query,
+        )
+        .unwrap();
+
+        let mut from_headers = HashMap::new();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-user-id", HeaderValue::from_static("u1"));
+        headers.insert("x-amz-meta-content-type", HeaderValue::from_static("custom"));
+        extract_metadata_from_mime(&headers, &mut from_headers);
+
+        // The header path also seeds a default `content-type`; that is system
+        // metadata, not user metadata, so drop it before comparing.
+        from_headers.remove("content-type");
+        assert_eq!(from_query, from_headers);
+        // `content-type` is a supported system header, so the user-metadata form
+        // must stay namespaced exactly like the header path stores it.
+        assert_eq!(from_query.get("x-amz-meta-content-type").map(String::as_str), Some("custom"));
+        assert!(!from_query.contains_key("content-type"));
+    }
+
+    #[test]
+    fn query_user_metadata_never_overwrites_header_metadata() {
+        let mut metadata = HashMap::new();
+        metadata.insert("user-id".to_string(), "from-header".to_string());
+        extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("x-amz-meta-user-id=from-query&x-amz-meta-other=v")),
+            &mut metadata,
+        )
+        .unwrap();
+        assert_eq!(metadata.get("user-id").map(String::as_str), Some("from-header"));
+        assert_eq!(metadata.get("other").map(String::as_str), Some("v"));
+    }
+
+    #[test]
+    fn query_user_metadata_handles_compat_prefixes_and_case() {
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("X-Amz-Meta-User-Id=u1&x-minio-meta-a=b&x-rustfs-meta-c=d")),
+            &mut metadata,
+        )
+        .unwrap();
+        assert_eq!(metadata.get("user-id").map(String::as_str), Some("u1"));
+        assert_eq!(metadata.get("a").map(String::as_str), Some("b"));
+        assert_eq!(metadata.get("c").map(String::as_str), Some("d"));
+    }
+
+    #[test]
+    fn query_user_metadata_skips_empty_keys_and_decodes_values() {
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query(
+                "x-amz-meta-=dropped&x-amz-meta-user-id=u%201&x-amz-meta-plus=a%2Bb",
+            )),
+            &mut metadata,
+        )
+        .unwrap();
+        assert!(!metadata.contains_key(""));
+        assert_eq!(metadata.get("user-id").map(String::as_str), Some("u 1"));
+        assert_eq!(metadata.get("plus").map(String::as_str), Some("a+b"));
+    }
+
+    #[test]
+    fn query_user_metadata_is_ignored_without_a_sigv4_signature() {
+        // SigV2 presigned: the query is not covered by the signature, so
+        // honoring it would let the URL holder widen the upload.
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some("AWSAccessKeyId=AKID&Expires=1&Signature=deadbeef&x-amz-meta-user-id=u1"),
+            &mut metadata,
+        )
+        .unwrap();
+        assert!(metadata.is_empty());
+
+        // Anonymous: no signature at all.
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&HeaderMap::new(), Some("x-amz-meta-user-id=u1"), &mut metadata).unwrap();
+        assert!(metadata.is_empty());
+
+        // JWT console session: same.
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer token"));
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&headers, Some("x-amz-meta-user-id=u1"), &mut metadata).unwrap();
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn query_user_metadata_is_ignored_when_the_query_is_absent() {
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&HeaderMap::new(), None, &mut metadata).unwrap();
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn query_user_metadata_rejects_values_that_cannot_be_header_values() {
+        // A stored control character makes s3s `add_opt_metadata` fail, which
+        // would 500 every Head/Get of the object (stored DoS).
+        let mut metadata = HashMap::new();
+        let err = extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("x-amz-meta-user-id=a%0d%0ab")),
+            &mut metadata,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn query_user_metadata_rejects_keys_that_cannot_be_header_names() {
+        let mut metadata = HashMap::new();
+        let err = extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("x-amz-meta-bad%20key=v")),
+            &mut metadata,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+        assert!(metadata.is_empty());
+    }
+
+    #[test]
+    fn query_user_metadata_rejects_duplicate_keys_after_normalization() {
+        let mut metadata = HashMap::new();
+        let err = extract_user_metadata_from_query(
+            &HeaderMap::new(),
+            Some(&presigned_sigv4_query("x-amz-meta-User-Id=1&x-amz-meta-user-id=2")),
+            &mut metadata,
+        )
+        .unwrap_err();
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn query_user_metadata_ignores_an_x_amz_credential_header_alone() {
+        // `is_request_presigned_signature_v4_with_query` treats a bare
+        // `x-amz-credential` header as presigned; the query gate must not.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-credential", HeaderValue::from_static("AKID"));
+        let mut metadata = HashMap::new();
+        extract_user_metadata_from_query(&headers, Some("x-amz-meta-user-id=u1"), &mut metadata).unwrap();
+        assert!(metadata.is_empty());
     }
 
     #[tokio::test]

@@ -972,6 +972,44 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
+/// True when the request's query string is covered by its own signature, so a
+/// query parameter may be read as an authenticated request property.
+///
+/// Every SigV4 variant signs the canonical query string (AWS General Reference,
+/// "Create a signed AWS API request"; s3s-sigv4 verifies every parameter except
+/// the signature itself), so a SigV4 request's query parameters are as
+/// trustworthy as its headers — the AWS SDK presigners rely on this when they
+/// hoist `x-amz-*` headers into the query (`@smithy/signature-v4`
+/// `moveHeadersToQuery`). SigV2's string-to-sign covers headers plus a fixed
+/// subresource list only, so honoring its query would let the holder of a
+/// presigned URL add object properties the presigner never authorized (for
+/// example `x-amz-meta-snowball-auto-extract`).
+///
+/// Detection is by request shape and deliberately stricter than
+/// [`get_request_auth_type_with_query`]: either the `Authorization` header
+/// carries SigV4 (all header-signed SigV4 variants, streaming included), or the
+/// query itself carries the SigV4 presign parameters. A bare `x-amz-credential`
+/// header — what [`is_request_presigned_signature_v4_with_query`] falls back
+/// on — is not proof of presigning and does not qualify, so an unauthenticated
+/// request cannot talk its way into reading query properties. Callers reach
+/// this only after s3s has verified the signature, so shape detection agrees
+/// with verification for genuine SigV4 traffic.
+pub(crate) fn query_string_is_signed(header: &HeaderMap, query: &str) -> bool {
+    if is_request_signature_v4(header) {
+        return true;
+    }
+    let mut algorithm = false;
+    let mut signature = false;
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        if name.eq_ignore_ascii_case("x-amz-algorithm") {
+            algorithm = value == SIGN_V4_ALGORITHM;
+        } else if name.eq_ignore_ascii_case("x-amz-signature") {
+            signature = !value.is_empty();
+        }
+    }
+    algorithm && signature
+}
+
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
