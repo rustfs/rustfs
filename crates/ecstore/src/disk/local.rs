@@ -8408,7 +8408,7 @@ impl LocalDisk {
                 },
             )
         {
-            multipart_source_state::put_active_multipart_source_head(admission.source().to_path_buf(), fm_bytes, cached_fi);
+            multipart_source_state::put_active_multipart_source_head(admission.source(), fm_bytes, cached_fi);
         }
         drop(namespace_owner);
 
