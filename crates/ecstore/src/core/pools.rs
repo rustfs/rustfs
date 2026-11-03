@@ -6862,8 +6862,7 @@ fn ensure_legacy_pool_meta_payload_complete(data: &[u8]) -> Result<()> {
         .get(4..)
         .ok_or_else(|| Error::other("pool metadata legacy source is too short"))?;
     let mut decoder = rmp_serde::Deserializer::new(Cursor::new(payload));
-    serde::de::IgnoredAny::deserialize(&mut decoder)
-        .map_err(|error| Error::other(format!("pool metadata legacy source is invalid: {error}")))?;
+    serde::de::IgnoredAny::deserialize(&mut decoder).map_err(|_| Error::other("pool metadata legacy source is invalid"))?;
     let payload_len = u64::try_from(payload.len()).map_err(|_| Error::other("pool metadata legacy source is too large"))?;
     if decoder.get_ref().position() != payload_len {
         return Err(Error::other("pool metadata legacy source has trailing bytes"));
