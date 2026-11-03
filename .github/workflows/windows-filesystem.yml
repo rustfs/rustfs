@@ -118,6 +118,17 @@ jobs:
           native_abort_pending_intent_is_not_a_delete_certificate_and_raw_cleanup_preserves_exact_evidence
           --nocapture
 
+      # Owned-undo reclaim removes a directory it pinned, copy heal persists
+      # fault bytes through a handle, and metadata reads meet a directory.
+      - name: Test native multipart reclaim, copy heal, and directory reads
+        shell: pwsh
+        run: >-
+          cargo test -p rustfs-ecstore --lib --
+          native_multipart_owned_undo
+          native_multipart_copy_heal
+          orphan_multipart_cleanup_rejects_metadata_directory_on_one_disk
+          --nocapture
+
       - name: Test directory removal fallback
         shell: pwsh
         run: "cargo test -p rustfs-ecstore --lib disk::fs::tests::test_remove -- --nocapture"

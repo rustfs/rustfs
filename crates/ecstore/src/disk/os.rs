@@ -5427,7 +5427,9 @@ impl PublicationRoot {
     pub(crate) fn open_readonly(&self, path: &Path) -> io::Result<std::fs::File> {
         #[cfg(target_os = "linux")]
         return self.open_relative(path, rustix::fs::OFlags::RDONLY, rustix::fs::Mode::empty());
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        return open_windows_readonly(path);
+        #[cfg(not(any(target_os = "linux", windows)))]
         std::fs::File::open(path)
     }
 
@@ -6115,6 +6117,28 @@ pub(crate) fn prepare_rename_commit_guard(
     {
         let _ = (source_parent, destination_parent, destination_base, publication_root);
         Ok(RenameCommitGuard {})
+    }
+}
+
+/// Unix opens a directory read-only and lets the reader classify it, while
+/// Windows refuses the plain open with ACCESS_DENIED. Reopen only an actual
+/// directory with backup semantics so the same `is_dir` checks apply.
+#[cfg(windows)]
+fn open_windows_readonly(path: &Path) -> io::Result<std::fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::FILE_FLAG_BACKUP_SEMANTICS;
+
+    match std::fs::File::open(path) {
+        Err(error)
+            if error.kind() == io::ErrorKind::PermissionDenied
+                && std::fs::symlink_metadata(path).is_ok_and(|metadata| metadata.is_dir()) =>
+        {
+            std::fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+                .open(path)
+        }
+        result => result,
     }
 }
 
