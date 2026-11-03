@@ -31,7 +31,7 @@ workspace = true
 
 [features]
 default = []
-fips = ["rustfs-s3-client/fips"]
+fips = ["rustfs-s3-client/fips", "rustfs-utils/fips"]
 diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]
 # Sampled wall/CPU diagnostics only; does not change the read backend.
 diagnostic-local-batch = ["rustix/time"]

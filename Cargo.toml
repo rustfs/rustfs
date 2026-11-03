@@ -212,6 +212,7 @@ serde_urlencoded = "0.7.1"
 # releases.
 aes-gcm = { version = "0.11.1" }
 argon2 = { version = "0.6.0" }
+aws-lc-rs = { version = "1.18.0", default-features = false }
 blake2 = "0.11.0"
 chacha20poly1305 = { version = "0.11.0" }
 crc-fast = "1.10.0"

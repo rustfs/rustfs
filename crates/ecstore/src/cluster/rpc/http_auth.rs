@@ -32,7 +32,6 @@ use crate::storage_api_contracts::internode::{
     PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
 
-use hmac::{Hmac, KeyInit, Mac};
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 #[cfg(test)]
@@ -47,6 +46,7 @@ use rustfs_io_metrics::internode_metrics::{
     global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
+use rustfs_utils::crypto::{HmacSha256, KeyInit, Mac};
 use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
@@ -57,8 +57,6 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 pub const RPC_BACKGROUND_ADMISSION_HEADER: &str = "x-rustfs-rpc-background-admission";
