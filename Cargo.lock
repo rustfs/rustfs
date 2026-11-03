@@ -11058,6 +11058,7 @@ dependencies = [
 name = "rustfs-utils"
 version = "1.0.2"
 dependencies = [
+ "aws-lc-rs",
  "base64-simd",
  "blake2",
  "brotli 9.1.1",
