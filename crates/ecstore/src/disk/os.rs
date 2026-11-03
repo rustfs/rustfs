@@ -1899,6 +1899,172 @@ impl<L> ShardedPathLockRegistry<L> {
     }
 }
 
+#[cfg(unix)]
+type PathCacheShardMap<V> = HashMap<Box<[u8]>, V, Xxh3SliceBuildHasher>;
+#[cfg(not(unix))]
+type PathCacheShardMap<V> = HashMap<PathBuf, V>;
+
+pub(crate) struct ShardedPathCache<V> {
+    shards: [Mutex<PathCacheShardMap<V>>; PATH_LOCK_SHARDS],
+    max_entries_per_shard: usize,
+}
+
+impl<V> ShardedPathCache<V> {
+    pub(crate) fn new(max_entries_per_shard: usize) -> Self {
+        Self {
+            shards: std::array::from_fn(|_| Mutex::new(HashMap::default())),
+            max_entries_per_shard: max_entries_per_shard.max(1),
+        }
+    }
+
+    #[cfg(unix)]
+    #[inline]
+    fn shard_index(key: &[u8]) -> usize {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        ((hash >> 32) as usize) & (PATH_LOCK_SHARDS - 1)
+    }
+
+    #[cfg(not(unix))]
+    #[inline]
+    fn shard_index(path: &Path) -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        path.hash(&mut hasher);
+        ((hasher.finish() >> 32) as usize) & (PATH_LOCK_SHARDS - 1)
+    }
+
+    #[inline]
+    pub(crate) fn insert(&self, path: &Path, value: V) {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(slot) = shard.get_mut(key.as_ref()) {
+                *slot = value;
+                return;
+            }
+            if shard.len() >= self.max_entries_per_shard
+                && let Some(evict_key) = shard.keys().next().cloned()
+            {
+                shard.remove(&evict_key);
+            }
+            shard.insert(key.into_owned().into_boxed_slice(), value);
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(slot) = shard.get_mut(path) {
+                *slot = value;
+                return;
+            }
+            if shard.len() >= self.max_entries_per_shard
+                && let Some(evict_key) = shard.keys().next().cloned()
+            {
+                shard.remove(&evict_key);
+            }
+            shard.insert(path.to_path_buf(), value);
+        }
+    }
+
+    #[inline]
+    pub(crate) fn remove(&self, path: &Path) -> Option<V> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            self.shards[shard_idx].lock().remove(key.as_ref())
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            self.shards[shard_idx].lock().remove(path)
+        }
+    }
+
+    /// Runs `f` while holding the target shard mutex. `f` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn with_get<R>(&self, path: &Path, f: impl FnOnce(&V) -> R) -> Option<R> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let shard = self.shards[shard_idx].lock();
+            shard.get(key.as_ref()).map(f)
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let shard = self.shards[shard_idx].lock();
+            shard.get(path).map(f)
+        }
+    }
+
+    /// Runs `f` while holding the target shard mutex. `f` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn with_get_mut<R>(&self, path: &Path, f: impl FnOnce(&mut V) -> R) -> Option<R> {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            shard.get_mut(key.as_ref()).map(f)
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            shard.get_mut(path).map(f)
+        }
+    }
+
+    /// Runs `should_remove` while holding the target shard mutex. `should_remove` must not block, perform I/O, or re-enter `self`.
+    #[inline]
+    pub(crate) fn remove_if_mut(&self, path: &Path, should_remove: impl FnOnce(&mut V) -> bool) {
+        #[cfg(unix)]
+        {
+            let key = canonical_unix_path_key(path);
+            let shard_idx = Self::shard_index(key.as_ref());
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(entry) = shard.get_mut(key.as_ref())
+                && should_remove(entry)
+            {
+                shard.remove(key.as_ref());
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            let shard_idx = Self::shard_index(path);
+            let mut shard = self.shards[shard_idx].lock();
+            if let Some(entry) = shard.get_mut(path)
+                && should_remove(entry)
+            {
+                shard.remove(path);
+            }
+        }
+    }
+
+    pub(crate) fn retain_outside_prefix(&self, prefix: &Path) {
+        #[cfg(unix)]
+        {
+            let prefix_key = canonical_unix_path_key(prefix);
+            let prefix_bytes = prefix_key.as_ref();
+            for shard in &self.shards {
+                shard
+                    .lock()
+                    .retain(|key, _| !unix_canonical_key_starts_with(key, prefix_bytes));
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            for shard in &self.shards {
+                shard.lock().retain(|key, _| !key.starts_with(prefix));
+            }
+        }
+    }
+}
+
 static FILE_SYNC_PERMITS: LazyLock<Semaphore> = LazyLock::new(|| Semaphore::new(global_file_sync_limit()));
 static DISK_FILE_SYNC_LIMITERS: LazyLock<ShardedPathLockRegistry<Semaphore>> = LazyLock::new(ShardedPathLockRegistry::new);
 
@@ -12435,6 +12601,59 @@ mod tests {
                 guard.entries.len(),
                 guard.next_gc_threshold
             );
+        }
+    }
+
+    #[test]
+    fn sharded_path_cache_normalizes_keys_reuses_slots_and_filters_prefixes() {
+        let cache: ShardedPathCache<usize> = ShardedPathCache::new(2);
+        let clean = Path::new("/tmp/sharded-cache-test/bucket/obj");
+        let non_canonical = Path::new("/tmp/sharded-cache-test//bucket/./obj/.");
+
+        cache.insert(clean, 10);
+        assert_eq!(cache.with_get(non_canonical, |v| *v), Some(10));
+
+        cache.with_get_mut(non_canonical, |v| *v += 5);
+        assert_eq!(cache.with_get(clean, |v| *v), Some(15));
+
+        cache.remove_if_mut(clean, |v| *v == 99);
+        assert_eq!(cache.with_get(clean, |v| *v), Some(15));
+        cache.remove_if_mut(non_canonical, |v| *v == 15);
+        assert_eq!(cache.with_get(clean, |v| *v), None);
+
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket/a"), 1);
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket/b"), 2);
+        cache.insert(Path::new("/tmp/sharded-cache-test/bucket-other/c"), 3);
+        cache.retain_outside_prefix(Path::new("/tmp/sharded-cache-test//bucket/."));
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket/a"), |v| *v), None);
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket/b"), |v| *v), None);
+        assert_eq!(cache.with_get(Path::new("/tmp/sharded-cache-test/bucket-other/c"), |v| *v), Some(3));
+
+        for i in 0..512 {
+            cache.insert(&PathBuf::from(format!("/tmp/sharded-cache-test/cap/{i}")), i);
+        }
+        for shard in &cache.shards {
+            assert!(shard.lock().len() <= 2);
+        }
+
+        #[cfg(unix)]
+        {
+            let overwrite_cache: ShardedPathCache<usize> = ShardedPathCache::new(2);
+            let target_shard = ShardedPathCache::<usize>::shard_index(b"/tmp/sharded-cache-test/same-0");
+            let mut same_shard_paths = vec![PathBuf::from("/tmp/sharded-cache-test/same-0")];
+            let mut candidate = 1usize;
+            while same_shard_paths.len() < 2 {
+                let p = PathBuf::from(format!("/tmp/sharded-cache-test/same-{candidate}"));
+                if ShardedPathCache::<usize>::shard_index(canonical_unix_path_key(&p).as_ref()) == target_shard {
+                    same_shard_paths.push(p);
+                }
+                candidate += 1;
+            }
+            overwrite_cache.insert(&same_shard_paths[0], 100);
+            overwrite_cache.insert(&same_shard_paths[1], 200);
+            overwrite_cache.insert(&same_shard_paths[0], 101);
+            assert_eq!(overwrite_cache.with_get(&same_shard_paths[0], |v| *v), Some(101));
+            assert_eq!(overwrite_cache.with_get(&same_shard_paths[1], |v| *v), Some(200));
         }
     }
 }
