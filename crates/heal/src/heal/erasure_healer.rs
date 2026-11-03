@@ -740,6 +740,9 @@ impl ErasureSetHealer {
 
         // 2. initialize progress
         self.initialize_progress(buckets, &state).await;
+        // Snapshot before any baseline write: set_progress_baseline overwrites
+        // the saved generation, which would hide a real generation mismatch.
+        let checkpoint = checkpoint_manager.progress_snapshot().await;
         let (baseline_known, baseline_count, baseline_size, baseline_generation) = {
             let baseline = self.progress.read().await;
             (
@@ -759,7 +762,6 @@ impl ErasureSetHealer {
         }
 
         // 3. continue from checkpoint
-        let checkpoint = checkpoint_manager.progress_snapshot().await;
         let current_bucket_index = checkpoint.current_bucket_index;
         let mut current_object_index = checkpoint.current_object_index;
 
@@ -1713,6 +1715,7 @@ impl ErasureSetHealer {
                     .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
                 let work = async move {
                     let mut retries = 0;
+                    let mut saw_slow_down = false;
                     let mut admin_identity = admin_identity;
                     let mut admin_task_id = admin_task_id;
                     loop {
@@ -1720,7 +1723,7 @@ impl ErasureSetHealer {
 
                         let permit = match permit {
                             Ok(permit) => permit,
-                            Err(err) => return (dedup_key, object_name, version_id, (0, Err(err)), None),
+                            Err(err) => return (dedup_key, object_name, version_id, (0, Err(err), saw_slow_down), None),
                         };
 
                         let in_flight_guard = PageConcurrencyGuard::new(in_flight.clone(), set_label.clone());
@@ -1728,7 +1731,8 @@ impl ErasureSetHealer {
                         if let (Some(identity), Some(task_id)) = (admin_identity.take(), admin_task_id.take()) {
                             let (result, canonical) =
                                 admin::heal_object(storage.as_ref(), &heal_opts, identity, &task_id, &cancel_token).await;
-                            return (dedup_key, object_name, version_id, result, canonical);
+                            let saw_slow_down = saw_slow_down || matches!(&result.1, Err(err) if err.is_slow_down());
+                            return (dedup_key, object_name, version_id, (result.0, result.1, saw_slow_down), canonical);
                         }
 
                         // Always go through heal_object. Genuine absence flows through
@@ -1830,18 +1834,23 @@ impl ErasureSetHealer {
 
                         drop(in_flight_guard);
                         drop(permit);
+                        if matches!(&result.1, Err(err) if err.is_slow_down()) {
+                            saw_slow_down = true;
+                        }
                         if retry_replacement
                             && retries < REPLACEMENT_OBJECT_MAX_RETRIES
                             && matches!(&result.1, Err(Error::TransientSkip { .. }))
                         {
                             retries += 1;
                             tokio::select! {
-                                _ = cancel_token.cancelled() => return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled)), None),
+                                _ = cancel_token.cancelled() => {
+                                    return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled), saw_slow_down), None);
+                                }
                                 _ = tokio::time::sleep(Duration::from_millis(250 * u64::from(retries))) => {}
                             }
                             continue;
                         }
-                        return (dedup_key, object_name, version_id, result, None);
+                        return (dedup_key, object_name, version_id, (result.0, result.1, saw_slow_down), None);
                     }
                 };
                 page_tasks.push(async move {
@@ -1852,7 +1861,7 @@ impl ErasureSetHealer {
                         };
                         match result {
                             Ok(result) => result,
-                            Err(error) => (key, object, version, (0, Err(error)), None),
+                            Err(error) => (key, object, version, (0, Err(error), false), None),
                         }
                     } else {
                         work.await
@@ -1861,12 +1870,16 @@ impl ErasureSetHealer {
             }
 
             while let Some((key, object, version_id, result, canonical)) = page_tasks.next().await {
-                let (object_size, result) = result;
-                // Exactly one rate observation per finished object.
-                page_rate.observe_object_outcome(&match &result {
-                    Ok(_) => Ok(true),
-                    Err(err) => Err(err),
-                });
+                let (object_size, result, saw_slow_down) = result;
+                // Exactly one rate observation per finished object, including
+                // SlowDown that later succeeded on a replacement retry.
+                page_rate.observe_object_outcome(
+                    &match &result {
+                        Ok(_) => Ok(true),
+                        Err(err) => Err(err),
+                    },
+                    saw_slow_down,
+                );
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
                     Ok(true) => {

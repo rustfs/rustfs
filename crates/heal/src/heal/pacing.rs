@@ -168,17 +168,23 @@ impl HealPageRate {
     }
 
     /// Fold one finished object into the rate state. Call once per outcome.
-    pub(crate) fn observe_object_outcome(&self, result: &std::result::Result<bool, &Error>) {
-        match result {
-            Ok(_) => self.observe_success(),
-            Err(err) if err.is_slow_down() => self.observe_slow_down(),
-            Err(_) => {}
+    /// `saw_slow_down` is true when any attempt of this object hit SlowDown,
+    /// including attempts that later succeeded on retry.
+    pub(crate) fn observe_object_outcome(&self, result: &std::result::Result<bool, &Error>, saw_slow_down: bool) {
+        if saw_slow_down || matches!(result, Err(err) if err.is_slow_down()) {
+            self.observe_slow_down();
+            return;
+        }
+        if result.is_ok() {
+            self.observe_success();
         }
     }
 
     /// S3 `SlowDown` is a rate signal: cut fan-out and arm exponential cool-down.
     fn observe_slow_down(&self) {
-        let step = self.slow_down_step.fetch_add(1, Ordering::Relaxed).min(8);
+        // fetch_add returns the previous step; +1 so the first SlowDown uses
+        // exponent 1 (2s), not exponent 0 (1s).
+        let step = self.slow_down_step.fetch_add(1, Ordering::Relaxed).saturating_add(1).min(8);
         let delay = Self::backoff(step);
         let ready = Instant::now() + delay;
         if let Ok(mut until) = self.slow_down_until.lock()
@@ -188,8 +194,19 @@ impl HealPageRate {
         }
     }
 
-    /// Restore one concurrency step after a quiet window.
+    /// Restore one concurrency step only after the SlowDown cool-down expires.
+    /// A same-page success must not undo the reduction while the pass is still
+    /// in the rate-limited window (the page semaphore is fixed until the next page).
     fn observe_success(&self) {
+        let cooling = self
+            .slow_down_until
+            .lock()
+            .ok()
+            .and_then(|until| *until)
+            .is_some_and(|ready| ready > Instant::now());
+        if cooling {
+            return;
+        }
         self.slow_down_step
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |step| Some(step.saturating_sub(1)))
             .ok();
@@ -245,9 +262,9 @@ impl HealPageRate {
     }
 
     fn backoff(step: u32) -> Duration {
-        // 2s, 4s, 8s, … capped at 30s — S3 clients are told to reduce rate with
-        // exponential backoff, and heal must do the same to itself.
-        let exponent = step.min(5);
+        // step 1 => 2s, 2 => 4s, … capped at 30s — S3 clients are told to reduce
+        // rate with exponential backoff, and heal must do the same to itself.
+        let exponent = step.clamp(1, 5);
         Duration::from_secs(2_u64.saturating_pow(exponent)).min(Duration::from_secs(30))
     }
 }
@@ -292,33 +309,63 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test(start_paused = true)]
+    async fn heal_page_rate_first_slow_down_waits_two_seconds() {
+        let rate = HealPageRate::new(8, None);
+        rate.observe_object_outcome(&Err(&Error::transient_skip("Please reduce your request rate")), false);
+        let cancel = CancellationToken::new();
+        let before = Instant::now();
+        rate.wait_before_page(&cancel).await.expect("cool-down wait");
+        assert_eq!(Instant::now() - before, Duration::from_secs(2));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn heal_page_rate_reduces_concurrency_and_backs_off() {
         let rate = HealPageRate::new(8, None);
         assert_eq!(rate.effective_concurrency(), 8);
-        rate.observe_object_outcome(&Err(&Error::transient_skip("Please reduce your request rate")));
+        rate.observe_object_outcome(&Err(&Error::transient_skip("Please reduce your request rate")), false);
         assert_eq!(rate.effective_concurrency(), 4);
-        rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)));
+        rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)), true);
         assert_eq!(rate.effective_concurrency(), 2);
         // Floor is one so maintenance never stops entirely.
         for _ in 0..8 {
-            rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)));
+            rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)), true);
         }
         assert_eq!(rate.effective_concurrency(), 1);
 
         let cancel = CancellationToken::new();
         assert!(rate.wait_before_page(&cancel).await.is_ok());
 
-        // Successes restore concurrency one step at a time.
+        // After cool-down, successes restore concurrency one step at a time.
         for _ in 0..12 {
-            rate.observe_object_outcome(&Ok(true));
+            rate.observe_object_outcome(&Ok(true), false);
         }
         assert!(rate.effective_concurrency() > 1);
     }
 
     #[tokio::test(start_paused = true)]
+    async fn heal_page_rate_same_page_success_does_not_undo_slow_down() {
+        let rate = HealPageRate::new(8, None);
+        rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)), false);
+        assert_eq!(rate.effective_concurrency(), 4);
+        // Same-page successes while cool-down is armed must not restore fan-out.
+        for _ in 0..4 {
+            rate.observe_object_outcome(&Ok(true), false);
+        }
+        assert_eq!(rate.effective_concurrency(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heal_page_rate_slow_down_then_retry_success_still_reduces() {
+        let rate = HealPageRate::new(8, None);
+        // Replacement retry: SlowDown on attempt 1, success on attempt 2.
+        rate.observe_object_outcome(&Ok(true), true);
+        assert_eq!(rate.effective_concurrency(), 4);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn heal_page_rate_wait_is_cancellable() {
         let rate = HealPageRate::new(4, None);
-        rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)));
+        rate.observe_object_outcome(&Err(&Error::Storage(crate::heal::EcstoreError::SlowDown)), false);
         let cancel = CancellationToken::new();
         cancel.cancel();
         assert!(matches!(rate.wait_before_page(&cancel).await, Err(Error::TaskCancelled)));
