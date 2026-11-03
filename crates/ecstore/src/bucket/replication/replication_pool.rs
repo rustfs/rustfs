@@ -3421,6 +3421,7 @@ mod tests {
         allow_first_read: Notify,
         read_count: AtomicUsize,
         delete_storage_calls: AtomicUsize,
+        delete_error: StdMutex<EcstoreError>,
         reported_size: StdMutex<Option<i64>>,
         stream_read_bytes: Arc<AtomicUsize>,
         write_count: AtomicUsize,
@@ -3672,7 +3673,12 @@ mod tests {
             _opts: Self::ObjectOptions,
         ) -> Result<Self::ObjectInfo, Self::Error> {
             self.shared.delete_storage_calls.fetch_add(1, Ordering::SeqCst);
-            Err(EcstoreError::NotImplemented)
+            Err(self
+                .shared
+                .delete_error
+                .lock()
+                .expect("delete error lock should not be poisoned")
+                .clone())
         }
 
         async fn delete_objects(
@@ -4171,6 +4177,7 @@ mod tests {
             allow_first_read: Notify::new(),
             read_count: AtomicUsize::new(0),
             delete_storage_calls: AtomicUsize::new(0),
+            delete_error: StdMutex::new(EcstoreError::NotImplemented),
             reported_size: StdMutex::new(None),
             stream_read_bytes: Arc::new(AtomicUsize::new(0)),
             write_count: AtomicUsize::new(0),
@@ -4218,6 +4225,103 @@ mod tests {
                 );
                 assert!(completed, "an empty delete is a completed no-op");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_worker_already_purged_source_completes_without_retry() {
+        let arn = "arn:test";
+        for delete_marker_version in [false, true] {
+            for version_id in [Uuid::new_v4(), Uuid::nil()] {
+                for error in [
+                    EcstoreError::VersionNotFound("source".to_string(), "purged".to_string(), version_id.to_string()),
+                    EcstoreError::ObjectNotFound("source".to_string(), "purged".to_string()),
+                    EcstoreError::FileVersionNotFound,
+                    EcstoreError::FileNotFound,
+                ] {
+                    let shared = empty_resync_shared_state();
+                    *shared.delete_error.lock().expect("delete error lock should not be poisoned") = error;
+                    let storage = Arc::new(LoadResyncNodeStore::new("purged-source", shared.clone()));
+                    let delete = DeletedObjectReplicationInfo {
+                        bucket: "source".to_string(),
+                        delete_object: ReplicationDeletedObject {
+                            object_name: "purged".to_string(),
+                            version_id: (!delete_marker_version).then_some(version_id),
+                            delete_marker_version_id: delete_marker_version.then_some(version_id),
+                            replication_state: Some(ReplicationState {
+                                replicate_decision_str: test_replicate_decision(&[arn]).to_string(),
+                                purge_targets: HashMap::from([(arn.to_string(), VersionPurgeStatusType::Complete)]),
+                                ..Default::default()
+                            }),
+                            ..Default::default()
+                        },
+                        op_type: ReplicationType::Delete,
+                        ..Default::default()
+                    };
+
+                    assert!(
+                        replicate_delete_with_outcome(delete, storage).await,
+                        "a confirmed target purge must complete when the source is already absent (marker={delete_marker_version}, version={version_id})"
+                    );
+                    assert_eq!(
+                        shared.delete_storage_calls.load(Ordering::SeqCst),
+                        2 + usize::from(!delete_marker_version && !version_id.is_nil()),
+                        "the worker must lock and attempt writeback, reading a non-null data version first"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_worker_missing_source_does_not_hide_unfinished_replication() {
+        let arn = "arn:test";
+        for (version_purge, target_status, error) in [
+            (
+                true,
+                VersionPurgeStatusType::Pending,
+                EcstoreError::ObjectNotFound("source".to_string(), "purged".to_string()),
+            ),
+            (true, VersionPurgeStatusType::Complete, EcstoreError::ErasureWriteQuorum),
+            (
+                false,
+                VersionPurgeStatusType::Empty,
+                EcstoreError::ObjectNotFound("source".to_string(), "purged".to_string()),
+            ),
+        ] {
+            let shared = empty_resync_shared_state();
+            *shared.delete_error.lock().expect("delete error lock should not be poisoned") = error;
+            let storage = Arc::new(LoadResyncNodeStore::new("unfinished-delete", shared));
+            let delete = DeletedObjectReplicationInfo {
+                bucket: "source".to_string(),
+                delete_object: ReplicationDeletedObject {
+                    object_name: "purged".to_string(),
+                    version_id: version_purge.then(Uuid::new_v4),
+                    delete_marker: !version_purge,
+                    replication_state: Some(ReplicationState {
+                        replicate_decision_str: test_replicate_decision(&[arn]).to_string(),
+                        targets: if version_purge {
+                            HashMap::new()
+                        } else {
+                            HashMap::from([(arn.to_string(), ReplicationStatusType::Completed)])
+                        },
+                        purge_targets: if version_purge {
+                            HashMap::from([(arn.to_string(), target_status)])
+                        } else {
+                            HashMap::new()
+                        },
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                },
+                op_type: ReplicationType::Delete,
+                ..Default::default()
+            };
+
+            assert!(
+                !replicate_delete_with_outcome(delete, storage).await,
+                "unfinished target work, source I/O failures, and marker creation must remain retryable"
+            );
         }
     }
 
@@ -5304,6 +5408,7 @@ mod tests {
                 allow_first_read: Notify::new(),
                 read_count: AtomicUsize::new(0),
                 delete_storage_calls: AtomicUsize::new(0),
+                delete_error: StdMutex::new(EcstoreError::NotImplemented),
                 reported_size: StdMutex::new(None),
                 stream_read_bytes: Arc::new(AtomicUsize::new(0)),
                 write_count: AtomicUsize::new(0),

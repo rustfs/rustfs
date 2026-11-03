@@ -2809,17 +2809,22 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
             true
         }
         Err(e) => {
-            error!(
-                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                arn = %dobj.target_arn,
-                object = %dobj.delete_object.object_name,
-                operation = "apply_replication_delete_state",
-                error = %e,
-                "Replication target operation failed"
-            );
+            // A batch purge or another worker may have removed this version
+            // already. Remote failures still control the final outcome below.
+            let source_already_purged = is_version_purge && (is_err_object_not_found(&e) || is_err_version_not_found(&e));
+            if !source_already_purged {
+                error!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    arn = %dobj.target_arn,
+                    object = %dobj.delete_object.object_name,
+                    operation = "apply_replication_delete_state",
+                    error = %e,
+                    "Replication target operation failed"
+                );
+            }
             send_event(EventArgs {
                 event_name,
                 bucket_name: bucket.clone(),
@@ -2832,7 +2837,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 },
                 ..Default::default()
             });
-            false
+            source_already_purged
         }
     };
 

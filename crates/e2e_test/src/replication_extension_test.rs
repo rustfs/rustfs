@@ -31,8 +31,8 @@ use aws_sdk_s3::error::ProvideErrorMetadata;
 use aws_sdk_s3::operation::list_object_versions::ListObjectVersionsOutput;
 use aws_sdk_s3::primitives::ByteStream;
 use aws_sdk_s3::types::{
-    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, DeleteMarkerEntry, ObjectVersion, ServerSideEncryption,
-    VersioningConfiguration,
+    BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Delete, DeleteMarkerEntry, ObjectIdentifier, ObjectVersion,
+    ServerSideEncryption, VersioningConfiguration,
 };
 use base64_simd::STANDARD as BASE64_STANDARD;
 use bytes::Bytes;
@@ -3729,6 +3729,8 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
     init_logging();
 
     let mut source_env = RustFSTestEnvironment::new().await?;
+    let source_log = format!("{}/source.log", source_env.temp_dir);
+    source_env.capture_log_path = Some(source_log.clone());
     let mut source_env_vars = replication_fast_env();
     source_env_vars.extend_from_slice(LOOPBACK_REPLICATION_TARGET_ENV);
     source_env.start_rustfs_server_with_env(vec![], &source_env_vars).await?;
@@ -3791,18 +3793,65 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
         "target did not preserve the source delete-marker version ID"
     );
 
-    source_client
-        .delete_object()
+    let wait_for_source_writeback = || async {
+        let metrics_url = format!("{}/{source_bucket}?replication-metrics", source_env.url);
+        timeout(Duration::from_secs(30), async {
+            loop {
+                let response = signed_request(
+                    http::Method::GET,
+                    &metrics_url,
+                    &source_env.access_key,
+                    &source_env.secret_key,
+                    None,
+                    None,
+                )
+                .await?;
+                let metrics: serde_json::Value = response.error_for_status()?.json().await?;
+                let queued = metrics["queued"]["curr"]["count"]
+                    .as_f64()
+                    .ok_or("missing replication queue count")?;
+                if metrics["provider_available"] == true && queued == 0.0 {
+                    return Ok::<(), Box<dyn Error + Send + Sync>>(());
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await?
+    };
+    wait_for_source_writeback().await?;
+
+    let purged = source_client
+        .delete_objects()
         .bucket(source_bucket)
-        .key(object_key)
-        .version_id(&purged_version_id)
+        .delete(
+            Delete::builder()
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(object_key)
+                        .version_id(&purged_version_id)
+                        .build()?,
+                )
+                .objects(
+                    ObjectIdentifier::builder()
+                        .key(object_key)
+                        .version_id(delete_marker_version_id)
+                        .build()?,
+                )
+                .build()?,
+        )
         .send()
         .await?;
+    assert!(purged.errors().is_empty(), "batch version purge failed: {:?}", purged.errors());
+    assert_eq!(purged.deleted().len(), 2, "both the data version and marker must be purged");
     assert_replication_converged(&source_client, source_bucket, &target_client, target_bucket).await?;
     let target_state = list_replication_state(&target_client, target_bucket).await?;
     assert!(
         target_state.iter().all(|entry| entry.version_id != purged_version_id),
         "target retained the explicitly purged object version"
+    );
+    assert!(
+        target_state.iter().all(|entry| entry.version_id != delete_marker_version_id),
+        "target retained the explicitly purged delete marker"
     );
     assert!(
         target_state
@@ -3818,6 +3867,19 @@ async fn test_bucket_replication_converges_delete_marker_and_version_purge() -> 
         .send()
         .await?;
     assert_eq!(retained.body.collect().await?.into_bytes().as_ref(), b"versioned replication payload v2");
+
+    // Wait for the source workers to finish their final writeback, which runs
+    // after the remote purge has already become visible (rustfs#9121).
+    wait_for_source_writeback().await?;
+    let logs = fs::read_to_string(source_log).await?;
+    let writeback_failures: Vec<_> = logs
+        .lines()
+        .filter(|line| line.contains("apply_replication_delete_state"))
+        .collect();
+    assert!(
+        writeback_failures.is_empty(),
+        "a completed batch purge must not report a source writeback failure: {writeback_failures:?}"
+    );
 
     Ok(())
 }
