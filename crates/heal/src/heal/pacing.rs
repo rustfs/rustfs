@@ -28,60 +28,91 @@ pub(crate) enum PacingDecision {
     Wait(Option<ForegroundPressure>),
 }
 
-/// S3 `SlowDown` ("Please reduce your request rate") is a rate signal, not a
-/// per-object failure. One governor owns a heal page loop's own concurrency so
-/// heal does not re-saturate the same admission at full speed after rejection.
-#[derive(Debug)]
-pub(crate) struct SlowDownRateGovernor {
+/// Single owner of "how hard may this heal page push storage?".
+///
+/// Combines two signals that used to be separate loops:
+/// - foreground admission pressure (`MainlinePacer`)
+/// - S3 `SlowDown` ("Please reduce your request rate") self-backpressure
+///
+/// One controller owns cool-down, effective page concurrency, and the
+/// pre-page wait, so a SlowDown cannot be retried at full fan-out behind a
+/// second independent throttle.
+pub(crate) struct HealPageRate {
     base_concurrency: usize,
     /// 0 = full base concurrency; each SlowDown increases the reduction.
-    step: AtomicU32,
-    next_ready: std::sync::Mutex<Option<Instant>>,
+    slow_down_step: AtomicU32,
+    slow_down_until: std::sync::Mutex<Option<Instant>>,
+    foreground: Option<Arc<MainlinePacer>>,
 }
 
-impl SlowDownRateGovernor {
-    pub(crate) fn new(base_concurrency: usize) -> Self {
+impl HealPageRate {
+    pub(crate) fn new(base_concurrency: usize, foreground: Option<Arc<MainlinePacer>>) -> Self {
         Self {
             base_concurrency: base_concurrency.max(1),
-            step: AtomicU32::new(0),
-            next_ready: std::sync::Mutex::new(None),
+            slow_down_step: AtomicU32::new(0),
+            slow_down_until: std::sync::Mutex::new(None),
+            foreground,
         }
     }
 
     /// Concurrency after applying the current SlowDown reduction. Always ≥ 1
     /// so maintenance can still make progress under sustained rate pressure.
     pub(crate) fn effective_concurrency(&self) -> usize {
-        let step = self.step.load(Ordering::Relaxed).min(8);
+        let step = self.slow_down_step.load(Ordering::Relaxed).min(8);
         (self.base_concurrency >> step).max(1)
     }
 
-    /// Cut concurrency and arm the next start delay. Repeated observations
-    /// compound the delay up to a bounded ceiling.
+    /// S3 `SlowDown` is a rate signal: cut fan-out and arm exponential cool-down.
     pub(crate) fn observe_slow_down(&self) {
-        let step = self.step.fetch_add(1, Ordering::Relaxed).min(8);
+        let step = self.slow_down_step.fetch_add(1, Ordering::Relaxed).min(8);
         let delay = Self::backoff(step);
         let ready = Instant::now() + delay;
-        if let Ok(mut next_ready) = self.next_ready.lock()
-            && next_ready.is_none_or(|current| current < ready)
+        if let Ok(mut until) = self.slow_down_until.lock()
+            && until.is_none_or(|current| current < ready)
         {
-            *next_ready = Some(ready);
+            *until = Some(ready);
         }
     }
 
     /// Restore one concurrency step after a quiet window.
     pub(crate) fn observe_success(&self) {
-        self.step
+        self.slow_down_step
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |step| Some(step.saturating_sub(1)))
             .ok();
     }
 
-    /// Wait until the SlowDown cool-down expires. Cancellation interrupts.
-    pub(crate) async fn wait_ready(&self, cancel: &CancellationToken) -> Result<()> {
+    /// Wait out SlowDown cool-down, then the foreground pacer. Cancellation interrupts.
+    pub(crate) async fn wait_before_page(&self, cancel: &CancellationToken) -> Result<()> {
+        self.wait_slow_down(cancel).await?;
+        if let Some(foreground) = &self.foreground {
+            foreground.wait(cancel).await?;
+        }
+        Ok(())
+    }
+
+    /// Foreground admission decision while the caller owns page capacity.
+    pub(crate) fn admission_decision(&self) -> Option<PacingDecision> {
+        self.foreground.as_ref().map(|pacer| pacer.admission_decision())
+    }
+
+    /// Foreground wait after a rejected admission. Returns whether a pause was paid.
+    pub(crate) async fn wait_after_admission(
+        &self,
+        cancel: &CancellationToken,
+        observed: Option<ForegroundPressure>,
+    ) -> Result<bool> {
+        match &self.foreground {
+            Some(foreground) => foreground.wait_after_admission(cancel, observed).await,
+            None => Ok(false),
+        }
+    }
+
+    async fn wait_slow_down(&self, cancel: &CancellationToken) -> Result<()> {
         let delay = self
-            .next_ready
+            .slow_down_until
             .lock()
             .ok()
-            .and_then(|next_ready| *next_ready)
+            .and_then(|until| *until)
             .map(|ready| ready.saturating_duration_since(Instant::now()));
         let Some(delay) = delay else {
             return Ok(());
@@ -104,7 +135,7 @@ impl SlowDownRateGovernor {
     }
 }
 
-/// Cooperative pacing for one heal execution, not a storage admission permit.
+/// Cooperative foreground pacing for one heal execution, not a storage admission permit.
 pub(crate) struct MainlinePacer {
     provider: Arc<dyn WorkloadAdmissionSnapshotProvider + Send + Sync>,
     read_high: usize,
@@ -247,39 +278,48 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     #[tokio::test(start_paused = true)]
-    async fn slow_down_governor_reduces_concurrency_and_backs_off() {
-        let governor = SlowDownRateGovernor::new(8);
-        assert_eq!(governor.effective_concurrency(), 8);
-        governor.observe_slow_down();
-        assert_eq!(governor.effective_concurrency(), 4);
-        governor.observe_slow_down();
-        assert_eq!(governor.effective_concurrency(), 2);
+    async fn heal_page_rate_reduces_concurrency_and_backs_off() {
+        let rate = HealPageRate::new(8, None);
+        assert_eq!(rate.effective_concurrency(), 8);
+        rate.observe_slow_down();
+        assert_eq!(rate.effective_concurrency(), 4);
+        rate.observe_slow_down();
+        assert_eq!(rate.effective_concurrency(), 2);
         // Floor is one so maintenance never stops entirely.
         for _ in 0..8 {
-            governor.observe_slow_down();
+            rate.observe_slow_down();
         }
-        assert_eq!(governor.effective_concurrency(), 1);
+        assert_eq!(rate.effective_concurrency(), 1);
 
         let cancel = CancellationToken::new();
-        let before = Instant::now();
-        // The latest observation armed a bounded cool-down; wait_ready honors it.
-        assert!(governor.wait_ready(&cancel).await.is_ok());
-        assert!(Instant::now() >= before);
+        assert!(rate.wait_before_page(&cancel).await.is_ok());
 
         // Successes restore concurrency one step at a time.
         for _ in 0..12 {
-            governor.observe_success();
+            rate.observe_success();
         }
-        assert!(governor.effective_concurrency() > 1);
+        assert!(rate.effective_concurrency() > 1);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn slow_down_governor_wait_is_cancellable() {
-        let governor = SlowDownRateGovernor::new(4);
-        governor.observe_slow_down();
+    async fn heal_page_rate_wait_is_cancellable() {
+        let rate = HealPageRate::new(4, None);
+        rate.observe_slow_down();
         let cancel = CancellationToken::new();
         cancel.cancel();
-        assert!(matches!(governor.wait_ready(&cancel).await, Err(Error::TaskCancelled)));
+        assert!(matches!(rate.wait_before_page(&cancel).await, Err(Error::TaskCancelled)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heal_page_rate_still_waits_for_foreground_after_slow_down_clears() {
+        let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundWrite, 100));
+        let foreground = MainlinePacer::new(provider, 0, 80, Duration::from_millis(250), HealRequestSource::AutoHeal)
+            .expect("foreground pacer");
+        let rate = HealPageRate::new(4, Some(Arc::new(foreground)));
+        let cancel = CancellationToken::new();
+        let before = Instant::now();
+        rate.wait_before_page(&cancel).await.expect("bounded foreground pause");
+        assert_eq!(Instant::now() - before, Duration::from_millis(250));
     }
 
     #[tokio::test(start_paused = true)]

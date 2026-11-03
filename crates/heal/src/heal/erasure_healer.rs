@@ -14,7 +14,7 @@
 
 use crate::error::{HealErrorClass, classify_heal_error};
 use crate::heal::{
-    pacing::SlowDownRateGovernor,
+    pacing::HealPageRate,
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
         CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ReplacementTargetIdentity, ResumeManager,
@@ -134,7 +134,7 @@ pub struct ErasureSetHealer {
 
 async fn acquire_page_permit(
     semaphore: Arc<Semaphore>,
-    pacer: Option<&super::pacing::MainlinePacer>,
+    rate: &HealPageRate,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     let acquire = || async {
@@ -147,18 +147,16 @@ async fn acquire_page_permit(
     let mut paid_pause = false;
     loop {
         let permit = acquire().await?;
-        if let Some(pacer) = pacer {
-            // Keep the real permit on the low-pressure path. Every acquisition
-            // gets a fresh decision, including a waiter that queued a second
-            // time. One completed pause is a bounded minimum-progress grant.
-            match pacer.admission_decision() {
-                super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
-                    drop(permit);
-                    paid_pause = pacer.wait_after_admission(cancel, pressure).await?;
-                    continue;
-                }
-                _ => {}
+        // Keep the real permit on the low-pressure path. Every acquisition
+        // gets a fresh decision, including a waiter that queued a second
+        // time. One completed pause is a bounded minimum-progress grant.
+        match rate.admission_decision() {
+            Some(super::pacing::PacingDecision::Wait(pressure)) if !paid_pause => {
+                drop(permit);
+                paid_pause = rate.wait_after_admission(cancel, pressure).await?;
+                continue;
             }
+            _ => {}
         }
         return Ok(permit);
     }
@@ -184,12 +182,13 @@ mod mainline_pacing_tests {
         let pacer = Arc::new(
             MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer"),
         );
+        let rate = Arc::new(HealPageRate::new(1, Some(pacer.clone())));
         let cancel = CancellationToken::new();
         let waiting = tokio::spawn({
             let semaphore = semaphore.clone();
-            let pacer = pacer.clone();
+            let rate = rate.clone();
             let cancel = cancel.clone();
-            async move { acquire_page_permit(semaphore, Some(&pacer), &cancel).await }
+            async move { acquire_page_permit(semaphore, &rate, &cancel).await }
         });
         tokio::task::yield_now().await;
         provider.active.store(100, Ordering::SeqCst);
@@ -201,12 +200,13 @@ mod mainline_pacing_tests {
         assert_eq!(semaphore.available_permits(), 1);
         let deadline = tokio::time::timeout(
             Duration::from_millis(10),
-            acquire_page_permit(semaphore.clone(), Some(&pacer), &CancellationToken::new()),
+            acquire_page_permit(semaphore.clone(), &rate, &CancellationToken::new()),
         )
         .await;
         assert!(deadline.is_err());
         assert_eq!(semaphore.available_permits(), 1, "deadline must release all permits");
-        let permit = acquire_page_permit(semaphore.clone(), None, &CancellationToken::new())
+        let unpaced = HealPageRate::new(1, None);
+        let permit = acquire_page_permit(semaphore.clone(), &unpaced, &CancellationToken::new())
             .await
             .expect("unpaced admission");
         assert_eq!(semaphore.available_permits(), 0, "disabling pacing cannot disable the hard cap");
@@ -222,10 +222,11 @@ mod mainline_pacing_tests {
             let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
             let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
             let pause = Duration::from_millis(250);
-            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer");
+            let pacer = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer"));
+            let rate = HealPageRate::new(1, Some(pacer));
             let cancel = CancellationToken::new();
-            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
-            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), &rate, &cancel));
+            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), &rate, &cancel));
             assert!(futures::poll!(first.as_mut()).is_pending());
             assert!(futures::poll!(second.as_mut()).is_pending());
             drop(occupied);
@@ -465,12 +466,7 @@ impl ErasureSetHealer {
             None
         };
         let buckets = admin_buckets.as_deref().unwrap_or(buckets);
-        if checkpoint_manager
-            .get_checkpoint()
-            .await
-            .admin
-            .is_some_and(|admin| admin.completed)
-        {
+        if checkpoint_manager.admin_completed().await {
             self.initialize_progress(buckets, &resume_manager.get_state().await).await;
             return Ok(());
         }
@@ -491,14 +487,7 @@ impl ErasureSetHealer {
         }
 
         if self.admin_task.is_some() {
-            let mut admin = checkpoint_manager
-                .get_checkpoint()
-                .await
-                .admin
-                .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome at completion".to_string()))?;
-            admin.completed = true;
-            admin.outcome.finish(None);
-            checkpoint_manager.set_admin(admin).await?;
+            checkpoint_manager.complete_admin().await?;
         } else {
             checkpoint_manager.cleanup().await?;
             resume_manager.cleanup().await?;
@@ -719,7 +708,7 @@ impl ErasureSetHealer {
             }
             return Err(Error::DanglingDeleteDeferred { retry_not_before });
         }
-        let checkpoint = checkpoint_manager.get_checkpoint().await;
+        let (current_bucket_index, current_object_index) = checkpoint_manager.resume_position().await;
 
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -727,8 +716,8 @@ impl ErasureSetHealer {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
             set_disk_id,
-            current_bucket_index = checkpoint.current_bucket_index,
-            current_object_index = checkpoint.current_object_index,
+            current_bucket_index,
+            current_object_index,
             state = "resuming",
             "Erasure set resumed"
         );
@@ -754,6 +743,7 @@ impl ErasureSetHealer {
         }
 
         // 3. continue from checkpoint
+        let checkpoint = checkpoint_manager.progress_snapshot().await;
         let current_bucket_index = checkpoint.current_bucket_index;
         let mut current_object_index = checkpoint.current_object_index;
 
@@ -761,17 +751,7 @@ impl ErasureSetHealer {
         let mut successful_objects = state.successful_objects;
         let mut failed_objects = state.failed_objects;
         let mut skipped_objects = state.skipped_objects;
-        let checkpoint_has_progress = checkpoint.baseline_known
-            || checkpoint.successful_objects > 0
-            || checkpoint.failed_object_count > 0
-            || checkpoint.skipped_object_count > 0
-            || checkpoint.skipped_new_versions > 0
-            || checkpoint.skipped_ilm_expired > 0
-            || checkpoint.processed_bytes > 0
-            || checkpoint.total_objects > 0
-            || checkpoint.total_bytes > 0
-            || checkpoint.baseline_generation.is_some()
-            || checkpoint.counter_unknown;
+        let checkpoint_has_progress = checkpoint.has_progress();
         let checkpoint_generation_mismatch = checkpoint.baseline_known && checkpoint.baseline_generation != baseline_generation;
         let mut restored_counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
         if checkpoint_has_progress {
@@ -1021,14 +1001,14 @@ impl ErasureSetHealer {
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
             if self.replacement_task_id.is_some() {
                 let state = resume_manager.get_state().await;
-                let checkpoint = checkpoint_manager.get_checkpoint().await;
+                let (grace_objects, retry_not_before, counter_unknown) = checkpoint_manager.dangling_delete_grace().await;
                 if state.can_retry()
                     && failed_objects == 0
                     && failed_buckets == 0
                     && skipped_objects > 0
-                    && skipped_objects == checkpoint.dangling_delete_grace_objects
-                    && !checkpoint.counter_unknown
-                    && let Some(retry_not_before) = checkpoint.dangling_delete_retry_not_before
+                    && skipped_objects == grace_objects
+                    && !counter_unknown
+                    && let Some(retry_not_before) = retry_not_before
                 {
                     // Publish the generation's rewind and wait first. If the
                     // checkpoint reset is interrupted, initialization reapplies
@@ -1498,9 +1478,10 @@ impl ErasureSetHealer {
                     self.replacement_task_id.is_some(),
                 )
             };
-        // S3 SlowDown is a rate signal: cut our own concurrency instead of
-        // re-saturating the same admission with full page fan-out.
-        let rate_governor = Arc::new(SlowDownRateGovernor::new(page_concurrency_limit));
+        // One controller owns SlowDown self-backpressure and foreground pacing
+        // so a rate rejection cannot be retried at full fan-out behind a second
+        // independent throttle.
+        let page_rate = Arc::new(HealPageRate::new(page_concurrency_limit, self.mainline_pacer.clone()));
         let in_flight = Arc::new(AtomicUsize::new(0));
         // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
         // disk can fail/skip hundreds of thousands of versions in one sweep, so
@@ -1522,10 +1503,7 @@ impl ErasureSetHealer {
         let include_lifecycle_object_info = lifecycle_expiry_context.is_some();
 
         loop {
-            if let Some(pacer) = &self.mainline_pacer {
-                pacer.wait(&self.cancel_token).await?;
-            }
-            rate_governor.wait_ready(&self.cancel_token).await?;
+            page_rate.wait_before_page(&self.cancel_token).await?;
             self.verify_replacement_identity_fence("page scan").await?;
             if let Some(expected) = incarnation {
                 self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
@@ -1548,7 +1526,7 @@ impl ErasureSetHealer {
             };
             let page_is_empty = objects.is_empty();
             let page_resume_index = *current_object_index;
-            let semaphore = Arc::new(Semaphore::new(rate_governor.effective_concurrency()));
+            let semaphore = Arc::new(Semaphore::new(page_rate.effective_concurrency()));
             let mut page_tasks = FuturesUnordered::new();
             let mut completed_in_page = 0usize;
 
@@ -1720,8 +1698,7 @@ impl ErasureSetHealer {
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
                 let retry_replacement = replacement_commit_evidence_required && self.source == HealRequestSource::AutoHeal;
-                let mainline_pacer = self.mainline_pacer.clone();
-                let rate_governor = rate_governor.clone();
+                let page_rate = page_rate.clone();
 
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
                 let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
@@ -1736,7 +1713,7 @@ impl ErasureSetHealer {
                     let mut admin_identity = admin_identity;
                     let mut admin_task_id = admin_task_id;
                     loop {
-                        let permit = acquire_page_permit(semaphore.clone(), mainline_pacer.as_deref(), &cancel_token).await;
+                        let permit = acquire_page_permit(semaphore.clone(), &page_rate, &cancel_token).await;
 
                         let permit = match permit {
                             Ok(permit) => permit,
@@ -1855,7 +1832,7 @@ impl ErasureSetHealer {
                         {
                             // Rate signal: the page loop must cut its own fan-out
                             // before the next attempt re-enters the same admission.
-                            rate_governor.observe_slow_down();
+                            page_rate.observe_slow_down();
                         }
                         if retry_replacement
                             && retries < REPLACEMENT_OBJECT_MAX_RETRIES
@@ -1892,7 +1869,7 @@ impl ErasureSetHealer {
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
                     Ok(true) => {
-                        rate_governor.observe_success();
+                        page_rate.observe_success();
                         telemetry_unknown |= !increment_counter(successful_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
@@ -1930,7 +1907,7 @@ impl ErasureSetHealer {
                     Err(err) if matches!(err, Error::TransientSkip { .. } | Error::DanglingDeleteDeferred { .. }) => {
                         let message = err.to_string();
                         if err.is_slow_down() {
-                            rate_governor.observe_slow_down();
+                            page_rate.observe_slow_down();
                         }
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
