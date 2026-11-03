@@ -129,7 +129,7 @@ pub struct ErasureSetHealer {
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
     replacement_execution: Option<Arc<super::storage::ReplacementExecution>>,
     work_parent: Option<super::manager::HealWork>,
-    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+    mainline_pacer: Option<super::pacing::ForegroundPacing>,
 }
 
 async fn acquire_page_permit(
@@ -151,7 +151,7 @@ async fn acquire_page_permit(
         // gets a fresh decision, including a waiter that queued a second
         // time. One completed pause is a bounded minimum-progress grant.
         match rate.admission_decision() {
-            Some(super::pacing::PacingDecision::Wait(pressure)) if !paid_pause => {
+            super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
                 drop(permit);
                 paid_pause = rate.wait_after_admission(cancel, pressure).await?;
                 continue;
@@ -165,7 +165,7 @@ async fn acquire_page_permit(
 #[cfg(test)]
 mod mainline_pacing_tests {
     use super::*;
-    use crate::heal::pacing::{MainlinePacer, TestPressure};
+    use crate::heal::pacing::{ForegroundPacing, HealPageRate, TestPressure};
     use rustfs_concurrency::WorkloadClass;
     use std::sync::atomic::Ordering;
     use tokio_util::sync::CancellationToken;
@@ -179,10 +179,9 @@ mod mainline_pacing_tests {
             .await
             .expect("existing object owns capacity");
         let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
-        let pacer = Arc::new(
-            MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer"),
-        );
-        let rate = Arc::new(HealPageRate::new(1, Some(pacer.clone())));
+        let pacer =
+            ForegroundPacing::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer");
+        let rate = Arc::new(HealPageRate::new(1, Some(pacer)));
         let cancel = CancellationToken::new();
         let waiting = tokio::spawn({
             let semaphore = semaphore.clone();
@@ -222,7 +221,7 @@ mod mainline_pacing_tests {
             let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
             let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
             let pause = Duration::from_millis(250);
-            let pacer = Arc::new(MainlinePacer::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer"));
+            let pacer = ForegroundPacing::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer");
             let rate = HealPageRate::new(1, Some(pacer));
             let cancel = CancellationToken::new();
             let mut first = Box::pin(acquire_page_permit(semaphore.clone(), &rate, &cancel));
@@ -331,6 +330,20 @@ impl ErasureSetHealer {
         }
     }
 
+    /// Page fan-out for one whole erasure-set pass (stable across buckets).
+    fn pass_page_concurrency_limit(&self) -> usize {
+        if self.source == HealRequestSource::AutoHeal && self.replacement_task_id.is_some() && self.heal_opts.no_lock {
+            // Versions of the same object must not race without its namespace lock.
+            1
+        } else {
+            Self::effective_heal_page_object_concurrency_for_source(
+                self.source,
+                self.heal_opts.scan_mode,
+                self.replacement_task_id.is_some(),
+            )
+        }
+    }
+
     /// Map the shared heal error class onto this healer's per-object actions.
     ///
     /// `classify_heal_error` is the only classifier; this adapter decides what
@@ -375,7 +388,7 @@ impl ErasureSetHealer {
         }
     }
 
-    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<super::pacing::ForegroundPacing>) -> Self {
         self.mainline_pacer = pacer;
         self
     }
@@ -708,6 +721,9 @@ impl ErasureSetHealer {
             }
             return Err(Error::DanglingDeleteDeferred { retry_not_before });
         }
+        // One rate controller for the whole pass: SlowDown cool-down and page
+        // fan-out persist across buckets instead of resetting at each one.
+        let page_rate = Arc::new(HealPageRate::new(self.pass_page_concurrency_limit(), self.mainline_pacer.clone()));
         let (current_bucket_index, current_object_index) = checkpoint_manager.resume_position().await;
 
         debug!(
@@ -835,6 +851,7 @@ impl ErasureSetHealer {
                     resume_manager,
                     checkpoint_manager,
                     state.start_time,
+                    &page_rate,
                 )
                 .await;
 
@@ -1404,7 +1421,7 @@ impl ErasureSetHealer {
 
     /// Heal one bucket's ordinary objects and report unresolved delete recovery separately.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
+    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager, page_rate), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
@@ -1418,6 +1435,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
         started_at_secs: u64,
+        page_rate: &Arc<HealPageRate>,
     ) -> Result<bool> {
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -1467,21 +1485,6 @@ impl ErasureSetHealer {
         // detects a non-advancing cursor even though next_marker embeds a
         // transient cache id that changes between identical pages.
         let mut previous_page_last: Option<(String, Option<String>)> = None;
-        let page_concurrency_limit =
-            if self.source == HealRequestSource::AutoHeal && self.replacement_task_id.is_some() && self.heal_opts.no_lock {
-                // Versions of the same object must not race without its namespace lock.
-                1
-            } else {
-                Self::effective_heal_page_object_concurrency_for_source(
-                    self.source,
-                    self.heal_opts.scan_mode,
-                    self.replacement_task_id.is_some(),
-                )
-            };
-        // One controller owns SlowDown self-backpressure and foreground pacing
-        // so a rate rejection cannot be retried at full fan-out behind a second
-        // independent throttle.
-        let page_rate = Arc::new(HealPageRate::new(page_concurrency_limit, self.mainline_pacer.clone()));
         let in_flight = Arc::new(AtomicUsize::new(0));
         // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
         // disk can fail/skip hundreds of thousands of versions in one sweep, so
@@ -1827,13 +1830,6 @@ impl ErasureSetHealer {
 
                         drop(in_flight_guard);
                         drop(permit);
-                        if let Err(err @ (Error::TransientSkip { .. } | Error::Storage(_))) = &result.1
-                            && err.is_slow_down()
-                        {
-                            // Rate signal: the page loop must cut its own fan-out
-                            // before the next attempt re-enters the same admission.
-                            page_rate.observe_slow_down();
-                        }
                         if retry_replacement
                             && retries < REPLACEMENT_OBJECT_MAX_RETRIES
                             && matches!(&result.1, Err(Error::TransientSkip { .. }))
@@ -1866,10 +1862,14 @@ impl ErasureSetHealer {
 
             while let Some((key, object, version_id, result, canonical)) = page_tasks.next().await {
                 let (object_size, result) = result;
+                // Exactly one rate observation per finished object.
+                page_rate.observe_object_outcome(&match &result {
+                    Ok(_) => Ok(true),
+                    Err(err) => Err(err),
+                });
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
                     Ok(true) => {
-                        page_rate.observe_success();
                         telemetry_unknown |= !increment_counter(successful_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
@@ -1906,9 +1906,6 @@ impl ErasureSetHealer {
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(err) if matches!(err, Error::TransientSkip { .. } | Error::DanglingDeleteDeferred { .. }) => {
                         let message = err.to_string();
-                        if err.is_slow_down() {
-                            page_rate.observe_slow_down();
-                        }
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
@@ -2467,6 +2464,7 @@ mod resume_loop_tests {
     use super::{
         ErasureSetHealer, NANOS_PER_SECOND, NEW_VERSION_SKIP_GRACE_SECS, should_skip_new_version, target_outcomes_complete,
     };
+    use crate::heal::pacing::HealPageRate;
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
         CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, RESUME_CHECKPOINT_FILE,
@@ -3048,6 +3046,7 @@ mod resume_loop_tests {
         let mut successful = 0u64;
         let mut failed = 0u64;
         let mut skipped = 0u64;
+        let page_rate = Arc::new(HealPageRate::new(env.healer.pass_page_concurrency_limit(), None));
         let result = env
             .healer
             .heal_bucket_with_resume(
@@ -3062,6 +3061,7 @@ mod resume_loop_tests {
                 &env.resume,
                 &env.checkpoint,
                 state.start_time,
+                &page_rate,
             )
             .await;
         (processed, successful, failed, skipped, result.map(|_| ()))
@@ -3129,6 +3129,7 @@ mod resume_loop_tests {
         let mut skipped = 0;
         let started_at = env.resume.get_state().await.start_time;
 
+        let page_rate = Arc::new(HealPageRate::new(healer.pass_page_concurrency_limit(), None));
         let error = healer
             .heal_bucket_with_resume(
                 "b",
@@ -3142,6 +3143,7 @@ mod resume_loop_tests {
                 &env.resume,
                 &env.checkpoint,
                 started_at,
+                &page_rate,
             )
             .await
             .expect_err("a remounted target must not begin a new page scan");

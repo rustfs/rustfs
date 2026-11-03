@@ -135,7 +135,7 @@ impl Error {
             Error::Storage(error) => matches!(error, EcstoreError::SlowDown | EcstoreError::TooManyOpenFiles),
             Error::Disk(error) => matches!(error, DiskError::TooManyOpenFiles),
             Error::TransientSkip { message } | Error::Other(message) | Error::TaskExecutionFailed { message } => {
-                message.contains("Please reduce your request rate") || message.contains("SlowDown")
+                message.contains("Please reduce your request rate")
             }
             Error::Io(error) => error.kind() == std::io::ErrorKind::WouldBlock,
             _ => false,
