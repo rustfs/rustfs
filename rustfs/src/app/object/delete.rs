@@ -295,16 +295,32 @@ fn enrich_delete_replication_state_if_needed(
     }
 }
 
-fn should_schedule_replica_delete_replication(
+/// The current peer set is read only when a rule has the derived shape. If it
+/// cannot be read, no rule is skipped: a redundant echo is safer than a chained
+/// target missing the delete.
+async fn replica_delete_fanout_state(
     snapshot: &DeleteReplicationConfigSnapshot,
+    bucket: &str,
     replication_source: &ObjectInfo,
     version_id: Option<Uuid>,
-) -> bool {
-    let Some(config) = snapshot.replication_config() else {
-        return false;
+) -> Option<ReplicationState> {
+    let config = snapshot.replication_config()?;
+    let site_peer_deployment_ids = if has_site_replication_shaped_rule(config) {
+        match crate::site_replication::site_replication_remote_peer_deployment_ids().await {
+            Ok(peers) => peers,
+            Err(error) => {
+                warn!(
+                    bucket = %bucket,
+                    error = %error,
+                    "failed to load site replication peers; forwarding replica delete along every rule"
+                );
+                HashSet::new()
+            }
+        }
+    } else {
+        HashSet::new()
     };
-
-    delete_replication_state_from_config(config, replication_source, version_id, true).is_some()
+    replica_delete_fanout_state_from_config(config, replication_source, version_id, &site_peer_deployment_ids)
 }
 
 fn validate_undo_delete_version(expected: Option<&str>, requested: Option<&str>) -> S3Result<()> {
@@ -1347,12 +1363,21 @@ impl DefaultObjectUsecase {
         let deleted_delete_marker_version = deleted_replication_info.is_some_and(|info| info.delete_marker);
 
         let delete_replication_version_id = delete_replication_version_id(deleted_object_source, deleted_delete_marker_version);
-        let schedule_delete_replication = if opts.replication_request && replica {
-            should_schedule_replica_delete_replication(
-                &delete_config_snapshot,
-                replication_state_source,
-                delete_replication_version_id,
+        let replica_fanout_state = if opts.replication_request && replica {
+            Some(
+                replica_delete_fanout_state(
+                    &delete_config_snapshot,
+                    &bucket,
+                    replication_state_source,
+                    delete_replication_version_id,
+                )
+                .await,
             )
+        } else {
+            None
+        };
+        let schedule_delete_replication = if let Some(fanout_state) = &replica_fanout_state {
+            fanout_state.is_some()
         } else {
             should_schedule_delete_replication(
                 &opts,
@@ -1381,8 +1406,12 @@ impl DefaultObjectUsecase {
                 replication_state: None,
                 ..Default::default()
             };
-            set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
-            enrich_delete_replication_state_if_needed(&delete_config_snapshot, &mut deleted_object, replication_state_source);
+            if let Some(Some(fanout_state)) = &replica_fanout_state {
+                set_deleted_object_replication_state(&mut deleted_object, fanout_state);
+            } else {
+                set_deleted_object_replication_state(&mut deleted_object, &replication_state_source.replication_state());
+                enrich_delete_replication_state_if_needed(&delete_config_snapshot, &mut deleted_object, replication_state_source);
+            }
             schedule_replication_delete(deleted_object, bucket.clone(), REPLICATE_INCOMING_DELETE.to_string()).await;
         }
 
@@ -3581,6 +3610,83 @@ mod tests {
         assert_eq!(state.version_purge_status_internal.as_deref(), Some(pending.as_str()));
         assert_eq!(state.replicate_decision_str, format!("{arn}=true;false;{arn};"));
         assert!(state.purge_targets.contains_key(&arn));
+    }
+
+    #[test]
+    fn replica_delete_fanout_skips_site_replication_peers_but_keeps_chain_targets() {
+        let peer_arn = "arn:rustfs:replication::peer-dep:bucket";
+        let chain_arn = "arn:aws:s3:::downstream-bucket".to_string();
+        let site_rule = crate::site_replication::build_site_replication_rule(peer_arn, 10, "site-repl-peer-dep");
+        let mut chain_rule = site_rule.clone();
+        chain_rule.id = Some("chain".to_string());
+        chain_rule.priority = Some(1);
+        chain_rule.destination.bucket = chain_arn.clone();
+        let site_only = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![site_rule.clone()],
+        };
+        let site_and_chain = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![site_rule, chain_rule],
+        };
+        let marker = ObjectInfo {
+            bucket: "bucket".to_string(),
+            name: "object".to_string(),
+            delete_marker: true,
+            replication_status: ReplicationStatusType::Replica,
+            ..Default::default()
+        };
+        let version = ObjectInfo {
+            delete_marker: false,
+            ..marker.clone()
+        };
+        // An ordinary bucket target ARN carries its target id, so an operator
+        // rule named `site-repl-<target id>` has the derived shape.
+        let shaped_operator_arn = "arn:minio:replication:us-east-1:target-1:downstream".to_string();
+        let mut shaped_operator_rule =
+            crate::site_replication::build_site_replication_rule(&shaped_operator_arn, 1, "site-repl-target-1");
+        shaped_operator_rule.priority = Some(1);
+        let shaped_operator_only = ReplicationConfiguration {
+            role: String::new(),
+            rules: vec![shaped_operator_rule],
+        };
+        assert!(has_site_replication_shaped_rule(&shaped_operator_only));
+        let site_peers = HashSet::from(["peer-dep".to_string()]);
+        let no_site_peers = HashSet::new();
+        let removed_peer_only = HashSet::from(["other-dep".to_string()]);
+        let purged_version = Some(Uuid::new_v4());
+        let fanout_targets = |state: ReplicationState, version_id: Option<Uuid>| {
+            if version_id.is_some() {
+                state.purge_targets.keys().cloned().collect::<Vec<_>>()
+            } else {
+                state.targets.keys().cloned().collect::<Vec<_>>()
+            }
+        };
+
+        for (source, version_id) in [(&marker, None), (&marker, purged_version), (&version, purged_version)] {
+            assert!(
+                delete_replication_state_from_config(&site_only, source, version_id, true).is_some(),
+                "the site-replication rule alone would forward the replica delete"
+            );
+            assert!(
+                replica_delete_fanout_state_from_config(&site_only, source, version_id, &site_peers).is_none(),
+                "a replica delete must not echo back across the site-replication mesh"
+            );
+
+            let state = replica_delete_fanout_state_from_config(&site_and_chain, source, version_id, &site_peers)
+                .expect("a replica delete must still follow a chained operator rule");
+            assert!(!state.replicate_decision_str.contains(peer_arn));
+            assert_eq!(fanout_targets(state, version_id), vec![chain_arn.clone()]);
+
+            for peers in [&no_site_peers, &removed_peer_only, &site_peers] {
+                let state = replica_delete_fanout_state_from_config(&shaped_operator_only, source, version_id, peers)
+                    .expect("an operator rule naming no current site peer must keep forwarding replica deletes");
+                assert_eq!(fanout_targets(state, version_id), vec![shaped_operator_arn.clone()]);
+            }
+            let state = replica_delete_fanout_state_from_config(&site_only, source, version_id, &no_site_peers)
+                .expect("with site replication disabled a site-repl rule is an operator rule");
+            assert_eq!(fanout_targets(state, version_id), vec![peer_arn.to_string()]);
+        }
     }
 
     #[test]
