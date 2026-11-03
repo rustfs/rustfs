@@ -332,7 +332,7 @@ fn mrf_bound_dedup_keys_separate_incarnation_source_and_untrusted_components() {
         PriorityHealQueue::make_dedup_key(&right),
         "length-prefixed object and version components must not alias"
     );
-    let mut forged = unbound.clone();
+    let mut forged = unbound;
     forged.heal_type = HealType::Object {
         bucket: "mrf-recreated-bucket".to_owned(),
         object: PriorityHealQueue::make_dedup_key(&bound),
