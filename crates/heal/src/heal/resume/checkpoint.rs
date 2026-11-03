@@ -715,6 +715,16 @@ impl CheckpointManager {
         self.checkpoint.read().await.clone()
     }
 
+    /// True when a page object is already settled in the current ledger.
+    /// Membership is checked under the lock without cloning the checkpoint,
+    /// which used to copy every page's dedup sets on the small-object path.
+    pub async fn is_object_settled(&self, key: &str) -> bool {
+        let checkpoint = self.checkpoint.read().await;
+        checkpoint.processed_objects.contains(key)
+            || checkpoint.failed_objects.contains(key)
+            || checkpoint.skipped_objects.contains(key)
+    }
+
     /// update position
     pub async fn update_position(&self, bucket_index: usize, object_index: usize) -> Result<()> {
         let mut checkpoint = self.checkpoint.write().await;

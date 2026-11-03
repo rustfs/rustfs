@@ -7,7 +7,13 @@ use rustfs_concurrency::{
     workload::{ForegroundPressure, foreground_pressure},
 };
 use rustfs_heal_contracts::heal_channel::HealRequestSource;
-use std::{sync::Arc, time::Duration};
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
+    time::Duration,
+};
 use tokio::{sync::Mutex, time::Instant};
 use tokio_util::sync::CancellationToken;
 
@@ -20,6 +26,82 @@ struct PacingState {
 pub(crate) enum PacingDecision {
     Ready,
     Wait(Option<ForegroundPressure>),
+}
+
+/// S3 `SlowDown` ("Please reduce your request rate") is a rate signal, not a
+/// per-object failure. One governor owns a heal page loop's own concurrency so
+/// heal does not re-saturate the same admission at full speed after rejection.
+#[derive(Debug)]
+pub(crate) struct SlowDownRateGovernor {
+    base_concurrency: usize,
+    /// 0 = full base concurrency; each SlowDown increases the reduction.
+    step: AtomicU32,
+    next_ready: std::sync::Mutex<Option<Instant>>,
+}
+
+impl SlowDownRateGovernor {
+    pub(crate) fn new(base_concurrency: usize) -> Self {
+        Self {
+            base_concurrency: base_concurrency.max(1),
+            step: AtomicU32::new(0),
+            next_ready: std::sync::Mutex::new(None),
+        }
+    }
+
+    /// Concurrency after applying the current SlowDown reduction. Always ≥ 1
+    /// so maintenance can still make progress under sustained rate pressure.
+    pub(crate) fn effective_concurrency(&self) -> usize {
+        let step = self.step.load(Ordering::Relaxed).min(8);
+        (self.base_concurrency >> step).max(1)
+    }
+
+    /// Cut concurrency and arm the next start delay. Repeated observations
+    /// compound the delay up to a bounded ceiling.
+    pub(crate) fn observe_slow_down(&self) {
+        let step = self.step.fetch_add(1, Ordering::Relaxed).min(8);
+        let delay = Self::backoff(step);
+        let ready = Instant::now() + delay;
+        if let Ok(mut next_ready) = self.next_ready.lock()
+            && next_ready.is_none_or(|current| current < ready)
+        {
+            *next_ready = Some(ready);
+        }
+    }
+
+    /// Restore one concurrency step after a quiet window.
+    pub(crate) fn observe_success(&self) {
+        self.step
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |step| Some(step.saturating_sub(1)))
+            .ok();
+    }
+
+    /// Wait until the SlowDown cool-down expires. Cancellation interrupts.
+    pub(crate) async fn wait_ready(&self, cancel: &CancellationToken) -> Result<()> {
+        let delay = self
+            .next_ready
+            .lock()
+            .ok()
+            .and_then(|next_ready| *next_ready)
+            .map(|ready| ready.saturating_duration_since(Instant::now()));
+        let Some(delay) = delay else {
+            return Ok(());
+        };
+        if delay.is_zero() {
+            return Ok(());
+        }
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => Err(Error::TaskCancelled),
+            _ = tokio::time::sleep(delay) => Ok(()),
+        }
+    }
+
+    fn backoff(step: u32) -> Duration {
+        // 2s, 4s, 8s, … capped at 30s — S3 clients are told to reduce rate with
+        // exponential backoff, and heal must do the same to itself.
+        let exponent = step.min(5);
+        Duration::from_secs(2_u64.saturating_pow(exponent)).min(Duration::from_secs(30))
+    }
 }
 
 /// Cooperative pacing for one heal execution, not a storage admission permit.
@@ -163,6 +245,42 @@ mod tests {
     use super::*;
     use rustfs_concurrency::WorkloadClass;
     use std::sync::atomic::Ordering;
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_down_governor_reduces_concurrency_and_backs_off() {
+        let governor = SlowDownRateGovernor::new(8);
+        assert_eq!(governor.effective_concurrency(), 8);
+        governor.observe_slow_down();
+        assert_eq!(governor.effective_concurrency(), 4);
+        governor.observe_slow_down();
+        assert_eq!(governor.effective_concurrency(), 2);
+        // Floor is one so maintenance never stops entirely.
+        for _ in 0..8 {
+            governor.observe_slow_down();
+        }
+        assert_eq!(governor.effective_concurrency(), 1);
+
+        let cancel = CancellationToken::new();
+        let before = Instant::now();
+        // The latest observation armed a bounded cool-down; wait_ready honors it.
+        assert!(governor.wait_ready(&cancel).await.is_ok());
+        assert!(Instant::now() >= before);
+
+        // Successes restore concurrency one step at a time.
+        for _ in 0..12 {
+            governor.observe_success();
+        }
+        assert!(governor.effective_concurrency() > 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn slow_down_governor_wait_is_cancellable() {
+        let governor = SlowDownRateGovernor::new(4);
+        governor.observe_slow_down();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        assert!(matches!(governor.wait_ready(&cancel).await, Err(Error::TaskCancelled)));
+    }
 
     #[tokio::test(start_paused = true)]
     async fn running_mainline_hysteresis_uses_configured_watermarks_and_stable_low_window() {

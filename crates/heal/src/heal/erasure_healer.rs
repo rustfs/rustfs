@@ -14,6 +14,7 @@
 
 use crate::error::{HealErrorClass, classify_heal_error};
 use crate::heal::{
+    pacing::SlowDownRateGovernor,
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
         CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ReplacementTargetIdentity, ResumeManager,
@@ -1167,14 +1168,9 @@ impl ErasureSetHealer {
 
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
-        let checkpoint = checkpoint_manager.get_checkpoint().await;
-        if checkpoint.processed_objects.contains(&checkpoint_key)
-            || checkpoint.failed_objects.contains(&checkpoint_key)
-            || checkpoint.skipped_objects.contains(&checkpoint_key)
-        {
+        if checkpoint_manager.is_object_settled(&checkpoint_key).await {
             return Ok(());
         }
-        drop(checkpoint);
 
         self.verify_replacement_identity_fence("pool metadata").await?;
         resume_manager
@@ -1502,6 +1498,9 @@ impl ErasureSetHealer {
                     self.replacement_task_id.is_some(),
                 )
             };
+        // S3 SlowDown is a rate signal: cut our own concurrency instead of
+        // re-saturating the same admission with full page fan-out.
+        let rate_governor = Arc::new(SlowDownRateGovernor::new(page_concurrency_limit));
         let in_flight = Arc::new(AtomicUsize::new(0));
         // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
         // disk can fail/skip hundreds of thousands of versions in one sweep, so
@@ -1526,6 +1525,7 @@ impl ErasureSetHealer {
             if let Some(pacer) = &self.mainline_pacer {
                 pacer.wait(&self.cancel_token).await?;
             }
+            rate_governor.wait_ready(&self.cancel_token).await?;
             self.verify_replacement_identity_fence("page scan").await?;
             if let Some(expected) = incarnation {
                 self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
@@ -1547,9 +1547,8 @@ impl ErasureSetHealer {
                     .await?
             };
             let page_is_empty = objects.is_empty();
-            let checkpoint = checkpoint_manager.get_checkpoint().await;
             let page_resume_index = *current_object_index;
-            let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
+            let semaphore = Arc::new(Semaphore::new(rate_governor.effective_concurrency()));
             let mut page_tasks = FuturesUnordered::new();
             let mut completed_in_page = 0usize;
 
@@ -1563,10 +1562,7 @@ impl ErasureSetHealer {
 
                 // Per-version dedup identity — the single canonical key.
                 let key = compose_key(&item.name, item.version_id.as_deref());
-                if checkpoint.processed_objects.contains(&key)
-                    || checkpoint.failed_objects.contains(&key)
-                    || checkpoint.skipped_objects.contains(&key)
-                {
+                if checkpoint_manager.is_object_settled(&key).await {
                     continue;
                 }
 
@@ -1725,6 +1721,7 @@ impl ErasureSetHealer {
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
                 let retry_replacement = replacement_commit_evidence_required && self.source == HealRequestSource::AutoHeal;
                 let mainline_pacer = self.mainline_pacer.clone();
+                let rate_governor = rate_governor.clone();
 
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
                 let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
@@ -1853,6 +1850,13 @@ impl ErasureSetHealer {
 
                         drop(in_flight_guard);
                         drop(permit);
+                        if let Err(err @ (Error::TransientSkip { .. } | Error::Storage(_))) = &result.1
+                            && err.is_slow_down()
+                        {
+                            // Rate signal: the page loop must cut its own fan-out
+                            // before the next attempt re-enters the same admission.
+                            rate_governor.observe_slow_down();
+                        }
                         if retry_replacement
                             && retries < REPLACEMENT_OBJECT_MAX_RETRIES
                             && matches!(&result.1, Err(Error::TransientSkip { .. }))
@@ -1888,6 +1892,7 @@ impl ErasureSetHealer {
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
                     Ok(true) => {
+                        rate_governor.observe_success();
                         telemetry_unknown |= !increment_counter(successful_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         debug!(
@@ -1924,6 +1929,9 @@ impl ErasureSetHealer {
                     Err(err @ Error::TaskCancelled) | Err(err @ Error::TaskTimeout) => return Err(err),
                     Err(err) if matches!(err, Error::TransientSkip { .. } | Error::DanglingDeleteDeferred { .. }) => {
                         let message = err.to_string();
+                        if err.is_slow_down() {
+                            rate_governor.observe_slow_down();
+                        }
                         telemetry_unknown |= !increment_counter(skipped_objects);
                         telemetry_unknown |= !add_bytes(&mut bytes_processed, object_size);
                         demote_to_debug_when!(!take_failure_log_sample(&mut transient_skip_samples_logged), warn, target: "rustfs::heal::erasure_healer", {
