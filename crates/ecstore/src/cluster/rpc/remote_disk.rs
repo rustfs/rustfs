@@ -5745,6 +5745,7 @@ mod tests {
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
+        fail_format_reads: Arc<AtomicBool>,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
         unsupported_methods: Arc<StdMutex<Vec<String>>>,
     }
@@ -5764,6 +5765,7 @@ mod tests {
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
+                fail_format_reads: Arc::default(),
                 next_format_read_gate: Arc::default(),
                 unsupported_methods: Arc::default(),
             }
@@ -5886,6 +5888,9 @@ mod tests {
                                     if let Some(gate) = gate {
                                         gate.entered.notify_one();
                                         gate.release.cancelled().await;
+                                    }
+                                    if peer.fail_format_reads.load(Ordering::Acquire) {
+                                        return Err(Status::unavailable("format read temporarily unavailable"));
                                     }
                                     peer.format_data.clone()
                                 } else {
@@ -8850,6 +8855,124 @@ mod tests {
         }
         assert_eq!(peer.peer.read_all_calls(), 0, "invalid endpoint ownership must fail before I/O");
         peer.stop().await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn endpoint_reconnect_failure_preserves_registered_remote_recovery() {
+        temp_env::async_with_vars(
+            [
+                (crate::disk::disk_store::ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, Some("true")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("1")),
+            ],
+            async {
+                runtime_sources::ensure_test_rpc_secret();
+                let mut reference = crate::layout::format::FormatV3::new(1, 1);
+                reference.erasure.this = reference.erasure.sets[0][0];
+                let peer = TestGrpcPeer::spawn(
+                    Bytes::from(reference.to_json().expect("format should serialize")),
+                    Bytes::from_static(b"recovered-peer-data"),
+                )
+                .await
+                .expect("authenticated regression peer is required");
+                let set = missing_read_set(&peer, reference).await;
+                let disk = crate::disk::new_disk(
+                    &set.set_endpoints[0],
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: true,
+                    },
+                )
+                .await
+                .expect("registered remote disk should construct");
+                let crate::disk::Disk::Remote(remote) = disk.as_ref() else {
+                    panic!("fixture must create a remote disk");
+                };
+                assert!(remote.health_check);
+                remote.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                set.disks.write().await[0] = Some(Arc::clone(&disk));
+
+                peer.peer.fail_format_reads.store(true, Ordering::Release);
+                set.connect_disks().await;
+                peer.peer.fail_format_reads.store(false, Ordering::Release);
+                let cancelled_after_failure = remote.cancel_token.is_cancelled();
+                assert!(peer.peer.read_all_calls() > 0, "reconnect must attempt the failing format RPC");
+                assert!(
+                    Arc::ptr_eq(&disk, set.disks.read().await[0].as_ref().expect("existing slot must remain")),
+                    "a failed reconnect must not publish its unvalidated candidate"
+                );
+                remote.spawn_recovery_monitor_if_needed();
+                let recovery = time::timeout(Duration::from_secs(5), async {
+                    while !disk.is_online().await {
+                        tokio::task::yield_now().await;
+                    }
+                    disk.read_all("bucket", "object").await
+                })
+                .await;
+                disk.close().await.expect("stop the registered disk's monitoring");
+                peer.stop().await;
+                assert!(!cancelled_after_failure, "failed replacement must retain the registered monitor");
+                assert_eq!(
+                    recovery
+                        .expect("failed reconnect must leave the registered disk able to recover without another sweep")
+                        .expect("the recovered registered disk must serve real I/O"),
+                    Bytes::from_static(b"recovered-peer-data")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn endpoint_reconnect_stops_old_remote_monitor_only_after_publication() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(
+            Bytes::from(reference.to_json().expect("format should serialize")),
+            Bytes::from_static(b"replacement-peer-data"),
+        )
+        .await
+        .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let disk = crate::disk::new_disk(
+            &set.set_endpoints[0],
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await
+        .expect("registered remote disk should construct");
+        let crate::disk::Disk::Remote(remote) = disk.as_ref() else {
+            panic!("fixture must create a remote disk");
+        };
+        remote.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        set.disks.write().await[0] = Some(Arc::clone(&disk));
+        let gate = peer.peer.pause_next_format_read();
+        let pending_set = Arc::clone(&set);
+        let pending = tokio::spawn(async move { pending_set.connect_disks().await });
+        time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("replacement must reach the format validation barrier");
+        let cancelled_before_publication = remote.cancel_token.is_cancelled();
+        gate.release.cancel();
+        pending.await.expect("validated replacement must finish publication");
+        let replacement = set.disks.read().await[0].clone().expect("replacement must occupy the slot");
+        let readback = replacement.read_all("bucket", "object").await;
+        replacement.close().await.expect("stop replacement monitoring");
+        peer.stop().await;
+        assert!(
+            !cancelled_before_publication,
+            "the registered monitor must survive pending format validation"
+        );
+        assert!(!Arc::ptr_eq(&disk, &replacement), "validated replacement must be published");
+        assert!(remote.cancel_token.is_cancelled(), "the displaced monitor must stop after publication");
+        assert_eq!(
+            readback.expect("replacement must serve real I/O"),
+            Bytes::from_static(b"replacement-peer-data")
+        );
     }
 
     #[tokio::test]
