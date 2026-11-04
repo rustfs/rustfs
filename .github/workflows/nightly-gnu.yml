@@ -221,13 +221,12 @@ jobs:
           # Force rebuild by touching build.rs so a restored cache cannot
           # reuse a rustfs artifact compiled before these console assets existed.
           touch rustfs/build.rs
-          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31 -p rustfs --bins
+          cargo zigbuild --release --locked --target x86_64-unknown-linux-gnu.2.31 -p rustfs --bin rustfs
 
       - name: Verify glibc symbol baseline
         run: |
           python3 scripts/release/check_glibc.py 2.31 \
-            target/x86_64-unknown-linux-gnu/release/rustfs \
-            target/x86_64-unknown-linux-gnu/release/rustfs-cli
+            target/x86_64-unknown-linux-gnu/release/rustfs
           target/x86_64-unknown-linux-gnu/release/rustfs --version | grep -Fx 'build target : x86_64-unknown-linux-gnu'
 
       - name: Verify console
