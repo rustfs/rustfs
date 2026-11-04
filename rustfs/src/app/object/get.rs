@@ -721,6 +721,35 @@ struct DiskReadPermitReader<R> {
     changed: Arc<tokio::sync::Notify>,
 }
 
+/// Out-of-band control over a [`DiskReadPermitReader`]'s lease, for the
+/// owner that decides a submitted read is stalled rather than merely unread.
+struct DiskReadLeaseControl<R> {
+    lease: Arc<Mutex<DiskReadLease<R>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl<R> DiskReadLeaseControl<R> {
+    /// Release the disk-read permit now, even with a read in flight. Dropping
+    /// the reader alone keeps the permit until that read completes (a cancelled
+    /// client must not widen disk concurrency); a deadline that classified the
+    /// read as stalled has already given up on its result, so the slot goes
+    /// back to the pool and the read is dropped with the reader.
+    fn abandon(&self) {
+        let waker = {
+            let mut state = self.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            state.pending = false;
+            state.reader.take();
+            state.permit.take();
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        self.changed.notify_one();
+    }
+}
+
 impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
     fn new(inner: R, disk_permit: GetObjectDiskPermit) -> Self {
         // Leave the configured upstream stall/reopen window ahead of this
@@ -729,6 +758,13 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
             .saturating_mul(2)
             .max(GET_DISK_READ_IDLE_TIMEOUT);
         Self::with_idle_timeout(inner, disk_permit, idle_timeout)
+    }
+
+    fn lease_control(&self) -> DiskReadLeaseControl<R> {
+        DiskReadLeaseControl {
+            lease: self.lease.clone(),
+            changed: self.changed.clone(),
+        }
     }
 
     fn with_idle_timeout(inner: R, disk_permit: GetObjectDiskPermit, idle_timeout: Duration) -> Self {
@@ -1233,10 +1269,20 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
         }
     };
     producer.mark_reader_started();
+    let GetObjectReader {
+        stream, buffered_body, ..
+    } = reader;
+    // Wrap outside the materialize future so a deadline can abandon the disk
+    // admission of a read it has classified as stalled (see `DiskReadLeaseControl`).
+    let (stream, lease_control) = match producer_io.disk_permit {
+        Some(permit) if buffered_body.is_none() => {
+            let reader = DiskReadPermitReader::new(stream, permit);
+            let control = reader.lease_control();
+            (wrap_reader(reader), Some(control))
+        }
+        _ => (wrap_reader(stream), None),
+    };
     let materialize = async move {
-        let GetObjectReader {
-            stream, buffered_body, ..
-        } = reader;
         let body = if let Some(body) = buffered_body {
             if body.len() == expected {
                 body
@@ -1247,11 +1293,6 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
                 )));
             }
         } else {
-            let stream = if let Some(permit) = producer_io.disk_permit {
-                wrap_reader(DiskReadPermitReader::new(stream, permit))
-            } else {
-                stream
-            };
             Bytes::from(
                 strict_materialize_object_body(stream, expected, GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ)
                     .await
@@ -1266,6 +1307,11 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
                 result.unwrap_or(Err(StorageError::Timeout))
             }
     };
+    if matches!(materialized, Err(StorageError::Timeout))
+        && let Some(control) = &lease_control
+    {
+        control.abandon();
+    }
     let result = match materialized {
         Ok((body, reservation)) => {
             if cancellation.is_cancelled() {
