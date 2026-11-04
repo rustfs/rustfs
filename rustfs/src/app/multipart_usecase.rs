@@ -69,6 +69,7 @@ use super::storage_api::multipart_usecase::sse::{
 };
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
+    validate_object_key,
 };
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
@@ -584,6 +585,8 @@ impl DefaultMultipartUsecase {
         &self,
         mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        // Uploads created before the key was reserved must not publish it.
+        validate_object_key(&req.input.key, "CompleteMultipartUpload")?;
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -990,6 +993,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        validate_object_key(&req.input.key, "CreateMultipartUpload")?;
         let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
             &req.headers,
             req.uri.query(),
@@ -2704,6 +2708,33 @@ mod tests {
         let err = make_usecase().execute_abort_multipart_upload(req).await.unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
         assert_eq!(s3_op_total(S3Operation::AbortMultipartUpload), before + 1);
+    }
+
+    #[tokio::test]
+    async fn multipart_upload_rejects_reserved_directory_markers() {
+        for key in ["__XLDIR__", "prefix__XLDIR__/object", "object__XLDIR__"] {
+            let create = CreateMultipartUploadInput::builder()
+                .bucket("bucket".to_owned())
+                .key(key.to_owned())
+                .build()
+                .expect("valid create request DTO");
+            let error = make_usecase()
+                .execute_create_multipart_upload(build_request(create, Method::POST))
+                .await
+                .expect_err("reserved key must be rejected before accessing storage");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket("bucket".to_owned())
+                .key(key.to_owned())
+                .upload_id("upload".to_owned())
+                .build()
+                .expect("valid complete request DTO");
+            let error = Box::pin(make_usecase().execute_complete_multipart_upload(build_request(complete, Method::POST)))
+                .await
+                .expect_err("uploads created before the fix must not publish reserved keys");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidArgument);
+        }
     }
 
     #[tokio::test]

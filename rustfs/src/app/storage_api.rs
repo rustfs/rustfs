@@ -1331,7 +1331,9 @@ pub(crate) mod multipart_usecase {
     pub(crate) use super::{
         access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
     };
-    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
+    pub(crate) use crate::storage::storage_api::{
+        ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, validate_object_key,
+    };
 }
 
 pub(crate) mod select_object {
