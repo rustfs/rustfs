@@ -159,7 +159,7 @@ fn md5_base64(input: impl AsRef<[u8]>) -> String {
 
 use super::Error;
 use super::get_bucket_sse_config;
-use crate::error::{ApiError, slow_down_read_api_error};
+use crate::error::ApiError;
 use rustfs_utils::http::headers::{
     AMZ_ENCRYPTION_AES, AMZ_ENCRYPTION_KMS, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_ALGORITHM,
     AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY, AMZ_SERVER_SIDE_ENCRYPTION_CUSTOMER_KEY_MD5, AMZ_SERVER_SIDE_ENCRYPTION_KMS_CONTEXT,
@@ -714,11 +714,8 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
 pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
     // GET/HEAD object-read contract: these failures mean "this object is not
     // readable right now" (S3 `SlowDownRead`), not a write admission reject.
-    if matches!(
-        err,
-        StorageError::PartMissingOrCorrupt | StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)
-    ) {
-        return slow_down_read_api_error(err);
+    if crate::error::is_object_read_unavailable(&err) {
+        return crate::error::object_read_unavailable_api_error(err);
     }
 
     if let StorageError::Io(io_error) = &err

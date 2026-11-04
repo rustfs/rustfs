@@ -207,6 +207,24 @@ pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
     }
 }
 
+/// True when a storage failure means the object is not readable right now
+/// (GET/HEAD `SlowDownRead`), as opposed to write-path unavailability.
+pub(crate) fn is_object_read_unavailable(err: &StorageError) -> bool {
+    matches!(
+        err,
+        StorageError::PartMissingOrCorrupt | StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)
+    )
+}
+
+/// Object-read mapping for those failures. Writes never take this path.
+pub(crate) fn object_read_unavailable_api_error(err: StorageError) -> ApiError {
+    if is_object_read_unavailable(&err) {
+        slow_down_read_api_error(err)
+    } else {
+        ApiError::from(err)
+    }
+}
+
 /// Marks a request body that exceeded a presigned upload size capability.
 ///
 /// This marker must survive the body-reader and storage layers so the client
@@ -2335,10 +2353,12 @@ mod tests {
             StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
             StorageError::PartMissingOrCorrupt,
         ] {
-            let api_error = crate::storage::sse::map_get_object_reader_error(source.clone());
+            assert!(is_object_read_unavailable(&source));
+            let api_error = object_read_unavailable_api_error(source.clone());
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
         }
+        assert!(!is_object_read_unavailable(&StorageError::ErasureWriteQuorum));
     }
 
     #[test]
@@ -2637,7 +2657,7 @@ mod tests {
             StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
         ] {
             // MinIO-compatible GET object-read response.
-            let api_error = crate::storage::sse::map_get_object_reader_error(error);
+            let api_error = object_read_unavailable_api_error(error);
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
 
