@@ -19,7 +19,7 @@ use futures::FutureExt;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded, normalize_read_quorum_error};
+use crate::error::UploadLimitExceeded;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
