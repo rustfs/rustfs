@@ -88,6 +88,17 @@ impl NamespaceLockWrapper {
     pub async fn get_read_lock(&self, timeout: Duration) -> std::result::Result<NamespaceLockGuard, crate::error::LockError> {
         self.lock.get_read_lock(self.resource.clone(), &self.owner, timeout).await
     }
+
+    /// Acquire write locks for `resources` in one batched round using this
+    /// wrapper's owner; see [`NamespaceLock::acquire_write_locks_batch`].
+    /// One guard or error per resource, in `resources` order.
+    pub async fn get_write_locks_batch(
+        &self,
+        resources: &[ObjectKey],
+        timeout: Duration,
+    ) -> Vec<std::result::Result<NamespaceLockGuard, crate::error::LockError>> {
+        self.lock.acquire_write_locks_batch(resources, &self.owner, timeout).await
+    }
 }
 
 impl NamespaceLockGuard {
@@ -346,6 +357,38 @@ impl NamespaceLock {
             Ok(Some(guard)) => Ok(guard),
             Ok(None) => Err(crate::error::LockError::timeout(resource_str, timeout)),
             Err(e) => Err(e),
+        }
+    }
+
+    /// Acquire exclusive locks for many independent resources in one batched
+    /// round; see [`crate::distributed_lock::DistributedLock::acquire_guard_batch`].
+    /// Returns one guard or error per resource, in `resources` order.
+    ///
+    /// This is the lock primitive bulk mutations (S3 `DeleteObjects`) should
+    /// use: per-key quorum round-trips serialize a 1000-key batch, while the
+    /// batched form is one wire round per lock client and stays deadlock-free
+    /// without any canonical serial fallback (every lock server orders
+    /// concurrent batches by the same global key order).
+    pub async fn acquire_write_locks_batch(
+        &self,
+        resources: &[ObjectKey],
+        owner: &str,
+        timeout: Duration,
+    ) -> Vec<std::result::Result<NamespaceLockGuard, crate::error::LockError>> {
+        let ttl = crate::fast_lock::DEFAULT_LOCK_TIMEOUT;
+        match self {
+            Self::Distributed(lock) => lock
+                .acquire_guard_batch(resources, owner, timeout, ttl)
+                .await
+                .into_iter()
+                .map(|result| result.map(NamespaceLockGuard::Standard))
+                .collect(),
+            Self::Local(lock) => lock
+                .acquire_guard_batch(resources, owner, timeout, ttl)
+                .await
+                .into_iter()
+                .map(|result| result.map(NamespaceLockGuard::Fast))
+                .collect(),
         }
     }
 

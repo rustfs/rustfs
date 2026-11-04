@@ -1441,7 +1441,11 @@ impl LocalDisk {
         let object = object.to_owned();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&root, owner).await;
         let scope = recovery_operation_scope();
-        os::run_blocking_namespace_operation(lease, move || {
+        // Journal inspections ride the durable-mutation lane (the fused delete
+        // prepare already does): a bulk delete publishes one transaction per
+        // key, and the one-worker foreground namespace lane would serialize
+        // those per-drive publishes behind every other mutation.
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
             Ok(inspection_with_markers_bounded(
                 &root,
                 &volume,
@@ -1891,7 +1895,10 @@ impl LocalDisk {
             let missing = observed.current_digest.is_none();
             let lease = os::acquire_namespace_mutation_lease_with_owner(&root, owner.clone()).await;
             let scope = recovery_operation_scope();
-            let plan = os::run_blocking_namespace_operation(lease, move || {
+            // Same durable-mutation lane as the journal inspection above: this
+            // plan closure runs inside every settle on the bulk-delete publish
+            // path.
+            let plan = os::run_blocking_namespace_operation_with_sync(lease, true, move || {
                 Ok((|| {
                     let before =
                         regular_metadata_bytes(&plan_root.join(transaction.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))?

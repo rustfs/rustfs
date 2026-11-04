@@ -479,7 +479,8 @@ mod bucket_default_sse_lookup_tests {
         let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
             .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
 
-        assert_eq!(err.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+        // Write path: retryable ServiceUnavailable, not the GET-only SlowDownRead.
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]
