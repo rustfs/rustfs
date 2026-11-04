@@ -936,9 +936,9 @@ impl SseKmsPrincipal {
 
 #[cfg(test)]
 #[derive(Clone)]
-struct TestAuthorizationHooks {
-    enforced: bool,
-    authorizer: Arc<dyn KmsKeyAuthorizer>,
+pub(crate) struct TestAuthorizationHooks {
+    pub(crate) enforced: bool,
+    pub(crate) authorizer: Arc<dyn KmsKeyAuthorizer>,
 }
 
 #[cfg(test)]
@@ -4490,7 +4490,7 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 
 #[cfg(test)]
 #[allow(unused_imports)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
         EncryptionResolutionError, EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
@@ -8047,20 +8047,20 @@ mod tests {
     // Per-key KMS authorization on the SSE-KMS data path (rustfs/backlog#1582)
     // ------------------------------------------------------------------------
 
-    struct RecordingKmsKeyAuthorizer {
+    pub(crate) struct RecordingKmsKeyAuthorizer {
         allowed: bool,
         calls: std::sync::Mutex<Vec<(KmsAction, String)>>,
     }
 
     impl RecordingKmsKeyAuthorizer {
-        fn new(allowed: bool) -> Arc<Self> {
+        pub(crate) fn new(allowed: bool) -> Arc<Self> {
             Arc::new(Self {
                 allowed,
                 calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
-        fn calls(&self) -> Vec<(KmsAction, String)> {
+        pub(crate) fn calls(&self) -> Vec<(KmsAction, String)> {
             self.calls.lock().expect("authorizer call log").clone()
         }
     }
@@ -8101,7 +8101,7 @@ mod tests {
         }
     }
 
-    fn sse_kms_object_metadata() -> HashMap<String, String> {
+    pub(crate) fn sse_kms_object_metadata() -> HashMap<String, String> {
         HashMap::from([
             ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
             ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "finance-key".to_string()),
@@ -8269,160 +8269,6 @@ mod tests {
             authorizer.calls().is_empty(),
             "with the switch off the data path must not evaluate KMS key policy at all"
         );
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn multipart_handlers_reject_another_callers_denied_kms_upload() {
-        crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
-            use crate::app::multipart_usecase::DefaultMultipartUsecase;
-            use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
-            use s3s::dto::{
-                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
-                UploadPartCopyInput, UploadPartInput,
-            };
-            let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("mpu-kms-current-caller", 16_384).await;
-            let usecase = DefaultMultipartUsecase::from_global();
-            let key = "kms-owned-upload";
-            let metadata = sse_kms_object_metadata();
-            let upload = store
-                .new_multipart_upload(
-                    &bucket,
-                    key,
-                    &crate::storage::ObjectOptions {
-                        user_defined: metadata,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("seed authorized upload envelope");
-            let authorizer = RecordingKmsKeyAuthorizer::new(false);
-            fn denied_request<T>(input: T, authorizer: Arc<RecordingKmsKeyAuthorizer>) -> s3s::S3Request<T> {
-                let mut req = s3s::S3Request {
-                    input,
-                    method: http::Method::PUT,
-                    uri: http::Uri::from_static("/"),
-                    headers: http::HeaderMap::new(),
-                    extensions: http::Extensions::new(),
-                    credentials: None,
-                    region: None,
-                    service: None,
-                    trailing_headers: None,
-                };
-                req.extensions.insert(super::ReqInfo {
-                    cred: Some(rustfs_credentials::Credentials {
-                        access_key: "denied-writer".to_string(),
-                        ..Default::default()
-                    }),
-                    ..Default::default()
-                });
-                req.extensions.insert(super::TestAuthorizationHooks {
-                    enforced: true,
-                    authorizer,
-                });
-                req
-            }
-            let mut part = UploadPartInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .build()
-                .expect("part");
-            part.body = Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc")));
-            part.content_length = Some(3);
-            // Keep typed request construction separate: each real handler must
-            // consult the destination envelope before encryption or commit.
-            let error = usecase
-                .execute_upload_part(denied_request(part, authorizer.clone()))
-                .await
-                .expect_err("denied part");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let copy = UploadPartCopyInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .part_number(1)
-                .copy_source(CopySource::Bucket {
-                    bucket: bucket.clone().into(),
-                    key: "source".into(),
-                    version_id: None,
-                })
-                .build()
-                .expect("copy");
-            let copy_req = denied_request(copy, authorizer.clone());
-            let error = usecase
-                .execute_upload_part_copy(copy_req)
-                .await
-                .expect_err("denied destination copy");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            let complete = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id.clone())
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(s3s::dto::ETag::Strong("etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("complete");
-            let complete_req = denied_request(complete, authorizer.clone());
-            let error = usecase
-                .execute_complete_multipart_upload(complete_req)
-                .await
-                .expect_err("denied completion");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string()); 3]);
-            assert!(
-                store
-                    .get_multipart_info(&bucket, key, &upload.upload_id, &crate::storage::ObjectOptions::default())
-                    .await
-                    .is_ok(),
-                "denials must retain the original upload"
-            );
-            let mut reader = crate::storage::PutObjReader::from_vec(b"abc".to_vec());
-            let uploaded_part = store
-                .put_object_part(&bucket, key, &upload.upload_id, 1, &mut reader, &crate::storage::ObjectOptions::default())
-                .await
-                .expect("trusted owner stages part");
-            store
-                .clone()
-                .complete_multipart_upload(
-                    &bucket,
-                    key,
-                    &upload.upload_id,
-                    vec![crate::storage::storage_api::contract::multipart::CompletePart {
-                        part_num: 1,
-                        etag: uploaded_part.etag,
-                        ..Default::default()
-                    }],
-                    &crate::storage::ObjectOptions::default(),
-                )
-                .await
-                .expect("trusted owner completes upload");
-            let replay = CompleteMultipartUploadInput::builder()
-                .bucket(bucket.clone())
-                .key(key.to_string())
-                .upload_id(upload.upload_id)
-                .multipart_upload(Some(CompletedMultipartUpload {
-                    parts: Some(vec![CompletedPart {
-                        part_number: Some(1),
-                        e_tag: Some(s3s::dto::ETag::Strong("guessed-etag".to_string())),
-                        ..Default::default()
-                    }]),
-                }))
-                .build()
-                .expect("replay");
-            let error = usecase
-                .execute_complete_multipart_upload(denied_request(replay, authorizer.clone()))
-                .await
-                .expect_err("replay must authorize before comparing guessed part metadata");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            assert_eq!(authorizer.calls().len(), 4);
-        });
     }
 
     #[tokio::test]
