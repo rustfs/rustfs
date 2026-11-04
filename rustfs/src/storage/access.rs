@@ -6677,8 +6677,8 @@ mod tests {
 
 #[cfg(test)]
 mod signed_query_lock_permission_regression {
+    use super::FS;
     use crate::runtime_sources::{AppContext, ServerContextSlot};
-    use crate::storage::ecfs::FS;
     use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
     use crate::storage::storage_api::contract::object::ObjectOperations;
     use hmac::{Hmac, KeyInit, Mac};
