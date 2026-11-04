@@ -405,7 +405,7 @@ apply_bucket_bootstrap() {
           /usr/bin/rc bucket anonymous set-json "$CONFIG_FILE" "bootstrap/$bucket" || return 1
           ;;
         versioning)
-          VERSIONING=$(jq -er 'if type == "boolean" then . else error("expected a JSON boolean") end' "$CONFIG_FILE") || return 1
+          VERSIONING=$(jq -r 'if type == "boolean" then . else error("expected a JSON boolean") end' "$CONFIG_FILE") || return 1
           if [ "$VERSIONING" = "true" ]; then
             /usr/bin/rc bucket version enable "bootstrap/$bucket" || return 1
           else
