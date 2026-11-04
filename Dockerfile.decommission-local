@@ -12,7 +12,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-FROM rust:1.97.1-trixie
+FROM rust:1.99.1-trixie
+
+ARG TARGETARCH
+ARG RC_RELEASE=latest
 
 RUN set -eux; \
     export DEBIAN_FRONTEND=noninteractive; \
@@ -21,6 +24,7 @@ RUN set -eux; \
     build-essential \
     ca-certificates \
     curl \
+    jq \
     git \
     pkg-config \
     libssl-dev \
@@ -36,6 +40,7 @@ COPY . .
 RUN ./scripts/static.sh
 RUN cargo run --bin gproto
 RUN cargo build --release --locked --bin rustfs
+RUN sh /usr/src/rustfs/scripts/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /usr/local/bin/rc
 
 RUN set -eux; \
     groupadd -g 10001 rustfs; \
@@ -50,8 +55,12 @@ RUN set -eux; \
     chown -R rustfs:rustfs /data /logs /app; \
     chmod 0750 /data /logs
 
-COPY entrypoint.sh /entrypoint.sh
-RUN install -m 0755 /usr/src/rustfs/target/release/rustfs /usr/bin/rustfs && chmod +x /entrypoint.sh
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+RUN install -m 0755 /usr/src/rustfs/target/release/rustfs /usr/bin/rustfs && \
+    install -m 0755 /usr/local/bin/rc /usr/bin/rc && \
+    chmod +x /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 ENV RUSTFS_VOLUMES="/data" \
     RUST_LOG="warn" \
@@ -63,5 +72,5 @@ ENV RUSTFS_VOLUMES="/data" \
 
 EXPOSE 9000 9001
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 CMD ["/usr/bin/rustfs"]
