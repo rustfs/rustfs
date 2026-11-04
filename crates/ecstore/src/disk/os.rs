@@ -4584,7 +4584,7 @@ pub(crate) fn rename_source_is_missing(src_file_path: &Path, publication_root: &
     let Some(source_parent) = src_file_path.parent() else {
         return false;
     };
-    let source_parent_guard = match lock_windows_directory_tree(source_parent, None, publication_root) {
+    let source_parent_guard = match lock_windows_directory_tree(source_parent, publication_root) {
         Ok(guard) => guard,
         Err(err) => return err.kind() == io::ErrorKind::NotFound,
     };
@@ -5006,7 +5006,7 @@ fn prepare_rename_with_retry(
             open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
         (source_parent_guard, parent_guard, source_identity_anchor, expected_source_identity)
     } else {
-        let source_parent_guard = lock_windows_directory_tree(source_parent, destination_parent, publication_root)?;
+        let source_parent_guard = lock_windows_directory_tree(source_parent, publication_root)?;
         let (source_identity_anchor, expected_source_identity) =
             open_windows_rename_source_identity(src_file_path, &source_parent_guard)?;
         let parent_guard = prepare_destination_parent()?;
@@ -5893,14 +5893,11 @@ impl RenameCommitGuard {
     }
 
     /// Reopen a destination tree for handle-relative child publication.
-    /// Ancestors remain write-exclusive while the final parent shares writes
-    /// required by the kernel's relative rename. Delete sharing stays omitted
-    /// throughout, so every retained directory identity remains pinned.
+    /// Every component is pinned by `open_windows_directory_component`.
     fn destination_directory_guard(&self, directory: &Path, create_missing: bool) -> io::Result<RenameDestinationPathGuard> {
         #[cfg(windows)]
         {
             use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
-            use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
             let relative = directory.strip_prefix(&self.destination_parent).map_err(|_| {
                 io::Error::new(
@@ -5933,35 +5930,17 @@ impl RenameCommitGuard {
             let parent = handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows destination guard lost its parent handle"))?;
-            let mut relative_components = relative
-                .components()
-                .filter_map(|component| match component {
-                    Component::Normal(component) => Some(component),
-                    _ => None,
-                })
-                .peekable();
-            let destination_parent_share = if relative_components.peek().is_none() {
-                FILE_SHARE_READ | FILE_SHARE_WRITE
-            } else {
-                FILE_SHARE_READ
-            };
-            handles.push(open_windows_relative_directory_component(
-                parent,
-                component,
-                FILE_OPEN,
-                destination_parent_share,
-            )?);
-            while let Some(component) = relative_components.next() {
+            handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
+            let relative_components = relative.components().filter_map(|component| match component {
+                Component::Normal(component) => Some(component),
+                _ => None,
+            });
+            for component in relative_components {
                 let parent = handles
                     .last()
                     .ok_or_else(|| io::Error::other("Windows destination path guard lost its parent handle"))?;
                 let disposition = if create_missing { FILE_OPEN_IF } else { FILE_OPEN };
-                let share_access = if relative_components.peek().is_none() {
-                    FILE_SHARE_READ | FILE_SHARE_WRITE
-                } else {
-                    FILE_SHARE_READ
-                };
-                handles.push(open_windows_relative_directory_component(parent, component, disposition, share_access)?);
+                handles.push(open_windows_directory_component(parent, component, disposition)?);
             }
             Ok(RenameDestinationPathGuard {
                 directory: directory.to_path_buf(),
@@ -6013,7 +5992,7 @@ fn multipart_payload_commit_guard_std(
 ) -> io::Result<RenameCommitGuard> {
     // Pin the payload staging tree like a distinct-tree metadata source; the
     // target stays the exact parent handle the metadata transaction holds.
-    let source_parent_guard = lock_windows_directory_tree(source_parent, Some(source_parent), publication_root)?;
+    let source_parent_guard = lock_windows_directory_tree(source_parent, publication_root)?;
     Ok(RenameCommitGuard {
         source_parent: source_parent.to_path_buf(),
         destination_parent: metadata_guard.destination_parent.clone(),
@@ -6087,20 +6066,16 @@ pub(crate) fn prepare_rename_commit_guard(
     }
     #[cfg(windows)]
     {
-        // A same-directory rename must use one shared-write parent handle:
-        // retaining a second read-only-share handle would block the kernel's
-        // relative target open. Delete sharing stays excluded, so identity is
-        // still pinned. Distinct source trees remain strict.
+        // A same-directory rename reuses one guard for both sides. Every pin
+        // shares writes and excludes delete; see
+        // `open_windows_directory_component`.
         let same_parent = publication_root.relative_path(source_parent)? == publication_root.relative_path(destination_parent)?;
         let (source_parent_guard, destination_parent_guard) = if same_parent {
             let destination_parent_guard =
                 mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
             (destination_parent_guard.clone(), destination_parent_guard)
         } else {
-            // The source parent also hosts private rollback staging files.
-            // Their handle-relative publication needs write sharing on this
-            // final directory while delete sharing remains excluded.
-            let source_parent_guard = lock_windows_directory_tree(source_parent, Some(source_parent), publication_root)?;
+            let source_parent_guard = lock_windows_directory_tree(source_parent, publication_root)?;
             let destination_parent_guard =
                 mkdir_all_below_existing_base_std(destination_parent, destination_base, publication_root)?;
             (source_parent_guard, destination_parent_guard)
@@ -6328,22 +6303,12 @@ fn windows_file_attribute_tag(
 }
 
 #[cfg(windows)]
-fn lock_windows_directory_tree(
-    path: &Path,
-    shared_write_ancestor: Option<&Path>,
-    publication_root: &PublicationRoot,
-) -> io::Result<ExistingBaseDirectoryGuard> {
+fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) -> io::Result<ExistingBaseDirectoryGuard> {
     use windows_sys::Wdk::Storage::FileSystem::FILE_OPEN;
-    use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
     let relative = publication_root.relative_path(path)?;
-    let shared_write_relative = shared_write_ancestor
-        .map(|ancestor| publication_root.relative_path(ancestor))
-        .transpose()?
-        .filter(|ancestor| relative.starts_with(*ancestor));
     let mut handles = Vec::with_capacity(relative.components().count().saturating_add(1));
     handles.push(publication_root.directory.clone());
-    let mut opened_relative = PathBuf::new();
 
     for component in relative.components() {
         let Component::Normal(component) = component else {
@@ -6358,17 +6323,7 @@ fn lock_windows_directory_tree(
         let parent = handles
             .last()
             .ok_or_else(|| io::Error::other("Windows directory guard lost its root handle"))?;
-        opened_relative.push(component);
-        let child = if shared_write_relative.is_some_and(|ancestor| opened_relative.as_path() == ancestor) {
-            // A handle-relative rename opens the target parent for write. When
-            // that parent is also a source ancestor, this source-side handle
-            // must share write access or the transaction blocks itself. Delete
-            // sharing remains omitted, so the directory identity stays pinned.
-            open_windows_relative_directory_component(parent, component, FILE_OPEN, FILE_SHARE_READ | FILE_SHARE_WRITE)?
-        } else {
-            open_windows_directory_component(parent, component, FILE_OPEN)?
-        };
-        handles.push(child);
+        handles.push(open_windows_directory_component(parent, component, FILE_OPEN)?);
     }
 
     Ok(ExistingBaseDirectoryGuard::new(handles))
@@ -6686,7 +6641,7 @@ pub(crate) fn compare_and_update_control_file(
     let parent = file_path
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "conditional file has no parent"))?;
-    let parent_guard = lock_windows_directory_tree(parent, Some(parent), publication_root)?;
+    let parent_guard = lock_windows_directory_tree(parent, publication_root)?;
     let lock = open_windows_relative(
         parent_guard.last_handle()?,
         std::ffi::OsStr::new(".rustfs-cas.lock"),
@@ -6750,28 +6705,29 @@ pub(crate) fn compare_and_update_control_file(
     Ok(ConditionalFileUpdate::Updated)
 }
 
+/// Pin one directory component of a guarded path.
+///
+/// The handle shares reads and writes but never delete: renaming or removing
+/// a directory needs delete access to it, so omitting delete sharing pins its
+/// identity. Write sharing must stay granted on every component, ancestors
+/// included, because the kernel opens the target parent for write during a
+/// rename. A directory pinned here as one object's ancestor is also the
+/// publication parent of a nested object (`a/b` holds `a/b/c`), and a
+/// read-only share would make that unrelated rename fail with
+/// ERROR_SHARING_VIOLATION. Write sharing does not unpin an ancestor: a
+/// pinned ancestor always contains its pinned child, and NTFS sets a
+/// name-surrogate reparse point only on an empty directory.
 #[cfg(windows)]
 fn open_windows_directory_component(
     parent: &WindowsDirectoryHandle,
     component: &std::ffi::OsStr,
     create_disposition: u32,
 ) -> io::Result<WindowsDirectoryHandle> {
-    use windows_sys::Win32::Storage::FileSystem::FILE_SHARE_READ;
-
-    open_windows_relative_directory_component(parent, component, create_disposition, FILE_SHARE_READ)
-}
-
-#[cfg(windows)]
-fn open_windows_relative_directory_component(
-    parent: &WindowsDirectoryHandle,
-    component: &std::ffi::OsStr,
-    create_disposition: u32,
-    share_access: u32,
-) -> io::Result<WindowsDirectoryHandle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT},
         Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_TRAVERSE,
+            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+            FILE_TRAVERSE,
         },
     };
 
@@ -6779,7 +6735,7 @@ fn open_windows_relative_directory_component(
         &parent.handle,
         component,
         FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-        share_access,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
         create_disposition,
         FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
         FILE_ATTRIBUTE_DIRECTORY,
@@ -7088,7 +7044,7 @@ pub(crate) fn pin_multipart_source_directory(
     #[cfg(windows)]
     {
         let _ = base;
-        lock_windows_directory_tree(directory, Some(directory), publication_root)
+        lock_windows_directory_tree(directory, publication_root)
     }
     #[cfg(not(any(unix, windows)))]
     {
@@ -8160,7 +8116,6 @@ pub(crate) fn mkdir_all_below_existing_base_std(
     #[cfg(windows)]
     {
         use windows_sys::Wdk::Storage::FileSystem::{FILE_OPEN, FILE_OPEN_IF};
-        use windows_sys::Win32::Storage::FileSystem::{FILE_SHARE_READ, FILE_SHARE_WRITE};
 
         let base_relative = publication_root.relative_path(base_dir)?;
         let capacity = base_relative
@@ -8171,13 +8126,12 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let mut handles = Vec::with_capacity(capacity);
         handles.push(publication_root.directory.clone());
         let mut guard = ExistingBaseDirectoryGuard::new(handles);
-        let mut components = base_relative
+        let components = base_relative
             .components()
             .map(|component| (component, FILE_OPEN))
             .chain(relative.components().map(|component| (component, FILE_OPEN_IF)))
-            .filter(|(component, _)| !matches!(component, Component::CurDir))
-            .peekable();
-        while let Some((component, disposition)) = components.next() {
+            .filter(|(component, _)| !matches!(component, Component::CurDir));
+        for (component, disposition) in components {
             let Component::Normal(component) = component else {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
@@ -8188,22 +8142,16 @@ pub(crate) fn mkdir_all_below_existing_base_std(
                 .handles
                 .last()
                 .ok_or_else(|| io::Error::other("Windows publication root guard is empty"))?;
-            // The kernel opens the final parent for write during a relative
-            // rename. Share writes from its first open: a temporary read-only
-            // share would block another rename into the same trash directory.
-            // Ancestors stay strict and no handle shares delete access, keeping
-            // every retained directory identity pinned.
-            let share_access = if components.peek().is_none() {
-                FILE_SHARE_READ | FILE_SHARE_WRITE
-            } else {
-                FILE_SHARE_READ
-            };
-            let child = open_windows_relative_directory_component(parent, component, disposition, share_access)?;
+            // Every component, including the final parent the kernel opens
+            // for write during a relative rename, shares writes from its first
+            // open; see `open_windows_directory_component`.
+            let child = open_windows_directory_component(parent, component, disposition)?;
             guard.handles.push(child);
-            #[cfg(test)]
-            if components.peek().is_none() {
-                prepare_rename_test_hooks::run_after_component_opened(dir_path);
-            }
+        }
+        // The hook observes the window right after the final component opened.
+        #[cfg(test)]
+        if guard.handles.len() > 1 {
+            prepare_rename_test_hooks::run_after_component_opened(dir_path);
         }
 
         Ok(guard)
@@ -9609,7 +9557,7 @@ mod tests {
         use std::os::windows::fs::OpenOptionsExt;
         use std::sync::atomic::{AtomicBool, Ordering};
         use windows_sys::Win32::{
-            Foundation::{ERROR_SHARING_VIOLATION, GENERIC_WRITE},
+            Foundation::ERROR_SHARING_VIOLATION,
             Storage::FileSystem::{
                 DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
                 FILE_SHARE_WRITE,
@@ -9651,13 +9599,13 @@ mod tests {
             let second_preparation = prepare_rename_with_retry(&sources[1], &destinations[1], base, &publication_root)
                 .expect("prepare the second trash rename");
             assert!(interleaved.load(Ordering::Acquire), "the competing parent-open window must be exercised");
-            for (path, access) in [(&tmp, GENERIC_WRITE), (&trash, DELETE)] {
+            for path in [&tmp, &trash] {
                 let err = std::fs::OpenOptions::new()
-                    .access_mode(access)
+                    .access_mode(DELETE)
                     .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
                     .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                     .open(path)
-                    .expect_err("ancestor writes and final-parent deletion must remain excluded");
+                    .expect_err("pinned ancestors and final parents must exclude deletion");
                 assert_eq!(
                     err.raw_os_error(),
                     Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code must fit i32"))
@@ -9672,6 +9620,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_rename_into_a_pinned_ancestor_succeeds_while_deletion_stays_excluded() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::ERROR_SHARING_VIOLATION,
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
+        };
+
+        // `bucket/parent` is an object directory and also the prefix of the
+        // nested object `bucket/parent/child`. A guard on the nested object
+        // pins `parent` as an ancestor while the parent object publishes a new
+        // data directory into it by pathname.
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let parent = base.join("parent");
+        let child = parent.join("child");
+        std::fs::create_dir_all(&child).expect("create nested object directory");
+        let staged = temp_dir.path().join("staged-data-dir");
+        std::fs::create_dir(&staged).expect("create staged data directory");
+        std::fs::write(staged.join("part.1"), b"payload").expect("write staged part");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+        let child_guard =
+            super::mkdir_all_below_existing_base_std(&child, &base, &publication_root).expect("pin the nested object tree");
+
+        let destination = parent.join(uuid::Uuid::new_v4().to_string());
+        std::fs::rename(&staged, &destination).expect("a pinned ancestor must accept a rename into it");
+        assert_eq!(std::fs::read(destination.join("part.1")).expect("read published part"), b"payload");
+
+        let err = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&parent)
+            .expect_err("the pinned ancestor must still refuse deletion");
+        assert_eq!(
+            err.raw_os_error(),
+            Some(i32::try_from(ERROR_SHARING_VIOLATION).expect("Windows error code must fit i32"))
+        );
+        drop(child_guard);
     }
 
     #[cfg(windows)]
@@ -10371,7 +10364,7 @@ mod tests {
 
         let publication_root = test_publication_root(&[&src, &dst, &base]);
         let source_parent_guard =
-            lock_windows_directory_tree(src.parent().expect("source reparse entry must have a parent"), None, &publication_root)
+            lock_windows_directory_tree(src.parent().expect("source reparse entry must have a parent"), &publication_root)
                 .expect("pin the source parent tree");
         let identity_error = match open_windows_rename_source_identity(&src, &source_parent_guard) {
             Ok(_) => panic!("a non-dedup source reparse entry must be rejected by its tag"),
@@ -10516,7 +10509,7 @@ mod tests {
         let guard = mkdir_all_below_existing_base_std(&base, &base).expect("guard destination base");
         let publication_root = test_publication_root(&[&src, &dst, &base]);
         let source_parent_guard =
-            lock_windows_directory_tree(src.parent().expect("source path must have a parent"), None, &publication_root)
+            lock_windows_directory_tree(src.parent().expect("source path must have a parent"), &publication_root)
                 .expect("anchor source parent");
         let source = open_windows_rename_source(&src, &source_parent_guard).expect("anchor source entry");
 

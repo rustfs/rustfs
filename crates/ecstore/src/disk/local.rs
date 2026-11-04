@@ -19763,6 +19763,9 @@ mod test {
         );
     }
 
+    // Only the Unix grouped dst dir fsync worker consults the injected
+    // failure; the non-Unix worker syncs by path without the hook.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn rename_data_non_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
@@ -19851,6 +19854,9 @@ mod test {
         );
     }
 
+    // Only the Unix grouped dst dir fsync worker consults the injected
+    // failure; the non-Unix worker syncs by path without the hook.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn rename_data_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
