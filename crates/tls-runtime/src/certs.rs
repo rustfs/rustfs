@@ -180,6 +180,13 @@ pub fn build_webpki_client_verifier(options: WebPkiClientVerifierOptions) -> io:
         ))
     })?;
 
+    build_webpki_client_verifier_from_ca_file(&ca_path).map(Some)
+}
+
+/// Load a client CA bundle and require every TLS peer to present a certificate signed by it.
+///
+/// Returns an error if the bundle is missing, unreadable, empty, or contains an invalid CA certificate.
+pub fn build_webpki_client_verifier_from_ca_file(ca_path: &std::path::Path) -> io::Result<Arc<dyn ClientCertVerifier>> {
     let ca_path = ca_path
         .to_str()
         .ok_or_else(|| Error::other(format!("Invalid UTF-8 in mTLS CA path: {ca_path:?}")))?;
@@ -197,7 +204,7 @@ pub fn build_webpki_client_verifier(options: WebPkiClientVerifierOptions) -> io:
         .build()
         .map_err(|e| Error::other(format!("Build client cert verifier failed: {e}")))?;
 
-    Ok(Some(verifier))
+    Ok(verifier)
 }
 
 fn mtls_ca_bundle_path(options: &WebPkiClientVerifierOptions) -> Option<PathBuf> {

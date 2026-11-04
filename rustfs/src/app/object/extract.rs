@@ -4523,6 +4523,46 @@ mod tests {
     }
 
     #[test]
+    fn resolve_put_object_extract_options_sees_hoisted_query_controls() {
+        // The AWS SDK presigner moves `x-amz-meta-snowball-*` into the query
+        // string. The request-hoist layer restores them as headers, and the
+        // extraction options must resolve from them before member headers drop
+        // the transport keys — otherwise members land under their bare names
+        // and can overwrite unrelated objects (rustfs/rustfs#9146).
+        let mut query = String::from("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID&X-Amz-Signature=deadbeef");
+        query.push_str("&x-amz-meta-snowball-auto-extract=true&x-amz-meta-snowball-prefix=batch/");
+        query.push_str("&x-amz-meta-snowball-ignore-dirs=true&x-amz-meta-minio-snowball-ignore-errors=true");
+        let mut req = http::Request::builder()
+            .method(http::Method::PUT)
+            .uri(format!("/bucket/key?{query}"))
+            .body(())
+            .expect("request");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        crate::auth::hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
+
+        assert!(is_put_object_extract_requested(req.headers()));
+        let options = resolve_put_object_extract_options(req.headers()).unwrap();
+        assert_eq!(options.prefix.as_deref(), Some("batch"));
+        assert!(options.ignore_dirs);
+        assert!(options.ignore_errors);
+
+        // Member headers keep the archive's own metadata and drop the transport
+        // keys, so no member object stores the controls that drove extraction.
+        let member_headers = snowball_member_headers(req.headers());
+        assert!(!member_headers.contains_key(AMZ_SNOWBALL_EXTRACT));
+        assert!(!member_headers.contains_key("x-amz-meta-snowball-prefix"));
+    }
+
+    #[test]
+    fn extract_request_discovery_honors_an_explicit_false_header_over_query() {
+        // Header precedence: `x-amz-meta-snowball-auto-extract: false` must not
+        // fall through to a hoisted `true` of the same key.
+        let mut headers = HeaderMap::new();
+        headers.insert(AMZ_SNOWBALL_EXTRACT, HeaderValue::from_static("false"));
+        assert!(!is_put_object_extract_requested(&headers));
+    }
+
+    #[test]
     fn resolve_put_object_extract_options_accepts_standard_headers() {
         let mut headers = HeaderMap::new();
         headers.insert(AMZ_SNOWBALL_PREFIX, HeaderValue::from_static(" /standard/prefix/ "));

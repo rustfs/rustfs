@@ -14,7 +14,9 @@
 
 use crate::runtime_sources::{AppContext, ServerContextSlot, current_action_credentials, current_ready_iam_handle};
 use http::HeaderMap;
+use http::HeaderValue;
 use http::Uri;
+use http::header::HeaderName;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
@@ -25,6 +27,7 @@ use rustfs_iam::sys::{
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
 use rustfs_trusted_proxies::ClientInfo;
 use rustfs_utils::MaskedAccessKey;
+use rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case;
 use rustfs_utils::http::{AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER, AMZ_OBJECT_LOCK_MODE_LOWER, AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER};
 use s3s::S3Error;
 use s3s::S3ErrorCode;
@@ -1012,6 +1015,125 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
+/// True when `query` can name a user-metadata parameter at all. A single ASCII
+/// scan, so a request whose query only carries things like `versionId` or a
+/// typed property never pays for a parse.
+fn query_may_carry_user_metadata(query: &str) -> bool {
+    const NEEDLE: &[u8] = b"-meta-";
+    query
+        .as_bytes()
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
+}
+
+/// Restores signature-covered `x-amz-meta-*` user metadata as request headers.
+///
+/// AWS SDK presigners hoist metadata into the query string, while RustFS's
+/// metadata consumers read headers (rustfs/rustfs#9142). Only user metadata is
+/// restored here. s3s has already parsed typed request properties before this
+/// hook runs; restoring Object Lock, encryption or routing headers here would
+/// bypass the corresponding DTO validation and per-property authorization.
+/// Those properties keep their existing handling (rustfs/backlog#3143).
+///
+/// This runs after s3s has verified the signature and before policy evaluation
+/// and the handler read request properties. It must not run earlier: s3s's own
+/// verifier rejects an `x-amz-*` header outside `X-Amz-SignedHeaders`, which is
+/// exactly what a restored parameter becomes.
+///
+/// Only a query the SigV4 signature covers is honored. SigV4 signs the
+/// canonical query string (AWS General Reference, "Create a signed AWS API
+/// request"; s3s-sigv4 verifies every parameter except the signature itself),
+/// so its query parameters are as trustworthy as its headers. SigV2's
+/// string-to-sign covers headers plus a fixed subresource list rather than
+/// arbitrary query parameters, so a SigV2 presigned URL keeps validating after
+/// `X-Amz-Algorithm`/`X-Amz-Signature` markers are appended to it — those
+/// markers must not be allowed to widen it into accepting query properties the
+/// presigner never authorized. An existing header always wins, so this is purely
+/// additive and the unsigned-header guard keeps rejecting anything the signer did
+/// not sign. Keys and values that could not have arrived as a header are
+/// rejected rather than stored: the read path rebuilds them as header fields,
+/// where a control character would fail every `HeadObject` of that object.
+pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> S3Result<()> {
+    let Some(query) = query else {
+        return Ok(());
+    };
+    if !query_may_carry_user_metadata(query) || is_request_signature_v2(headers) {
+        return Ok(());
+    }
+
+    // One pass over the query: recognize the presigned-SigV4 marker set and
+    // stage user metadata parameters. Nothing is validated
+    // or applied until the gate below passes, so a request whose query is not
+    // signature-covered is never rejected here.
+    let mut algorithm = false;
+    let mut credential = false;
+    let mut signature = false;
+    let mut staged: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut duplicate = false;
+    for (name, value) in form_urlencoded::parse(query.as_bytes()) {
+        if name.eq_ignore_ascii_case("awsaccesskeyid") {
+            // A SigV2 presigned URL is recognized by its own credential
+            // parameter; the SigV4 markers below can be appended to it without
+            // invalidating the SigV2 signature, so it must not be widened.
+            if !value.is_empty() {
+                return Ok(());
+            }
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-amz-algorithm") {
+            algorithm = value == SIGN_V4_ALGORITHM;
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-amz-credential") {
+            credential = !value.is_empty();
+            continue;
+        }
+        if name.eq_ignore_ascii_case("x-amz-signature") {
+            signature = !value.is_empty();
+            continue;
+        }
+        // Parameter names keep whatever case the signer used (`X-Amz-Meta-User-Id`
+        // is what a hoist produces), so match the prefix the way `HeaderName` would.
+        if !starts_with_ignore_ascii_case(&name, "x-amz-meta-") {
+            continue;
+        }
+        let stored_name = name.to_ascii_lowercase();
+        duplicate |= !seen.insert(stored_name.clone());
+        staged.push((stored_name, value.into_owned()));
+    }
+
+    if !is_request_signature_v4(headers) && !(algorithm && credential && signature) {
+        return Ok(());
+    }
+    if duplicate {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Duplicate x-amz request parameters in the request query string".to_owned(),
+        ));
+    }
+
+    for (name, value) in staged {
+        // The read path rebuilds `x-amz-meta-<key>` as a header name and the
+        // value as a header value (s3s `add_opt_metadata`); anything that could
+        // not have arrived as a header would 500 every Head/Get of the object.
+        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid x-amz request parameter name".to_owned())
+        })?;
+        let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
+            S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "x-amz request parameter values must be valid HTTP header values".to_owned(),
+            )
+        })?;
+        if headers.contains_key(&header_name) {
+            continue;
+        }
+        headers.insert(header_name, header_value);
+    }
+    Ok(())
+}
+
 pub(crate) fn is_request_presigned_signature_v4_with_query(header: &HeaderMap, query: Option<&str>) -> bool {
     if let Some(credential) = header.get(AMZ_CREDENTIAL) {
         return !credential.to_str().unwrap_or("").is_empty();
@@ -1284,20 +1406,45 @@ pub(crate) fn reject_unsigned_amz_headers_on_presigned_request(header: &HeaderMa
         if !name.starts_with("x-amz-") || PRESIGNED_UNSIGNED_AMZ_HEADER_ALLOWLIST.contains(&name) {
             continue;
         }
-        if !signed.iter().any(|signed_name| signed_name == name) {
-            warn!(
-                event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_REQUEST,
-                reason = "unsigned_amz_header",
-                header = name,
-                "Presigned request rejected"
-            );
-            return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
+        if signed.iter().any(|signed_name| signed_name == name) {
+            continue;
         }
+        // The query-hoist layer restores a signed `x-amz-*` query parameter as
+        // a header before this rule runs a second time at the access boundary.
+        // Such a header carries exactly the value the signature covers, so it
+        // is as signed as the parameter itself; a header the signer did not
+        // sign cannot match one.
+        if header_as_signed_query_value(header, query, name) {
+            continue;
+        }
+        warn!(
+            event = EVENT_PRESIGNED_UNSIGNED_AMZ_HEADER,
+            component = LOG_COMPONENT_AUTH,
+            subsystem = LOG_SUBSYSTEM_REQUEST,
+            reason = "unsigned_amz_header",
+            header = name,
+            "Presigned request rejected"
+        );
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, UNSIGNED_HEADERS_MESSAGE.to_string()));
     }
 
     Ok(())
+}
+
+/// True when `name` is a single-valued header whose value is exactly the value
+/// of a same-named query parameter.
+///
+/// The SigV4 canonical query string covers every parameter except the signature
+/// itself, so a match proves the value the header carries is authorized. Only
+/// a single-valued header can match: the query-hoist layer never produces a
+/// multi-valued one, and a second value would be unsigned.
+fn header_as_signed_query_value(header: &HeaderMap, query: &str, name: &str) -> bool {
+    let mut values = header.get_all(name).iter();
+    let (Some(value), None) = (values.next(), values.next()) else {
+        return false;
+    };
+    form_urlencoded::parse(query.as_bytes())
+        .any(|(param, param_value)| param.eq_ignore_ascii_case(name) && param_value.as_bytes() == value.as_bytes())
 }
 
 /// Parse the RustFS presigned PutObject size capability after authentication.
