@@ -19,7 +19,7 @@ use futures::FutureExt;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{UploadLimitExceeded, normalize_read_quorum_error};
+use crate::error::UploadLimitExceeded;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -997,11 +997,6 @@ impl PutObjectCompletion {
 
 /// Record the failed completion and hand the error back to the caller.
 fn fail_put_object(completion: PutObjectCompletion, err: S3Error) -> S3Error {
-    let err = if matches!(&completion, PutObjectCompletion::S3(_)) {
-        normalize_read_quorum_error(err)
-    } else {
-        err
-    };
     let result: S3Result<S3Response<()>> = Err(err);
     let _ = completion.complete(&result);
     match result {
@@ -1085,9 +1080,7 @@ impl DefaultObjectUsecase {
     #[instrument(name = "execute_put_object", level = "info", skip(self, _fs, req))]
     #[hotpath::measure(impl_type = "DefaultObjectUsecase", future = true)]
     pub async fn execute_put_object(&self, _fs: &FS, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
-        self.execute_put_object_boxed(_fs, req)
-            .await
-            .map_err(normalize_read_quorum_error)
+        self.execute_put_object_boxed(_fs, req).await
     }
 
     fn execute_put_object_boxed<'a>(
@@ -2433,13 +2426,14 @@ mod tests {
     }
 
     #[test]
-    fn failed_put_completion_normalizes_only_s3_errors() {
+    fn failed_put_completion_keeps_write_safe_quorum_code() {
         let error = || S3Error::from(ApiError::from(StorageError::ErasureReadQuorum));
         let err = fail_put_object(PutObjectCompletion::S3(OperationHelper::Disabled), error());
         assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
         assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
+        // Internal completions share the write-safe default; SlowDownRead is GET-only.
         let internal = fail_put_object(PutObjectCompletion::Internal(None), error());
-        assert_eq!(internal.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+        assert_eq!(internal.code(), &S3ErrorCode::ServiceUnavailable);
     }
     use s3s::dto::{
         DefaultRetention, ObjectLockConfiguration, ObjectLockEnabled, ObjectLockRule, ServerSideEncryptionByDefault,

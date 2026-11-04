@@ -1876,6 +1876,7 @@ where
 /// rulings of [`crate::auth::reject_unsigned_amz_headers_on_sigv4_request`]
 /// must be applied here, in front of s3s. Rejections carry the same S3 error
 /// document the access layer would have produced.
+
 #[derive(Clone, Default)]
 pub struct SigV4HeaderGuardLayer;
 
@@ -4141,6 +4142,262 @@ mod tests {
             .expect("inner response");
         assert_eq!(response.status(), StatusCode::IM_A_TEAPOT);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    use crate::auth::{hoist_signed_query_params, reject_unsigned_amz_headers_on_presigned_request};
+    use http::header::HeaderName;
+
+    /// A SigV4 presigned query: the presigner moved the request's `x-amz-*`
+    /// headers into it and every parameter is covered by the signature.
+    fn presigned_query(extra: &str) -> String {
+        let mut query =
+            String::from("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20260101%2Fus-east-1%2Fs3%2Faws4_request");
+        query.push_str("&X-Amz-Date=20260101T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef");
+        query.push('&');
+        query.push_str(extra);
+        query
+    }
+
+    fn hoist(uri_query: &str) -> Result<http::Request<()>, S3Error> {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/bucket/key?{uri_query}"))
+            .body(())
+            .expect("request");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref())?;
+        Ok(req)
+    }
+
+    #[test]
+    fn hoist_restores_presigned_query_metadata_as_headers() {
+        let req = hoist(&presigned_query("x-amz-meta-user-id=u1&x-amz-tagging=project%3Drustfs")).expect("hoist");
+        assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
+        assert!(req.headers().get("x-amz-tagging").is_none());
+    }
+
+    #[test]
+    fn hoist_leaves_typed_request_properties_unchanged() {
+        for name in [
+            "x-amz-object-lock-legal-hold",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-server-side-encryption",
+            "x-amz-storage-class",
+            "x-amz-copy-source",
+            "x-amz-content-sha256",
+            "x-amz-tagging",
+        ] {
+            let req = hoist(&presigned_query(&format!("{name}=value"))).expect("metadata hoist");
+            assert!(!req.headers().contains_key(name), "typed property must keep its original path: {name}");
+        }
+    }
+
+    #[test]
+    fn hoist_normalizes_parameter_names_like_header_names() {
+        let req = hoist(&presigned_query("X-Amz-Meta-User-Id=u1")).expect("hoist");
+        assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
+        // `HeaderName` is lowercase, so the stored key is the normalized one.
+        assert_eq!(req.headers().keys().map(|name| name.as_str()).collect::<Vec<_>>(), ["x-amz-meta-user-id"]);
+    }
+
+    #[test]
+    fn hoist_never_overwrites_a_header_the_client_sent() {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/bucket/key?{}", presigned_query("x-amz-meta-user-id=from-query")))
+            .header("x-amz-meta-user-id", "from-header")
+            .body(())
+            .expect("request");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
+        assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("from-header"));
+    }
+
+    #[test]
+    fn hoist_skips_sigv4_auth_params_and_non_amz_parameters() {
+        let req = hoist(&presigned_query("versionId=3&x-amz-security-token=token")).expect("hoist");
+        assert!(req.headers().get("x-amz-algorithm").is_none());
+        assert!(req.headers().get("x-amz-credential").is_none());
+        assert!(req.headers().get("x-amz-signature").is_none());
+        assert!(req.headers().get("x-amz-security-token").is_none());
+        assert!(req.headers().get("versionId").is_none());
+    }
+
+    #[test]
+    fn hoist_ignores_a_sigv2_upload_that_only_claims_sigv4_markers() {
+        // The SigV2 string-to-sign does not cover arbitrary query parameters,
+        // so appending the SigV4 presign markers leaves the original signature
+        // valid while making the query look signed. A URL holder must not be
+        // able to turn on archive extraction that way.
+        let mut query = String::from("AWSAccessKeyId=AKID&Expires=1893456000&Signature=deadbeef");
+        query.push_str("&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID&X-Amz-Signature=deadbeef");
+        query.push_str("&x-amz-meta-snowball-auto-extract=true&x-amz-meta-user-id=u1");
+        let req = hoist(&query).expect("hoist");
+        assert!(req.headers().get("x-amz-meta-snowball-auto-extract").is_none());
+        assert!(req.headers().get("x-amz-meta-user-id").is_none());
+    }
+
+    #[test]
+    fn hoist_requires_the_complete_presign_marker_set() {
+        // A lone marker is not a presigned request; `X-Amz-Signature` alone is
+        // what the unsigned-header guard keys on, not proof of presigning.
+        let req = hoist("X-Amz-Signature=deadbeef&x-amz-meta-user-id=u1").expect("hoist");
+        assert!(req.headers().get("x-amz-meta-user-id").is_none());
+    }
+
+    #[test]
+    fn hoist_preserves_an_explicit_false_extraction_header() {
+        // Header precedence: a client that says `false` in a header must not be
+        // overruled by the hoisted form of the same key.
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/bucket/key?{}", presigned_query("x-amz-meta-snowball-auto-extract=true")))
+            .header("x-amz-meta-snowball-auto-extract", "false")
+            .body(())
+            .expect("request");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
+        assert_eq!(
+            req.headers()
+                .get("x-amz-meta-snowball-auto-extract")
+                .and_then(|v| v.to_str().ok()),
+            Some("false")
+        );
+    }
+
+    #[test]
+    fn hoist_ignores_a_query_the_signature_does_not_cover() {
+        // SigV2 signs headers plus a fixed subresource list, not arbitrary
+        // query parameters; honoring them would widen a presigned upload.
+        let req = hoist("AWSAccessKeyId=AKID&Signature=deadbeef&x-amz-meta-user-id=u1").expect("hoist");
+        assert!(req.headers().get("x-amz-meta-user-id").is_none());
+
+        // Anonymous: no signature at all.
+        let req = hoist("x-amz-meta-user-id=u1").expect("hoist");
+        assert!(req.headers().get("x-amz-meta-user-id").is_none());
+    }
+
+    #[test]
+    fn hoist_restores_params_on_a_header_signed_sigv4_request() {
+        let mut req = Request::builder()
+            .method(Method::PUT)
+            .uri("/bucket/key?x-amz-meta-user-id=u1")
+            .header(
+                "authorization",
+                "AWS4-HMAC-SHA256 Credential=AKID/20260101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=deadbeef",
+            )
+            .body(())
+            .expect("request");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
+        assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
+    }
+
+    #[test]
+    fn hoist_rejects_names_and_values_that_could_not_be_headers() {
+        // A stored control character would make the read path fail every
+        // HeadObject of that object.
+        let err = hoist(&presigned_query("x-amz-meta-user-id=a%0d%0ab")).expect_err("control char");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+
+        let err = hoist(&presigned_query("x-amz-meta-bad%20key=v")).expect_err("bad name");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn hoist_rejects_duplicate_parameters_after_name_normalization() {
+        let err = hoist(&presigned_query("x-amz-meta-User-Id=1&x-amz-meta-user-id=2")).expect_err("duplicate");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[test]
+    fn hoisted_metadata_matches_the_header_path_exactly() {
+        let req = hoist(&presigned_query("x-amz-meta-user-id=u1&x-amz-meta-content-type=custom")).expect("hoist");
+        let mut from_query = HeaderMap::new();
+        for name in ["x-amz-meta-user-id", "x-amz-meta-content-type"] {
+            from_query.insert(HeaderName::from_static(name), req.headers().get(name).expect("hoisted header").clone());
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-user-id", HeaderValue::from_static("u1"));
+        headers.insert("x-amz-meta-content-type", HeaderValue::from_static("custom"));
+        assert_eq!(from_query, headers);
+    }
+
+    #[tokio::test]
+    async fn hoist_then_guard_accepts_a_valid_metadata_bearing_presigned_put() {
+        // The AWS SDK presigner emits `SignedHeaders=host` and moves
+        // `x-amz-content-sha256` and `x-amz-meta-*` into the query. Only the
+        // metadata is restored as headers; the digest keeps its dedicated
+        // query verification path. The guard accepts the signed metadata.
+        let inner = CountingHybridService::default();
+        let calls = inner.calls();
+        let mut service = SigV4HeaderGuardLayer.layer(inner);
+
+        let mut query =
+            String::from("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20261103%2Fus-east-1%2Fs3%2Faws4_request");
+        query.push_str("&X-Amz-Date=20261103T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef");
+        query.push_str("&x-amz-content-sha256=UNSIGNED-PAYLOAD&x-amz-meta-user-id=u1");
+
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/repro/bucket/meta-query.csv?{query}"))
+            .header("content-type", "text/csv")
+            .body(Full::<Bytes>::from(Bytes::new()))
+            .expect("request");
+        // The authorization boundary hoists the signed query properties before
+        // the handler and before RustFS's own unsigned-header guard re-runs.
+        let hoisted_query = request.uri().query().map(str::to_owned);
+        hoist_signed_query_params(request.headers_mut(), hoisted_query.as_deref()).expect("hoist");
+
+        let response = service.call(request).await.expect("inner response");
+
+        let status = response.status();
+        let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "status={status} body={body}");
+        assert_eq!(status, StatusCode::IM_A_TEAPOT, "body={body}");
+    }
+
+    #[test]
+    fn hoist_rejects_a_control_character_value_with_invalid_argument() {
+        let err = hoist(&presigned_query("x-amz-meta-user-id=a%0d%0ab")).expect_err("control char");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
+    }
+
+    #[tokio::test]
+    async fn sigv4_header_guard_accepts_a_header_that_matches_a_signed_query_value() {
+        // The hoist layer restores `?x-amz-meta-user-id=u1` as a header before
+        // the access boundary re-runs this rule; the value it carries is the one
+        // the signature covers.
+        let uri = format!("/bucket/key?{}", presigned_query("x-amz-meta-user-id=u1"));
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-user-id", HeaderValue::from_static("u1"));
+        assert!(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(uri.split('?').nth(1).unwrap())).is_ok());
+    }
+
+    #[tokio::test]
+    async fn sigv4_header_guard_still_rejects_an_unsigned_header() {
+        let uri = format!("/bucket/key?{}", presigned_query("x-amz-meta-user-id=u1"));
+        let query = uri.split('?').nth(1).unwrap();
+
+        // Same name, different value: the signer did not authorize it.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-user-id", HeaderValue::from_static("evil"));
+        assert!(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(query)).is_err());
+
+        // No such parameter at all.
+        let mut headers = HeaderMap::new();
+        headers.insert("x-amz-meta-other", HeaderValue::from_static("v"));
+        assert!(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(query)).is_err());
+
+        // Multi-valued: the hoist layer never produces one, and the extra value
+        // is unsigned.
+        let mut headers = HeaderMap::new();
+        headers.append("x-amz-meta-user-id", HeaderValue::from_static("u1"));
+        headers.append("x-amz-meta-user-id", HeaderValue::from_static("evil"));
+        assert!(reject_unsigned_amz_headers_on_presigned_request(&headers, Some(query)).is_err());
     }
 
     #[tokio::test]
