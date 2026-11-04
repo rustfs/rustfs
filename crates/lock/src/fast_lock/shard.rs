@@ -153,7 +153,15 @@ impl LockShard {
         {
             return false;
         }
-        self.try_fast_path(request).is_some()
+        // Count the acquisition like `acquire_lock` does: batch callers use
+        // this path for every uncontended key, and the metric promises the
+        // total of successful acquisitions.
+        if self.try_fast_path(request).is_some() {
+            self.metrics.record_fast_path_success();
+            true
+        } else {
+            false
+        }
     }
 
     /// Try fast path lock acquisition (lock-free when possible)

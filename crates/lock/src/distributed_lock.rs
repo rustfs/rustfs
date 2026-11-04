@@ -476,27 +476,6 @@ impl DistributedLockGuard {
         record_lock_held_release(self.lock_type);
         true
     }
-
-    /// Release the lock and await the unlock RPCs.
-    ///
-    /// [`Drop`] and [`Self::release`] are fire-and-forget on distributed
-    /// locks, so a caller that immediately re-acquires the same resources
-    /// (an optimistic lock-wave fallback) would race still-in-flight unlocks
-    /// and can block on locks it already owns. Those callers must await the
-    /// release instead of relying on drop.
-    pub async fn release_and_wait(&mut self) -> bool {
-        self.stop_heartbeat();
-
-        if self.disarmed {
-            return true;
-        }
-
-        let entries = self.entries.iter().map(HeldLockEntry::release_entry).collect();
-        self.disarmed = true;
-        record_lock_held_release(self.lock_type);
-        DistributedLock::release_entries(entries, "distributed_lock_guard_release_awaited").await;
-        true
-    }
 }
 
 impl Drop for DistributedLockGuard {
@@ -713,6 +692,130 @@ impl DistributedLock {
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
         self.acquire_guard(&req).await
+    }
+
+    /// Acquire exclusive locks for many independent resources in one batched
+    /// round: one [`LockClient::acquire_locks_batch`] RPC per client instead of
+    /// one quorum round-trip per key. Returns one guard or error per resource.
+    ///
+    /// Bulk operations (S3 `DeleteObjects`) are the only multi-key write-lock
+    /// holders, and their keys are independent. Per-key outcomes are
+    /// deadlock-free without any serial fallback: the wire call is a single
+    /// round per client and every lock server orders concurrent batches by the
+    /// same global (shard, key) order, so no acquirer can hold one key while
+    /// waiting for another. A key that fails to reach quorum releases its
+    /// partial grants (awaited) before its error is returned.
+    ///
+    /// Guards keep the same TTL heartbeat and lock-lost semantics as
+    /// [`Self::acquire_guard`]. Contention is waited out server-side up to
+    /// `timeout` (each request carries it), matching the single-key path.
+    pub async fn acquire_guard_batch(
+        &self,
+        resources: &[ObjectKey],
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Vec<Result<DistributedLockGuard>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        if self.clients.is_empty() {
+            return resources
+                .iter()
+                .map(|_| Err(LockError::internal("No lock clients available")))
+                .collect();
+        }
+
+        let required_quorum = self.required_quorum(LockType::Exclusive);
+        let attempt_started = Instant::now();
+        let requests: Vec<LockRequest> = resources
+            .iter()
+            .map(|resource| {
+                LockRequest::new(resource.clone(), LockType::Exclusive, owner)
+                    .with_acquire_timeout(timeout)
+                    .with_ttl(ttl)
+            })
+            .collect();
+
+        // One batched round per client; a client-level failure is a per-key
+        // failure for every key that still needed that client's vote.
+        let rounds = join_all(self.clients.iter().map(|client| {
+            let requests = requests.clone();
+            async move { client.acquire_locks_batch(&requests).await }
+        }))
+        .await;
+
+        let mut results: Vec<Result<DistributedLockGuard>> = Vec::with_capacity(resources.len());
+        let mut orphaned_entries: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
+        for (key_idx, resource) in resources.iter().enumerate() {
+            let mut entries: Vec<HeldLockEntry> = Vec::new();
+            let mut failure: Option<String> = None;
+            for (client_idx, client) in self.clients.iter().enumerate() {
+                match &rounds[client_idx] {
+                    Ok(responses) => match responses.get(key_idx) {
+                        Some(response) if response.success => {
+                            let lock_id = response
+                                .lock_info
+                                .as_ref()
+                                .map(|info| info.id.clone())
+                                .unwrap_or_else(|| LockId::new_unique(resource));
+                            entries.push(HeldLockEntry {
+                                lock_id,
+                                client: client.clone(),
+                                valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
+                            });
+                        }
+                        Some(response) => {
+                            failure.get_or_insert_with(|| {
+                                response
+                                    .error
+                                    .clone()
+                                    .unwrap_or_else(|| "distributed lock acquisition failed".to_string())
+                            });
+                        }
+                        None => {
+                            failure.get_or_insert_with(|| "client returned incomplete batch lock response".to_string());
+                        }
+                    },
+                    Err(err) => {
+                        failure.get_or_insert_with(|| err.to_string());
+                    }
+                }
+            }
+
+            if entries.len() >= required_quorum {
+                let heartbeat = LockHeartbeatConfig {
+                    ttl,
+                    interval: derive_refresh_interval(entries.len(), ttl, None),
+                    refresh_quorum: required_quorum,
+                    owner: owner.to_string(),
+                    resource: resource.clone(),
+                };
+                results.push(Ok(DistributedLockGuard::new(
+                    LockId::new_unique(resource),
+                    entries,
+                    LockType::Exclusive,
+                    heartbeat,
+                )));
+            } else {
+                let achieved = entries.len();
+                orphaned_entries.extend(entries.iter().map(HeldLockEntry::release_entry));
+                if let Some(error) = failure {
+                    tracing::debug!(resource = %resource, owner, required_quorum, achieved, "batch lock acquire failed: {error}");
+                }
+                results.push(Err(LockError::QuorumNotReached {
+                    required: required_quorum,
+                    achieved,
+                }));
+            }
+        }
+
+        // Awaited so a caller that falls back per key cannot race these
+        // unlocks (the distributed release on drop is fire-and-forget).
+        if !orphaned_entries.is_empty() {
+            Self::release_entries(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
+        }
+        results
     }
 
     fn spawn_lock_requests_until(

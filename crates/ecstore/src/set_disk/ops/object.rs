@@ -9865,57 +9865,25 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            // Bulk delete is the only multi-key transaction-lock holder, so an
-            // optimistic all-or-nothing wave is safe: any probe failure releases
-            // the whole wave (awaiting the unlock RPCs) and the canonical serial
-            // order below resolves overlap with a concurrent batch exactly as
-            // before. See `rustfs_lock::wave::probe_lock_wave`.
-            const DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY: usize = 32;
-            const DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
-            let probe = if keys.len() > 1 {
-                rustfs_lock::wave::probe_lock_wave(
-                    keys.iter().cloned().collect::<Vec<_>>(),
-                    DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY,
-                    |key| async move {
-                        let guard = self
-                            .acquire_delete_transaction_lock_with_timeout(bucket, &key, DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT)
-                            .await
-                            .ok()?;
-                        Some((key, guard))
-                    },
-                    |pairs| async move {
-                        for (_, mut guard) in pairs {
-                            if let Some(guard) = Arc::get_mut(&mut guard) {
-                                guard.release_and_wait().await;
-                            }
-                        }
-                    },
-                )
-                .await
-                .map(|pairs| pairs.into_iter().collect::<std::collections::BTreeMap<_, _>>())
-            } else {
-                None
-            };
-            match probe {
-                Some(guards) => {
-                    for guard in guards.values() {
-                        opts.add_namespace_lock_guard(guard);
+            // Bulk delete is the only multi-key transaction-lock holder; one
+            // batched lock round replaces one quorum round-trip per key and is
+            // deadlock-free by construction (a single `lock_batch` RPC per lock
+            // client, global (shard, key) order at each server). Per-key
+            // failures keep the set layer's per-key error reporting.
+            let key_names: Vec<&str> = keys.iter().map(|key| key.as_str()).collect();
+            let acquired = self
+                .acquire_delete_transaction_locks_batch(bucket, &key_names, super::super::get_lock_acquire_timeout())
+                .await;
+            for (key, result) in keys.into_iter().zip(acquired) {
+                match result {
+                    Ok(guard) => {
+                        opts.add_namespace_lock_guard(&guard);
+                        transaction_guards.insert(key, guard);
                     }
-                    transaction_guards = guards;
-                }
-                None => {
-                    for key in keys {
-                        match self.acquire_delete_transaction_lock(bucket, &key).await {
-                            Ok(guard) => {
-                                opts.add_namespace_lock_guard(&guard);
-                                transaction_guards.insert(key, guard);
-                            }
-                            Err(error) => {
-                                for (index, lock_name) in lock_names.iter().enumerate() {
-                                    if lock_name.as_ref() == key {
-                                        del_errs[index] = Some(error.clone());
-                                    }
-                                }
+                    Err(error) => {
+                        for (index, lock_name) in lock_names.iter().enumerate() {
+                            if lock_name.as_ref() == key {
+                                del_errs[index] = Some(error.clone());
                             }
                         }
                     }
