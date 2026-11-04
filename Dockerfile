@@ -16,6 +16,7 @@ FROM alpine:3.24.2 AS build
 
 ARG TARGETARCH
 ARG RELEASE=latest
+ARG RC_RELEASE=latest
 
 RUN apk add --no-cache ca-certificates curl jq unzip
 WORKDIR /build
@@ -69,6 +70,9 @@ RUN set -eux; \
     chmod +x /build/rustfs; \
     rm -rf rustfs.zip /build/.tmp || true
 
+COPY scripts/download_rc.sh /usr/local/bin/download_rc.sh
+RUN sh /usr/local/bin/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /build/rc
+
 
 FROM alpine:3.24.2
 
@@ -95,14 +99,18 @@ RUN apk upgrade --no-cache && \
     ca-certificates \
     coreutils \
     curl \
+    jq \
     tzdata \
     && test "$(TZ=Asia/Kolkata date +%z)" = "+0530"
 
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /build/rustfs /usr/bin/rustfs
-COPY entrypoint.sh /entrypoint.sh
+COPY --from=build /build/rc /usr/bin/rc
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
 
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 RUN addgroup -g 10001 -S rustfs && \
     adduser -u 10001 -G rustfs -S rustfs -D && \
@@ -124,6 +132,6 @@ VOLUME ["/data"]
 
 USER rustfs
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 
 CMD ["rustfs"]
