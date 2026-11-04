@@ -128,6 +128,20 @@ impl Error {
         Error::TransientSkip { message: message.into() }
     }
 
+    /// S3 `SlowDown` ("Please reduce your request rate") is a rate signal.
+    /// Callers must cut their own concurrency instead of retrying at full speed.
+    pub(crate) fn is_slow_down(&self) -> bool {
+        match self {
+            Error::Storage(error) => matches!(error, EcstoreError::SlowDown | EcstoreError::TooManyOpenFiles),
+            Error::Disk(error) => matches!(error, DiskError::TooManyOpenFiles),
+            Error::TransientSkip { message } | Error::Other(message) | Error::TaskExecutionFailed { message } => {
+                message.contains("Please reduce your request rate")
+            }
+            Error::Io(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+            _ => false,
+        }
+    }
+
     /// Whether a heal operation can be retried without changing its inputs.
     pub(crate) fn is_recoverable_heal(&self) -> bool {
         match classify_heal_error(self) {
@@ -448,6 +462,22 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn slow_down_is_a_rate_signal_across_wrapped_shapes() {
+        assert!(Error::Storage(EcstoreError::SlowDown).is_slow_down());
+        assert!(Error::Storage(EcstoreError::TooManyOpenFiles).is_slow_down());
+        assert!(Error::Disk(DiskError::TooManyOpenFiles).is_slow_down());
+        assert!(Error::transient_skip("Please reduce your request rate").is_slow_down());
+        assert!(
+            Error::TaskExecutionFailed {
+                message: "Failed to recreate missing object b/o: Storage error: Please reduce your request rate".to_owned(),
+            }
+            .is_slow_down()
+        );
+        assert!(!Error::Storage(EcstoreError::FileNotFound).is_slow_down());
+        assert!(!Error::transient_skip("DiskNotFound").is_slow_down());
+    }
 
     #[test]
     fn pool_metadata_failures_keep_their_typed_recovery_classification() {

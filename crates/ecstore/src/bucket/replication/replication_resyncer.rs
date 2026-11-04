@@ -3015,7 +3015,7 @@ const DELETE_MARKER_PURGE_WATCH_INTERVAL: TokioDuration = TokioDuration::from_se
 /// If the marker disappears (deleted before or while the replica landed),
 /// purge the replicated marker from the targets, retrying failed targets on
 /// later rounds. When the window drains with targets still dirty, persist the
-/// purge intent as a durable MRF entry so the next startup replays it through
+/// purge intent as a durable MRF entry so the next MRF replay pass re-drives it through
 /// `purge_stale_delete_marker_targets`.
 async fn watch_and_purge_source_delete_marker<S: ReplicationStorage>(
     bucket: String,
@@ -3106,7 +3106,7 @@ async fn enqueue_delete_marker_purge_mrf(dobj: &DeletedObjectReplicationInfo, fa
 /// Heal callers retry for the full watch window because the startup MRF
 /// processor runs before bucket metadata (and thus target clients) finishes
 /// initializing — the first pass can see `target_client_missing` and a later
-/// round resolves the client; the replay loop is serial and startup-only, so
+/// round resolves the client; replay passes are serial background work, so
 /// blocking it for up to the window per dirty entry is acceptable. Live
 /// callers run on replication workers where a down target would pin a worker
 /// for the whole window, so they attempt once and lean on the durable intent

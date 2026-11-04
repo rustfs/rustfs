@@ -34,7 +34,7 @@ pub(super) fn running_mainline_pacer(
     request: &HealRequest,
     config: &HealConfig,
     provider: &Option<WorkloadSnapshotProviderRef>,
-) -> Option<Arc<crate::heal::pacing::MainlinePacer>> {
+) -> Option<crate::heal::pacing::ForegroundPacing> {
     let pace_running = request.source == HealRequestSource::Admin
         || (request.source == HealRequestSource::AutoHeal
             && matches!(&request.heal_type, HealType::ErasureSet { .. })
@@ -43,14 +43,13 @@ pub(super) fn running_mainline_pacer(
         return None;
     }
     provider.as_ref().and_then(|provider| {
-        crate::heal::pacing::MainlinePacer::new(
+        crate::heal::pacing::ForegroundPacing::new(
             provider.clone(),
             config.mainline_read_utilization_high_percent,
             config.mainline_write_utilization_high_percent,
             config.mainline_max_sleep,
             request.source,
         )
-        .map(Arc::new)
     })
 }
 

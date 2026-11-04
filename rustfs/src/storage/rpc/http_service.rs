@@ -90,8 +90,83 @@ static PUT_FILE_AUTH_STRICT: LazyLock<bool> = LazyLock::new(|| {
         rustfs_config::DEFAULT_INTERNODE_RPC_BODY_DIGEST_STRICT,
     )
 });
-static PUT_FILE_TARGET_LOCKS: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Mutex<()>>>>> =
-    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+const PUT_FILE_TARGET_LOCK_SHARDS: usize = 64;
+const PUT_FILE_TARGET_LOCK_INITIAL_GC_THRESHOLD: usize = 64;
+
+#[derive(Clone, Copy, Default)]
+struct Xxh3TargetKeyHasher(u64);
+
+impl std::hash::Hasher for Xxh3TargetKeyHasher {
+    #[inline]
+    fn write(&mut self, bytes: &[u8]) {
+        self.0 = xxhash_rust::xxh3::xxh3_64(bytes);
+    }
+
+    #[inline]
+    fn write_usize(&mut self, _i: usize) {}
+
+    #[inline]
+    fn finish(&self) -> u64 {
+        self.0
+    }
+}
+
+type Xxh3TargetKeyBuildHasher = std::hash::BuildHasherDefault<Xxh3TargetKeyHasher>;
+
+struct PutFileTargetLockShard {
+    entries: HashMap<Box<[u8]>, Weak<Mutex<()>>, Xxh3TargetKeyBuildHasher>,
+    next_gc_threshold: usize,
+}
+
+impl Default for PutFileTargetLockShard {
+    fn default() -> Self {
+        Self {
+            entries: HashMap::default(),
+            next_gc_threshold: PUT_FILE_TARGET_LOCK_INITIAL_GC_THRESHOLD,
+        }
+    }
+}
+
+struct ShardedPutFileTargetLockRegistry {
+    shards: [parking_lot::Mutex<PutFileTargetLockShard>; PUT_FILE_TARGET_LOCK_SHARDS],
+}
+
+impl ShardedPutFileTargetLockRegistry {
+    fn new() -> Self {
+        Self {
+            shards: std::array::from_fn(|_| parking_lot::Mutex::new(PutFileTargetLockShard::default())),
+        }
+    }
+
+    #[inline]
+    fn get_or_create(&self, key: &[u8]) -> Arc<Mutex<()>> {
+        let hash = xxhash_rust::xxh3::xxh3_64(key);
+        let shard_idx = ((hash >> 32) as usize) & (PUT_FILE_TARGET_LOCK_SHARDS - 1);
+        let mut shard = self.shards[shard_idx].lock();
+        if let Some(existing) = shard.entries.get(key).and_then(Weak::upgrade) {
+            return existing;
+        }
+        let created = Arc::new(Mutex::new(()));
+        let weak = Arc::downgrade(&created);
+        if let Some(slot) = shard.entries.get_mut(key) {
+            *slot = weak;
+            return created;
+        }
+        if shard.entries.len() >= shard.next_gc_threshold {
+            shard.entries.retain(|_, lock| lock.strong_count() > 0);
+            shard.next_gc_threshold = shard
+                .entries
+                .len()
+                .saturating_add(1)
+                .saturating_mul(2)
+                .max(PUT_FILE_TARGET_LOCK_INITIAL_GC_THRESHOLD);
+        }
+        shard.entries.insert(key.into(), weak);
+        created
+    }
+}
+
+static PUT_FILE_TARGET_LOCKS: LazyLock<ShardedPutFileTargetLockRegistry> = LazyLock::new(ShardedPutFileTargetLockRegistry::new);
 
 macro_rules! log_internode_rpc_response_failure {
     ($status:expr, $rpc_path:expr, $method:expr, $operation:expr, $reason:expr, $result:expr, Some(($context_key:expr, $context_value:expr)), Some($error_text:expr)) => {{
@@ -1437,16 +1512,31 @@ where
 }
 
 fn put_file_target_lock(disk: &DiskStore, query: &PutFileQuery) -> Arc<Mutex<()>> {
-    let key = format!("{:p}\0{}\0{}", Arc::as_ptr(disk), query.volume, query.path);
-    let mut locks = PUT_FILE_TARGET_LOCKS.lock();
-    locks.retain(|_, lock| lock.strong_count() > 0);
-    if let Some(lock) = locks.get(&key).and_then(Weak::upgrade) {
-        return lock;
+    let disk_addr = (Arc::as_ptr(disk) as usize).to_ne_bytes();
+    let vol_bytes = query.volume.as_bytes();
+    let vol_len = (vol_bytes.len() as u64).to_ne_bytes();
+    let path_bytes = query.path.as_bytes();
+    let total_len = disk_addr.len() + vol_len.len() + vol_bytes.len() + path_bytes.len();
+
+    let mut stack_buf = [0u8; 512];
+    if total_len <= stack_buf.len() {
+        let mut pos = 0;
+        stack_buf[pos..pos + disk_addr.len()].copy_from_slice(&disk_addr);
+        pos += disk_addr.len();
+        stack_buf[pos..pos + vol_len.len()].copy_from_slice(&vol_len);
+        pos += vol_len.len();
+        stack_buf[pos..pos + vol_bytes.len()].copy_from_slice(vol_bytes);
+        pos += vol_bytes.len();
+        stack_buf[pos..pos + path_bytes.len()].copy_from_slice(path_bytes);
+        return PUT_FILE_TARGET_LOCKS.get_or_create(&stack_buf[..total_len]);
     }
 
-    let lock = Arc::new(Mutex::new(()));
-    locks.insert(key, Arc::downgrade(&lock));
-    lock
+    let mut heap_key = Vec::with_capacity(total_len);
+    heap_key.extend_from_slice(&disk_addr);
+    heap_key.extend_from_slice(&vol_len);
+    heap_key.extend_from_slice(vol_bytes);
+    heap_key.extend_from_slice(path_bytes);
+    PUT_FILE_TARGET_LOCKS.get_or_create(&heap_key)
 }
 
 async fn remove_put_file_staging(disk: &DiskStore, volume: &str, path: &str) -> Result<(), BoxError> {
@@ -3745,6 +3835,53 @@ mod tests {
             let mut data = Vec::new();
             reader.read_to_end(&mut data).await.expect("read metadata");
             assert_eq!(data, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn sharded_put_file_target_lock_separates_tuples_and_handles_long_keys() {
+        let (disk_a, _dir_a) = new_put_file_test_disk().await;
+        let (disk_b, _dir_b) = new_put_file_test_disk().await;
+
+        let make_query = |volume: &str, path: &str| PutFileQuery {
+            disk: "disk-a".to_string(),
+            volume: volume.to_string(),
+            path: path.to_string(),
+            append: false,
+            size: 0,
+            put_file_auth: None,
+            put_file_nonce: None,
+            put_file_server_epoch: None,
+        };
+
+        let q1 = make_query("ab", "c");
+        let q2 = make_query("a", "bc");
+        let lock_q1_a = put_file_target_lock(&disk_a, &q1);
+        let lock_q1_b = put_file_target_lock(&disk_a, &q1);
+        let lock_q2 = put_file_target_lock(&disk_a, &q2);
+        let lock_other_disk = put_file_target_lock(&disk_b, &q1);
+        assert!(std::sync::Arc::ptr_eq(&lock_q1_a, &lock_q1_b));
+        assert!(!std::sync::Arc::ptr_eq(&lock_q1_a, &lock_q2));
+        assert!(!std::sync::Arc::ptr_eq(&lock_q1_a, &lock_other_disk));
+
+        let long_path = "segment/".repeat(80);
+        let q_long = make_query("bucket", &long_path);
+        let lock_long_a = put_file_target_lock(&disk_a, &q_long);
+        let lock_long_b = put_file_target_lock(&disk_a, &q_long);
+        assert!(std::sync::Arc::ptr_eq(&lock_long_a, &lock_long_b));
+
+        let registry = super::ShardedPutFileTargetLockRegistry::new();
+        let held = registry.get_or_create(b"persistent-target");
+        drop(registry.get_or_create(b"reused-target"));
+        drop(registry.get_or_create(b"reused-target"));
+        for i in 0..(super::PUT_FILE_TARGET_LOCK_SHARDS * super::PUT_FILE_TARGET_LOCK_INITIAL_GC_THRESHOLD * 3) {
+            let key = format!("ephemeral-{i}");
+            drop(registry.get_or_create(key.as_bytes()));
+        }
+        assert!(std::sync::Arc::ptr_eq(&held, &registry.get_or_create(b"persistent-target")));
+        for shard in &registry.shards {
+            let guard = shard.lock();
+            assert!(guard.entries.len() <= guard.next_gc_threshold);
         }
     }
 }
