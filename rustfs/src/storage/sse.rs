@@ -715,7 +715,7 @@ pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
     // GET/HEAD object-read contract: these failures mean "this object is not
     // readable right now" (S3 `SlowDownRead`), not a write admission reject.
     if crate::error::is_object_read_unavailable(&err) {
-        return crate::error::object_read_unavailable_api_error(err);
+        return crate::error::slow_down_read_api_error(err);
     }
 
     if let StorageError::Io(io_error) = &err
