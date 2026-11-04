@@ -411,7 +411,7 @@ impl PoolTier {
         })
     }
 
-    /// Return a buffer to the pool for reuse without ever blocking the caller.
+    /// Return a buffer to the pool for reuse without waiting for the queue lock.
     fn return_buffer(&self, buffer: BytesMut) {
         let mut buffer = Some(buffer);
 
