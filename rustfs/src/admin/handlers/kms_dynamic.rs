@@ -28,7 +28,7 @@ use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_s3_error};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -859,7 +859,7 @@ impl Operation for ConfigureKmsHandler {
                 owner,
                 false,
                 kms_configure_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Configure,
@@ -1012,7 +1012,7 @@ impl Operation for StartKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Start,
@@ -1169,7 +1169,7 @@ impl Operation for StopKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Stop,
@@ -1271,7 +1271,7 @@ impl Operation for ReloadKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Reload,
@@ -1365,7 +1365,7 @@ impl Operation for GetKmsStatusHandler {
             owner,
             false,
             kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
@@ -1459,7 +1459,7 @@ impl Operation for ReconfigureKmsHandler {
                 owner,
                 false,
                 kms_configure_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Reconfigure,
