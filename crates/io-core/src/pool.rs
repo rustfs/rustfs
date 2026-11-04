@@ -84,7 +84,8 @@ struct PoolTier {
     available_buffers: Mutex<Vec<BytesMut>>,
     /// Metrics for tracking this tier
     metrics: Arc<BytesPoolMetrics>,
-    /// Serialize acquisition counters and hit-rate publication.
+    /// Serialize acquisitions before taking buffers so a slow recorder does not
+    /// accumulate allocated buffers behind hit-rate publication.
     acquire_metrics_lock: Mutex<()>,
     /// Total acquisitions for this tier
     tier_total_acquires: AtomicU64,
@@ -345,7 +346,6 @@ impl PoolTier {
     }
 
     fn record_acquire_metrics(&self, buffer_capacity: usize, was_reused: bool) {
-        let _guard = self.acquire_metrics_lock.lock().unwrap_or_else(|e| e.into_inner());
         let pool_metrics = &self.metrics;
         pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
         self.tier_total_acquires.fetch_add(1, Ordering::Relaxed);
@@ -383,6 +383,7 @@ impl PoolTier {
             }
         };
 
+        let _guard = self.acquire_metrics_lock.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, was_reused) = self.take_or_allocate_buffer(size);
         let buffer_capacity = buffer.capacity();
         self.record_acquire_metrics(buffer_capacity, was_reused);
@@ -398,6 +399,7 @@ impl PoolTier {
         // Try to acquire permit without blocking
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
 
+        let _guard = self.acquire_metrics_lock.lock().unwrap_or_else(|e| e.into_inner());
         let (buffer, was_reused) = self.take_or_allocate_buffer(size);
         let buffer_capacity = buffer.capacity();
         self.record_acquire_metrics(buffer_capacity, was_reused);
