@@ -13646,7 +13646,7 @@ mod missing_key_delete_quorum_tests {
 mod batch_delete_lock_probe_tests {
     use super::*;
     use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
-    use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
 
     #[tokio::test]
     async fn contended_key_drops_probe_wave_and_serial_fallback_finishes() {
