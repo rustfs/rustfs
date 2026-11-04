@@ -40,6 +40,7 @@ hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-config/hotpath-cpu", "r
 hotpath.workspace = true
 async-trait = { workspace = true }
 axum = { workspace = true }
+futures = { workspace = true }
 http = { workspace = true }
 ipnetwork = { workspace = true, features = ["serde"] }
 metrics = { workspace = true }

@@ -14,6 +14,20 @@
 
 use std::sync::Arc;
 
+pub(crate) fn is_unreadable_bucket_tags(error: &crate::error::Error) -> bool {
+    let crate::error::Error::Io(error) = error else {
+        return false;
+    };
+    let Some(storage_error) = error.get_ref().and_then(|inner| inner.downcast_ref::<IamStorageError>()) else {
+        return false;
+    };
+    rustfs_ecstore::api::bucket::metadata::unreadable_config_refusal(storage_error)
+        .is_some_and(|failure| failure.config_file == rustfs_ecstore::api::bucket::metadata::BUCKET_TAGGING_CONFIG)
+}
+
+#[cfg(test)]
+pub(crate) use rustfs_ecstore::api::bucket::metadata::UnreadableBucketConfig;
+
 pub(crate) use rustfs_ecstore::api::config::RUSTFS_CONFIG_PREFIX as IAM_CONFIG_ROOT_PREFIX;
 use rustfs_ecstore::api::config::com::{
     delete_config as ecstore_delete_config, read_config_no_lock as ecstore_read_config_no_lock,

@@ -39,7 +39,7 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
@@ -296,6 +296,7 @@ pub(super) fn init_observability_http(
     tracing_subscriber::registry()
         .with(filter)
         .with(pyroscope_log_filter())
+        .with(s3s_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer_opt)
         .with(stdout_layer_opt)
@@ -1196,6 +1197,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(env_filter)
             .with(pyroscope_log_filter())
+            .with(s3s_log_filter())
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
@@ -1219,6 +1221,7 @@ mod tests {
             tracing_subscriber::registry()
                 .with(build_env_filter("info", None))
                 .with(pyroscope_log_filter())
+                .with(s3s_log_filter())
                 .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
                 .try_init()
                 .expect("install isolated LogTracer subscriber");

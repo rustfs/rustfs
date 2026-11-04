@@ -42,7 +42,6 @@ use crate::admin::service::caller_identity::{CallerIdentity, oidc_profile_fields
 use crate::admin::storage_api::s3::{self, Body, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
-use crate::server::RemoteAddr;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -162,6 +161,13 @@ pub struct ChangeOwnPasswordHandler {}
 #[async_trait::async_trait]
 impl Operation for ChangeOwnPasswordHandler {
     async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let signing_secret = req
+            .credentials
+            .as_ref()
+            .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?
+            .secret_key
+            .expose()
+            .to_string();
         let caller = CallerIdentity::resolve(&req).await?;
         let audit = AccountAuditContext::from_request(&req);
 
@@ -203,7 +209,9 @@ impl Operation for ChangeOwnPasswordHandler {
             return Err(s3::error(S3ErrorCode::InvalidRequest, "the calling identity no longer exists"));
         };
 
-        if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key) {
+        if !constant_time_eq(&request.current_secret_key, &stored.credentials.secret_key)
+            || !constant_time_eq(&request.current_secret_key, &signing_secret)
+        {
             warn!(
                 component = LOG_COMPONENT_ADMIN,
                 subsystem = LOG_SUBSYSTEM_ACCOUNT,
@@ -256,31 +264,16 @@ impl Operation for ChangeOwnPasswordHandler {
             let iam_store =
                 current_ready_iam_handle().map_err(|_| s3::error(S3ErrorCode::InternalError, "iam is not initialized"))?;
 
-            let (updated_at, status) = iam_store
-                .set_user_secret_key(&access_key, &new_secret_key)
+            let (updated_at, status, revoked) = iam_store
+                .change_own_secret_key(&access_key, &signing_secret, &new_secret_key)
                 .await
-                .map_err(iam_error_to_s3_error)?;
-
-            // Sessions minted under the old secret must not outlive it. A
-            // failure here is reported but does not undo the rotation: the new
-            // secret is already authoritative, and re-running the revocation is
-            // safe, whereas rolling the secret back would resurrect it.
-            let revoked = match iam_store.revoke_sts_sessions_for_parent(&access_key).await {
-                Ok(revoked) => revoked,
-                Err(err) => {
-                    warn!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_ACCOUNT,
-                        event = EVENT_ADMIN_ACCOUNT_STATE,
-                        action = "change_own_password",
-                        access_key = %MaskedAccessKey(&access_key),
-                        result = "session_revocation_incomplete",
-                        error = ?err,
-                        "admin account state"
-                    );
-                    0
-                }
-            };
+                .map_err(|error| {
+                    if matches!(error, rustfs_iam::error::Error::IAMActionNotAllowed) {
+                        s3::error(S3ErrorCode::InvalidRequest, "the current secret key is incorrect")
+                    } else {
+                        iam_error_to_s3_error(error)
+                    }
+                })?;
 
             emit_audit(
                 &audit_for_task,
@@ -378,7 +371,7 @@ impl Operation for SetUserSecretKeyHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await
         .inspect_err(|_| {
@@ -424,27 +417,10 @@ impl Operation for SetUserSecretKeyHandler {
                 ));
             }
 
-            let (updated_at, status) = iam_store
-                .set_user_secret_key(&target, &request.secret_key)
+            let (updated_at, status, revoked) = iam_store
+                .rotate_user_secret_key(&target, &request.secret_key)
                 .await
                 .map_err(iam_error_to_s3_error)?;
-
-            let revoked = match iam_store.revoke_sts_sessions_for_parent(&target).await {
-                Ok(revoked) => revoked,
-                Err(err) => {
-                    warn!(
-                        component = LOG_COMPONENT_ADMIN,
-                        subsystem = LOG_SUBSYSTEM_ACCOUNT,
-                        event = EVENT_ADMIN_ACCOUNT_STATE,
-                        action = "set_user_secret_key",
-                        access_key = %MaskedAccessKey(&target),
-                        result = "session_revocation_incomplete",
-                        error = ?err,
-                        "admin account state"
-                    );
-                    0
-                }
-            };
 
             emit_audit(
                 &audit_for_task,
@@ -648,16 +624,23 @@ mod tests {
     #[test]
     fn both_rotation_handlers_broadcast_after_revoking_sessions() {
         let src = include_str!("account.rs");
-        for marker in [
-            "impl Operation for ChangeOwnPasswordHandler",
-            "impl Operation for SetUserSecretKeyHandler",
+        // Session revocation now runs inside the IAM rotation call, under the
+        // per-key mutation lock, so the handler must reach that call before it
+        // broadcasts the new secret to peer sites.
+        for (marker, rotation) in [
+            ("impl Operation for ChangeOwnPasswordHandler", "change_own_secret_key("),
+            ("impl Operation for SetUserSecretKeyHandler", "rotate_user_secret_key("),
         ] {
             let start = src.find(marker).expect("handler should exist");
             let block = &src[start..];
             let block = &block[..block.find("\n}\n").expect("handler block end")];
             let revoke = block
-                .find("revoke_sts_sessions_for_parent")
-                .expect("handler must revoke sessions");
+                .find(rotation)
+                .expect("handler must rotate through the IAM call that revokes sessions");
+            assert!(
+                !block.contains("revoke_sts_sessions_for_parent"),
+                "{marker}: revocation belongs to the locked IAM rotation, not a separate handler step"
+            );
             let broadcast = block
                 .find("broadcast_secret_key_rotation(")
                 .expect("handler must broadcast the rotation to peer sites");

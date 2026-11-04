@@ -4967,7 +4967,20 @@ impl SetDisks {
                 );
             }
 
-            if let Some(version_id) = opts.version_id.as_deref()
+            // A write without a version id to a key that is not versioning-Enabled
+            // replaces the key's null version in place, so the WORM gate must judge
+            // that version too. The request-layer pre-check reads the latest
+            // version, which is not the one replaced when a UUID version or a
+            // delete marker sits above a retained null version.
+            let worm_gate_version_id = opts.version_id.clone().or_else(|| {
+                (!opts.versioned
+                    && opts
+                        .object_lock_config_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)))
+                .then(|| Uuid::nil().to_string())
+            });
+            if let Some(version_id) = worm_gate_version_id.as_deref()
                 && !is_meta_bucketname(bucket)
             {
                 let explicit_version_lookup_started = rustfs_io_metrics::put_stage_timer();
@@ -4987,9 +5000,10 @@ impl SetDisks {
                     .await;
                 match current {
                     Ok(existing) => {
-                        let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
-                            Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
-                        })?;
+                        let object_lock_config = opts
+                            .object_lock_config_snapshot
+                            .as_deref()
+                            .ok_or_else(|| Error::other("destructive PUT is missing its Object Lock configuration snapshot"))?;
                         // The WORM gate protects the locked version from local
                         // overwrites; an authorized replication write passes it
                         // only when the LWW merge below will judge every
@@ -5020,6 +5034,8 @@ impl SetDisks {
                             }
                         }
                     }
+                    // A null delete marker has no protected payload to replace.
+                    Err(StorageError::MethodNotAllowed) if version_id == Uuid::nil().to_string() => {}
                     Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }

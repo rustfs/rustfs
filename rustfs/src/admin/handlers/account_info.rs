@@ -22,7 +22,7 @@ use crate::admin::storage_api::contract::bucket::{BucketOperations, BucketOption
 use crate::admin::storage_api::data_usage::{apply_bucket_usage_memory_overlay, load_admin_data_usage_from_backend_cached};
 use crate::admin::storage_api::metadata_sys;
 use crate::auth::get_condition_values;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use http::{HeaderMap, HeaderValue};
 use hyper::{Method, StatusCode};
 use matchit::Params;
@@ -146,7 +146,7 @@ impl Operation for AccountInfoHandler {
         let claims = cred.claims.as_ref().unwrap_or(&default_claims);
 
         let cred_clone = cred.clone();
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         let conditions = get_condition_values(&req.headers, &cred_clone, None, None, remote_addr);
         let cred_clone = Arc::new(cred_clone);
         let conditions = Arc::new(conditions);

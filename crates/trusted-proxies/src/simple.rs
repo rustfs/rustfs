@@ -19,7 +19,8 @@
 //! switch the global entrypoints to the legacy chain validator.
 
 use crate::{ClientInfo, LegacyTrustedProxyLayer, LegacyTrustedProxyMiddleware, ValidationMode, global};
-use axum::http::{HeaderMap, Request};
+use axum::http::{HeaderMap, Request, Response, StatusCode};
+use futures::future::{Either, Ready, ready};
 use rustfs_config::{
     DEFAULT_TRUSTED_PROXY_ENABLED, DEFAULT_TRUSTED_PROXY_IMPLEMENTATION, ENV_TRUSTED_PROXY_ENABLED,
     ENV_TRUSTED_PROXY_IMPLEMENTATION,
@@ -35,11 +36,14 @@ use tracing::debug;
 /// Constant switch for the crate's default integration path.
 pub const SIMPLE_INTERNAL_ONLY_DEFAULT: bool = true;
 
+#[cfg(test)]
 const HEADER_FORWARDED: &str = "forwarded";
 const HEADER_X_FORWARDED_FOR: &str = "x-forwarded-for";
 const HEADER_X_FORWARDED_HOST: &str = "x-forwarded-host";
 const HEADER_X_FORWARDED_PROTO: &str = "x-forwarded-proto";
+#[cfg(test)]
 const HEADER_X_FORWARDED_SCHEME: &str = "x-forwarded-scheme";
+#[cfg(test)]
 const HEADER_X_REAL_IP: &str = "x-real-ip";
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -162,14 +166,15 @@ pub enum TrustedProxyMiddleware<S> {
     Legacy(LegacyTrustedProxyMiddleware<S>),
 }
 
-impl<S, ReqBody> Service<Request<ReqBody>> for TrustedProxyMiddleware<S>
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for TrustedProxyMiddleware<S>
 where
-    S: Service<Request<ReqBody>> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
+    ResBody: Default,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = Either<S::Future, Ready<Result<S::Response, S::Error>>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         match self {
@@ -224,14 +229,15 @@ pub struct SimpleTrustedProxyMiddleware<S> {
     enabled: bool,
 }
 
-impl<S, ReqBody> Service<Request<ReqBody>> for SimpleTrustedProxyMiddleware<S>
+impl<S, ReqBody, ResBody> Service<Request<ReqBody>> for SimpleTrustedProxyMiddleware<S>
 where
-    S: Service<Request<ReqBody>> + Clone + Send + 'static,
+    S: Service<Request<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
     S::Future: Send,
+    ResBody: Default,
 {
     type Response = S::Response;
     type Error = S::Error;
-    type Future = S::Future;
+    type Future = Either<S::Future, Ready<Result<S::Response, S::Error>>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx)
@@ -240,13 +246,23 @@ where
     fn call(&mut self, mut req: Request<ReqBody>) -> Self::Future {
         if self.enabled {
             let peer_addr = req.extensions().get::<SocketAddr>().copied();
+            if peer_addr.is_some_and(|peer| is_internal_ip(peer.ip()))
+                && (req.headers().contains_key(HEADER_X_FORWARDED_FOR)
+                    || req.headers().contains_key("forwarded")
+                    || req.headers().contains_key("x-real-ip"))
+                && forwarded_client_ip(req.headers()).is_none_or(|ip| !is_usable_ip(ip))
+            {
+                let mut response = Response::new(ResBody::default());
+                *response.status_mut() = StatusCode::BAD_REQUEST;
+                return Either::Right(ready(Ok(response)));
+            }
             let client_info = resolve_client_info(peer_addr, req.headers());
             req.extensions_mut().insert(client_info);
         } else {
             debug!("Simple trusted proxy middleware is disabled");
         }
 
-        self.inner.call(req)
+        Either::Left(self.inner.call(req))
     }
 }
 
@@ -275,52 +291,28 @@ fn resolve_client_info(peer_addr: Option<SocketAddr>, headers: &HeaderMap) -> Cl
 
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     parse_x_forwarded_for(headers)
-        .or_else(|| parse_single_ip_header(headers, HEADER_X_REAL_IP))
-        .or_else(|| parse_forwarded_header(headers))
 }
 
 fn forwarded_host(headers: &HeaderMap) -> Option<String> {
-    parse_single_value_header(headers, HEADER_X_FORWARDED_HOST)
-        .and_then(sanitize_forwarded_host)
-        .or_else(|| parse_forwarded_header_value(headers, "host").and_then(sanitize_forwarded_host))
+    parse_single_value_header(headers, HEADER_X_FORWARDED_HOST).and_then(sanitize_forwarded_host)
 }
 
 fn forwarded_proto(headers: &HeaderMap) -> Option<String> {
-    parse_single_value_header(headers, HEADER_X_FORWARDED_PROTO)
-        .and_then(sanitize_forwarded_proto)
-        .or_else(|| parse_single_value_header(headers, HEADER_X_FORWARDED_SCHEME).and_then(sanitize_forwarded_proto))
-        .or_else(|| parse_forwarded_header_value(headers, "proto").and_then(sanitize_forwarded_proto))
+    parse_single_value_header(headers, HEADER_X_FORWARDED_PROTO).and_then(sanitize_forwarded_proto)
 }
 
 fn parse_single_value_header(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
-        .get(name)?
+        .get_all(name)
+        .iter()
+        .next_back()?
         .to_str()
         .ok()?
-        .split(',')
+        .rsplit(',')
         .next()
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-}
-
-fn parse_forwarded_header_value(headers: &HeaderMap, name: &str) -> Option<String> {
-    let value = headers.get(HEADER_FORWARDED)?.to_str().ok()?;
-    let first = value.split(',').next()?.trim();
-
-    for part in first.split(';') {
-        let Some((key, value)) = part.trim().split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case(name) {
-            let value = value.trim().trim_matches('"');
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-        }
-    }
-
-    None
 }
 
 fn sanitize_forwarded_host(value: String) -> Option<String> {
@@ -346,30 +338,10 @@ fn sanitize_forwarded_value(value: &str) -> Option<String> {
 }
 
 fn parse_x_forwarded_for(headers: &HeaderMap) -> Option<IpAddr> {
-    let value = headers.get(HEADER_X_FORWARDED_FOR)?.to_str().ok()?;
-    let first = value.split(',').next()?.trim();
-    parse_ip_token(first)
-}
-
-fn parse_single_ip_header(headers: &HeaderMap, name: &str) -> Option<IpAddr> {
-    let value = headers.get(name)?.to_str().ok()?;
-    parse_ip_token(value)
-}
-
-fn parse_forwarded_header(headers: &HeaderMap) -> Option<IpAddr> {
-    let value = headers.get(HEADER_FORWARDED)?.to_str().ok()?;
-    let first_entry = value.split(',').next()?.trim();
-
-    for part in first_entry.split(';') {
-        let Some((key, raw_value)) = part.split_once('=') else {
-            continue;
-        };
-        if key.trim().eq_ignore_ascii_case("for") {
-            return parse_ip_token(raw_value.trim());
-        }
-    }
-
-    None
+    // Simple mode trusts exactly one proxy. The rightmost value is the peer
+    // that proxy observed, even when that peer is another private address.
+    let value = headers.get_all(HEADER_X_FORWARDED_FOR).iter().next_back()?.to_str().ok()?;
+    parse_ip_token(value.rsplit(',').next()?.trim())
 }
 
 fn parse_ip_token(value: &str) -> Option<IpAddr> {
@@ -381,22 +353,22 @@ fn parse_ip_token(value: &str) -> Option<IpAddr> {
     if let Some(bracketed) = value.strip_prefix('[')
         && let Some(end) = bracketed.find(']')
     {
-        return IpAddr::from_str(&bracketed[..end]).ok();
+        return IpAddr::from_str(&bracketed[..end]).ok().map(|ip| ip.to_canonical());
     }
 
     if let Ok(ip) = IpAddr::from_str(value) {
-        return Some(ip);
+        return Some(ip.to_canonical());
     }
 
     if let Ok(socket_addr) = SocketAddr::from_str(value) {
-        return Some(socket_addr.ip());
+        return Some(socket_addr.ip().to_canonical());
     }
 
     None
 }
 
 fn is_internal_ip(ip: IpAddr) -> bool {
-    match ip {
+    match ip.to_canonical() {
         IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
         IpAddr::V6(ip) => ip.is_loopback() || ip.is_unique_local() || ip.is_unicast_link_local(),
     }
@@ -459,14 +431,14 @@ mod tests {
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10, 10.0.0.5"));
         headers.insert(HEADER_X_REAL_IP, HeaderValue::from_static("198.51.100.10"));
         headers.insert(HEADER_FORWARDED, HeaderValue::from_static("for=192.0.2.60;proto=https"));
-        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([203, 0, 113, 10])));
+        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([10, 0, 0, 5])));
     }
 
     #[test]
-    fn test_forwarded_header_fallback() {
+    fn test_forwarded_header_does_not_select_another_address_family() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_FORWARDED, HeaderValue::from_static("for=203.0.113.10;proto=https"));
-        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([203, 0, 113, 10])));
+        assert_eq!(forwarded_client_ip(&headers), None);
     }
 
     #[test]
@@ -494,18 +466,18 @@ mod tests {
     }
 
     #[test]
-    fn test_internal_peer_preserves_forwarded_scheme_fallback() {
+    fn test_internal_peer_ignores_unselected_forwarded_scheme() {
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.10"));
         headers.insert(HEADER_X_FORWARDED_SCHEME, HeaderValue::from_static("https"));
 
         let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
 
-        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+        assert_eq!(client_info.forwarded_proto, None);
     }
 
     #[test]
-    fn test_forwarded_header_preserves_proto_and_host() {
+    fn test_forwarded_header_cannot_supply_proto_or_host() {
         let mut headers = HeaderMap::new();
         headers.insert(
             HEADER_FORWARDED,
@@ -514,9 +486,9 @@ mod tests {
 
         let client_info = resolve_client_info(Some(SocketAddr::from(([10, 0, 0, 5], 9000))), &headers);
 
-        assert_eq!(client_info.real_ip, IpAddr::from([203, 0, 113, 10]));
-        assert_eq!(client_info.forwarded_host.as_deref(), Some("s3.example.test"));
-        assert_eq!(client_info.forwarded_proto.as_deref(), Some("https"));
+        assert_eq!(client_info.real_ip, IpAddr::from([10, 0, 0, 5]));
+        assert_eq!(client_info.forwarded_host, None);
+        assert_eq!(client_info.forwarded_proto, None);
     }
 
     #[test]
@@ -559,10 +531,12 @@ mod tests {
 
     #[test]
     fn test_forwarded_header_segment_without_equals() {
-        // A segment without '=' before 'for=' must not abort parsing.
+        // Simple mode never accepts the alternate Forwarded family.
         let mut headers = HeaderMap::new();
         headers.insert(HEADER_FORWARDED, HeaderValue::from_static("proto;for=203.0.113.10"));
-        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([203, 0, 113, 10])));
+        assert_eq!(forwarded_client_ip(&headers), None);
+        headers.insert(HEADER_X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.20"));
+        assert_eq!(forwarded_client_ip(&headers), Some(IpAddr::from([203, 0, 113, 20])));
     }
 
     #[test]

@@ -30,10 +30,10 @@ pub const ENV_TRUSTED_PROXY_VALIDATION_MODE: &str = "RUSTFS_TRUSTED_PROXY_VALIDA
 /// Default validation mode is "hop_by_hop".
 pub const DEFAULT_TRUSTED_PROXY_VALIDATION_MODE: &str = "hop_by_hop";
 
-/// Environment variable to enable RFC 7239 "Forwarded" header support.
+/// Select RFC 7239 "Forwarded" instead of "X-Forwarded-For" in legacy mode.
 pub const ENV_TRUSTED_PROXY_ENABLE_RFC7239: &str = "RUSTFS_TRUSTED_PROXY_ENABLE_RFC7239";
-/// RFC 7239 support is enabled by default.
-pub const DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239: bool = true;
+/// Legacy mode uses X-Forwarded-For unless RFC 7239 is explicitly selected.
+pub const DEFAULT_TRUSTED_PROXY_ENABLE_RFC7239: bool = false;
 
 /// Environment variable for the maximum allowed proxy hops.
 pub const ENV_TRUSTED_PROXY_MAX_HOPS: &str = "RUSTFS_TRUSTED_PROXY_MAX_HOPS";

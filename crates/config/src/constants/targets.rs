@@ -146,3 +146,9 @@ pub const ENV_TARGET_STORE_COMPRESS: &str = "RUSTFS_TARGET_STORE_COMPRESS";
 
 /// Queue-store compression is enabled by default to reduce disk footprint.
 pub const DEFAULT_TARGET_STORE_COMPRESS: bool = true;
+
+/// Maximum on-disk bytes in each target queue, including failed entries and pending writes.
+pub const ENV_TARGET_STORE_MAX_BYTES: &str = "RUSTFS_TARGET_STORE_MAX_BYTES";
+
+/// Queue writes fail at one GiB unless the operator sets another positive byte budget.
+pub const DEFAULT_TARGET_STORE_MAX_BYTES: u64 = 1024 * 1024 * 1024;

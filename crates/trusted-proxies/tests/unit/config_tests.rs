@@ -36,7 +36,7 @@ fn test_config_loader_default() {
             assert_eq!(config.server_addr.port(), 9000);
             assert!(!config.proxy.proxies.is_empty());
             assert_eq!(config.proxy.validation_mode, ValidationMode::HopByHop);
-            assert!(config.proxy.enable_rfc7239);
+            assert!(!config.proxy.enable_rfc7239);
             assert_eq!(config.proxy.max_hops, 10);
         },
     );
