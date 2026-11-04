@@ -95,6 +95,16 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
+        self.acquire_delete_transaction_lock_with_timeout(bucket, object, super::super::get_lock_acquire_timeout())
+            .await
+    }
+
+    pub(in crate::set_disk) async fn acquire_delete_transaction_lock_with_timeout(
+        &self,
+        bucket: &str,
+        object: &str,
+        timeout: std::time::Duration,
+    ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
         let resource = ObjectKey::with_version(
             bucket,
             object_name_disk_identity(object).as_ref(),
@@ -103,7 +113,7 @@ impl SetDisks {
         let guard = self
             .namespace_lock_for_key(resource)
             .await
-            .get_write_lock(super::super::get_lock_acquire_timeout())
+            .get_write_lock(timeout)
             .await
             .map_err(|error| self.map_namespace_lock_error(bucket, object, "delete_transaction", error))?;
         #[cfg(test)]

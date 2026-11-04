@@ -9795,16 +9795,62 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            for key in keys {
-                match self.acquire_delete_transaction_lock(bucket, &key).await {
-                    Ok(guard) => {
-                        opts.add_namespace_lock_guard(&guard);
-                        transaction_guards.insert(key, guard);
+            // Bulk delete is the only multi-key transaction-lock holder, so an
+            // optimistic all-or-nothing wave is safe: any probe failure drops
+            // the wave and the canonical serial order below resolves overlap
+            // with a concurrent batch exactly as before. Bounded parallelism
+            // keeps a 1000-key batch from paying one quorum round-trip per key.
+            // Every probe is consumed before the fallback runs, so a losing
+            // wave releases each probed lock explicitly instead of relying on
+            // in-flight cancellation.
+            const DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY: usize = 32;
+            const DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
+            let probe = if keys.len() > 1 {
+                let mut pending = Vec::with_capacity(keys.len());
+                for key in &keys {
+                    let key = key.clone();
+                    pending.push(async move {
+                        let result = self
+                            .acquire_delete_transaction_lock_with_timeout(bucket, &key, DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT)
+                            .await;
+                        (key, result)
+                    });
+                }
+                let results: Vec<_> = futures::stream::iter(pending)
+                    .buffered(DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY)
+                    .collect()
+                    .await;
+                let wave: Option<std::collections::BTreeMap<String, Arc<rustfs_lock::NamespaceLockGuard>>> = results
+                    .into_iter()
+                    .map(|(key, result)| result.map(|guard| (key, guard)))
+                    .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
+                    .ok();
+                // On failure the collected guards drop here, releasing the
+                // whole wave before the serial fallback acquires anything.
+                wave
+            } else {
+                None
+            };
+            match probe {
+                Some(guards) => {
+                    for guard in guards.values() {
+                        opts.add_namespace_lock_guard(guard);
                     }
-                    Err(error) => {
-                        for (index, lock_name) in lock_names.iter().enumerate() {
-                            if lock_name.as_ref() == key {
-                                del_errs[index] = Some(error.clone());
+                    transaction_guards = guards;
+                }
+                None => {
+                    for key in keys {
+                        match self.acquire_delete_transaction_lock(bucket, &key).await {
+                            Ok(guard) => {
+                                opts.add_namespace_lock_guard(&guard);
+                                transaction_guards.insert(key, guard);
+                            }
+                            Err(error) => {
+                                for (index, lock_name) in lock_names.iter().enumerate() {
+                                    if lock_name.as_ref() == key {
+                                        del_errs[index] = Some(error.clone());
+                                    }
+                                }
                             }
                         }
                     }
