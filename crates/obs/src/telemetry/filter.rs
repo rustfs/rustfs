@@ -41,6 +41,16 @@ pub(super) fn pyroscope_log_filter() -> FilterFn {
     filter_fn(allows_non_pyroscope_dependency_event)
 }
 
+/// s3s verbose events include response bodies and expected signatures. Keep
+/// diagnostics spans, but never let these events reach logs or OTLP exporters.
+pub(super) fn s3s_log_filter() -> FilterFn {
+    filter_fn(|metadata| {
+        !(metadata.is_event()
+            && (metadata.target() == "s3s" || metadata.target().starts_with("s3s::"))
+            && *metadata.level() > tracing::Level::INFO)
+    })
+}
+
 /// Build an `EnvFilter` from the given log level string.
 ///
 /// If `default_level` is provided, it is used directly. Otherwise, the
@@ -337,6 +347,47 @@ mod tests {
 
     fn http_log_directive(level: &str) -> String {
         format!("{HTTP_SERVER_LOG_TARGET}={level}")
+    }
+
+    #[test]
+    fn s3s_filter_blocks_credentials_despite_explicit_verbose_directives() {
+        use tracing_subscriber::prelude::*;
+        for directive in ["trace", concat!("trace,", "s3s::service=trace,", "s3s::ops::signature=debug")] {
+            let writer = SharedWriter::default();
+            let captured = Arc::clone(&writer.0);
+            let subscriber = tracing_subscriber::registry()
+                .with(EnvFilter::new(directive))
+                .with(s3s_log_filter())
+                .with(
+                    tracing_subscriber::fmt::layer()
+                        .without_time()
+                        .with_ansi(false)
+                        .with_writer(writer)
+                        .with_span_events(tracing_subscriber::fmt::format::FmtSpan::NEW),
+                );
+            with_default(subscriber, || {
+                let span = tracing::debug_span!(target: "s3s::service", "safe-operation-span");
+                let _entered = span.enter();
+                tracing::debug!(target: "s3s::service", response = "secret-response", "response dump");
+                tracing::trace!(target: "s3s", response = "secret-trace", "response dump");
+                tracing::debug!(target: "s3s::ops::signature", expected = "secret-signature", "signature mismatch");
+                tracing::info!(target: "s3s::service", "visible-info");
+                tracing::warn!(target: "s3s::service", "visible-warning");
+                tracing::debug!(target: "rustfs", "visible-rustfs-debug");
+                tracing::debug!(target: "s3s_other", "visible-other-target");
+            });
+            let output = String::from_utf8(captured.lock().expect("captured logs").clone()).expect("UTF-8 logs");
+            assert!(!output.contains("secret"), "{output}");
+            for expected in [
+                "safe-operation-span",
+                "visible-info",
+                "visible-warning",
+                "visible-rustfs-debug",
+                "visible-other-target",
+            ] {
+                assert!(output.contains(expected), "missing {expected}: {output}");
+            }
+        }
     }
 
     #[test]
