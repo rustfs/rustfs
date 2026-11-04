@@ -52,7 +52,6 @@ use crate::auth::is_request_presigned_signature_v4_with_query;
 use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 use crate::storage::storage_api::options_consumer::StorageObjectOptions as ObjectOptions;
 use s3s::dto::VersioningConfiguration;
-use url::form_urlencoded;
 
 /// Test-only counter of versioning-config fetches, used to pin that batch
 /// handlers resolve the configuration once per request, not once per key
@@ -1071,17 +1070,14 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
 /// protection. Streaming payloads are verified chunk by chunk by s3s and never
 /// produced a digest here.
 ///
-/// s3s reads the header only, and it reads it while it is still building the
-/// request body. The one case it does not cover is a presigned request whose
-/// digest arrives in the query string alone — including one the query-hoist
-/// later restores as a header, which happens only after s3s has already
-/// decided not to install a hash validator. So the question is not whether a
-/// digest header is present, but whether the digest reached the request as a
-/// query parameter: that one is always the storage layer's to verify
-/// (rustfs/rustfs#9146).
+/// s3s reads the header only. The one case it does not cover is a presigned
+/// request whose digest arrives in the query string alone, which is why that
+/// path still hands the digest to the storage layer. The query-hoist restores
+/// only `x-amz-meta-*` user metadata (rustfs/backlog#3143), so it never
+/// manufactures the header this checks for.
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
-        AuthType::Presigned if query_carries_content_sha256(query) => {
+        AuthType::Presigned if !headers.contains_key(AMZ_CONTENT_SHA256) => {
             if skip_content_sha256_cksum_with_query(headers, query) {
                 None
             } else {
@@ -1090,18 +1086,6 @@ pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, qu
         }
         _ => None,
     }
-}
-
-/// True when the request declares its payload hash as a query parameter.
-///
-/// That form is invisible to s3s's payload-hash input, so nothing has validated
-/// the body against it yet. `AMZ_CONTENT_SHA256` is matched case-insensitively
-/// because the presigner preserves the case the header was signed with.
-fn query_carries_content_sha256(query: Option<&str>) -> bool {
-    query.is_some_and(|query| {
-        form_urlencoded::parse(query.as_bytes())
-            .any(|(name, value)| name.eq_ignore_ascii_case(AMZ_CONTENT_SHA256) && !value.is_empty())
-    })
 }
 fn skip_content_sha256_cksum_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> bool {
     let include_query_values = matches!(get_request_auth_type_with_query(headers, query), AuthType::Presigned);
@@ -2883,27 +2867,6 @@ mod tests {
         );
 
         let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
-        assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
-    }
-
-    /// The query-hoist restores `?x-amz-content-sha256=<digest>` as a header
-    /// only after s3s has already built the body without a hash validator, so
-    /// the restored header must not be mistaken for one the auth layer is
-    /// enforcing (review of rustfs/rustfs#9146).
-    #[test]
-    fn presigned_request_with_hoisted_digest_is_still_verified_by_the_storage_layer() {
-        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256={PAYLOAD_SHA256}");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-content-sha256", HeaderValue::from_static(PAYLOAD_SHA256));
-        assert_eq!(
-            super::get_content_sha256_with_query(&headers, Some(&query)),
-            Some(PAYLOAD_SHA256.to_string())
-        );
-
-        // The unsigned form of a hoisted digest still opts out of hashing.
-        let query = format!("{PRESIGNED_QUERY}&x-amz-content-sha256=UNSIGNED-PAYLOAD");
-        let mut headers = HeaderMap::new();
-        headers.insert("x-amz-content-sha256", HeaderValue::from_static("UNSIGNED-PAYLOAD"));
         assert_eq!(super::get_content_sha256_with_query(&headers, Some(&query)), None);
     }
 

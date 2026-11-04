@@ -975,14 +975,15 @@ fn is_request_signature_v2(header: &HeaderMap) -> bool {
     false
 }
 
-/// True when `query` can name an `x-amz-*` request property at all. A single
-/// ASCII scan, so a request whose query only carries things like `versionId`
-/// never pays for a parse.
-fn query_may_carry_amz_params(query: &str) -> bool {
+/// True when `query` can name a user-metadata parameter at all. A single ASCII
+/// scan, so a request whose query only carries things like `versionId` or a
+/// typed property never pays for a parse.
+fn query_may_carry_user_metadata(query: &str) -> bool {
+    const NEEDLE: &[u8] = b"-meta-";
     query
         .as_bytes()
-        .windows(5)
-        .any(|window| window.eq_ignore_ascii_case(b"-amz-"))
+        .windows(NEEDLE.len())
+        .any(|window| window.eq_ignore_ascii_case(NEEDLE))
 }
 
 /// Restores signature-covered `x-amz-meta-*` user metadata as request headers.
@@ -1016,7 +1017,7 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     let Some(query) = query else {
         return Ok(());
     };
-    if !query_may_carry_amz_params(query) || is_request_signature_v2(headers) {
+    if !query_may_carry_user_metadata(query) || is_request_signature_v2(headers) {
         return Ok(());
     }
 
