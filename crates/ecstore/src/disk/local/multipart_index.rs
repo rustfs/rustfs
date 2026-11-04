@@ -12,6 +12,7 @@ use crate::disk::{
 };
 use rustfs_filemeta::{FileInfo, FileInfoOpts, get_file_info};
 use sha2::{Digest, Sha256};
+use std::future::Future;
 use std::{
     collections::{BTreeSet, HashMap},
     io,
@@ -32,7 +33,9 @@ static OWNERS: LazyLock<parking_lot::Mutex<HashMap<PhysicalRoot, Weak<IndexOwner
     LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 pub(super) struct IndexOwner {
-    root: os::PublicationRoot,
+    // Only the path: holding the disk's pinned root handle here would keep the
+    // mount alive past the last disk owner, which the disk lifecycle forbids.
+    root_path: Arc<PathBuf>,
     physical: PhysicalRoot,
     #[cfg(unix)]
     _identity_pin: std::fs::File,
@@ -44,6 +47,9 @@ pub(super) struct IndexOwner {
     // No persisted readiness is trusted: an old binary may have written while
     // this process was stopped. Same-process handles share the continuous owner.
     initialized: OnceLock<Arc<IndexBootstrap>>,
+    // Set while some task drives the bootstrap scan; cleared by that driver's
+    // drop so a cancelled scan can be resumed by the next caller.
+    driving: AtomicBool,
     disabled: AtomicBool,
     #[cfg(test)]
     rebuild_head_pause: parking_lot::Mutex<Option<RebuildHeadPause>>,
@@ -232,7 +238,7 @@ impl IndexOwner {
             pin
         };
         let owner = Arc::new(Self {
-            root: root.clone(),
+            root_path: Arc::new(root.path().to_path_buf()),
             physical: key,
             #[cfg(unix)]
             _identity_pin: identity_pin,
@@ -240,6 +246,7 @@ impl IndexOwner {
             epoch: Uuid::new_v4(),
             blocking_queue: os::register_disk_blocking_queue(logical_root, base),
             initialized: OnceLock::new(),
+            driving: AtomicBool::new(false),
             disabled: AtomicBool::new(false),
             #[cfg(test)]
             rebuild_head_pause: parking_lot::Mutex::new(None),
@@ -260,31 +267,46 @@ impl IndexOwner {
         self.blocking_queue.clone()
     }
 
-    /// Schedule one owned scan without delaying disk admission. Until EOF, callers
-    /// retain complete legacy discovery; a failed scan disables only this optimization.
-    pub(super) fn start(self: &Arc<Self>) {
-        self.initialized.get_or_init(|| {
-            let bootstrap = Arc::new(IndexBootstrap {
-                result: AtomicU8::new(0),
-                completed: Notify::new(),
-            });
-            let completion = bootstrap.clone();
-            let owner = self.clone();
-            tokio::spawn(async move {
-                let success = owner.rebuild().await.is_ok();
-                // A completion waiter may drop the final disk handle and reopen it.
-                // Release this boot owner before publishing completion to that waiter.
-                drop(owner);
-                completion.result.store(if success { 1 } else { 2 }, Ordering::Release);
-                completion.completed.notify_waiters();
-            });
-            bootstrap
-        });
+    /// Hand out the one owned bootstrap scan. The caller drives the returned
+    /// future on a task it already owns (the disk's cleanup loop), so no task is
+    /// spawned per disk and dropping the future releases this owner; the next
+    /// `start` resumes an unfinished scan. Until EOF, callers retain complete
+    /// legacy discovery; a failed scan disables only this optimization.
+    pub(super) fn start(self: &Arc<Self>) -> Option<impl Future<Output = ()> + Send + 'static> {
+        let bootstrap = self
+            .initialized
+            .get_or_init(|| {
+                Arc::new(IndexBootstrap {
+                    result: AtomicU8::new(0),
+                    completed: Notify::new(),
+                })
+            })
+            .clone();
+        if bootstrap.result.load(Ordering::Acquire) != 0 || self.driving.swap(true, Ordering::AcqRel) {
+            return None;
+        }
+        struct Driver(Arc<IndexOwner>);
+        impl Drop for Driver {
+            fn drop(&mut self) {
+                self.0.driving.store(false, Ordering::Release);
+            }
+        }
+        let driver = Driver(self.clone());
+        Some(async move {
+            let success = driver.0.rebuild().await.is_ok();
+            // A completion waiter may drop the final disk handle and reopen it.
+            // Release this boot owner before publishing completion to that waiter.
+            drop(driver);
+            bootstrap.result.store(if success { 1 } else { 2 }, Ordering::Release);
+            bootstrap.completed.notify_waiters();
+        })
     }
 
     #[cfg(any(test, feature = "test-util"))]
     pub(super) async fn initialize(self: &Arc<Self>) {
-        self.start();
+        if let Some(scan) = self.start() {
+            scan.await;
+        }
         let Some(bootstrap) = self.initialized.get() else {
             return;
         };
@@ -350,17 +372,18 @@ impl IndexOwner {
         }
         #[cfg(not(unix))]
         {
+            let root = os::PublicationRoot::new(&self.root_path)?;
             let directory = self.base.join(INDEX).join(sha(bucket));
             let marker = directory.join(source_root);
-            let _parents = os::mkdir_all_below_existing_base_std(&directory, &self.base, &self.root)?;
-            os::replace_multipart_source_metadata(&marker, b"1", &self.base, &self.root)?;
-            os::sync_multipart_owned_record_parents(&self.base.join(".rustfs.sys"), &directory, true, &self.base, &self.root)?;
+            let _parents = os::mkdir_all_below_existing_base_std(&directory, &self.base, &root)?;
+            os::replace_multipart_source_metadata(&marker, b"1", &self.base, &root)?;
+            os::sync_multipart_owned_record_parents(&self.base.join(".rustfs.sys"), &directory, true, &self.base, &root)?;
         }
         self.ensure_current_root()
     }
 
     fn ensure_current_root(&self) -> io::Result<()> {
-        let current = os::PublicationRoot::new(self.root.path())?.physical_identity()?;
+        let current = os::PublicationRoot::new(&self.root_path)?.physical_identity()?;
         if current != self.physical {
             self.disabled.store(true, Ordering::Release);
             return Err(io::Error::other("multipart index physical root changed"));
@@ -389,7 +412,8 @@ impl IndexOwner {
         #[cfg(not(unix))]
         {
             let path = self.base.join(relative);
-            let guard = os::pin_multipart_source_directory(&path, &self.base, &self.root)?;
+            let root = os::PublicationRoot::new(&self.root_path)?;
+            let guard = os::pin_multipart_source_directory(&path, &self.base, &root)?;
             Ok(IndexDirectory { path, _guard: guard })
         }
     }

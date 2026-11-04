@@ -8135,8 +8135,6 @@ impl LocalDisk {
             Self::check_startup_writable(&disk.publication_root, &disk.root.join(directory)).await?;
         }
 
-        disk.multipart_index.start();
-
         let (exit_tx, exit_rx) = tokio::sync::broadcast::channel(1);
         disk.exit_signal = Some(exit_tx);
 
@@ -8147,6 +8145,7 @@ impl LocalDisk {
             publication_root,
             #[cfg(target_os = "linux")]
             disk.mount_lease.clone(),
+            disk.multipart_index.clone(),
             exit_rx,
         ));
         debug!(
@@ -8165,8 +8164,19 @@ impl LocalDisk {
         root: PathBuf,
         publication_root: os::PublicationRoot,
         #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
+        multipart_index: Arc<multipart_index::IndexOwner>,
         mut exit_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
+        // The multipart index bootstrap rides this task instead of its own:
+        // the disk lifecycle accounts for exactly this background task, and
+        // stopping the disk abandons the scan (a reconnect resumes it).
+        if let Some(bootstrap) = multipart_index.start() {
+            tokio::select! {
+                _ = bootstrap => {}
+                _ = exit_rx.recv() => return,
+            }
+        }
+        drop(multipart_index);
         let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
