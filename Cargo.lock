@@ -10114,9 +10114,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kafka"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bd2f8b46ec4dd462c2235948d1efa2103957230c171e118c6ff8e5d1a845ab48"
+checksum = "82dc39ba1a5a9f6b2e49decb0b54c23ebaebdfb08a899307c266694bfd269bf9"
 dependencies = [
  "base64 0.23.1",
  "bytes",
@@ -10139,9 +10139,9 @@ dependencies = [
 
 [[package]]
 name = "rustfs-kafka-async"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b3b98705f6f9f5071b8793d29935de764c31668c6e9877553b229eb67127af6"
+checksum = "684f5e78ea1421bbf915e4cd0515bdefd587cfa281da000e41ae4a434f90195a"
 dependencies = [
  "base64 0.23.1",
  "bytes",
