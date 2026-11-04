@@ -10020,6 +10020,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 && !guarded
                 && goi.name.is_empty()
             {
+                // Recovery can restore or retire versions of this key
+                // (rolling back an interrupted prepared delete brings a
+                // retained version back). A pre-fetched read for a later
+                // duplicate of the same name would still report the stale
+                // miss and skip its object-lock check — bypassing retention —
+                // so evict those entries and let the loop re-read them live.
+                for (other_index, other) in objects.iter().enumerate() {
+                    if other_index != i && other.object_name == dobj.object_name {
+                        source_reads.remove(&other_index);
+                    }
+                }
                 let recovery = self
                     .recover_delete_key(
                         bucket,

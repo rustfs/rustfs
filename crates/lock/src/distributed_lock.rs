@@ -810,10 +810,12 @@ impl DistributedLock {
             }
         }
 
-        // Awaited so a caller that falls back per key cannot race these
-        // unlocks (the distributed release on drop is fire-and-forget).
+        // One bounded synchronous pass so the caller cannot race these
+        // unlocks on an immediate retry; anything a slow peer still holds
+        // keeps retrying in the background instead of parking the request
+        // on the deferred unlock schedule.
         if !orphaned_entries.is_empty() {
-            Self::release_entries(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
+            Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
         }
         results
     }
@@ -877,6 +879,19 @@ impl DistributedLock {
             "distributed unlock left unreleased entries after retry; continuing with deferred retries"
         );
         Self::release_entries_deferred(pending, context).await;
+    }
+
+    /// Release entries with one synchronous pass, then continue the retry
+    /// schedule in the background.
+    ///
+    /// The batch-acquire rollback path runs on the request: it must not park
+    /// the caller on the deferred unlock schedule when a peer is unreachable,
+    /// while still confirming the healthy quorum is free before returning.
+    async fn release_entries_bounded(entries: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
+        let pending = Self::release_pending_once(entries, 1, context).await;
+        if !pending.is_empty() {
+            Self::spawn_release_cleanup(pending, context);
+        }
     }
 
     async fn release_pending_once(
