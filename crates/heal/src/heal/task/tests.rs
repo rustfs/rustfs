@@ -1056,6 +1056,7 @@ async fn automatic_replacement_uses_target_scoped_format() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let disk = make_resume_disk(&temp).await;
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         resume_disk: Mutex::new(Some(disk.clone())),
         ..Default::default()
@@ -1264,6 +1265,7 @@ async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let first_identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
     let second_identity = replacement_identity("replacement-a", "device-b", "filesystem-b");
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([
             vec![first_identity.clone()],
@@ -1330,6 +1332,7 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
     .await
     .expect("existing intent should be stored on the non-target anchor");
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
         ..Default::default()
@@ -2998,6 +3001,7 @@ async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_pers
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
         replacement_execution_fixture: Mutex::new(Some(execution)),
@@ -3012,7 +3016,9 @@ async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_pers
         let task = task.clone();
         async move { task.execute().await }
     });
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("owned format I/O must start");
     waiter.abort();
     assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
     task.cancel_token.cancel();
@@ -3122,6 +3128,7 @@ async fn replacement_format_failures_keep_the_durable_budget_across_new_executor
     request.heal_endpoints = vec!["replacement-a".to_string()];
     for _attempt in 1..=3 {
         let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
             replacement_target_identities_ready: Mutex::new(true),
             resume_disk: Mutex::new(Some(disk.clone())),
             format_error: Mutex::new(Some(Error::other("injected format failure"))),
@@ -5683,6 +5690,7 @@ async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
         replacement_execution_fixture: Mutex::new(Some(execution)),
@@ -5699,7 +5707,9 @@ async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_
         let task = task.clone();
         async move { task.execute_owned(Some(parent)).await }
     });
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("owned format I/O must start");
     waiter.abort();
     assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
     task.cancel_token.cancel();

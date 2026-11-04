@@ -949,8 +949,65 @@ pub enum ShardIntegrityWriteMode {
     Protected,
 }
 
+/// Shared foreground recovery allowance. Clones of ObjectOptions retain one request budget.
+/// Credits cover directory entries (including a minimum charge for an empty probe) and
+/// transaction inspections. Failed/cancelled probes keep their worst-case reservation.
+#[derive(Debug)]
+pub struct DeleteRecoveryWorkBudget {
+    remaining: std::sync::atomic::AtomicU32,
+}
+
+/// Entries one disk may reserve up front per recovery step (discovery plus
+/// inspection). Every disk of every set a request fans out to reserves this
+/// much before any refund arrives, so a budget must cover that many disks.
+const DELETE_RECOVERY_RESERVATION_PER_DISK: u32 = 4096 + 65_536;
+
+impl Default for DeleteRecoveryWorkBudget {
+    /// Covers a full 16-drive set with headroom; `for_disks` scales it when a
+    /// request spans more drives than that.
+    fn default() -> Self {
+        Self::new(16 * 1024 * 1024)
+    }
+}
+
+impl DeleteRecoveryWorkBudget {
+    /// A per-request budget sized for `disks` concurrent up-front reservations.
+    pub(crate) fn for_disks(disks: usize) -> Self {
+        let per_disk = u64::from(DELETE_RECOVERY_RESERVATION_PER_DISK) * 2;
+        let scaled = u64::try_from(disks).unwrap_or(u64::MAX).saturating_mul(per_disk);
+        let default = u64::from(Self::default().remaining());
+        Self::new(u32::try_from(scaled.max(default)).unwrap_or(u32::MAX))
+    }
+
+    pub(crate) fn new(entries: u32) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicU32::new(entries),
+        }
+    }
+
+    pub(crate) fn reserve(&self, maximum: u32) -> crate::disk::error::Result<u32> {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                (remaining > 0).then(|| remaining.saturating_sub(maximum))
+            })
+            .map(|remaining| remaining.min(maximum))
+            .map_err(|_| crate::disk::error::DiskError::DeleteRecoveryWorkLimit)
+    }
+
+    pub(crate) fn remaining(&self) -> u32 {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    pub(crate) fn refund(&self, unused: u32) {
+        self.remaining.fetch_add(unused, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    #[doc(hidden)]
+    pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
@@ -1102,6 +1159,12 @@ pub struct ObjectOptions {
     pub expiration: ExpirationOptions,
     pub lifecycle_audit_event: LcAuditEvent,
 
+    /// In-process request gate evaluated on authoritative completion metadata.
+    /// Not persisted or sent over RPC. The trait deliberately has no Debug bound:
+    /// implementations may own customer encryption keys.
+    #[doc(hidden)]
+    pub multipart_completion_authorization:
+        Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartCompletionAuthorization<Error = Error>>>,
     pub eval_metadata: Option<HashMap<String, String>>,
     /// Internal compare-and-set condition for replication workers publishing
     /// terminal status after remote I/O. Storage validates it while holding
@@ -1115,6 +1178,10 @@ pub struct ObjectOptions {
     /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
     /// before a destructive commit reaches the set layer.
     pub object_lock_config_snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
+    /// ECStore single PUTs acquire their destructive-write configuration guards
+    /// only after staging the client body. External lock owners supply a snapshot.
+    #[doc(hidden)]
+    pub defer_put_object_lock_snapshot: bool,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
@@ -1146,6 +1213,11 @@ pub enum ReplicationStatusWritebackMode {
 }
 
 impl ObjectOptions {
+    pub(crate) fn ensure_delete_recovery_work_budget(&mut self) {
+        self.delete_recovery_work_budget
+            .get_or_insert_with(|| Arc::new(DeleteRecoveryWorkBudget::default()));
+    }
+
     pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
         match self.shard_integrity_write_mode {
             Some(ShardIntegrityWriteMode::Protected) => true,

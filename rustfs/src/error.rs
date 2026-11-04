@@ -820,7 +820,7 @@ impl From<StorageError> for ApiError {
             // Retryable on an upgraded node (or once the cluster upgrade
             // completes); see UNSUPPORTED_PARTICIPANT_MESSAGE.
             StorageError::UnsupportedDisk => S3ErrorCode::ServiceUnavailable,
-            StorageError::SlowDown => S3ErrorCode::SlowDown,
+            StorageError::SlowDown | StorageError::DeleteRecoveryWorkLimit => S3ErrorCode::SlowDown,
             StorageError::FaultyDisk
             | StorageError::FaultyRemoteDisk
             | StorageError::DiskNotFound
@@ -2486,6 +2486,7 @@ mod tests {
             (StorageError::StorageFull, S3ErrorCode::ServiceUnavailable),
             (StorageError::UnsupportedDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::SlowDown, S3ErrorCode::SlowDown),
+            (StorageError::DeleteRecoveryWorkLimit, S3ErrorCode::SlowDown),
             (StorageError::FaultyDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::DiskNotFound, S3ErrorCode::ServiceUnavailable),

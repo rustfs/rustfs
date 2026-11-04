@@ -423,8 +423,6 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
     !is_meta_bucketname(&oi.bucket)
 }
 
-const MAX_UPLOADS_LIST: usize = 10000;
-
 mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;

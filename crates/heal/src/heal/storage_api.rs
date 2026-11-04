@@ -98,10 +98,19 @@ pub(crate) mod storage {
     };
 
     #[cfg(test)]
-    pub(crate) use super::storage_contracts::DeleteBucketOptions;
+    pub(crate) use super::storage_contracts::{DeleteBucketOptions, MakeBucketOptions};
 }
 
 #[cfg(test)]
 pub(crate) mod status {
     pub(crate) use super::storage_contracts::BucketInfo;
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    pub(crate) use rustfs_ecstore::api::bucket::metadata_sys::{
+        init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks,
+    };
+    pub(crate) use rustfs_ecstore::api::config::com::{delete_config, read_config, save_config};
+    pub(crate) use rustfs_ecstore::api::object::{ObjectOptions, PutObjReader};
 }

@@ -77,6 +77,9 @@ pub enum Error {
     #[error("Replacement target is not ready: {0}")]
     ReplacementTargetNotReady(String),
 
+    #[error("Replacement bucket namespace changed; a fresh identity-bound pass is required")]
+    ReplacementNamespaceChanged,
+
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
 
@@ -132,7 +135,10 @@ impl Error {
     /// Callers must cut their own concurrency instead of retrying at full speed.
     pub(crate) fn is_slow_down(&self) -> bool {
         match self {
-            Error::Storage(error) => matches!(error, EcstoreError::SlowDown | EcstoreError::TooManyOpenFiles),
+            Error::Storage(error) => matches!(
+                error,
+                EcstoreError::SlowDown | EcstoreError::TooManyOpenFiles | EcstoreError::DeleteRecoveryWorkLimit
+            ),
             Error::Disk(error) => matches!(error, DiskError::TooManyOpenFiles),
             Error::TransientSkip { message } | Error::Other(message) | Error::TaskExecutionFailed { message } => {
                 message.contains("Please reduce your request rate")
@@ -229,9 +235,10 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
         Error::DanglingDeleteDeferred { retry_not_before } => HealErrorClass::DanglingGrace {
             retry_not_before: Some(*retry_not_before),
         },
-        Error::ReplacementTargetNotReady(_) | Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => {
-            HealErrorClass::Transient
-        }
+        Error::ReplacementTargetNotReady(_)
+        | Error::ReplacementNamespaceChanged
+        | Error::TransientSkip { .. }
+        | Error::BucketDiscoveryIncomplete => HealErrorClass::Transient,
         Error::LegacyMrfUnverified { .. } => HealErrorClass::Permanent,
         Error::Storage(error) => classify_storage_error(error),
         Error::Disk(error) => classify_disk_error(error),
@@ -285,6 +292,7 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         | EcstoreError::FaultyDisk
         | EcstoreError::FaultyRemoteDisk
         | EcstoreError::SlowDown
+        | EcstoreError::DeleteRecoveryWorkLimit
         | EcstoreError::OperationCanceled
         | EcstoreError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
         _ if error.is_quorum_error() => HealErrorClass::Transient,

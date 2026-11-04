@@ -64,6 +64,10 @@ impl MetadataProvider {
         }
     }
 
+    pub(crate) fn source_column_count(&self) -> usize {
+        self.provider.schema().fields().len()
+    }
+
     fn build_table_handle(&self) -> datafusion::common::Result<TableHandle> {
         self.current_session_table_provider.build_table_handle(self.provider.clone())
     }

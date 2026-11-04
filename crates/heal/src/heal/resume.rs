@@ -27,6 +27,7 @@ use super::{
     BUCKET_META_PREFIX, DiskError, DiskStore, HealDiskExt as _, RUSTFS_META_BUCKET, storage_api::owner::EcstoreDiskBytes,
 };
 
+mod bucket_pass;
 mod checkpoint;
 mod gc;
 mod handoff;
@@ -345,6 +346,16 @@ pub struct ResumeState {
     /// input after restart.
     #[serde(default)]
     pub replacement_buckets: Vec<String>,
+    /// Current namespace pass, separate from the immutable generation plan.
+    /// Legacy snapshots have no binding and must discard every old cursor.
+    #[serde(default)]
+    pub replacement_bucket_incarnations: Option<std::collections::BTreeMap<String, Uuid>>,
+    /// Last proven retired identity per name, retained for returning stale volumes.
+    #[serde(default)]
+    pub replacement_retired_bucket_incarnations: std::collections::BTreeMap<String, Uuid>,
+    /// Reapply the checkpoint rewind after any interruption between the two writes.
+    #[serde(default)]
+    pub replacement_bucket_pass_reset_pending: bool,
     /// A task-scoped generation assigned before formatting an automatic
     /// replacement. A new unformatted replacement receives a new generation
     /// and therefore cannot reuse an older disk's cursor or checkpoint.
@@ -454,6 +465,9 @@ impl ResumeState {
             replacement_targets: Vec::new(),
             replacement_target_identities: Vec::new(),
             replacement_buckets: Vec::new(),
+            replacement_bucket_incarnations: None,
+            replacement_retired_bucket_incarnations: std::collections::BTreeMap::new(),
+            replacement_bucket_pass_reset_pending: false,
             replacement_generation: None,
             replacement_phase: ReplacementPhase::None,
             replacement_execution_protocol: 0,
@@ -985,7 +999,16 @@ impl ResumeManager {
                     return Err(replacement_recovery_conflict("invalid retired legacy generation"));
                 }
             }
-            if state.replacement_execution_protocol != 1
+            let valid_execution_protocol = match state.replacement_execution_protocol {
+                1 => state.replacement_bucket_incarnations.is_none(),
+                2 => state
+                    .replacement_bucket_incarnations
+                    .as_ref()
+                    .is_some_and(|identities| identities.values().all(|incarnation| !incarnation.is_nil())),
+                _ => false,
+            };
+            if !valid_execution_protocol
+                || state.replacement_retired_bucket_incarnations.values().any(Uuid::is_nil)
                 || state.replacement_predecessor.as_deref()
                     != state.replacement_lineage.last().map(|link| link.predecessor.as_str())
             {

@@ -356,6 +356,60 @@ async fn restarted_main_loop_completes_durable_pause_backlog_catch_up() {
 
 #[tokio::test]
 #[serial]
+async fn running_main_loop_starts_next_cycle_despite_maintenance_config_churn() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("2")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        global_metrics().set_cycle(None).await;
+        let (_temp_dir, store) = setup_scanner_cycle_store().await;
+        let ctx = CancellationToken::new();
+        let ready = ScannerRuntimeObservedProbe::install(&store, false);
+        let scanner_ctx = ctx.clone();
+        let scanner_store = store.clone();
+        let scanner_task = tokio::spawn(async move { run_data_scanner(scanner_ctx, scanner_store).await });
+        ready.wait().await;
+        let ScannerCycleStateStartup::Ready { cycle: initial, .. } = load_scanner_cycle_state_for_startup(store.clone()).await
+        else {
+            panic!("initial scanner cycle must persist its state");
+        };
+        drop(ready);
+        let churn_ctx = ctx.clone();
+        let churn = tokio::spawn(async move {
+            loop {
+                crate::scanner_io::record_scanner_maintenance_change("churning-lifecycle");
+                tokio::select! {
+                    _ = churn_ctx.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        });
+        let progressed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let ScannerCycleStateStartup::Ready { cycle, .. } = load_scanner_cycle_state_for_startup(store.clone()).await
+                    && cycle.next > initial.next
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        ctx.cancel();
+        churn.await.expect("churn task");
+        tokio::time::timeout(Duration::from_secs(5), scanner_task)
+            .await
+            .expect("scanner cancellation")
+            .expect("scanner task")
+            .expect("scanner exit");
+        assert!(progressed.is_ok(), "maintenance wakes must not indefinitely move the next cycle deadline");
+        global_metrics().set_cycle(None).await;
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
 async fn running_main_loop_catches_up_pause_cleared_after_startup_observe() {
     temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("1")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
         crate::runtime_config::refresh_scanner_runtime_config_for_tests();

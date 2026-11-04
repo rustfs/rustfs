@@ -505,8 +505,12 @@ pub(crate) mod ecstore_data_usage {
 
 #[allow(unused_imports)]
 pub(crate) mod ecstore_disk {
+    #[cfg(test)]
+    pub(crate) use rustfs_ecstore::api::disk::wait_for_multipart_index_bootstrap;
     pub(crate) use rustfs_ecstore::api::disk::{
-        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
+        BUCKET_META_PREFIX, BatchReadVersionReq, BatchReadVersionResp, BoundedDeleteRecoveryDiscovery,
+        BoundedDeleteRecoveryInspection, BoundedDeleteRecoverySettlement, BoundedDeleteRecoverySettlementReply, CheckPartsResp,
+        ConditionalFileUpdate, DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES, DELETE_RECOVERY_MAX_INSPECTION_ENTRIES,
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
         DiskInfoOptions, DiskStore, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
@@ -522,6 +526,10 @@ pub(crate) mod ecstore_disk {
     pub(crate) use rustfs_ecstore::api::disk::{
         CurrentDeleteGeneration, DiskOption, capture_source_condition, new_disk, strip_native_controls,
         with_background_resource_unit,
+    };
+    pub(crate) use rustfs_ecstore::api::disk::{
+        MULTIPART_INDEX_RPC_MAX_BYTES, MULTIPART_INDEX_RPC_MAX_REQUEST_BYTES, MultipartIndexPage, MultipartIndexRpcReply,
+        MultipartIndexRpcRequest,
     };
     pub(crate) use rustfs_ecstore::api::disk::{endpoint, error, error_reduce};
 }
@@ -781,6 +789,10 @@ pub(crate) type ReadMultipleReq = ecstore_disk::ReadMultipleReq;
 pub(crate) type ReadMultipleResp = ecstore_disk::ReadMultipleResp;
 pub(crate) type ReadOptions = ecstore_disk::ReadOptions;
 pub(crate) type OldCurrentSize = ecstore_disk::OldCurrentSize;
+pub(crate) type BoundedDeleteRecoveryDiscovery = ecstore_disk::BoundedDeleteRecoveryDiscovery;
+pub(crate) type BoundedDeleteRecoveryInspection = ecstore_disk::BoundedDeleteRecoveryInspection;
+pub(crate) type BoundedDeleteRecoverySettlement = ecstore_disk::BoundedDeleteRecoverySettlement;
+pub(crate) type BoundedDeleteRecoverySettlementReply = ecstore_disk::BoundedDeleteRecoverySettlementReply;
 pub(crate) type DeleteRecoveryCursor = ecstore_disk::DeleteRecoveryCursor;
 pub(crate) type DeleteRecoveryPage = ecstore_disk::DeleteRecoveryPage;
 pub(crate) type DeleteRecoveryInspection = ecstore_disk::DeleteRecoveryInspection;
@@ -1456,6 +1468,12 @@ pub(crate) async fn try_migrate_server_config(store: Arc<ECStore>) {
 }
 
 pub(crate) trait StorageDiskRpcExt {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> DiskResult<ecstore_disk::MultipartIndexPage>;
+
     async fn supports_guarded_delete_versions(&self) -> DiskResult<()>;
     async fn delete_versions_guarded_recoverable(
         &self,
@@ -1553,6 +1571,24 @@ pub(crate) trait StorageDiskRpcExt {
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>>;
     async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> DiskResult<bool>;
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> DiskResult<BoundedDeleteRecoveryDiscovery>;
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        max_entries: u32,
+    ) -> DiskResult<BoundedDeleteRecoveryInspection>;
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: BoundedDeleteRecoverySettlement,
+    ) -> DiskResult<BoundedDeleteRecoverySettlementReply>;
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -1597,6 +1633,13 @@ impl<T> StorageDiskRpcExt for T
 where
     T: ecstore_disk::DiskAPI,
 {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> DiskResult<ecstore_disk::MultipartIndexPage> {
+        ecstore_disk::DiskAPI::list_multipart_index_roots(self, bucket, marker).await
+    }
     async fn supports_guarded_delete_versions(&self) -> DiskResult<()> {
         ecstore_disk::DiskAPI::supports_guarded_delete_versions(self).await
     }
@@ -1780,6 +1823,30 @@ where
         ecstore_disk::DiskAPI::has_delete_transaction_evidence(self, volume, object).await
     }
 
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> DiskResult<BoundedDeleteRecoveryDiscovery> {
+        ecstore_disk::DiskAPI::discover_delete_transactions_bounded(self, volume, object, max_entries).await
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        max_entries: u32,
+    ) -> DiskResult<BoundedDeleteRecoveryInspection> {
+        ecstore_disk::DiskAPI::inspect_delete_transaction_bounded(self, volume, object, transaction, max_entries).await
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: BoundedDeleteRecoverySettlement,
+    ) -> DiskResult<BoundedDeleteRecoverySettlementReply> {
+        ecstore_disk::DiskAPI::settle_delete_transaction_bounded(self, volume, request, None).await
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,

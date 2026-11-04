@@ -256,6 +256,38 @@ pub const BUCKET_POLICY_CONFIG: &str = "policy.json";
 pub const BUCKET_NOTIFICATION_CONFIG: &str = "notification.xml";
 pub const BUCKET_LIFECYCLE_CONFIG: &str = "lifecycle.xml";
 pub const BUCKET_SSECONFIG: &str = "bucket-encryption.xml";
+/// Shared tag-entry validation for object requests and persisted bucket tags.
+pub fn validate_tag_set_entries(tag_set: &[s3s::dto::Tag]) -> std::result::Result<(), &'static str> {
+    fn is_valid_tag_text(value: &str) -> bool {
+        static VALID_TAG_TEXT: std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>> = std::sync::OnceLock::new();
+        VALID_TAG_TEXT
+            .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$"))
+            .as_ref()
+            .is_ok_and(|pattern| pattern.is_match(value))
+    }
+    let mut keys = std::collections::HashSet::with_capacity(tag_set.len());
+    for tag in tag_set {
+        let key = tag
+            .key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or("Tag key cannot be empty")?;
+        if key.encode_utf16().count() > 128 || !is_valid_tag_text(key) {
+            return Err("The TagKey you have provided is invalid");
+        }
+        let value = tag.value.as_deref().ok_or("Tag value cannot be null")?;
+        if value.encode_utf16().count() > 256 || !is_valid_tag_text(value) {
+            return Err("The TagValue you have provided is invalid");
+        }
+        if !keys.insert(key) {
+            return Err("Cannot provide multiple Tags with the same key");
+        }
+    }
+    Ok(())
+}
+
+pub const MAX_BUCKET_TAGS: usize = 50;
+
 pub const BUCKET_TAGGING_CONFIG: &str = "tagging.xml";
 pub const BUCKET_QUOTA_CONFIG_FILE: &str = "quota.json";
 pub const OBJECT_LOCK_CONFIG: &str = "object-lock.xml";
@@ -990,6 +1022,20 @@ impl BucketMetadata {
                 self.encryption_config_updated_at = updated;
             }
             BUCKET_TAGGING_CONFIG => {
+                if !data.is_empty() {
+                    let tagging = deserialize::<Tagging>(&data).map_err(|_| {
+                        Error::InvalidArgument(self.name.clone(), String::new(), "Invalid bucket tagging XML".to_owned())
+                    })?;
+                    if tagging.tag_set.len() > MAX_BUCKET_TAGS {
+                        return Err(Error::InvalidArgument(
+                            self.name.clone(),
+                            String::new(),
+                            "Cannot have more than 50 tags per bucket".to_owned(),
+                        ));
+                    }
+                    validate_tag_set_entries(&tagging.tag_set)
+                        .map_err(|message| Error::InvalidArgument(self.name.clone(), String::new(), message.to_owned()))?;
+                }
                 self.tagging_config_xml = data;
                 // Drop the parsed form (like lifecycle above) so clearing the
                 // payload can't leave stale parsed tags to be cached.
@@ -1784,6 +1830,31 @@ mod test {
     /// backlog#2292: a replicated config is stamped with the source
     /// `updated_at` it was given, not the local clock, while the plain
     /// `update_config` entry keeps stamping the local clock.
+    #[test]
+    fn bucket_tag_updates_reject_unreadable_shapes_without_replacing_metadata() {
+        let mut metadata = BucketMetadata::new("validated-tags");
+        let valid = br#"<Tagging><TagSet><Tag><Key>team</Key><Value></Value></Tag></TagSet></Tagging>"#.to_vec();
+        metadata
+            .update_config(BUCKET_TAGGING_CONFIG, valid.clone())
+            .expect("empty value is valid");
+        let updated = metadata.tagging_config_updated_at;
+        for invalid in [
+            "<Tagging><TagSet><Tag><Key>team</Key></Tag></TagSet></Tagging>".to_owned(),
+            "<Tagging><TagSet><Tag><Key></Key><Value>x</Value></Tag></TagSet></Tagging>".to_owned(),
+            "<Tagging><TagSet><Tag><Key>team</Key><Value>x</Value></Tag><Tag><Key>team</Key><Value>y</Value></Tag></TagSet></Tagging>".to_owned(),
+            format!("<Tagging><TagSet>{}</TagSet></Tagging>", (0..51).map(|i| format!("<Tag><Key>k{i}</Key><Value>v</Value></Tag>")).collect::<String>()),
+        ] {
+            assert!(metadata.update_config_at(BUCKET_TAGGING_CONFIG, invalid.into_bytes(), updated + time::Duration::hours(1)).is_err());
+            assert_eq!(metadata.tagging_config_xml, valid);
+            assert_eq!(metadata.tagging_config_updated_at, updated);
+        }
+        metadata.tagging_config_xml = b"legacy corrupt tags".to_vec();
+        metadata
+            .update_config(BUCKET_TAGGING_CONFIG, Vec::new())
+            .expect("deletion repairs legacy corruption");
+        assert!(metadata.tagging_config_xml.is_empty());
+    }
+
     #[test]
     fn update_config_at_stamps_the_given_time_and_update_config_stamps_now() {
         let source_time = OffsetDateTime::now_utc() - time::Duration::hours(3);

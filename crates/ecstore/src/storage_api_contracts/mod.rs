@@ -52,8 +52,8 @@ pub(crate) mod list {
 
 pub(crate) mod multipart {
     pub(crate) use rustfs_storage_api::{
-        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartOperations, MultipartUploadInspection,
-        MultipartUploadResult, PartInfo,
+        CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartCompletionAuthorization, MultipartInfo, MultipartOperations,
+        MultipartUploadInspection, MultipartUploadResult, PartInfo,
     };
 }
 
