@@ -5019,6 +5019,11 @@ impl DiskHealthEntry {
 #[error("committed system metadata write requires repair by its owning writer")]
 pub(crate) struct SystemMetadataRepairRequired;
 
+/// An inline metadata write was rejected before staging or commit began.
+#[derive(Debug, thiserror::Error)]
+#[error("system metadata write rejected before staging: {0}")]
+pub(crate) struct SystemMetadataWriteNotStarted(#[source] pub(crate) Error);
+
 impl SetDisks {
     pub(in crate::set_disk) async fn persist_delete_marker_purge(
         &self,

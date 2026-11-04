@@ -4526,7 +4526,16 @@ impl SetDisks {
                     "Set disk write quorum unavailable"
                 );
                 if let Some(write_err) = reduce_write_quorum_errs(&errors, OBJECT_OP_IGNORED_ERRS, write_quorum) {
-                    return Err(to_object_err(write_err.into(), vec![bucket, object]));
+                    let error = to_object_err(write_err.into(), vec![bucket, object]);
+                    if direct_inline_commit
+                        && is_meta_bucketname(bucket)
+                        && opts.write_completion == crate::object_api::WriteCompletion::TailDrainedWithOwnerRepair
+                    {
+                        // Inline writer setup only checks disk availability;
+                        // no shard or metadata write has been dispatched yet.
+                        return Err(Error::other(crate::set_disk::SystemMetadataWriteNotStarted(error)));
+                    }
+                    return Err(error);
                 }
 
                 return Err(Error::other(format!("not enough disks to write: {errors:?}")));
