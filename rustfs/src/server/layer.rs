@@ -34,7 +34,6 @@ use crate::storage_api::server::layer::batch_diagnostic;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
 use futures::future::Either;
-use http::header::HeaderName;
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
@@ -1860,85 +1859,6 @@ where
 /// rulings of [`crate::auth::reject_unsigned_amz_headers_on_sigv4_request`]
 /// must be applied here, in front of s3s. Rejections carry the same S3 error
 /// document the access layer would have produced.
-/// SigV4 query parameters that carry authentication state rather than a request
-/// property. They must not be restored as headers: the verifier reads them from
-/// the query, and `x-amz-security-token` in particular would otherwise look like
-/// an unsigned `x-amz-*` header to [`reject_unsigned_amz_headers_on_presigned_request`].
-///
-/// [`reject_unsigned_amz_headers_on_presigned_request`]: crate::auth::reject_unsigned_amz_headers_on_presigned_request
-const SIGV4_QUERY_AUTH_PARAMS: &[&str] = &[
-    "x-amz-algorithm",
-    "x-amz-credential",
-    "x-amz-date",
-    "x-amz-expires",
-    "x-amz-signedheaders",
-    "x-amz-signature",
-    "x-amz-security-token",
-    "x-amz-region-set",
-];
-
-/// Restores the `x-amz-*` request properties the SigV4 presigners hoist into
-/// the query string back into the request headers.
-///
-/// The AWS SDK presigners move every signable `x-amz-*` header into the query
-/// (`@smithy/signature-v4` `moveHeadersToQuery`) so an uploader does not have to
-/// resend them, and AWS S3 serves the request as if the headers were still
-/// there. RustFS dropped the hoisted form, so a presigned upload lost its user
-/// metadata (rustfs/rustfs#9142), its tagging, its storage class, its object
-/// lock settings and its copy source. Doing this once at the request boundary
-/// means every downstream reader — s3s input parsing,
-/// `extract_metadata_from_mime`, the snowball extract trigger and its
-/// transport-key filter — sees an ordinary header and needs no query knowledge.
-///
-/// Only a query the SigV4 signature covers is honored: on SigV2 the query is
-/// not signed, so honoring it would let the holder of a presigned URL add
-/// object properties the presigner never authorized (for example
-/// `x-amz-meta-snowball-auto-extract`, which triggers tar extraction).
-///
-/// An existing header always wins, so this never overwrites what the client
-/// sent and the unsigned-header guard keeps rejecting anything the signer did
-/// not sign. Keys and values that could not have arrived as a header are
-/// rejected rather than silently dropped or stored: the read path rebuilds them
-/// as header fields, where a control character would fail every `HeadObject` of
-/// that object.
-pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> Result<(), S3Error> {
-    let Some(query) = query.map(str::to_owned) else {
-        return Ok(());
-    };
-    if !crate::auth::query_string_is_signed(headers, &query) {
-        return Ok(());
-    }
-    let mut seen = std::collections::HashSet::new();
-    for (name, value) in url::form_urlencoded::parse(query.as_bytes()) {
-        // Query parameter names keep whatever case the signer used (`X-Amz-Meta-User-Id`
-        // is what a hoist produces), so match the prefix the way `HeaderName` would.
-        if !rustfs_utils::http::metadata_compat::starts_with_ignore_ascii_case(&name, "x-amz-")
-            || SIGV4_QUERY_AUTH_PARAMS.iter().any(|param| name.eq_ignore_ascii_case(param))
-        {
-            continue;
-        }
-        if !seen.insert(name.to_ascii_lowercase()) {
-            return Err(S3Error::with_message(
-                S3ErrorCode::InvalidArgument,
-                "Duplicate x-amz request parameters in the request query string".to_owned(),
-            ));
-        }
-        let header_name = HeaderName::from_bytes(name.as_bytes()).map_err(|_| {
-            S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid x-amz request parameter name".to_owned())
-        })?;
-        let header_value = HeaderValue::from_bytes(value.as_bytes()).map_err(|_| {
-            S3Error::with_message(
-                S3ErrorCode::InvalidArgument,
-                "x-amz request parameter values must be valid HTTP header values".to_owned(),
-            )
-        })?;
-        if headers.contains_key(&header_name) {
-            continue;
-        }
-        headers.insert(header_name, header_value);
-    }
-    Ok(())
-}
 
 #[derive(Clone, Default)]
 pub struct SigV4HeaderGuardLayer;
@@ -4199,7 +4119,8 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
-    use crate::auth::reject_unsigned_amz_headers_on_presigned_request;
+    use crate::auth::{hoist_signed_query_params, reject_unsigned_amz_headers_on_presigned_request};
+    use http::header::HeaderName;
 
     /// A SigV4 presigned query: the presigner moved the request's `x-amz-*`
     /// headers into it and every parameter is covered by the signature.
@@ -4218,8 +4139,8 @@ mod tests {
             .uri(format!("/bucket/key?{uri_query}"))
             .body(())
             .expect("request");
-        let query = req.uri().query().map(str::to_owned);
-        hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref())?;
         Ok(req)
     }
 
@@ -4246,8 +4167,8 @@ mod tests {
             .header("x-amz-meta-user-id", "from-header")
             .body(())
             .expect("request");
-        let query = req.uri().query().map(str::to_owned);
-        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
         assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("from-header"));
     }
 
@@ -4293,8 +4214,8 @@ mod tests {
             .header("x-amz-meta-snowball-auto-extract", "false")
             .body(())
             .expect("request");
-        let query = req.uri().query().map(str::to_owned);
-        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
         assert_eq!(
             req.headers()
                 .get("x-amz-meta-snowball-auto-extract")
@@ -4326,8 +4247,8 @@ mod tests {
             )
             .body(())
             .expect("request");
-        let query = req.uri().query().map(str::to_owned);
-        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
+        let hoisted_query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), hoisted_query.as_deref()).expect("hoist");
         assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
     }
 
@@ -4385,8 +4306,8 @@ mod tests {
             .expect("request");
         // The authorization boundary hoists the signed query properties before
         // the handler and before RustFS's own unsigned-header guard re-runs.
-        let request_query = request.uri().query().map(str::to_owned);
-        hoist_signed_query_params(request.headers_mut(), request_query.as_deref()).expect("hoist");
+        let hoisted_query = request.uri().query().map(str::to_owned);
+        hoist_signed_query_params(request.headers_mut(), hoisted_query.as_deref()).expect("hoist");
 
         let response = service.call(request).await.expect("inner response");
 

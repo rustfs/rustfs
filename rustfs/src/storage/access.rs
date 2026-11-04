@@ -1421,8 +1421,7 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     // exactly what a hoisted parameter becomes — and before policy evaluation and
     // the handler read request properties, so every operation sees one request
     // shape (rustfs/rustfs#9142).
-    let query = req.uri.query().map(str::to_owned);
-    crate::server::hoist_signed_query_params(&mut req.headers, query.as_deref())?;
+    crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
     authorize_request_with_location_constraint(req, action, None).await
 }
 
