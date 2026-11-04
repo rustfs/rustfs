@@ -914,9 +914,11 @@ impl DefaultMultipartUsecase {
         // checksum: stored (decrypted) values take precedence over the request input;
         // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
         // CompleteMultipartUploadOutput field, are echoed as raw response headers (#1261).
-        // Keyless completion remains supported, but plaintext checksums and the
-        // customer-key fingerprint are returned only after verifying that key.
-        // Apply this equally to a new commit and a lost-response replay.
+        // Keyless completion remains supported, but plaintext checksums are
+        // returned only after verifying that key (backlog#3050). The customer-key
+        // MD5 is a fingerprint of the key, not of the plaintext, and the S3
+        // conformance suite expects it on a keyless completion, so it is echoed
+        // unconditionally. Apply this equally to a new commit and a replay.
         let disclose_checksums = (ssec_algorithm.is_none() && ssec_key_md5.is_none()) || customer_key_provided;
         let classified = if disclose_checksums {
             let (checksums, is_multipart) = obj_info
@@ -990,7 +992,7 @@ impl DefaultMultipartUsecase {
                 .headers
                 .insert("x-amz-server-side-encryption-customer-algorithm", value);
         }
-        if disclose_checksums && let Some(key_md5) = ssec_key_md5.as_deref() {
+        if let Some(key_md5) = ssec_key_md5.as_deref() {
             let value =
                 HeaderValue::from_str(key_md5).map_err(|_| s3_error!(InternalError, "Invalid stored SSE-C key metadata"))?;
             response
