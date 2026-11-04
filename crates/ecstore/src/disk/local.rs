@@ -26575,6 +26575,7 @@ mod test {
             root.clone(),
             disk.publication_root.clone(),
             disk.mount_lease.clone(),
+            disk.multipart_index.clone(),
             exited,
         ));
         tokio::task::yield_now().await;
