@@ -11,7 +11,7 @@ use crate::admin::{
 };
 use crate::{
     auth::{check_key_valid_with_context, get_session_token},
-    server::{ADMIN_PREFIX, RemoteAddr},
+    server::ADMIN_PREFIX,
 };
 use http::{HeaderMap, HeaderValue, Method, StatusCode};
 use matchit::Params;
@@ -97,7 +97,7 @@ pub(super) async fn owner(
         &credentials,
         false,
         Action::AdminAction(action),
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|a| a.map(|a| a.0)),
+        crate::admin::auth::policy_source_addr(&req.extensions),
         AdminResourceScope::bucket_object("", ""),
     )
     .await?;

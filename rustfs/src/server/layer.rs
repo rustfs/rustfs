@@ -488,6 +488,14 @@ fn finish_foreground_observation(observation: &Cell<Option<ForegroundObservation
     }
 }
 
+/// A synthesized response (such as the trusted-proxy layer's rejection) carries
+/// no foreground observation and is never counted as a completed request.
+impl<B: Default> Default for ForegroundResponseBody<B> {
+    fn default() -> Self {
+        Self::new(B::default(), None, false, false)
+    }
+}
+
 impl<B> ForegroundResponseBody<B> {
     fn new(inner: B, observation: Option<ForegroundObservation<'static>>, succeeded: bool, suppressed: bool) -> Self {
         let body = Self {

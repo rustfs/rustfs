@@ -28,9 +28,9 @@ pub mod state;
 
 pub use certs::{
     CertDirectoryLoadOptions, TlsCertPairInspection, TlsCertPairStatus, TlsDirectoryInspection, TlsDomainInspection,
-    WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, inspect_cert_directory,
-    load_all_certs_from_directory, load_all_certs_from_directory_strict, load_cert_bundle_der_bytes, load_certs,
-    load_private_key, validate_certified_key,
+    WebPkiClientVerifierOptions, build_webpki_client_verifier, build_webpki_client_verifier_from_ca_file,
+    create_multi_cert_resolver, inspect_cert_directory, load_all_certs_from_directory, load_all_certs_from_directory_strict,
+    load_cert_bundle_der_bytes, load_certs, load_private_key, validate_certified_key,
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};

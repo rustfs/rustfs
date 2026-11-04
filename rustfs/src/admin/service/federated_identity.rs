@@ -20,7 +20,7 @@ use crate::admin::{
 use rustfs_iam::{
     federation::{FederatedSessionBinding, FederatedSessionBindingError, FederatedSessionTransaction, OIDC_VIRTUAL_PARENT_CLAIM},
     store::{MappedPolicy, object::ObjectStore},
-    sys::{IamSys, is_safe_claim_policy_name},
+    sys::{IamSys, OIDC_ISSUER_CLAIM, is_safe_claim_policy_name},
 };
 use rustfs_madmin::{SITE_REPL_API_VERSION, SR_IAM_ITEM_STS_ACC, SRIAMItem, SRSTSCredential};
 use rustfs_policy::auth::get_new_credentials_with_metadata;
@@ -111,6 +111,9 @@ fn build_oidc_token_claims(transaction: &FederatedSessionTransaction) -> HashMap
     let mut token_claims = HashMap::new();
     token_claims.insert("sub".to_string(), Value::String(authorization.subject().to_string()));
     token_claims.insert("iss".to_string(), Value::String("rustfs-oidc".to_string()));
+    if let Some(issuer) = authorization.issuer() {
+        token_claims.insert(OIDC_ISSUER_CLAIM.to_string(), Value::String(issuer.to_string()));
+    }
     token_claims.insert("oidc_provider".to_string(), Value::String(authorization.provider_id().to_string()));
 
     if !authorization.email().is_empty() {
@@ -329,14 +332,31 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         let parent_user = authorization.oidc_virtual_parent().ok_or_else(|| {
             FederatedSessionBindingError::InvalidRequest("verified OIDC identity is missing issuer or subject".to_string())
         })?;
-        let (selected_policy_names, ignorable_policy_names) = match iam_store
-            .sts_policy_db_get(&parent_user, &Some(authorization.mapped_iam_groups().to_vec()))
+        let (mapped_policy_names, has_identity_mapping) = iam_store
+            .sts_policy_db_get_with_identity_mapping(&parent_user, &Some(authorization.mapped_iam_groups().to_vec()))
             .await
-            .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?
-        {
-            mapped_policy_names if !mapped_policy_names.is_empty() => (mapped_policy_names, &[][..]),
-            _ => (authorization.policies().to_vec(), authorization.group_claim_policies()),
+            .map_err(|_| FederatedSessionBindingError::Internal("failed to resolve OIDC policy mapping".to_string()))?;
+        // An explicit identity mapping overrides token policies. Group mappings
+        // are additive and must not discard claim-derived Deny policies.
+        let ignorable_policy_names: Vec<String> = if has_identity_mapping {
+            Vec::new()
+        } else {
+            authorization
+                .group_claim_policies()
+                .iter()
+                .filter(|name| !mapped_policy_names.contains(name))
+                .cloned()
+                .collect()
         };
+        let mut selected_policy_names = mapped_policy_names;
+        if !has_identity_mapping {
+            for name in authorization.policies() {
+                if !selected_policy_names.contains(name) {
+                    selected_policy_names.push(name.clone());
+                }
+            }
+        }
+
         // A name may be skipped only after storage confirms the policy is absent. A failed lookup
         // must not be mistaken for absence, or an unreadable Deny policy would be dropped from the
         // signed session and could not be restored at request time.
@@ -368,7 +388,7 @@ impl FederatedSessionBinding for DefaultFederatedSessionBinding {
         let resolved_policy_names = MappedPolicy::new(&resolved_policy_mapping).to_slice();
         let selection = select_oidc_policies(
             &selected_policy_names,
-            ignorable_policy_names,
+            &ignorable_policy_names,
             &resolved_policy_names,
             &missing_policy_names,
         )
@@ -543,6 +563,7 @@ mod tests {
             HashMap::from([
                 ("sub".to_string(), serde_json::json!("subject")),
                 ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                (OIDC_ISSUER_CLAIM.to_string(), serde_json::json!("https://idp.example.test")),
                 ("oidc_provider".to_string(), serde_json::json!("default")),
                 ("email".to_string(), serde_json::json!("user@example.com")),
                 ("preferred_username".to_string(), serde_json::json!("user")),
@@ -566,6 +587,7 @@ mod tests {
             HashMap::from([
                 ("sub".to_string(), serde_json::json!("subject")),
                 ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                (OIDC_ISSUER_CLAIM.to_string(), serde_json::json!("https://idp.example.test")),
                 ("oidc_provider".to_string(), serde_json::json!("default")),
             ])
         );
@@ -641,6 +663,7 @@ mod tests {
             HashMap::from([
                 ("sub".to_string(), serde_json::json!("subject")),
                 ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+                (OIDC_ISSUER_CLAIM.to_string(), serde_json::json!("https://idp.example.test")),
                 ("oidc_provider".to_string(), serde_json::json!("default")),
                 ("email".to_string(), serde_json::json!("user@example.com")),
                 ("preferred_username".to_string(), serde_json::json!("user")),
@@ -682,6 +705,153 @@ mod tests {
                 "apiVersion": SITE_REPL_API_VERSION,
             })
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn binding_group_policies_preserve_claim_denies() {
+        let iam = ready_test_iam().await;
+        let deny = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::payroll/*"
+        }]}"#,
+        )
+        .expect("parse payroll Deny");
+        iam.set_policy("claim-deny-payroll", deny).await.expect("store claim Deny");
+        iam.add_users_to_group("claim-policy-group", Vec::new())
+            .await
+            .expect("create mapped group");
+        iam.policy_db_set("claim-policy-group", UserType::Reg, true, "readwrite")
+            .await
+            .expect("attach group Allow");
+        let authorization = || {
+            let mut fixture = authorization_fixture();
+            fixture.sub = "claim-deny-subject".to_string();
+            fixture.policies = vec!["readwrite".to_string(), "claim-deny-payroll".to_string()];
+            fixture.mapped_iam_groups = vec!["claim-policy-group".to_string()];
+            fixture
+        };
+        let credentials = DefaultFederatedSessionBinding
+            .bind(&transaction_from_fixture(authorization()))
+            .await
+            .expect("bind group plus claim policies");
+        let claims = get_claims_for_test(&credentials);
+        let selected = MappedPolicy::new(claims.get("policy").and_then(Value::as_str).expect("policy claim")).to_slice();
+        assert!(selected.contains(&"claim-deny-payroll".to_string()));
+        let conditions = HashMap::new();
+        let args = Args {
+            account: &credentials.access_key,
+            groups: &credentials.groups,
+            action: Action::S3Action(S3Action::GetObjectAction),
+            bucket: "payroll",
+            object: "salary.csv",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(!iam.is_allowed(&args).await, "group Allow must not discard claim Deny");
+        let mut authorization = authorization();
+        authorization.policies.push("missing-required-policy".to_string());
+        assert!(
+            DefaultFederatedSessionBinding
+                .bind(&transaction_from_fixture(authorization))
+                .await
+                .is_err(),
+            "group mappings must not hide unresolved required claim policies"
+        );
+    }
+
+    fn get_claims_for_test(credentials: &rustfs_credentials::Credentials) -> HashMap<String, Value> {
+        let signing_key = current_token_signing_key().expect("test signing key");
+        rustfs_iam::sys::get_claims_from_token_with_secret(&credentials.session_token, &signing_key)
+            .expect("verify issued session token")
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn group_conditions_follow_live_parent_membership_for_all_credentials() {
+        let iam = ready_test_iam().await;
+        let user = "live-group-condition-user";
+        let group = "live-restricted-group";
+        iam.create_user(
+            user,
+            &AddOrUpdateUserReq {
+                secret_key: "live-group-user-secret".to_string(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create group condition user");
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*",
+             "Condition":{"StringEquals":{"aws:groups":"live-restricted-group"}}}
+        ]}"#,
+        )
+        .expect("parse group condition policy");
+        for member in [true, false, true] {
+            if member {
+                iam.add_users_to_group(group, vec![user.to_string()])
+                    .await
+                    .expect("add membership");
+            } else {
+                iam.remove_users_from_group(group, vec![user.to_string()])
+                    .await
+                    .expect("remove membership");
+            }
+            for kind in ["regular", "sts", "service"] {
+                let mut credentials = rustfs_credentials::Credentials {
+                    access_key: if kind == "regular" {
+                        user
+                    } else {
+                        "derived-group-condition-key"
+                    }
+                    .to_string(),
+                    secret_key: "valid-derived-secret".to_string(),
+                    status: "on".to_string(),
+                    groups: Some(vec!["credential-group".to_string()]),
+                    ..Default::default()
+                };
+                if kind != "regular" {
+                    credentials.parent_user = user.to_string();
+                    credentials.session_token = "signed-token".to_string();
+                }
+                credentials.claims = Some(HashMap::from([("groups".to_string(), serde_json::json!(["token-group"]))]));
+                if kind == "service" {
+                    credentials
+                        .claims
+                        .as_mut()
+                        .expect("claims")
+                        .insert("sa-policy".to_string(), serde_json::json!("inherited-policy"));
+                }
+                let conditions = crate::auth::get_condition_values(&http::HeaderMap::new(), &credentials, None, None, None);
+                let groups = conditions.get("groups").expect("credential and token groups");
+                assert!(groups.contains(&"token-group".to_string()));
+                assert!(groups.contains(&"credential-group".to_string()));
+                assert_eq!(groups.contains(&group.to_string()), member, "{kind}");
+                let claims = HashMap::new();
+                assert_eq!(
+                    policy
+                        .is_allowed(&Args {
+                            account: &credentials.access_key,
+                            groups: &credentials.groups,
+                            action: Action::S3Action(S3Action::GetObjectAction),
+                            bucket: "bucket",
+                            object: "object",
+                            conditions: &conditions,
+                            claims: &claims,
+                            is_owner: false,
+                            deny_only: false,
+                        })
+                        .await,
+                    !member,
+                    "{kind}"
+                );
+            }
+        }
     }
 
     #[tokio::test]

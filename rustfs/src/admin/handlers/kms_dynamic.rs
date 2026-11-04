@@ -28,7 +28,7 @@ use crate::admin::storage_api::error::StorageError;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{S3ErrorCode, error as admin_s3_error};
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -97,6 +97,118 @@ fn kms_service_control_actions() -> Vec<Action> {
     vec![Action::KmsAction(KmsAction::ServiceControlAction)]
 }
 
+// A remote KMS administrator may reuse operator-provisioned files, but cannot
+// select new files or redirect the credentials read from them.
+struct VaultConnection<'a> {
+    address: &'a str,
+    namespace: Option<&'a str>,
+    auth: &'a rustfs_kms::VaultAuthMethod,
+    tls: Option<&'a rustfs_kms::config::TlsConfig>,
+}
+
+fn vault_connection(config: &KmsConfig) -> Option<VaultConnection<'_>> {
+    match &config.backend_config {
+        rustfs_kms::BackendConfig::VaultKv2(vault) => Some(VaultConnection {
+            address: &vault.address,
+            namespace: vault.namespace.as_deref(),
+            auth: &vault.auth_method,
+            tls: vault.tls.as_ref(),
+        }),
+        rustfs_kms::BackendConfig::VaultTransit(vault) => Some(VaultConnection {
+            address: &vault.address,
+            namespace: vault.namespace.as_deref(),
+            auth: &vault.auth_method,
+            tls: vault.tls.as_ref(),
+        }),
+        _ => None,
+    }
+}
+
+fn vault_auth_uses_file(auth: &rustfs_kms::VaultAuthMethod) -> bool {
+    use rustfs_kms::VaultAuthMethod;
+    matches!(
+        auth,
+        VaultAuthMethod::AppRole {
+            secret_id_file: Some(_),
+            ..
+        } | VaultAuthMethod::Kubernetes { .. }
+            | VaultAuthMethod::TokenFile { .. }
+    )
+}
+
+fn same_vault_file_auth(requested: &rustfs_kms::VaultAuthMethod, existing: &rustfs_kms::VaultAuthMethod) -> bool {
+    use rustfs_kms::VaultAuthMethod;
+    match (requested, existing) {
+        (
+            VaultAuthMethod::AppRole {
+                role_id,
+                secret_id_file,
+                mount,
+                ..
+            },
+            VaultAuthMethod::AppRole {
+                role_id: old_role,
+                secret_id_file: old_file,
+                mount: old_mount,
+                ..
+            },
+        ) => role_id == old_role && secret_id_file == old_file && mount == old_mount,
+        (
+            VaultAuthMethod::Kubernetes {
+                role, jwt_path, mount, ..
+            },
+            VaultAuthMethod::Kubernetes {
+                role: old_role,
+                jwt_path: old_path,
+                mount: old_mount,
+                ..
+            },
+        ) => role == old_role && jwt_path == old_path && mount == old_mount,
+        (VaultAuthMethod::TokenFile { path, .. }, VaultAuthMethod::TokenFile { path: old_path, .. }) => path == old_path,
+        _ => false,
+    }
+}
+
+fn validate_vault_local_file_access(
+    requested: &KmsConfig,
+    existing: Option<&KmsConfig>,
+    inherited_auth: bool,
+) -> Result<(), String> {
+    let Some(requested) = vault_connection(requested) else {
+        return Ok(());
+    };
+    let auth_file = vault_auth_uses_file(requested.auth);
+    let tls_files = requested
+        .tls
+        .is_some_and(|tls| tls.ca_cert_path.is_some() || tls.client_cert_path.is_some() || tls.client_key_path.is_some());
+    if !auth_file && !tls_files && !inherited_auth {
+        return Ok(());
+    }
+    let error = "Vault server-local files and reused credentials must retain their operator-configured connection";
+    let existing = existing.and_then(vault_connection).ok_or_else(|| error.to_string())?;
+    if requested.address != existing.address || requested.namespace != existing.namespace {
+        return Err(error.to_string());
+    }
+    if auth_file && !same_vault_file_auth(requested.auth, existing.auth) {
+        return Err(error.to_string());
+    }
+    let tls_settings = |tls: Option<&rustfs_kms::config::TlsConfig>| {
+        tls.map(|tls| {
+            (
+                tls.ca_cert_path.clone(),
+                tls.client_cert_path.clone(),
+                tls.client_key_path.clone(),
+                tls.skip_verify,
+            )
+        })
+        .unwrap_or_default()
+    };
+    if tls_settings(requested.tls) != tls_settings(existing.tls) {
+        return Err(error.to_string());
+    }
+    Ok(())
+}
+
 fn normalize_configure_request_secrets(
     request: &mut ConfigureKmsRequest,
     existing_config: Option<&KmsConfig>,
@@ -142,7 +254,7 @@ fn normalize_configure_request_secrets(
     };
 
     if !needs_existing_auth {
-        return Ok(());
+        return validate_vault_local_file_access(&request.to_kms_config(), existing_config, false);
     }
 
     let existing_auth = existing_config
@@ -157,7 +269,7 @@ fn normalize_configure_request_secrets(
         ConfigureKmsRequest::Aws(_) => {}
     }
 
-    Ok(())
+    validate_vault_local_file_access(&request.to_kms_config(), existing_config, true)
 }
 
 fn ensure_kms_config_persistable(config: &KmsConfig) -> Result<(), String> {
@@ -747,7 +859,7 @@ impl Operation for ConfigureKmsHandler {
                 owner,
                 false,
                 kms_configure_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Configure,
@@ -900,7 +1012,7 @@ impl Operation for StartKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Start,
@@ -1057,7 +1169,7 @@ impl Operation for StopKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Stop,
@@ -1159,7 +1271,7 @@ impl Operation for ReloadKmsHandler {
                 owner,
                 false,
                 kms_service_control_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Reload,
@@ -1253,7 +1365,7 @@ impl Operation for GetKmsStatusHandler {
             owner,
             false,
             kms_service_control_actions(),
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
@@ -1347,7 +1459,7 @@ impl Operation for ReconfigureKmsHandler {
                 owner,
                 false,
                 kms_configure_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAdminOperation::Reconfigure,
@@ -1951,6 +2063,147 @@ mod tests {
             backend: rustfs_kms::KmsBackend::VaultKv2,
             backend_config: rustfs_kms::BackendConfig::VaultKv2(Box::new(vault)),
             ..Default::default()
+        }
+    }
+
+    fn vault_request(backend: &str, auth: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "backend_type": backend,
+            "address": "https://vault.internal:8200",
+            "auth_method": auth,
+        })
+    }
+
+    fn decode_vault_request(value: serde_json::Value) -> rustfs_kms::ConfigureKmsRequest {
+        serde_json::from_value(value).expect("valid Vault configure request")
+    }
+
+    fn vault_file_auth_methods() -> [serde_json::Value; 3] {
+        [
+            serde_json::json!({"TokenFile": {"path": "/etc/rustfs/vault-token"}}),
+            serde_json::json!({"AppRole": {
+                "role_id": "rustfs", "secret_id": "", "secret_id_file": "/etc/rustfs/secret-id"
+            }}),
+            serde_json::json!({"Kubernetes": {"role": "rustfs", "jwt_path": "/etc/rustfs/service-account"}}),
+        ]
+    }
+
+    #[test]
+    fn vault_local_files_require_existing_operator_configuration() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for auth in vault_file_auth_methods() {
+                let mut request = decode_vault_request(vault_request(backend, auth));
+                normalize_configure_request_secrets(&mut request, None)
+                    .expect_err("remote requests cannot bootstrap server-local credential reads");
+                let existing = vault_config("https://vault.internal:8200", VAULT_TOKEN);
+                normalize_configure_request_secrets(&mut request, Some(&existing))
+                    .expect_err("inline-token configuration grants no local-file access");
+            }
+            // Omitting jwt_path selects the pod's projected token, which is
+            // still a server-local credential and must not bypass the guard.
+            let mut request = decode_vault_request(vault_request(backend, serde_json::json!({"Kubernetes": {"role": "rustfs"}})));
+            normalize_configure_request_secrets(&mut request, None)
+                .expect_err("default Kubernetes path also needs operator configuration");
+        }
+    }
+
+    #[test]
+    fn vault_local_files_allow_unchanged_connections_but_reject_redirects() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for auth in vault_file_auth_methods() {
+                let value = vault_request(backend, auth);
+                let existing = decode_vault_request(value.clone()).to_kms_config();
+                let mut request = decode_vault_request(value.clone());
+                normalize_configure_request_secrets(&mut request, Some(&existing))
+                    .expect("existing operator-provisioned credentials remain usable");
+
+                for (field, replacement) in [
+                    ("address", serde_json::json!("https://attacker.invalid:8200")),
+                    ("namespace", serde_json::json!("attacker")),
+                    ("skip_tls_verify", serde_json::json!(true)),
+                    ("ca_cert_path", serde_json::json!("/tmp/attacker-ca.pem")),
+                ] {
+                    let mut changed = value.clone();
+                    changed[field] = replacement;
+                    normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
+                        .expect_err("file credentials cannot be redirected or lose their trust boundary");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vault_local_files_reject_changed_auth_paths_and_routes() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for (auth, variant, path) in [
+                (vault_file_auth_methods()[0].clone(), "TokenFile", "path"),
+                (vault_file_auth_methods()[1].clone(), "AppRole", "secret_id_file"),
+                (vault_file_auth_methods()[2].clone(), "Kubernetes", "jwt_path"),
+            ] {
+                let value = vault_request(backend, auth);
+                let existing = decode_vault_request(value.clone()).to_kms_config();
+                let mut changed = value.clone();
+                changed["auth_method"][variant][path] = serde_json::json!("/proc/self/environ");
+                normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
+                    .expect_err("the request cannot select an arbitrary server file");
+                if variant != "TokenFile" {
+                    let mut changed = value.clone();
+                    changed["auth_method"][variant]["mount"] = serde_json::json!("attacker-auth");
+                    normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
+                        .expect_err("file contents cannot be sent to a different authentication mount");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn vault_local_files_reject_new_or_repurposed_tls_paths() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for field in ["ca_cert_path", "client_cert_path", "client_key_path"] {
+                let mut value = vault_request(backend, serde_json::json!({"Token": {"token": "explicit-token"}}));
+                value[field] = serde_json::json!("/etc/rustfs/operator.pem");
+                let mut request = decode_vault_request(value.clone());
+                normalize_configure_request_secrets(&mut request, None).expect_err("TLS paths cannot be provisioned remotely");
+                let existing = request.to_kms_config();
+                normalize_configure_request_secrets(&mut request, Some(&existing)).expect("unchanged TLS paths remain usable");
+                value[field] = serde_json::json!("/proc/self/environ");
+                normalize_configure_request_secrets(&mut decode_vault_request(value), Some(&existing))
+                    .expect_err("TLS paths cannot be changed remotely");
+            }
+        }
+    }
+
+    #[test]
+    fn vault_local_files_validate_inherited_auth_after_normalization() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for auth in vault_file_auth_methods()
+                .into_iter()
+                .chain([serde_json::json!({"Token": {"token": VAULT_TOKEN}})])
+            {
+                let existing = decode_vault_request(vault_request(backend, auth)).to_kms_config();
+                let value = vault_request(backend, serde_json::json!({"Token": {"token": "  "}}));
+                let mut request = decode_vault_request(value.clone());
+                normalize_configure_request_secrets(&mut request, Some(&existing))
+                    .expect("blank token preserves credentials for the same connection");
+                let mut changed = value;
+                changed["address"] = serde_json::json!("http://attacker.invalid:8200");
+                normalize_configure_request_secrets(&mut decode_vault_request(changed), Some(&existing))
+                    .expect_err("blank token cannot forward existing credentials elsewhere");
+            }
+        }
+    }
+
+    #[test]
+    fn vault_local_files_allow_explicit_credentials_without_files() {
+        for backend in ["VaultKV2", "VaultTransit"] {
+            for auth in [
+                serde_json::json!({"Token": {"token": "explicit-token"}}),
+                serde_json::json!({"AppRole": {"role_id": "role", "secret_id": "explicit-secret"}}),
+            ] {
+                let mut request = decode_vault_request(vault_request(backend, auth));
+                normalize_configure_request_secrets(&mut request, None)
+                    .expect("explicit credentials need no server-local access");
+            }
         }
     }
 

@@ -20,7 +20,7 @@ use tower::ServiceExt;
 #[tokio::test]
 async fn test_proxy_validation_flow() {
     let proxies = vec![TrustedProxy::Single("127.0.0.1".parse().unwrap())];
-    let config = TrustedProxyConfig::new(proxies, ValidationMode::HopByHop, true, 10, true, vec![]);
+    let config = TrustedProxyConfig::new(proxies, ValidationMode::HopByHop, false, 10, true, vec![]);
     let proxy_layer = LegacyTrustedProxyLayer::enabled(config, None);
 
     let app = Router::new().route("/test", get(|| async { "OK" })).layer(proxy_layer);

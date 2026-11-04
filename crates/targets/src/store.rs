@@ -14,7 +14,10 @@
 
 use crate::error::StoreError;
 use rustfs_config::notify::{COMPRESS_EXT, DEFAULT_EXT};
-use rustfs_config::{DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, ENV_TARGET_STORE_COMPRESS, EnableState};
+use rustfs_config::{
+    DEFAULT_LIMIT, DEFAULT_TARGET_STORE_COMPRESS, DEFAULT_TARGET_STORE_MAX_BYTES, ENV_TARGET_STORE_COMPRESS,
+    ENV_TARGET_STORE_MAX_BYTES, EnableState,
+};
 use serde::{Serialize, de::DeserializeOwned};
 use snap::raw::{Decoder, Encoder};
 use std::{
@@ -76,9 +79,8 @@ const LEGACY_BATCH_COUNT_SEPARATOR: char = ':';
 const FAILED_STORE_SUBDIR: &str = "failed";
 
 /// Maximum number of entries retained in the failed store per target, bounded independently of the
-/// live queue so an accumulation of terminal failures cannot starve live events. At the bound the
-/// oldest failed entry is dropped to admit the newer one, so a newer failure is never lost in favour
-/// of an older one.
+/// live queue. Both stores share the byte budget. At the count bound the oldest failed entry is
+/// dropped to admit the newer one, provided the byte budget can also admit it.
 const FAILED_STORE_MAX_ENTRIES: usize = 10_000;
 
 /// Maximum age of a failed-store entry before it is removed as expired, measured from the file write
@@ -361,10 +363,13 @@ pub trait FailedEventStore: Send + Sync {
 /// A store that uses the filesystem to persist events in a queue
 pub struct QueueStore<T> {
     entry_limit: u64,
+    byte_limit: u64,
+    stored_bytes: Arc<AtomicU64>,
+    failed_bytes: Arc<AtomicU64>,
     directory: PathBuf,
     file_ext: String,
     compress: bool,
-    entries: Arc<RwLock<HashMap<String, i64>>>, // key -> modtime as unix nano
+    entries: Arc<RwLock<HashMap<String, u64>>>, // key -> persisted file bytes
     pending_entries: Arc<AtomicU64>,
     /// Cached count of complete failed-store entries, shared across clones. Initialized by one
     /// directory read in open() and kept current by the failed-store write, the capacity trim, and
@@ -383,6 +388,9 @@ impl<T> Clone for QueueStore<T> {
     fn clone(&self) -> Self {
         QueueStore {
             entry_limit: self.entry_limit,
+            byte_limit: self.byte_limit,
+            stored_bytes: Arc::clone(&self.stored_bytes),
+            failed_bytes: Arc::clone(&self.failed_bytes),
             directory: self.directory.clone(),
             file_ext: self.file_ext.clone(),
             compress: self.compress,
@@ -406,6 +414,22 @@ impl Drop for EntryReservation<'_> {
     }
 }
 
+struct ByteReservation<'a> {
+    counter: &'a AtomicU64,
+    bytes: u64,
+    committed: bool,
+}
+
+impl Drop for ByteReservation<'_> {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self
+                .counter
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| Some(used.saturating_sub(self.bytes)));
+        }
+    }
+}
+
 impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// Creates a new QueueStore
     pub fn new(directory: impl Into<PathBuf>, limit: u64, ext: &str) -> Self {
@@ -420,6 +444,13 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
         QueueStore {
             directory: directory.into(),
             entry_limit,
+            byte_limit: std::env::var(ENV_TARGET_STORE_MAX_BYTES)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .filter(|value| *value > 0)
+                .unwrap_or(DEFAULT_TARGET_STORE_MAX_BYTES),
+            stored_bytes: Arc::new(AtomicU64::new(0)),
+            failed_bytes: Arc::new(AtomicU64::new(0)),
             file_ext: file_ext.to_string(),
             compress,
             entries: Arc::new(RwLock::new(HashMap::with_capacity((entry_limit as usize).min(MAX_PREALLOC_CAPACITY)))),
@@ -531,6 +562,34 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             .map_err(|e| StoreError::Compression(e.to_string()))
     }
 
+    fn reserve_bytes(&self, bytes: u64) -> Result<ByteReservation<'_>, StoreError> {
+        self.stored_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| {
+                used.checked_add(bytes).filter(|total| *total <= self.byte_limit)
+            })
+            .map_err(|_| StoreError::LimitExceeded)?;
+        Ok(ByteReservation {
+            counter: &self.stored_bytes,
+            bytes,
+            committed: false,
+        })
+    }
+
+    fn release_bytes(&self, bytes: u64) {
+        let _ = self
+            .stored_bytes
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |used| Some(used.saturating_sub(bytes)));
+    }
+
+    fn reconcile_failed_bytes(&self, bytes: u64) {
+        let previous = self.failed_bytes.swap(bytes, Ordering::SeqCst);
+        if bytes >= previous {
+            self.stored_bytes.fetch_add(bytes - previous, Ordering::SeqCst);
+        } else {
+            self.release_bytes(previous - bytes);
+        }
+    }
+
     fn reserve_entry_slot(&self) -> Result<EntryReservation<'_>, StoreError> {
         loop {
             let entries = self
@@ -565,7 +624,7 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// one — never a half-written payload. On a crash mid-write the temp file is
     /// left behind and cleaned up by `open()`, so an acknowledged event is never
     /// lost and no ghost/truncated entry is ever indexed.
-    fn write_file(&self, key: &Key, data: &[u8]) -> Result<i64, StoreError> {
+    fn write_file(&self, key: &Key, data: &[u8]) -> Result<u64, StoreError> {
         let path = self.file_path(key);
         let parent = path
             .parent()
@@ -582,6 +641,8 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             std::borrow::Cow::Borrowed(data)
         };
 
+        let size = payload.len() as u64;
+        let mut budget = self.reserve_bytes(size)?;
         let tmp_path = {
             let mut file_name = key.to_key_string();
             file_name.push_str(TMP_SUFFIX);
@@ -589,13 +650,17 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
         };
 
         // One implementation of the write-fsync-rename invariant, shared with the failed-store write.
-        // The temp file is removed on any error path so a failed write leaves no residue.
-        write_temp_then_rename(&tmp_path, &path, &payload)?;
+        // If cleanup itself fails, retain the reservation until reopen removes the orphan.
+        if let Err(error) = write_temp_then_rename(&tmp_path, &path, &payload) {
+            budget.committed =
+                !matches!(std::fs::metadata(&tmp_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+            return Err(error);
+        }
+        budget.committed = true;
 
         // Best-effort: persist the new directory entry created by rename.
         Self::fsync_dir(&self.directory);
 
-        let modified = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
         debug!(
             event = EVENT_TARGET_STORE_STATE,
             component = LOG_COMPONENT_TARGETS,
@@ -604,15 +669,15 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
             key = %key,
             "target store state"
         );
-        Ok(modified)
+        Ok(size)
     }
 
-    fn insert_entry(&self, key: &Key, modified: i64) -> Result<(), StoreError> {
+    fn insert_entry(&self, key: &Key, size: u64) -> Result<(), StoreError> {
         let mut entries = self
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
-        entries.insert(key.to_key_string(), modified);
+        entries.insert(key.to_key_string(), size);
         Ok(())
     }
 
@@ -626,11 +691,12 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     }
 
     fn write_and_index(&self, key: &Key, data: &[u8]) -> Result<(), StoreError> {
-        let modified = self.write_file(key, data)?;
-        if let Err(err) = self.insert_entry(key, modified) {
+        let size = self.write_file(key, data)?;
+        if let Err(err) = self.insert_entry(key, size) {
             self.remove_file_if_present(key).map_err(|cleanup_err| {
                 StoreError::Internal(format!("Failed to index store entry {key}: {err}; cleanup failed: {cleanup_err}"))
             })?;
+            self.release_bytes(size);
             return Err(err);
         }
         Ok(())
@@ -644,23 +710,29 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
     /// Reads the failed directory once and counts complete entries, skipping non-file entries and
     /// residual temp files from an interrupted write. Off the hot path, so it seeds the cached count
     /// at open and reconciles it on the maintenance scan rather than serving failed_len.
-    fn count_failed_entries_on_disk(&self) -> u64 {
+    fn failed_usage_on_disk(&self) -> Result<(u64, u64), StoreError> {
         let read_dir = match std::fs::read_dir(self.failed_dir()) {
             Ok(read_dir) => read_dir,
-            Err(_) => return 0,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+            Err(error) => return Err(StoreError::Io(error)),
         };
-
-        let mut count = 0u64;
-        for entry in read_dir.flatten() {
-            if entry.file_name().to_string_lossy().ends_with(TMP_SUFFIX) {
+        let (mut count, mut bytes) = (0_u64, 0_u64);
+        for entry in read_dir {
+            let entry = entry.map_err(StoreError::Io)?;
+            let Some(metadata) = Self::failed_scan_entry_metadata(entry.metadata())? else {
+                continue;
+            };
+            if !metadata.is_file() {
                 continue;
             }
-            // file_type reads the directory entry kind without a full stat where the platform records it.
-            if matches!(entry.file_type(), Ok(file_type) if file_type.is_file()) {
-                count += 1;
+            if entry.file_name().to_string_lossy().ends_with(TMP_SUFFIX) {
+                std::fs::remove_file(entry.path()).map_err(StoreError::Io)?;
+                continue;
             }
+            count += 1;
+            bytes = bytes.checked_add(metadata.len()).ok_or(StoreError::LimitExceeded)?;
         }
-        count
+        Ok((count, bytes))
     }
 
     /// Lowers the cached failed count by one removed entry, clamped at zero so a decrement can never
@@ -735,9 +807,13 @@ impl<T: Serialize + DeserializeOwned + Send + Sync> QueueStore<T> {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
+            let size = std::fs::metadata(path).map(|metadata| metadata.len()).unwrap_or_default();
             match std::fs::remove_file(path) {
                 Ok(()) => {
                     self.decrement_failed_count();
+                    let remaining = self.failed_bytes.load(Ordering::SeqCst).saturating_sub(size);
+                    self.failed_bytes.store(remaining, Ordering::SeqCst);
+                    self.release_bytes(size);
                     warn!(
                         event = EVENT_TARGET_STORE_STATE,
                         component = LOG_COMPONENT_TARGETS,
@@ -777,6 +853,7 @@ where
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
         self.pending_entries.store(0, Ordering::SeqCst);
+        let mut live_bytes = 0_u64;
         entries_map.clear();
         for entry in dir_entries {
             let entry = entry.map_err(|error| io_error_with_path(&self.directory, error))?;
@@ -791,7 +868,9 @@ where
             // Remove leftover temp files from an interrupted atomic write; they
             // are never valid committed entries.
             if file_name.ends_with(TMP_SUFFIX) {
-                let _ = std::fs::remove_file(entry.path());
+                if std::fs::remove_file(entry.path()).is_err() {
+                    live_bytes = live_bytes.checked_add(metadata.len()).ok_or(StoreError::LimitExceeded)?;
+                }
                 continue;
             }
 
@@ -809,14 +888,17 @@ where
                 continue;
             }
 
-            let modified = metadata.modified().map_err(|error| io_error_with_path(&entry_path, error))?;
-            let unix_nano = modified.duration_since(UNIX_EPOCH).unwrap_or_default().as_nanos() as i64;
-            entries_map.insert(file_name, unix_nano);
+            live_bytes = live_bytes.checked_add(metadata.len()).ok_or(StoreError::LimitExceeded)?;
+            entries_map.insert(file_name, metadata.len());
         }
 
         // Seed the cached failed count from one read of the failed directory, under the write guard
         // already held, so failed_len() serves an atomic load rather than a directory scan.
-        self.failed_count.store(self.count_failed_entries_on_disk(), Ordering::SeqCst);
+        let (failed_count, failed_bytes) = self.failed_usage_on_disk()?;
+        self.failed_count.store(failed_count, Ordering::SeqCst);
+        self.failed_bytes.store(failed_bytes, Ordering::SeqCst);
+        self.stored_bytes
+            .store(live_bytes.checked_add(failed_bytes).ok_or(StoreError::LimitExceeded)?, Ordering::SeqCst);
 
         debug!(
             event = EVENT_TARGET_STORE_STATE,
@@ -1005,12 +1087,14 @@ where
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
 
         // A batch entry indexed under the legacy separator is removed under both renderings so its slot is reclaimed.
-        let removed_current = entries.remove(&key.to_key_string()).is_some();
-        let removed_legacy = key.item_count > 1
-            && entries
-                .remove(&key.to_key_string_with(LEGACY_BATCH_COUNT_SEPARATOR))
-                .is_some();
-        if !removed_current && !removed_legacy {
+        let removed_current = entries.remove(&key.to_key_string());
+        let removed_legacy = if key.item_count > 1 {
+            entries.remove(&key.to_key_string_with(LEGACY_BATCH_COUNT_SEPARATOR))
+        } else {
+            None
+        };
+        self.release_bytes(removed_current.unwrap_or_default() + removed_legacy.unwrap_or_default());
+        if removed_current.is_none() && removed_legacy.is_none() {
             debug!(
                 event = EVENT_TARGET_STORE_STATE,
                 component = LOG_COMPONENT_TARGETS,
@@ -1042,15 +1126,18 @@ where
             .entries
             .write()
             .map_err(|_| StoreError::Internal("Failed to acquire write lock on entries".to_string()))?;
+        match std::fs::remove_dir_all(&self.directory) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(StoreError::Io(err)),
+        }
         entries.clear();
         self.pending_entries.store(0, Ordering::SeqCst);
         self.failed_count.store(0, Ordering::SeqCst);
+        self.failed_bytes.store(0, Ordering::SeqCst);
+        self.stored_bytes.store(0, Ordering::SeqCst);
 
-        match std::fs::remove_dir_all(&self.directory) {
-            Ok(()) => Ok(()),
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(StoreError::Io(err)),
-        }
+        Ok(())
     }
 
     fn list(&self) -> Vec<Self::Key> {
@@ -1144,7 +1231,13 @@ where
 
         let entry_id = entry_name.to_string();
         let final_path = failed_dir.join(&entry_id);
-        let is_new_entry = !final_path.exists();
+        let old_size = match std::fs::metadata(&final_path) {
+            Ok(metadata) => Some(metadata.len()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(StoreError::Io(error)),
+        };
+        let is_new_entry = old_size.is_none();
+        let mut budget = self.reserve_bytes(data.len() as u64)?;
 
         // A repeated move of the same live entry lands on the same filename and replaces the earlier
         // file. The count bound is enforced only when the write creates a new entry, since an
@@ -1160,7 +1253,22 @@ where
         let temp_path = failed_dir.join(format!("{entry_id}.{}{}", Uuid::new_v4(), TMP_SUFFIX));
         // rename replaces an existing destination file on the supported platforms, which the
         // idempotent overwrite relies on.
-        write_temp_then_rename(&temp_path, &final_path, data)?;
+        if let Err(error) = write_temp_then_rename(&temp_path, &final_path, data) {
+            budget.committed =
+                !matches!(std::fs::metadata(&temp_path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+            if budget.committed {
+                self.failed_bytes.fetch_add(data.len() as u64, Ordering::SeqCst);
+            }
+            return Err(error);
+        }
+        budget.committed = true;
+        self.release_bytes(old_size.unwrap_or_default());
+        let failed_bytes = self
+            .failed_bytes
+            .load(Ordering::SeqCst)
+            .saturating_sub(old_size.unwrap_or_default())
+            .saturating_add(data.len() as u64);
+        self.failed_bytes.store(failed_bytes, Ordering::SeqCst);
 
         // A new failed file grows the cached count. An overwrite of an existing failed file leaves it
         // unchanged.
@@ -1232,6 +1340,8 @@ where
         // made outside the store drifts the value by at most one maintenance interval and no concurrent
         // write is overwritten.
         self.failed_count.store((materialized_len - pruned) as u64, Ordering::SeqCst);
+        let (_, bytes) = self.failed_usage_on_disk()?;
+        self.reconcile_failed_bytes(bytes);
         Ok(pruned)
     }
 
@@ -1257,6 +1367,107 @@ mod tests {
 
     fn temp_store_dir(name: &str) -> PathBuf {
         std::env::temp_dir().join(format!("rustfs-targets-{name}-{}", Uuid::new_v4()))
+    }
+
+    fn byte_limited_store(directory: &Path, limit: u64, compress: bool) -> QueueStore<serde_json::Value> {
+        let mut store = QueueStore::new_with_compression(directory, 100, ".event", compress);
+        store.byte_limit = limit;
+        store.open().expect("queue open");
+        store
+    }
+
+    #[test]
+    fn queue_byte_budget_is_shared_by_concurrent_clones() {
+        let directory = temp_store_dir("byte-concurrency");
+        let store = byte_limited_store(&directory, 96, false);
+        let barrier = Arc::new(Barrier::new(8));
+        let writers: Vec<_> = (0..8)
+            .map(|_| {
+                let store = store.clone();
+                let barrier = barrier.clone();
+                thread::spawn(move || {
+                    barrier.wait();
+                    store.put_raw(&[7; 32])
+                })
+            })
+            .collect();
+        let mut keys = Vec::new();
+        for writer in writers {
+            match writer.join().expect("writer") {
+                Ok(key) => keys.push(key),
+                Err(StoreError::LimitExceeded) => {}
+                Err(error) => panic!("unexpected write failure: {error}"),
+            }
+        }
+        assert_eq!(keys.len(), 3);
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 96);
+        for key in keys {
+            store.del(&key).expect("release queue bytes");
+        }
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 0);
+        assert!(store.put_raw(&[8; 96]).is_ok());
+        store.delete().expect("cleanup");
+    }
+
+    #[test]
+    fn queue_byte_budget_survives_restart_and_preserves_over_limit_entries() {
+        let directory = temp_store_dir("byte-restart");
+        let store = byte_limited_store(&directory, 128, false);
+        let key = store.put_raw(&[1; 40]).expect("live event");
+        store.put_failed_raw("failed-event", &[2; 30]).expect("failed event");
+        drop(store);
+        let store = byte_limited_store(&directory, 50, false);
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 70);
+        assert_eq!(store.get_raw(&key).unwrap(), [1; 40]);
+        assert_eq!(std::fs::read(store.failed_dir().join("failed-event")).unwrap(), [2; 30]);
+        assert!(matches!(store.put_raw(&[3]), Err(StoreError::LimitExceeded)));
+        store.del(&key).unwrap();
+        assert!(store.put_raw(&[4; 20]).is_ok());
+        assert!(matches!(store.put_failed_raw("another-event", &[5]), Err(StoreError::LimitExceeded)));
+        store.delete().unwrap();
+    }
+
+    #[test]
+    fn queue_byte_budget_counts_compressed_files_without_truncating_payloads() {
+        let directory = temp_store_dir("byte-compression");
+        let store = byte_limited_store(&directory, 128, true);
+        let payload = vec![b'x'; 1024];
+        let key = store.put_raw(&payload).expect("compressed event fits");
+        let bytes = std::fs::metadata(store.file_path(&key)).unwrap().len();
+        assert!(bytes < 128);
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), bytes);
+        assert_eq!(store.get_raw(&key).unwrap(), payload);
+        drop(store);
+        let store = byte_limited_store(&directory, 128, false);
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), bytes);
+        assert_eq!(store.get_raw(&key).unwrap(), payload);
+        assert!(matches!(store.put_raw(&payload), Err(StoreError::LimitExceeded)));
+        store.delete().unwrap();
+    }
+
+    #[test]
+    fn queue_byte_budget_reclaims_failed_overwrites_expiry_and_write_failures() {
+        let directory = temp_store_dir("byte-failed");
+        let store = byte_limited_store(&directory, 96, false);
+        let live = store.put_raw(&[1; 32]).unwrap();
+        store.put_failed_raw("failed-event", &[2; 32]).unwrap();
+        assert!(matches!(store.put_failed_raw("too-large", &[3; 64]), Err(StoreError::LimitExceeded)));
+        assert_eq!(store.get_raw(&live).unwrap(), [1; 32]);
+        store.put_failed_raw("failed-event", &[4; 16]).unwrap();
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 48);
+        let failed = store.failed_dir().join("failed-event");
+        File::open(&failed).unwrap().set_modified(UNIX_EPOCH).unwrap();
+        assert_eq!(store.prune_failed_store().unwrap(), 1);
+        assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 32);
+        std::fs::create_dir(store.failed_dir().join("cannot-replace-directory")).unwrap();
+        assert!(store.put_failed_raw("cannot-replace-directory", &[5; 20]).is_err());
+        assert_eq!(
+            store.stored_bytes.load(Ordering::SeqCst),
+            32,
+            "failed temporary write must release its reservation"
+        );
+        assert!(store.put_raw(&[6; 64]).is_ok());
+        store.delete().unwrap();
     }
 
     #[test]

@@ -144,7 +144,7 @@ impl Statement {
 
         for action in self.actions.iter() {
             match action {
-                Action::S3Action(_) => saw_s3 = true,
+                Action::All | Action::S3Action(_) => saw_s3 = true,
                 Action::AdminAction(_) => saw_admin = true,
                 Action::StsAction(_) => saw_sts = true,
                 Action::KmsAction(_) => saw_kms = true,

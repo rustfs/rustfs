@@ -15,7 +15,7 @@
 use super::func::InnerFunc;
 use ipnetwork::IpNetwork;
 use serde::{Deserialize, Serialize, de::Visitor};
-use std::{borrow::Cow, collections::HashMap, net::IpAddr};
+use std::{collections::HashMap, net::IpAddr};
 
 pub type AddrFunc = InnerFunc<AddrFuncValue>;
 
@@ -30,7 +30,16 @@ impl AddrFunc {
                 };
 
                 for ip_net in inner.values.0.iter() {
-                    if ip_net.contains(ip) {
+                    let canonical = ip.to_canonical();
+                    let matches_mapped_network = match (ip_net, canonical) {
+                        (IpNetwork::V6(network), IpAddr::V4(address))
+                            if network.prefix() >= 96 && network.ip().to_ipv4_mapped().is_some() =>
+                        {
+                            network.contains(address.to_ipv6_mapped())
+                        }
+                        _ => false,
+                    };
+                    if ip_net.contains(ip) || ip_net.contains(canonical) || matches_mapped_network {
                         return true;
                     }
                 }
@@ -81,13 +90,7 @@ impl<'de> Deserialize<'de> for AddrFuncValue {
 
         impl AddrFuncValueVisitor {
             fn cidr<E: serde::de::Error>(v: &str) -> Result<IpNetwork, E> {
-                let mut cidr_str = Cow::from(v);
-                if v.find('/').is_none() {
-                    cidr_str.to_mut().push_str("/32");
-                }
-
-                cidr_str
-                    .parse::<IpNetwork>()
+                v.parse::<IpNetwork>()
                     .map_err(|_| E::custom(format!("{v} can not be parsed to CIDR")))
             }
         }
@@ -107,6 +110,40 @@ mod tests {
     };
     use test_case::test_case;
 
+    #[test]
+    fn source_ip_matches_ipv4_and_mapped_forms_across_protocols() {
+        for network in ["203.0.113.0/24", "::ffff:203.0.113.0/120"] {
+            let function: AddrFunc =
+                serde_json::from_str(&format!(r#"{{"aws:SourceIp":"{network}"}}"#)).expect("parse source IP condition");
+            for address in ["203.0.113.9", "::ffff:203.0.113.9"] {
+                assert!(
+                    function.evaluate(&std::collections::HashMap::from([("SourceIp".to_string(), vec![address.to_string()]),])),
+                    "{network} must match {address}"
+                );
+            }
+            for address in ["198.51.100.9", "::ffff:198.51.100.9", "2001:db8::9"] {
+                assert!(
+                    !function.evaluate(&std::collections::HashMap::from([("SourceIp".to_string(), vec![address.to_string()]),])),
+                    "{network} must not match {address}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn bare_address_matches_only_the_named_host() {
+        for (host, neighbor, prefix) in [
+            ("2001:db8:85a3::8a2e:370:7334", "2001:db8:ffff::1", 128),
+            ("203.0.113.7", "203.0.113.8", 32),
+        ] {
+            let function: AddrFunc =
+                serde_json::from_str(&format!(r#"{{"aws:SourceIp":"{host}"}}"#)).expect("parse bare IP address condition");
+            assert_eq!(function.0[0].values.0[0].prefix(), prefix);
+            assert!(function.evaluate(&std::collections::HashMap::from([("SourceIp".to_string(), vec![host.to_string()])])));
+            assert!(!function.evaluate(&std::collections::HashMap::from([("SourceIp".to_string(), vec![neighbor.to_string()])])));
+        }
+    }
+
     fn new_func(name: KeyName, variable: Option<String>, value: Vec<&str>) -> AddrFunc {
         AddrFunc {
             0: vec![FuncKeyValue {
@@ -119,20 +156,20 @@ mod tests {
     #[test_case(r#"{"aws:SourceIp": "203.0.113.0/24"}"#, new_func(Aws(AWSSourceIP), None, vec!["203.0.113.0/24"]); "1")]
     #[test_case(r#"{"aws:SourceIp": "203.0.113.0"}"#, new_func(Aws(AWSSourceIP), None, vec!["203.0.113.0/32"]); "2")]
     #[test_case(r#"{"aws:SourceIp": "2001:DB8:1234:5678::/64"}"#, new_func(Aws(AWSSourceIP),None, vec!["2001:DB8:1234:5678::/64"]); "3")]
-    #[test_case(r#"{"aws:SourceIp": "2001:DB8:1234:5678::"}"#, new_func(Aws(AWSSourceIP), None, vec!["2001:DB8:1234:5678::/32"]); "4")]
+    #[test_case(r#"{"aws:SourceIp": "2001:DB8:1234:5678::"}"#, new_func(Aws(AWSSourceIP), None, vec!["2001:DB8:1234:5678::/128"]); "4")]
     #[test_case(r#"{"aws:SourceIp": ["203.0.113.0/24","203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), None, vec!["203.0.113.0/24", "203.0.113.0/32"]); "5")]
     #[test_case(r#"{"aws:SourceIp": ["2001:DB8:1234:5678::/64","203.0.113.0/24"]}"#, new_func(Aws(AWSSourceIP), None, vec!["2001:DB8:1234:5678::/64", "203.0.113.0/24"]); "6")]
-    #[test_case(r#"{"aws:SourceIp": ["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::"]}"#, new_func(Aws(AWSSourceIP),None, vec!["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::/32"]); "7")]
-    #[test_case(r#"{"aws:SourceIp": ["2001:DB8:1234:5678::", "203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), None, vec!["2001:DB8:1234:5678::/32", "203.0.113.0/32"]); "8")]
+    #[test_case(r#"{"aws:SourceIp": ["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::"]}"#, new_func(Aws(AWSSourceIP),None, vec!["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::/128"]); "7")]
+    #[test_case(r#"{"aws:SourceIp": ["2001:DB8:1234:5678::", "203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), None, vec!["2001:DB8:1234:5678::/128", "203.0.113.0/32"]); "8")]
     #[test_case(r#"{"aws:SourceIp/a": "203.0.113.0/24"}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["203.0.113.0/24"]); "9")]
     #[test_case(r#"{"aws:SourceIp/a": "203.0.113.0/24"}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["203.0.113.0/24"]); "10")]
     #[test_case(r#"{"aws:SourceIp/a": "203.0.113.0"}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["203.0.113.0/32"]); "11")]
     #[test_case(r#"{"aws:SourceIp/a": "2001:DB8:1234:5678::/64"}"#, new_func(Aws(AWSSourceIP),Some("a".into()), vec!["2001:DB8:1234:5678::/64"]); "12")]
-    #[test_case(r#"{"aws:SourceIp/a": "2001:DB8:1234:5678::"}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["2001:DB8:1234:5678::/32"]); "13")]
+    #[test_case(r#"{"aws:SourceIp/a": "2001:DB8:1234:5678::"}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["2001:DB8:1234:5678::/128"]); "13")]
     #[test_case(r#"{"aws:SourceIp/a": ["203.0.113.0/24", "203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["203.0.113.0/24", "203.0.113.0/32"]); "14")]
     #[test_case(r#"{"aws:SourceIp/a": ["2001:DB8:1234:5678::/64", "203.0.113.0/24"]}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["2001:DB8:1234:5678::/64", "203.0.113.0/24"]); "15")]
-    #[test_case(r#"{"aws:SourceIp/a": ["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::"]}"#, new_func(Aws(AWSSourceIP),Some("a".into()), vec!["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::/32"]); "16")]
-    #[test_case(r#"{"aws:SourceIp/a": ["2001:DB8:1234:5678::", "203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["2001:DB8:1234:5678::/32", "203.0.113.0/32"]); "17")]
+    #[test_case(r#"{"aws:SourceIp/a": ["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::"]}"#, new_func(Aws(AWSSourceIP),Some("a".into()), vec!["2001:DB8:1234:5678::/64", "2001:DB8:1234:5678::/128"]); "16")]
+    #[test_case(r#"{"aws:SourceIp/a": ["2001:DB8:1234:5678::", "203.0.113.0"]}"#, new_func(Aws(AWSSourceIP), Some("a".into()), vec!["2001:DB8:1234:5678::/128", "203.0.113.0/32"]); "17")]
     fn test_deser(input: &str, expect: AddrFunc) -> Result<(), serde_json::Error> {
         let v: AddrFunc = serde_json::from_str(input)?;
         assert_eq!(v, expect);

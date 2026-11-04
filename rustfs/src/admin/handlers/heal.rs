@@ -1474,7 +1474,7 @@ async fn authenticate_heal_admin_request(req: &S3Request<Body>) -> S3Result<Stri
         owner,
         false,
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        crate::admin::auth::policy_source_addr(&req.extensions),
     )
     .await?;
     Ok(cred.access_key)

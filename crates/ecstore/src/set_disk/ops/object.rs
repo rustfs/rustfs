@@ -4958,7 +4958,20 @@ impl SetDisks {
                 );
             }
 
-            if let Some(version_id) = opts.version_id.as_deref()
+            // A write without a version id to a key that is not versioning-Enabled
+            // replaces the key's null version in place, so the WORM gate must judge
+            // that version too. The request-layer pre-check reads the latest
+            // version, which is not the one replaced when a UUID version or a
+            // delete marker sits above a retained null version.
+            let worm_gate_version_id = opts.version_id.clone().or_else(|| {
+                (!opts.versioned
+                    && opts
+                        .object_lock_config_snapshot
+                        .as_ref()
+                        .is_some_and(|snapshot| !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)))
+                .then(|| Uuid::nil().to_string())
+            });
+            if let Some(version_id) = worm_gate_version_id.as_deref()
                 && !is_meta_bucketname(bucket)
             {
                 let explicit_version_lookup_started = rustfs_io_metrics::put_stage_timer();
@@ -4978,9 +4991,10 @@ impl SetDisks {
                     .await;
                 match current {
                     Ok(existing) => {
-                        let object_lock_config = opts.object_lock_config_snapshot.as_deref().ok_or_else(|| {
-                            Error::other("explicit-version PUT is missing its Object Lock configuration snapshot")
-                        })?;
+                        let object_lock_config = opts
+                            .object_lock_config_snapshot
+                            .as_deref()
+                            .ok_or_else(|| Error::other("destructive PUT is missing its Object Lock configuration snapshot"))?;
                         // The WORM gate protects the locked version from local
                         // overwrites; an authorized replication write passes it
                         // only when the LWW merge below will judge every
@@ -5011,6 +5025,8 @@ impl SetDisks {
                             }
                         }
                     }
+                    // A null delete marker has no protected payload to replace.
+                    Err(StorageError::MethodNotAllowed) if version_id == Uuid::nil().to_string() => {}
                     Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
                     Err(err) => return Err(err),
                 }
@@ -9304,6 +9320,60 @@ impl SetDisks {
 }
 
 impl SetDisks {
+    /// Judge the version a versionless destructive delete removes.
+    ///
+    /// For a key that is not versioning-`Enabled`, a delete without a version
+    /// id removes the `null` version, while the preceding Object Lock check
+    /// judged the key's latest entry. When a UUID version or delete marker
+    /// sits above a retained `null` version, the two differ and the retained
+    /// version must be judged on its own. The caller holds the object's write
+    /// lock. Plain unversioned keys and versioning-`Enabled` keys keep a single
+    /// lookup: their latest entry is the version removed.
+    ///
+    /// The lookup future is boxed from a synchronous wrapper so it leaves the
+    /// delete futures' frames: `delete_object` already nests the boxed batch
+    /// path, and inlining a second `get_object_info` overflowed the 4 MiB test
+    /// stack on Linux.
+    fn check_null_version_object_lock_delete<'a>(
+        &'a self,
+        bucket: &'a str,
+        object: &'a str,
+        latest: &'a ObjectInfo,
+        opts: &'a ObjectOptions,
+    ) -> impl Future<Output = Result<()>> + Send + 'a {
+        Box::pin(self.check_null_version_object_lock_delete_inner(bucket, object, latest, opts))
+    }
+
+    async fn check_null_version_object_lock_delete_inner(
+        &self,
+        bucket: &str,
+        object: &str,
+        latest: &ObjectInfo,
+        opts: &ObjectOptions,
+    ) -> Result<()> {
+        if is_meta_bucketname(bucket)
+            || opts.version_id.is_some()
+            || set_disk_delete_creates_delete_marker(opts)
+            || opts.transition.expire_restored
+            || latest.version_id.is_none_or(|version| version.is_nil())
+        {
+            return Ok(());
+        }
+        let null_opts = ObjectOptions {
+            version_id: Some(Uuid::nil().to_string()),
+            no_lock: true,
+            metadata_cache_safe: false,
+            ..opts.clone()
+        };
+        match self.get_object_info(bucket, object, &null_opts).await {
+            Ok(existing) => check_object_lock_delete(&self.ctx, bucket, object, &existing, &null_opts).await,
+            // A null delete marker has no protected payload to remove.
+            Err(StorageError::MethodNotAllowed) => Ok(()),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => Ok(()),
+            Err(err) => Err(err),
+        }
+    }
+
     /// Read current metadata without cache admission or read-side repair. The
     /// outer batch owner already holds the sorted namespace write-lock set.
     pub(crate) async fn conditional_delete_current_snapshot(
@@ -10018,6 +10088,17 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             if object_lock_check_required
                 && !source_missing
                 && let Err(err) = check_object_lock_delete(&self.ctx, bucket, &dobj.object_name, &goi, &check_opts).await
+            {
+                del_errs[i] = Some(err);
+                continue;
+            }
+            // Not gated on `source_missing`: with a delete marker on top the
+            // latest-version lookup reports the key as missing while the null
+            // version below it may still be retained.
+            if object_lock_check_required
+                && let Err(err) = self
+                    .check_null_version_object_lock_delete(bucket, &dobj.object_name, &goi, &check_opts)
+                    .await
             {
                 del_errs[i] = Some(err);
                 continue;
@@ -11094,6 +11175,8 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             opts.precondition_check(&goi)?;
             check_object_lock_delete(&self.ctx, bucket, object, &goi, &opts).await?;
         }
+        self.check_null_version_object_lock_delete(bucket, object, &goi, &opts)
+            .await?;
         let delete_marker_purge_candidate = opts
             .version_id
             .as_deref()

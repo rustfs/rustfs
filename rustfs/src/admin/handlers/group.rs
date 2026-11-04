@@ -434,7 +434,7 @@ impl Operation for SetGroupStatus {
 pub struct UpdateGroupMembers {}
 #[async_trait::async_trait]
 impl Operation for UpdateGroupMembers {
-    async fn call(&self, req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    async fn call(&self, mut req: S3Request<Body>, _params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
             component = LOG_COMPONENT_ADMIN,
@@ -448,9 +448,16 @@ impl Operation for UpdateGroupMembers {
             return Err(s3_error!(InvalidRequest, "authentication required"));
         }
 
-        authorize_admin_request(&req, vec![Action::AdminAction(AdminAction::AddUserToGroupAdminAction)]).await?;
+        authorize_admin_request(
+            &req,
+            vec![
+                Action::AdminAction(AdminAction::AddUserToGroupAdminAction),
+                Action::AdminAction(AdminAction::RemoveUserFromGroupAdminAction),
+            ],
+        )
+        .await?;
 
-        let mut input = req.input;
+        let mut input = std::mem::take(&mut req.input);
         let body = match input.store_all_limited(MAX_ADMIN_REQUEST_BODY_SIZE).await {
             Ok(b) => b,
             Err(e) => {
@@ -469,6 +476,13 @@ impl Operation for UpdateGroupMembers {
 
         let args: GroupAddRemove = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
+
+        let action = if args.is_remove {
+            AdminAction::RemoveUserFromGroupAdminAction
+        } else {
+            AdminAction::AddUserToGroupAdminAction
+        };
+        authorize_admin_request(&req, vec![Action::AdminAction(action)]).await?;
 
         warn!(
             event = EVENT_ADMIN_GROUP_STATE,
@@ -719,6 +733,143 @@ mod tests {
         &block[..end]
     }
 
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn group_members_handler_enforces_add_and_remove_permissions() {
+        use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+        use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        use rustfs_policy::policy::Policy;
+        use std::sync::Arc;
+
+        struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                Arc::clone(&self.0)
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        ObjectStore::new(store.clone())
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialize IAM");
+        for key in ["group-adder", "group-remover", "group-member"] {
+            iam.create_user(
+                key,
+                &AddOrUpdateUserReq {
+                    secret_key: "group-user-secret".to_owned(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create group test user");
+        }
+        for (key, allow, deny) in [
+            ("group-adder", "admin:AddUserToGroup", "admin:RemoveUserFromGroup"),
+            ("group-remover", "admin:RemoveUserFromGroup", "admin:AddUserToGroup"),
+        ] {
+            let document = serde_json::json!({"Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": [allow]}, {"Effect": "Deny", "Action": [deny]}
+            ]});
+            iam.set_policy(
+                key,
+                Policy::parse_config(&serde_json::to_vec(&document).expect("policy JSON")).expect("parse policy"),
+            )
+            .await
+            .expect("store delegated policy");
+            iam.policy_db_set(key, UserType::Reg, false, key)
+                .await
+                .expect("attach delegated policy");
+        }
+        iam.add_users_to_group("guardrail", vec!["group-member".to_owned()])
+            .await
+            .expect("seed protected group");
+        let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(Arc::clone(&iam))), Arc::new(TestKms)));
+        assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: "group-test-root".to_owned(),
+            secret_key: "group-root-secret".to_owned(),
+            status: "on".to_owned(),
+            ..Default::default()
+        }));
+        publish_test_app_context(context);
+
+        for (key, remove, allowed) in [
+            ("group-adder", true, false),
+            ("group-remover", false, false),
+            ("group-remover", true, true),
+            ("group-adder", false, true),
+        ] {
+            let before = iam
+                .get_group_description("guardrail")
+                .await
+                .expect("read original membership")
+                .members;
+            let mut req = credential_less_request(Method::PUT, "/rustfs/admin/v3/update-group-members");
+            req.credentials = Some(s3s::auth::Credentials {
+                access_key: key.to_owned(),
+                secret_key: s3s::auth::SecretKey::from("group-user-secret".to_owned()),
+            });
+            req.input = Body::from(
+                serde_json::to_vec(&serde_json::json!({
+                    "group": "guardrail", "members": ["group-member"], "groupStatus": "enabled", "isRemove": remove
+                }))
+                .expect("group update JSON"),
+            );
+            let result = UpdateGroupMembers {}.call(req, Params::new()).await;
+            let after = iam
+                .get_group_description("guardrail")
+                .await
+                .expect("read resulting membership")
+                .members;
+            if allowed {
+                result.expect("matching delegated action permits the mutation");
+                assert_eq!(after.contains(&"group-member".to_owned()), !remove);
+            } else {
+                let error = result.expect_err("the opposite action must not authorize the mutation");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(after, before, "a rejected mutation must preserve the group");
+            }
+        }
+    }
+
+    #[test]
+    fn update_group_members_authorizes_the_decoded_mutation() {
+        let source = include_str!("group.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source");
+        let handler = source_block(source, "impl Operation for UpdateGroupMembers");
+        assert_eq!(handler.matches("authorize_admin_request(").count(), 2);
+        let decoded = handler
+            .find("let args: GroupAddRemove")
+            .expect("decode request before choosing action");
+        let action = handler
+            .find("let action = if args.is_remove")
+            .expect("body controls requested action");
+        let gate = handler.rfind("authorize_admin_request(").expect("mutation authorization");
+        assert!(decoded < action && action < gate);
+        assert!(handler[action..gate].contains("AdminAction::RemoveUserFromGroupAdminAction"));
+        assert!(handler[action..gate].contains("AdminAction::AddUserToGroupAdminAction"));
+        for mutation in [".remove_users_from_group(", ".add_users_to_group("] {
+            assert!(gate < handler.find(mutation).expect("group mutation"));
+        }
+    }
+
     #[test]
     fn group_handlers_use_the_shared_admin_gate_with_their_actions() {
         let production = include_str!("group.rs")
@@ -731,7 +882,6 @@ mod tests {
             ("GetGroup", "GetGroupAdminAction"),
             ("DeleteGroup", "RemoveUserFromGroupAdminAction"),
             ("SetGroupStatus", "EnableGroupAdminAction"),
-            ("UpdateGroupMembers", "AddUserToGroupAdminAction"),
         ] {
             let block = source_block(production, &format!("impl Operation for {handler}"));
             assert_eq!(

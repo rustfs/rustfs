@@ -173,7 +173,11 @@ where
     <Message>Invalid Keystone token</Message>
     <Details>{}</Details>
 </Error>"#,
-                            xml_escape(&e.to_string())
+                            xml_escape(match e {
+                                crate::KeystoneError::InvalidToken => "Invalid token",
+                                crate::KeystoneError::TokenExpired => "Token expired",
+                                _ => "Keystone token validation failed",
+                            })
                         );
 
                         let body: BoxBody = Full::new(Bytes::from(error_xml))

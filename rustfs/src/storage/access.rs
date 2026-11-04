@@ -155,6 +155,19 @@ struct RequestedObjectLockRetainUntil(OffsetDateTime);
 #[derive(Clone, Debug)]
 struct RequestedObjectLockRetention(ObjectLockRetention);
 
+/// Legal hold status a standalone PutObjectLegalHold applies from its XML body.
+#[derive(Clone, Debug)]
+struct RequestedObjectLegalHold(ObjectLockLegalHold);
+
+/// Tag set a standalone PutObjectTagging applies from its XML body.
+#[derive(Clone, Debug)]
+struct RequestedObjectTags(Tagging);
+
+/// Request headers with the object policy inputs a POST upload applies from its
+/// form fields, so header-derived condition keys describe what is stored.
+#[derive(Clone, Debug)]
+struct PostObjectPolicyHeaders(http::HeaderMap);
+
 /// These operations stage upload state without publishing an object. Keep this
 /// separate from the marker controlling multipart publication fences.
 #[derive(Clone, Copy, Debug)]
@@ -925,8 +938,14 @@ fn authorization_conditions<T>(
     client_info: Option<&ClientInfo>,
     action: Action,
 ) -> S3Result<HashMap<String, Vec<String>>> {
+    // A POST upload applies its form fields, not its headers, so the policy
+    // decision must read the values the handler stores.
+    let headers = req
+        .extensions
+        .get::<PostObjectPolicyHeaders>()
+        .map_or(&req.headers, |headers| &headers.0);
     let mut conditions = get_condition_values_with_query_and_client_info(
-        &req.headers,
+        headers,
         cred,
         version_id,
         None,
@@ -951,7 +970,31 @@ fn authorization_conditions<T>(
         conditions.insert("LocationConstraint".to_string(), vec![location]);
     }
     merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
-    merge_request_object_tag_conditions(action, &req.headers, &mut conditions)?;
+    merge_request_object_tag_conditions(action, headers, &mut conditions)?;
+    if let Some(RequestedObjectLegalHold(legal_hold)) = req.extensions.get::<RequestedObjectLegalHold>() {
+        // Standalone legal hold writes apply the XML body, so headers must not
+        // supply a different value to the policy decision.
+        conditions.remove("object-lock-legal-hold");
+        if let Some(status) = &legal_hold.status {
+            conditions.insert("object-lock-legal-hold".to_string(), vec![status.as_str().to_string()]);
+        }
+    }
+    if let Some(RequestedObjectTags(tagging)) = req.extensions.get::<RequestedObjectTags>() {
+        // Standalone tag writes apply the XML body; the x-amz-tagging header is
+        // not stored and must not describe the request to the policy engine.
+        conditions.retain(|key, _| key != "RequestObjectTagKeys" && !key.starts_with("RequestObjectTag/"));
+        let mut keys = Vec::new();
+        for tag in &tagging.tag_set {
+            if let (Some(key), Some(value)) = (&tag.key, &tag.value) {
+                keys.push(key.clone());
+                conditions
+                    .entry(format!("RequestObjectTag/{key}"))
+                    .or_default()
+                    .push(value.clone());
+            }
+        }
+        conditions.insert("RequestObjectTagKeys".to_string(), keys);
+    }
     if let Some(RequestedObjectLockRetention(retention)) = req.extensions.get::<RequestedObjectLockRetention>() {
         // Standalone retention writes apply the XML body, so headers must not
         // supply a different value to the policy decision.
@@ -1005,6 +1048,58 @@ fn set_requested_object_lock_retention(req: &mut S3Request<PutObjectRetentionInp
     let retention = req.input.retention.clone().unwrap_or_default();
     set_requested_object_lock_retain_until(req, retention.retain_until_date.as_ref());
     req.extensions.insert(RequestedObjectLockRetention(retention));
+}
+
+/// A POST upload stores the object policy inputs from its form fields, while
+/// header-derived condition keys would otherwise read the HTTP headers. Project
+/// the form fields over the headers for the policy decision, removing a header
+/// whose field is absent so a client header cannot stand in for a stored value.
+fn set_post_object_policy_headers(req: &mut S3Request<PutObjectInput>) -> S3Result<()> {
+    if req.method != http::Method::POST {
+        return Ok(());
+    }
+    let input = &req.input;
+    let retain_until = input
+        .object_lock_retain_until_date
+        .as_ref()
+        .map(|date| OffsetDateTime::from(date.clone()).format(&time::format_description::well_known::Rfc3339))
+        .transpose()
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid retain-until date"))?;
+    let mut headers = req.headers.clone();
+    for (key, value) in [
+        ("x-amz-object-lock-mode", input.object_lock_mode.as_ref().map(ObjectLockMode::as_str)),
+        (
+            "x-amz-object-lock-legal-hold",
+            input
+                .object_lock_legal_hold_status
+                .as_ref()
+                .map(ObjectLockLegalHoldStatus::as_str),
+        ),
+        ("x-amz-object-lock-retain-until-date", retain_until.as_deref()),
+        ("x-amz-tagging", input.tagging.as_deref()),
+        ("x-amz-acl", input.acl.as_ref().map(ObjectCannedACL::as_str)),
+        ("x-amz-storage-class", input.storage_class.as_ref().map(StorageClass::as_str)),
+        (
+            "x-amz-server-side-encryption",
+            input.server_side_encryption.as_ref().map(ServerSideEncryption::as_str),
+        ),
+        ("x-amz-server-side-encryption-aws-kms-key-id", input.ssekms_key_id.as_deref()),
+        ("x-amz-server-side-encryption-customer-algorithm", input.sse_customer_algorithm.as_deref()),
+        ("x-amz-grant-full-control", input.grant_full_control.as_deref()),
+        ("x-amz-grant-read", input.grant_read.as_deref()),
+        ("x-amz-grant-read-acp", input.grant_read_acp.as_deref()),
+        ("x-amz-grant-write-acp", input.grant_write_acp.as_deref()),
+    ] {
+        headers.remove(key);
+        if let Some(value) = value {
+            let value = value
+                .parse()
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid form field"))?;
+            headers.insert(key, value);
+        }
+    }
+    req.extensions.insert(PostObjectPolicyHeaders(headers));
+    Ok(())
 }
 
 fn merge_object_lock_remaining_retention_days_condition(
@@ -3465,6 +3560,7 @@ impl S3Access for FS {
             };
             let requested_retain_until = req.input.object_lock_retain_until_date.clone();
             set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
+            set_post_object_policy_headers(req)?;
             authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
             req.extensions.insert(bucket_generation?);
 
@@ -3502,6 +3598,8 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_legal_hold(&self, req: &mut S3Request<PutObjectLegalHoldInput>) -> S3Result<()> {
+        req.extensions
+            .insert(RequestedObjectLegalHold(req.input.legal_hold.clone().unwrap_or_default()));
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -3549,6 +3647,7 @@ impl S3Access for FS {
     ///
     /// This method returns `Ok(())` by default.
     async fn put_object_tagging(&self, req: &mut S3Request<PutObjectTaggingInput>) -> S3Result<()> {
+        req.extensions.insert(RequestedObjectTags(req.input.tagging.clone()));
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -3681,8 +3780,8 @@ mod tests {
     };
     use super::{BulkDenialAudit, audit_request_denial};
     use super::{
-        remaining_retention_days, requested_bucket_location_constraint, set_requested_object_lock_retain_until,
-        set_requested_object_lock_retention,
+        RequestedObjectLegalHold, RequestedObjectTags, remaining_retention_days, requested_bucket_location_constraint,
+        set_post_object_policy_headers, set_requested_object_lock_retain_until, set_requested_object_lock_retention,
     };
     use crate::auth::OBJECT_LOCK_REMAINING_RETENTION_DAYS_CONDITION;
     use crate::error::ApiError;
@@ -4810,6 +4909,108 @@ mod tests {
     fn remaining_retention_days_conditions<T>(req: &S3Request<T>, action: Action) -> HashMap<String, Vec<String>> {
         let credentials = rustfs_credentials::Credentials::default();
         authorization_conditions(req, &credentials, None, None, None, None, action).expect("conditions should build")
+    }
+
+    #[test]
+    fn legal_hold_policy_checks_body_instead_of_conflicting_headers() {
+        let mut req = build_request(
+            PutObjectLegalHoldInput {
+                legal_hold: Some(ObjectLockLegalHold {
+                    status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::OFF)),
+                }),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        req.headers
+            .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+        let action = Action::S3Action(S3Action::PutObjectLegalHoldAction);
+        // Without the hook's extension the header leaks into the decision.
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
+        req.extensions
+            .insert(RequestedObjectLegalHold(req.input.legal_hold.clone().unwrap_or_default()));
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["OFF".to_string()]));
+        // A body without a status stores no hold change; the header must not fill it in.
+        req.extensions
+            .insert(RequestedObjectLegalHold(ObjectLockLegalHold::default()));
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert!(!conditions.contains_key("object-lock-legal-hold"));
+    }
+
+    #[test]
+    fn tagging_policy_checks_body_instead_of_conflicting_headers() {
+        let mut req = build_request(
+            PutObjectTaggingInput::builder()
+                .bucket("bucket".to_string())
+                .key("object".to_string())
+                .tagging(Tagging {
+                    tag_set: vec![Tag {
+                        key: Some("classification".to_string()),
+                        value: Some("confidential".to_string()),
+                    }],
+                })
+                .build()
+                .expect("valid tagging request DTO"),
+            Method::PUT,
+        );
+        req.headers
+            .insert("x-amz-tagging", HeaderValue::from_static("classification=public"));
+        let action = Action::S3Action(S3Action::PutObjectTaggingAction);
+        req.extensions.insert(RequestedObjectTags(req.input.tagging.clone()));
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("RequestObjectTag/classification"), Some(&vec!["confidential".to_string()]));
+        assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&vec!["classification".to_string()]));
+        req.extensions.insert(RequestedObjectTags(Tagging::default()));
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert!(!conditions.contains_key("RequestObjectTag/classification"));
+        assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&Vec::new()));
+    }
+
+    #[test]
+    fn post_object_policy_checks_form_fields_instead_of_headers() {
+        let mut req = build_request(
+            PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static(ObjectLockLegalHoldStatus::ON)),
+                object_lock_mode: Some(ObjectLockMode::from_static(ObjectLockMode::COMPLIANCE)),
+                tagging: Some("classification=confidential".to_string()),
+                ..Default::default()
+            },
+            Method::POST,
+        );
+        req.headers
+            .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("OFF"));
+        req.headers
+            .insert("x-amz-object-lock-mode", HeaderValue::from_static("GOVERNANCE"));
+        req.headers
+            .insert("x-amz-object-lock-retain-until-date", HeaderValue::from_static("2029-01-01T00:00:00Z"));
+        req.headers
+            .insert("x-amz-tagging", HeaderValue::from_static("classification=public"));
+        set_post_object_policy_headers(&mut req).expect("form fields project onto policy headers");
+        let action = Action::S3Action(S3Action::PutObjectAction);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
+        assert_eq!(conditions.get("object-lock-mode"), Some(&vec!["COMPLIANCE".to_string()]));
+        // The form sets no retain-until date, so the header must not stand in for one.
+        assert!(!conditions.contains_key("object-lock-retain-until-date"));
+        assert_eq!(conditions.get("RequestObjectTag/classification"), Some(&vec!["confidential".to_string()]));
+        // A PUT keeps reading its headers.
+        let mut put = build_request(
+            PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                ..Default::default()
+            },
+            Method::PUT,
+        );
+        put.headers
+            .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static("ON"));
+        set_post_object_policy_headers(&mut put).expect("PUT is untouched");
+        let conditions = remaining_retention_days_conditions(&put, action);
+        assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["ON".to_string()]));
     }
 
     #[tokio::test]

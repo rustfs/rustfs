@@ -131,7 +131,10 @@ persist until the refresh settles.
 Control-plane retry begins on the 30-second drain, while heavyweight snapshots,
 pending topology operations, and bucket wiring are revisited on the 600-second
 pass. Object MRF entries are persisted every 10 seconds by default and target
-health is probed every 5 seconds. These are scheduling bounds, not delivery
+health is probed every 5 seconds. The persisted MRF journal is replayed at
+startup and then once every 5 minutes across the cluster, so a delete-marker purge or an overflowed
+replication whose target was down converges within one replay interval after
+the target returns. These are scheduling bounds, not delivery
 SLAs: network timeouts and the amount of queued work add to them.
 
 Objects that must be rediscovered by the scanner have this conservative upper

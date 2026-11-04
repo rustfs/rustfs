@@ -23,7 +23,7 @@ use crate::admin::{
     handlers::supervise_admin_mutation,
     handlers::target_descriptor::{
         AdminTargetSpec, RuntimeHealthStatus, TargetEndpointSource, TargetInstanceReadModel, admin_target_spec_from_builtin,
-        allowed_target_keys, build_enabled_target_kvs, build_json_response, build_validated_target_kvs, collect_target_instances,
+        allowed_target_keys, build_json_response, build_validated_target_kvs, collect_target_instances,
         collect_validated_key_values, find_target_instance, target_module_disabled_reason,
         target_mutation_block_reason as shared_target_mutation_block_reason,
     },
@@ -53,7 +53,7 @@ use rustfs_config::{AUDIT_DEFAULT_DIR, EVENT_DEFAULT_DIR, MAX_ADMIN_REQUEST_BODY
 use rustfs_policy::policy::action::{Action, AdminAction};
 use rustfs_targets::catalog::builtin::{builtin_audit_target_admin_descriptors, builtin_notify_target_admin_descriptors};
 use rustfs_targets::{builtin_target_plugin_operational_state, runtime_state_from_status_label};
-use s3s::{Body, S3Request, S3Response, S3Result, s3_error};
+use s3s::{Body, S3Error, S3Request, S3Response, S3Result, s3_error};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
 use std::sync::LazyLock;
@@ -149,7 +149,10 @@ fn restore_redacted_secret_values(
             continue;
         }
         if !secret_fields.iter().any(|field| field.eq_ignore_ascii_case(&kv.key)) {
-            continue;
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "the redacted placeholder is only valid for stored secret fields",
+            ));
         }
         let stored = stored_config
             .and_then(|kvs| kvs.lookup(&kv.key))
@@ -164,6 +167,50 @@ fn restore_redacted_secret_values(
         kv.value = stored;
     }
     Ok(())
+}
+
+/// Restore only credentials whose destination and trust configuration remain unchanged, then run
+/// the target's real validator. This gate precedes validators that authenticate to remote servers.
+async fn validate_instance_update(
+    resolved: &ResolvedPluginInstanceTarget,
+    requested: &mut [KeyValue],
+    stored: Option<&KVS>,
+    effective: Option<&KVS>,
+) -> S3Result<KVS> {
+    let spec = &resolved.target_spec;
+    let preserves_secrets =
+        spec.secret_fields
+            .iter()
+            .any(|&key| match requested.iter().find(|kv| kv.key.eq_ignore_ascii_case(key)) {
+                Some(kv) => kv.value == REDACTED_SECRET_VALUE,
+                None => effective.is_some_and(|config| config.lookup(key).is_some_and(|value| !value.is_empty())),
+            });
+    restore_redacted_secret_values(requested, spec.secret_fields, stored)?;
+    let context = resolved.context;
+    let candidate = if let Some(effective) = effective {
+        effective_validation_fields(context, spec.subsystem, effective, requested)?
+    } else {
+        let allowed = allowed_target_keys(context.specs, spec.subsystem);
+        collect_validated_key_values(
+            requested.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
+            &allowed,
+            spec.subsystem,
+            "plugin instance",
+        )?
+    };
+    if preserves_secrets {
+        let bindings = rustfs_targets::manifest::builtin_target_manifest(spec.service).credential_binding_fields();
+        if bindings.iter().any(|key| {
+            let old = stored.and_then(|config| config.lookup(key)).unwrap_or_default();
+            candidate.get(*key).map(String::as_str).unwrap_or_default() != old
+        }) {
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "changing a target destination or TLS trust configuration requires explicit credentials",
+            ));
+        }
+    }
+    build_validated_target_kvs(spec, candidate, context.default_queue_dir).await
 }
 
 /// Case-insensitive lookup of an instance's persisted config section.
@@ -970,21 +1017,8 @@ impl Operation for PutPluginInstanceHandler {
         } else {
             stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name)
         };
-        restore_redacted_secret_values(&mut body.key_values, resolved.target_spec.secret_fields, stored_secrets)?;
-
-        let validated_kvs = if let Some(effective) = effective_instance.as_ref() {
-            let candidate = effective_validation_fields(context, resolved.target_spec.subsystem, effective, &body.key_values)?;
-            build_validated_target_kvs(&resolved.target_spec, candidate, context.default_queue_dir).await?
-        } else {
-            build_enabled_target_kvs(
-                context.specs,
-                body.key_values.iter().map(|kv| (kv.key.as_str(), kv.value.as_str())),
-                resolved.target_spec.subsystem,
-                context.default_queue_dir,
-                "plugin instance",
-            )
-            .await?
-        };
+        let validated_kvs =
+            validate_instance_update(&resolved, &mut body.key_values, stored_secrets, effective_instance.as_ref()).await?;
 
         let kvs = if let Some(expected_config) = body.expected_config.as_ref() {
             let original = stored_instance_config(&config_snapshot, resolved.target_spec.subsystem, &resolved.target_name)
@@ -1376,6 +1410,195 @@ mod tests {
     }
 
     #[test]
+    fn amqp_and_redis_instance_views_redact_credential_bearing_urls() {
+        for domain in [PluginContractDomain::Notify, PluginContractDomain::Audit] {
+            let context = super::plugin_instance_domain_context(domain);
+            for service in ["amqp", "redis"] {
+                let spec = context
+                    .specs
+                    .iter()
+                    .find(|spec| spec.service == service)
+                    .expect("builtin target");
+                let mut config = KVS::new();
+                config.insert("url".to_owned(), format!("{service}://operator:private-password@example.test/"));
+                config.insert("password".to_owned(), "separate-password".to_owned());
+                let mapped = super::map_instance_config(config, super::secret_fields_for_instance(domain, spec.subsystem));
+                assert_eq!(mapped["url"], super::REDACTED_SECRET_VALUE);
+                assert_eq!(mapped["password"], super::REDACTED_SECRET_VALUE);
+                let encoded = serde_json::to_string(&mapped).expect("response JSON");
+                assert!(!encoded.contains("private-password"));
+                assert!(!encoded.contains("separate-password"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_update_binds_pulsar_credentials_to_tls_verification() {
+        use rustfs_config::{PULSAR_AUTH_TOKEN, PULSAR_BROKER, PULSAR_TLS_ALLOW_INSECURE, PULSAR_TLS_HOSTNAME_VERIFICATION};
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let target_spec = context
+            .specs
+            .iter()
+            .find(|spec| spec.service == "pulsar")
+            .expect("Pulsar target")
+            .clone();
+        let resolved = super::ResolvedPluginInstanceTarget {
+            context,
+            target_name: "primary".to_owned(),
+            target_spec,
+        };
+        let mut stored = KVS::new();
+        stored.insert(PULSAR_BROKER.to_owned(), "pulsar+ssl://broker.example.test:6651".to_owned());
+        stored.insert(PULSAR_AUTH_TOKEN.to_owned(), "operator-token".to_owned());
+        stored.insert(PULSAR_TLS_ALLOW_INSECURE.to_owned(), "off".to_owned());
+        stored.insert(PULSAR_TLS_HOSTNAME_VERIFICATION.to_owned(), "on".to_owned());
+        for (key, value) in [(PULSAR_TLS_ALLOW_INSECURE, "on"), (PULSAR_TLS_HOSTNAME_VERIFICATION, "off")] {
+            let mut requested = vec![super::KeyValue {
+                key: key.to_owned(),
+                value: value.to_owned(),
+            }];
+            let error = super::validate_instance_update(&resolved, &mut requested, Some(&stored), Some(&stored))
+                .await
+                .expect_err("weaker TLS verification must require explicit credentials");
+            assert!(error.to_string().contains("requires explicit credentials"));
+        }
+    }
+
+    #[tokio::test]
+    async fn plugin_update_never_sends_preserved_credentials_to_a_changed_destination() {
+        use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("destination trap");
+        listener.set_nonblocking(true).expect("nonblocking trap");
+        let new_url = format!("redis://{}/", listener.local_addr().expect("trap address"));
+        let context = super::plugin_instance_domain_context(PluginContractDomain::Notify);
+        let spec = context
+            .specs
+            .iter()
+            .find(|spec| spec.service == "redis")
+            .expect("Redis target")
+            .clone();
+        let resolved = super::ResolvedPluginInstanceTarget {
+            context,
+            target_name: "primary".to_owned(),
+            target_spec: spec,
+        };
+        let mut stored = KVS::new();
+        stored.insert("url".to_owned(), "redis://127.0.0.1:1/".to_owned());
+        stored.insert("username".to_owned(), "operator".to_owned());
+        stored.insert("password".to_owned(), "operator-password".to_owned());
+        let field = |key: &str, value: &str| super::KeyValue {
+            key: key.to_owned(),
+            value: value.to_owned(),
+        };
+        for conditional in [false, true] {
+            for omitted in [false, true] {
+                let mut requested = vec![field("url", &new_url)];
+                if !omitted {
+                    requested.push(field("password", super::REDACTED_SECRET_VALUE));
+                }
+                if omitted && !conditional {
+                    continue;
+                }
+                let error =
+                    super::validate_instance_update(&resolved, &mut requested, Some(&stored), conditional.then_some(&stored))
+                        .await
+                        .expect_err("destination changes cannot inherit credentials");
+                assert!(error.to_string().contains("requires explicit credentials"));
+                assert!(
+                    matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+                    "validator must not connect before refusing credential reuse"
+                );
+            }
+        }
+        // A legacy replacement that omits its destination must not restore the password into defaults.
+        let mut requested = vec![field("password", super::REDACTED_SECRET_VALUE)];
+        assert!(
+            super::validate_instance_update(&resolved, &mut requested, Some(&stored), None)
+                .await
+                .is_err()
+        );
+        // Trust changes are destination changes even if the hostname stays unchanged.
+        let mut requested = vec![field("url", super::REDACTED_SECRET_VALUE), field("tls_allow_insecure", "on")];
+        assert!(
+            super::validate_instance_update(&resolved, &mut requested, Some(&stored), Some(&stored))
+                .await
+                .is_err()
+        );
+        assert!(matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock));
+
+        let listener = tokio::net::TcpListener::from_std(listener).expect("async Redis control");
+        let server = tokio::spawn(async move {
+            let mut exchanges = Vec::new();
+            for _ in 0..2 {
+                let (stream, _) = listener.accept().await.expect("authorized credentials may connect");
+                let mut stream = BufReader::new(stream);
+                let mut received = Vec::new();
+                for _ in 0..16 {
+                    let mut line = String::new();
+                    assert!(stream.read_line(&mut line).await.expect("Redis array") > 0);
+                    let count: usize = line
+                        .trim()
+                        .strip_prefix('*')
+                        .expect("RESP array")
+                        .parse()
+                        .expect("array size");
+                    let mut command = Vec::new();
+                    for _ in 0..count {
+                        line.clear();
+                        stream.read_line(&mut line).await.expect("Redis bulk length");
+                        let length: usize = line.trim().strip_prefix('$').expect("RESP bulk").parse().expect("bulk size");
+                        let mut bytes = vec![0; length + 2];
+                        stream.read_exact(&mut bytes).await.expect("Redis bulk value");
+                        command.push(String::from_utf8(bytes[..length].to_vec()).expect("UTF8 Redis command"));
+                    }
+                    let ping = command.first().is_some_and(|value| value == "PING");
+                    let response = match command.first().map(String::as_str) {
+                        Some("PING") => b"+PONG\r\n".as_slice(),
+                        Some("HELLO") => b"%1\r\n+server\r\n+redis\r\n".as_slice(),
+                        _ => b"+OK\r\n".as_slice(),
+                    };
+                    received.extend(command);
+                    stream.get_mut().write_all(response).await.expect("Redis reply");
+                    if ping {
+                        break;
+                    }
+                }
+                assert!(received.contains(&"PING".to_owned()), "Redis validation must finish");
+                exchanges.push(received);
+            }
+            exchanges
+        });
+        let mut requested = vec![
+            field("url", &new_url),
+            field("username", "operator"),
+            field("password", "replacement-password"),
+        ];
+        let validated = super::validate_instance_update(&resolved, &mut requested, Some(&stored), None)
+            .await
+            .expect("explicit replacement secret may authorize the new endpoint");
+        assert_eq!(validated.get("password"), "replacement-password");
+        stored.insert("url".to_owned(), new_url);
+        let mut requested = vec![
+            field("url", super::REDACTED_SECRET_VALUE),
+            field("password", super::REDACTED_SECRET_VALUE),
+            field("username", "operator"),
+            field("channel", "changed-delivery-channel"),
+        ];
+        let restored = super::validate_instance_update(&resolved, &mut requested, Some(&stored), None)
+            .await
+            .expect("unchanged destination can round-trip hidden credentials while editing delivery settings");
+        assert_eq!(restored.get("password"), "operator-password");
+        assert!(!restored.0.iter().any(|kv| kv.value == super::REDACTED_SECRET_VALUE));
+        let received = tokio::time::timeout(std::time::Duration::from_secs(10), server)
+            .await
+            .expect("Redis deadline")
+            .expect("Redis task");
+        assert!(received[0].contains(&"replacement-password".to_owned()));
+        assert!(!received[0].contains(&"operator-password".to_owned()));
+        assert!(received[1].contains(&"operator-password".to_owned()));
+    }
+
+    #[test]
     fn put_round_trip_restores_stored_secret_for_redacted_placeholder() {
         let mut key_values = vec![
             super::KeyValue {
@@ -1415,14 +1638,14 @@ mod tests {
     }
 
     #[test]
-    fn put_round_trip_leaves_placeholder_on_non_secret_fields_untouched() {
+    fn put_round_trip_rejects_placeholder_on_non_secret_fields() {
         let mut key_values = vec![super::KeyValue {
             key: WEBHOOK_ENDPOINT.to_string(),
             value: super::REDACTED_SECRET_VALUE.to_string(),
         }];
 
         super::restore_redacted_secret_values(&mut key_values, &[WEBHOOK_AUTH_TOKEN], None)
-            .expect("non-secret fields are not subject to placeholder restoration");
+            .expect_err("non-secret fields must not persist the reserved placeholder");
         assert_eq!(key_values[0].value, super::REDACTED_SECRET_VALUE);
     }
 

@@ -708,7 +708,6 @@ pub(crate) mod bucket {
         pub(crate) type DeleteReplicationConfigSnapshot =
             crate::storage::storage_api::ecstore_bucket::replication::DeleteReplicationConfigSnapshot;
         pub(crate) type ReplicateDecision = replication_contracts::ReplicateDecision;
-        #[cfg(test)]
         pub(crate) type ReplicationState = replication_contracts::ReplicationState;
         pub(crate) type ReplicationStatusType = replication_contracts::ReplicationStatusType;
         pub(crate) type ReplicationTargetValidationError = replication_contracts::ReplicationTargetValidationError;
@@ -957,6 +956,52 @@ pub(crate) mod bucket {
                 replica,
             };
             replication_contracts::delete_replication_state_from_config(config, &source)
+        }
+
+        /// Replication state for forwarding a replica delete (an inbound
+        /// replication request) to this site's own targets.
+        ///
+        /// Operator rules with ReplicaModifications keep forwarding, so chained
+        /// replication A -> B -> C propagates deletes (rustfs#2609). Derived
+        /// site-replication rules never do: site replication is a full mesh
+        /// where the origin delivers, and MRF-retries, every delete to each
+        /// peer itself. Forwarding along a `site-repl-<deploymentId>` rule only
+        /// echoes the delete back to the origin, where it removes the origin's
+        /// pending-purge version before its own delivery state is written back,
+        /// and duplicates it to every other peer (rustfs#9121). MinIO never
+        /// re-replicates a replication request at all.
+        ///
+        /// Rule ids and target ARN shapes are not reserved: an ordinary bucket
+        /// target ARN also carries a target id, so an operator rule can match
+        /// the derived shape. Only a rule naming a current remote peer in
+        /// `site_peer_deployment_ids` is skipped; with site replication
+        /// disabled the set is empty and every rule forwards.
+        pub(crate) fn replica_delete_fanout_state_from_config(
+            config: &s3s::dto::ReplicationConfiguration,
+            obj_info: &crate::storage::storage_api::StorageObjectInfo,
+            version_id: Option<Uuid>,
+            site_peer_deployment_ids: &HashSet<String>,
+        ) -> Option<replication_contracts::ReplicationState> {
+            let is_site_peer_rule = |rule: &s3s::dto::ReplicationRule| {
+                replication_contracts::site_replication_rule_deployment_id(rule)
+                    .is_some_and(|deployment_id| site_peer_deployment_ids.contains(deployment_id))
+            };
+            if !config.rules.iter().any(is_site_peer_rule) {
+                return delete_replication_state_from_config(config, obj_info, version_id, true);
+            }
+
+            let mut operator_config = config.clone();
+            operator_config.rules.retain(|rule| !is_site_peer_rule(rule));
+            delete_replication_state_from_config(&operator_config, obj_info, version_id, true)
+        }
+
+        /// Whether `config` has a rule with the derived site-replication shape,
+        /// so the replica-delete fan-out needs the current peer set.
+        pub(crate) fn has_site_replication_shaped_rule(config: &s3s::dto::ReplicationConfiguration) -> bool {
+            config
+                .rules
+                .iter()
+                .any(|rule| replication_contracts::site_replication_rule_deployment_id(rule).is_some())
         }
 
         pub(crate) fn replication_target_arns(config: &s3s::dto::ReplicationConfiguration) -> HashSet<String> {
@@ -1286,7 +1331,9 @@ pub(crate) mod multipart_usecase {
     pub(crate) use super::{
         access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
     };
-    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
+    pub(crate) use crate::storage::storage_api::{
+        ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, validate_object_key,
+    };
 }
 
 pub(crate) mod select_object {

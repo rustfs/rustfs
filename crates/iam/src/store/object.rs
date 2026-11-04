@@ -1154,7 +1154,7 @@ impl Store for ObjectStore {
         // node-counted lock quorum (rustfs#4304; startup contract rustfs#4056).
         const LOAD_ALL_MODE: LoadMode = LoadMode::BootstrapNoLock;
 
-        let cache_snapshot = cache.snapshot();
+        let reload = cache.begin_reload().await;
         let listed_config_items = self.list_all_iamconfig_items().await?;
 
         let mut policy_docs_cache = CacheEntity::new(get_default_policies());
@@ -1201,26 +1201,20 @@ impl Store for ObjectStore {
         }
 
         // groups
-        let mut groups_cache = None;
+        let mut groups_cache = CacheEntity::default();
         if let Some(item_name_list) = listed_config_items.get(GROUPS_LIST_KEY) {
-            let mut items_cache = CacheEntity::default();
-
             for item in item_name_list.iter() {
                 let name = rustfs_utils::path::dir(item);
                 debug!(group = %name, "IAM group loaded");
-                if let Err(err) = self.load_group_with(&name, &mut items_cache, LOAD_ALL_MODE).await {
+                if let Err(err) = self.load_group_with(&name, &mut groups_cache, LOAD_ALL_MODE).await {
                     return Err(Error::other(format!("load group failed: {err}")));
                 };
             }
-
-            groups_cache = Some(items_cache);
         }
 
         // user policies
-        let mut user_policies_cache = None;
+        let mut user_policies_cache = CacheEntity::default();
         if let Some(item_name_list) = listed_config_items.get(POLICY_DB_USERS_LIST_KEY) {
-            let mut items_cache = CacheEntity::default();
-
             // Load in fixed-size chunks so each mapping is fetched exactly once
             // (backlog#806 — the split_off loop was O(n^2)).
             for chunk in item_name_list.chunks(32) {
@@ -1235,32 +1229,26 @@ impl Store for ObjectStore {
 
                     let name = chunk[idx].trim_end_matches(".json").to_owned();
                     debug!(user = %name, "IAM user policy loaded");
-                    items_cache.insert(name, p);
+                    user_policies_cache.insert(name, p);
                 }
             }
-
-            user_policies_cache = Some(items_cache);
         }
 
         // group policy
-        let mut group_policies_cache = None;
+        let mut group_policies_cache = CacheEntity::default();
         if let Some(item_name_list) = listed_config_items.get(POLICY_DB_GROUPS_LIST_KEY) {
-            let mut items_cache = CacheEntity::default();
-
             for item in item_name_list.iter() {
                 let name = item.trim_end_matches(".json");
 
                 debug!(group = %name, "IAM group policy loaded");
                 if let Err(err) = self
-                    .load_mapped_policy_with(name, UserType::Reg, true, &mut items_cache, LOAD_ALL_MODE)
+                    .load_mapped_policy_with(name, UserType::Reg, true, &mut group_policies_cache, LOAD_ALL_MODE)
                     .await
                     && !is_err_no_such_policy(&err)
                 {
                     return Err(Error::other(format!("load group policy failed: {err}")));
                 };
             }
-
-            group_policies_cache = Some(items_cache);
         }
 
         let mut sts_policies_cache = CacheEntity::default();
@@ -1330,25 +1318,48 @@ impl Store for ObjectStore {
             }
         }
 
+        #[cfg(test)]
+        if let Ok(barrier) = LOAD_ALL_COMMIT_BARRIER.try_with(std::sync::Arc::clone) {
+            barrier.0.notify_one();
+            barrier.1.notified().await;
+        }
+
         cache.with_write_lock(|cache| {
-            if cache.matches_snapshot(&cache_snapshot) {
-                cache.replace_policy_docs(policy_docs_cache);
-                if let Some(groups_cache) = groups_cache {
-                    cache.replace_groups(groups_cache);
-                }
-                if let Some(user_policies_cache) = user_policies_cache {
-                    cache.replace_user_policies(user_policies_cache);
-                }
-                if let Some(group_policies_cache) = group_policies_cache {
-                    cache.replace_group_policies(group_policies_cache);
-                }
-                cache.replace_users(user_items_cache);
-                cache.replace_sts_accounts(sts_items_cache);
-                cache.replace_sts_policies(sts_policies_cache);
-                cache.build_user_group_memberships();
-            } else {
-                warn!("IAM full reload cache commit skipped due to concurrent cache changes");
-            }
+            reload.merge_partition(
+                crate::cache::CachePartition::PolicyDocs,
+                &mut policy_docs_cache,
+                &cache.state().policy_docs,
+            );
+            reload.merge_partition(crate::cache::CachePartition::Groups, &mut groups_cache, &cache.state().groups);
+            reload.merge_partition(
+                crate::cache::CachePartition::UserPolicies,
+                &mut user_policies_cache,
+                &cache.state().user_policies,
+            );
+            reload.merge_partition(
+                crate::cache::CachePartition::GroupPolicies,
+                &mut group_policies_cache,
+                &cache.state().group_policies,
+            );
+            reload.merge_partition(crate::cache::CachePartition::Users, &mut user_items_cache, &cache.state().users);
+            reload.merge_partition(
+                crate::cache::CachePartition::StsAccounts,
+                &mut sts_items_cache,
+                &cache.state().sts_accounts,
+            );
+            reload.merge_partition(
+                crate::cache::CachePartition::StsPolicies,
+                &mut sts_policies_cache,
+                &cache.state().sts_policies,
+            );
+            cache.replace_policy_docs(policy_docs_cache);
+            cache.replace_groups(groups_cache);
+            cache.replace_user_policies(user_policies_cache);
+            cache.replace_group_policies(group_policies_cache);
+            cache.replace_users(user_items_cache);
+            cache.replace_sts_accounts(sts_items_cache);
+            cache.replace_sts_policies(sts_policies_cache);
+            cache.build_user_group_memberships();
         });
 
         Ok(())
@@ -1364,6 +1375,11 @@ fn map_delete_user_identity_error(name: &str, err: Error) -> Error {
 }
 
 #[cfg(test)]
+tokio::task_local! {
+    static LOAD_ALL_COMMIT_BARRIER: std::sync::Arc<(tokio::sync::Notify, tokio::sync::Notify)>;
+}
+
+#[cfg(test)]
 mod tests {
     use super::{DecryptSource, LoadMode, ObjectStore, map_delete_user_identity_error};
     use crate::error::Error;
@@ -1371,6 +1387,99 @@ mod tests {
     use rustfs_credentials::{Credentials, init_global_action_credentials};
     use serial_test::serial;
     use temp_env::with_vars;
+
+    #[test]
+    #[serial]
+    fn test_load_all_clears_partitions_with_empty_prefix() {
+        use crate::cache::Cache;
+        use crate::store::{GroupInfo, MappedPolicy, Store, UserType};
+
+        std::thread::Builder::new()
+            .stack_size(8 * 1024 * 1024)
+            .spawn(|| {
+                let runtime = tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(2)
+                    .enable_all()
+                    .build()
+                    .expect("build IAM reload test runtime");
+                runtime.block_on(async {
+                    let _credentials = test_cred();
+                    let temp = tempfile::tempdir().expect("create IAM reload store directory");
+                    let env = Box::pin(
+                        rustfs_test_utils::TestECStoreEnv::builder()
+                            .base_dir(temp.path())
+                            .init_bucket_metadata(false)
+                            .build(),
+                    )
+                    .await;
+                    let store = ObjectStore::new(env.ecstore);
+                    store
+                        .save_group_info("reload-group", GroupInfo::new(vec!["reload-user".to_string()]))
+                        .await
+                        .expect("seed group membership");
+                    store
+                        .save_mapped_policy("reload-user", UserType::Reg, false, MappedPolicy::new("readwrite"), None)
+                        .await
+                        .expect("seed user policy");
+                    store
+                        .save_mapped_policy("reload-group", UserType::Reg, true, MappedPolicy::new("readonly"), None)
+                        .await
+                        .expect("seed group policy");
+
+                    let cache = Cache::default();
+                    store.load_all(&cache).await.expect("load nonempty IAM partitions");
+                    {
+                        let snapshot = cache.snapshot();
+                        assert!(snapshot.groups.contains_key("reload-group"));
+                        assert_eq!(snapshot.user_policies["reload-user"].policies, "readwrite");
+                        assert_eq!(snapshot.group_policies["reload-group"].policies, "readonly");
+                        assert!(snapshot.user_group_memberships["reload-user"].contains("reload-group"));
+                    }
+
+                    // Mutate durable state without notifying this cache, as on
+                    // a peer that missed the last mapping/group deletion.
+                    store
+                        .delete_mapped_policy("reload-user", UserType::Reg, false)
+                        .await
+                        .expect("remove last user mapping");
+                    store
+                        .delete_mapped_policy("reload-group", UserType::Reg, true)
+                        .await
+                        .expect("remove last group mapping");
+                    store.delete_group_info("reload-group").await.expect("remove last group");
+                    assert!(cache.snapshot().groups.contains_key("reload-group"));
+                    // Simulate a missed peer revocation while STS publication
+                    // and a separate user update overlap this full disk reload.
+                    let stale = rustfs_policy::auth::UserIdentity {
+                        version: 1,
+                        ..Default::default()
+                    };
+                    cache.add_or_update_user("revoked-user", &stale, time::OffsetDateTime::now_utc());
+                    let barrier = std::sync::Arc::new((tokio::sync::Notify::new(), tokio::sync::Notify::new()));
+                    let loading = super::LOAD_ALL_COMMIT_BARRIER.scope(std::sync::Arc::clone(&barrier), store.load_all(&cache));
+                    let concurrent = async {
+                        barrier.0.notified().await;
+                        cache.add_or_update_sts_account("new-session", &stale, time::OffsetDateTime::now_utc());
+                        cache.add_or_update_user("new-service", &stale, time::OffsetDateTime::now_utc());
+                        barrier.1.notify_one();
+                    };
+                    let (loaded, ()) = tokio::join!(loading, concurrent);
+                    loaded.expect("reconcile revoked identities despite STS traffic");
+                    let snapshot = cache.snapshot();
+                    assert!(!snapshot.users.contains_key("revoked-user"));
+                    assert!(snapshot.users.contains_key("new-service"));
+                    assert!(snapshot.sts_accounts.contains_key("new-session"));
+                    assert!(snapshot.groups.is_empty());
+                    assert!(snapshot.user_policies.is_empty());
+                    assert!(snapshot.group_policies.is_empty());
+                    assert!(snapshot.user_group_memberships.is_empty());
+                    assert!(!snapshot.policy_docs.is_empty(), "built-in policies must remain available");
+                });
+            })
+            .expect("spawn IAM reload test thread")
+            .join()
+            .expect("IAM reload test should complete");
+    }
 
     /// rustfs#4304 / startup contract rustfs#4056: the bulk snapshot load
     /// (`load_all`) must never depend on the node-counted namespace lock
