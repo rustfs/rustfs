@@ -81,6 +81,14 @@ const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 1000;
 const RECURSIVE_DELETE_VERSION_SCAN_PAGE_SIZE: i32 = 2;
 const RESTORE_WORKER_LOCK_PREFIX: &str = "ilm/restore-worker-locks";
 const RESTORE_WORKER_LOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(50);
+/// Bounded parallelism for the optimistic write-lock probe wave on bulk
+/// deletes. Uncontended keys resolve in a few quorum round-trips instead of
+/// one serialized round-trip per key.
+const DELETE_OBJECTS_LOCK_PROBE_CONCURRENCY: usize = 32;
+/// Probe timeout for the optimistic wave. A contending multi-key batch must
+/// fail fast here so it can drop the wave and fall back to canonical serial
+/// order instead of holding already-probed locks across the other batch.
+const DELETE_OBJECTS_LOCK_PROBE_TIMEOUT: Duration = Duration::from_millis(250);
 const TIER_DELETE_DISPATCH_LOCAL_REPLAY_CONCURRENCY: usize = 16;
 
 fn install_tier_free_version_receipt_sink(opts: &mut ObjectOptions) -> Option<TierFreeVersionReceiptSink> {
@@ -3369,6 +3377,17 @@ impl ECStore {
         bucket: &str,
         object: &str,
     ) -> Result<ObjectLockDiagGuard> {
+        self.acquire_object_write_lock_with_timeout(op, bucket, object, get_lock_acquire_timeout())
+            .await
+    }
+
+    pub(super) async fn acquire_object_write_lock_with_timeout(
+        &self,
+        op: &'static str,
+        bucket: &str,
+        object: &str,
+        timeout: Duration,
+    ) -> Result<ObjectLockDiagGuard> {
         let diag_enabled = is_object_lock_diag_enabled();
         let ns_lock = self.handle_new_ns_lock(bucket, object).await?;
         let acquire_start = Instant::now();
@@ -3376,7 +3395,6 @@ impl ECStore {
         if matches!(op, "delete_object" | "delete_objects") {
             notify_delete_namespace_pending(bucket);
         }
-        let timeout = get_lock_acquire_timeout();
         let mut attempt = ObjectLockAttempt::start(op, bucket, object, None, &ns_lock, "write", timeout);
         let result = ns_lock.get_write_lock(timeout).await;
         attempt.observe(&result);
@@ -3467,6 +3485,12 @@ impl ECStore {
         }
     }
 
+    /// Acquire the per-object write locks a bulk delete needs before any
+    /// mutation. Bulk delete is the only multi-key write-lock holder: two
+    /// overlapping batches that acquire their keys in parallel can each hold
+    /// what the other wants, so the optimistic probe wave is all-or-nothing.
+    /// Any probe failure drops the whole wave (guards release on drop) and the
+    /// canonical serial order resolves contention exactly as before.
     async fn acquire_delete_objects_write_locks(
         &self,
         bucket: &str,
@@ -3480,10 +3504,19 @@ impl ECStore {
         let object_names = sorted_unique_delete_object_names(objects);
         // Lock order: encoded object names are acquired in ascending order, then
         // the set-layer calls receive no_lock so they do not reacquire them.
-        let mut guards = Vec::with_capacity(object_names.len());
-        for object in object_names {
-            guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+        let mut guards = if object_names.len() > 1 {
+            self.probe_delete_objects_write_locks(bucket, &object_names).await.ok()
+        } else {
+            None
+        };
+        if guards.is_none() {
+            let mut serial = Vec::with_capacity(object_names.len());
+            for object in object_names {
+                serial.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+            }
+            guards = Some(serial);
         }
+        let guards = guards.expect("either the probe wave or the serial fallback populated the guards");
         opts.no_lock = true;
         for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
             opts.add_namespace_lock_lost_signal(signal);
@@ -3491,6 +3524,31 @@ impl ECStore {
         opts.ensure_namespace_lock_fence();
 
         Ok(guards)
+    }
+
+    /// Optimistic all-or-nothing lock wave over the unique object names of one
+    /// bulk delete. Bounded parallelism keeps a 1000-key batch from issuing its
+    /// quorum round-trips strictly one after another while the short per-key
+    /// timeout keeps two overlapping batches from parking on each other. Every
+    /// probe is consumed before failure is reported, so a losing wave releases
+    /// each probed lock explicitly instead of relying on in-flight cancellation.
+    async fn probe_delete_objects_write_locks(&self, bucket: &str, object_names: &[&str]) -> Result<Vec<ObjectLockDiagGuard>> {
+        let mut pending = Vec::with_capacity(object_names.len());
+        for object in object_names {
+            pending.push(self.acquire_object_write_lock_with_timeout(
+                "delete_objects",
+                bucket,
+                object,
+                DELETE_OBJECTS_LOCK_PROBE_TIMEOUT,
+            ));
+        }
+        let results: Vec<Result<ObjectLockDiagGuard>> = futures::stream::iter(pending)
+            .buffered(DELETE_OBJECTS_LOCK_PROBE_CONCURRENCY)
+            .collect()
+            .await;
+        // On failure the collected guards drop here, releasing the whole wave
+        // before the serial fallback acquires anything.
+        results.into_iter().collect()
     }
 
     pub(super) async fn acquire_object_read_lock_if_needed(
@@ -13578,5 +13636,80 @@ mod missing_key_delete_quorum_tests {
                 .expect("physical cleanup must eventually release the exact-key guard");
         })
         .await;
+    }
+}
+
+/// The bulk-delete write-lock wave is optimistic and all-or-nothing: a
+/// contended key drops the whole wave and the canonical serial order finishes
+/// the batch (rustfs/backlog#3146).
+#[cfg(test)]
+mod batch_delete_lock_probe_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, BucketOptions, MakeBucketOptions};
+
+    #[tokio::test]
+    async fn contended_key_drops_probe_wave_and_serial_fallback_finishes() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "lock-probe-fallback";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        for key in ["a-object", "b-object"] {
+            let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed object");
+        }
+
+        // Hold the canonical-first key's write lock so the optimistic wave
+        // cannot be all-or-nothing and must fall back to serial acquisition.
+        let held = store
+            .acquire_object_write_lock("delete_objects", bucket, "a-object")
+            .await
+            .expect("hold contended key");
+        let deleting = store.clone();
+        let batch = tokio::spawn(async move {
+            deleting
+                .delete_objects_with_tier_delete_journal_and_accounting(
+                    bucket,
+                    vec![
+                        ObjectToDelete {
+                            object_name: "b-object".to_owned(),
+                            ..Default::default()
+                        },
+                        ObjectToDelete {
+                            object_name: "a-object".to_owned(),
+                            ..Default::default()
+                        },
+                    ],
+                    ObjectOptions::default(),
+                )
+                .await
+        });
+
+        // Long enough for the 250ms probe wave to fail and the serial
+        // fallback to park on the held key in canonical order.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+        assert!(!batch.is_finished(), "serial fallback must wait for the held key");
+        drop(held);
+
+        let (deleted, errors, _) = tokio::time::timeout(Duration::from_secs(30), batch)
+            .await
+            .expect("fallback must finish after the lock releases")
+            .expect("delete task");
+        assert!(errors.iter().all(Option::is_none), "batch outcome: {errors:?}");
+        assert_eq!(deleted.len(), 2, "both keys must report a result");
     }
 }
