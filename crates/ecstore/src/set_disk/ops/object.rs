@@ -10593,6 +10593,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // response can hide a persisted decision and must never roll back.
             let groups = groups.collect::<Vec<_>>();
             published_groups.extend(groups.iter().map(|index| vers[*index].name.clone()));
+            // Journal publish fans out per object per drive; keep enough
+            // publications in flight to feed the drives' durable-mutation
+            // lanes (8 workers each) across a 16-drive set.
+            const DELETE_JOURNAL_PUBLISH_CONCURRENCY: usize = 32;
             let publications = futures::stream::iter(groups.into_iter().map(|index: usize| {
                 let group = &vers[index];
                 let recovery_ticket = recovery_tickets[index].clone();
@@ -10628,7 +10632,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     (index, result)
                 }
             }))
-            .buffer_unordered(16)
+            .buffer_unordered(DELETE_JOURNAL_PUBLISH_CONCURRENCY)
             .collect::<Vec<_>>()
             .await;
             for (index, result) in publications {
