@@ -15,7 +15,7 @@
 use crate::{
     GlobalLockManager, ObjectKey,
     error::Result,
-    fast_lock::{FastLockGuard, LockManager, LockMode, ObjectLockRequest},
+    fast_lock::{FastLockGuard, LockManager, LockMode, LockResult, ObjectLockRequest},
     types::{LockPriority, LockRequest, LockType},
 };
 use std::sync::Arc;
@@ -111,5 +111,62 @@ impl LocalLock {
             .with_acquire_timeout(timeout)
             .with_ttl(ttl);
         self.acquire_guard(&req).await
+    }
+
+    /// Acquire exclusive locks for many independent resources in one batched
+    /// pass; see [`crate::distributed_lock::DistributedLock::acquire_guard_batch`].
+    /// The manager's batch acquire sorts every request into one global
+    /// (shard, key) order, so concurrent batches cannot deadlock. Returns one
+    /// guard or error per resource, in `resources` order.
+    pub async fn acquire_guard_batch(
+        &self,
+        resources: &[ObjectKey],
+        owner: &str,
+        timeout: Duration,
+        ttl: Duration,
+    ) -> Vec<Result<FastLockGuard>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let batch = crate::fast_lock::BatchLockRequest {
+            requests: resources
+                .iter()
+                .map(|resource| {
+                    ObjectLockRequest::new_write(resource.clone(), owner)
+                        .with_acquire_timeout(timeout)
+                        .with_lock_timeout(ttl)
+                })
+                .collect(),
+            owner: owner.into(),
+            all_or_nothing: false,
+        };
+        let outcome = self.manager.acquire_locks_batch(batch).await;
+        let mut guards = outcome
+            .successful_locks
+            .into_iter()
+            .zip(outcome.guards)
+            .collect::<std::collections::HashMap<ObjectKey, FastLockGuard>>();
+        let mut failures = outcome
+            .failed_locks
+            .into_iter()
+            .collect::<std::collections::HashMap<ObjectKey, LockResult>>();
+        resources
+            .iter()
+            .map(|resource| {
+                if let Some(guard) = guards.remove(resource) {
+                    return Ok(guard);
+                }
+                match failures.remove(resource) {
+                    Some(LockResult::Timeout) => Err(crate::error::LockError::timeout(resource.to_string(), timeout)),
+                    Some(LockResult::Conflict { current_owner, .. }) => Err(crate::error::LockError::AlreadyLocked {
+                        resource: resource.to_string(),
+                        owner: current_owner.to_string(),
+                    }),
+                    Some(LockResult::Acquired) | None => {
+                        Err(crate::error::LockError::internal("batch lock acquire returned no outcome for key"))
+                    }
+                }
+            })
+            .collect()
     }
 }
