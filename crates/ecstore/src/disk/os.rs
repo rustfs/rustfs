@@ -7608,12 +7608,15 @@ fn read_multipart_metadata(
         let parent = path
             .parent()
             .ok_or_else(|| io::Error::other("multipart metadata has no parent"))?;
-        let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+        // A read must not recreate a retired upload: pin the existing parent
+        // instead of taking the write-side guard, which creates missing parents.
+        existing_base_directory_suffix(parent, base)?;
+        let guard = pin_multipart_source_directory(parent, base, publication_root)?;
         let name = path
             .file_name()
             .ok_or_else(|| io::Error::other("multipart metadata has no name"))?;
         let mut file = open_windows_relative(
-            guard.source_parent_guard.last_handle()?,
+            guard.last_handle()?,
             name,
             SYNCHRONIZE | FILE_READ_ATTRIBUTES | FILE_READ_DATA,
             FILE_SHARE_READ,
