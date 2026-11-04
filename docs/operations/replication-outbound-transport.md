@@ -28,8 +28,13 @@
 | --- | --- | --- |
 | `RUSTFS_REPLICATION_STREAMING_CHECKSUMS` | unset (plain payloads) | `true` or `1` restores SDK trailer checksums (`RequestChecksumCalculation::WhenSupported`). Every streaming upload is then `aws-chunked` with an `x-amz-trailer`, except a single-part PUT that forwards the source's `x-amz-checksum-*` header, which is sent plain so the target does not receive a second algorithm; use only when every target decodes that framing. |
 | `RUSTFS_REPLICATION_REPLICA_ETAG_VERIFY` | enabled | `false` or `0` disables the post-PUT ETag comparison for targets whose 32-hex ETags are legitimately not the content MD5. |
+| `RUSTFS_REPLICATION_REQUEST_TIMEOUT_SECS` | `60` | SDK operation budget for replication requests, including retries; also the response deadline after an upload finishes sending its body. Values outside `1..=86400` fall back to the default. |
+| `RUSTFS_REPLICATION_COMPLETE_TIMEOUT_SECS` | `900` | Independent operation budget for multipart completion, including a target that sends keepalive whitespace without completing. Values outside `1..=86400` fall back to the default. |
+| `RUSTFS_REPLICATION_MIN_TRANSFER_RATE_BYTES_PER_SEC` | `1048576` | Rate used to calculate upload transmission headroom. Zero falls back to the default; positive values are accepted. This is a timeout calculation, not a bandwidth throttle. |
 
-Both knobs are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.
+These settings are read by the RustFS process that owns the replication target, at client build time; restart the server after changing them.
+
+PUT and UploadPart use an operation budget of the request timeout plus `ceil(body_bytes / minimum_transfer_rate) * max_attempts` seconds. The current retry policy allows three attempts; the separate response deadline still starts after each upload finishes sending. Multipart completion uses its own completion budget. These defaults apply to every replication target class, including custom S3-compatible endpoints; increase them when a supported target needs longer to acknowledge a request.
 
 ### Remote tier transport timeouts
 

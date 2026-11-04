@@ -68,7 +68,6 @@ use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::task::{Context, Poll};
@@ -79,7 +78,6 @@ use std::{
 };
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, trace, warn};
 use url::{Url, form_urlencoded};
@@ -185,6 +183,21 @@ where
     collect_response_body_inner(body, Some(limit), None).await
 }
 
+/// Keep the remote body with its reader; idle and range errors surface while reading.
+pub(crate) fn response_body_reader(body: Incoming, limit: Option<usize>, idle_timeout: StdDuration) -> ReadCloser {
+    let stream = futures::stream::try_unfold((Box::pin(body), 0_usize), move |(mut body, received)| async move {
+        let Some(data) = next_response_body_data(body.as_mut(), Some(idle_timeout)).await? else {
+            return Ok::<_, std::io::Error>(None);
+        };
+        let received = received
+            .checked_add(data.len())
+            .filter(|size| limit.is_none_or(|limit| *size <= limit))
+            .ok_or_else(response_body_exceeds_limit_error)?;
+        Ok(Some((data, (body, received))))
+    });
+    ReadCloser::new(tokio_util::io::StreamReader::new(Box::pin(stream)))
+}
+
 const C_UNKNOWN: i32 = -1;
 const C_OFFLINE: i32 = 0;
 #[allow(
@@ -217,9 +230,9 @@ fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> s
     signer_error::signer_error_to_io_error(scope, error)
 }
 
-/// Streaming object body handed to the client by the storage engine. The
-/// client only ever reads it to completion, so the engine-side reader type
-/// (e.g. ecstore's `GetObjectReader`) stays behind this boxed `AsyncRead`.
+/// Streaming object body shared by the client and storage engine. The concrete
+/// reader (e.g. ecstore's `GetObjectReader` or a remote response body) stays
+/// behind this boxed `AsyncRead`.
 pub struct ObjectReader(Box<dyn AsyncRead + Send + Sync + Unpin>);
 
 impl ObjectReader {
@@ -255,7 +268,8 @@ pub enum ReaderImpl {
     ObjectBody(ObjectReader),
 }
 
-pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
+/// Remote object reader. Dropping it releases the response body without collecting it.
+pub type ReadCloser = ObjectReader;
 
 #[derive(Debug)]
 pub struct TransitionClient {
