@@ -57,7 +57,6 @@ use super::object::{
     object_transaction_fencing_requested, read_object_transaction_epoch_fence, verify_object_transaction_epoch_fence,
 };
 use crate::api::config::storageclass;
-#[cfg(test)]
 use crate::bucket::metadata_sys::ObjectLockConfigState;
 use crate::bucket::quota::reservation;
 use crate::bucket::replication::ReplicationStatusType;
@@ -4113,6 +4112,40 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             "complete_multipart_upload_commit",
         )
         .await?;
+
+        if !opts.versioned
+            && !crate::bucket::utils::is_meta_bucketname(bucket)
+            && let Some(snapshot) = opts.object_lock_config_snapshot.as_deref()
+            && !matches!(snapshot.state(), ObjectLockConfigState::ConfirmedAbsent)
+        {
+            // Completion replaces the null version, not necessarily the latest
+            // version inspected by the request-level Object Lock check.
+            let current = self
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(Uuid::nil().to_string()),
+                        no_lock: true,
+                        metadata_cache_safe: false,
+                        versioned: opts.versioned,
+                        version_suspended: opts.version_suspended,
+                        ..Default::default()
+                    },
+                )
+                .await;
+            match current {
+                Ok(existing) => {
+                    if check_object_lock_for_deletion_with_state(snapshot.state(), &existing, false)?.is_some() {
+                        return Err(StorageError::PrefixAccessDenied(bucket.to_string(), object.to_string()));
+                    }
+                }
+                // A null delete marker has no protected payload to replace.
+                Err(StorageError::MethodNotAllowed) => {}
+                Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => {}
+                Err(err) => return Err(err),
+            }
+        }
 
         if opts.data_movement
             && opts.http_preconditions.is_some()

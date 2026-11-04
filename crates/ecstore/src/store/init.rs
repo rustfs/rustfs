@@ -27549,4 +27549,85 @@ mod tests {
             }
         }
     }
+
+    /// A versionless PUT or multipart completion replaces the null version in
+    /// place, so the commit-time WORM gate must judge that version even when a
+    /// UUID version or delete marker is the key's latest entry
+    /// (rustfs/backlog#3019).
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn null_version_object_lock_put_and_multipart_preserve_retained_target() {
+        let temp = tempfile::tempdir().expect("create null-version overwrite store");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "null-version-overwrite-lock", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("null-overwrite-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket");
+        for protection in ["COMPLIANCE", "GOVERNANCE", "legal-hold"] {
+            for latest_is_marker in [false, true] {
+                let object = format!("{protection}-{latest_is_marker}");
+                seed_retained_null_version(&store, &bucket, &object, protection, latest_is_marker).await;
+                let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+                let error = store
+                    .put_object(&bucket, &object, &mut replacement, &ObjectOptions::default())
+                    .await
+                    .expect_err("PUT must reject replacement of a retained null version");
+                assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+
+                let upload = store
+                    .clone()
+                    .new_multipart_upload(&bucket, &object, &ObjectOptions::default())
+                    .await
+                    .expect("initiate multipart upload");
+                let mut part_reader = PutObjReader::from_vec(b"multipart replacement".to_vec());
+                let part = store
+                    .clone()
+                    .put_object_part(&bucket, &object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+                    .await
+                    .expect("stage multipart replacement");
+                let error = store
+                    .clone()
+                    .complete_multipart_upload(
+                        &bucket,
+                        &object,
+                        &upload.upload_id,
+                        vec![crate::storage_api_contracts::multipart::CompletePart {
+                            part_num: part.part_num,
+                            etag: part.etag,
+                            ..Default::default()
+                        }],
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect_err("multipart completion must reject replacement of a retained null version");
+                assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+                assert_retained_null_version_body(&store, &bucket, &object).await;
+
+                let mut next_version = PutObjReader::from_vec(b"new UUID version".to_vec());
+                store
+                    .put_object(
+                        &bucket,
+                        &object,
+                        &mut next_version,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("a new UUID version must remain allowed");
+                assert_retained_null_version_body(&store, &bucket, &object).await;
+            }
+        }
+    }
 }
