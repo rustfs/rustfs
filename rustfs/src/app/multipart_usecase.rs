@@ -582,15 +582,6 @@ impl DefaultMultipartUsecase {
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_complete_multipart_upload(
         &self,
-        req: S3Request<CompleteMultipartUploadInput>,
-    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        self.execute_complete_multipart_upload_inner(req)
-            .await
-            .map_err(crate::error::normalize_read_quorum_error)
-    }
-
-    async fn execute_complete_multipart_upload_inner(
-        &self,
         mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
@@ -1243,13 +1234,7 @@ impl DefaultMultipartUsecase {
 
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
-    pub async fn execute_upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
-        self.execute_upload_part_inner(req)
-            .await
-            .map_err(crate::error::normalize_read_quorum_error)
-    }
-
-    async fn execute_upload_part_inner(&self, mut req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+    pub async fn execute_upload_part(&self, mut req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -1697,15 +1682,6 @@ impl DefaultMultipartUsecase {
     #[instrument(level = "debug", skip(self, req))]
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_upload_part_copy(
-        &self,
-        req: S3Request<UploadPartCopyInput>,
-    ) -> S3Result<S3Response<UploadPartCopyOutput>> {
-        self.execute_upload_part_copy_inner(req)
-            .await
-            .map_err(crate::error::normalize_read_quorum_error)
-    }
-
-    async fn execute_upload_part_copy_inner(
         &self,
         req: S3Request<UploadPartCopyInput>,
     ) -> S3Result<S3Response<UploadPartCopyOutput>> {

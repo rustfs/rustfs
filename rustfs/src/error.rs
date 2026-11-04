@@ -12,7 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::storage::DiskError;
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
 use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unreadable_config_refusal};
 use http::StatusCode;
@@ -206,44 +205,6 @@ pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
         message: SLOW_DOWN_READ_MESSAGE.to_string(),
         source: Some(Box::new(err)),
     }
-}
-
-/// Normalize a storage read-quorum failure at write (PUT / multipart / LIST)
-/// boundaries.
-///
-/// Storage-level read quorum failures keep their `SlowDownRead` code for GET
-/// compatibility. Write and LIST paths expose storage unavailability instead of
-/// throttling, while retaining the typed source for diagnostics and audit
-/// consumers. Matching covers both `StorageError` and `DiskError` quorum forms
-/// so a write cannot leak the GET-only code when the source was narrowed to a
-/// disk error (rustfs/backlog#3145).
-pub(crate) fn normalize_read_quorum_error(mut err: S3Error) -> S3Error {
-    let is_slow_down_read = matches!(
-        err.code(),
-        S3ErrorCode::Custom(code) if &**code == SLOW_DOWN_READ_CODE
-    );
-    if !is_slow_down_read {
-        return err;
-    }
-    let has_read_quorum_source = err.source().is_some_and(|source| {
-        error_chain_find(source, |error| {
-            let storage_quorum = matches!(
-                error.downcast_ref::<StorageError>(),
-                Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
-            );
-            let disk_quorum = matches!(error.downcast_ref::<DiskError>(), Some(DiskError::ErasureReadQuorum));
-            (storage_quorum || disk_quorum).then_some(())
-        })
-        .is_some()
-    });
-
-    if has_read_quorum_source {
-        err.set_code(S3ErrorCode::ServiceUnavailable);
-        err.set_message(ApiError::error_code_to_message(&S3ErrorCode::ServiceUnavailable));
-        err.set_status_code(StatusCode::SERVICE_UNAVAILABLE);
-    }
-
-    err
 }
 
 /// Marks a request body that exceeded a presigned upload size capability.
@@ -832,9 +793,10 @@ impl From<StorageError> for ApiError {
             | StorageError::DiskNotFound
             | StorageError::Timeout
             | StorageError::TooManyOpenFiles => S3ErrorCode::ServiceUnavailable,
-            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => {
-                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())
-            }
+            // Write-safe default: a read-quorum failure on PUT/multipart/LIST
+            // must not look like a GET "resource is unreadable" throttle. GET
+            // object reads opt into `SlowDownRead` via `map_get_object_reader_error`.
+            StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::ErasureWriteQuorum | StorageError::InsufficientWriteQuorum(_, _) => S3ErrorCode::ServiceUnavailable,
             StorageError::NamespaceLockQuorumUnavailable { .. } => S3ErrorCode::ServiceUnavailable,
             StorageError::QuotaExceeded { .. } => S3ErrorCode::InvalidRequest,
@@ -2338,24 +2300,7 @@ mod tests {
     }
 
     #[test]
-    fn write_path_normalizes_disk_error_read_quorum() {
-        // A write that only saw a narrowed DiskError quorum failure must not
-        // leak the GET-only SlowDownRead code (backlog#3145).
-        let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "unreadable");
-        err.set_source(Box::new(DiskError::ErasureReadQuorum));
-        let err = normalize_read_quorum_error(err);
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
-        assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
-
-        // Nested under an io::Error as well.
-        let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "unreadable");
-        err.set_source(Box::new(IoError::other(DiskError::ErasureReadQuorum)));
-        let err = normalize_read_quorum_error(err);
-        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
-    }
-
-    #[test]
-    fn put_read_quorum_error_preserves_context_and_is_idempotent() {
+    fn write_path_quorum_errors_are_service_unavailable() {
         for source in [
             StorageError::ErasureReadQuorum,
             StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
@@ -2370,7 +2315,6 @@ mod tests {
                 headers.insert("retry-after", http::HeaderValue::from_static("2"));
                 err.set_headers(headers);
 
-                let err = normalize_read_quorum_error(normalize_read_quorum_error(err));
                 assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
                 assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
@@ -2381,6 +2325,19 @@ mod tests {
                 });
                 assert_eq!(retained, Some(source.clone()));
             }
+        }
+    }
+
+    #[test]
+    fn get_object_reader_keeps_slow_down_read_for_quorum() {
+        for source in [
+            StorageError::ErasureReadQuorum,
+            StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
+            StorageError::PartMissingOrCorrupt,
+        ] {
+            let api_error = crate::storage::sse::map_get_object_reader_error(source.clone());
+            assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
+            assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
         }
     }
 
@@ -2401,23 +2358,10 @@ mod tests {
             let mut err = S3Error::with_message(code.clone(), "original message");
             err.set_source(Box::new(StorageError::ErasureReadQuorum));
             let original_status = err.status_code();
-            let err = normalize_read_quorum_error(err);
+            // Non-quorum codes must not be rewritten by the write-path mapping.
             assert_eq!(err.code(), &code);
             assert_eq!(err.message(), Some("original message"));
             assert_eq!(err.status_code(), original_status);
-        }
-        for source in [
-            None,
-            Some(StorageError::ErasureWriteQuorum),
-            Some(StorageError::PartMissingOrCorrupt),
-        ] {
-            let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "original message");
-            if let Some(source) = source {
-                err.set_source(Box::new(source));
-            }
-            let err = normalize_read_quorum_error(err);
-            assert_eq!(err.code(), &S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
-            assert_eq!(err.message(), Some("original message"));
         }
     }
 
@@ -2513,10 +2457,11 @@ mod tests {
             (StorageError::FaultyRemoteDisk, S3ErrorCode::ServiceUnavailable),
             (StorageError::DiskNotFound, S3ErrorCode::ServiceUnavailable),
             (StorageError::TooManyOpenFiles, S3ErrorCode::ServiceUnavailable),
-            (StorageError::ErasureReadQuorum, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into())),
+            // Write-safe default; GET object reads opt into SlowDownRead.
+            (StorageError::ErasureReadQuorum, S3ErrorCode::ServiceUnavailable),
             (
                 StorageError::InsufficientReadQuorum("test".into(), "test".into()),
-                S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()),
+                S3ErrorCode::ServiceUnavailable,
             ),
             (StorageError::ErasureWriteQuorum, S3ErrorCode::ServiceUnavailable),
             (
@@ -2691,7 +2636,8 @@ mod tests {
             StorageError::ErasureReadQuorum,
             StorageError::InsufficientReadQuorum("bucket".into(), "object".into()),
         ] {
-            let api_error = ApiError::from(error);
+            // MinIO-compatible GET object-read response.
+            let api_error = crate::storage::sse::map_get_object_reader_error(error);
             assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
             assert_eq!(api_error.message, SLOW_DOWN_READ_MESSAGE);
 

@@ -712,7 +712,12 @@ pub(crate) fn validate_sse_headers_for_read(metadata: &HashMap<String, String>, 
 }
 
 pub(crate) fn map_get_object_reader_error(err: StorageError) -> ApiError {
-    if matches!(err, StorageError::PartMissingOrCorrupt) {
+    // GET/HEAD object-read contract: these failures mean "this object is not
+    // readable right now" (S3 `SlowDownRead`), not a write admission reject.
+    if matches!(
+        err,
+        StorageError::PartMissingOrCorrupt | StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _)
+    ) {
         return slow_down_read_api_error(err);
     }
 
