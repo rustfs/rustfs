@@ -38,7 +38,7 @@ impl S3 for Consumer {
             .get::<BodyReadControl>()
             .expect("HTTP control extension")
             .clone();
-        control.activate(Duration::from_secs(300), "test-bucket", "test-key", "request", expected as u64);
+        control.activate_upload(Duration::from_secs(300), "test-bucket", "test-key", "request", expected as u64);
         let stream = req.input.body.expect("body");
         let inner = rustfs_rio::wrap_reader(StreamReader::new(stream.map(|item| item.map_err(io::Error::other))));
         let mut reader =
@@ -207,7 +207,7 @@ fn signed_request(payload: &[u8], unsigned_trailer: bool) -> SignedRequest {
 
 #[tokio::test(start_paused = true)]
 async fn signed_chunk_with_raw_progress_survives_eight_minutes_without_decoded_output() {
-    let payload = vec![7; 65536];
+    let payload = vec![7; 1024 * 1024];
     let SignedRequest {
         request,
         sender,
@@ -220,13 +220,13 @@ async fn signed_chunk_with_raw_progress_survives_eight_minutes_without_decoded_o
     sender.send(Ok(Frame::data(prefix))).expect("body receiver");
     assert!(poll!(call.as_mut()).is_pending());
     let start = Instant::now();
-    for chunk in payload.chunks(8192) {
+    for chunk in payload.chunks(65536) {
         assert_eq!(
             consumer.received.load(Ordering::Relaxed),
             0,
             "incomplete chunks must not escape signature validation"
         );
-        tokio::time::advance(Duration::from_secs(60)).await;
+        tokio::time::advance(Duration::from_secs(30)).await;
         sender
             .send(Ok(Frame::data(Bytes::copy_from_slice(chunk))))
             .expect("body receiver");
@@ -355,4 +355,28 @@ async fn trailer_adapter_is_pending_until_the_decoded_body_ends() {
     assert_eq!(trailer.lookup("x-amz-checksum-crc32"), TrailerValue::Present("y/Q5Jg==".to_owned()));
     assert_eq!(trailer.lookup("x-amz-checksum-sha256"), TrailerValue::Missing);
     assert_eq!(*consumer.committed.lock(), Some(payload.to_vec()));
+}
+
+#[tokio::test(start_paused = true)]
+async fn signed_chunk_trickle_cannot_renew_upload_progress_window() {
+    let SignedRequest {
+        request, sender, prefix, ..
+    } = signed_request(&[7; 65536], false);
+    let consumer = Consumer::default();
+    let service = service(consumer.clone());
+    sender.send(Ok(Frame::data(prefix))).unwrap();
+    let mut call = Box::pin(service.call(request));
+    assert!(poll!(call.as_mut()).is_pending());
+    for _ in 0..5 {
+        tokio::time::advance(Duration::from_secs(10)).await;
+        sender.send(Ok(Frame::data(Bytes::from_static(&[7])))).unwrap();
+        assert!(poll!(call.as_mut()).is_pending());
+        assert_eq!(consumer.received.load(Ordering::Relaxed), 0);
+    }
+    tokio::time::advance(Duration::from_secs(10)).await;
+    let response = call.await.expect("S3 response");
+    assert_eq!(response.status(), http::StatusCode::BAD_REQUEST);
+    let body = BodyExt::collect(response.into_body()).await.unwrap().to_bytes();
+    assert!(String::from_utf8_lossy(&body).contains("<Code>RequestTimeout</Code>"));
+    assert!(consumer.committed.lock().is_none());
 }

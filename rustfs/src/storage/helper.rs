@@ -94,6 +94,31 @@ where
     }
 }
 
+/// Own a parsed mutation through its storage and event/audit completion.
+/// Dropping the HTTP waiter does not cancel the operation. Streaming bodies
+/// must use their bounded upload owner instead of this entry point.
+pub(crate) async fn run_owned_mutation<T, F>(operation: F) -> S3Result<S3Response<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = S3Result<S3Response<T>>> + Send + 'static,
+{
+    let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
+    let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let operation = ecstore_diagnostic::with_captured_read_version_context(
+        ecstore_diagnostic::ReadVersionContextBoundary::BackgroundTask,
+        operation,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let operation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        operation,
+    );
+    super::request_context::spawn_traced_join(operation)
+        .await
+        .map_err(|_| s3s::s3_error!(InternalError, "object mutation owner task failed"))?
+}
+
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
     let mut resp_elements = extract_resp_elements(response);
@@ -135,6 +160,84 @@ fn request_audit_builder<T>(
         builder = builder.access_key(&cred.access_key);
     }
     builder
+}
+
+#[cfg(test)]
+type MutationCompletionPause = (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+#[cfg(test)]
+type MutationCompletionProbes = HashMap<String, std::sync::Weak<MutationCompletionProbe>>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MutationCompletionProbe {
+    pub(crate) audits: std::sync::Mutex<Vec<AuditEntry>>,
+    pub(crate) events: std::sync::Mutex<Vec<rustfs_notify::EventArgs>>,
+    changed: tokio::sync::Notify,
+    pause: std::sync::Mutex<Option<MutationCompletionPause>>,
+}
+
+#[cfg(test)]
+fn completion_probes() -> &'static std::sync::Mutex<MutationCompletionProbes> {
+    static PROBES: std::sync::OnceLock<std::sync::Mutex<MutationCompletionProbes>> = std::sync::OnceLock::new();
+    PROBES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn completion_probe(bucket: &str) -> Option<std::sync::Arc<MutationCompletionProbe>> {
+    completion_probes()
+        .lock()
+        .expect("completion probes")
+        .get(bucket)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+#[cfg(test)]
+impl MutationCompletionProbe {
+    pub(crate) fn install(bucket: &str) -> std::sync::Arc<Self> {
+        let probe = std::sync::Arc::new(Self::default());
+        let mut probes = completion_probes().lock().expect("completion probes");
+        probes.retain(|_, value| value.strong_count() > 0);
+        probes.insert(bucket.to_owned(), std::sync::Arc::downgrade(&probe));
+        probe
+    }
+
+    pub(crate) fn pause_after_commit(&self) -> MutationCompletionPause {
+        let entered = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        *self.pause.lock().expect("completion pause") = Some((entered.clone(), resume.clone()));
+        (entered, resume)
+    }
+
+    pub(crate) async fn wait_for(&self, audits: usize, events: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.audits.lock().expect("audits").len() >= audits && self.events.lock().expect("events").len() >= events {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("committed mutation must dispatch its audit and events");
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn pause_committed_mutation_for_test(bucket: &str) {
+    let pause = completion_probe(bucket).and_then(|probe| probe.pause.lock().expect("completion pause").take());
+    if let Some((entered, resume)) = pause {
+        entered.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_mutation_event_for_test(event: &rustfs_notify::EventArgs) {
+    if let Some(probe) = completion_probe(&event.bucket_name) {
+        probe.events.lock().expect("events").push(event.clone());
+        probe.changed.notify_one();
+    }
 }
 
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
@@ -191,8 +294,20 @@ impl OperationHelper {
             );
         }
 
+        #[cfg(test)]
+        let probe_enabled = completion_probe(
+            req.extensions
+                .get::<ReqInfo>()
+                .and_then(|info| info.bucket.as_deref())
+                .unwrap_or_else(|| req.uri.path().trim_start_matches('/').split('/').next().unwrap_or_default()),
+        )
+        .is_some();
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = !audit_only && should_build_notification_event(is_notify_module_enabled());
+        #[cfg(test)]
+        let audit_enabled = audit_enabled || probe_enabled;
+        #[cfg(test)]
+        let notify_enabled = notify_enabled || (!audit_only && probe_enabled);
         if audit_only && !audit_enabled {
             // Nothing to record and no metric to bump: skip the path parsing below.
             return Self::Disabled;
@@ -547,13 +662,39 @@ impl Drop for OperationHelper {
             return;
         };
 
+        // An early error or panic must have an outcome, but is never proof
+        // of a successful mutation. Committed owners complete explicitly.
+        if state.api_builder.0.status.is_none() {
+            let elapsed = state.start_time.elapsed();
+            state.api_builder = state
+                .api_builder
+                .clone()
+                .status("failure".to_string())
+                .status_code(StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32)
+                .time_to_response(format!("{elapsed:.2?}"))
+                .time_to_response_in_ns(elapsed.as_nanos().to_string());
+            if let Some(builder) = state.audit_builder.take() {
+                state.audit_builder = Some(
+                    builder
+                        .api(state.api_builder.clone().build())
+                        .error("Operation ended before reporting its outcome".to_string()),
+                );
+            }
+        }
+
         // Distribute audit logs
         if state.audit_enabled
             && let Some(builder) = state.audit_builder.take()
         {
+            let entry = builder.build();
+            #[cfg(test)]
+            if let Some(probe) = entry.api.bucket.as_deref().and_then(completion_probe) {
+                probe.audits.lock().expect("audits").push(entry.clone());
+                probe.changed.notify_one();
+            }
             let ctx = Some(state.request_context.clone());
             spawn_background_with_context(ctx, async move {
-                AuditLogger::log(builder.build()).await;
+                AuditLogger::log(entry).await;
             });
         }
 
@@ -565,6 +706,8 @@ impl Drop for OperationHelper {
             let event_args = builder.build();
             // Avoid generating notifications for copy requests
             if !event_args.is_replication_request() {
+                #[cfg(test)]
+                capture_mutation_event_for_test(&event_args);
                 let ctx = Some(state.request_context.clone());
                 spawn_background_with_context(ctx, async move {
                     runtime_sources::current_notify_interface().notify(event_args).await;
@@ -644,6 +787,48 @@ mod tests {
                 .expect("unscoped observer remains live");
         });
         assert_eq!(rx.await.expect("unscoped task completes"), (None, None));
+    }
+
+    #[tokio::test]
+    async fn owned_mutation_keeps_keystone_context_and_audits_panics_as_failure() {
+        let bucket = "owned-mutation-panic";
+        let probe = super::MutationCompletionProbe::install(bucket);
+        let credentials = Credentials {
+            access_key: "keystone:test".to_owned(),
+            ..Default::default()
+        };
+        let result: S3Result<S3Response<()>> = rustfs_keystone::KEYSTONE_CREDENTIALS
+            .scope(Some(credentials), async {
+                super::run_owned_mutation(async {
+                    assert_eq!(
+                        rustfs_keystone::KEYSTONE_CREDENTIALS
+                            .with(|credentials| credentials.as_ref().map(|value| value.access_key.clone())),
+                        Some("keystone:test".to_owned())
+                    );
+                    let req = S3Request {
+                        input: (),
+                        method: Method::DELETE,
+                        uri: Uri::from_static("/owned-mutation-panic/object"),
+                        headers: HeaderMap::new(),
+                        extensions: Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    let _helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+                    panic!("injected mutation panic before reporting a commit");
+                })
+                .await
+            })
+            .await;
+        assert_eq!(result.expect_err("join failure").code(), &S3ErrorCode::InternalError);
+        probe.wait_for(1, 0).await;
+        let audits = probe.audits.lock().expect("audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].api.status.as_deref(), Some("failure"));
+        assert_eq!(audits[0].api.status_code, Some(500));
+        assert!(probe.events.lock().expect("events").is_empty());
     }
 
     #[cfg(feature = "diagnostic-read-version-caller")]

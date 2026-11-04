@@ -97,10 +97,11 @@ pub(crate) mod contract {
     }
 
     pub(crate) mod multipart {
+        pub(crate) use super::super::storage_contracts::MultipartCompletionAuthorization;
         pub(crate) const MAX_MULTIPART_PART_NUMBER: i32 = 10000;
-        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
         #[cfg(test)]
-        pub(crate) use super::super::storage_contracts::{MultipartInfo, MultipartOperations, PartInfo};
+        pub(crate) use super::super::storage_contracts::{CompletePart, MultipartInfo, MultipartOperations, PartInfo};
+        pub(crate) use super::super::storage_contracts::{ListMultipartsInfo, ListPartsInfo};
     }
 
     pub(crate) mod object {
@@ -133,26 +134,27 @@ pub(crate) use super::ecfs_extend::{
     get_buffer_size_opt_in, get_validated_store, has_read_preconditions, load_bucket_object_lock_config_state,
     parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize, process_lambda_configurations,
     process_queue_configurations, process_topic_configurations, remove_object_lock_metadata_for_copy, validate_bucket_exists,
-    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_object_key,
-    wrap_response_with_cors,
+    validate_bucket_object_lock_enabled_state, validate_list_object_unordered_with_delimiter, validate_new_object_key,
+    validate_object_key, wrap_response_with_cors,
 };
 pub(crate) use super::sse::{
     DecryptionRequest, EncryptionRequest, ObjectDekRewrapOutcome, PrepareEncryptionRequest, SseKmsPrincipal,
-    authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
-    project_sse_read_response_headers, rewrap_object_encryption_metadata, sse_decryption, sse_encryption, sse_prepare_encryption,
-    strip_managed_encryption_metadata, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, classify_sse_read_response,
+    extract_server_side_encryption_from_headers, project_sse_read_response_headers, rewrap_object_encryption_metadata,
+    sse_decryption, sse_encryption, sse_prepare_encryption, strip_managed_encryption_metadata, validate_sse_headers_for_read,
+    validate_sse_headers_for_write, validate_ssec_for_read,
 };
 
 pub(crate) mod access_consumer {
     pub(crate) use super::super::access::{
         MultipartStagingOperation, PostObjectRequestMarker, ReqInfo, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX,
         TableDataPlaneListAccess, TableDataPlaneListCursorPosition, TableDataPlanePublicationGuards,
-        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_internal_object_request,
-        authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard, authorize_copy_object_tags,
+        authorize_internal_object_request, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
+        retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
 }
 
@@ -217,7 +219,13 @@ pub(crate) mod head_prefix_consumer {
 }
 
 pub(crate) mod helper_consumer {
-    pub(crate) use super::super::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
+    #[cfg(test)]
+    pub(crate) use super::super::helper::{
+        MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
+    };
+    pub(crate) use super::super::helper::{
+        OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+    };
 
     pub(crate) type StorageObjectInfo = super::StorageObjectInfo;
 }
@@ -233,6 +241,7 @@ pub(crate) mod options_consumer {
         parse_copy_source_range, preserve_unclassified_user_metadata, put_opts_with_replication_authorization,
         validate_archive_content_encoding,
     };
+    pub(crate) use rustfs_ecstore::api::rio::validate_compression_scheme;
 
     pub(crate) mod contract {
         pub(crate) mod object {
@@ -358,9 +367,7 @@ pub(crate) mod s3_api_consumer {
 
         pub(crate) type StorageObjectInfo = super::super::StorageObjectInfo;
 
-        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-            super::super::to_s3s_etag(etag)
-        }
+        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod common {
@@ -384,13 +391,13 @@ pub(crate) mod s3_api_consumer {
             }
         }
 
-        pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
-            super::super::to_s3s_etag(etag)
-        }
+        pub(crate) use super::super::to_s3s_xml_etag;
     }
 
     pub(crate) mod tagging {
-        pub(crate) use super::super::super::s3_api::tagging::{parse_copy_object_tags, resolve_copy_object_tags};
+        pub(crate) use super::super::super::s3_api::tagging::{
+            parse_copy_object_tags, resolve_copy_object_tags, validate_bucket_tag_set,
+        };
     }
 }
 
@@ -398,13 +405,14 @@ pub(crate) mod sse_consumer {
     pub(crate) use super::super::sse::{
         EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, log_sse_kms_key_policy_mode,
-        map_get_object_reader_error, mark_encrypted_multipart_metadata,
+        map_get_object_reader_error, mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
     pub(crate) use super::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
-        authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
-        get_buffer_size_opt_in, load_bucket_object_lock_config_state, project_sse_read_response_headers, sse_decryption,
-        sse_encryption, sse_prepare_encryption, validate_bucket_object_lock_enabled_state,
+        authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, classify_sse_read_response,
+        extract_server_side_encryption_from_headers, get_buffer_size_opt_in, load_bucket_object_lock_config_state,
+        project_sse_read_response_headers, sse_decryption, sse_encryption, sse_prepare_encryption,
+        validate_bucket_object_lock_enabled_state,
     };
 }
 
@@ -649,7 +657,8 @@ pub(crate) mod ecstore_set_disk {
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::set_disk::test_util::{
         ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
-        PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
+        PutObjectCommitPause, fail_next_quota_ledger_save_for_test, initialize_quota_ledger_for_test,
+        retry_quota_reconciliation_for_test,
     };
     pub(crate) use rustfs_ecstore::api::set_disk::{
         DEFAULT_READ_BUFFER_SIZE, file_info_quorum_hash, get_lock_acquire_timeout, is_valid_storage_class,
@@ -2445,6 +2454,16 @@ pub(crate) fn set_tonic_canonical_body_digest<T>(request: &mut tonic::Request<T>
 
 pub(crate) fn to_s3s_etag(etag: &str) -> s3s::dto::ETag {
     ecstore_client::object_api_utils::to_s3s_etag(etag)
+}
+
+/// The pinned s3s XML serializer writes ETag values as raw text. Escape only
+/// at XML response boundaries; HTTP headers and conditional comparisons keep
+/// the original stored value. Existing unsafe ETags must remain listable.
+pub(crate) fn to_s3s_xml_etag(etag: &str) -> s3s::dto::ETag {
+    let mut etag = to_s3s_etag(etag);
+    let (s3s::dto::ETag::Strong(value) | s3s::dto::ETag::Weak(value)) = &mut etag;
+    *value = quick_xml::escape::escape(value.as_str()).into_owned();
+    etag
 }
 
 pub(crate) fn table_catalog_path_hash(value: &str) -> String {

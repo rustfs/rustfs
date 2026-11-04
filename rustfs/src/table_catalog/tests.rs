@@ -22111,10 +22111,10 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         .expect("delete object entrypoints should remain in app/object/delete.rs");
 
     for expected in [
-        "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
+        "validate_new_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
         "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
         "validate_table_catalog_object_mutation(&bucket, &object).await?;",
-        "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
+        "validate_new_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
         "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
     ] {
         assert!(source.contains(expected), "missing object mutation guard: {expected}");
@@ -22124,7 +22124,7 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
         .map(|(_, body)| body.split_once("\n#[cfg(test)]").map_or(body, |(entrypoint, _)| entrypoint))
         .expect("copy object entrypoint should remain in app/object/copy.rs");
     let copy_key = copy_object
-        .find("validate_object_key(&key, \"COPY (dest)\")?;")
+        .find("validate_new_object_key(&key, \"COPY (dest)\")?;")
         .expect("copy destination key validation");
     let copy_guard = copy_object
         .find("validate_table_catalog_object_mutation(&bucket, &key).await?;")

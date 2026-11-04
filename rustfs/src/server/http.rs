@@ -1429,6 +1429,329 @@ where
     }
 }
 
+// Validate control-plane digests before s3s discards the serialized body.
+// Object uploads and multipart/form-data must retain their streaming readers.
+struct ControlRequestBody(s3s::Body);
+
+impl http_body::Body for ControlRequestBody {
+    type Data = Bytes;
+    type Error = Error;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<std::result::Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        Pin::new(&mut self.0)
+            .poll_frame(cx)
+            .map(|frame| frame.map(|result| result.map_err(Error::other)))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        http_body::Body::is_end_stream(&self.0)
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::Body::size_hint(&self.0)
+    }
+}
+
+fn control_request_body(body: s3s::Body) -> ControlRequestBody {
+    ControlRequestBody(body)
+}
+
+#[derive(Clone)]
+struct ControlBodyDigestService<S> {
+    inner: S,
+    idle_timeout: Duration,
+    total_timeout: Duration,
+    max_body_size: usize,
+    virtual_host: Option<Arc<MultiDomain>>,
+}
+
+impl<S> ControlBodyDigestService<S> {
+    fn new(inner: S, idle_timeout: Duration) -> Self {
+        Self {
+            inner,
+            idle_timeout,
+            total_timeout: Duration::from_secs(30),
+            max_body_size: rustfs_s3_config().xml_max_body_size,
+            virtual_host: None,
+        }
+    }
+
+    fn with_virtual_host_domains(mut self, domains: Arc<[String]>) -> Self {
+        if !domains.is_empty() {
+            // Startup already validated this same domain set for S3Service.
+            self.virtual_host = Some(Arc::new(MultiDomain::new(domains.iter()).expect("validated S3 host domains")));
+        }
+        self
+    }
+}
+
+fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Option<&MultiDomain>) -> Option<bool> {
+    let query = url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes());
+    // Match s3s' multipart POST precedence, including its unique-header rule.
+    if request.method() == Method::POST
+        && request.headers().get_all("content-type").iter().count() == 1
+        && request
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.parse::<mime_guess::Mime>().ok())
+            .is_some_and(|mime| mime.type_() == mime_guess::mime::MULTIPART && mime.subtype() == mime_guess::mime::FORM_DATA)
+    {
+        return None;
+    }
+    let mut operation_ids = query.filter(|(key, _)| key == "x-id");
+    let operation_id = operation_ids.next().map(|(_, value)| value);
+    // s3s rejects duplicate declarations and treats a unique x-id as authoritative.
+    if operation_ids.next().is_some() {
+        return None;
+    }
+    if request.method() == Method::POST {
+        let decoded_path = urlencoding::decode(request.uri().path()).ok()?;
+        use s3s::host::S3Host;
+        // Use s3s' host parser, including CNAME fallback, and its Host-first
+        // precedence. A rate-limit host hint is intentionally only best-effort.
+        let mut host_values = request.headers().get_all("host").iter();
+        let host = host_values.next().and_then(|value| value.to_str().ok()).or_else(|| {
+            matches!(request.version(), Version::HTTP_2 | Version::HTTP_3)
+                .then(|| request.uri().authority().map(|value| value.as_str()))
+                .flatten()
+        });
+        if host_values.next().is_some() {
+            return None;
+        }
+        let host = match (virtual_host, host) {
+            (Some(parser), Some(host)) if host.parse::<SocketAddr>().is_err() && host.parse::<IpAddr>().is_err() => {
+                Some(parser.parse_host_header(host).ok()?)
+            }
+            _ => None,
+        };
+        let path = s3s::path::parse_virtual_hosted_style(host.as_ref().and_then(|host| host.bucket()), &decoded_path).ok()?;
+        if !matches!(path, s3s::path::S3Path::Bucket { .. }) {
+            return None;
+        }
+        let delete_objects = match operation_id.as_deref() {
+            Some("DeleteObjects") => true,
+            Some(_) => false,
+            None => {
+                // These bucket POST routes precede DeleteObjects in s3s' router.
+                query.clone().any(|(key, _)| key == "delete")
+                    && !query
+                        .clone()
+                        .any(|(key, _)| matches!(key.as_ref(), "metadataConfiguration" | "metadataTable"))
+            }
+        };
+        return delete_objects.then_some(true);
+    }
+    if request.method() == Method::PUT
+        && operation_id
+            .as_deref()
+            .is_some_and(|operation| matches!(operation, "PutObject" | "UploadPart"))
+    {
+        return None;
+    }
+    // Other configuration APIs keep their existing optional-MD5 contract, but
+    // an MD5 that is supplied (and signed by SigV2) must actually match.
+    if request.method() == Method::PUT
+        && request.headers().contains_key("content-md5")
+        && query.clone().any(|(key, value)| {
+            (key == "x-id" && value.starts_with("Put") && value != "PutObject")
+                || matches!(
+                    key.as_ref(),
+                    "acl"
+                        | "cors"
+                        | "lifecycle"
+                        | "logging"
+                        | "notification"
+                        | "policy"
+                        | "replication"
+                        | "requestPayment"
+                        | "tagging"
+                        | "versioning"
+                        | "website"
+                        | "object-lock"
+                        | "retention"
+                        | "legal-hold"
+                        | "ownershipControls"
+                        | "encryption"
+                        | "accelerate"
+                        | "intelligent-tiering"
+                        | "analytics"
+                        | "metrics"
+                        | "inventory"
+                        | "publicAccessBlock"
+                )
+        })
+    {
+        return Some(false);
+    }
+    None
+}
+
+fn control_body_digest_error(code: &'static str) -> Response<s3s::Body> {
+    // Only static protocol error codes reach this function; never reflect headers or bodies.
+    let xml = format!("<?xml version=\"1.0\" encoding=\"UTF-8\"?><Error><Code>{code}</Code><Message>{code}</Message></Error>");
+    let length = xml.len();
+    let mut response = Response::new(s3s::Body::from(xml));
+    *response.status_mut() = http::StatusCode::BAD_REQUEST;
+    response
+        .headers_mut()
+        .insert("content-type", HeaderValue::from_static("application/xml"));
+    response.headers_mut().insert("content-length", HeaderValue::from(length));
+    response
+}
+
+const CONTROL_BODY_CHECKSUM_HEADERS: [&str; 10] = [
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+    "x-amz-checksum-sha512",
+    "x-amz-checksum-xxhash64",
+    "x-amz-checksum-xxhash3",
+    "x-amz-checksum-xxhash128",
+    "x-amz-checksum-md5",
+];
+
+fn verify_control_body_digest(headers: &HeaderMap, bytes: &[u8]) -> std::result::Result<(), &'static str> {
+    use md5::Digest;
+    if let Some(expected) = headers.get("content-md5") {
+        if headers.get_all("content-md5").iter().count() != 1 {
+            return Err("InvalidDigest");
+        }
+        let expected = base64_simd::STANDARD
+            .decode_to_vec(expected.as_bytes())
+            .map_err(|_| "InvalidDigest")?;
+        if expected.len() != 16 {
+            return Err("InvalidDigest");
+        }
+        if md5::Md5::digest(bytes).as_slice() != expected.as_slice() {
+            return Err("BadDigest");
+        }
+    }
+    let mut checksums = s3s::checksum::ChecksumHasher {
+        crc32: headers.contains_key("x-amz-checksum-crc32").then(Default::default),
+        crc32c: headers.contains_key("x-amz-checksum-crc32c").then(Default::default),
+        crc64nvme: headers.contains_key("x-amz-checksum-crc64nvme").then(Default::default),
+        sha1: headers.contains_key("x-amz-checksum-sha1").then(Default::default),
+        sha256: headers.contains_key("x-amz-checksum-sha256").then(Default::default),
+        sha512: headers.contains_key("x-amz-checksum-sha512").then(Default::default),
+        xxhash64: headers.contains_key("x-amz-checksum-xxhash64").then(Default::default),
+        xxhash3: headers.contains_key("x-amz-checksum-xxhash3").then(Default::default),
+        xxhash128: headers.contains_key("x-amz-checksum-xxhash128").then(Default::default),
+        md5: headers.contains_key("x-amz-checksum-md5").then(Default::default),
+    };
+    checksums.update(bytes);
+    let checksums = checksums.finalize();
+    let computed = [
+        checksums.checksum_crc32,
+        checksums.checksum_crc32c,
+        checksums.checksum_crc64nvme,
+        checksums.checksum_sha1,
+        checksums.checksum_sha256,
+        checksums.checksum_sha512,
+        checksums.checksum_xxhash64,
+        checksums.checksum_xxhash3,
+        checksums.checksum_xxhash128,
+        checksums.checksum_md5,
+    ];
+    for (name, computed) in CONTROL_BODY_CHECKSUM_HEADERS.into_iter().zip(computed) {
+        if let Some(computed) = computed
+            && (headers.get_all(name).iter().count() != 1
+                || headers.get(name).map(HeaderValue::as_bytes) != Some(computed.as_bytes()))
+        {
+            return Err("BadDigest");
+        }
+    }
+    Ok(())
+}
+
+impl<S, B> Service<HttpRequest<B>> for ControlBodyDigestService<S>
+where
+    S: Service<HttpRequest<ControlRequestBody>, Response = Response<s3s::Body>> + Clone + Send + 'static,
+    S::Future: Send + 'static,
+    S::Error: Send + 'static,
+    B: http_body::Body<Data = Bytes> + Send + 'static,
+    B::Error: Send + Sync + 'static,
+    Box<dyn std::error::Error + Send + Sync>: From<B::Error>,
+{
+    type Response = Response<s3s::Body>;
+    type Error = S::Error;
+    type Future = Pin<Box<dyn Future<Output = std::result::Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<std::result::Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, request: HttpRequest<B>) -> Self::Future {
+        use http_body_util::BodyExt;
+        let clone = self.inner.clone();
+        let mut inner = std::mem::replace(&mut self.inner, clone);
+        let required = control_body_digest_required(&request, self.virtual_host.as_deref());
+        let idle_timeout = self.idle_timeout;
+        let total_timeout = self.total_timeout;
+        let limit = self.max_body_size;
+        Box::pin(async move {
+            let mut request = request.map(s3s::Body::http_body_unsync);
+            let Some(required) = required else {
+                return inner.call(request.map(control_request_body)).await;
+            };
+            let headers = request.headers();
+            let sig_v2 = headers
+                .get("authorization")
+                .is_some_and(|value| value.as_bytes().starts_with(b"AWS "))
+                || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
+                    .any(|(key, _)| key == "AWSAccessKeyId");
+            let has_checksum = CONTROL_BODY_CHECKSUM_HEADERS.iter().any(|name| headers.contains_key(*name));
+            if required && !headers.contains_key("content-md5") && (sig_v2 || !has_checksum) {
+                return Ok(control_body_digest_error("MissingContentMD5"));
+            }
+            if headers
+                .get("content-length")
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > limit as u64)
+            {
+                return Ok(control_body_digest_error("EntityTooLarge"));
+            }
+            let deadline = tokio::time::Instant::now() + total_timeout;
+            let collected = tokio::time::timeout_at(deadline, async {
+                let mut bytes = bytes::BytesMut::new();
+                while let Some(frame) = tokio::time::timeout(idle_timeout, request.body_mut().frame())
+                    .await
+                    .map_err(|_| "RequestTimeout")?
+                {
+                    if tokio::time::Instant::now() >= deadline {
+                        return Err("RequestTimeout");
+                    }
+                    let frame = frame.map_err(|_| "IncompleteBody")?;
+                    if let Ok(data) = frame.into_data() {
+                        if data.len() > limit.saturating_sub(bytes.len()) {
+                            return Err("EntityTooLarge");
+                        }
+                        bytes.extend_from_slice(&data);
+                    }
+                }
+                Ok(bytes.freeze())
+            })
+            .await
+            .unwrap_or(Err("RequestTimeout"));
+            let bytes = match collected {
+                Ok(bytes) => bytes,
+                Err(code) => return Ok(control_body_digest_error(code)),
+            };
+            if let Err(code) = verify_control_body_digest(request.headers(), &bytes) {
+                return Ok(control_body_digest_error(code));
+            }
+            *request.body_mut() = s3s::Body::from(bytes);
+            inner.call(request.map(control_request_body)).await
+        })
+    }
+}
+
 fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, span: &Span) {
     span.record("status_code", tracing::field::display(response.status()));
     let _enter = span.enter();
@@ -2139,10 +2462,10 @@ async fn start_http_server_inner(
         let make_service = move |peer_addr: SocketAddr| -> Http3ExternalService {
             let remote_addr = RemoteAddr(peer_addr);
 
+            let service = ControlBodyDigestService::new(h3_s3_service.clone(), http_request_body_read_timeout)
+                .with_virtual_host_domains(h3_vh_domain_hosts.clone());
             #[cfg(feature = "swift")]
-            let service = SwiftService::new(true, None, h3_s3_service.clone());
-            #[cfg(not(feature = "swift"))]
-            let service = h3_s3_service.clone();
+            let service = SwiftService::new(true, None, service);
             let service = EarlyResponseBodyService::new(service, http_request_body_read_timeout);
             let service = ServiceBuilder::new()
                 .layer(tower::util::MapResponseLayer::new(|response: Response<s3s::Body>| {
@@ -2794,10 +3117,10 @@ fn process_connection(
                 .prepare(),
         );
 
+        let http_service = ControlBodyDigestService::new(s3_service, request_body_idle_timeout)
+            .with_virtual_host_domains(vh_domain_hosts.clone());
         #[cfg(feature = "swift")]
-        let http_service = SwiftService::new(true, None, s3_service);
-        #[cfg(not(feature = "swift"))]
-        let http_service = s3_service;
+        let http_service = SwiftService::new(true, None, http_service);
         let http_service =
             EarlyResponseBodyService::new(http_service, request_body_idle_timeout).with_task_owner(task_owner.clone());
         let http_service = InternodeRpcService::new(http_service);
@@ -3349,6 +3672,552 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
+
+    const DIGEST_DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
+
+    struct DigestCheckedS3(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for DigestCheckedS3 {
+        async fn delete_objects(
+            &self,
+            request: s3s::S3Request<s3s::dto::DeleteObjectsInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::DeleteObjectsOutput>> {
+            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
+            assert_eq!(request.input.delete.objects[0].key, "safe-object");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(s3s::S3Response::new(s3s::dto::DeleteObjectsOutput::default()))
+        }
+    }
+
+    struct DigestMultipartS3(Arc<AtomicUsize>);
+
+    #[async_trait::async_trait]
+    impl s3s::S3 for DigestMultipartS3 {
+        async fn create_multipart_upload(
+            &self,
+            request: s3s::S3Request<s3s::dto::CreateMultipartUploadInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CreateMultipartUploadOutput>> {
+            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
+            assert_eq!(request.input.bucket, "bucket");
+            assert_eq!(request.input.key, "object");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(s3s::S3Response::new(s3s::dto::CreateMultipartUploadOutput::default()))
+        }
+
+        async fn complete_multipart_upload(
+            &self,
+            request: s3s::S3Request<s3s::dto::CompleteMultipartUploadInput>,
+        ) -> s3s::S3Result<s3s::S3Response<s3s::dto::CompleteMultipartUploadOutput>> {
+            assert_eq!(request.credentials.expect("authenticated request").access_key, "digest-key");
+            assert_eq!(request.input.bucket, "bucket");
+            assert_eq!(request.input.key, "object");
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(s3s::S3Response::new(s3s::dto::CompleteMultipartUploadOutput::default()))
+        }
+    }
+
+    fn signed_digest_route_request(uri: &str, body: &'static str, with_md5: bool, virtual_host: bool) -> HttpRequest<s3s::Body> {
+        use md5::Digest;
+        let uri: Uri = uri.parse().unwrap();
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .header("host", uri.authority().unwrap().as_str())
+            .uri(uri)
+            .header("content-length", body.len())
+            .header("content-type", "application/xml")
+            .body(s3s::Body::from(body.to_string()))
+            .unwrap();
+        if with_md5 {
+            request.headers_mut().insert(
+                "content-md5",
+                base64_simd::STANDARD
+                    .encode_to_string(md5::Md5::digest(body.as_bytes()))
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        let wire_uri = request.uri().clone();
+        if virtual_host {
+            // The repository V2 signer currently ignores its virtual_host flag.
+            // Sign the canonical bucket-prefixed resource, then restore the wire URI.
+            let bucket = wire_uri.host().unwrap().split('.').next().unwrap();
+            let mut parts = wire_uri.clone().into_parts();
+            parts.path_and_query = Some(format!("/{bucket}{}", wire_uri.path_and_query().unwrap()).parse().unwrap());
+            *request.uri_mut() = Uri::from_parts(parts).unwrap();
+        }
+        let mut request = rustfs_signer::try_sign_v2(request, body.len() as i64, "digest-key", "digest-secret", false).unwrap();
+        *request.uri_mut() = wire_uri;
+        request
+    }
+
+    #[tokio::test]
+    async fn control_body_digest_follows_s3_multipart_routing_with_delete_query() {
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = S3ServiceBuilder::new(DigestMultipartS3(calls.clone()));
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
+        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
+        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
+        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
+            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
+        for virtual_host in [false, true] {
+            let base = if virtual_host {
+                "http://bucket.example.com/object"
+            } else {
+                "http://example.com/bucket/object"
+            };
+            for (query, body) in [
+                ("x-id=CreateMultipartUpload&uploads&delete", ""),
+                ("uploads&delete", ""),
+                (
+                    "x-id=CompleteMultipartUpload&uploadId=id&delete",
+                    "<CompleteMultipartUpload><Part><ETag>etag</ETag><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
+                ),
+                (
+                    "uploadId=id&delete",
+                    "<CompleteMultipartUpload><Part><ETag>etag</ETag><PartNumber>1</PartNumber></Part></CompleteMultipartUpload>",
+                ),
+            ] {
+                let uri = format!("{base}?{query}");
+                let response = service
+                    .clone()
+                    .oneshot(signed_digest_route_request(&uri, body, false, virtual_host))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&bytes));
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 8);
+    }
+
+    #[tokio::test]
+    async fn control_body_digest_keeps_bucket_deletes_guarded_with_multipart_query() {
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls.clone()));
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
+        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
+        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
+        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
+            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
+        for virtual_host in [false, true] {
+            let base = if virtual_host {
+                "http://bucket.example.com/"
+            } else {
+                "http://example.com/bucket"
+            };
+            for query in ["delete&uploads", "delete&uploadId=id", "x-id=DeleteObjects&uploads"] {
+                let uri = format!("{base}?{query}");
+                digest_error(
+                    service
+                        .clone()
+                        .oneshot(signed_digest_route_request(&uri, DIGEST_DELETE_XML, false, virtual_host))
+                        .await
+                        .unwrap(),
+                    "MissingContentMD5",
+                )
+                .await;
+                let response = service
+                    .clone()
+                    .oneshot(signed_digest_route_request(&uri, DIGEST_DELETE_XML, true, virtual_host))
+                    .await
+                    .unwrap();
+                let status = response.status();
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&bytes));
+                let mut tampered = signed_digest_route_request(&uri, DIGEST_DELETE_XML, true, virtual_host);
+                *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
+                digest_error(service.clone().oneshot(tampered).await.unwrap(), "BadDigest").await;
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 6);
+    }
+
+    #[tokio::test]
+    async fn control_body_digest_guards_cname_and_host_header_precedence() {
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls.clone()));
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
+        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
+        builder.set_host(MultiDomain::new(["example.com"]).unwrap());
+        let service = ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
+            .with_virtual_host_domains(vec!["example.com".to_owned()].into());
+        for different_authority in [false, true] {
+            for md5 in [false, true] {
+                // SigV2 canonicalizes a CNAME request as /<whole-host>/.
+                let mut request = signed_digest_route_request(
+                    "http://alias.example.net/alias.example.net/?delete",
+                    DIGEST_DELETE_XML,
+                    md5,
+                    false,
+                );
+                *request.uri_mut() = if different_authority {
+                    "http://example.com/?delete"
+                } else {
+                    "http://alias.example.net/?delete"
+                }
+                .parse()
+                .unwrap();
+                let response = service.clone().oneshot(request).await.unwrap();
+                if md5 {
+                    let status = response.status();
+                    let body = response.into_body().collect().await.unwrap().to_bytes();
+                    assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+                } else {
+                    digest_error(response, "MissingContentMD5").await;
+                }
+            }
+        }
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    fn digest_checked_s3(calls: Arc<AtomicUsize>) -> ControlBodyDigestService<S3Service> {
+        let mut builder = S3ServiceBuilder::new(DigestCheckedS3(calls));
+        builder.set_auth(s3s::auth::SimpleAuth::from_single("digest-key", "digest-secret"));
+        builder.set_config(Arc::new(StaticConfigProvider::new(Arc::new(rustfs_s3_config()))));
+        ControlBodyDigestService::new(builder.build(), Duration::from_secs(2))
+    }
+
+    fn digest_v2_request(presigned: bool, md5: bool, secret: &str) -> HttpRequest<s3s::Body> {
+        digest_v2_request_at(presigned, md5, secret, "http://localhost/bucket?delete")
+    }
+
+    fn digest_v2_request_at(presigned: bool, md5: bool, secret: &str, uri: &str) -> HttpRequest<s3s::Body> {
+        use md5::Digest;
+        let signing_uri = uri.replace("%64elete", "delete");
+        let mut request = HttpRequest::builder()
+            .method("POST")
+            .header("date", chrono::Utc::now().format("%a, %d %b %Y %H:%M:%S GMT").to_string())
+            .uri(signing_uri)
+            .header("host", "localhost")
+            .header("content-type", "application/xml")
+            .header("content-length", DIGEST_DELETE_XML.len())
+            .body(s3s::Body::from(DIGEST_DELETE_XML.to_string()))
+            .unwrap();
+        if md5 {
+            request.headers_mut().insert(
+                "content-md5",
+                base64_simd::STANDARD
+                    .encode_to_string(md5::Md5::digest(DIGEST_DELETE_XML.as_bytes()))
+                    .parse()
+                    .unwrap(),
+            );
+        }
+        let mut request = if presigned {
+            let mut request = rustfs_signer::try_pre_sign_v2(request, "digest-key", secret, 60, false).unwrap();
+            // The signer leaves the final base64 query value unescaped.
+            let uri = request.uri().to_string();
+            let (prefix, signature) = uri.rsplit_once("&Signature=").unwrap();
+            let encoded = url::form_urlencoded::Serializer::new(String::new())
+                .append_pair("Signature", signature)
+                .finish();
+            *request.uri_mut() = format!("{prefix}&{encoded}").parse().unwrap();
+            request
+        } else {
+            rustfs_signer::try_sign_v2(request, DIGEST_DELETE_XML.len() as i64, "digest-key", secret, false).unwrap()
+        };
+        if uri.contains("%64elete") {
+            *request.uri_mut() = request
+                .uri()
+                .to_string()
+                .replace("?delete", "?%64elete")
+                .replace("&delete", "&%64elete")
+                .parse()
+                .unwrap();
+        }
+        request
+    }
+
+    async fn digest_error(response: Response<s3s::Body>, code: &str) {
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&bytes).contains(&format!("<Code>{code}</Code>")));
+    }
+
+    #[tokio::test]
+    async fn delete_objects_digest_binds_sigv2_header_and_query_bodies() {
+        use tower::ServiceExt;
+        for presigned in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let service = digest_checked_s3(calls.clone());
+            let response = service
+                .clone()
+                .oneshot(digest_v2_request(presigned, true, "digest-secret"))
+                .await
+                .unwrap();
+            let status = response.status();
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+            let mut tampered = digest_v2_request(presigned, true, "digest-secret");
+            *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
+            digest_error(service.clone().oneshot(tampered).await.unwrap(), "BadDigest").await;
+            digest_error(
+                service
+                    .clone()
+                    .oneshot(digest_v2_request(presigned, false, "digest-secret"))
+                    .await
+                    .unwrap(),
+                "MissingContentMD5",
+            )
+            .await;
+            let mut checksum_only = digest_v2_request(presigned, false, "digest-secret");
+            checksum_only
+                .headers_mut()
+                .insert("x-amz-checksum-sha256", HeaderValue::from_static("placeholder"));
+            digest_error(service.clone().oneshot(checksum_only).await.unwrap(), "MissingContentMD5").await;
+
+            let mut malformed = digest_v2_request(presigned, true, "digest-secret");
+            malformed
+                .headers_mut()
+                .insert("content-md5", HeaderValue::from_static("invalid"));
+            digest_error(service.clone().oneshot(malformed).await.unwrap(), "InvalidDigest").await;
+            let response = service
+                .oneshot(digest_v2_request(presigned, true, "wrong-secret"))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::FORBIDDEN,
+                "digest verification must not replace authentication"
+            );
+            assert_eq!(calls.load(Ordering::SeqCst), 1, "only the original authenticated XML may dispatch");
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_objects_digest_covers_operation_id_and_encoded_query_routes() {
+        use tower::ServiceExt;
+        for uri in [
+            "http://localhost/bucket?x-id=DeleteObjects",
+            "http://localhost/bucket?%64elete",
+        ] {
+            for presigned in [false, true] {
+                let calls = Arc::new(AtomicUsize::new(0));
+                let service = digest_checked_s3(calls.clone());
+                let request = digest_v2_request_at(presigned, true, "digest-secret", uri);
+                let response = service.clone().oneshot(request).await.unwrap();
+                let status = response.status();
+                let body = response.into_body().collect().await.unwrap().to_bytes();
+                assert_eq!(status, StatusCode::OK, "{uri}: {}", String::from_utf8_lossy(&body));
+                let mut request = digest_v2_request_at(presigned, true, "digest-secret", uri);
+                *request.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
+                digest_error(service.clone().oneshot(request).await.unwrap(), "BadDigest").await;
+                digest_error(
+                    service
+                        .oneshot(digest_v2_request_at(presigned, false, "digest-secret", uri))
+                        .await
+                        .unwrap(),
+                    "MissingContentMD5",
+                )
+                .await;
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+            }
+        }
+    }
+
+    fn digest_v4_request(checksum: &str) -> HttpRequest<s3s::Body> {
+        use s3s_sigv4::{AmzDate, Payload, calculate_signature, create_canonical_request, create_string_to_sign};
+        let timestamp = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
+        let date = AmzDate::parse(&timestamp).unwrap();
+        let canonical = create_canonical_request(
+            "POST",
+            "/bucket",
+            &[("delete", "")],
+            [
+                ("host", "localhost"),
+                ("x-amz-checksum-sha256", checksum),
+                ("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+                ("x-amz-date", timestamp.as_str()),
+            ],
+            Payload::Unsigned,
+        );
+        let to_sign = create_string_to_sign(&canonical, &date, "us-east-1", "s3");
+        let signature = calculate_signature(&to_sign, "digest-secret", &date, "us-east-1", "s3");
+        HttpRequest::builder().method("POST").uri("http://localhost/bucket?delete")
+            .header("host", "localhost").header("content-length", DIGEST_DELETE_XML.len())
+            .header("x-amz-checksum-sha256", checksum).header("x-amz-content-sha256", "UNSIGNED-PAYLOAD")
+            .header("x-amz-date", &timestamp)
+            .header("authorization", format!("AWS4-HMAC-SHA256 Credential=digest-key/{}/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-checksum-sha256;x-amz-content-sha256;x-amz-date, Signature={signature}", date.fmt_date()))
+            .body(s3s::Body::from(DIGEST_DELETE_XML.to_string())).unwrap()
+    }
+
+    #[tokio::test]
+    async fn delete_objects_digest_preserves_sigv4_checksum_requests() {
+        use sha2::Digest;
+        use tower::ServiceExt;
+        let checksum = base64_simd::STANDARD.encode_to_string(sha2::Sha256::digest(DIGEST_DELETE_XML.as_bytes()));
+        let calls = Arc::new(AtomicUsize::new(0));
+        let service = digest_checked_s3(calls.clone());
+        let response = service.clone().oneshot(digest_v4_request(&checksum)).await.unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+        let mut tampered = digest_v4_request(&checksum);
+        *tampered.body_mut() = s3s::Body::from(DIGEST_DELETE_XML.replace("safe-object", "evil-object"));
+        digest_error(service.oneshot(tampered).await.unwrap(), "BadDigest").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn control_body_digest_bounds_declared_and_undeclared_bodies() {
+        use tower::ServiceExt;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = digest_checked_s3(calls.clone());
+        service.max_body_size = DIGEST_DELETE_XML.len();
+        for declared in [false, true] {
+            let mut request = digest_v2_request(false, true, "digest-secret");
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let polled = Arc::new(AtomicUsize::new(0));
+            let dropped = Arc::new(AtomicBool::new(false));
+            sender.send(Bytes::from_static(DIGEST_DELETE_XML.as_bytes())).unwrap();
+            sender.send(Bytes::from_static(b" ")).unwrap();
+            if declared {
+                request
+                    .headers_mut()
+                    .insert(CONTENT_LENGTH, HeaderValue::from(DIGEST_DELETE_XML.len() + 1));
+            } else {
+                request.headers_mut().remove(CONTENT_LENGTH);
+            }
+            let request = request.map(|_| TrackedRequestBody {
+                receiver,
+                bytes_polled: polled.clone(),
+                dropped: dropped.clone(),
+            });
+            digest_error(service.clone().oneshot(request).await.unwrap(), "EntityTooLarge").await;
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(polled.load(Ordering::SeqCst), if declared { 0 } else { DIGEST_DELETE_XML.len() + 1 });
+        }
+        let mut request = digest_v2_request(false, true, "digest-secret");
+        request.headers_mut().remove(CONTENT_LENGTH);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        sender.send(Bytes::from_static(DIGEST_DELETE_XML.as_bytes())).unwrap();
+        drop(sender);
+        let response = service
+            .oneshot(request.map(|_| TrackedRequestBody {
+                receiver,
+                bytes_polled: Arc::default(),
+                dropped: Arc::default(),
+            }))
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        assert_eq!(status, StatusCode::LENGTH_REQUIRED, "{}", String::from_utf8_lossy(&body));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "preserve s3s' missing-length rejection after bounded collection"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn control_body_digest_idle_total_deadlines_and_cancellation_release_body() {
+        use tower::ServiceExt;
+        for trickle in [false, true] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let mut service = digest_checked_s3(calls.clone());
+            service.total_timeout = Duration::from_secs(5);
+            let (sender, receiver) = mpsc::unbounded_channel();
+            let dropped = Arc::new(AtomicBool::new(false));
+            let request = digest_v2_request(false, true, "digest-secret").map(|_| TrackedRequestBody {
+                receiver,
+                bytes_polled: Arc::default(),
+                dropped: dropped.clone(),
+            });
+            let task = tokio::spawn(service.oneshot(request));
+            for _ in 0..6 {
+                if trickle {
+                    let _ = sender.send(Bytes::from_static(b" "));
+                }
+                tokio::task::yield_now().await;
+                tokio::time::advance(Duration::from_secs(1)).await;
+            }
+            digest_error(task.await.unwrap().unwrap(), "RequestTimeout").await;
+            assert!(dropped.load(Ordering::SeqCst));
+            assert_eq!(calls.load(Ordering::SeqCst), 0);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let (_sender, receiver) = mpsc::unbounded_channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(
+            digest_checked_s3(calls.clone()).oneshot(digest_v2_request(false, true, "digest-secret").map(|_| {
+                TrackedRequestBody {
+                    receiver,
+                    bytes_polled: Arc::default(),
+                    dropped: dropped.clone(),
+                }
+            })),
+        );
+        tokio::task::yield_now().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn control_body_digest_preserves_streaming_uploads_and_checks_config_md5() {
+        use tower::ServiceExt;
+        for (method, uri) in [
+            ("PUT", "/bucket/key"),
+            ("PUT", "/bucket/key?partNumber=1&uploadId=id"),
+            ("POST", "/bucket?uploads"),
+            ("POST", "/bucket"),
+            ("POST", "/bucket/key?uploadId=id"),
+            ("POST", "/bucket?delete"),
+            ("PUT", "/bucket/key?x-id=PutObject&tagging"),
+        ] {
+            let (_sender, receiver) = mpsc::unbounded_channel();
+            let polled = Arc::new(AtomicUsize::new(0));
+            let inner_polled = polled.clone();
+            let inner = tower::service_fn(move |_: HttpRequest<ControlRequestBody>| {
+                assert_eq!(inner_polled.load(Ordering::SeqCst), 0, "uploads must reach dispatch without buffering");
+                async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }
+            });
+            let request = HttpRequest::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-md5", "invalid")
+                .header("content-type", "multipart/form-data; boundary=upload")
+                .body(TrackedRequestBody {
+                    receiver,
+                    bytes_polled: polled,
+                    dropped: Arc::default(),
+                })
+                .unwrap();
+            let response = ControlBodyDigestService::new(inner, Duration::from_secs(1))
+                .oneshot(request)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+        }
+        let calls = Arc::new(AtomicUsize::new(0));
+        let inner_calls = calls.clone();
+        let inner = tower::service_fn(move |_: HttpRequest<ControlRequestBody>| {
+            inner_calls.fetch_add(1, Ordering::SeqCst);
+            async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }
+        });
+        let service = ControlBodyDigestService::new(inner, Duration::from_secs(1));
+        let mut request = digest_v2_request(false, true, "digest-secret");
+        *request.method_mut() = Method::PUT;
+        *request.uri_mut() = "/bucket?versioning".parse().unwrap();
+        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bucket?versioning")
+            .header("content-md5", "1B2M2Y8AsgTpgAmY7PhCfg==")
+            .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
+            .unwrap();
+        digest_error(service.oneshot(request).await.unwrap(), "BadDigest").await;
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
 
     type RateLimitTestCore = tower::util::BoxCloneService<
         HttpRequest<s3s::Body>,
