@@ -13753,14 +13753,12 @@ mod batch_delete_lock_tests {
                 .await
                 .expect("overlapping batches must not deadlock")
                 .expect("delete task");
-            for error in &errors {
-                if let Some(error) = error {
-                    let message = error.to_string();
-                    assert!(
-                        message.contains("lock") || message.contains("Lock") || message.contains("namespace"),
-                        "overlap may only surface lock outcomes: {message}"
-                    );
-                }
+            for error in errors.iter().flatten() {
+                let message = error.to_string();
+                assert!(
+                    message.contains("lock") || message.contains("Lock") || message.contains("namespace"),
+                    "overlap may only surface lock outcomes: {message}"
+                );
             }
         }
     }
