@@ -95,13 +95,8 @@ impl SetDisks {
         bucket: &str,
         object: &str,
     ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
-        let resource = ObjectKey::with_version(
-            bucket,
-            object_name_disk_identity(object).as_ref(),
-            format!("rustfs:delete-transaction:{}:{}", self.pool_index, self.set_index),
-        );
         let guard = self
-            .namespace_lock_for_key(resource)
+            .namespace_lock_for_key(self.delete_transaction_resource(bucket, object))
             .await
             .get_write_lock(super::super::get_lock_acquire_timeout())
             .await
@@ -109,6 +104,94 @@ impl SetDisks {
         #[cfg(test)]
         super::delete_recovery::test_hooks::run_after_transaction_lock_acquired(bucket, object, &guard);
         Ok(Arc::new(guard))
+    }
+
+    fn delete_transaction_resource(&self, bucket: &str, object: &str) -> ObjectKey {
+        ObjectKey::with_version(
+            bucket,
+            object_name_disk_identity(object).as_ref(),
+            format!("rustfs:delete-transaction:{}:{}", self.pool_index, self.set_index),
+        )
+    }
+
+    /// Batched write-lock acquisition for the whole key set of one bulk
+    /// mutation: one lock round instead of one quorum round-trip per key.
+    ///
+    /// Bulk delete is the only multi-key write-lock holder. The batched round
+    /// is deadlock-free by construction (a single `lock_batch` RPC per lock
+    /// client, and every lock server orders concurrent batches by the same
+    /// global (shard, key) order), so unlike an optimistic probe wave it
+    /// needs no canonical serial fallback. Outcomes are per key and use the
+    /// same error shape as the single-key paths.
+    async fn namespace_write_locks_batch(
+        &self,
+        bucket: &str,
+        resources: &[ObjectKey],
+        timeout: std::time::Duration,
+        mode: &'static str,
+    ) -> Vec<Result<rustfs_lock::NamespaceLockGuard>> {
+        if resources.is_empty() {
+            return Vec::new();
+        }
+        let lock = self.namespace_lock_for_key(resources[0].clone()).await;
+        lock.get_write_locks_batch(resources, timeout)
+            .await
+            .into_iter()
+            .zip(resources)
+            .map(|(result, resource)| {
+                result.map_err(|error| self.map_namespace_lock_error(bucket, resource.object.as_ref(), mode, error))
+            })
+            .collect()
+    }
+
+    /// Batched raw namespace write locks for a bulk delete's key set. The
+    /// resource keys use the same disk-identity folding as `new_ns_lock`, so
+    /// aliases (`a\b` vs `a/b`) still share one lock.
+    pub(crate) async fn acquire_object_write_locks_batch(
+        &self,
+        bucket: &str,
+        objects: &[&str],
+        timeout: std::time::Duration,
+    ) -> Vec<Result<rustfs_lock::NamespaceLockGuard>> {
+        let resources: Vec<ObjectKey> = objects
+            .iter()
+            .map(|object| ObjectKey {
+                bucket: Arc::from(bucket),
+                object: Arc::from(object_name_disk_identity(object).as_ref()),
+                version: None,
+            })
+            .collect();
+        self.namespace_write_locks_batch(bucket, &resources, timeout, "write").await
+    }
+
+    /// Batched delete-transaction locks for a bulk delete's key set; see
+    /// [`Self::acquire_delete_transaction_lock`] for the resource shape.
+    pub(in crate::set_disk) async fn acquire_delete_transaction_locks_batch(
+        &self,
+        bucket: &str,
+        objects: &[&str],
+        timeout: std::time::Duration,
+    ) -> Vec<Result<Arc<rustfs_lock::NamespaceLockGuard>>> {
+        let resources: Vec<ObjectKey> = objects
+            .iter()
+            .map(|object| self.delete_transaction_resource(bucket, object))
+            .collect();
+        let mut guards = Vec::with_capacity(resources.len());
+        for (object, result) in objects.iter().zip(
+            self.namespace_write_locks_batch(bucket, &resources, timeout, "delete_transaction")
+                .await,
+        ) {
+            match result {
+                Ok(guard) => {
+                    #[cfg(test)]
+                    super::delete_recovery::test_hooks::run_after_transaction_lock_acquired(bucket, object, &guard);
+                    let _ = object;
+                    guards.push(Ok(Arc::new(guard)));
+                }
+                Err(error) => guards.push(Err(error)),
+            }
+        }
+        guards
     }
 
     #[allow(dead_code, reason = "lock diagnostics formatter with no caller in this port (backlog#1823)")]

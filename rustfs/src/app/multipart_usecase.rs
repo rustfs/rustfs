@@ -551,12 +551,9 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
-        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
-        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
-        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
-        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
-        // abort operations to avoid leaking information about upload_id format requirements.
+        // Per the AWS S3 API reference, a malformed upload ID is reported as
+        // NoSuchUpload (404), the same as an upload that was aborted or
+        // completed. See multipart_upload_api_error.
         match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), &opts)
             .await
@@ -569,13 +566,7 @@ impl DefaultMultipartUsecase {
                 );
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
+            Err(err) => Err(multipart_upload_api_error(err)),
         }
     }
 
@@ -700,7 +691,7 @@ impl DefaultMultipartUsecase {
         let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
             Ok(info) => Some(info),
             Err(err) if is_err_invalid_upload_id(&err) => None,
-            Err(err) => return Err(ApiError::from(err).into()),
+            Err(err) => return Err(multipart_upload_api_error(err)),
         };
         // A ciphertext-passthrough session stores encrypted parts verbatim and
         // completes without the customer key (the replication client has none),
@@ -1283,7 +1274,7 @@ impl DefaultMultipartUsecase {
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
         if let Some(limit) = max_total_object_size
@@ -1678,7 +1669,7 @@ impl DefaultMultipartUsecase {
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, params.part_number_marker, params.max_parts, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
 
         Ok(S3Response::new(build_list_parts_output(res)))
     }
@@ -1795,7 +1786,7 @@ impl DefaultMultipartUsecase {
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
             bucket: &bucket,
@@ -2122,6 +2113,21 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
         }
     }
     Ok(())
+}
+
+/// Maps a storage error from an operation that addresses an existing multipart
+/// upload (UploadPart, UploadPartCopy, ListParts, CompleteMultipartUpload and
+/// AbortMultipartUpload) to an S3 error.
+///
+/// A malformed upload ID cannot name an existing upload, so it is reported as
+/// `NoSuchUpload` (404), which the AWS S3 error reference describes as "The
+/// upload ID might be invalid, or the multipart upload might have been aborted
+/// or completed".
+fn multipart_upload_api_error(err: StorageError) -> S3Error {
+    if matches!(err, StorageError::MalformedUploadID(_)) {
+        return S3Error::new(S3ErrorCode::NoSuchUpload);
+    }
+    ApiError::from(err).into()
 }
 
 #[cfg(test)]
@@ -2795,6 +2801,22 @@ mod tests {
 
         metadata.insert("x-minio-internal-max-total-object-size".to_string(), "1".to_string());
         assert!(multipart_max_total_object_size(&metadata).is_err());
+    }
+
+    #[test]
+    fn multipart_upload_api_error_reports_malformed_upload_id_as_no_such_upload() {
+        let malformed = multipart_upload_api_error(StorageError::MalformedUploadID("bucket/object-not-an-id".to_string()));
+        assert_eq!(malformed.code(), &S3ErrorCode::NoSuchUpload);
+
+        let unknown = multipart_upload_api_error(StorageError::InvalidUploadID(
+            "bucket".to_string(),
+            "object".to_string(),
+            "dXBsb2FkLWlk".to_string(),
+        ));
+        assert_eq!(unknown.code(), &S3ErrorCode::NoSuchUpload);
+
+        let other = multipart_upload_api_error(StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()));
+        assert_eq!(other.code(), &S3ErrorCode::NoSuchKey);
     }
 
     #[tokio::test]
