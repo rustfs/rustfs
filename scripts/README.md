@@ -32,6 +32,7 @@ their issue closes.
 | `check_extension_schema_boundaries.sh` | ci-gate | Extension-schema crate boundary guard | ci.yml Quick Checks; `make pre-commit` |
 | `check_layer_dependencies.sh` | ci-gate | Crate-layering DAG guard (reads `layer-dependency-baseline.txt`) | ci.yml Quick Checks |
 | `check_logging_guardrails.sh` | ci-gate | Blocks legacy logging patterns from returning | `make pre-commit` / `pre-pr` |
+| `download_rc.sh` | ci-gate | Downloads and verifies the RustFS CLI release binary for container builds | `Dockerfile`, `Dockerfile.glibc`, `Dockerfile.source`, `Dockerfile.decommission-local` |
 | `check_migration_gate_count.sh` | ci-gate | Migration-critical test gate with committed count floor (`.config/migration-gate-floor.txt`) | ci.yml Test and Lint; `docs/testing/README.md` |
 | `check_no_planning_docs.sh` | ci-gate | Blocks committed planning-type documents | ci.yml Quick Checks; `make pre-commit` |
 | `check_no_tokio_io_uring.sh` | ci-gate | Keeps tokio's io-uring backend disabled | ci.yml Quick Checks |
@@ -96,7 +97,7 @@ their issue closes.
 | `test_scanner_heal_scheduler_pressure_evidence.py` | dev-tool | Scheduler-pressure evidence fail-closed tests | `test_scanner_heal_scheduler_pressure_evidence.sh` |
 | `test_scanner_heal_linux_evidence_plan.py` | dev-tool | Linux evidence plan coverage tests | `test_scanner_heal_linux_evidence_plan.sh` |
 | `test_build_rustfs_options.sh` | dev-tool | Shell test for rustfs build-option wiring | `make test` (script-tests) |
-| `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential-handling test | `make test` (script-tests) |
+| `test_entrypoint_credentials.sh` | dev-tool | Container entrypoint credential and bundled bootstrap-default test | `make test` (script-tests) |
 | `test_helm_chart_version.sh` | dev-tool | Test for `helm_chart_version.sh` | — |
 | `test_package_service_scripts.sh` | ci-gate | Verifies DEB/RPM install, upgrade, removal, and service restart scriptlets | audit.yml `workflow-pin-report` |
 | `test_package_versions.sh` | ci-gate | Exact-output and fail-closed tests for DEB/RPM package version normalization | audit.yml `workflow-pin-report`; package.yml RPM build |

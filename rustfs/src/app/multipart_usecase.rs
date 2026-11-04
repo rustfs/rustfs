@@ -551,12 +551,9 @@ impl DefaultMultipartUsecase {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
 
-        // Special handling for abort_multipart_upload: Per AWS S3 API specification, this operation
-        // should return NoSuchUpload (404) when the upload_id doesn't exist, even if the format
-        // appears invalid. This differs from other multipart operations (upload_part, list_parts,
-        // complete_multipart_upload) which return InvalidArgument for malformed upload_ids.
-        // The lenient validation matches AWS S3 behavior where format validation is relaxed for
-        // abort operations to avoid leaking information about upload_id format requirements.
+        // Per the AWS S3 API reference, a malformed upload ID is reported as
+        // NoSuchUpload (404), the same as an upload that was aborted or
+        // completed. See multipart_upload_api_error.
         match store
             .abort_multipart_upload(bucket.as_str(), key.as_str(), upload_id.as_str(), &opts)
             .await
@@ -569,13 +566,7 @@ impl DefaultMultipartUsecase {
                 );
                 Ok(S3Response::new(AbortMultipartUploadOutput { ..Default::default() }))
             }
-            Err(err) => {
-                // Convert MalformedUploadID to NoSuchUpload for S3 API compatibility
-                if matches!(err, StorageError::MalformedUploadID(_)) {
-                    return Err(S3Error::new(S3ErrorCode::NoSuchUpload));
-                }
-                Err(ApiError::from(err).into())
-            }
+            Err(err) => Err(multipart_upload_api_error(err)),
         }
     }
 
@@ -708,7 +699,7 @@ impl DefaultMultipartUsecase {
         let multipart_info = match store.get_multipart_info(&bucket, &key, &upload_id, &opts).await {
             Ok(info) => Some(info),
             Err(err) if is_err_invalid_upload_id(&err) => None,
-            Err(err) => return Err(ApiError::from(err).into()),
+            Err(err) => return Err(multipart_upload_api_error(err)),
         };
         let completion_principal = SseKmsPrincipal::from_request(&req);
         let completion_authorization = multipart_completion_authorization(
@@ -1314,7 +1305,7 @@ impl DefaultMultipartUsecase {
         let fi = store
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
@@ -1708,7 +1699,7 @@ impl DefaultMultipartUsecase {
         let res = store
             .list_object_parts(&bucket, &key, &upload_id, params.part_number_marker, params.max_parts, &opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
 
         Ok(S3Response::new(build_list_parts_output(res)))
     }
@@ -1825,7 +1816,7 @@ impl DefaultMultipartUsecase {
         let mp_info = store
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
-            .map_err(ApiError::from)?;
+            .map_err(multipart_upload_api_error)?;
         authorize_sse_kms_multipart_write(copy_principal.as_ref(), &mp_info.user_defined).await?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
@@ -2153,6 +2144,21 @@ fn normalize_presigned_part_checksums(req: &mut S3Request<UploadPartInput>) -> S
         }
     }
     Ok(())
+}
+
+/// Maps a storage error from an operation that addresses an existing multipart
+/// upload (UploadPart, UploadPartCopy, ListParts, CompleteMultipartUpload and
+/// AbortMultipartUpload) to an S3 error.
+///
+/// A malformed upload ID cannot name an existing upload, so it is reported as
+/// `NoSuchUpload` (404), which the AWS S3 error reference describes as "The
+/// upload ID might be invalid, or the multipart upload might have been aborted
+/// or completed".
+fn multipart_upload_api_error(err: StorageError) -> S3Error {
+    if matches!(err, StorageError::MalformedUploadID(_)) {
+        return S3Error::new(S3ErrorCode::NoSuchUpload);
+    }
+    ApiError::from(err).into()
 }
 
 #[cfg(test)]
@@ -2834,6 +2840,22 @@ mod tests {
 
         metadata.insert("x-minio-internal-max-total-object-size".to_string(), "1".to_string());
         assert!(multipart_max_total_object_size(&metadata).is_err());
+    }
+
+    #[test]
+    fn multipart_upload_api_error_reports_malformed_upload_id_as_no_such_upload() {
+        let malformed = multipart_upload_api_error(StorageError::MalformedUploadID("bucket/object-not-an-id".to_string()));
+        assert_eq!(malformed.code(), &S3ErrorCode::NoSuchUpload);
+
+        let unknown = multipart_upload_api_error(StorageError::InvalidUploadID(
+            "bucket".to_string(),
+            "object".to_string(),
+            "dXBsb2FkLWlk".to_string(),
+        ));
+        assert_eq!(unknown.code(), &S3ErrorCode::NoSuchUpload);
+
+        let other = multipart_upload_api_error(StorageError::ObjectNotFound("bucket".to_string(), "object".to_string()));
+        assert_eq!(other.code(), &S3ErrorCode::NoSuchKey);
     }
 
     #[tokio::test]
@@ -4364,5 +4386,167 @@ mod tests {
         assert_eq!(format_copy_source_version_id(None, true, false), Some("null".to_string()));
         assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, true), Some("null".to_string()));
         assert_eq!(format_copy_source_version_id(Some(valid), true, false), Some(valid.to_string()));
+    }
+
+    // Lives in the app layer: the handlers under test are app use cases; the SSE
+    // helpers it borrows are infra test support (allowed downward dependency).
+    #[test]
+    #[serial_test::serial]
+    fn multipart_handlers_reject_another_callers_denied_kms_upload() {
+        crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
+            use crate::app::storage_api::test::ReqInfo;
+            use crate::app::storage_api::test::sse::{
+                RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+            };
+            use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
+            use rustfs_policy::policy::action::KmsAction;
+            use s3s::S3ErrorCode;
+            use s3s::dto::{
+                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
+                UploadPartCopyInput, UploadPartInput,
+            };
+            use std::sync::Arc;
+            let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("mpu-kms-current-caller", 16_384).await;
+            let usecase = DefaultMultipartUsecase::from_global();
+            let key = "kms-owned-upload";
+            let metadata = sse_kms_object_metadata();
+            let upload = store
+                .new_multipart_upload(
+                    &bucket,
+                    key,
+                    &crate::storage::ObjectOptions {
+                        user_defined: metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed authorized upload envelope");
+            let authorizer = RecordingKmsKeyAuthorizer::new(false);
+            fn denied_request<T>(input: T, authorizer: Arc<RecordingKmsKeyAuthorizer>) -> s3s::S3Request<T> {
+                let mut req = s3s::S3Request {
+                    input,
+                    method: http::Method::PUT,
+                    uri: http::Uri::from_static("/"),
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                req.extensions.insert(ReqInfo {
+                    cred: Some(rustfs_credentials::Credentials {
+                        access_key: "denied-writer".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                req.extensions.insert(TestAuthorizationHooks {
+                    enforced: true,
+                    authorizer,
+                });
+                req
+            }
+            let mut part = UploadPartInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .part_number(1)
+                .build()
+                .expect("part");
+            part.body = Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc")));
+            part.content_length = Some(3);
+            // Keep typed request construction separate: each real handler must
+            // consult the destination envelope before encryption or commit.
+            let error = usecase
+                .execute_upload_part(denied_request(part, authorizer.clone()))
+                .await
+                .expect_err("denied part");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let copy = UploadPartCopyInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .part_number(1)
+                .copy_source(CopySource::Bucket {
+                    bucket: bucket.clone().into(),
+                    key: "source".into(),
+                    version_id: None,
+                })
+                .build()
+                .expect("copy");
+            let copy_req = denied_request(copy, authorizer.clone());
+            let error = usecase
+                .execute_upload_part_copy(copy_req)
+                .await
+                .expect_err("denied destination copy");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(s3s::dto::ETag::Strong("etag".to_string())),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("complete");
+            let complete_req = denied_request(complete, authorizer.clone());
+            let error = usecase
+                .execute_complete_multipart_upload(complete_req)
+                .await
+                .expect_err("denied completion");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string()); 3]);
+            assert!(
+                store
+                    .get_multipart_info(&bucket, key, &upload.upload_id, &crate::storage::ObjectOptions::default())
+                    .await
+                    .is_ok(),
+                "denials must retain the original upload"
+            );
+            let mut reader = crate::storage::PutObjReader::from_vec(b"abc".to_vec());
+            let uploaded_part = store
+                .put_object_part(&bucket, key, &upload.upload_id, 1, &mut reader, &crate::storage::ObjectOptions::default())
+                .await
+                .expect("trusted owner stages part");
+            store
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    key,
+                    &upload.upload_id,
+                    vec![crate::storage::storage_api::contract::multipart::CompletePart {
+                        part_num: 1,
+                        etag: uploaded_part.etag,
+                        ..Default::default()
+                    }],
+                    &crate::storage::ObjectOptions::default(),
+                )
+                .await
+                .expect("trusted owner completes upload");
+            let replay = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id)
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(s3s::dto::ETag::Strong("guessed-etag".to_string())),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("replay");
+            let error = usecase
+                .execute_complete_multipart_upload(denied_request(replay, authorizer.clone()))
+                .await
+                .expect_err("replay must authorize before comparing guessed part metadata");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(authorizer.calls().len(), 4);
+        });
     }
 }

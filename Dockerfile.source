@@ -28,17 +28,19 @@ ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
 ARG RUSTFS_BUILD_FEATURES=""
+ARG RC_RELEASE=latest
 
 # -----------------------------
 # Build stage
 # -----------------------------
-FROM rust:1.97.1-trixie AS builder
+FROM rust:1.99.1-trixie AS builder
 
 # Re-declare args after FROM
 ARG TARGETPLATFORM
 ARG BUILDPLATFORM
 ARG TARGETARCH
 ARG RUSTFS_BUILD_FEATURES
+ARG RC_RELEASE
 
 # Debug: print platforms
 RUN echo "Build info -> BUILDPLATFORM=${BUILDPLATFORM}, TARGETPLATFORM=${TARGETPLATFORM}"
@@ -52,6 +54,7 @@ RUN set -eux; \
     build-essential \
     ca-certificates \
     curl \
+    jq \
     git \
     pkg-config \
     libssl-dev \
@@ -166,6 +169,8 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
     ;; \
     esac
 
+RUN sh /usr/src/rustfs/scripts/download_rc.sh "$TARGETARCH" musl "$RC_RELEASE" /usr/local/bin/rc
+
 # -----------------------------
 # Development stage (keeps toolchain)
 # -----------------------------
@@ -199,10 +204,13 @@ ENV RUSTFS_VOLUMES="/data" \
 # We rely on cargo run to build and run
 EXPOSE 9000 9001
 
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /entrypoint.sh
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+RUN install -m 0755 /usr/local/bin/rc /usr/bin/rc && \
+    chmod +x /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 CMD ["cargo", "run", "--bin", "rustfs", "--"]
 
 # -----------------------------
@@ -227,6 +235,7 @@ RUN set -eux; \
     apt-get install -y --no-install-recommends \
     ca-certificates \
     curl \
+    jq \
     tzdata \
     coreutils; \
     rm -rf /var/lib/apt/lists/*
@@ -248,8 +257,11 @@ RUN set -eux; \
 
 # Copy the freshly built binary and the entrypoint
 COPY --from=builder /usr/local/bin/rustfs /usr/bin/rustfs
-COPY entrypoint.sh /entrypoint.sh
-RUN chmod +x /usr/bin/rustfs /entrypoint.sh
+COPY --from=builder /usr/local/bin/rc /usr/bin/rc
+COPY entrypoint.sh /etc/rustfs/entrypoint.sh
+COPY bootstrap/ /etc/rustfs/bootstrap/
+RUN chmod +x /usr/bin/rustfs /usr/bin/rc /etc/rustfs/entrypoint.sh && \
+    ln -s /etc/rustfs/entrypoint.sh /entrypoint.sh
 
 # Default environment (override in docker run/compose as needed)
 ENV RUSTFS_VOLUMES="/data" \
@@ -263,5 +275,5 @@ EXPOSE 9000
 VOLUME ["/data"]
 
 # Keep root here; entrypoint will drop privileges using chroot --userspec
-ENTRYPOINT ["/entrypoint.sh"]
+ENTRYPOINT ["/etc/rustfs/entrypoint.sh"]
 CMD ["/usr/bin/rustfs"]

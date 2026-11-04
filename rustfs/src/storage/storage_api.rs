@@ -432,6 +432,10 @@ pub(crate) mod tonic_service_consumer {
 
 #[cfg(test)]
 pub(crate) mod test_consumer {
+    pub(crate) mod sse {
+        pub(crate) use super::super::super::sse::TestAuthorizationHooks;
+        pub(crate) use super::super::super::sse::tests::{RecordingKmsKeyAuthorizer, sse_kms_object_metadata};
+    }
     pub(crate) use super::super::{
         apply_cors_headers, apply_default_lock_retention_metadata, check_preconditions, decode_tags_to_map,
         get_adaptive_buffer_size_with_profile, get_buffer_size_opt_in, matches_origin_pattern, parse_etag,

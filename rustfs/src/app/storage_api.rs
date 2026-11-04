@@ -1403,6 +1403,11 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    pub(crate) mod sse {
+        pub(crate) use crate::storage::storage_api::test_consumer::sse::{
+            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+        };
+    }
     pub(crate) use super::{bucket, ecfs, object_utils, runtime};
     pub(crate) mod data_usage {
         pub(crate) use super::super::data_usage::*;

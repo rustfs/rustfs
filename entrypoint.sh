@@ -322,4 +322,207 @@ else
   echo "Starting: $*"
 fi
 
+BOOTSTRAP_DIR="${RUSTFS_BOOTSTRAP_DIR:-/etc/rustfs/bootstrap}"
+BUCKETS_FILE="$BOOTSTRAP_DIR/buckets.json"
+
+bootstrap_credential() {
+  SOURCE="$1"
+  LABEL="$2"
+  case "$SOURCE" in
+    value:*) printf '%s' "${SOURCE#value:}" ;;
+    file:*)
+      FILE="${SOURCE#file:}"
+      IFS= read -r VALUE < "$FILE" || :
+      trim_credential "$VALUE"
+      ;;
+    *)
+      echo "ERROR: Bootstrap requires an explicit $LABEL or its _FILE variant." >&2
+      return 1
+      ;;
+  esac
+}
+
+bootstrap_bucket_config() {
+  BUCKET="$1"
+  CONFIG_DIR="$2"
+  CONFIG_FILE="$CONFIG_DIR/$BUCKET.json"
+  [ -f "$CONFIG_FILE" ] || return 0
+  if ! jq -e --arg bucket "$BUCKET" 'type == "array" and index($bucket) != null' "$BUCKETS_FILE" >/dev/null; then
+    echo "ERROR: Bootstrap configuration '$CONFIG_FILE' refers to a bucket absent from buckets.json." >&2
+    return 1
+  fi
+  return 0
+}
+
+cleanup_bootstrap() {
+  if [ -n "${RUSTFS_PID:-}" ]; then
+    kill "$RUSTFS_PID" 2>/dev/null || true
+    wait "$RUSTFS_PID" 2>/dev/null || true
+  fi
+  if [ -n "${RC_CONFIG_DIR:-}" ]; then
+    rm -rf "$RC_CONFIG_DIR" 2>/dev/null || true
+  fi
+}
+
+apply_bucket_bootstrap() {
+  BOOTSTRAP_ENDPOINT="${RUSTFS_BOOTSTRAP_ENDPOINT:-}"
+  case "$BOOTSTRAP_ENDPOINT" in
+    http://*|https://*) ;;
+    *) echo "ERROR: RUSTFS_BOOTSTRAP_ENDPOINT must be an http(s) S3 endpoint when buckets are configured." >&2; return 1 ;;
+  esac
+
+  BOOTSTRAP_ACCESS_KEY=$(bootstrap_credential "$ACCESS_SOURCE" RUSTFS_ACCESS_KEY) || return 1
+  BOOTSTRAP_SECRET_KEY=$(bootstrap_credential "$SECRET_SOURCE" RUSTFS_SECRET_KEY) || return 1
+  ENCODED_ACCESS_KEY=$(jq -rn --arg value "$BOOTSTRAP_ACCESS_KEY" '$value | @uri') || return 1
+  ENCODED_SECRET_KEY=$(jq -rn --arg value "$BOOTSTRAP_SECRET_KEY" '$value | @uri') || return 1
+  ENDPOINT_AUTHORITY="${BOOTSTRAP_ENDPOINT#*://}"
+  case "$ENDPOINT_AUTHORITY" in
+    */*) ENDPOINT_AUTHORITY="${ENDPOINT_AUTHORITY%%/*}" ;;
+  esac
+  case "$BOOTSTRAP_ENDPOINT" in
+    https://*) RC_HOST_bootstrap="https://${ENCODED_ACCESS_KEY}:${ENCODED_SECRET_KEY}@${ENDPOINT_AUTHORITY}" ;;
+    http://*) RC_HOST_bootstrap="http://${ENCODED_ACCESS_KEY}:${ENCODED_SECRET_KEY}@${ENDPOINT_AUTHORITY}" ;;
+  esac
+  export RC_HOST_bootstrap
+
+  RC_CONFIG_DIR=$(mktemp -d "${TMPDIR:-/tmp}/rustfs-bootstrap.XXXXXX") || return 1
+  export RC_CONFIG_DIR
+
+  BUCKETS=$(jq -r '.[]' "$BUCKETS_FILE")
+  for bucket in $BUCKETS; do
+    echo "Ensuring bootstrap bucket: $bucket"
+    /usr/bin/rc bucket create "bootstrap/$bucket" --ignore-existing || return 1
+    /usr/bin/rc bucket public-access-block set "bootstrap/$bucket" "$BOOTSTRAP_DIR/public-access-block.json" || return 1
+  done
+
+  for bucket in $BUCKETS; do
+    for config_kind in policies versioning lifecycle cors notifications; do
+      CONFIG_FILE="$BOOTSTRAP_DIR/$config_kind/$bucket.json"
+      [ -f "$CONFIG_FILE" ] || continue
+      bootstrap_bucket_config "$bucket" "$BOOTSTRAP_DIR/$config_kind" || return 1
+      case "$config_kind" in
+        policies)
+          /usr/bin/rc bucket anonymous set-json "$CONFIG_FILE" "bootstrap/$bucket" || return 1
+          ;;
+        versioning)
+          VERSIONING=$(jq -r 'if type == "boolean" then . else error("expected a JSON boolean") end' "$CONFIG_FILE") || return 1
+          if [ "$VERSIONING" = "true" ]; then
+            /usr/bin/rc bucket version enable "bootstrap/$bucket" || return 1
+          else
+            /usr/bin/rc bucket version suspend "bootstrap/$bucket" || return 1
+          fi
+          ;;
+        lifecycle)
+          /usr/bin/rc bucket lifecycle rule import "bootstrap/$bucket" "$CONFIG_FILE" || return 1
+          ;;
+        cors)
+          /usr/bin/rc bucket cors set "bootstrap/$bucket" "$CONFIG_FILE" || return 1
+          ;;
+        notifications)
+          while IFS="$(printf '\t')" read -r arn events; do
+            /usr/bin/rc bucket event add "bootstrap/$bucket" "$arn" --event "$events" || return 1
+          done <<EOF
+$(jq -r '.[] | [.arn, (.events | join(","))] | @tsv' "$CONFIG_FILE")
+EOF
+          ;;
+      esac
+    done
+  done
+  return 0
+}
+
+validate_bootstrap_assets() {
+  for config_kind in policies versioning lifecycle cors notifications; do
+    CONFIG_DIR="$BOOTSTRAP_DIR/$config_kind"
+    for CONFIG_FILE in "$CONFIG_DIR"/*.json; do
+      [ -f "$CONFIG_FILE" ] || continue
+      CONFIG_BUCKET=${CONFIG_FILE##*/}
+      CONFIG_BUCKET=${CONFIG_BUCKET%.json}
+      bootstrap_bucket_config "$CONFIG_BUCKET" "$CONFIG_DIR" || return 1
+      case "$config_kind" in
+        versioning)
+          jq -e 'type == "boolean"' "$CONFIG_FILE" >/dev/null || {
+            echo "ERROR: Versioning configuration '$CONFIG_FILE' must contain a JSON boolean." >&2
+            return 1
+          }
+          ;;
+        notifications)
+          jq -e 'type == "array" and all(.[]; keys == ["arn", "events"] and (.arn | type == "string" and length > 0) and (.events | type == "array" and length > 0 and all(.[]; type == "string" and length > 0))) and ((map(.arn) | unique | length) == length)' "$CONFIG_FILE" >/dev/null || {
+            echo "ERROR: Notification configuration '$CONFIG_FILE' must be an array of unique arn/events objects." >&2
+            return 1
+          }
+          ;;
+      esac
+    done
+  done
+}
+
+if [ "$1" = "/usr/bin/rustfs" ]; then
+  if [ ! -r "$BUCKETS_FILE" ] || ! jq -e '. as $buckets | (type == "array" and all(.[]; type == "string" and test("^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$") and (contains("..") | not))) and ((unique | length) == ($buckets | length))' "$BUCKETS_FILE" >/dev/null; then
+    echo "ERROR: $BUCKETS_FILE must be a JSON array of unique, valid S3 bucket names." >&2
+    exit 1
+  fi
+
+  validate_bootstrap_assets || exit 1
+  BOOTSTRAP_BUCKET_COUNT=$(jq 'length' "$BUCKETS_FILE")
+  if [ "$BOOTSTRAP_BUCKET_COUNT" -gt 0 ]; then
+    [ -r "$BOOTSTRAP_DIR/public-access-block.json" ] || {
+      echo "ERROR: Missing $BOOTSTRAP_DIR/public-access-block.json." >&2
+      exit 1
+    }
+    if ! jq -e 'type == "object" and keys == ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"] and all(.[]; type == "boolean")' "$BOOTSTRAP_DIR/public-access-block.json" >/dev/null; then
+      echo "ERROR: Public Access Block configuration must define all four boolean flags and no other fields." >&2
+      exit 1
+    fi
+    BOOTSTRAP_ENDPOINT="${RUSTFS_BOOTSTRAP_ENDPOINT:-}"
+    case "$BOOTSTRAP_ENDPOINT" in
+      http://*|https://*) ;;
+      *) echo "ERROR: RUSTFS_BOOTSTRAP_ENDPOINT is required when buckets are configured." >&2; exit 1 ;;
+    esac
+    ENDPOINT_AUTHORITY="${BOOTSTRAP_ENDPOINT#*://}"
+    case "$ENDPOINT_AUTHORITY" in
+      */*|*\?*|*\#*|*@*) echo "ERROR: RUSTFS_BOOTSTRAP_ENDPOINT must contain only the scheme, host, and optional port." >&2; exit 1 ;;
+    esac
+    bootstrap_credential "$ACCESS_SOURCE" RUSTFS_ACCESS_KEY >/dev/null || exit 1
+    bootstrap_credential "$SECRET_SOURCE" RUSTFS_SECRET_KEY >/dev/null || exit 1
+    /usr/bin/rc bucket public-access-block --help >/dev/null 2>&1 || {
+      echo "ERROR: The bundled RustFS CLI does not support bucket Public Access Block; rebuild with an rc release that includes bootstrap support." >&2
+      exit 1
+    }
+    BOOTSTRAP_TIMEOUT="${RUSTFS_BOOTSTRAP_TIMEOUT:-120}"
+    case "$BOOTSTRAP_TIMEOUT" in
+      ''|*[!0-9]*|0) echo "ERROR: RUSTFS_BOOTSTRAP_TIMEOUT must be a positive integer number of seconds." >&2; exit 1 ;;
+    esac
+    [ "$BOOTSTRAP_TIMEOUT" -le 3600 ] || { echo "ERROR: RUSTFS_BOOTSTRAP_TIMEOUT must not exceed 3600 seconds." >&2; exit 1; }
+    MAX_BOOTSTRAP_ATTEMPTS=$(((BOOTSTRAP_TIMEOUT + 1) / 2))
+
+    "$@" &
+    RUSTFS_PID=$!
+    trap cleanup_bootstrap EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    BOOTSTRAP_HEALTH_URL="${BOOTSTRAP_ENDPOINT%/}/health/ready"
+    attempt=0
+    while ! curl -fsS "$BOOTSTRAP_HEALTH_URL" >/dev/null 2>&1; do
+      kill -0 "$RUSTFS_PID" 2>/dev/null || { echo "ERROR: RustFS exited before becoming ready for bootstrap." >&2; exit 1; }
+      attempt=$((attempt + 1))
+      [ "$attempt" -lt "$MAX_BOOTSTRAP_ATTEMPTS" ] || { echo "ERROR: RustFS did not become ready for bootstrap at RUSTFS_BOOTSTRAP_ENDPOINT within RUSTFS_BOOTSTRAP_TIMEOUT." >&2; exit 1; }
+      sleep 2
+    done
+
+    set +e
+    apply_bucket_bootstrap
+    BOOTSTRAP_STATUS=$?
+    set -e
+    if [ "$BOOTSTRAP_STATUS" -ne 0 ]; then
+      echo "ERROR: RustFS bootstrap failed." >&2
+      exit "$BOOTSTRAP_STATUS"
+    fi
+    wait "$RUSTFS_PID"
+    exit $?
+  fi
+fi
+
 exec "$@"
