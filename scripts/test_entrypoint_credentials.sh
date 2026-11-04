@@ -14,16 +14,6 @@ if [ -e /usr/bin/rustfs ]; then
   exit 1
 fi
 
-# Every image that ships the entrypoint must not bake root credentials into
-# its ENV — with hard-fail enforcement gone, this guard is the remaining
-# teeth of the "no built-in default credentials" policy.
-for dockerfile in Dockerfile Dockerfile.glibc Dockerfile.source Dockerfile.decommission-local; do
-  if grep -Eq 'RUSTFS_(ACCESS|SECRET)_KEY=' "$ROOT_DIR/$dockerfile"; then
-    echo "$dockerfile must not bake root credentials into image ENV" >&2
-    exit 1
-  fi
-done
-
 assert_contains() {
   if ! grep -q "$2" "$1"; then
     echo "Expected ${1##*/} to contain: $2" >&2
@@ -40,6 +30,26 @@ assert_lacks() {
   fi
 }
 
+# Every image that ships the entrypoint must not bake root credentials into
+# its ENV — with hard-fail enforcement gone, this guard is the remaining
+# teeth of the "no built-in default credentials" policy.
+for dockerfile in Dockerfile Dockerfile.glibc Dockerfile.source Dockerfile.decommission-local; do
+  if grep -Eq 'RUSTFS_(ACCESS|SECRET)_KEY=' "$ROOT_DIR/$dockerfile"; then
+    echo "$dockerfile must not bake root credentials into image ENV" >&2
+    exit 1
+  fi
+  assert_contains "$ROOT_DIR/$dockerfile" "bootstrap/"
+  assert_contains "$ROOT_DIR/$dockerfile" "/etc/rustfs/entrypoint.sh"
+  assert_contains "$ROOT_DIR/$dockerfile" "/usr/bin/rc"
+done
+
+if [ "$(jq -c . "$ROOT_DIR/bootstrap/buckets.json")" != "[]" ]; then
+  echo "The bundled default buckets.json must be an empty array" >&2
+  exit 1
+fi
+jq -e 'keys == ["block_public_acls", "block_public_policy", "ignore_public_acls", "restrict_public_buckets"] and all(.[]; . == true)' \
+  "$ROOT_DIR/bootstrap/public-access-block.json" >/dev/null
+
 # The test environment has no /usr/bin/rustfs, so a run that passes credential
 # validation still exits non-zero at exec time. "Starting: /usr/bin/rustfs" on
 # stdout is the proof that validation let startup proceed.
@@ -49,7 +59,7 @@ run_expect_start() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1 || true
+  env -i PATH="$PATH" RUSTFS_BOOTSTRAP_DIR="$ROOT_DIR/bootstrap" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1 || true
 
   assert_contains "$log_file" "$expected"
   assert_contains "$log_file" "Starting: /usr/bin/rustfs"
@@ -62,7 +72,7 @@ run_expect_failure() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1; then
+  if env -i PATH="$PATH" RUSTFS_BOOTSTRAP_DIR="$ROOT_DIR/bootstrap" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= "$@" sh "$ENTRYPOINT" rustfs >"$log_file" 2>&1; then
     echo "Expected $label to fail" >&2
     exit 1
   fi
@@ -79,7 +89,7 @@ run_cli_expect_start() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1 || true
+  env -i PATH="$PATH" RUSTFS_BOOTSTRAP_DIR="$ROOT_DIR/bootstrap" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1 || true
 
   assert_contains "$log_file" "$expected"
   assert_contains "$log_file" "Starting: /usr/bin/rustfs"
@@ -92,7 +102,7 @@ run_cli_expect_failure() {
   shift 2
 
   log_file="$TMP_DIR/$label.log"
-  if env -i PATH="$PATH" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1; then
+  if env -i PATH="$PATH" RUSTFS_BOOTSTRAP_DIR="$ROOT_DIR/bootstrap" RUSTFS_VOLUMES="$TMP_DIR/data" RUSTFS_OBS_LOG_DIRECTORY= RUSTFS_SECRET_KEY=custom-secret sh "$ENTRYPOINT" rustfs "$@" >"$log_file" 2>&1; then
     echo "Expected $label to fail" >&2
     exit 1
   fi
