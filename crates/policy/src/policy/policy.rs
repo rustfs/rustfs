@@ -3417,6 +3417,277 @@ mod test {
     }
 
     #[tokio::test]
+    async fn global_wildcard_deny_covers_all_families_without_broadening_allow() {
+        for action in [
+            "s3:GetObject",
+            "s3:ForceDeleteObject",
+            "admin:CreateUser",
+            "sts:AssumeRole",
+            "kms:Configure",
+            "kms:Decrypt",
+        ] {
+            let parsed_action = Action::try_from(action).expect("action parses");
+            let conditions = HashMap::new();
+            let claims = HashMap::new();
+            let args = Args {
+                account: "user",
+                groups: &None,
+                action: parsed_action,
+                bucket: if action.starts_with("s3:") { "bucket" } else { "" },
+                object: if action.starts_with("s3:") { "object" } else { "" },
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            for (effect, selector, wildcard, expected) in [
+                ("Deny", "Action", "*", false),
+                ("Deny", "Action", "s3:*", !action.starts_with("s3:")),
+                ("Deny", "NotAction", "*", true),
+            ] {
+                let document = serde_json::json!({
+                    "Version": "2012-10-17", "Statement": [
+                        {"Effect": "Allow", "Action": action, "Resource": "*"},
+                        {"Effect": effect, selector: wildcard, "Resource": "*"}
+                    ]
+                });
+                let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy"))
+                    .expect("parse wildcard policy");
+                assert_eq!(policy.is_allowed(&args).await, expected, "{effect} {selector} {wildcard} for {action}");
+                let serialized = serde_json::to_value(&policy).expect("serialize policy");
+                assert_eq!(serialized["Statement"][1][selector][0], wildcard);
+            }
+            for selector in ["Action", "NotAction"] {
+                let document = serde_json::json!({
+                    "Version": "2012-10-17", "Statement": [{"Effect": "Allow", selector: "*", "Resource": "*"}]
+                });
+                let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy"))
+                    .expect("parse wildcard Allow");
+                assert_eq!(policy.is_allowed(&args).await, selector == "Action" && action == "s3:GetObject");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn global_wildcard_deny_still_obeys_resource_and_condition_scope() {
+        let document = serde_json::json!({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "admin:CreateUser", "Resource": "*"},
+                {"Effect": "Deny", "Action": "*", "Resource": "arn:aws:s3:::bucket/*"}
+            ]
+        });
+        let policy = Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse scoped Deny");
+        let claims = HashMap::new();
+        let conditions = HashMap::new();
+        let mut args = Args {
+            account: "user",
+            groups: &None,
+            action: Action::try_from("admin:CreateUser").expect("admin action"),
+            bucket: "",
+            object: "",
+            conditions: &conditions,
+            claims: &claims,
+            is_owner: false,
+            deny_only: false,
+        };
+        assert!(policy.is_allowed(&args).await, "bucket-scoped Deny must not become a global admin Deny");
+        let mut document = document;
+        document["Statement"][1]["Resource"] = serde_json::json!("*");
+        document["Statement"][1]["Condition"] = serde_json::json!({"StringEquals": {"aws:username": "blocked"}});
+        let conditional =
+            Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse conditional Deny");
+        assert!(conditional.is_allowed(&args).await);
+        let conditions = HashMap::from([("username".to_string(), vec!["blocked".to_string()])]);
+        args.conditions = &conditions;
+        assert!(!conditional.is_allowed(&args).await);
+    }
+
+    #[tokio::test]
+    async fn security_conditions_enforce_identity_and_bucket_denies() {
+        for (operator, key, policy_value, request_value, denied) in [
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", None, true),
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", Some("30"), false),
+            ("NumericNotEquals", "s3:object-lock-remaining-retention-days", "30", Some("10"), true),
+            ("DateNotEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", None, true),
+            (
+                "DateNotEquals",
+                "s3:object-lock-retain-until-date",
+                "2030-01-01T00:00:00Z",
+                Some("2030-01-01T00:00:00Z"),
+                false,
+            ),
+            ("DateGreaterThan", "aws:EpochTime", "2020-01-01T00:00:00Z", Some("1577836801"), true),
+            ("DateGreaterThan", "aws:EpochTime", "2020-01-01T00:00:00Z", Some("1577836799"), false),
+            (
+                "NotIpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:ffff::1"),
+                true,
+            ),
+            (
+                "NotIpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:85a3::8a2e:370:7334"),
+                false,
+            ),
+            (
+                "IpAddress",
+                "aws:SourceIp",
+                "2001:db8:85a3::8a2e:370:7334",
+                Some("2001:db8:ffff::1"),
+                false,
+            ),
+            ("IpAddress", "aws:SourceIp", "2001:db8::/32", Some("2001:db8:ffff::1"), true),
+        ] {
+            let mut document = serde_json::json!({
+                "Version": "2012-10-17", "Statement": [
+                    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*"},
+                    {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::bucket/*",
+                     "Condition": {operator: {key: policy_value}}}
+                ]
+            });
+            let policy =
+                Policy::parse_config(&serde_json::to_vec(&document).expect("serialize policy")).expect("parse identity policy");
+            let conditions = request_value
+                .map(|value| {
+                    HashMap::from([(key.split_once(':').expect("condition prefix").1.to_string(), vec![value.to_string()])])
+                })
+                .unwrap_or_default();
+            let claims = HashMap::new();
+            let args = Args {
+                account: "user",
+                groups: &None,
+                action: Action::S3Action(S3Action::PutObjectAction),
+                bucket: "bucket",
+                object: "object",
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, !denied, "identity {operator} {key} {request_value:?}");
+            for statement in document["Statement"].as_array_mut().expect("statements array") {
+                statement["Principal"] = serde_json::json!("*");
+            }
+            let policy: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize bucket policy"))
+                .expect("parse bucket policy");
+            assert_eq!(
+                policy
+                    .is_allowed(&BucketPolicyArgs {
+                        account: "user",
+                        groups: &None,
+                        action: args.action,
+                        bucket: "bucket",
+                        object: "object",
+                        conditions: &conditions,
+                        is_owner: false,
+                    })
+                    .await,
+                !denied,
+                "bucket {operator} {key} {request_value:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn service_principal_never_grants_access_to_a_named_access_key() {
+        for principal in [
+            serde_json::json!({"Service": "logging.s3.amazonaws.com"}),
+            serde_json::json!({"Service": "*"}),
+            serde_json::json!({"Service": "logging.s3.amazonaws.com", "AWS": "authorized-user"}),
+        ] {
+            let document = serde_json::json!({
+                "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": principal,
+                "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::bucket/*"}]
+            });
+            let policy: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+            for action in [S3Action::GetObjectAction, S3Action::PutObjectAction] {
+                for account in ["logging.s3.amazonaws.com", "authorized-user"] {
+                    let allowed = policy
+                        .is_allowed(&BucketPolicyArgs {
+                            account,
+                            groups: &None,
+                            action: Action::S3Action(action),
+                            bucket: "bucket",
+                            object: "log",
+                            conditions: &HashMap::new(),
+                            is_owner: false,
+                        })
+                        .await;
+                    assert_eq!(allowed, account == "authorized-user" && principal.get("AWS").is_some());
+                }
+            }
+            assert_eq!(serde_json::to_value(&policy).unwrap()["Statement"][0]["Principal"], principal);
+        }
+    }
+
+    #[tokio::test]
+    async fn directory_objects_obey_prefix_denies_in_identity_and_bucket_policies() {
+        let mut document = serde_json::json!({
+            "Version": "2012-10-17", "Statement": [
+                {"Effect": "Allow", "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/*"},
+                {"Effect": "Deny", "Action": "s3:*", "Resource": "arn:aws:s3:::bucket/private/*"}
+            ]
+        });
+        let identity = Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap();
+        for statement in document["Statement"].as_array_mut().unwrap() {
+            statement["Principal"] = serde_json::json!("*");
+        }
+        let bucket: BucketPolicy = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+        for action in [
+            S3Action::GetObjectAction,
+            S3Action::PutObjectAction,
+            S3Action::DeleteObjectAction,
+            S3Action::DeleteObjectVersionAction,
+        ] {
+            for (object, allowed) in [
+                ("private/", false),
+                ("private/child", false),
+                ("public/", true),
+                ("private", true),
+            ] {
+                let conditions = HashMap::new();
+                assert_eq!(
+                    identity
+                        .is_allowed(&Args {
+                            account: "user",
+                            groups: &None,
+                            action: Action::S3Action(action),
+                            bucket: "bucket",
+                            object,
+                            conditions: &conditions,
+                            claims: &HashMap::new(),
+                            is_owner: false,
+                            deny_only: false,
+                        })
+                        .await,
+                    allowed,
+                    "identity {action:?} {object}"
+                );
+                for account in ["user", ""] {
+                    assert_eq!(
+                        bucket
+                            .is_allowed(&BucketPolicyArgs {
+                                account,
+                                groups: &None,
+                                action: Action::S3Action(action),
+                                bucket: "bucket",
+                                object,
+                                conditions: &conditions,
+                                is_owner: false,
+                            })
+                            .await,
+                        allowed,
+                        "bucket {account} {action:?} {object}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn force_delete_actions_require_an_explicit_grant() {
         let wildcard = Policy::parse_config(
             br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:*"],"Resource":["arn:aws:s3:::*"]}]}"#,

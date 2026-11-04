@@ -26,11 +26,12 @@ pub type NumberFunc = InnerFunc<NumberFuncValue>;
 pub struct NumberFuncValue(i64);
 
 impl NumberFunc {
-    pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, if_exists: bool, values: &HashMap<String, Vec<String>>) -> bool {
+    pub fn evaluate(&self, op: impl Fn(&i64, &i64) -> bool, absent: bool, values: &HashMap<String, Vec<String>>) -> bool {
         for inner in self.0.iter() {
             let v = match values.get(inner.key.name().as_str()).and_then(|x| x.first()) {
                 Some(x) => x,
-                None => return if_exists,
+                None if absent => continue,
+                None => return false,
             };
 
             let Ok(rv) = v.parse::<i64>() else {
@@ -144,6 +145,20 @@ mod tests {
         assert_eq!(limit.evaluate(i64::le, false, &values), less_than_equals);
         assert_eq!(limit.evaluate(i64::gt, false, &values), greater_than);
         assert_eq!(limit.evaluate(i64::eq, false, &values), equals);
+    }
+
+    #[test]
+    fn absent_numeric_key_does_not_skip_other_keys() {
+        let mut function = new_func(S3(S3MaxKeys), None, 30);
+        function
+            .0
+            .extend(new_func(S3(S3ObjectLockRemainingRetentionDays), None, 30).0);
+        let values = HashMap::from([("object-lock-remaining-retention-days".to_string(), vec!["30".to_string()])]);
+        assert!(!function.evaluate(i64::ne, true, &values));
+        assert!(!function.evaluate(i64::gt, true, &values));
+        assert!(function.evaluate(i64::eq, true, &values));
+        function.0.reverse();
+        assert!(!function.evaluate(i64::ne, true, &values));
     }
 
     #[test]

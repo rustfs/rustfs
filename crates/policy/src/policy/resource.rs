@@ -17,7 +17,11 @@ use serde::{
     Deserialize, Deserializer, Serialize,
     de::{self, Error as DeError, Visitor},
 };
-use std::{collections::HashMap, fmt, ops::Deref};
+use std::{
+    collections::{HashMap, HashSet},
+    fmt,
+    ops::Deref,
+};
 
 use super::{
     Error as IamError, Validator,
@@ -48,12 +52,6 @@ impl ResourceSet {
     /// Returns true if the resource set is empty.
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
-    }
-
-    fn push_unique(&mut self, resource: Resource) {
-        if !self.0.contains(&resource) {
-            self.0.push(resource);
-        }
     }
 
     pub async fn is_match(&self, resource: &str, conditions: &HashMap<String, Vec<String>>) -> bool {
@@ -130,9 +128,7 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 E: de::Error,
             {
                 let resource = Resource::try_from(value).map_err(|e| E::custom(format!("invalid resource: {}", e)))?;
-                let mut resources = ResourceSet::default();
-                resources.push_unique(resource);
-                Ok(resources)
+                Ok(ResourceSet(vec![resource]))
             }
 
             fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
@@ -140,11 +136,14 @@ impl<'de> Deserialize<'de> for ResourceSet {
                 A: de::SeqAccess<'de>,
                 A::Error: DeError,
             {
-                let mut resources = ResourceSet(Vec::with_capacity(seq.size_hint().unwrap_or(0)));
+                let mut resources = ResourceSet::default();
+                let mut seen = HashSet::new();
                 while let Some(value) = seq.next_element::<String>()? {
                     match Resource::try_from(value.as_str()) {
                         Ok(resource) => {
-                            resources.push_unique(resource);
+                            if seen.insert(resource.clone()) {
+                                resources.0.push(resource);
+                            }
                         }
                         Err(e) => {
                             return Err(A::Error::custom(format!("invalid resource: {}", e)));
@@ -224,7 +223,14 @@ impl Resource {
                 return true;
             }
 
-            if cp != "." && wildcard::is_match(resolved_pattern, &cp) {
+            // Keep directory objects distinct from their bare key for prefix
+            // matching, while retaining path cleaning and exact-match compatibility.
+            let wildcard_resource = if matches!(self, Resource::S3(_)) && resource.ends_with('/') && cp.contains('/') {
+                format!("{cp}/")
+            } else {
+                cp.clone()
+            };
+            if cp != "." && wildcard::is_match(resolved_pattern, &wildcard_resource) {
                 return true;
             }
         }
@@ -314,6 +320,20 @@ mod tests {
     use std::collections::HashMap;
     use test_case::test_case;
 
+    #[test]
+    fn large_resource_sets_deduplicate_without_changing_first_seen_order() {
+        let unique = (0..40_000)
+            .map(|index| format!("arn:aws:s3:::bucket/key-{index}"))
+            .collect::<Vec<_>>();
+        let mut repeated = unique.clone();
+        repeated.extend(unique.iter().rev().cloned());
+        let resources: super::ResourceSet = serde_json::from_slice(&serde_json::to_vec(&repeated).expect("encode resources"))
+            .expect("large valid resource list parses");
+        assert_eq!(resources.len(), unique.len());
+        assert_eq!(serde_json::to_value(resources).expect("serialize resources"), serde_json::json!(unique));
+        assert!(serde_json::from_str::<super::ResourceSet>(r#"["arn:aws:s3:::bucket/key","invalid"]"#).is_err());
+    }
+
     #[test_case("*", "mybucket" => true; "all buckets")]
     #[test_case("*", "mybucket/myobject" => true; "all objects")]
     #[test_case("*", "key/mykey" => true; "all keys")]
@@ -335,6 +355,10 @@ mod tests {
     #[test_case("arn:aws:s3:::mybucket","mybucket/myobject" => false; "15")]
     #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/../victim-bucket/evil.txt" => false; "16")]
     #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/safe/../../victim-bucket/evil.txt" => false; "17")]
+    #[test_case("arn:aws:s3:::bucket/secret/*","bucket/secret/" => true; "directory prefix")]
+    #[test_case("arn:aws:s3:::bucket/secret","bucket/secret/" => true; "directory exact compatibility")]
+    #[test_case("arn:aws:s3:::bucket/*","bucket/" => false; "bucket is not a directory object")]
+    #[test_case("arn:aws:s3:::attacker-bucket/*","attacker-bucket/../victim-bucket/" => false; "directory traversal")]
     #[test_case("arn:aws:kms:::key/mykey","key/mykey" => true; "kms exact key")]
     #[test_case("arn:aws:kms:::key/mykey","key/otherkey" => false; "kms wrong key")]
     #[test_case("arn:aws:kms:::key/*","key/mykey" => true; "kms key wildcard")]
