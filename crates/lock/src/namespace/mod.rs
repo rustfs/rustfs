@@ -118,6 +118,18 @@ impl NamespaceLockGuard {
         }
     }
 
+    /// Release the lock and await the unlock RPCs.
+    ///
+    /// The [`Drop`]/[`Self::release`] path is fire-and-forget for distributed
+    /// guards; callers that immediately re-acquire the same resource must
+    /// await the release instead of racing in-flight unlocks.
+    pub async fn release_and_wait(&mut self) -> bool {
+        match self {
+            Self::Standard(guard) => guard.release_and_wait().await,
+            Self::Fast(guard) => guard.release(),
+        }
+    }
+
     /// Check if the lock has been released
     pub fn is_released(&self) -> bool {
         match self {

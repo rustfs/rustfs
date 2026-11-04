@@ -9866,38 +9866,33 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
             // Bulk delete is the only multi-key transaction-lock holder, so an
-            // optimistic all-or-nothing wave is safe: any probe failure drops
-            // the wave and the canonical serial order below resolves overlap
-            // with a concurrent batch exactly as before. Bounded parallelism
-            // keeps a 1000-key batch from paying one quorum round-trip per key.
-            // Every probe is consumed before the fallback runs, so a losing
-            // wave releases each probed lock explicitly instead of relying on
-            // in-flight cancellation.
+            // optimistic all-or-nothing wave is safe: any probe failure releases
+            // the whole wave (awaiting the unlock RPCs) and the canonical serial
+            // order below resolves overlap with a concurrent batch exactly as
+            // before. See `rustfs_lock::wave::probe_lock_wave`.
             const DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY: usize = 32;
             const DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
             let probe = if keys.len() > 1 {
-                let mut pending = Vec::with_capacity(keys.len());
-                for key in &keys {
-                    let key = key.clone();
-                    pending.push(async move {
-                        let result = self
+                rustfs_lock::wave::probe_lock_wave(
+                    keys.iter().cloned().collect::<Vec<_>>(),
+                    DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY,
+                    |key| async move {
+                        let guard = self
                             .acquire_delete_transaction_lock_with_timeout(bucket, &key, DELETE_TRANSACTION_LOCK_PROBE_TIMEOUT)
-                            .await;
-                        (key, result)
-                    });
-                }
-                let results: Vec<_> = futures::stream::iter(pending)
-                    .buffered(DELETE_TRANSACTION_LOCK_PROBE_CONCURRENCY)
-                    .collect()
-                    .await;
-                let wave: Option<std::collections::BTreeMap<String, Arc<rustfs_lock::NamespaceLockGuard>>> = results
-                    .into_iter()
-                    .map(|(key, result)| result.map(|guard| (key, guard)))
-                    .collect::<std::result::Result<std::collections::BTreeMap<_, _>, _>>()
-                    .ok();
-                // On failure the collected guards drop here, releasing the
-                // whole wave before the serial fallback acquires anything.
-                wave
+                            .await
+                            .ok()?;
+                        Some((key, guard))
+                    },
+                    |pairs| async move {
+                        for (_, mut guard) in pairs {
+                            if let Some(guard) = Arc::get_mut(&mut guard) {
+                                guard.release_and_wait().await;
+                            }
+                        }
+                    },
+                )
+                .await
+                .map(|pairs| pairs.into_iter().collect::<std::collections::BTreeMap<_, _>>())
             } else {
                 None
             };
@@ -9948,6 +9943,21 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 },
             }
         };
+        // Per-key read inputs are resolved exactly once; the pre-fetch and the
+        // admission loop below consume this table so the two cannot disagree
+        // on eligibility or read options.
+        let mut source_inputs: Vec<Option<BatchDeleteSourceInputs>> = Vec::with_capacity(objects.len());
+        for dobj in &objects {
+            let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
+            source_inputs.push(Some(batch_delete_source_inputs(
+                bucket,
+                dobj,
+                &opts,
+                &delete_config_snapshot,
+                &object_lock_config,
+                guarded,
+            )));
+        }
         // Bounded-parallel pre-fetch of the source metadata each admitted key
         // needs below. These reads are pure quorum lookups under the locks
         // already held; sequencing one metadata fan-out per key made a
@@ -9956,23 +9966,24 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> = HashMap::with_capacity(objects.len());
         {
             let mut pending = Vec::new();
-            for (i, dobj) in objects.iter().enumerate() {
+            for (i, source) in source_inputs.iter().enumerate() {
                 if del_errs[i].is_some() {
                     continue;
                 }
-                let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
-                let source =
-                    batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
-                if source.needs_source_read {
-                    let object_name = dobj.object_name.clone();
-                    let check_opts = source.check_opts;
-                    pending.push(async move {
-                        let (goi, file_info, _write_quorum, gerr) = self
-                            .get_object_info_fileinfo_and_quorum(bucket, &object_name, &check_opts)
-                            .await;
-                        (i, (goi, file_info, gerr))
-                    });
+                let Some(source) = source else {
+                    continue;
+                };
+                if !source.needs_source_read {
+                    continue;
                 }
+                let object_name = objects[i].object_name.clone();
+                let check_opts = &source.check_opts;
+                pending.push(async move {
+                    let (goi, file_info, _write_quorum, gerr) = self
+                        .get_object_info_fileinfo_and_quorum(bucket, &object_name, check_opts)
+                        .await;
+                    (i, (goi, file_info, gerr))
+                });
             }
             let reads = futures::stream::iter(pending)
                 .buffer_unordered(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
@@ -10001,7 +10012,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ));
                 continue;
             }
-            let source = batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
+            let Some(source) = source_inputs[i].take() else {
+                continue;
+            };
             let BatchDeleteSourceInputs {
                 replication_object_name,
                 explicit_null_version,

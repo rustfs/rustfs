@@ -31,6 +31,9 @@ pub mod fast_lock;
 pub mod error;
 pub mod types;
 
+// Optimistic multi-key lock-probe waves (bulk delete and friends)
+pub mod wave;
+
 // ============================================================================
 // Public API Exports
 // ============================================================================

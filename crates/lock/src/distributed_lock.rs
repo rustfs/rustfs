@@ -476,6 +476,27 @@ impl DistributedLockGuard {
         record_lock_held_release(self.lock_type);
         true
     }
+
+    /// Release the lock and await the unlock RPCs.
+    ///
+    /// [`Drop`] and [`Self::release`] are fire-and-forget on distributed
+    /// locks, so a caller that immediately re-acquires the same resources
+    /// (an optimistic lock-wave fallback) would race still-in-flight unlocks
+    /// and can block on locks it already owns. Those callers must await the
+    /// release instead of relying on drop.
+    pub async fn release_and_wait(&mut self) -> bool {
+        self.stop_heartbeat();
+
+        if self.disarmed {
+            return true;
+        }
+
+        let entries = self.entries.iter().map(HeldLockEntry::release_entry).collect();
+        self.disarmed = true;
+        record_lock_held_release(self.lock_type);
+        DistributedLock::release_entries(entries, "distributed_lock_guard_release_awaited").await;
+        true
+    }
 }
 
 impl Drop for DistributedLockGuard {
