@@ -10091,6 +10091,7 @@ version = "1.0.2"
 dependencies = [
  "bytes",
  "hotpath",
+ "metrics",
  "rustfs-io-metrics",
  "thiserror 2.0.21",
  "tokio",
