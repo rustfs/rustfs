@@ -31,7 +31,7 @@ use std::time::Duration;
 #[serde(rename_all = "snake_case")]
 #[derive(Default)]
 pub enum ValidationMode {
-    /// Lenient mode: Accepts the entire chain as long as the last proxy is trusted.
+    /// Lenient mode: Identifies the client immediately before the trusted suffix.
     Lenient,
     /// Strict mode: Requires all proxies in the chain to be trusted.
     Strict,
@@ -90,8 +90,8 @@ impl TrustedProxy {
     /// Checks if the given IP address matches this proxy configuration.
     pub fn contains(&self, ip: &IpAddr) -> bool {
         match self {
-            Self::Single(proxy_ip) => ip == proxy_ip,
-            Self::Cidr(network) => network.contains(*ip),
+            Self::Single(proxy_ip) => ip.to_canonical() == proxy_ip.to_canonical(),
+            Self::Cidr(network) => network.contains(*ip) || network.contains(ip.to_canonical()),
         }
     }
 }
@@ -103,7 +103,7 @@ pub struct TrustedProxyConfig {
     pub proxies: Vec<TrustedProxy>,
     /// The validation mode to use for verifying proxy chains.
     pub validation_mode: ValidationMode,
-    /// Whether to enable RFC 7239 "Forwarded" header support.
+    /// Select RFC 7239 `Forwarded` exclusively; false selects `X-Forwarded-For`.
     pub enable_rfc7239: bool,
     /// Maximum allowed proxy hops in the chain.
     pub max_hops: usize,
