@@ -9806,7 +9806,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         let unique_lock_count = batch.requests.len();
 
         let mut failed_map = HashMap::new();
-        let mut _local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
+        let mut local_batch_guards: Vec<FastLockGuard> = Vec::with_capacity(batch.requests.len());
         let mut locked_objects = HashSet::new();
 
         // Instance-scoped, not the ambient facade (backlog#1052) — see
@@ -9823,7 +9823,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             (failed_map, locked_objects, dist_batch_lock_ids) = self.acquire_dist_delete_object_locks_batch(&batch).await;
         } else {
             let batch_result = self.local_lock_manager.acquire_locks_batch(batch).await;
-            _local_batch_guards = batch_result.guards;
+            local_batch_guards = batch_result.guards;
 
             for key in batch_result.successful_locks {
                 locked_objects.insert(key.object.as_ref().to_string());
@@ -10783,9 +10783,14 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // Deferred recovery takes fresh raw and transaction locks. Discard the
         // completed leases' deadlines while retaining every caller-owned fence.
         opts.namespace_lock_fence = outer_namespace_lock_fence;
-        // Release inner owners before reacquiring any raw key lock.
+        // Release inner owners before reacquiring any raw key lock. The raw
+        // batch guards must go too: deferred recovery takes a fresh write lock
+        // on the same keys below, and a still-held local batch guard would
+        // deadlock it against itself (the distributed path releases its batch
+        // ids in the same region).
         drop(namespace_owner);
         drop(transaction_guards);
+        drop(local_batch_guards);
 
         // TODO(backlog): support partial object deletion for multi-part objects
 
@@ -25121,6 +25126,131 @@ mod delete_objects_lock_gating_tests {
             .put_object(bucket, object, &mut reader, &ObjectOptions::default())
             .await
             .expect("plain object should be written");
+    }
+
+    /// Regression for the PR9155 review finding: a pre-fetched source-missing
+    /// read of a later duplicate must not skip the object-lock check after an
+    /// earlier entry's recovery rolls back an interrupted prepared delete and
+    /// restores a GOVERNANCE-retained version. Without the eviction the later
+    /// duplicate deletes the restored version, bypassing retention.
+    #[tokio::test]
+    async fn duplicate_entries_recheck_object_lock_after_recovery_restores_retained_version() {
+        let (_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
+        let bucket = "recovery-retention-dup";
+        let object = "retained.bin";
+        for disk in &disk_stores {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+
+        // A versioned put, so the batch can address the version explicitly.
+        let mut reader = PutObjReader::from_vec(vec![7u8; 256]);
+        set_disks
+            .put_object(
+                bucket,
+                object,
+                &mut reader,
+                &ObjectOptions {
+                    versioned: true,
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("versioned object should be written");
+        let version = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read back the version identity")
+            .version_id
+            .expect("versioned put assigns a version id");
+
+        // GOVERNANCE retention on that version, persisted the way
+        // PutObjectRetention persists it.
+        let retain_until = OffsetDateTime::now_utc() + time::Duration::days(60);
+        set_disks
+            .put_object_metadata(
+                bucket,
+                object,
+                &ObjectOptions {
+                    no_lock: true,
+                    version_id: Some(version.to_string()),
+                    eval_metadata: Some(HashMap::from([
+                        (metadata_keys::OBJECT_LOCK_MODE.to_string(), "GOVERNANCE".to_string()),
+                        (
+                            metadata_keys::OBJECT_LOCK_RETAIN_UNTIL_DATE.to_string(),
+                            retain_until
+                                .format(&time::format_description::well_known::Rfc3339)
+                                .expect("retention date formats"),
+                        ),
+                    ])),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("governance retention should persist");
+
+        // Interrupted authorized delete: the recoverable per-disk delete
+        // applies the version removal and leaves the prepared journal
+        // undecided — exactly a crash between apply and publish.
+        let transaction = Uuid::new_v4();
+        for disk in &disk_stores {
+            let fi = disk
+                .read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("version exists before the interrupted delete");
+            let errors = disk
+                .delete_versions_recoverable(
+                    bucket,
+                    vec![FileInfoVersions {
+                        name: object.to_string(),
+                        versions: vec![fi],
+                        ..Default::default()
+                    }],
+                    DeleteOptions {
+                        recoverable_delete: true,
+                        old_data_dir: Some(transaction),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(errors.iter().all(Option::is_none), "the plant must apply: {errors:?}");
+        }
+
+        // A no-bypass batch naming the retained version twice: the first
+        // entry rolls the prepared delete back (restoring the retained
+        // version) and must be denied; the second must re-read and stay
+        // denied too instead of reusing the stale pre-fetched miss.
+        let victim = ObjectToDelete {
+            object_name: object.to_string(),
+            version_id: Some(version),
+            ..Default::default()
+        };
+        let (_deleted, errors) = set_disks
+            .delete_objects(
+                bucket,
+                vec![victim.clone(), victim],
+                ObjectOptions {
+                    versioned: true,
+                    object_lock_config_snapshot: Some(Arc::new(ObjectLockConfigSnapshot::new(
+                        ObjectLockConfigState::ConfirmedAbsent,
+                    ))),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            errors.iter().all(|error| error
+                .as_ref()
+                .is_some_and(|error| matches!(error, StorageError::PrefixAccessDenied(_, _)))),
+            "both duplicates must be denied by the restored retention: {errors:?}"
+        );
+
+        // The retained version survives the batch.
+        for disk in &disk_stores {
+            disk.read_version("", bucket, object, &version.to_string(), &crate::disk::ReadOptions::default())
+                .await
+                .expect("the retained version must survive the batch");
+        }
     }
 
     #[tokio::test]
