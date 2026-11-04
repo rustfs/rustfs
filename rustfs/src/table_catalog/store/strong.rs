@@ -1532,9 +1532,19 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn materialize_bucket_snapshot(
         &self,
         source: StrongTableCatalogBucketSnapshot,
+    ) -> TableCatalogStoreResult<(String, bool)> {
+        self.materialize_bucket_snapshot_with_fence(source, &TableCatalogObjectMutationFence::default())
+            .await
+    }
+
+    pub(in crate::table_catalog) async fn materialize_bucket_snapshot_with_fence(
+        &self,
+        source: StrongTableCatalogBucketSnapshot,
+        fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<(String, bool)> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
@@ -1562,7 +1572,8 @@ where
                 postcondition,
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, Some(fence))
+            .await?;
         self.hydrate_state().await?;
         let state = self.state.lock().await;
         let snapshot_etag = state
@@ -1572,11 +1583,27 @@ where
         Ok((snapshot_etag, true))
     }
 
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn remove_bucket_snapshot_if_unchanged(
         &self,
         table_bucket: &str,
         expected_fingerprint: &str,
     ) -> TableCatalogStoreResult<()> {
+        self.remove_bucket_snapshot_if_unchanged_with_fence(
+            table_bucket,
+            expected_fingerprint,
+            &TableCatalogObjectMutationFence::default(),
+        )
+        .await
+    }
+
+    pub(in crate::table_catalog) async fn remove_bucket_snapshot_if_unchanged_with_fence(
+        &self,
+        table_bucket: &str,
+        expected_fingerprint: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let (snapshot, precondition, postcondition) = {
@@ -1597,7 +1624,8 @@ where
                 StrongSnapshotWritePostcondition::TableBucketAbsent(table_bucket.to_string()),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, Some(fence))
+            .await
     }
 
     pub(super) async fn restore_absent_migration_snapshot_baseline(&self) -> TableCatalogStoreResult<()> {

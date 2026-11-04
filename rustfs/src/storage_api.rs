@@ -483,6 +483,7 @@ pub(crate) mod workload {
 pub(crate) mod table {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
+    pub(crate) use crate::storage::storage_api::request_context_consumer::spawn_traced_join;
     pub(crate) mod contract {
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
@@ -518,6 +519,13 @@ pub(crate) mod table {
         StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, get_bucket_metadata,
         get_lock_acquire_timeout, table_catalog_path_hash,
     };
+
+    #[cfg(test)]
+    pub(crate) mod test_support {
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::init_bucket_metadata_sys;
+        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+    }
 }
 
 pub(crate) mod on_demand_migration {

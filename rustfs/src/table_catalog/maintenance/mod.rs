@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod compaction;
 mod config;
 mod periodic;
 mod periodic_runtime;
@@ -19,6 +20,7 @@ mod planner;
 mod recovery;
 mod worker;
 
+pub(crate) use compaction::{run_compaction_output, run_compaction_worker, try_admit_compaction};
 pub(crate) use config::*;
 pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime};
 pub(crate) use planner::*;

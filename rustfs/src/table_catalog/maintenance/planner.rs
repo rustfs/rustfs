@@ -402,10 +402,10 @@ where
                     "compaction data file must be inside the table data directory".to_string(),
                 ));
             }
-            let Some(data_object) = backend.read_object(table_bucket, &data_key).await? else {
+            let Some(data_metadata) = backend.object_metadata(table_bucket, &data_key).await? else {
                 return Err(TableCatalogStoreError::NotFound(format!("compaction data file {data_key}")));
             };
-            let size_bytes = u64::try_from(data_object.data.len()).unwrap_or(u64::MAX);
+            let size_bytes = data_metadata.size;
             if size_bytes <= config.small_file_threshold_bytes {
                 planning.candidates.push(TableCompactionDataFileCandidate {
                     rewrite_prefix: compaction_data_file_rewrite_prefix_for_entry(entry, warehouse_object_prefix, &data_key)
@@ -447,7 +447,7 @@ where
         ));
     }
 
-    let object_exists = backend.read_object(table_bucket, &delete_key).await?.is_some();
+    let object_exists = backend.object_metadata(table_bucket, &delete_key).await?.is_some();
     planning.status = TableRowLevelMaintenancePlanningStatus::ManualReviewRequired;
     planning.delete_file_count = planning.delete_file_count.saturating_add(1);
     planning.manual_review_count = planning.manual_review_count.saturating_add(1);
@@ -519,6 +519,7 @@ pub(crate) async fn compaction_current_data_files<B>(
     table: &IdentifierSegment,
     entry: &TableEntry,
     current_metadata: &serde_json::Value,
+    admission: &Arc<tokio::sync::OwnedSemaphorePermit>,
 ) -> TableCatalogStoreResult<Vec<CompactedDataFile>>
 where
     B: TableCatalogObjectBackend,
@@ -603,7 +604,7 @@ where
                     "compaction data file must be inside the table data directory".to_string(),
                 ));
             }
-            let Some(data_object) = backend.read_object(table_bucket, &data_key).await? else {
+            let Some(data_metadata) = backend.object_metadata(table_bucket, &data_key).await? else {
                 return Err(TableCatalogStoreError::NotFound(format!("compaction data file {data_key}")));
             };
             let snapshot_id = reference
@@ -625,14 +626,24 @@ where
                     TableCatalogStoreError::Invalid("compaction manifest data file missing file sequence number".to_string())
                 })?;
             data_files.push(CompactedDataFile {
-                object_key: data_key,
+                object_key: data_key.clone(),
                 file_path: reference.location,
-                file_size_bytes: reference
-                    .file_size_bytes
-                    .unwrap_or_else(|| u64::try_from(data_object.data.len()).unwrap_or(u64::MAX)),
+                file_size_bytes: reference.file_size_bytes.unwrap_or(data_metadata.size),
                 record_count: match reference.record_count {
                     Some(record_count) => record_count,
-                    None => parquet_record_count(&data_object.data)?,
+                    None => {
+                        let object = backend
+                            .read_object_limited(table_bucket, &data_key, TABLE_COMPACTION_MAX_STORED_BYTES)
+                            .await?
+                            .ok_or_else(|| TableCatalogStoreError::NotFound(format!("compaction data file {data_key}")))?;
+                        let admission = Arc::clone(admission);
+                        tokio::task::spawn_blocking(move || {
+                            let _admission = admission;
+                            parquet_record_count(object.data)
+                        })
+                        .await
+                        .map_err(|_| TableCatalogStoreError::Internal("compaction footer worker failed".to_owned()))??
+                    }
                 },
                 partition_spec_id: manifest_reference.partition_spec_id.unwrap_or(0),
                 partition: reference.partition,
@@ -836,58 +847,6 @@ pub(crate) fn compaction_manifest_partition_spec_id(data_files: &[CompactedDataF
     Ok(partition_spec_id)
 }
 
-pub(crate) fn compact_parquet_data_files(input_files: &[(String, Vec<u8>)]) -> TableCatalogStoreResult<CompactedParquetFile> {
-    let mut schema: Option<SchemaRef> = None;
-    let mut batches = Vec::new();
-    let mut record_count = 0_u64;
-
-    for (location, data) in input_files {
-        let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data.clone())).map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to read compaction input parquet {location}: {err}"))
-        })?;
-        let file_schema = builder.schema().clone();
-        match schema.as_ref() {
-            Some(expected_schema) if expected_schema.as_ref() != file_schema.as_ref() => {
-                return Err(TableCatalogStoreError::Invalid("compaction input parquet schemas must match".to_string()));
-            }
-            Some(_) => {}
-            None => schema = Some(file_schema),
-        }
-
-        let reader = builder.build().map_err(|err| {
-            TableCatalogStoreError::Invalid(format!("failed to build compaction parquet reader {location}: {err}"))
-        })?;
-        for batch in reader {
-            let batch = batch.map_err(|err| {
-                TableCatalogStoreError::Invalid(format!("failed to read compaction parquet batch {location}: {err}"))
-            })?;
-            record_count = record_count.saturating_add(u64::try_from(batch.num_rows()).unwrap_or(u64::MAX));
-            batches.push(batch);
-        }
-    }
-
-    let Some(schema) = schema else {
-        return Err(TableCatalogStoreError::Invalid(
-            "compaction requires at least one parquet input file".to_string(),
-        ));
-    };
-    let mut data = Vec::new();
-    {
-        let mut writer = ArrowWriter::try_new(&mut data, schema, None)
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to build compaction parquet writer: {err}")))?;
-        for batch in batches {
-            writer
-                .write(&batch)
-                .map_err(|err| TableCatalogStoreError::Internal(format!("failed to write compaction parquet batch: {err}")))?;
-        }
-        writer
-            .close()
-            .map_err(|err| TableCatalogStoreError::Internal(format!("failed to close compaction parquet writer: {err}")))?;
-    }
-
-    Ok(CompactedParquetFile { data, record_count })
-}
-
 fn validate_compaction_manifest_entry_status(entry_status: Option<i32>) -> TableCatalogStoreResult<()> {
     match entry_status {
         Some(0 | 1) => Ok(()),
@@ -901,8 +860,8 @@ fn validate_compaction_manifest_entry_status(entry_status: Option<i32>) -> Table
     }
 }
 
-fn parquet_record_count(data: &[u8]) -> TableCatalogStoreResult<u64> {
-    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::copy_from_slice(data))
+fn parquet_record_count(data: Vec<u8>) -> TableCatalogStoreResult<u64> {
+    let builder = ParquetRecordBatchReaderBuilder::try_new(Bytes::from(data))
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read compaction parquet metadata: {err}")))?;
     u64::try_from(builder.metadata().file_metadata().num_rows())
         .map_err(|_| TableCatalogStoreError::Invalid("compaction parquet record count must not be negative".to_string()))

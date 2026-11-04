@@ -112,6 +112,8 @@ metadata or warehouse directory, including a recreated source name after rename.
 Such tables require disjoint cleanup roots before maintenance can run; enabling
 deletion does not override this ownership check.
 
+Create, register, and commit publication share one preparation deadline derived from the existing lock-acquisition timeout. Migration and bucket-lock queueing, reference HEAD validation, ownership inventories, metadata parsing, and snapshot preparation consume that same interval; repeated preparation does not renew it. Expiry before a possible durable catalog write returns HTTP 503 and releases the preparation locks. A valid large operation that cannot finish within the interval may continue to fail on retry; smaller operations or less contention are required. Once a catalog write may have begun, this deadline no longer cancels that transaction. A preceding rename recovery completes under its existing protocol, then the new operation checks the original deadline. Individual PUT completion and persisted commit/rename recovery retain their existing cancellation guarantees; the entire multi-write catalog operation is not newly detached from client cancellation. This is a preparation limit, not a hard bound on disk I/O or the durable tail: snapshot write/reload and rename maintenance copy verification/cleanup can still scale with stored state. Rename maintenance inventory isolation remains a separate limitation.
+
 Durable-strong rename preserves maintenance configuration, job identifiers,
 current/latest aliases, history, audit events, and quarantine state. A persisted
 rename intent protects sidecar migration across interruption: the source remains
