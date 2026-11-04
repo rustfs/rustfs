@@ -1795,6 +1795,146 @@ mod test {
         Ok(())
     }
 
+    async fn assert_catalog_migration_policy_matrix(data: &[u8], cases: &[(&str, AdminAction, bool)]) -> Result<()> {
+        let policy = Policy::parse_config(data)?;
+        let conditions = HashMap::new();
+        let claims = HashMap::new();
+        let groups = None;
+        for (bucket, action, expected) in cases {
+            let args = Args {
+                account: "catalog-migration-operator",
+                groups: &groups,
+                action: Action::AdminAction(*action),
+                bucket,
+                conditions: &conditions,
+                is_owner: false,
+                object: "",
+                claims: &claims,
+                deny_only: false,
+            };
+            assert_eq!(policy.is_allowed(&args).await, *expected, "{action:?} on warehouse {bucket:?}");
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_allow_resource_is_limited_to_the_requested_warehouse() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:MigrateTableCatalog",
+                    "Resource": "arn:aws:s3:::warehouse-a"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("", AdminAction::MigrateTableCatalogAction, false),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_allow_not_resource_excludes_only_the_named_warehouse() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:MigrateTableCatalog",
+                    "NotResource": "arn:aws:s3:::warehouse-b"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_explicit_deny_resource_does_not_spread_to_other_warehouses() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "admin:MigrateTableCatalog", "Resource": "arn:aws:s3:::warehouse-b"}
+                ]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_explicit_deny_not_resource_preserves_its_exception() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [
+                    {"Effect": "Allow", "Action": "admin:*", "Resource": "*"},
+                    {"Effect": "Deny", "Action": "admin:MigrateTableCatalog", "NotResource": "arn:aws:s3:::warehouse-a"}
+                ]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-c", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_admin_wildcard_still_honors_the_requested_action_scope() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{
+                    "Effect": "Allow",
+                    "Action": "admin:*",
+                    "Resource": "arn:aws:s3:::warehouse-a"
+                }]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, false),
+                ("", AdminAction::MigrateTableCatalogAction, false),
+                ("warehouse-b", AdminAction::ServerInfoAdminAction, true),
+                ("", AdminAction::GetTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn catalog_migration_resource_free_admin_grants_keep_their_global_behavior() -> Result<()> {
+        assert_catalog_migration_policy_matrix(
+            br#"{
+                "Version": "2012-10-17",
+                "Statement": [{"Effect": "Allow", "Action": "admin:MigrateTableCatalog"}]
+            }"#,
+            &[
+                ("warehouse-a", AdminAction::MigrateTableCatalogAction, true),
+                ("warehouse-b", AdminAction::MigrateTableCatalogAction, true),
+                ("", AdminAction::MigrateTableCatalogAction, true),
+            ],
+        )
+        .await
+    }
+
     #[tokio::test]
     async fn test_table_admin_action_with_resource_is_limited_to_bucket() -> Result<()> {
         use crate::policy::action::{Action, AdminAction};

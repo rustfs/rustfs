@@ -1874,10 +1874,7 @@ fn table_catalog_backend_for_data_plane<T>(
         None => runtime_sources::current_app_context(),
     }
     .ok_or_else(object_store_not_initialized_error)?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        context.object_store(),
-        context.table_catalog_strong_runtime(),
-    ))
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(context.object_store()))
 }
 
 fn table_catalog_store_for_data_plane<T>(

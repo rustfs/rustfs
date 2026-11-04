@@ -88,67 +88,6 @@ impl Operation for GetTableBucketHandler {
     }
 }
 
-pub struct GetTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for GetTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        let resource = TableCatalogResource::warehouse(&warehouse);
-        authorize_table_catalog_resource_request(&req, &resource, AdminAction::GetTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .plan_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
-pub struct MaterializeTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for MaterializeTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .materialize_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration-materialize", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
-pub struct CancelTableCatalogMigrationHandler {}
-
-#[async_trait::async_trait]
-impl Operation for CancelTableCatalogMigrationHandler {
-    async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
-        let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
-        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
-        let store = table_catalog_object_store_from_extensions(&req.extensions)?;
-        let started = Instant::now();
-        let result = store
-            .cancel_durable_strong_backing_migration(&warehouse)
-            .await
-            .map_err(catalog_store_error);
-        record_table_catalog_admin_operation_result("migration-cancel", &warehouse, "", "", started, &result);
-        let response = result?;
-        build_json_response(StatusCode::OK, &response)
-    }
-}
-
 pub struct CreateTableCatalogBackupHandler {}
 
 #[async_trait::async_trait]
@@ -162,12 +101,104 @@ impl Operation for CreateTableCatalogBackupHandler {
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
-            .create_durable_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
+            .create_catalog_backup(&warehouse, request.expected_snapshot_etag.as_deref())
             .await
             .map_err(catalog_store_error);
         record_table_catalog_admin_operation_result("catalog-backup", &warehouse, "", "", started, &result);
         let response = result?;
         build_json_response(StatusCode::OK, &response)
+    }
+}
+
+/// Returns the saved artifact bytes without applying or re-encoding its catalog.
+pub struct ExportTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ExportTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_json_body::<CatalogBackupExportRequest>(std::mem::take(&mut req.input)).await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .export_catalog_backup(&warehouse, &request.backup_id)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup-export", &warehouse, "", "", started, &result);
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static(JSON_CONTENT_TYPE));
+        headers.insert(http::header::CACHE_CONTROL, HeaderValue::from_static("no-store, private"));
+        headers.insert(http::header::PRAGMA, HeaderValue::from_static("no-cache"));
+        headers.insert(http::header::EXPIRES, HeaderValue::from_static("0"));
+        Ok(S3Response::with_headers((StatusCode::OK, Body::from(result?)), headers))
+    }
+}
+
+/// Stores a validated candidate artifact; catalog publication is a separate restore.
+pub struct ImportTableCatalogBackupHandler {}
+
+#[async_trait::async_trait]
+impl Operation for ImportTableCatalogBackupHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let data = read_limited_body(
+            std::mem::take(&mut req.input),
+            CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE,
+            TABLE_CATALOG_REQUEST_BODY_TIMEOUT,
+            Some("catalog backup import"),
+        )
+        .await?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .import_catalog_backup(&warehouse, data.to_vec())
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup-import", &warehouse, "", "", started, &result);
+        build_sensitive_json_response(StatusCode::OK, &result?)
+    }
+}
+
+/// Prepares one verified small object while leaving catalog publication to restore.
+pub struct PrepareTableCatalogBackupObjectHandler {}
+
+#[async_trait::async_trait]
+impl Operation for PrepareTableCatalogBackupObjectHandler {
+    async fn call(&self, mut req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
+        let warehouse = warehouse_from_params(&params)?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
+        ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
+        let request = read_bounded_json_body::<CatalogBackupObjectPrepareRequest>(
+            &req.headers,
+            std::mem::take(&mut req.input),
+            CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE,
+            TABLE_CATALOG_REQUEST_BODY_TIMEOUT,
+            "catalog backup object preparation",
+        )
+        .await?;
+        if request.data_base64.len() > CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE {
+            return Err(S3Error::from(ApiError::invalid_request(
+                "data-base64 exceeds the encoded preparation limit",
+            )));
+        }
+        let data = base64_simd::STANDARD
+            .decode_to_vec(request.data_base64.as_bytes())
+            .map_err(|_| S3Error::from(ApiError::invalid_request("data-base64 must be standard padded Base64")))?;
+        let store = table_catalog_store_from_extensions(&req.extensions)?;
+        let started = Instant::now();
+        let result = store
+            .prepare_catalog_backup_object(&warehouse, &request.backup_id, &request.object, data)
+            .await
+            .map_err(catalog_store_error);
+        record_table_catalog_admin_operation_result("catalog-backup-prepare", &warehouse, "", "", started, &result);
+        build_sensitive_json_response(StatusCode::OK, &result?)
     }
 }
 
@@ -184,11 +215,12 @@ impl Operation for RestoreTableCatalogBackupHandler {
         let store = table_catalog_store_from_extensions(&req.extensions)?;
         let started = Instant::now();
         let result = store
-            .restore_durable_catalog_backup(
+            .restore_catalog_backup_with_id(
                 &warehouse,
                 &request.backup_id,
                 request.expected_snapshot_etag.as_deref(),
                 request.allow_replace,
+                request.restore_id.as_deref(),
             )
             .await
             .map_err(catalog_store_error);
@@ -204,7 +236,8 @@ pub struct BackfillTableWarehouseIndexHandler {}
 impl Operation for BackfillTableWarehouseIndexHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let started = Instant::now();

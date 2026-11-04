@@ -79,6 +79,10 @@ const DEFAULT_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 15 * 60;
 const MIN_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60;
 const MAX_TABLE_CATALOG_CREDENTIAL_TTL_SECONDS: i64 = 60 * 60;
 const TABLE_CATALOG_REQUEST_BODY_TIMEOUT: StdDuration = StdDuration::from_secs(30);
+const CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE: usize = 64 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE: usize = 24 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE: usize = 16 * 1024 * 1024;
+const CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE: usize = CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE.div_ceil(3) * 4;
 const TABLE_CATALOG_COMMIT_REQUIREMENT_MAX_COUNT: usize = 1_024;
 const TABLE_CATALOG_COMMIT_UPDATE_MAX_COUNT: usize = 1_024;
 const NAMESPACE_REQUEST_BODY_MAX_SIZE: usize = MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -177,18 +181,15 @@ const TABLE_CATALOG_ENDPOINTS: &[&str] = &[
     "POST /v1/{prefix}/namespaces/{namespace}/views/{view}",
     "DELETE /v1/{prefix}/namespaces/{namespace}/views/{view}",
 ];
-const TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS: &[&str] =
-    &["POST /v1/{prefix}/catalog/backup", "POST /v1/{prefix}/catalog/restore"];
-
 static GET_CONFIG_HANDLER: GetCatalogConfigHandler = GetCatalogConfigHandler {};
 static ENABLE_TABLE_BUCKET_HANDLER: EnableTableBucketHandler = EnableTableBucketHandler {};
 static DISABLE_TABLE_BUCKET_HANDLER: DisableTableBucketHandler = DisableTableBucketHandler {};
 static GET_TABLE_BUCKET_HANDLER: GetTableBucketHandler = GetTableBucketHandler {};
-static GET_TABLE_CATALOG_MIGRATION_HANDLER: GetTableCatalogMigrationHandler = GetTableCatalogMigrationHandler {};
-static MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER: MaterializeTableCatalogMigrationHandler =
-    MaterializeTableCatalogMigrationHandler {};
-static CANCEL_TABLE_CATALOG_MIGRATION_HANDLER: CancelTableCatalogMigrationHandler = CancelTableCatalogMigrationHandler {};
 static CREATE_TABLE_CATALOG_BACKUP_HANDLER: CreateTableCatalogBackupHandler = CreateTableCatalogBackupHandler {};
+static EXPORT_TABLE_CATALOG_BACKUP_HANDLER: ExportTableCatalogBackupHandler = ExportTableCatalogBackupHandler {};
+static IMPORT_TABLE_CATALOG_BACKUP_HANDLER: ImportTableCatalogBackupHandler = ImportTableCatalogBackupHandler {};
+static PREPARE_TABLE_CATALOG_BACKUP_OBJECT_HANDLER: PrepareTableCatalogBackupObjectHandler =
+    PrepareTableCatalogBackupObjectHandler {};
 static RESTORE_TABLE_CATALOG_BACKUP_HANDLER: RestoreTableCatalogBackupHandler = RestoreTableCatalogBackupHandler {};
 static BACKFILL_TABLE_WAREHOUSE_INDEX_HANDLER: BackfillTableWarehouseIndexHandler = BackfillTableWarehouseIndexHandler {};
 static LIST_NAMESPACES_HANDLER: RestListNamespacesHandler = RestListNamespacesHandler {};
@@ -515,9 +516,28 @@ struct CatalogBackupRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CatalogBackupExportRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CatalogBackupObjectPrepareRequest {
+    #[serde(rename = "backup-id")]
+    backup_id: String,
+    object: String,
+    #[serde(rename = "data-base64")]
+    data_base64: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CatalogRestoreRequest {
     #[serde(rename = "backup-id")]
     backup_id: String,
+    #[serde(default, rename = "restore-id")]
+    restore_id: Option<String>,
     #[serde(default, rename = "expected-snapshot-etag")]
     expected_snapshot_etag: Option<String>,
     #[serde(default, rename = "allow-replace")]
@@ -1037,10 +1057,7 @@ fn catalog_config_response(warehouse: Option<&str>) -> S3Result<CatalogConfigRes
     if let Some(warehouse) = warehouse {
         defaults.insert(PREFIX_PROPERTY.to_string(), warehouse.to_string());
     }
-    let mut endpoints = TABLE_CATALOG_ENDPOINTS.to_vec();
-    if backing_mode == crate::table_catalog::TableCatalogBackingMode::DurableStrong {
-        endpoints.extend_from_slice(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS);
-    }
+    let endpoints = TABLE_CATALOG_ENDPOINTS.to_vec();
     Ok(CatalogConfigResponse {
         defaults,
         overrides,
@@ -1939,10 +1956,6 @@ where
             && publication.guards.iter().all(|guard| !guard.is_lock_lost())
     }
 
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        self.backend.acquires_catalog_migration_read_permit()
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         let publication = self.publication.lock();
         publication
@@ -2425,9 +2438,8 @@ fn table_catalog_backend_from_extensions(
 ) -> S3Result<crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>> {
     let context = runtime_sources::app_context_from_extensions(extensions)
         .ok_or_else(|| table_catalog_internal_error("request application context is not initialized"))?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_runtimes(
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_registration_cache(
         context.object_store(),
-        context.table_catalog_strong_runtime(),
         context.table_catalog_registration_cache(),
     ))
 }
@@ -2448,16 +2460,10 @@ fn table_catalog_store_from_extensions(
 }
 
 fn table_catalog_object_store_from_extensions(extensions: &http::Extensions) -> S3Result<EcStoreObjectTableCatalogStore> {
-    match crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)? {
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked => Ok(crate::table_catalog::ObjectTableCatalogStore::new(
-            table_catalog_backend_from_extensions(extensions)?,
-        )),
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong => Err(s3_error!(
-            InvalidRequest,
-            "operation is not supported with {} table catalog backing",
-            crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG
-        )),
-    }
+    crate::table_catalog::TableCatalogBackingMode::from_env().map_err(catalog_store_error)?;
+    Ok(crate::table_catalog::ObjectTableCatalogStore::new(table_catalog_backend_from_extensions(
+        extensions,
+    )?))
 }
 
 async fn table_bucket_enabled_from_extensions(extensions: &http::Extensions, bucket: &str) -> S3Result<bool> {
