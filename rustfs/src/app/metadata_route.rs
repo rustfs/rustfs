@@ -689,18 +689,14 @@ async fn call_list_object_versions(req: S3Request<Body>, bucket: String) -> S3Re
     let request = req.map_input(|_| input);
     let output = DefaultBucketUsecase::from_global()
         .execute_list_object_versions_m(request)
-        .await
-        .map_err(crate::error::normalize_read_quorum_error)?;
+        .await?;
     xml_response(&output.output)
 }
 
 async fn call_list_objects_v2(req: S3Request<Body>, bucket: String) -> S3Result<S3Response<Body>> {
     let input = list_objects_v2_input(bucket, &req.uri, &req.headers)?;
     let request = req.map_input(|_| input);
-    let output = DefaultBucketUsecase::from_global()
-        .execute_list_objects_v2m(request)
-        .await
-        .map_err(crate::error::normalize_read_quorum_error)?;
+    let output = DefaultBucketUsecase::from_global().execute_list_objects_v2m(request).await?;
     xml_response(&output.output)
 }
 
