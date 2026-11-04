@@ -4145,10 +4145,27 @@ mod tests {
     }
 
     #[test]
-    fn hoist_restores_presigned_query_params_as_headers() {
+    fn hoist_restores_presigned_query_metadata_as_headers() {
         let req = hoist(&presigned_query("x-amz-meta-user-id=u1&x-amz-tagging=project%3Drustfs")).expect("hoist");
         assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
-        assert_eq!(req.headers().get("x-amz-tagging").and_then(|v| v.to_str().ok()), Some("project=rustfs"));
+        assert!(req.headers().get("x-amz-tagging").is_none());
+    }
+
+    #[test]
+    fn hoist_leaves_typed_request_properties_unchanged() {
+        for name in [
+            "x-amz-object-lock-legal-hold",
+            "x-amz-object-lock-mode",
+            "x-amz-object-lock-retain-until-date",
+            "x-amz-server-side-encryption",
+            "x-amz-storage-class",
+            "x-amz-copy-source",
+            "x-amz-content-sha256",
+            "x-amz-tagging",
+        ] {
+            let req = hoist(&presigned_query(&format!("{name}=value"))).expect("metadata hoist");
+            assert!(!req.headers().contains_key(name), "typed property must keep its original path: {name}");
+        }
     }
 
     #[test]
@@ -4286,9 +4303,9 @@ mod tests {
     #[tokio::test]
     async fn hoist_then_guard_accepts_a_valid_metadata_bearing_presigned_put() {
         // The AWS SDK presigner emits `SignedHeaders=host` and moves
-        // `x-amz-content-sha256` and `x-amz-meta-*` into the query. The hoist
-        // restores them as headers, and the unsigned-header guard must accept
-        // those headers because the signature covers the query values.
+        // `x-amz-content-sha256` and `x-amz-meta-*` into the query. Only the
+        // metadata is restored as headers; the digest keeps its dedicated
+        // query verification path. The guard accepts the signed metadata.
         let inner = CountingHybridService::default();
         let calls = inner.calls();
         let mut service = SigV4HeaderGuardLayer.layer(inner);

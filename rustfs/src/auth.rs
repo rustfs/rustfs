@@ -985,30 +985,14 @@ fn query_may_carry_amz_params(query: &str) -> bool {
         .any(|window| window.eq_ignore_ascii_case(b"-amz-"))
 }
 
-/// SigV4 query parameters that carry authentication state rather than a request
-/// property. They must not be restored as headers: the verifier reads them from
-/// the query, and `x-amz-security-token` in particular would otherwise look like
-/// an unsigned `x-amz-*` header to [`reject_unsigned_amz_headers_on_presigned_request`].
-const SIGV4_QUERY_AUTH_PARAMS: &[&str] = &[
-    "x-amz-algorithm",
-    "x-amz-credential",
-    "x-amz-date",
-    "x-amz-expires",
-    "x-amz-signedheaders",
-    "x-amz-signature",
-    "x-amz-security-token",
-    "x-amz-region-set",
-];
-
-/// Restores the `x-amz-*` request properties the SigV4 presigners hoist into
-/// the query string back into the request headers.
+/// Restores signature-covered `x-amz-meta-*` user metadata as request headers.
 ///
-/// The AWS SDK presigners move every signable `x-amz-*` header into the query
-/// (`@smithy/signature-v4` `moveHeadersToQuery`) so an uploader does not have to
-/// resend them, and AWS S3 serves the request as if the headers were still
-/// there. RustFS dropped the hoisted form, so a presigned upload lost its user
-/// metadata (rustfs/rustfs#9142), its tagging, its storage class, its object
-/// lock settings and its copy source.
+/// AWS SDK presigners hoist metadata into the query string, while RustFS's
+/// metadata consumers read headers (rustfs/rustfs#9142). Only user metadata is
+/// restored here. s3s has already parsed typed request properties before this
+/// hook runs; restoring Object Lock, encryption or routing headers here would
+/// bypass the corresponding DTO validation and per-property authorization.
+/// Those properties keep their existing handling (rustfs/backlog#3143).
 ///
 /// This runs after s3s has verified the signature and before policy evaluation
 /// and the handler read request properties. It must not run earlier: s3s's own
@@ -1037,7 +1021,7 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
     }
 
     // One pass over the query: recognize the presigned-SigV4 marker set and
-    // stage every parameter that names a request header. Nothing is validated
+    // stage user metadata parameters. Nothing is validated
     // or applied until the gate below passes, so a request whose query is not
     // signature-covered is never rejected here.
     let mut algorithm = false;
@@ -1070,9 +1054,7 @@ pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -
         }
         // Parameter names keep whatever case the signer used (`X-Amz-Meta-User-Id`
         // is what a hoist produces), so match the prefix the way `HeaderName` would.
-        if !starts_with_ignore_ascii_case(&name, "x-amz-")
-            || SIGV4_QUERY_AUTH_PARAMS.iter().any(|param| name.eq_ignore_ascii_case(param))
-        {
+        if !starts_with_ignore_ascii_case(&name, "x-amz-meta-") {
             continue;
         }
         let stored_name = name.to_ascii_lowercase();

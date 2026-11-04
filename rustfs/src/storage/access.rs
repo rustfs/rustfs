@@ -1415,7 +1415,7 @@ impl BulkDenialAudit {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
-    // Restore the `x-amz-*` request properties the SigV4 presigners hoist into
+    // Restore the `x-amz-meta-*` user metadata the SigV4 presigners hoist into
     // the query string. This runs after s3s has verified the signature — its own
     // verifier rejects an `x-amz-*` header outside `SignedHeaders`, which is
     // exactly what a hoisted parameter becomes — and before policy evaluation and
@@ -6672,5 +6672,165 @@ mod tests {
             .await
             .expect_err("unavailable policy metadata must fail closed");
         assert_eq!(err.code(), &S3ErrorCode::InternalError);
+    }
+}
+
+#[cfg(test)]
+mod signed_query_lock_permission_regression {
+    use super::*;
+    use crate::runtime_sources::{AppContext, ServerContextSlot};
+    use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+    use crate::storage::storage_api::contract::object::ObjectOperations;
+    use hmac::{Hmac, KeyInit, Mac};
+    use sha2::{Digest, Sha256};
+    use std::sync::Arc;
+
+    fn presigned_lock_put(bucket: &str, key: &str, hoisted: bool) -> http::Request<s3s::Body> {
+        let now = time::OffsetDateTime::now_utc();
+        let stamp = now
+            .format(
+                &time::format_description::parse_borrowed::<2>("[year][month][day]T[hour][minute][second]Z")
+                    .expect("timestamp format"),
+            )
+            .expect("timestamp");
+        let day = &stamp[..8];
+        let scope = format!("{day}/us-east-1/s3/aws4_request");
+        let signed_headers = if hoisted {
+            "host"
+        } else {
+            "host;x-amz-object-lock-legal-hold"
+        };
+        let mut params = std::collections::BTreeMap::from([
+            ("X-Amz-Algorithm", "AWS4-HMAC-SHA256".to_owned()),
+            ("X-Amz-Credential", format!("review-local-access/{scope}")),
+            ("X-Amz-Date", stamp.clone()),
+            ("X-Amz-Expires", "300".to_owned()),
+            ("X-Amz-SignedHeaders", signed_headers.to_owned()),
+        ]);
+        if hoisted {
+            params.insert("x-amz-object-lock-legal-hold", "ON".to_owned());
+            params.insert("x-amz-meta-user-id", "u1".to_owned());
+        }
+        let query = params
+            .into_iter()
+            .map(|(k, v)| format!("{}={}", urlencoding::encode(k), urlencoding::encode(&v)))
+            .collect::<Vec<_>>()
+            .join("&");
+        let path = format!("/{bucket}/{key}");
+        let lock_header = if hoisted { "" } else { "x-amz-object-lock-legal-hold:ON\n" };
+        let canonical = format!("PUT\n{path}\n{query}\nhost:localhost\n{lock_header}\n{signed_headers}\nUNSIGNED-PAYLOAD");
+        let to_sign = format!(
+            "AWS4-HMAC-SHA256\n{stamp}\n{scope}\n{}",
+            hex_simd::encode_to_string(Sha256::digest(canonical), hex_simd::AsciiCase::Lower)
+        );
+        let mut signing_key = b"AWS4review-local-secret".to_vec();
+        for value in [day, "us-east-1", "s3", "aws4_request"] {
+            let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&signing_key).expect("signing key");
+            mac.update(value.as_bytes());
+            signing_key = mac.finalize().into_bytes().to_vec();
+        }
+        let mut mac = <Hmac<Sha256> as KeyInit>::new_from_slice(&signing_key).expect("signing key");
+        mac.update(to_sign.as_bytes());
+        let signature = hex_simd::encode_to_string(mac.finalize().into_bytes(), hex_simd::AsciiCase::Lower);
+        let mut request = http::Request::builder()
+            .method("PUT")
+            .uri(format!("http://localhost{path}?{query}&X-Amz-Signature={signature}"))
+            .header("host", "localhost")
+            .header("content-length", "4")
+            .header("content-md5", "CY9rzUYh03PK3k6DJie09g==");
+        if !hoisted {
+            request = request.header("x-amz-object-lock-legal-hold", "ON");
+        }
+        request
+            .body(s3s::Body::from(bytes::Bytes::from_static(b"test")))
+            .expect("signed request")
+    }
+
+    #[tokio::test]
+    async fn signed_query_metadata_cannot_add_legal_hold_without_permission() {
+        use http_body_util::BodyExt;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let iam = rustfs_iam::init_iam_sys(store.clone()).await.expect("test IAM");
+        let context = Arc::new(AppContext::with_default_interfaces(
+            store.clone(),
+            iam,
+            Arc::new(rustfs_kms::KmsServiceManager::new()),
+        ));
+        assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: "review-local-access".to_owned(),
+            secret_key: "review-local-secret".to_owned(),
+            status: "on".to_owned(),
+            ..Default::default()
+        }));
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        let fs = FS::with_server_ctx(slot);
+        let bucket = "review-lock-permission";
+        store
+            .make_bucket(
+                bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("locked bucket");
+        let policy = format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}},{{"Effect":"Deny","Principal":{{"AWS":"*"}},"Action":["s3:PutObjectLegalHold","s3:PutObjectRetention"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+        );
+        let mut metadata = (*crate::storage::get_bucket_metadata(bucket).await.expect("bucket metadata")).clone();
+        metadata.policy_config = Some(serde_json::from_str(&policy).expect("bucket policy"));
+        metadata.policy_config_json = policy.into_bytes();
+        crate::storage::storage_api::set_bucket_metadata(bucket.to_owned(), metadata)
+            .await
+            .expect("set bucket policy");
+        let mut builder = s3s::service::S3ServiceBuilder::new(fs.clone());
+        builder.set_auth(crate::auth::IAMAuth::with_server_context(
+            "review-local-access",
+            "review-local-secret",
+            fs.server_ctx().clone(),
+        ));
+        builder.set_access(fs);
+        let mut config = s3s::config::S3Config::default();
+        config.normalize_forward_slash_path = true;
+        config.enable_sig_v2 = true;
+        config.put_object_max_size = Some(rustfs_config::MAX_SINGLE_PUT_OBJECT_SIZE);
+        config.sig_v4_allowed_services.push("s3tables".to_owned());
+        builder.set_config(Arc::new(s3s::config::StaticConfigProvider::new(Arc::new(config))));
+        let service = builder.build();
+        let response = service
+            .call(presigned_lock_put(bucket, "header-control", false))
+            .await
+            .expect("header request");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("header body").to_bytes();
+        assert_eq!(status, http::StatusCode::FORBIDDEN, "header control: {}", String::from_utf8_lossy(&body));
+        assert!(
+            String::from_utf8_lossy(&body).contains("<Code>AccessDenied</Code>"),
+            "signed header must reach the independent permission check: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let response = service
+            .call(presigned_lock_put(bucket, "query-target", true))
+            .await
+            .expect("query request");
+        let status = response.status();
+        let body = response.into_body().collect().await.expect("query body").to_bytes();
+        let stored = store
+            .get_object_info(bucket, "query-target", &crate::storage::ObjectOptions::default())
+            .await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "ordinary metadata PUT should succeed: {}",
+            String::from_utf8_lossy(&body)
+        );
+        let stored = stored.expect("ordinary metadata PUT must publish an object");
+        assert!(
+            !stored.user_defined.contains_key("x-amz-object-lock-legal-hold"),
+            "query metadata must not grant a separate Object Lock capability"
+        );
+        assert_eq!(stored.user_defined.get("user-id").map(String::as_str), Some("u1"));
     }
 }
