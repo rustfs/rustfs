@@ -42,6 +42,7 @@ rustfs-io-metrics = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
+metrics = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "fs"] }
 
 [lib]
