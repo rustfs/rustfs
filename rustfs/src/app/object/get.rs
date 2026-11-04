@@ -681,6 +681,7 @@ struct DiskReadLease<R> {
     pending_capacity: usize,
     closed: bool,
     expired: bool,
+    abandoned: tokio_util::sync::CancellationToken,
     last_progress: tokio::time::Instant,
     window_start: tokio::time::Instant,
     window_bytes: usize,
@@ -738,6 +739,7 @@ impl<R> DiskReadLeaseControl<R> {
         let waker = {
             let mut state = self.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             state.closed = true;
+            state.abandoned.cancel();
             state.pending = false;
             state.reader.take();
             state.permit.take();
@@ -776,6 +778,7 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
             pending_capacity: 0,
             closed: false,
             expired: false,
+            abandoned: tokio_util::sync::CancellationToken::new(),
             last_progress: now,
             window_start: now,
             window_bytes: 0,
@@ -789,7 +792,7 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
     }
 
     async fn watch(lease: Arc<Mutex<DiskReadLease<R>>>, changed: Arc<tokio::sync::Notify>) {
-        let (reader, permit, pending_capacity, waker) = loop {
+        let (reader, permit, pending_capacity, waker, abandoned) = loop {
             let next_check = {
                 let mut state = lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
                 if !state.closed {
@@ -802,6 +805,7 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
                         state.permit.take(),
                         state.pending.then_some(state.pending_capacity),
                         state.waker.take(),
+                        state.abandoned.clone(),
                     );
                 }
                 state.next_check_delay(tokio::time::Instant::now())
@@ -821,7 +825,13 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
                 // read, discard its result, and never start another read.
                 let mut scratch = vec![0_u8; capacity.min(64 * 1024)];
                 let mut buffer = ReadBuf::new(&mut scratch);
-                let _ = std::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buffer)).await;
+                // An explicit stalled-read timeout can retire admission even
+                // after this task has taken ownership of the pending read.
+                tokio::select! {
+                    biased;
+                    _ = abandoned.cancelled() => {},
+                    _ = std::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buffer)) => {},
+                }
             }
             drop(reader);
         }
@@ -7069,6 +7079,146 @@ mod tests {
             rustfs_object_data_cache::ObjectDataCacheLookup::Miss
         ));
         producer_task.await.expect("producer task must join");
+        assert!(adapter.reserve_body(&plan).is_some(), "timeout must release the body reservation");
+        let ColdFillRole::Produce(successor) = coordinator.join(key) else {
+            panic!("timeout must release the session for a successor");
+        };
+        drop(successor);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_watchdog_timeout_releases_pending_read_admission() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 2 * 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024 * 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("timeout cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "timeout-bucket",
+            object: "timeout-object",
+            version_id: None,
+            etag: "timeout-etag",
+            size: 768 * 1024,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let key = plan.key().cloned().expect("timeout body must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key.clone()) else {
+            panic!("first timeout request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let disk_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let disk_gate = Arc::clone(&disk_permits);
+        let readers = Arc::new(AtomicUsize::new(0));
+        let reader_count = Arc::clone(&readers);
+        // Use the real asynchronous stream contract: the submitted read stays
+        // pending until the peer is explicitly closed after the assertion.
+        struct ObservedPendingRead {
+            inner: tokio::io::DuplexStream,
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl AsyncRead for ObservedPendingRead {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                Pin::new(&mut self.inner).poll_read(cx, buffer)
+            }
+        }
+        let (pending_stream, pending_peer) = tokio::io::duplex(64);
+        let (first_poll, first_poll_ready) = tokio::sync::oneshot::channel();
+        let pending_stream = ObservedPendingRead {
+            inner: pending_stream,
+            started: Some(first_poll),
+        };
+        let manager = get_concurrency_manager();
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            move || async move {
+                let permit = disk_gate
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ColdFillError::DiskAdmissionClosed)?;
+                let mut io = DefaultObjectUsecase::get_object_io_planning_without_disk(manager);
+                io.disk_permit = Some(permit.into());
+                Ok(io)
+            },
+            move || async move {
+                reader_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(GetObjectReader {
+                    stream: Box::new(pending_stream),
+                    object_info: ObjectInfo {
+                        size: 768 * 1024,
+                        actual_size: 768 * 1024,
+                        ..Default::default()
+                    },
+                    buffered_body: None,
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 768 * 1024,
+                deadline: None,
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+        first_poll_ready.await.expect("producer must submit its first read");
+        let ColdFillRole::Wait(follower) = coordinator.join(key.clone()) else {
+            panic!("second timeout request must follow");
+        };
+
+        tokio::time::advance(
+            get_object_disk_read_timeout()
+                .saturating_mul(2)
+                .max(GET_DISK_READ_IDLE_TIMEOUT)
+                + Duration::from_secs(1),
+        )
+        .await;
+        let (leader_result, follower_result) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(leader.wait(), follower.wait()) })
+                .await
+                .expect("typed timeout must wake all waiters");
+        assert!(matches!(
+            leader_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert!(matches!(
+            follower_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 1);
+        producer_task.await.expect("producer task must join");
+        let replacement = tokio::time::timeout(Duration::from_secs(1), disk_permits.clone().acquire_owned()).await;
+        let released_before_pending_io = matches!(&replacement, Ok(Ok(_)));
+        drop(replacement);
+        drop(pending_peer);
+        let replacement_after_io = tokio::time::timeout(Duration::from_secs(1), disk_permits.clone().acquire_owned())
+            .await
+            .expect("control: completing pending I/O releases admission")
+            .expect("gate open");
+        drop(replacement_after_io);
+        assert!(
+            released_before_pending_io,
+            "a classified stalled read must return admission before pending I/O completes"
+        );
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+        ));
         assert!(adapter.reserve_body(&plan).is_some(), "timeout must release the body reservation");
         let ColdFillRole::Produce(successor) = coordinator.join(key) else {
             panic!("timeout must release the session for a successor");
