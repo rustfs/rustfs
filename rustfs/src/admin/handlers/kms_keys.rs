@@ -22,7 +22,7 @@ use crate::admin::storage_api::s3;
 use crate::admin::utils::extract_query_params;
 use crate::auth::{check_key_valid, get_session_token};
 use crate::kms_deletion_gate::current_key_impact;
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
@@ -325,7 +325,7 @@ impl Operation for CreateKeyHandler {
                 owner,
                 false,
                 kms_create_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAuditOperation::CreateKey,
@@ -418,7 +418,7 @@ impl Operation for DescribeKeyHandler {
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
                 requested_key_id.as_deref().unwrap_or_default(),
             )
             .await,
@@ -1488,7 +1488,7 @@ impl Operation for ListKeysHandler {
                 owner,
                 false,
                 kms_list_keys_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAuditOperation::ListKeys,
@@ -1583,7 +1583,7 @@ impl Operation for GenerateDataKeyHandler {
                 owner,
                 false,
                 kms_generate_data_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
                 parsed.as_ref().map(|request| request.key_id.as_str()).unwrap_or_default(),
             )
             .await,
@@ -1664,7 +1664,7 @@ impl Operation for CreateKmsKeyHandler {
                 owner,
                 false,
                 kms_create_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAuditOperation::CreateKey,
@@ -1943,7 +1943,7 @@ impl Operation for DeleteKmsKeyHandler {
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -2111,7 +2111,7 @@ impl Operation for CancelKmsKeyDeletionHandler {
                 owner,
                 false,
                 kms_delete_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
                 scoped.as_deref().unwrap_or_default(),
             )
             .await,
@@ -2263,7 +2263,7 @@ impl Operation for ListKmsKeysHandler {
                 owner,
                 false,
                 kms_list_keys_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
             )
             .await,
             KmsAuditOperation::ListKeys,
@@ -2459,7 +2459,7 @@ impl Operation for DescribeKmsKeyHandler {
                 owner,
                 false,
                 kms_describe_key_actions(),
-                req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+                crate::admin::auth::policy_source_addr(&req.extensions),
                 params.get("key_id").unwrap_or_default(),
             )
             .await,

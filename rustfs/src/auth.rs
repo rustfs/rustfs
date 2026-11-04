@@ -19,7 +19,8 @@ use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
-    SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
+    OIDC_ISSUER_CLAIM, SESSION_POLICY_NAME, get_claims_from_token_with_secret,
+    get_claims_from_token_with_secret_allow_missing_exp, is_rustfs_oidc_claims,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
 use rustfs_trusted_proxies::ClientInfo;
@@ -801,6 +802,17 @@ pub fn get_condition_values_with_query_and_client_info(
             }
         }
 
+        if is_rustfs_oidc_claims(claims) {
+            args.remove("iss");
+            if let Some(issuer) = claims
+                .get(OIDC_ISSUER_CLAIM)
+                .and_then(Value::as_str)
+                .filter(|issuer| !issuer.is_empty())
+            {
+                args.insert("iss".to_string(), vec![issuer.to_string()]);
+            }
+        }
+
         let grps = extract_string_list_claim(claims, "groups");
         if !grps.is_empty() {
             args.insert("groups".to_string(), grps);
@@ -812,10 +824,19 @@ pub fn get_condition_values_with_query_and_client_info(
         }
     }
 
-    if let Some(groups) = &cred.groups
-        && !args.contains_key("groups")
-    {
-        args.insert("groups".to_string(), groups.clone());
+    let effective_user = if (cred.is_service_account() || cred.is_temp()) && !cred.parent_user.is_empty() {
+        &cred.parent_user
+    } else {
+        &cred.access_key
+    };
+    let live_groups = current_ready_iam_handle()
+        .map(|iam| iam.user_group_memberships(effective_user))
+        .unwrap_or_default();
+    for group in cred.groups.iter().flatten().chain(live_groups.iter()) {
+        let groups = args.entry("groups".to_string()).or_default();
+        if !groups.contains(group) {
+            groups.push(group.clone());
+        }
     }
 
     // Every remaining header is attacker-controlled. A header must never contribute
@@ -2303,6 +2324,56 @@ mod tests {
         assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
         // Verify the header is removed after processing
         // (we can't directly test this without changing the function signature)
+    }
+
+    #[tokio::test]
+    async fn oidc_issuer_condition_uses_verified_provider_not_session_marker_or_header() {
+        use rustfs_policy::policy::{
+            Args, Policy,
+            action::{Action, S3Action},
+        };
+
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+                {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*",
+                 "Condition":{"StringEquals":{"jwt:iss":"https://partner.example"}}}
+            ]}"#,
+        )
+        .expect("parse issuer condition");
+        let mut credentials = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("iss", HeaderValue::from_static("https://spoofed.invalid"));
+        headers.insert(OIDC_ISSUER_CLAIM, HeaderValue::from_static("https://spoofed.invalid"));
+        for issuer in [Some("https://partner.example"), Some("https://corporate.example"), None] {
+            let mut claims = HashMap::from([
+                ("iss".to_string(), json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), json!("provider")),
+                ("sub".to_string(), json!("subject")),
+            ]);
+            if let Some(issuer) = issuer {
+                claims.insert(OIDC_ISSUER_CLAIM.to_string(), json!(issuer));
+            }
+            credentials.claims = Some(claims);
+            let conditions = get_condition_values(&headers, &credentials, None, None, None);
+            assert_eq!(conditions.get("iss"), issuer.map(|value| vec![value.to_string()]).as_ref());
+            assert_eq!(
+                policy
+                    .is_allowed(&Args {
+                        account: &credentials.access_key,
+                        groups: &credentials.groups,
+                        action: Action::S3Action(S3Action::GetObjectAction),
+                        bucket: "bucket",
+                        object: "object",
+                        conditions: &conditions,
+                        claims: credentials.claims_or_empty(),
+                        is_owner: false,
+                        deny_only: false,
+                    })
+                    .await,
+                issuer != Some("https://partner.example"),
+            );
+        }
     }
 
     #[test]

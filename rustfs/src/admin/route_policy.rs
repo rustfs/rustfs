@@ -18,7 +18,6 @@ use rustfs_security_governance::{
 };
 
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
-const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
 const TLS_CERTIFICATE_PUBLISH: AdminActionRef = AdminActionRef::new("TLSCertificatePublishAdminAction");
@@ -187,12 +186,6 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-group-status", ENABLE_GROUP, RouteRiskLevel::High),
-    admin(
-        HttpMethod::Put,
-        "/rustfs/admin/v3/update-group-members",
-        ADD_USER_TO_GROUP,
-        RouteRiskLevel::High,
-    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/temporary-account-info",
@@ -1806,6 +1799,11 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
+    deferred(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/update-group-members",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
     // The self-service account routes act on the caller, never on a target
     // named in the request, so they gate on possession of the credential (plus,
