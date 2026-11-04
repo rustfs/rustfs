@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use crate::storage::DiskError;
 use crate::storage_api::error::contract::{StorageErrorCode, range::HTTPRangeError};
 use crate::storage_api::error::{PoolMetadataError, QuotaError, StorageError, unreadable_config_refusal};
 use http::StatusCode;
@@ -207,11 +208,15 @@ pub(crate) fn slow_down_read_api_error(err: StorageError) -> ApiError {
     }
 }
 
-/// Normalize a storage read-quorum failure at PUT and LIST boundaries.
+/// Normalize a storage read-quorum failure at write (PUT / multipart / LIST)
+/// boundaries.
 ///
 /// Storage-level read quorum failures keep their `SlowDownRead` code for GET
-/// compatibility. PUT and LIST expose storage unavailability instead of
-/// throttling, while retaining the typed source for diagnostics and audit consumers.
+/// compatibility. Write and LIST paths expose storage unavailability instead of
+/// throttling, while retaining the typed source for diagnostics and audit
+/// consumers. Matching covers both `StorageError` and `DiskError` quorum forms
+/// so a write cannot leak the GET-only code when the source was narrowed to a
+/// disk error (rustfs/backlog#3145).
 pub(crate) fn normalize_read_quorum_error(mut err: S3Error) -> S3Error {
     let is_slow_down_read = matches!(
         err.code(),
@@ -222,11 +227,12 @@ pub(crate) fn normalize_read_quorum_error(mut err: S3Error) -> S3Error {
     }
     let has_read_quorum_source = err.source().is_some_and(|source| {
         error_chain_find(source, |error| {
-            matches!(
+            let storage_quorum = matches!(
                 error.downcast_ref::<StorageError>(),
                 Some(StorageError::ErasureReadQuorum | StorageError::InsufficientReadQuorum(_, _))
-            )
-            .then_some(())
+            );
+            let disk_quorum = matches!(error.downcast_ref::<DiskError>(), Some(DiskError::ErasureReadQuorum));
+            (storage_quorum || disk_quorum).then_some(())
         })
         .is_some()
     });
@@ -2329,6 +2335,23 @@ mod tests {
 
         assert_eq!(api_error.code, S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()));
         assert_eq!(S3Error::from(api_error).status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    }
+
+    #[test]
+    fn write_path_normalizes_disk_error_read_quorum() {
+        // A write that only saw a narrowed DiskError quorum failure must not
+        // leak the GET-only SlowDownRead code (backlog#3145).
+        let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "unreadable");
+        err.set_source(Box::new(DiskError::ErasureReadQuorum));
+        let err = normalize_read_quorum_error(err);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
+        assert_eq!(err.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+
+        // Nested under an io::Error as well.
+        let mut err = S3Error::with_message(S3ErrorCode::Custom(SLOW_DOWN_READ_CODE.into()), "unreadable");
+        err.set_source(Box::new(IoError::other(DiskError::ErasureReadQuorum)));
+        let err = normalize_read_quorum_error(err);
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]
