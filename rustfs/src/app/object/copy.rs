@@ -256,6 +256,12 @@ impl DefaultObjectUsecase {
             validate_archive_content_encoding(&key, content_type.as_deref(), content_encoding.as_deref())?;
             let mut replacement_metadata = metadata.unwrap_or_default();
             namespace_reserved_user_metadata(&mut replacement_metadata);
+            // s3s parsed `input.metadata` before the query hoist ran, so a
+            // hoisted `x-amz-meta-*` is only visible on the headers now.
+            super::super::storage_api::object_usecase::options::extract_metadata_from_mime(
+                &req.headers,
+                &mut replacement_metadata,
+            );
             apply_standard_object_metadata(
                 &mut replacement_metadata,
                 cache_control.as_deref(),

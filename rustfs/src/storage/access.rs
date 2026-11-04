@@ -1415,6 +1415,14 @@ impl BulkDenialAudit {
 
 /// Authorizes the request based on the action and credentials.
 pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3Result<()> {
+    // Restore the `x-amz-*` request properties the SigV4 presigners hoist into
+    // the query string. This runs after s3s has verified the signature — its own
+    // verifier rejects an `x-amz-*` header outside `SignedHeaders`, which is
+    // exactly what a hoisted parameter becomes — and before policy evaluation and
+    // the handler read request properties, so every operation sees one request
+    // shape (rustfs/rustfs#9142).
+    let query = req.uri.query().map(str::to_owned);
+    crate::server::hoist_signed_query_params(&mut req.headers, query.as_deref())?;
     authorize_request_with_location_constraint(req, action, None).await
 }
 

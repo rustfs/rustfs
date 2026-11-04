@@ -4537,7 +4537,8 @@ mod tests {
             .uri(format!("/bucket/key?{query}"))
             .body(())
             .expect("request");
-        crate::server::hoist_signed_query_params(&mut req).expect("hoist");
+        let hoist_query = req.uri().query().map(str::to_owned);
+        crate::server::hoist_signed_query_params(req.headers_mut(), hoist_query.as_deref()).expect("hoist");
 
         assert!(is_put_object_extract_requested(req.headers()));
         let options = resolve_put_object_extract_options(req.headers()).unwrap();

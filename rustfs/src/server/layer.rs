@@ -1901,11 +1901,11 @@ const SIGV4_QUERY_AUTH_PARAMS: &[&str] = &[
 /// rejected rather than silently dropped or stored: the read path rebuilds them
 /// as header fields, where a control character would fail every `HeadObject` of
 /// that object.
-pub fn hoist_signed_query_params<B>(req: &mut HttpRequest<B>) -> Result<(), S3Error> {
-    let Some(query) = req.uri().query().map(str::to_owned) else {
+pub fn hoist_signed_query_params(headers: &mut HeaderMap, query: Option<&str>) -> Result<(), S3Error> {
+    let Some(query) = query.map(str::to_owned) else {
         return Ok(());
     };
-    if !crate::auth::query_string_is_signed(req.headers(), &query) {
+    if !crate::auth::query_string_is_signed(headers, &query) {
         return Ok(());
     }
     let mut seen = std::collections::HashSet::new();
@@ -1932,56 +1932,12 @@ pub fn hoist_signed_query_params<B>(req: &mut HttpRequest<B>) -> Result<(), S3Er
                 "x-amz request parameter values must be valid HTTP header values".to_owned(),
             )
         })?;
-        if req.headers().contains_key(&header_name) {
+        if headers.contains_key(&header_name) {
             continue;
         }
-        req.headers_mut().insert(header_name, header_value);
+        headers.insert(header_name, header_value);
     }
     Ok(())
-}
-
-/// Restores hoisted `x-amz-*` query parameters as request headers before s3s
-/// routes and deserializes the request. See [`hoist_signed_query_params`].
-#[derive(Clone, Default)]
-pub struct SignedQueryHoistLayer;
-
-impl<S> Layer<S> for SignedQueryHoistLayer {
-    type Service = SignedQueryHoistService<S>;
-
-    fn layer(&self, inner: S) -> Self::Service {
-        SignedQueryHoistService { inner }
-    }
-}
-
-#[derive(Clone)]
-pub struct SignedQueryHoistService<S> {
-    inner: S,
-}
-
-impl<S, ReqBody, RestBody, GrpcBody> Service<HttpRequest<ReqBody>> for SignedQueryHoistService<S>
-where
-    S: Service<HttpRequest<ReqBody>, Response = Response<HybridBody<RestBody, GrpcBody>>> + Clone + Send + 'static,
-    S::Future: Send + 'static,
-    ReqBody: Send + 'static,
-    RestBody: From<Bytes> + Send + 'static,
-    GrpcBody: Send + 'static,
-{
-    type Response = Response<HybridBody<RestBody, GrpcBody>>;
-    type Error = S::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, mut req: HttpRequest<ReqBody>) -> Self::Future {
-        if let Err(error) = hoist_signed_query_params(&mut req) {
-            let version = req.version();
-            return Box::pin(async move { Ok(sigv4_header_guard_rejection(version, error)) });
-        }
-        let mut inner = self.inner.clone();
-        Box::pin(async move { inner.call(req).await })
-    }
 }
 
 #[derive(Clone, Default)]
@@ -4262,7 +4218,8 @@ mod tests {
             .uri(format!("/bucket/key?{uri_query}"))
             .body(())
             .expect("request");
-        hoist_signed_query_params(&mut req)?;
+        let query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), query.as_deref())?;
         Ok(req)
     }
 
@@ -4289,7 +4246,8 @@ mod tests {
             .header("x-amz-meta-user-id", "from-header")
             .body(())
             .expect("request");
-        hoist_signed_query_params(&mut req).expect("hoist");
+        let query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
         assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("from-header"));
     }
 
@@ -4335,7 +4293,8 @@ mod tests {
             .header("x-amz-meta-snowball-auto-extract", "false")
             .body(())
             .expect("request");
-        hoist_signed_query_params(&mut req).expect("hoist");
+        let query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
         assert_eq!(
             req.headers()
                 .get("x-amz-meta-snowball-auto-extract")
@@ -4367,7 +4326,8 @@ mod tests {
             )
             .body(())
             .expect("request");
-        hoist_signed_query_params(&mut req).expect("hoist");
+        let query = req.uri().query().map(str::to_owned);
+        hoist_signed_query_params(req.headers_mut(), query.as_deref()).expect("hoist");
         assert_eq!(req.headers().get("x-amz-meta-user-id").and_then(|v| v.to_str().ok()), Some("u1"));
     }
 
@@ -4403,27 +4363,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn signed_query_hoist_layer_rejects_a_control_character_value() {
+    async fn hoist_then_guard_accepts_a_valid_metadata_bearing_presigned_put() {
+        // The AWS SDK presigner emits `SignedHeaders=host` and moves
+        // `x-amz-content-sha256` and `x-amz-meta-*` into the query. The hoist
+        // restores them as headers, and the unsigned-header guard must accept
+        // those headers because the signature covers the query values.
         let inner = CountingHybridService::default();
         let calls = inner.calls();
-        let mut service = SignedQueryHoistLayer.layer(inner);
+        let mut service = SigV4HeaderGuardLayer.layer(inner);
 
-        let response = service
-            .call(
-                Request::builder()
-                    .method(Method::PUT)
-                    .uri(format!("/bucket/key?{}", presigned_query("x-amz-meta-user-id=a%0d%0ab")))
-                    .body(Full::<Bytes>::from(Bytes::new()))
-                    .expect("request"),
-            )
-            .await
-            .expect("hoist response");
+        let mut query =
+            String::from("X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKID%2F20261103%2Fus-east-1%2Fs3%2Faws4_request");
+        query.push_str("&X-Amz-Date=20261103T000000Z&X-Amz-Expires=300&X-Amz-SignedHeaders=host&X-Amz-Signature=deadbeef");
+        query.push_str("&x-amz-content-sha256=UNSIGNED-PAYLOAD&x-amz-meta-user-id=u1");
 
-        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let mut request = Request::builder()
+            .method(Method::PUT)
+            .uri(format!("/repro/bucket/meta-query.csv?{query}"))
+            .header("content-type", "text/csv")
+            .body(Full::<Bytes>::from(Bytes::new()))
+            .expect("request");
+        // The authorization boundary hoists the signed query properties before
+        // the handler and before RustFS's own unsigned-header guard re-runs.
+        let request_query = request.uri().query().map(str::to_owned);
+        hoist_signed_query_params(request.headers_mut(), request_query.as_deref()).expect("hoist");
+
+        let response = service.call(request).await.expect("inner response");
+
+        let status = response.status();
         let body = BodyExt::collect(response.into_body()).await.expect("body").to_bytes();
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-        assert!(body.contains("<Code>InvalidArgument</Code>"), "body: {body}");
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "status={status} body={body}");
+        assert_eq!(status, StatusCode::IM_A_TEAPOT, "body={body}");
+    }
+
+    #[test]
+    fn hoist_rejects_a_control_character_value_with_invalid_argument() {
+        let err = hoist(&presigned_query("x-amz-meta-user-id=a%0d%0ab")).expect_err("control char");
+        assert_eq!(err.code(), &S3ErrorCode::InvalidArgument);
     }
 
     #[tokio::test]
