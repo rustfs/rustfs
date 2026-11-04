@@ -1072,7 +1072,9 @@ pub fn parse_copy_source_range(range_str: &str) -> S3Result<HTTPRangeSpec> {
 ///
 /// s3s reads the header only. The one case it does not cover is a presigned
 /// request whose digest arrives in the query string alone, which is why that
-/// path still hands the digest to the storage layer.
+/// path still hands the digest to the storage layer. The query-hoist restores
+/// only `x-amz-meta-*` user metadata (rustfs/backlog#3143), so it never
+/// manufactures the header this checks for.
 pub(crate) fn get_content_sha256_with_query(headers: &HeaderMap<HeaderValue>, query: Option<&str>) -> Option<String> {
     match get_request_auth_type_with_query(headers, query) {
         AuthType::Presigned if !headers.contains_key(AMZ_CONTENT_SHA256) => {
