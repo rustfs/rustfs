@@ -24,7 +24,7 @@ use crate::admin::{
 };
 use crate::auth::{check_key_valid_with_context, get_session_token};
 use crate::error::ApiError;
-use crate::server::{RemoteAddr, TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
+use crate::server::{TABLE_CATALOG_COMPAT_PREFIX, TABLE_CATALOG_PREFIX};
 use crate::table_catalog::{DEFAULT_WAREHOUSE_ID, TableCatalogStore};
 use bytes::Bytes;
 use futures::{StreamExt, TryStreamExt, stream};
@@ -1141,7 +1141,7 @@ async fn authorize_table_catalog_request(req: &S3Request<Body>, action: AdminAct
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        crate::admin::auth::policy_source_addr(&req.extensions),
         AdminResourceScope::bucket(""),
     )
     .await
@@ -1255,7 +1255,7 @@ async fn authorize_table_catalog_object_for_principal(
         &principal.credentials,
         principal.owner,
         Action::AdminAction(action),
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        crate::admin::auth::policy_source_addr(&req.extensions),
         AdminResourceScope::bucket_object(bucket, object),
     )
     .await

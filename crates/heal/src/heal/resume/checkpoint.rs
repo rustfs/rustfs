@@ -152,6 +152,42 @@ impl AdminErasureCheckpoint {
     }
 }
 
+/// Lightweight progress view for resume decisions. Omits the per-page object
+/// ledgers so callers do not clone a million-object checkpoint just to read
+/// counters and positions.
+#[derive(Debug, Clone, Copy)]
+pub struct CheckpointProgressSnapshot {
+    pub current_bucket_index: usize,
+    pub current_object_index: usize,
+    pub successful_objects: u64,
+    pub failed_object_count: u64,
+    pub skipped_object_count: u64,
+    pub skipped_new_versions: u64,
+    pub skipped_ilm_expired: u64,
+    pub processed_bytes: u64,
+    pub total_objects: u64,
+    pub total_bytes: u64,
+    pub baseline_generation: Option<u64>,
+    pub baseline_known: bool,
+    pub counter_unknown: bool,
+}
+
+impl CheckpointProgressSnapshot {
+    pub fn has_progress(&self) -> bool {
+        self.baseline_known
+            || self.successful_objects > 0
+            || self.failed_object_count > 0
+            || self.skipped_object_count > 0
+            || self.skipped_new_versions > 0
+            || self.skipped_ilm_expired > 0
+            || self.processed_bytes > 0
+            || self.total_objects > 0
+            || self.total_bytes > 0
+            || self.baseline_generation.is_some()
+            || self.counter_unknown
+    }
+}
+
 /// resume checkpoint
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumeCheckpoint {
@@ -713,6 +749,75 @@ impl CheckpointManager {
     /// get current checkpoint
     pub async fn get_checkpoint(&self) -> ResumeCheckpoint {
         self.checkpoint.read().await.clone()
+    }
+
+    /// True when a page object is already settled in the current ledger.
+    /// Membership is checked under the lock without cloning the checkpoint,
+    /// which used to copy every page's dedup sets on the small-object path.
+    pub async fn is_object_settled(&self, key: &str) -> bool {
+        let checkpoint = self.checkpoint.read().await;
+        checkpoint.processed_objects.contains(key)
+            || checkpoint.failed_objects.contains(key)
+            || checkpoint.skipped_objects.contains(key)
+    }
+
+    /// True when the administrator checkpoint already finished.
+    pub async fn admin_completed(&self) -> bool {
+        self.checkpoint
+            .read()
+            .await
+            .admin
+            .as_ref()
+            .is_some_and(|admin| admin.completed)
+    }
+
+    /// Current resume position without cloning the object ledgers.
+    pub async fn resume_position(&self) -> (usize, usize) {
+        let checkpoint = self.checkpoint.read().await;
+        (checkpoint.current_bucket_index, checkpoint.current_object_index)
+    }
+
+    /// Dangling-delete grace summary without cloning the object ledgers.
+    pub async fn dangling_delete_grace(&self) -> (u64, Option<u64>, bool) {
+        let checkpoint = self.checkpoint.read().await;
+        (
+            checkpoint.dangling_delete_grace_objects,
+            checkpoint.dangling_delete_retry_not_before,
+            checkpoint.counter_unknown,
+        )
+    }
+
+    /// Aggregate progress counters without cloning the page dedup sets.
+    pub async fn progress_snapshot(&self) -> CheckpointProgressSnapshot {
+        let checkpoint = self.checkpoint.read().await;
+        CheckpointProgressSnapshot {
+            current_bucket_index: checkpoint.current_bucket_index,
+            current_object_index: checkpoint.current_object_index,
+            successful_objects: checkpoint.successful_objects,
+            failed_object_count: checkpoint.failed_object_count,
+            skipped_object_count: checkpoint.skipped_object_count,
+            skipped_new_versions: checkpoint.skipped_new_versions,
+            skipped_ilm_expired: checkpoint.skipped_ilm_expired,
+            processed_bytes: checkpoint.processed_bytes,
+            total_objects: checkpoint.total_objects,
+            total_bytes: checkpoint.total_bytes,
+            baseline_generation: checkpoint.baseline_generation,
+            baseline_known: checkpoint.baseline_known,
+            counter_unknown: checkpoint.counter_unknown,
+        }
+    }
+
+    /// Finish the administrator outcome in place and persist it.
+    pub async fn complete_admin(&self) -> Result<()> {
+        let mut checkpoint = self.checkpoint.write().await;
+        let admin = checkpoint
+            .admin
+            .as_mut()
+            .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome at completion".to_string()))?;
+        admin.completed = true;
+        admin.outcome.finish(None);
+        drop(checkpoint);
+        self.save_checkpoint().await
     }
 
     /// update position

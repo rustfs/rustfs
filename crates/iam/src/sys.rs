@@ -45,6 +45,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::OnceLock;
+use subtle::ConstantTimeEq;
 use time::OffsetDateTime;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
@@ -149,6 +150,7 @@ fn get_policy_plugin_state() -> Arc<RwLock<PolicyPluginState>> {
         .clone()
 }
 
+#[derive(Clone)]
 pub struct IamSys<T> {
     store: Arc<IamCache<T>>,
     roles_map: HashMap<ARN, String>,
@@ -165,6 +167,16 @@ enum PreparedSessionPolicy {
 enum PreparedServicePolicyMode {
     Inherited,
     SessionBound,
+}
+
+tokio::task_local! {
+    static BUCKET_TAG_DELETION: ();
+}
+
+/// Scope authorization to the server's DeleteBucketTagging operation. The IAM action is shared
+/// with PutBucketTagging, so policy arguments and client headers cannot identify this repair path.
+pub async fn with_bucket_tag_deletion<F: std::future::Future>(operation: F) -> F::Output {
+    BUCKET_TAG_DELETION.scope((), operation).await
 }
 
 #[derive(Clone)]
@@ -688,6 +700,54 @@ impl<T: Store> IamSys<T> {
         Ok(updated_at)
     }
 
+    /// Publish a SigV4-derived session only while its authenticated parent is
+    /// unchanged. The parent lock spans validation and durable publication, so
+    /// rotation/deletion either precedes this check or observes the new session.
+    /// Canceling the caller does not cancel an admitted storage write or release
+    /// its parent lock before publication completes.
+    pub async fn set_temp_user_from_parent(
+        &self,
+        cred: &Credentials,
+        authenticated_parent: &Credentials,
+    ) -> Result<OffsetDateTime> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        let iam = self.clone();
+        let cred = cred.clone();
+        let authenticated_parent = authenticated_parent.clone();
+        runtime
+            .spawn(async move { iam.set_temp_user_from_parent_inner(&cred, &authenticated_parent).await })
+            .await
+            .map_err(Error::other)?
+    }
+
+    async fn set_temp_user_from_parent_inner(
+        &self,
+        cred: &Credentials,
+        authenticated_parent: &Credentials,
+    ) -> Result<OffsetDateTime> {
+        if cred.parent_user != authenticated_parent.access_key {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        let parent_lock = self.store.cache.parent_mutation_lock(&cred.parent_user);
+        let _parent_guard = parent_lock.lock().await;
+        let parent = if crate::is_root_access_key(&cred.parent_user) {
+            crate::root_credentials::credentials()
+        } else {
+            self.store.get_user(&cred.parent_user).await.map(|user| user.credentials)
+        };
+        let Some(parent) = parent else {
+            return Err(IamError::IAMActionNotAllowed);
+        };
+        if !parent.is_valid()
+            || parent.is_temp()
+            || parent.is_service_account()
+            || !bool::from(parent.secret_key.as_bytes().ct_eq(authenticated_parent.secret_key.as_bytes()))
+        {
+            return Err(IamError::IAMActionNotAllowed);
+        }
+        self.set_temp_user(&cred.access_key, cred, None).await
+    }
+
     pub async fn is_temp_user(&self, name: &str) -> Result<(bool, String)> {
         let Some(u) = self.store.get_user(name).await else {
             return Err(IamError::NoSuchUser(name.to_string()));
@@ -753,6 +813,13 @@ impl<T: Store> IamSys<T> {
         opts: NewServiceAccountOpts,
         updated_at: OffsetDateTime,
     ) -> Result<(Credentials, OffsetDateTime)> {
+        if !opts.access_key.is_empty()
+            && (opts.access_key.trim() == "."
+                || opts.access_key.trim() == ".."
+                || opts.access_key.chars().any(|ch| ch.is_control() || matches!(ch, '/' | '\\')))
+        {
+            return Err(IamError::InvalidArgument);
+        }
         if parent_user.is_empty() {
             return Err(IamError::InvalidArgument);
         }
@@ -983,7 +1050,7 @@ impl<T: Store> IamSys<T> {
             }
         };
 
-        if !sa.credentials.is_temp() {
+        if sa.credentials.is_service_account() || !sa.credentials.is_temp() {
             return Err(IamError::NoSuchTempAccount(access_key.to_string()));
         }
 
@@ -1061,7 +1128,34 @@ impl<T: Store> IamSys<T> {
 
     /// [`Self::create_user`] stamping the identity with `updated_at` (a
     /// replicated edit's source time) instead of the local clock (backlog#2291).
+    /// Once admitted, persistence and session revocation continue if the caller
+    /// stops waiting. A revocation error can follow a persisted secret change.
     pub async fn create_user_at(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<OffsetDateTime> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        let iam = self.clone();
+        let access_key = access_key.to_string();
+        let args = args.clone();
+        #[cfg(test)]
+        let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
+        let operation = async move { iam.create_user_at_inner(&access_key, &args, updated_at).await };
+        #[cfg(test)]
+        let task = runtime.spawn(async move {
+            if let Some(probe) = notification_probe {
+                return crate::LOAD_USER_NOTIFICATION_PROBE.scope(probe, operation).await;
+            }
+            operation.await
+        });
+        #[cfg(not(test))]
+        let task = runtime.spawn(operation);
+        task.await.map_err(Error::other)?
+    }
+
+    async fn create_user_at_inner(
         &self,
         access_key: &str,
         args: &AddOrUpdateUserReq,
@@ -1079,9 +1173,15 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        let updated_at = self.store.add_user_at(access_key, args, updated_at).await?;
+        let (updated_at, secret_changed, parent_guard) = self
+            .store
+            .add_user_at_with_secret_change(access_key, args, updated_at)
+            .await?;
+        if secret_changed {
+            self.revoke_sts_sessions_for_parent(access_key).await?;
+        }
+        drop(parent_guard);
         self.load_user(access_key, UserType::Reg).await?;
-
         self.notify_for_user(access_key, false).await;
 
         Ok(updated_at)
@@ -1092,6 +1192,71 @@ impl<T: Store> IamSys<T> {
         access_key: &str,
         secret_key: &str,
     ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus)> {
+        self.rotate_user_secret_key(access_key, secret_key)
+            .await
+            .map(|(updated_at, status, _revoked)| (updated_at, status))
+    }
+
+    /// Rotate a secret and revoke its STS sessions under one parent mutation lock.
+    /// A revocation error is returned after the new secret has been persisted;
+    /// callers must not report the rotation as fully completed in that case.
+    /// An admitted rotation continues through revocation after caller cancellation.
+    pub async fn rotate_user_secret_key(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
+        self.rotate_user_secret_key_checked(access_key, secret_key, None).await
+    }
+
+    /// Change an enabled regular caller's secret only if its signing secret is
+    /// still current under the parent mutation lock. Status and policies are kept.
+    /// Persistence and revocation continue after caller cancellation.
+    pub async fn change_own_secret_key(
+        &self,
+        access_key: &str,
+        expected_secret: &str,
+        secret_key: &str,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
+        self.rotate_user_secret_key_checked(access_key, secret_key, Some(expected_secret))
+            .await
+    }
+
+    async fn rotate_user_secret_key_checked(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        expected_secret: Option<&str>,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        let iam = self.clone();
+        let access_key = access_key.to_string();
+        let secret_key = secret_key.to_string();
+        let expected_secret = expected_secret.map(str::to_string);
+        #[cfg(test)]
+        let notification_probe = crate::LOAD_USER_NOTIFICATION_PROBE.try_with(Arc::clone).ok();
+        let operation = async move {
+            iam.rotate_user_secret_key_inner(&access_key, &secret_key, expected_secret.as_deref())
+                .await
+        };
+        #[cfg(test)]
+        let task = runtime.spawn(async move {
+            if let Some(probe) = notification_probe {
+                return crate::LOAD_USER_NOTIFICATION_PROBE.scope(probe, operation).await;
+            }
+            operation.await
+        });
+        #[cfg(not(test))]
+        let task = runtime.spawn(operation);
+        task.await.map_err(Error::other)?
+    }
+
+    async fn rotate_user_secret_key_inner(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        expected_secret: Option<&str>,
+    ) -> Result<(OffsetDateTime, rustfs_madmin::AccountStatus, usize)> {
         if !is_access_key_valid(access_key) {
             return Err(IamError::InvalidAccessKeyLength);
         }
@@ -1100,9 +1265,14 @@ impl<T: Store> IamSys<T> {
             return Err(IamError::InvalidSecretKeyLength);
         }
 
-        let (updated_at, status) = self.store.update_user_secret_key(access_key, secret_key).await?;
+        let (updated_at, status, parent_guard) = self
+            .store
+            .update_user_secret_key_with_guard(access_key, secret_key, expected_secret)
+            .await?;
+        let revoked = self.revoke_sts_sessions_for_parent(access_key).await?;
+        drop(parent_guard);
         self.notify_for_user(access_key, false).await;
-        Ok((updated_at, status))
+        Ok((updated_at, status, revoked))
     }
 
     /// Add SSH public key for a user (for SFTP authentication)
@@ -1143,6 +1313,11 @@ impl<T: Store> IamSys<T> {
                 }
             }
         }
+    }
+
+    /// Current built-in IAM groups for a user or a derived credential's parent.
+    pub fn user_group_memberships(&self, name: &str) -> Vec<String> {
+        self.store.user_group_memberships(name)
     }
 
     pub async fn get_user(&self, access_key: &str) -> Option<UserIdentity> {
@@ -1275,6 +1450,15 @@ impl<T: Store> IamSys<T> {
         self.store.policy_db_get(name, groups).await
     }
 
+    /// Resolve STS policies while preserving whether an explicit identity mapping supplied them.
+    pub async fn sts_policy_db_get_with_identity_mapping(
+        &self,
+        name: &str,
+        groups: &Option<Vec<String>>,
+    ) -> Result<(Vec<String>, bool)> {
+        self.store.sts_policy_db_get_with_identity_mapping(name, groups).await
+    }
+
     pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
         self.store.sts_policy_db_get(name, groups).await
     }
@@ -1358,15 +1542,72 @@ impl<T: Store> IamSys<T> {
         Ok(Some(verified_claims))
     }
 
+    /// Create within the authenticated caller's scope and current parent revision.
+    /// An admitted write owns its parent lock until publication even if the caller
+    /// stops waiting; errors never publish a credential from a changed parent.
     pub async fn new_service_account_from_caller(
+        &self,
+        parent_user: &str,
+        groups: Option<Vec<String>>,
+        opts: NewServiceAccountOpts,
+        caller: &Credentials,
+    ) -> Result<(Credentials, OffsetDateTime, HashMap<String, Value>)> {
+        let runtime = tokio::runtime::Handle::try_current().map_err(Error::other)?;
+        let iam = self.clone();
+        let parent_user = parent_user.to_string();
+        let caller = caller.clone();
+        runtime
+            .spawn(async move {
+                iam.new_service_account_from_caller_inner(&parent_user, groups, opts, &caller)
+                    .await
+            })
+            .await
+            .map_err(Error::other)?
+    }
+
+    async fn new_service_account_from_caller_inner(
         &self,
         parent_user: &str,
         groups: Option<Vec<String>>,
         mut opts: NewServiceAccountOpts,
         caller: &Credentials,
     ) -> Result<(Credentials, OffsetDateTime, HashMap<String, Value>)> {
-        if parent_user != caller.access_key && parent_user != caller.parent_user {
+        if parent_user != caller.access_key && parent_user != caller.parent_user && !crate::is_root_access_key(&caller.access_key)
+        {
             return Err(IamError::IAMActionNotAllowed);
+        }
+
+        let parent_lock = self.store.cache.parent_mutation_lock(parent_user);
+        let _parent_guard = parent_lock.lock().await;
+        let federated_parent = if caller.is_service_account() {
+            is_valid_verified_federated_policy(caller.claims_or_empty(), parent_user)
+        } else {
+            is_verified_or_legacy_federated_session(caller.claims_or_empty(), parent_user)
+        };
+        if !crate::is_root_access_key(parent_user) && !federated_parent {
+            let Some(parent) = self.store.get_user(parent_user).await else {
+                return Err(IamError::IAMActionNotAllowed);
+            };
+            if !parent.credentials.is_valid()
+                || parent.credentials.is_temp()
+                || parent.credentials.is_service_account()
+                || (caller.access_key == parent_user
+                    && !bool::from(parent.credentials.secret_key.as_bytes().ct_eq(caller.secret_key.as_bytes())))
+            {
+                return Err(IamError::IAMActionNotAllowed);
+            }
+        }
+
+        if !federated_parent && caller.access_key != parent_user && !crate::is_root_access_key(&caller.access_key) {
+            let Some(current) = self.store.get_user(&caller.access_key).await else {
+                return Err(IamError::IAMActionNotAllowed);
+            };
+            if !current.credentials.is_valid()
+                || current.credentials.parent_user != parent_user
+                || !bool::from(current.credentials.secret_key.as_bytes().ct_eq(caller.secret_key.as_bytes()))
+            {
+                return Err(IamError::IAMActionNotAllowed);
+            }
         }
 
         let verified_federated_policy = if caller.is_service_account() {
@@ -1486,10 +1727,41 @@ impl<T: Store> IamSys<T> {
             };
         }
         if let Some(prepared) = state.prepared_iam_auth() {
+            if matches!(prepared.mode, PreparedIamMode::Opa) && !self.external_auth_identity_is_active(args).await {
+                return PreparedIamAuth {
+                    needs_existing_object_tag: false,
+                    mode: PreparedIamMode::TerminalDeny,
+                };
+            }
             return prepared;
         }
         self.prepare_builtin_auth(args).await
     }
+    async fn external_auth_identity_is_active(&self, args: &Args<'_>) -> bool {
+        let Some(user) = self.store.get_user(args.account).await else {
+            // Anonymous and external identities can be authorized by the plugin;
+            // a derived credential that disappeared from IAM cannot.
+            return !args.claims.contains_key("parent");
+        };
+        let credentials = &user.credentials;
+        if !credentials.is_valid() {
+            return false;
+        }
+        if !credentials.is_service_account() && !credentials.is_temp() {
+            return true;
+        }
+        let parent = &credentials.parent_user;
+        let federated = if credentials.is_service_account() {
+            is_valid_verified_federated_policy(args.claims, parent)
+        } else {
+            is_verified_or_legacy_federated_session(args.claims, parent)
+        };
+        if federated || crate::is_root_access_key(parent) {
+            return true;
+        }
+        matches!(self.check_key(parent).await, Ok((Some(_), true)))
+    }
+
     async fn prepare_builtin_auth(&self, args: &Args<'_>) -> PreparedIamAuth {
         let Ok((is_svc, parent_user)) = self.is_service_account(args.account).await else {
             return PreparedIamAuth {
@@ -1544,7 +1816,20 @@ impl<T: Store> IamSys<T> {
                 let tags = if args.bucket.is_empty() {
                     HashMap::new()
                 } else {
-                    self.store.api.load_bucket_tags(args.bucket).await?
+                    match self.store.api.load_bucket_tags(args.bucket).await {
+                        Ok(tags) => tags,
+                        Err(error)
+                            if args.action
+                                == rustfs_policy::policy::action::Action::S3Action(
+                                    rustfs_policy::policy::action::S3Action::PutBucketTaggingAction,
+                                )
+                                && BUCKET_TAG_DELETION.try_with(|()| true).unwrap_or(false)
+                                && crate::storage_api::is_unreadable_bucket_tags(&error) =>
+                        {
+                            HashMap::new()
+                        }
+                        Err(error) => return Err(error),
+                    }
                 };
                 let conditions = opa_bucket_tag_conditions(args.conditions, tags);
                 opa_enable
@@ -2008,6 +2293,9 @@ pub fn is_safe_claim_policy_name(policy: &str) -> bool {
     has_alnum
 }
 
+/// Verified upstream issuer preserved separately from RustFS's session marker.
+pub const OIDC_ISSUER_CLAIM: &str = "x-rustfs-internal-oidc-issuer";
+
 pub fn is_rustfs_oidc_claims(claims: &HashMap<String, Value>) -> bool {
     claims.get("iss").and_then(Value::as_str) == Some("rustfs-oidc")
         && claims
@@ -2379,6 +2667,86 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn opa_cannot_authorize_disabled_parents_of_derived_credentials() {
+        let iam = IamSys::new(IamCache::new(StsTestMockStore::new(false)).await.expect("initialize IAM"));
+        let previous = IamSys::<StsTestMockStore>::policy_plugin_state().await;
+        IamSys::<StsTestMockStore>::set_policy_plugin_client(opa::AuthZPlugin::new(opa::Args {
+            url: "http://127.0.0.1:1/allow".to_string(),
+            auth_token: String::new(),
+        }))
+        .await;
+        let mut outcomes = Vec::new();
+        for (service_account, spoofed_oidc_claims) in [(false, false), (true, false), (true, true)] {
+            let parent = "opa-disabled-parent";
+            let account = if service_account {
+                "opa-service-child"
+            } else {
+                "opa-session-child"
+            };
+            let mut parent_identity = UserIdentity::new(Credentials {
+                access_key: parent.to_string(),
+                secret_key: "parent-secret".to_string(),
+                status: ACCOUNT_ON.to_string(),
+                ..Default::default()
+            });
+            let mut claims = HashMap::from([("parent".to_string(), Value::String(parent.to_string()))]);
+            if service_account {
+                claims.insert(iam_policy_claim_name_sa(), Value::String(INHERITED_POLICY_TYPE.to_string()));
+            }
+            if spoofed_oidc_claims {
+                claims.extend([
+                    ("iss".to_string(), Value::String("rustfs-oidc".to_string())),
+                    ("oidc_provider".to_string(), Value::String("custom-provider".to_string())),
+                    ("sub".to_string(), Value::String("custom-subject".to_string())),
+                ]);
+            }
+            let child = UserIdentity::new(Credentials {
+                access_key: account.to_string(),
+                secret_key: "child-secret".to_string(),
+                session_token: "signed-session".to_string(),
+                parent_user: parent.to_string(),
+                status: ACCOUNT_ON.to_string(),
+                claims: Some(claims.clone()),
+                ..Default::default()
+            });
+            iam.store.cache.add_or_update_user(account, &child, OffsetDateTime::now_utc());
+            let conditions = HashMap::new();
+            let args = Args {
+                account,
+                groups: &None,
+                action: Action::S3Action(S3Action::GetObjectAction),
+                bucket: "bucket",
+                object: "object",
+                conditions: &conditions,
+                claims: &claims,
+                is_owner: false,
+                deny_only: false,
+            };
+            for enabled in [true, false, true] {
+                parent_identity.credentials.status = if enabled { "on" } else { "off" }.to_string();
+                iam.store
+                    .cache
+                    .add_or_update_user(parent, &parent_identity, OffsetDateTime::now_utc());
+                let prepared = iam.prepare_auth(&args).await;
+                let correct = if enabled {
+                    matches!(prepared.mode, PreparedIamMode::Opa)
+                } else {
+                    matches!(iam.try_eval_prepared(&prepared, &args).await, Err(Error::IAMActionNotAllowed))
+                };
+                outcomes.push((service_account, spoofed_oidc_claims, enabled, correct));
+            }
+        }
+        *get_policy_plugin_state().write().await = previous;
+        for (service_account, spoofed_oidc_claims, enabled, correct) in outcomes {
+            assert!(
+                correct,
+                "service_account={service_account}, spoofed_oidc_claims={spoofed_oidc_claims}, parent_enabled={enabled}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn test_prepare_auth_requests_existing_object_tags_in_opa_mode() {
         let store = StsTestMockStore::new(false);
         let iam_sys = IamSys::new(IamCache::new(store).await.expect("initialize IAM cache"));
@@ -2542,7 +2910,7 @@ mod tests {
         let url = format!("http://{}/decision", listener.local_addr().expect("receiver address"));
         let receiver = tokio::spawn(async move {
             let mut payloads = Vec::new();
-            for _ in 0..5 {
+            for decision_index in 0..7 {
                 let (stream, _) = listener.accept().await.expect("accept OPA request");
                 let mut stream = BufReader::new(stream);
                 let mut length = None;
@@ -2561,11 +2929,16 @@ mod tests {
                 let mut body = vec![0; length.expect("OPA JSON has a content length")];
                 stream.read_exact(&mut body).await.expect("read complete OPA body");
                 payloads.push(serde_json::from_slice::<serde_json::Value>(&body).expect("OPA JSON"));
-                stream
-                    .get_mut()
-                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 15\r\nConnection: close\r\n\r\n{\"result\":true}")
-                    .await
-                    .expect("send decision");
+                let decision = if decision_index == 6 {
+                    "{\"result\":false}"
+                } else {
+                    "{\"result\":true}"
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{decision}",
+                    decision.len()
+                );
+                stream.get_mut().write_all(response.as_bytes()).await.expect("send decision");
             }
             payloads
         });
@@ -2632,12 +3005,31 @@ mod tests {
                 let prepared = iam.prepare_auth(&args).await;
                 let error = iam.try_eval_prepared(&prepared, &args).await;
                 let denied = !iam.eval_prepared(&prepared, &args).await;
+                args.action = Action::S3Action(S3Action::PutBucketTaggingAction);
+                assert!(
+                    !with_bucket_tag_deletion(iam.is_allowed(&args)).await,
+                    "storage failures must still prevent tag deletion"
+                );
+                for _ in 0..2 {
+                    *store.bucket_tags.lock().expect("tag state") =
+                        Err(Error::from(crate::IamStorageError::other(crate::storage_api::UnreadableBucketConfig {
+                            bucket: args.bucket.to_owned(),
+                            config_file: "tagging.xml".to_owned(),
+                            raw_len: 42,
+                        })));
+                    assert!(!iam.is_allowed(&args).await, "ordinary PutBucketTagging must not bypass unreadable tags");
+                    outcomes.push(with_bucket_tag_deletion(iam.is_allowed(&args)).await);
+                }
                 *get_policy_plugin_state().write().await = previous;
                 (outcomes, error, denied)
             },
         )
         .await;
-        assert_eq!(outcomes, [true; 5]);
+        assert_eq!(
+            outcomes,
+            [true, true, true, true, true, true, false],
+            "OPA must still authorize deletion of unreadable tags"
+        );
         assert!(
             matches!(error, Err(Error::Io(_))),
             "lookup failure must remain an error, not an implicit denial"
@@ -2684,6 +3076,12 @@ mod tests {
         block_delete: Arc<std::sync::atomic::AtomicBool>,
         delete_started: Arc<tokio::sync::Notify>,
         release_delete: Arc<tokio::sync::Notify>,
+        block_regular_save: Arc<std::sync::atomic::AtomicBool>,
+        regular_save_started: Arc<tokio::sync::Notify>,
+        release_regular_save: Arc<tokio::sync::Notify>,
+        block_derived_save: Arc<std::sync::atomic::AtomicBool>,
+        derived_save_started: Arc<tokio::sync::Notify>,
+        release_derived_save: Arc<tokio::sync::Notify>,
         block_group_save: Arc<std::sync::atomic::AtomicBool>,
         group_save_started: Arc<tokio::sync::Notify>,
         group_save_release: Arc<tokio::sync::Notify>,
@@ -2701,6 +3099,12 @@ mod tests {
                 block_delete: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 delete_started: Arc::new(tokio::sync::Notify::new()),
                 release_delete: Arc::new(tokio::sync::Notify::new()),
+                block_regular_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                regular_save_started: Arc::new(tokio::sync::Notify::new()),
+                release_regular_save: Arc::new(tokio::sync::Notify::new()),
+                block_derived_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                derived_save_started: Arc::new(tokio::sync::Notify::new()),
+                release_derived_save: Arc::new(tokio::sync::Notify::new()),
                 block_group_save: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 group_save_started: Arc::new(tokio::sync::Notify::new()),
                 group_save_release: Arc::new(tokio::sync::Notify::new()),
@@ -2717,8 +3121,20 @@ mod tests {
 
     #[async_trait::async_trait]
     impl Store for StsTestMockStore {
-        async fn load_bucket_tags(&self, _bucket: &str) -> Result<HashMap<String, String>> {
-            self.bucket_tags.lock().expect("tag state").clone()
+        async fn load_bucket_tags(&self, bucket: &str) -> Result<HashMap<String, String>> {
+            let tags = self.bucket_tags.lock().expect("tag state");
+            // Error::clone stringifies IO errors; retain the typed storage refusal
+            // so this fixture exercises the same recovery decision as ObjectStore.
+            if tags.as_ref().is_err_and(crate::storage_api::is_unreadable_bucket_tags) {
+                return Err(Error::from(crate::storage_api::IamStorageError::other(
+                    crate::storage_api::UnreadableBucketConfig {
+                        bucket: bucket.to_string(),
+                        config_file: "tagging.xml".to_string(),
+                        raw_len: 42,
+                    },
+                )));
+            }
+            tags.clone()
         }
 
         fn has_watcher(&self) -> bool {
@@ -2744,6 +3160,16 @@ mod tests {
             item: UserIdentity,
             _ttl: Option<usize>,
         ) -> Result<()> {
+            if user_type == UserType::Reg && self.block_regular_save.load(std::sync::atomic::Ordering::SeqCst) {
+                self.regular_save_started.notify_one();
+                self.release_regular_save.notified().await;
+            }
+            if matches!(user_type, UserType::Svc | UserType::Sts)
+                && self.block_derived_save.load(std::sync::atomic::Ordering::SeqCst)
+            {
+                self.derived_save_started.notify_one();
+                self.release_derived_save.notified().await;
+            }
             if user_type == UserType::Svc {
                 *self
                     .saved_service_account_count
@@ -2798,6 +3224,18 @@ mod tests {
                     ..Default::default()
                 });
                 m.insert(name.to_string(), user);
+            }
+            if let Some(user) = self.saved_sts_users.lock().expect("saved users").get(name) {
+                let stored_type = if user.credentials.is_service_account() {
+                    UserType::Svc
+                } else if !user.credentials.session_token.is_empty() {
+                    UserType::Sts
+                } else {
+                    UserType::Reg
+                };
+                if user_type == stored_type {
+                    m.insert(name.to_string(), user.clone());
+                }
             }
             Ok(())
         }
@@ -2903,6 +3341,20 @@ mod tests {
                 Policy::parse_config(CUSTOM_STS_CLAIM_POLICY_JSON.as_bytes()).expect("custom STS claim policy should parse");
             policy_docs.insert(CUSTOM_STS_CLAIM_POLICY.to_string(), PolicyDoc::new(custom_claim_policy));
 
+            // Background reloads must observe the identities this mock persisted.
+            // Keep the mock storage lock through publication, just as its writes
+            // are serialized, instead of resetting live identities to seed data.
+            let saved = self.saved_sts_users.lock().expect("saved users");
+            let mut saved_users = HashMap::new();
+            let mut saved_sessions = HashMap::new();
+            for (key, identity) in saved.iter() {
+                if !identity.credentials.session_token.is_empty() && !identity.credentials.is_service_account() {
+                    saved_sessions.insert(key.clone(), identity.clone());
+                } else {
+                    saved_users.insert(key.clone(), identity.clone());
+                }
+            }
+
             if self.empty_policies {
                 const PARENT_USER: &str = "sts-empty-parent-policy-test";
                 let creds = Credentials {
@@ -2924,6 +3376,7 @@ mod tests {
                 };
                 let mut users = HashMap::new();
                 users.insert(PARENT_USER.to_string(), parent_identity);
+                users.extend(saved_users);
 
                 cache.with_write_lock(|cache| {
                     cache.replace_policy_docs(CacheEntity::new(policy_docs));
@@ -2931,7 +3384,7 @@ mod tests {
                     cache.replace_groups(CacheEntity::default());
                     cache.replace_group_policies(CacheEntity::default());
                     cache.replace_user_policies(CacheEntity::default());
-                    cache.replace_sts_accounts(CacheEntity::default());
+                    cache.replace_sts_accounts(CacheEntity::new(saved_sessions));
                     cache.replace_sts_policies(CacheEntity::default());
                     cache.build_user_group_memberships();
                 });
@@ -2960,6 +3413,7 @@ mod tests {
             };
             let mut users = HashMap::new();
             users.insert(PARENT_USER.to_string(), parent_identity);
+            users.extend(saved_users);
 
             let group = GroupInfo::new(vec![PARENT_USER.to_string()]);
             let mut groups = HashMap::new();
@@ -2975,7 +3429,7 @@ mod tests {
                 cache.replace_groups(CacheEntity::new(groups));
                 cache.replace_group_policies(CacheEntity::new(group_policies));
                 cache.replace_user_policies(CacheEntity::default());
-                cache.replace_sts_accounts(CacheEntity::default());
+                cache.replace_sts_accounts(CacheEntity::new(saved_sessions));
                 cache.replace_sts_policies(CacheEntity::default());
                 cache.build_user_group_memberships();
             });
@@ -3307,6 +3761,547 @@ mod tests {
             .expect_err("duplicate service account should fail");
 
         assert_eq!(err, Error::AccessKeyAlreadyExists);
+    }
+
+    #[tokio::test]
+    async fn service_account_creation_rejects_invalid_path_components_before_storage() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+        for key in [
+            "nul\0key",
+            "slash/key",
+            "back\\slash",
+            ".",
+            "..",
+            " . ",
+            "line\nkey",
+            "del\u{7f}key",
+            "c1\u{85}key",
+        ] {
+            let error = iam_sys
+                .new_service_account("svc-parent-user", None, service_account_opts(key, "serviceAccountSecret123"))
+                .await
+                .expect_err("invalid access keys must not reach persistent storage");
+            assert_eq!(error, Error::InvalidArgument, "{key:?}");
+        }
+        assert_eq!(iam_sys.store.api.saved_service_account_count(), 0);
+        iam_sys
+            .new_service_account("svc-parent-user", None, service_account_opts("valid-svc-key", "serviceAccountSecret123"))
+            .await
+            .expect("a valid service account remains creatable after rejected keys");
+        assert_eq!(iam_sys.store.api.saved_service_account_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn temporary_account_lookup_rejects_service_account_credentials() {
+        ensure_test_global_credentials();
+        let iam_sys = test_iam_sys().await;
+        let mut opts = service_account_opts("expiring-service-key", "serviceAccountSecret123");
+        opts.expiration = Some(OffsetDateTime::now_utc() + time::Duration::hours(1));
+        let (created, _) = iam_sys
+            .new_service_account("svc-parent-user", None, opts)
+            .await
+            .expect("create an expiring service account");
+        assert!(created.is_temp(), "session-token shape alone cannot distinguish service accounts");
+        let error = iam_sys
+            .get_temporary_account(&created.access_key)
+            .await
+            .expect_err("temporary-account permission must not expose service accounts");
+        assert!(matches!(error, Error::NoSuchTempAccount(_)));
+        let (service, _) = iam_sys
+            .get_service_account(&created.access_key)
+            .await
+            .expect("service-account lookup remains available");
+        assert_eq!(service.access_key, created.access_key);
+    }
+
+    fn rotation_test_session(parent: &str, key: &str) -> Credentials {
+        Credentials {
+            access_key: key.to_string(),
+            secret_key: "derivedSessionSecret123".to_string(),
+            session_token: "signed-session".to_string(),
+            expiration: Some(OffsetDateTime::now_utc() + time::Duration::hours(1)),
+            status: ACCOUNT_ON.to_string(),
+            parent_user: parent.to_string(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn add_user_rejects_active_and_expired_derived_access_keys() {
+        let iam = test_iam_sys().await;
+        let args = AddOrUpdateUserReq {
+            secret_key: "replacementSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+        for service in [false, true] {
+            for expired in [false, true] {
+                let key = format!("collision-{service}-{expired}");
+                let mut child = rotation_test_session("existing-parent", &key);
+                if expired {
+                    child.expiration = Some(OffsetDateTime::UNIX_EPOCH);
+                }
+                if service {
+                    child.claims = Some(HashMap::from([(
+                        iam_policy_claim_name_sa(),
+                        Value::String(INHERITED_POLICY_TYPE.to_string()),
+                    )]));
+                }
+                // This fixture represents a persisted identity. The immediate
+                // background reload must not erase a cache-only insertion.
+                iam.store
+                    .api
+                    .save_user_identity(
+                        &key,
+                        if service { UserType::Svc } else { UserType::Sts },
+                        UserIdentity::new(child.clone()),
+                        None,
+                    )
+                    .await
+                    .expect("persist derived identity");
+                if service {
+                    iam.store
+                        .cache
+                        .add_or_update_user(&key, &UserIdentity::new(child.clone()), OffsetDateTime::now_utc());
+                } else {
+                    iam.store
+                        .cache
+                        .add_or_update_sts_account(&key, &UserIdentity::new(child.clone()), OffsetDateTime::now_utc());
+                }
+                assert_eq!(
+                    iam.create_user(&key, &args).await.expect_err("reject derived key"),
+                    Error::AccessKeyAlreadyExists
+                );
+                assert_eq!(
+                    iam.get_user(&key).await.expect("preserved identity").credentials.secret_key,
+                    child.secret_key
+                );
+                assert_eq!(
+                    iam.store
+                        .api
+                        .saved_sts_users
+                        .lock()
+                        .expect("saved users")
+                        .get(&key)
+                        .expect("preserved persistent identity")
+                        .credentials
+                        .secret_key,
+                    child.secret_key,
+                    "a rejected collision must not overwrite the persisted derived identity"
+                );
+            }
+        }
+        iam.create_user("regular-update", &args).await.expect("create regular user");
+        iam.create_user("regular-update", &args)
+            .await
+            .expect("regular user update remains supported");
+    }
+
+    #[tokio::test]
+    async fn add_user_secret_rotation_revokes_sessions_but_identical_secret_does_not() {
+        let iam = test_iam_sys().await;
+        let parent = "rotation-parent";
+        let mut args = AddOrUpdateUserReq {
+            secret_key: "originalParentSecret123".to_string(),
+            policy: None,
+            status: rustfs_madmin::AccountStatus::Enabled,
+        };
+        iam.create_user(parent, &args).await.expect("create parent");
+        let authenticated = iam.get_user(parent).await.expect("parent").credentials;
+        let child = rotation_test_session(parent, "rotation-session");
+        iam.set_temp_user_from_parent(&child, &authenticated)
+            .await
+            .expect("mint session");
+        iam.create_user(parent, &args).await.expect("same secret is idempotent");
+        assert!(iam.get_user(&child.access_key).await.is_some());
+        args.secret_key = "replacementParentSecret123".to_string();
+        let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+        crate::LOAD_USER_NOTIFICATION_PROBE
+            .scope(probe, iam.create_user(parent, &args))
+            .await
+            .expect("rotate via add-user");
+        assert!(iam.get_user(&child.access_key).await.is_none());
+        assert!(
+            !iam.store
+                .api
+                .saved_sts_users
+                .lock()
+                .expect("saved users")
+                .contains_key(&child.access_key)
+        );
+        assert!(matches!(
+            iam.set_temp_user_from_parent(&child, &authenticated).await,
+            Err(Error::IAMActionNotAllowed)
+        ));
+    }
+
+    #[tokio::test]
+    async fn self_secret_change_cannot_undo_concurrent_disable_rotation_or_deletion() {
+        ensure_test_global_credentials();
+        for mutation in ["disable", "rotate", "delete"] {
+            let store = StsTestMockStore::new(false);
+            let iam = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM")));
+            let parent = "self-change-parent";
+            let original = "originalParentSecret123";
+            iam.create_user(
+                parent,
+                &AddOrUpdateUserReq {
+                    secret_key: original.to_string(),
+                    policy: None,
+                    status: rustfs_madmin::AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("create parent");
+            if mutation == "delete" {
+                store.block_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+            } else {
+                store.block_regular_save.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            let administrator = {
+                let iam = Arc::clone(&iam);
+                tokio::spawn(async move {
+                    match mutation {
+                        "delete" => iam.delete_user(parent, false).await,
+                        "disable" => iam
+                            .set_user_status(parent, rustfs_madmin::AccountStatus::Disabled)
+                            .await
+                            .map(|_| ()),
+                        _ => iam.rotate_user_secret_key(parent, "administratorSecret123").await.map(|_| ()),
+                    }
+                })
+            };
+            let started = if mutation == "delete" {
+                &store.delete_started
+            } else {
+                &store.regular_save_started
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), started.notified())
+                .await
+                .expect("admin storage barrier");
+            let stale_self = {
+                let iam = Arc::clone(&iam);
+                tokio::spawn(async move { iam.change_own_secret_key(parent, original, "attackerChosenSecret123").await })
+            };
+            assert!(iam.store.cache.parent_mutation_lock(parent).try_lock().is_err());
+            store.block_delete.store(false, std::sync::atomic::Ordering::SeqCst);
+            store.block_regular_save.store(false, std::sync::atomic::Ordering::SeqCst);
+            if mutation == "delete" {
+                store.release_delete.notify_one();
+            } else {
+                store.release_regular_save.notify_one();
+            }
+            tokio::time::timeout(std::time::Duration::from_secs(5), administrator)
+                .await
+                .expect("admin finishes")
+                .expect("admin join")
+                .expect("admin mutation");
+            let error = tokio::time::timeout(std::time::Duration::from_secs(5), stale_self)
+                .await
+                .expect("self finishes")
+                .expect("self join")
+                .expect_err("stale self change must fail");
+            assert_eq!(error, Error::IAMActionNotAllowed);
+            let cached = iam.store.get_user(parent).await;
+            let persisted = store.saved_sts_users.lock().expect("saved users").get(parent).cloned();
+            for identity in [cached, persisted] {
+                match mutation {
+                    "delete" => assert!(identity.is_none(), "self request must not resurrect a removed identity"),
+                    "disable" => {
+                        let cred = identity.expect("disabled identity").credentials;
+                        assert!(!cred.is_valid());
+                        assert_eq!(cred.secret_key, original);
+                    }
+                    _ => assert_eq!(identity.expect("rotated identity").credentials.secret_key, "administratorSecret123"),
+                }
+            }
+        }
+        let iam = test_iam_sys().await;
+        iam.create_user(
+            "self-positive",
+            &AddOrUpdateUserReq {
+                secret_key: "originalParentSecret123".to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent");
+        let (_, status, _) = iam
+            .change_own_secret_key("self-positive", "originalParentSecret123", "replacementParentSecret123")
+            .await
+            .expect("current enabled caller may rotate");
+        assert_eq!(status, rustfs_madmin::AccountStatus::Enabled);
+        assert_eq!(
+            iam.get_user("self-positive")
+                .await
+                .expect("updated user")
+                .credentials
+                .secret_key,
+            "replacementParentSecret123"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_rotation_and_add_user_finish_revocation_after_caller_cancellation() {
+        ensure_test_global_credentials();
+        for via_add_user in [false, true] {
+            let store = StsTestMockStore::new(false);
+            let iam = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM")));
+            let parent = "cancel-rotation-parent";
+            let mut args = AddOrUpdateUserReq {
+                secret_key: "originalParentSecret123".to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            };
+            iam.create_user(parent, &args).await.expect("create parent");
+            let authenticated = iam.get_user(parent).await.expect("parent").credentials;
+            let session = rotation_test_session(parent, "cancel-rotation-session");
+            iam.set_temp_user_from_parent(&session, &authenticated)
+                .await
+                .expect("mint session");
+            args.secret_key = "replacementParentSecret123".to_string();
+            store.block_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+            let rotation = {
+                let iam = Arc::clone(&iam);
+                tokio::spawn(async move {
+                    let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+                    crate::LOAD_USER_NOTIFICATION_PROBE
+                        .scope(probe, async {
+                            if via_add_user {
+                                iam.create_user(parent, &args).await.map(|_| ())
+                            } else {
+                                iam.rotate_user_secret_key(parent, &args.secret_key).await.map(|_| ())
+                            }
+                        })
+                        .await
+                })
+            };
+            tokio::time::timeout(std::time::Duration::from_secs(5), store.delete_started.notified())
+                .await
+                .expect("rotation reached revocation");
+            rotation.abort();
+            assert!(rotation.await.expect_err("caller canceled").is_cancelled());
+            assert!(
+                iam.store.cache.parent_mutation_lock(parent).try_lock().is_err(),
+                "canceling the caller must not release the rotation lock"
+            );
+            store.block_delete.store(false, std::sync::atomic::Ordering::SeqCst);
+            store.release_delete.notify_one();
+            let parent_lock = iam.store.cache.parent_mutation_lock(parent);
+            let completed = tokio::time::timeout(std::time::Duration::from_secs(5), parent_lock.lock())
+                .await
+                .expect("rotation must complete its sweep");
+            assert!(iam.store.get_user(&session.access_key).await.is_none());
+            assert!(
+                !store
+                    .saved_sts_users
+                    .lock()
+                    .expect("saved users")
+                    .contains_key(&session.access_key)
+            );
+            assert_eq!(
+                iam.store.get_user(parent).await.expect("parent").credentials.secret_key,
+                "replacementParentSecret123"
+            );
+            drop(completed);
+            assert!(matches!(
+                iam.set_temp_user_from_parent(&session, &authenticated).await,
+                Err(Error::IAMActionNotAllowed)
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn revoked_sts_cannot_mint_service_account_between_rotation_and_sweep() {
+        ensure_test_global_credentials();
+        let store = StsTestMockStore::new(false);
+        let iam = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM")));
+        let parent = "sts-rotation-parent";
+        iam.create_user(
+            parent,
+            &AddOrUpdateUserReq {
+                secret_key: "originalParentSecret123".to_string(),
+                policy: None,
+                status: rustfs_madmin::AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create parent");
+        let original_parent = iam.get_user(parent).await.expect("parent").credentials;
+        let session = rotation_test_session(parent, "sts-rotation-session");
+        iam.set_temp_user_from_parent(&session, &original_parent)
+            .await
+            .expect("mint STS");
+        store.block_delete.store(true, std::sync::atomic::Ordering::SeqCst);
+        let rotation = {
+            let iam = Arc::clone(&iam);
+            tokio::spawn(async move {
+                let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+                crate::LOAD_USER_NOTIFICATION_PROBE
+                    .scope(probe, iam.rotate_user_secret_key(parent, "replacementParentSecret123"))
+                    .await
+            })
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), store.delete_started.notified())
+            .await
+            .expect("sweep reached storage");
+        assert!(
+            iam.store.cache.parent_mutation_lock(parent).try_lock().is_err(),
+            "rotation must retain its lock through the sweep"
+        );
+        let creation = {
+            let iam = Arc::clone(&iam);
+            tokio::spawn(async move {
+                iam.new_service_account_from_caller(
+                    parent,
+                    None,
+                    service_account_opts("escaped-service", "escapedServiceSecret123"),
+                    &session,
+                )
+                .await
+            })
+        };
+        store.block_delete.store(false, std::sync::atomic::Ordering::SeqCst);
+        store.release_delete.notify_one();
+        let (_, _, revoked) = tokio::time::timeout(std::time::Duration::from_secs(5), rotation)
+            .await
+            .expect("rotation timeout")
+            .expect("rotation join")
+            .expect("rotation");
+        assert_eq!(revoked, 1);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), creation)
+            .await
+            .expect("creation timeout")
+            .expect("creation join");
+        assert!(matches!(result, Err(Error::IAMActionNotAllowed)));
+        assert!(
+            !store
+                .saved_sts_users
+                .lock()
+                .expect("saved users")
+                .contains_key("escaped-service")
+        );
+    }
+
+    #[tokio::test]
+    async fn derived_publication_is_ordered_with_parent_rotation_and_deletion() {
+        ensure_test_global_credentials();
+        for service in [false, true] {
+            for (deleting, canceled) in [(false, false), (true, false), (false, true), (true, true)] {
+                let store = StsTestMockStore::new(false);
+                let iam = Arc::new(IamSys::new(IamCache::new(store.clone()).await.expect("IAM")));
+                let parent = "concurrent-parent";
+                iam.create_user(
+                    parent,
+                    &AddOrUpdateUserReq {
+                        secret_key: "originalParentSecret123".to_string(),
+                        policy: None,
+                        status: rustfs_madmin::AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("create parent");
+                let authenticated = iam.get_user(parent).await.expect("parent").credentials;
+                let key = "concurrent-derived-key";
+                store.block_derived_save.store(true, std::sync::atomic::Ordering::SeqCst);
+                let creation = {
+                    let iam = Arc::clone(&iam);
+                    let authenticated = authenticated.clone();
+                    tokio::spawn(async move {
+                        if service {
+                            iam.new_service_account_from_caller(
+                                parent,
+                                None,
+                                service_account_opts(key, "derivedServiceSecret123"),
+                                &authenticated,
+                            )
+                            .await
+                            .map(|_| ())
+                        } else {
+                            iam.set_temp_user_from_parent(&rotation_test_session(parent, key), &authenticated)
+                                .await
+                                .map(|_| ())
+                        }
+                    })
+                };
+                tokio::time::timeout(std::time::Duration::from_secs(5), store.derived_save_started.notified())
+                    .await
+                    .expect("creation reached storage");
+                let creation = if canceled {
+                    creation.abort();
+                    assert!(creation.await.expect_err("caller canceled").is_cancelled());
+                    None
+                } else {
+                    Some(creation)
+                };
+                let parent_lock = iam.store.cache.parent_mutation_lock(parent);
+                assert!(parent_lock.try_lock().is_err(), "publication must own the parent's mutation boundary");
+                let mutation = {
+                    let iam = Arc::clone(&iam);
+                    tokio::spawn(async move {
+                        if deleting {
+                            iam.delete_user(parent, false).await
+                        } else {
+                            let probe = IamSys::<StsTestMockStore>::load_user_notification_probe(0, false, false);
+                            crate::LOAD_USER_NOTIFICATION_PROBE
+                                .scope(probe, iam.set_user_secret_key(parent, "replacementParentSecret123"))
+                                .await
+                                .map(|_| ())
+                        }
+                    })
+                };
+                store.block_derived_save.store(false, std::sync::atomic::Ordering::SeqCst);
+                store.release_derived_save.notify_one();
+                if let Some(creation) = creation {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), creation)
+                        .await
+                        .expect("creation timeout")
+                        .expect("creation join")
+                        .expect("creation");
+                }
+                tokio::time::timeout(std::time::Duration::from_secs(5), mutation)
+                    .await
+                    .expect("mutation timeout")
+                    .expect("mutation join")
+                    .expect("mutation");
+                assert_eq!(
+                    iam.get_user(key).await.is_some(),
+                    service && !deleting,
+                    "existing service keys survive rotation, but no derived keys survive parent deletion"
+                );
+                assert!(matches!(
+                    iam.set_temp_user_from_parent(&rotation_test_session(parent, "late-session"), &authenticated)
+                        .await,
+                    Err(Error::IAMActionNotAllowed)
+                ));
+                assert!(matches!(
+                    iam.new_service_account_from_caller(
+                        parent,
+                        None,
+                        service_account_opts("late-service", "lateServiceSecret123"),
+                        &authenticated
+                    )
+                    .await,
+                    Err(Error::IAMActionNotAllowed)
+                ));
+                assert!(
+                    !store
+                        .saved_sts_users
+                        .lock()
+                        .expect("saved users")
+                        .contains_key("late-session")
+                );
+                assert!(
+                    !store
+                        .saved_sts_users
+                        .lock()
+                        .expect("saved users")
+                        .contains_key("late-service")
+                );
+            }
+        }
     }
 
     #[tokio::test]

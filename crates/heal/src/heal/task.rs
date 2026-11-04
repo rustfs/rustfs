@@ -485,7 +485,7 @@ pub struct HealTask {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
     pub storage: Arc<dyn HealStorageAPI>,
-    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+    mainline_pacer: Option<super::pacing::ForegroundPacing>,
 }
 
 impl HealTask {
@@ -586,7 +586,7 @@ impl HealTask {
         task
     }
 
-    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<super::pacing::ForegroundPacing>) -> Self {
         self.mainline_pacer = pacer;
         self
     }

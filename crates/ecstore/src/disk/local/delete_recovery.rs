@@ -1002,21 +1002,17 @@ pub(super) fn inspection_with_markers(
 
 type PreparedDeleteReceiptEntry = (DeleteRecoveryJournal, bool);
 
-static PREPARED_DELETE_RECEIPTS: std::sync::LazyLock<parking_lot::Mutex<HashMap<PathBuf, PreparedDeleteReceiptEntry>>> =
-    std::sync::LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
+const PREPARED_DELETE_RECEIPTS_PER_SHARD: usize = 64;
 
-fn put_prepared_delete_receipt(rollback: PathBuf, entry: PreparedDeleteReceiptEntry) {
-    let mut map = PREPARED_DELETE_RECEIPTS.lock();
-    if map.len() >= 4096
-        && let Some(evict_key) = map.keys().next().cloned()
-    {
-        map.remove(&evict_key);
-    }
-    map.insert(rollback, entry);
+static PREPARED_DELETE_RECEIPTS: std::sync::LazyLock<os::ShardedPathCache<PreparedDeleteReceiptEntry>> =
+    std::sync::LazyLock::new(|| os::ShardedPathCache::new(PREPARED_DELETE_RECEIPTS_PER_SHARD));
+
+fn put_prepared_delete_receipt(rollback: impl AsRef<Path>, entry: PreparedDeleteReceiptEntry) {
+    PREPARED_DELETE_RECEIPTS.insert(rollback.as_ref(), entry);
 }
 
 fn take_prepared_delete_receipt(rollback: &Path) -> Option<PreparedDeleteReceiptEntry> {
-    PREPARED_DELETE_RECEIPTS.lock().remove(rollback)
+    PREPARED_DELETE_RECEIPTS.remove(rollback)
 }
 
 impl LocalDisk {

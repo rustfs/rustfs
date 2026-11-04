@@ -65,6 +65,12 @@ impl WebDavConfig {
             ));
         }
 
+        if self.ca_file.is_some() && (!self.tls_enabled || self.cert_dir.is_none()) {
+            return Err(WebDavInitError::InvalidConfig(
+                "A client CA requires TLS and a server certificate directory".to_owned(),
+            ));
+        }
+
         if let Some(path) = &self.cert_dir
             && !tokio::fs::try_exists(path).await.unwrap_or(false)
         {

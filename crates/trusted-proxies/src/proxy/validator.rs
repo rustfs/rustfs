@@ -49,7 +49,7 @@ impl ClientInfo {
     /// Creates a `ClientInfo` for a direct connection without any proxies.
     pub fn direct(addr: SocketAddr) -> Self {
         Self {
-            real_ip: addr.ip(),
+            real_ip: addr.ip().to_canonical(),
             forwarded_host: None,
             forwarded_proto: None,
             is_from_trusted_proxy: false,
@@ -71,11 +71,11 @@ impl ClientInfo {
         warnings: Vec<String>,
     ) -> Self {
         Self {
-            real_ip,
+            real_ip: real_ip.to_canonical(),
             forwarded_host,
             forwarded_proto,
             is_from_trusted_proxy: true,
-            proxy_ip: Some(proxy_ip),
+            proxy_ip: Some(proxy_ip.to_canonical()),
             proxy_hops,
             validation_mode,
             warnings,
@@ -152,7 +152,7 @@ impl ProxyValidator {
             return Ok(ClientInfo::direct(SocketAddr::new(IpAddr::from([0, 0, 0, 0]), 0)));
         };
 
-        let peer_ip = peer_addr.ip();
+        let peer_ip = peer_addr.ip().to_canonical();
         if peer_ip.is_unspecified() {
             debug!(
                 event = "proxy_validation.evaluate",
@@ -249,14 +249,35 @@ impl ProxyValidator {
 
     /// Validates a request that originated from a trusted proxy.
     fn validate_trusted_proxy_request(&self, proxy_addr: &SocketAddr, headers: &HeaderMap) -> Result<ClientInfo, ProxyError> {
-        let proxy_ip = proxy_addr.ip();
+        let proxy_ip = proxy_addr.ip().to_canonical();
 
-        // Prefer RFC 7239 "Forwarded" header if enabled, otherwise fallback to legacy headers.
-        let client_info = if self.config.enable_rfc7239 {
-            self.try_parse_rfc7239_headers(headers, proxy_ip)
-                .unwrap_or_else(|| self.parse_legacy_headers(headers))
+        // Select one header family explicitly. A client-provided alternative
+        // must never override the family appended by the trusted proxy.
+        let selected = if self.config.enable_rfc7239 {
+            "forwarded"
         } else {
-            self.parse_legacy_headers(headers)
+            "x-forwarded-for"
+        };
+        if !headers.contains_key(selected) {
+            if headers.contains_key("forwarded") || headers.contains_key("x-forwarded-for") || headers.contains_key("x-real-ip") {
+                return Err(ProxyError::HeaderParseError("configured forwarding header is missing".to_string()));
+            }
+            return Ok(ClientInfo::direct(*proxy_addr));
+        }
+        let value = headers
+            .get_all(selected)
+            .iter()
+            .map(|header| {
+                header
+                    .to_str()
+                    .map_err(|_| ProxyError::HeaderParseError("forwarding header is not text".to_string()))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .join(",");
+        let client_info = if self.config.enable_rfc7239 {
+            Self::parse_forwarded_header(&value)?
+        } else {
+            self.parse_legacy_headers(headers, &value)?
         };
 
         // Analyze the integrity and continuity of the proxy chain.
@@ -299,37 +320,29 @@ impl ProxyValidator {
         ))
     }
 
-    /// Attempts to parse the RFC 7239 "Forwarded" header.
-    fn try_parse_rfc7239_headers(&self, headers: &HeaderMap, proxy_ip: IpAddr) -> Option<ParsedHeaders> {
-        headers
-            .get("forwarded")
-            .and_then(|h| h.to_str().ok())
-            .and_then(|s| Self::parse_forwarded_header(s, proxy_ip))
-    }
-
-    /// Parses legacy proxy headers (X-Forwarded-For, X-Forwarded-Host, X-Forwarded-Proto).
-    fn parse_legacy_headers(&self, headers: &HeaderMap) -> ParsedHeaders {
-        let forwarded_host = headers
-            .get("x-forwarded-host")
-            .and_then(|h| h.to_str().ok())
-            .map(String::from);
-
-        let forwarded_proto = headers
-            .get("x-forwarded-proto")
-            .and_then(|h| h.to_str().ok())
-            .map(String::from);
-
-        let proxy_chain = headers
-            .get("x-forwarded-for")
-            .and_then(|h| h.to_str().ok())
-            .map(Self::parse_x_forwarded_for)
-            .unwrap_or_default();
-
-        ParsedHeaders {
+    /// Parses only the configured legacy header family, including repeated lines.
+    fn parse_legacy_headers(&self, headers: &HeaderMap, value: &str) -> Result<ParsedHeaders, ProxyError> {
+        let last_value = |name| {
+            headers
+                .get_all(name)
+                .iter()
+                .next_back()?
+                .to_str()
+                .ok()?
+                .rsplit(',')
+                .next()
+                .map(str::trim)
+                .map(String::from)
+        };
+        let proxy_chain = value
+            .split(',')
+            .map(|token| Self::parse_forwarded_node(token.trim()).ok_or_else(|| ProxyError::invalid_xff("invalid address")))
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(ParsedHeaders {
             proxy_chain,
-            forwarded_host,
-            forwarded_proto,
-        }
+            forwarded_host: last_value("x-forwarded-host"),
+            forwarded_proto: last_value("x-forwarded-proto"),
+        })
     }
 
     /// Parses the RFC 7239 "Forwarded" header value.
@@ -344,12 +357,8 @@ impl ProxyValidator {
     /// which is appended by the directly connected trusted proxy — mirroring
     /// how the legacy path reads proxy-set `X-Forwarded-Host`/`Proto` headers.
     /// Values injected by the client in earlier elements are ignored.
-    fn parse_forwarded_header(header_value: &str, proxy_ip: IpAddr) -> Option<ParsedHeaders> {
-        let elements: Vec<&str> = header_value
-            .split(',')
-            .map(|element| element.trim())
-            .filter(|element| !element.is_empty())
-            .collect();
+    fn parse_forwarded_header(header_value: &str) -> Result<ParsedHeaders, ProxyError> {
+        let elements: Vec<&str> = header_value.split(',').map(|element| element.trim()).collect();
 
         let mut proxy_chain = Vec::new();
         let mut forwarded_host = None;
@@ -358,6 +367,7 @@ impl ProxyValidator {
         let last_index = elements.len().saturating_sub(1);
         for (index, element) in elements.iter().enumerate() {
             let is_last = index == last_index;
+            let mut client_ip = None;
             for part in element.split(';') {
                 let part = part.trim();
                 if let Some((key, value)) = part.split_once('=') {
@@ -366,9 +376,13 @@ impl ProxyValidator {
 
                     match key.as_str() {
                         "for" => {
-                            if let Some(ip) = Self::parse_forwarded_node(value) {
-                                proxy_chain.push(ip);
+                            if client_ip.is_some() {
+                                return Err(ProxyError::invalid_forwarded("duplicate for parameter"));
                             }
+                            client_ip = Some(
+                                Self::parse_forwarded_node(value)
+                                    .ok_or_else(|| ProxyError::invalid_forwarded("invalid for address"))?,
+                            );
                         }
                         // Only honor host/proto from the trusted proxy-appended node.
                         "host" if is_last => {
@@ -381,14 +395,10 @@ impl ProxyValidator {
                     }
                 }
             }
+            proxy_chain.push(client_ip.ok_or_else(|| ProxyError::invalid_forwarded("missing for address"))?);
         }
 
-        // Fallback to the proxy IP if no client IP was found in the header.
-        if proxy_chain.is_empty() {
-            proxy_chain.push(proxy_ip);
-        }
-
-        Some(ParsedHeaders {
+        Ok(ParsedHeaders {
             proxy_chain,
             forwarded_host,
             forwarded_proto,
@@ -428,7 +438,7 @@ impl ProxyValidator {
             token.rsplit_once(':').map(|(host, _)| host).unwrap_or(token)
         };
 
-        ip_str.parse::<IpAddr>().ok()
+        ip_str.parse::<IpAddr>().ok().map(|ip| ip.to_canonical())
     }
 
     /// Records the start of a validation attempt in metrics.

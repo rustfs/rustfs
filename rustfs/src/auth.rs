@@ -19,7 +19,8 @@ use http::header::{IF_MATCH, IF_NONE_MATCH};
 use rustfs_credentials::Credentials;
 use rustfs_iam::error::Error as IamError;
 use rustfs_iam::sys::{
-    SESSION_POLICY_NAME, get_claims_from_token_with_secret, get_claims_from_token_with_secret_allow_missing_exp,
+    OIDC_ISSUER_CLAIM, SESSION_POLICY_NAME, get_claims_from_token_with_secret,
+    get_claims_from_token_with_secret_allow_missing_exp, is_rustfs_oidc_claims,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive, is_server_derived_condition_key};
 use rustfs_trusted_proxies::ClientInfo;
@@ -585,6 +586,27 @@ fn policy_secure_transport(client_info: Option<&ClientInfo>) -> bool {
         .unwrap_or(false)
 }
 
+/// Canonicalize an `s3:VersionId` condition value.
+///
+/// The object handlers accept several spellings of one version id (upper
+/// case, unhyphenated, braced, `urn:uuid:`), and the storage layer resolves
+/// all of them to the same version. Policy conditions must see the single
+/// spelling the server itself emits, otherwise a `Deny` with `StringEquals`
+/// can be bypassed by re-spelling the id. `null` in any case and the nil
+/// UUID both name the null version. Strings that are not a UUID are passed
+/// through unchanged; the handlers reject them later.
+pub(crate) fn canonical_policy_version_id(version: &str) -> String {
+    let trimmed = version.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return "null".to_string();
+    }
+    match uuid::Uuid::parse_str(trimmed) {
+        Ok(id) if id.is_nil() => "null".to_string(),
+        Ok(id) => id.to_string(),
+        Err(_) => version.to_string(),
+    }
+}
+
 /// Get condition values for policy evaluation
 ///
 /// # Arguments
@@ -679,9 +701,6 @@ pub fn get_condition_values_with_query_and_client_info(
     let curr_time = OffsetDateTime::now_utc();
     let epoch_time = curr_time.unix_timestamp();
 
-    // Use provided version ID or empty string
-    let vid = version_id.unwrap_or("");
-
     // Determine auth type and signature version from headers and query
     let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
 
@@ -709,9 +728,10 @@ pub fn get_condition_values_with_query_and_client_info(
     args.insert("username".to_owned(), vec![username]);
     args.insert("principaltype".to_owned(), vec![principal_type.to_string()]);
 
-    // Add version ID
-    if !vid.is_empty() {
-        args.insert("versionid".to_owned(), vec![vid.to_string()]);
+    // Add version ID. Policy conditions must identify the same version the
+    // storage layer resolves, whatever spelling the client used.
+    if let Some(vid) = version_id.filter(|vid| !vid.is_empty()) {
+        args.insert("versionid".to_owned(), vec![canonical_policy_version_id(vid)]);
     }
 
     // Add signature version and auth type
@@ -782,6 +802,17 @@ pub fn get_condition_values_with_query_and_client_info(
             }
         }
 
+        if is_rustfs_oidc_claims(claims) {
+            args.remove("iss");
+            if let Some(issuer) = claims
+                .get(OIDC_ISSUER_CLAIM)
+                .and_then(Value::as_str)
+                .filter(|issuer| !issuer.is_empty())
+            {
+                args.insert("iss".to_string(), vec![issuer.to_string()]);
+            }
+        }
+
         let grps = extract_string_list_claim(claims, "groups");
         if !grps.is_empty() {
             args.insert("groups".to_string(), grps);
@@ -793,10 +824,19 @@ pub fn get_condition_values_with_query_and_client_info(
         }
     }
 
-    if let Some(groups) = &cred.groups
-        && !args.contains_key("groups")
-    {
-        args.insert("groups".to_string(), groups.clone());
+    let effective_user = if (cred.is_service_account() || cred.is_temp()) && !cred.parent_user.is_empty() {
+        &cred.parent_user
+    } else {
+        &cred.access_key
+    };
+    let live_groups = current_ready_iam_handle()
+        .map(|iam| iam.user_group_memberships(effective_user))
+        .unwrap_or_default();
+    for group in cred.groups.iter().flatten().chain(live_groups.iter()) {
+        let groups = args.entry("groups".to_string()).or_default();
+        if !groups.contains(group) {
+            groups.push(group.clone());
+        }
     }
 
     // Every remaining header is attacker-controlled. A header must never contribute
@@ -2017,6 +2057,40 @@ mod tests {
     }
 
     #[test]
+    fn version_id_condition_uses_canonical_spelling() {
+        let cred = create_test_credentials();
+        let headers = HeaderMap::new();
+        let canonical = "68f21f07-9bae-4b3a-a120-36f48fb9de1a";
+        for spelling in [
+            canonical,
+            "68F21F07-9BAE-4B3A-A120-36F48FB9DE1A",
+            "68f21f079bae4b3aa12036f48fb9de1a",
+            "{68f21f07-9bae-4b3a-a120-36f48fb9de1a}",
+            "urn:uuid:68f21f07-9bae-4b3a-a120-36f48fb9de1a",
+            " 68f21f07-9bae-4b3a-a120-36f48fb9de1a ",
+        ] {
+            let conditions = get_condition_values(&headers, &cred, Some(spelling), None, None);
+            assert_eq!(conditions.get("versionid"), Some(&vec![canonical.to_string()]), "{spelling}");
+        }
+        for spelling in [
+            "null",
+            "NULL",
+            " null ",
+            "00000000-0000-0000-0000-000000000000",
+            "00000000000000000000000000000000",
+        ] {
+            let conditions = get_condition_values(&headers, &cred, Some(spelling), None, None);
+            assert_eq!(conditions.get("versionid"), Some(&vec!["null".to_string()]), "{spelling}");
+        }
+        // Strings the handlers reject are passed through unchanged.
+        let conditions = get_condition_values(&headers, &cred, Some("not-a-uuid"), None, None);
+        assert_eq!(conditions.get("versionid"), Some(&vec!["not-a-uuid".to_string()]));
+        for absent in [None, Some("")] {
+            assert!(!get_condition_values(&headers, &cred, absent, None, None).contains_key("versionid"));
+        }
+    }
+
+    #[test]
     fn ghsa_6r96_claim_condition_keys_ignore_spoofed_headers() {
         // The credential carries no groups/roles claims, so these keys are absent --
         // precisely the case a spoofed header would otherwise fill in.
@@ -2250,6 +2324,56 @@ mod tests {
         assert_eq!(conditions.get("signatureAge"), Some(&vec!["300".to_string()]));
         // Verify the header is removed after processing
         // (we can't directly test this without changing the function signature)
+    }
+
+    #[tokio::test]
+    async fn oidc_issuer_condition_uses_verified_provider_not_session_marker_or_header() {
+        use rustfs_policy::policy::{
+            Args, Policy,
+            action::{Action, S3Action},
+        };
+
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*"},
+                {"Effect":"Deny","Action":"s3:GetObject","Resource":"arn:aws:s3:::bucket/*",
+                 "Condition":{"StringEquals":{"jwt:iss":"https://partner.example"}}}
+            ]}"#,
+        )
+        .expect("parse issuer condition");
+        let mut credentials = create_test_credentials();
+        let mut headers = HeaderMap::new();
+        headers.insert("iss", HeaderValue::from_static("https://spoofed.invalid"));
+        headers.insert(OIDC_ISSUER_CLAIM, HeaderValue::from_static("https://spoofed.invalid"));
+        for issuer in [Some("https://partner.example"), Some("https://corporate.example"), None] {
+            let mut claims = HashMap::from([
+                ("iss".to_string(), json!("rustfs-oidc")),
+                ("oidc_provider".to_string(), json!("provider")),
+                ("sub".to_string(), json!("subject")),
+            ]);
+            if let Some(issuer) = issuer {
+                claims.insert(OIDC_ISSUER_CLAIM.to_string(), json!(issuer));
+            }
+            credentials.claims = Some(claims);
+            let conditions = get_condition_values(&headers, &credentials, None, None, None);
+            assert_eq!(conditions.get("iss"), issuer.map(|value| vec![value.to_string()]).as_ref());
+            assert_eq!(
+                policy
+                    .is_allowed(&Args {
+                        account: &credentials.access_key,
+                        groups: &credentials.groups,
+                        action: Action::S3Action(S3Action::GetObjectAction),
+                        bucket: "bucket",
+                        object: "object",
+                        conditions: &conditions,
+                        claims: credentials.claims_or_empty(),
+                        is_owner: false,
+                        deny_only: false,
+                    })
+                    .await,
+                issuer != Some("https://partner.example"),
+            );
+        }
     }
 
     #[test]

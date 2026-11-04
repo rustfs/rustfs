@@ -165,14 +165,27 @@ impl<'de> Deserialize<'de> for ActionSet {
     }
 }
 
-#[derive(Serialize, Deserialize, Hash, PartialEq, Eq, Clone, Debug, Copy)]
+#[derive(Deserialize, Hash, PartialEq, Eq, Clone, Debug, Copy)]
 #[serde(try_from = "&str", untagged)]
 pub enum Action {
+    All,
     S3Action(S3Action),
     AdminAction(AdminAction),
     StsAction(StsAction),
     KmsAction(KmsAction),
     None,
+}
+
+impl Serialize for Action {
+    fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::None => serializer.serialize_unit(),
+            _ => serializer.serialize_str(self.into()),
+        }
+    }
 }
 
 impl Action {
@@ -181,6 +194,11 @@ impl Action {
     }
 
     pub fn is_match_for_effect(&self, action: &Action, deny: bool) -> bool {
+        if matches!(self, Self::All) {
+            // Preserve the historical S3-only Allow while allowing deny-all and
+            // NotAction exclusions to cover every action family.
+            return deny || Self::S3Action(S3Action::AllActions).is_match_for_effect(action, false);
+        }
         // Force-delete bypasses emptiness and version checks. A blanket `s3:*`
         // / `*` Allow (including canned consoleAdmin) must not confer it; the
         // statement has to name `s3:ForceDeleteBucket` or `s3:ForceDeleteObject`.
@@ -202,6 +220,7 @@ fn action_requires_explicit_grant(action: &Action) -> bool {
 impl From<&Action> for &str {
     fn from(value: &Action) -> &'static str {
         match value {
+            Action::All => "*",
             Action::S3Action(s) => s.into(),
             Action::AdminAction(s) => s.into(),
             Action::StsAction(s) => s.into(),
@@ -221,9 +240,8 @@ impl Action {
 impl TryFrom<&str> for Action {
     type Error = Error;
     fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
-        // Support wildcard "*" which matches all S3 actions (AWS S3 standard)
         if value == "*" {
-            return Ok(Self::S3Action(S3Action::AllActions));
+            return Ok(Self::All);
         }
         if value.starts_with(Self::S3_PREFIX) {
             Ok(Self::S3Action(
@@ -822,7 +840,7 @@ mod tests {
     #[test]
     fn blanket_s3_wildcard_does_not_grant_force_delete() {
         let wildcard = Action::try_from("s3:*").expect("s3:* parses");
-        let star = Action::try_from("*").expect("* parses as s3:*");
+        let star = Action::try_from("*").expect("* parses");
         let force_bucket = Action::try_from("s3:ForceDeleteBucket").expect("force bucket action parses");
         let force_object = Action::try_from("s3:ForceDeleteObject").expect("force object action parses");
         let delete_object = Action::try_from("s3:DeleteObject").expect("delete object parses");
@@ -841,9 +859,10 @@ mod tests {
 
     #[test]
     fn test_action_wildcard_parsing() {
-        // Test that "*" parses to S3Action::AllActions
+        // Preserve the bare wildcard through serialization.
         let action = Action::try_from("*").expect("Should parse wildcard");
-        assert!(matches!(action, Action::S3Action(S3Action::AllActions)));
+        assert!(matches!(action, Action::All));
+        assert_eq!(serde_json::to_string(&action).expect("serialize wildcard"), r#""*""#);
     }
 
     #[test]
@@ -929,15 +948,13 @@ mod tests {
 
     #[test]
     fn test_actionset_wildcard_serialization() {
-        // Wildcard action should serialize as array for S3 specification compliance
-        let actionset = ActionSet(vec![Action::try_from("*").expect("Should parse wildcard")]);
-
-        let json = serde_json::to_string(&actionset).expect("Should serialize");
-        let parsed: serde_json::Value = serde_json::from_str(&json).expect("Should parse");
-        assert!(parsed.is_array(), "Should serialize as array");
-        let arr = parsed.as_array().expect("Should be array");
-        assert_eq!(arr.len(), 1);
-        assert_eq!(arr[0].as_str().unwrap(), "s3:*");
+        for wildcard in ["*", "s3:*"] {
+            let actionset = ActionSet(vec![Action::try_from(wildcard).expect("parse wildcard")]);
+            let json = serde_json::to_string(&actionset).expect("serialize action set");
+            assert_eq!(json, format!(r#"["{wildcard}"]"#));
+            let round_trip: ActionSet = serde_json::from_str(&json).expect("deserialize action set");
+            assert_eq!(round_trip, actionset);
+        }
     }
 
     #[test]

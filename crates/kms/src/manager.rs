@@ -214,6 +214,9 @@ impl KmsManager {
     }
 
     async fn create_key_inner(&self, request: CreateKeyRequest) -> Result<CreateKeyResponse> {
+        if request.key_name.as_deref() == Some(crate::probe::PROBE_KEY_ID) {
+            return Err(KmsError::invalid_operation("the KMS probe key is reserved for internal health checks"));
+        }
         // A blank name is neither "generate one" (that is `None`) nor a usable
         // id: the Local backend would write a key file with an empty stem and
         // the Vault backends would address their mount root, each failing with
@@ -438,6 +441,9 @@ impl KmsManager {
     /// any backend sees the request. The backends repeat the window bound as a
     /// defensive assertion for callers that hold a backend handle directly.
     async fn delete_key_inner(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
+        if request.key_id == crate::probe::PROBE_KEY_ID {
+            return Err(KmsError::invalid_operation("the KMS probe key cannot be deleted through key management"));
+        }
         self.check_deletion_request(&request)?;
         if request.force_immediate.unwrap_or(false) {
             self.refuse_referenced_immediate_deletion(&request.key_id).await?;
@@ -591,7 +597,11 @@ impl KmsManager {
     /// Disable a key on behalf of `context`'s principal
     pub async fn disable_key_with_context(&self, key_id: &str, context: &OperationContext) -> Result<()> {
         let started = Instant::now();
-        let result = self.backend.disable_key(key_id).await;
+        let result = if key_id == crate::probe::PROBE_KEY_ID {
+            Err(KmsError::invalid_operation("the KMS probe key cannot be disabled through key management"))
+        } else {
+            self.backend.disable_key(key_id).await
+        };
         if result.is_ok() {
             self.invalidate_cached_metadata(key_id).await;
         }
