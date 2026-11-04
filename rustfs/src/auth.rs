@@ -588,6 +588,27 @@ fn policy_secure_transport(client_info: Option<&ClientInfo>) -> bool {
         .unwrap_or(false)
 }
 
+/// Canonicalize an `s3:VersionId` condition value.
+///
+/// The object handlers accept several spellings of one version id (upper
+/// case, unhyphenated, braced, `urn:uuid:`), and the storage layer resolves
+/// all of them to the same version. Policy conditions must see the single
+/// spelling the server itself emits, otherwise a `Deny` with `StringEquals`
+/// can be bypassed by re-spelling the id. `null` in any case and the nil
+/// UUID both name the null version. Strings that are not a UUID are passed
+/// through unchanged; the handlers reject them later.
+pub(crate) fn canonical_policy_version_id(version: &str) -> String {
+    let trimmed = version.trim();
+    if trimmed.eq_ignore_ascii_case("null") {
+        return "null".to_string();
+    }
+    match uuid::Uuid::parse_str(trimmed) {
+        Ok(id) if id.is_nil() => "null".to_string(),
+        Ok(id) => id.to_string(),
+        Err(_) => version.to_string(),
+    }
+}
+
 /// Get condition values for policy evaluation
 ///
 /// # Arguments
@@ -682,9 +703,6 @@ pub fn get_condition_values_with_query_and_client_info(
     let curr_time = OffsetDateTime::now_utc();
     let epoch_time = curr_time.unix_timestamp();
 
-    // Use provided version ID or empty string
-    let vid = version_id.unwrap_or("");
-
     // Determine auth type and signature version from headers and query
     let (auth_type, signature_version) = determine_auth_type_and_version_with_query(header, query);
 
@@ -712,9 +730,10 @@ pub fn get_condition_values_with_query_and_client_info(
     args.insert("username".to_owned(), vec![username]);
     args.insert("principaltype".to_owned(), vec![principal_type.to_string()]);
 
-    // Add version ID
-    if !vid.is_empty() {
-        args.insert("versionid".to_owned(), vec![vid.to_string()]);
+    // Add version ID. Policy conditions must identify the same version the
+    // storage layer resolves, whatever spelling the client used.
+    if let Some(vid) = version_id.filter(|vid| !vid.is_empty()) {
+        args.insert("versionid".to_owned(), vec![canonical_policy_version_id(vid)]);
     }
 
     // Add signature version and auth type
@@ -2160,6 +2179,40 @@ mod tests {
 
         let conditions = get_condition_values(&headers, &cred, Some("server-version"), None, None);
         assert_eq!(conditions.get("versionid"), Some(&vec!["server-version".to_string()]));
+    }
+
+    #[test]
+    fn version_id_condition_uses_canonical_spelling() {
+        let cred = create_test_credentials();
+        let headers = HeaderMap::new();
+        let canonical = "68f21f07-9bae-4b3a-a120-36f48fb9de1a";
+        for spelling in [
+            canonical,
+            "68F21F07-9BAE-4B3A-A120-36F48FB9DE1A",
+            "68f21f079bae4b3aa12036f48fb9de1a",
+            "{68f21f07-9bae-4b3a-a120-36f48fb9de1a}",
+            "urn:uuid:68f21f07-9bae-4b3a-a120-36f48fb9de1a",
+            " 68f21f07-9bae-4b3a-a120-36f48fb9de1a ",
+        ] {
+            let conditions = get_condition_values(&headers, &cred, Some(spelling), None, None);
+            assert_eq!(conditions.get("versionid"), Some(&vec![canonical.to_string()]), "{spelling}");
+        }
+        for spelling in [
+            "null",
+            "NULL",
+            " null ",
+            "00000000-0000-0000-0000-000000000000",
+            "00000000000000000000000000000000",
+        ] {
+            let conditions = get_condition_values(&headers, &cred, Some(spelling), None, None);
+            assert_eq!(conditions.get("versionid"), Some(&vec!["null".to_string()]), "{spelling}");
+        }
+        // Strings the handlers reject are passed through unchanged.
+        let conditions = get_condition_values(&headers, &cred, Some("not-a-uuid"), None, None);
+        assert_eq!(conditions.get("versionid"), Some(&vec!["not-a-uuid".to_string()]));
+        for absent in [None, Some("")] {
+            assert!(!get_condition_values(&headers, &cred, absent, None, None).contains_key("versionid"));
+        }
     }
 
     #[test]

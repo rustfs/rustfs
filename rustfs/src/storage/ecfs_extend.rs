@@ -339,6 +339,19 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
         ));
     }
 
+    // Storage encodes directory objects as `<name>__XLDIR__` after this client-key
+    // boundary, and `scan_dir` decodes every entry with that suffix back into a
+    // marker. A client key carrying the suffix would be mistaken for a marker:
+    // the bare key `__XLDIR__` makes the walk schedule the directory it is
+    // scanning as its own child until the stack overflows, and keys below a
+    // `*__XLDIR__/` segment vanish from listings and quota accounting.
+    if key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved directory marker",
+        ));
+    }
+
     if key.is_empty() || !crate::storage::storage_api::ecstore_bucket::utils::is_valid_object_prefix(key) {
         return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid object key"));
     }
@@ -1137,5 +1150,28 @@ pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'sta
             format!("{op}: partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
         )),
         Some(n) => Ok(Some(n as usize)),
+    }
+}
+
+#[cfg(test)]
+mod object_key_admission_tests {
+    use super::validate_object_key;
+
+    #[test]
+    fn reserved_directory_marker_keys_are_rejected() {
+        for key in [
+            "__XLDIR__",
+            "__XLDIR__/",
+            "prefix__XLDIR__/object",
+            "object__XLDIR__",
+            "a/__XLDIR__/b",
+        ] {
+            for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                assert!(validate_object_key(key, operation).is_err(), "{operation}: {key}");
+            }
+        }
+        for key in ["ordinary/key", "xldir", "__xldir__", "directory/", "unicode-中文"] {
+            assert!(validate_object_key(key, "PutObject").is_ok(), "{key}");
+        }
     }
 }
