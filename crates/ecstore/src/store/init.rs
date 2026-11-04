@@ -27353,4 +27353,201 @@ mod tests {
             .expect("recovery must preserve the local source object");
         assert_eq!(source_after.size, i64::try_from(payload.len()).expect("payload length should fit i64"));
     }
+
+    #[cfg(feature = "test-util")]
+    async fn seed_retained_null_version(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        protection: &str,
+        latest_is_marker: bool,
+    ) {
+        let metadata = if protection == "legal-hold" {
+            HashMap::from([("x-amz-object-lock-legal-hold".to_string(), "ON".to_string())])
+        } else {
+            HashMap::from([
+                ("x-amz-object-lock-mode".to_string(), protection.to_string()),
+                ("x-amz-object-lock-retain-until-date".to_string(), "2099-01-01T00:00:00Z".to_string()),
+            ])
+        };
+        let mut original = PutObjReader::from_vec(b"protected null version".to_vec());
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut original,
+                &ObjectOptions {
+                    user_defined: metadata,
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed retained null version");
+        let mut latest = PutObjReader::from_vec(b"unprotected latest version".to_vec());
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut latest,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed newer unprotected UUID version");
+        if latest_is_marker {
+            store
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create a UUID delete marker above the retained null version");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn assert_retained_null_version_body(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let mut reader = store
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retained null version must remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read retained null version");
+        assert_eq!(body, b"protected null version");
+    }
+
+    /// A versionless delete removes the null version, so the Object Lock check
+    /// must judge that version even when a UUID version or delete marker is
+    /// the key's latest entry (rustfs/backlog#3017).
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn null_version_object_lock_delete_checks_actual_target() {
+        use crate::bucket::replication::DeleteReplicationConfigSnapshot;
+        use s3s::dto::{BucketVersioningStatus, ExcludedPrefix, VersioningConfiguration};
+
+        let temp = tempfile::tempdir().expect("create null-version delete store");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "null-version-delete-lock", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("null-delete-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket");
+        let configs = [
+            VersioningConfiguration::default(),
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::SUSPENDED)),
+                ..Default::default()
+            },
+            VersioningConfiguration {
+                status: Some(BucketVersioningStatus::from_static(BucketVersioningStatus::ENABLED)),
+                excluded_prefixes: Some(vec![ExcludedPrefix {
+                    prefix: Some("archive/".to_string()),
+                }]),
+                ..Default::default()
+            },
+        ];
+        for (case, config) in configs.into_iter().enumerate() {
+            let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(config, None));
+            for protection in ["COMPLIANCE", "GOVERNANCE", "legal-hold"] {
+                for latest_is_marker in [false, true] {
+                    let object = format!("archive/{case}-{protection}-{latest_is_marker}");
+                    seed_retained_null_version(&store, &bucket, &object, protection, latest_is_marker).await;
+                    let (_, errors) = store
+                        .delete_objects(
+                            &bucket,
+                            vec![ObjectToDelete {
+                                object_name: object.clone(),
+                                ..Default::default()
+                            }],
+                            ObjectOptions {
+                                delete_replication_config_snapshot: Some(Arc::clone(&snapshot)),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(errors.as_slice(), [Some(StorageError::PrefixAccessDenied(_, _))]),
+                        "batch delete must judge the retained null version: {object}: {errors:?}"
+                    );
+                    let error = store
+                        .delete_object(
+                            &bucket,
+                            &object,
+                            ObjectOptions {
+                                version_suspended: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect_err("suspended single delete must also judge the retained null version");
+                    assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+                    assert_retained_null_version_body(&store, &bucket, &object).await;
+                    if protection == "GOVERNANCE" {
+                        let (_, errors) = store
+                            .delete_objects(
+                                &bucket,
+                                vec![ObjectToDelete {
+                                    object_name: object.clone(),
+                                    ..Default::default()
+                                }],
+                                ObjectOptions {
+                                    delete_replication_config_snapshot: Some(Arc::clone(&snapshot)),
+                                    object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions {
+                                        bypass_governance: true,
+                                    }),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        assert!(errors.iter().all(Option::is_none), "authorized governance bypass: {errors:?}");
+                        assert!(
+                            store
+                                .get_object_reader(
+                                    &bucket,
+                                    &object,
+                                    None,
+                                    HeaderMap::new(),
+                                    &ObjectOptions {
+                                        version_id: Some(Uuid::nil().to_string()),
+                                        ..Default::default()
+                                    }
+                                )
+                                .await
+                                .is_err(),
+                            "authorized deletion must make the retained null payload unreadable"
+                        );
+                    }
+                }
+            }
+        }
+    }
 }

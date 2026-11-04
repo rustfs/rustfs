@@ -11222,8 +11222,16 @@ impl LocalDisk {
 
                 if entry.ends_with(SLASH_SEPARATOR) {
                     if entry.ends_with(GLOBAL_DIR_SUFFIX_WITH_SLASH) {
-                        let entry =
-                            format!("{}{}", entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH), SLASH_SEPARATOR);
+                        let marker_name = entry.as_str().trim_end_matches(GLOBAL_DIR_SUFFIX_WITH_SLASH);
+                        // An empty marker name would schedule the directory being
+                        // scanned as its own child and recurse until the stack
+                        // overflows. Ignore malformed markers left by older writers
+                        // or corrupt disks instead of decoding them.
+                        if marker_name.is_empty() {
+                            item.clear();
+                            continue;
+                        }
+                        let entry = format!("{marker_name}{SLASH_SEPARATOR}");
                         dir_objes.insert(entry.clone());
                         *item = entry;
                         continue;
@@ -26832,6 +26840,49 @@ mod test {
 
         assert_eq!(names, vec![format!("{base_dir}/")]);
         assert_eq!(objs_returned, 1);
+    }
+
+    #[tokio::test]
+    async fn test_scan_dir_ignores_empty_directory_markers() {
+        use rustfs_filemeta::MetacacheReader;
+        use tempfile::tempdir;
+
+        let dir = tempdir().expect("create disk directory");
+        let bucket = "test-bucket";
+        let bucket_dir = dir.path().join(bucket);
+        for object in ["__XLDIR__", "nested/__XLDIR__", "nested/healthy", "folder__XLDIR__"] {
+            let object_dir = bucket_dir.join(object);
+            fs::create_dir_all(&object_dir).await.expect("create object directory");
+            fs::write(object_dir.join("xl.meta"), b"meta")
+                .await
+                .expect("write object metadata");
+        }
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 disk path")).expect("valid disk endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let (reader, mut writer) = tokio::io::duplex(4096);
+        let mut out = MetacacheWriter::new(&mut writer);
+        let opts = WalkDirOptions {
+            bucket: bucket.to_owned(),
+            recursive: true,
+            ..Default::default()
+        };
+        let mut count = 0;
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            disk.scan_dir(String::new(), String::new(), &opts, &mut out, &mut count, false, None),
+        )
+        .await
+        .expect("malformed directory marker must not recurse into its parent")
+        .expect("scan succeeds despite malformed markers");
+        out.close().await.expect("close metacache stream");
+        let entries = MetacacheReader::new(reader).read_all().await.expect("read listed objects");
+        let names: Vec<_> = entries
+            .into_iter()
+            .filter(|entry| !entry.metadata.is_empty())
+            .map(|entry| entry.name)
+            .collect();
+        assert_eq!(names, vec!["folder/", "nested/healthy"]);
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]
