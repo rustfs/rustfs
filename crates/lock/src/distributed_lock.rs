@@ -2995,4 +2995,120 @@ mod tests {
 
         drop(guard);
     }
+
+    /// Per-object scripted client: grants only the named objects and records
+    /// every released lock's resource.
+    #[derive(Debug)]
+    struct ScriptedBatchClient {
+        grants: Vec<String>,
+        releases: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ScriptedBatchClient {
+        fn build(grants: &[&str]) -> (Arc<dyn LockClient>, Arc<Mutex<Vec<String>>>) {
+            let releases = Arc::new(Mutex::new(Vec::new()));
+            let client = Arc::new(Self {
+                grants: grants.iter().map(|object| (*object).to_string()).collect(),
+                releases: Arc::clone(&releases),
+            }) as Arc<dyn LockClient>;
+            (client, releases)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for ScriptedBatchClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            if self.grants.iter().any(|object| object == request.resource.object.as_ref()) {
+                let info = LockInfo {
+                    id: request.lock_id.clone(),
+                    resource: request.resource.clone(),
+                    lock_type: request.lock_type,
+                    status: crate::types::LockStatus::Acquired,
+                    owner: request.owner.clone(),
+                    acquired_at: std::time::SystemTime::now(),
+                    expires_at: std::time::SystemTime::now() + request.ttl,
+                    last_refreshed: std::time::SystemTime::now(),
+                    metadata: request.metadata.clone(),
+                    priority: request.priority,
+                    wait_start_time: None,
+                };
+                Ok(LockResponse::success(info, Duration::ZERO))
+            } else {
+                Ok(LockResponse::failure("denied by test script", Duration::ZERO))
+            }
+        }
+
+        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.releases
+                .lock()
+                .expect("release log")
+                .push(lock_id.resource.object.to_string());
+            Ok(true)
+        }
+
+        async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
+            Ok(true)
+        }
+
+        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.release(lock_id).await
+        }
+
+        async fn check_status(&self, _lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            Ok(None)
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            Ok(LockStats::default())
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            Ok(())
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    /// A batch key granted by fewer than quorum clients fails alone, and its
+    /// partial grants are released synchronously before the call returns
+    /// (PR9155 review coverage for the distributed rollback path).
+    #[tokio::test]
+    async fn acquire_guard_batch_releases_partial_grants_below_quorum() {
+        let (c0, c0_releases) = ScriptedBatchClient::build(&["kept", "lost"]);
+        let (c1, _c1_releases) = ScriptedBatchClient::build(&["kept"]);
+        let (c2, _c2_releases) = ScriptedBatchClient::build(&[]);
+        let lock = DistributedLock::new("batch-test".to_string(), vec![c0, c1, c2], 2);
+
+        let resources = vec![ObjectKey::new("bucket", "kept"), ObjectKey::new("bucket", "lost")];
+        let results = lock
+            .acquire_guard_batch(&resources, "owner", Duration::from_millis(200), Duration::from_secs(30))
+            .await;
+
+        assert!(results[0].is_ok(), "kept reached quorum: {:?}", results[0].as_ref().err());
+        let error = results[1].as_ref().expect_err("lost must fail below quorum");
+        assert!(
+            matches!(
+                error,
+                LockError::QuorumNotReached {
+                    required: 2,
+                    achieved: 1
+                }
+            ),
+            "lost must report its partial vote: {error:?}"
+        );
+        // Exactly the orphaned grant is released before the call returns,
+        // while "kept" stays held by its live guard.
+        assert_eq!(
+            c0_releases.lock().expect("release log").clone(),
+            vec!["lost".to_string()],
+            "only the below-quorum key's partial grant is released synchronously"
+        );
+        drop(results);
+    }
 }
