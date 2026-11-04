@@ -10535,6 +10535,7 @@ dependencies = [
  "md-5 0.11.0",
  "percent-encoding",
  "proptest",
+ "rcgen",
  "regex",
  "russh",
  "russh-sftp",

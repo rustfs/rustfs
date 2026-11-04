@@ -85,6 +85,17 @@ impl KeystoneAuthProvider {
         Ok(self.keystone_token_to_credentials(&keystone_token))
     }
 
+    /// Revalidate a long-lived subscription directly with Keystone, bypassing
+    /// the request cache so token revocation terminates an existing stream.
+    /// Returns the same authentication and expiry errors as a new token login.
+    pub async fn revalidate_subscription_token(&self, token: &str) -> Result<Credentials> {
+        let validated = self.client.validate_token(token).await?;
+        if validated.is_expired() {
+            return Err(KeystoneError::TokenExpired);
+        }
+        Ok(self.keystone_token_to_credentials(&validated))
+    }
+
     /// Authenticate using EC2 credentials (S3 API with AWS SigV4)
     pub async fn authenticate_with_ec2(&self, access_key: &str, signature: &str, string_to_sign: &str) -> Result<Credentials> {
         // Check cache
