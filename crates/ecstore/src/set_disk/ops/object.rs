@@ -9338,6 +9338,76 @@ where
     futures::future::try_join_all(probes).await.map(|_| ()).map_err(Error::from)
 }
 
+/// Per-key source-read inputs for the bulk-delete admission loop. The bounded
+/// metadata pre-fetch and the loop itself must resolve these identically, so
+/// both sides derive them here.
+struct BatchDeleteSourceInputs {
+    replication_object_name: String,
+    explicit_null_version: bool,
+    version_id: Option<Uuid>,
+    versioned: bool,
+    version_suspended: bool,
+    check_opts: ObjectOptions,
+    object_lock_check_required: bool,
+    replicate_delete: bool,
+    needs_source_read: bool,
+}
+
+fn batch_delete_source_inputs(
+    bucket: &str,
+    dobj: &ObjectToDelete,
+    opts: &ObjectOptions,
+    delete_config_snapshot: &DeleteReplicationConfigSnapshot,
+    object_lock_config: &Arc<ObjectLockConfigSnapshot>,
+    guarded: bool,
+) -> BatchDeleteSourceInputs {
+    let replication_object_name = decode_dir_object(&dobj.object_name);
+    let explicit_null_version = is_explicit_null_version(dobj.version_id);
+    let version_id = delete_file_info_version_id(dobj.version_id);
+    let (versioned, version_suspended) = delete_config_snapshot
+        .versioning_config()
+        .delete_state(replication_object_name.as_str());
+    let check_opts = ObjectOptions {
+        version_id: dobj.version_id.map(|version_id| version_id.to_string()),
+        versioned,
+        version_suspended,
+        object_lock_delete: opts.object_lock_delete.clone(),
+        object_lock_config_snapshot: Some(Arc::clone(object_lock_config)),
+        no_lock: true,
+        suppress_read_repair: guarded,
+        ..Default::default()
+    };
+    // A missing bucket Object Lock configuration does not prove that
+    // persisted object metadata is clean: migrated or corrupt data may
+    // still carry an explicit retention or legal hold. Only a real
+    // delete-marker creation can skip the object-level WORM check.
+    let object_lock_check_required = !is_meta_bucketname(bucket) && !set_disk_delete_creates_delete_marker(&check_opts);
+    let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
+    let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
+    let replication_needs_source = replicate_delete
+        && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
+    // Guarded explicit-version deletes are rejected before any read and must
+    // not join the pre-fetch wave.
+    let admission_error = guarded && dobj.version_id.is_some();
+    let needs_source_read = !admission_error
+        && (object_lock_check_required
+            || replication_needs_source
+            || opts.tier_delete_journal_api.is_some()
+            || dobj.expected_identity.is_some()
+            || dobj.version_id.is_some());
+    BatchDeleteSourceInputs {
+        replication_object_name,
+        explicit_null_version,
+        version_id,
+        versioned,
+        version_suspended,
+        check_opts,
+        object_lock_check_required,
+        replicate_delete,
+        needs_source_read,
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
     type Error = Error;
@@ -9878,6 +9948,38 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 },
             }
         };
+        // Bounded-parallel pre-fetch of the source metadata each admitted key
+        // needs below. These reads are pure quorum lookups under the locks
+        // already held; sequencing one metadata fan-out per key made a
+        // 1000-key batch pay a full round of drive reads at a time.
+        const DELETE_OBJECTS_SOURCE_READ_CONCURRENCY: usize = 16;
+        let mut source_reads: HashMap<usize, (ObjectInfo, FileInfo, Option<Error>)> = HashMap::with_capacity(objects.len());
+        {
+            let mut pending = Vec::new();
+            for (i, dobj) in objects.iter().enumerate() {
+                if del_errs[i].is_some() {
+                    continue;
+                }
+                let guarded = current_generations.is_some_and(|generations| generations.contains_key(&dobj.object_name));
+                let source =
+                    batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
+                if source.needs_source_read {
+                    let object_name = dobj.object_name.clone();
+                    let check_opts = source.check_opts;
+                    pending.push(async move {
+                        let (goi, file_info, _write_quorum, gerr) = self
+                            .get_object_info_fileinfo_and_quorum(bucket, &object_name, &check_opts)
+                            .await;
+                        (i, (goi, file_info, gerr))
+                    });
+                }
+            }
+            let reads = futures::stream::iter(pending)
+                .buffer_unordered(DELETE_OBJECTS_SOURCE_READ_CONCURRENCY)
+                .collect::<Vec<_>>()
+                .await;
+            source_reads.extend(reads);
+        }
         let mut vers_map: HashMap<&String, FileInfoVersions> = HashMap::new();
         let mut tier_reference_leases: Vec<(usize, String, Option<TierDestinationId>)> = Vec::new();
         let mut tier_free_version_receipt_candidates: HashMap<usize, TierFreeVersionReceiptCandidate> = HashMap::new();
@@ -9899,41 +10001,28 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                 ));
                 continue;
             }
-            let replication_object_name = decode_dir_object(&dobj.object_name);
-            let explicit_null_version = is_explicit_null_version(dobj.version_id);
-            let version_id = delete_file_info_version_id(dobj.version_id);
-            let (versioned, version_suspended) = delete_config_snapshot
-                .versioning_config()
-                .delete_state(replication_object_name.as_str());
-            let check_opts = ObjectOptions {
-                version_id: dobj.version_id.map(|version_id| version_id.to_string()),
+            let source = batch_delete_source_inputs(bucket, dobj, &opts, &delete_config_snapshot, &object_lock_config, guarded);
+            let BatchDeleteSourceInputs {
+                replication_object_name,
+                explicit_null_version,
+                version_id,
                 versioned,
                 version_suspended,
-                object_lock_delete: opts.object_lock_delete.clone(),
-                object_lock_config_snapshot: Some(Arc::clone(&object_lock_config)),
-                no_lock: true,
-                suppress_read_repair: guarded,
-                ..Default::default()
-            };
-            // A missing bucket Object Lock configuration does not prove that
-            // persisted object metadata is clean: migrated or corrupt data may
-            // still carry an explicit retention or legal hold. Only a real
-            // delete-marker creation can skip the object-level WORM check.
-            let object_lock_check_required = !is_meta_bucketname(bucket) && !set_disk_delete_creates_delete_marker(&check_opts);
-            let replicate_delete = delete_config_snapshot.has_active_rule(&replication_object_name);
-            let marker_delete = dobj.version_id.is_none() || dobj.synthetic_version_id;
-            let replication_needs_source = replicate_delete
-                && (!marker_delete || delete_config_snapshot.active_delete_marker_rules_require_tags(&replication_object_name));
-            let (mut goi, mut authoritative_file_info, mut gerr) = if object_lock_check_required
-                || replication_needs_source
-                || opts.tier_delete_journal_api.is_some()
-                || dobj.expected_identity.is_some()
-                || dobj.version_id.is_some()
-            {
-                let (goi, file_info, _write_quorum, gerr) = self
-                    .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
-                    .await;
-                (goi, file_info, gerr)
+                check_opts,
+                object_lock_check_required,
+                replicate_delete,
+                needs_source_read,
+            } = source;
+            let (mut goi, mut authoritative_file_info, mut gerr) = if needs_source_read {
+                match source_reads.remove(&i) {
+                    Some(read) => read,
+                    None => {
+                        let (goi, file_info, _write_quorum, gerr) = self
+                            .get_object_info_fileinfo_and_quorum(bucket, &dobj.object_name, &check_opts)
+                            .await;
+                        (goi, file_info, gerr)
+                    }
+                }
             } else {
                 (ObjectInfo::default(), FileInfo::default(), None)
             };
