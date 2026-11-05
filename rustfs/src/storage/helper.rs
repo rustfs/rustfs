@@ -26,6 +26,7 @@ use rustfs_audit::{
     entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
+use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
@@ -133,6 +134,21 @@ fn request_audit_builder<T>(
         .filter(|cred| !cred.access_key.is_empty())
     {
         builder = builder.access_key(&cred.access_key);
+        if !cred.parent_user.is_empty() {
+            builder = builder.parent_user(&cred.parent_user);
+        }
+        if let Some(claims) = cred.claims.as_ref().filter(|claims| is_rustfs_oidc_claims(claims)) {
+            let identity_claims = ["sub", "iss", OIDC_ISSUER_CLAIM, "oidc_provider"]
+                .into_iter()
+                .filter_map(|key| {
+                    claims
+                        .get(key)
+                        .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                        .map(|value| (key.to_string(), value.clone()))
+                })
+                .collect();
+            builder = builder.req_claims(identity_claims);
+        }
     }
     builder
 }
@@ -1037,6 +1053,17 @@ mod tests {
                                 secret_key: "audit-secret-must-not-leak".to_string(),
                                 session_token: "audit-token-must-not-leak".to_string(),
                                 parent_user: parent_user.to_string(),
+                                claims: match key {
+                                    "service-account" => Some(std::collections::HashMap::from([(
+                                        rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                                        serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
+                                    )])),
+                                    "sts-session" => Some(std::collections::HashMap::from([(
+                                        "sessionPolicy".to_string(),
+                                        serde_json::json!("private-session-policy"),
+                                    )])),
+                                    _ => None,
+                                },
                                 ..Default::default()
                             }),
                             ..Default::default()
@@ -1057,13 +1084,193 @@ mod tests {
                         assert_eq!(entry.access_key.as_deref(), expected_access_key);
                         let json = serde_json::to_value(&entry).expect("audit entry should serialize");
                         assert_eq!(json.get("accessKey").and_then(|key| key.as_str()), expected_access_key);
+                        let expected_parent_user = (!parent_user.is_empty()).then_some(parent_user);
+                        assert_eq!(entry.parent_user.as_deref(), expected_parent_user);
+                        assert_eq!(json.get("parentUser").and_then(|value| value.as_str()), expected_parent_user);
+                        assert!(!json.as_object().unwrap().contains_key("requestClaims"));
                         let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
                         assert!(!rendered.contains("audit-secret-must-not-leak"));
                         assert!(!rendered.contains("audit-token-must-not-leak"));
+                        assert!(!rendered.contains("private-session-policy"));
                     }
                 }
             },
         );
+    }
+
+    fn oidc_audit_credentials(issuer: Option<&str>) -> Credentials {
+        let mut claims = std::collections::HashMap::from([
+            ("sub".to_string(), serde_json::json!(" subject-9170 ")),
+            ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+            ("oidc_provider".to_string(), serde_json::json!("default")),
+            ("email".to_string(), serde_json::json!("private@example.test")),
+            ("preferred_username".to_string(), serde_json::json!("private-user")),
+            ("groups".to_string(), serde_json::json!(["private-group"])),
+            ("roles".to_string(), serde_json::json!(["private-role"])),
+            ("policy".to_string(), serde_json::json!("private-policy")),
+            ("sessionPolicy".to_string(), serde_json::json!("private-encoded-policy")),
+            ("sessionPolicy-extracted".to_string(), serde_json::json!("private-decoded-policy")),
+            ("custom".to_string(), serde_json::json!({"token": "private-custom-token"})),
+        ]);
+        if let Some(issuer) = issuer {
+            claims.insert(rustfs_iam::sys::OIDC_ISSUER_CLAIM.to_string(), serde_json::json!(issuer));
+        }
+        Credentials {
+            access_key: "oidc-session".to_string(),
+            parent_user: "oidc-parent".to_string(),
+            secret_key: "audit-secret-must-not-leak".to_string(),
+            session_token: "audit-token-must-not-leak".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn operation_helper_preserves_oidc_audit_identity_without_sensitive_claims() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for issuer in [Some("https://idp-a.example.test"), Some("https://idp-b.example.test"), None] {
+                    for service_account in [false, true] {
+                        let mut credentials = oidc_audit_credentials(issuer);
+                        if service_account {
+                            credentials.access_key = "oidc-service-account".to_string();
+                            credentials.claims.as_mut().unwrap().insert(
+                                rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                                serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
+                            );
+                        }
+                        let before = serde_json::to_value(&credentials).expect("credentials should serialize");
+                        let mut expected_claims = serde_json::json!({
+                            "sub": " subject-9170 ",
+                            "iss": "rustfs-oidc",
+                            "oidc_provider": "default"
+                        });
+                        if let Some(issuer) = issuer {
+                            expected_claims["x-rustfs-internal-oidc-issuer"] = serde_json::json!(issuer);
+                        }
+
+                        for outcome in [None, Some(true), Some(false)] {
+                            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                            req.extensions.insert(ReqInfo {
+                                cred: Some(credentials.clone()),
+                                ..Default::default()
+                            });
+                            let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                            if let Some(success) = outcome {
+                                let result = if success {
+                                    Ok(S3Response::new(GetObjectOutput::default()))
+                                } else {
+                                    Err(S3Error::new(S3ErrorCode::NoSuchKey))
+                                };
+                                helper = helper.complete(&result);
+                            }
+                            let OperationHelper::Enabled(state) = &mut helper else {
+                                panic!("audit helper should be enabled");
+                            };
+                            let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                            let json = serde_json::to_value(&entry).expect("audit entry should serialize");
+                            assert_eq!(json["accessKey"], credentials.access_key);
+                            assert_eq!(json["parentUser"], "oidc-parent");
+                            assert_eq!(json["requestClaims"], expected_claims);
+                            let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
+                            assert!(!rendered.contains("private-"));
+                            assert!(!rendered.contains("private@example.test"));
+                            assert!(!rendered.contains("audit-secret-must-not-leak"));
+                            assert!(!rendered.contains("audit-token-must-not-leak"));
+                            assert_eq!(
+                                serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
+                                before
+                            );
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn authorization_denial_preserves_oidc_audit_identity() {
+        use rustfs_policy::policy::action::{Action, S3Action};
+
+        let credentials = oidc_audit_credentials(Some("https://idp.example.test"));
+        let before = serde_json::to_value(&credentials).unwrap();
+        let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+        req.extensions.insert(ReqInfo {
+            cred: Some(credentials),
+            ..Default::default()
+        });
+        let entry = super::authorization_denial_entry(
+            &req,
+            &Action::S3Action(S3Action::GetObjectAction),
+            "iam_explicit_deny",
+            super::DenialScope::Request,
+        );
+        let json = serde_json::to_value(entry).expect("denial should serialize");
+        assert_eq!(json["parentUser"], "oidc-parent");
+        assert_eq!(
+            json["requestClaims"],
+            serde_json::json!({
+                "sub": " subject-9170 ",
+                "iss": "rustfs-oidc",
+                "oidc_provider": "default",
+                "x-rustfs-internal-oidc-issuer": "https://idp.example.test"
+            })
+        );
+        assert_eq!(json["api"]["status_code"], 403);
+        assert_eq!(json["tags"]["denialReason"], "iam_explicit_deny");
+        let rendered = json.to_string();
+        assert!(!rendered.contains("private"));
+        assert!(!rendered.contains("audit-secret-must-not-leak"));
+        assert!(!rendered.contains("audit-token-must-not-leak"));
+        assert_eq!(
+            serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn request_audit_identity_omits_non_oidc_and_empty_claims() {
+        for (key, value, expected_oidc) in [
+            (rustfs_iam::sys::OIDC_ISSUER_CLAIM, serde_json::json!(""), true),
+            (rustfs_iam::sys::OIDC_ISSUER_CLAIM, serde_json::json!(["https://idp.example.test"]), true),
+            ("iss", serde_json::json!("other-session"), false),
+            ("sub", serde_json::json!(""), false),
+            ("oidc_provider", serde_json::Value::Null, false),
+        ] {
+            let mut credentials = oidc_audit_credentials(None);
+            credentials.claims.as_mut().unwrap().insert(key.to_string(), value);
+            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+            req.extensions.insert(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            });
+            let entry = super::request_audit_builder(
+                &req,
+                req.extensions.get::<ReqInfo>(),
+                EventName::ObjectAccessedGet,
+                "GetObject",
+                rustfs_audit::ApiDetails::default(),
+                "audit-identity-boundary",
+            )
+            .build();
+            let json = serde_json::to_value(entry).expect("audit entry should serialize");
+            assert_eq!(json["parentUser"], "oidc-parent");
+            if expected_oidc {
+                assert_eq!(
+                    json["requestClaims"],
+                    serde_json::json!({"sub": " subject-9170 ", "iss": "rustfs-oidc", "oidc_provider": "default"})
+                );
+            } else {
+                assert!(!json.as_object().unwrap().contains_key("requestClaims"));
+            }
+        }
     }
 
     #[test]
