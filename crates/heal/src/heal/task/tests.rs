@@ -1658,6 +1658,7 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 struct MockStorage {
     retry_test_pages: Option<Vec<Vec<HealListItem>>>,
     retry_test_delays: HashMap<String, Duration>,
+    retry_test_success_delays: HashMap<String, Duration>,
     retry_test_listing_delays: Mutex<VecDeque<Duration>>,
     retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
@@ -2656,6 +2657,9 @@ impl HealStorageAPI for MockStorage {
         }
         if object == "object-dir/" {
             return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
+        }
+        if let Some(delay) = self.retry_test_success_delays.get(object) {
+            tokio::time::sleep(*delay).await;
         }
         self.healed_objects.lock().unwrap().push(object.to_string());
         if let Some(bucket_incarnation_id) = self.bucket_incarnation_after_object_heal.lock().unwrap().take() {
