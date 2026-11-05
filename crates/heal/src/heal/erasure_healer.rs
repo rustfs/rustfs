@@ -498,7 +498,10 @@ impl ErasureSetHealer {
             .execute_heal_with_resume(buckets, set_disk_id, &resume_manager, &checkpoint_manager)
             .await;
 
-        if self.replacement_task_id.is_some() {
+        // A cancelled or timed-out pass keeps its control classification: the
+        // namespace check runs only for completed or storage-failed passes so a
+        // concurrent bucket deletion cannot reclassify a stop as a failure.
+        if self.replacement_task_id.is_some() && !matches!(result, Err(Error::TaskCancelled | Error::TaskTimeout)) {
             resume_manager.verify_replacement_bucket_pass(self.storage.as_ref()).await?;
         }
         result?;
@@ -3597,6 +3600,85 @@ mod resume_loop_tests {
         );
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
         drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn replacement_cancellation_keeps_its_classification_when_the_namespace_changes() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let replacement_task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("retry", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("retry", None, HealOutcome::Transient);
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+        let cancel = healer.cancel_token.clone();
+        let observe = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = env.storage.heal_started.notified();
+                    if !env.storage.calls().is_empty() {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("the replacement object repair must start");
+            // The only bucket is recreated while the operator cancels the pass.
+            env.storage
+                .incarnations
+                .lock()
+                .expect("incarnations")
+                .insert("b".to_string(), uuid::Uuid::from_u128(7));
+            cancel.cancel();
+        };
+
+        let buckets = ["b".to_string()];
+        let (result, ()) = tokio::join!(healer.heal_erasure_set(&buckets, "pool_0_set_0"), observe);
+
+        assert!(
+            matches!(result, Err(Error::TaskCancelled)),
+            "a cancelled pass keeps its control classification: {result:?}"
+        );
+        let manager = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("cancelled replacement intent must remain");
+        assert!(
+            matches!(
+                manager.verify_replacement_bucket_pass(env.storage.as_ref()).await,
+                Err(Error::ReplacementNamespaceChanged)
+            ),
+            "the fixture must have changed the recorded bucket identity"
+        );
+        assert!(!manager.get_state().await.completed);
     }
 
     #[tokio::test]

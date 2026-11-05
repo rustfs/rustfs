@@ -25,7 +25,7 @@ pub(super) struct PublicationQueue {
 }
 
 pub(super) struct PublicationTicket {
-    pub(super) state: Arc<ObjectLockState>,
+    state: Arc<ObjectLockState>,
     pub(super) queue: Arc<PublicationQueue>,
     token: Arc<()>,
     mode: LockMode,

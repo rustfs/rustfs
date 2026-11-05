@@ -50,6 +50,14 @@ fn budget_error() -> TableCatalogStoreError {
     TableCatalogStoreError::Invalid("table compaction exceeds the server memory or expanded-value budget".to_owned())
 }
 
+/// Stored-input ceiling failure for one rewrite group, naming the limit the
+/// operator must stay under with `max-rewrite-bytes-per-job`.
+pub(crate) fn compaction_stored_input_ceiling_error(group_id: &str) -> TableCatalogStoreError {
+    TableCatalogStoreError::Invalid(format!(
+        "compaction rewrite group {group_id} stored inputs exceed the {TABLE_COMPACTION_MAX_STORED_BYTES} byte server ceiling; lower max-rewrite-bytes-per-job to at most that value and replan"
+    ))
+}
+
 fn add_budget(total: &mut usize, amount: usize, limit: usize) -> TableCatalogStoreResult<()> {
     *total = total
         .checked_add(amount)
@@ -476,7 +484,7 @@ impl Write for BoundedOutput {
     }
 }
 
-pub(crate) fn compact_parquet_data_files(input_files: Vec<(String, Vec<u8>)>) -> TableCatalogStoreResult<CompactedParquetFile> {
+fn compact_parquet_data_files(input_files: Vec<(String, Vec<u8>)>) -> TableCatalogStoreResult<CompactedParquetFile> {
     compact_parquet_with_limits(input_files, TABLE_COMPACTION_MAX_DECODED_BYTES, COMPACTION_WRITE_BYTES)
 }
 
@@ -497,12 +505,15 @@ fn compact_parquet_with_budgets(
 ) -> TableCatalogStoreResult<CompactedParquetFile> {
     let mut schema: Option<SchemaRef> = None;
     let mut declared = 0;
-    let mut stored = 0;
+    let mut stored = 0_usize;
     let mut files = Vec::new();
     let mut leaf_columns = 0;
     // Validate every footer before decoding any page or creating output.
     for (location, data) in input_files {
-        add_budget(&mut stored, data.len(), TABLE_COMPACTION_MAX_STORED_BYTES)?;
+        stored = stored
+            .checked_add(data.len())
+            .filter(|total| *total <= TABLE_COMPACTION_MAX_STORED_BYTES)
+            .ok_or_else(|| compaction_stored_input_ceiling_error("input"))?;
         let data = Bytes::from(data);
         validate_footer_metadata(&data, limit).map_err(|err| match err {
             TableCatalogStoreError::Invalid(message) => TableCatalogStoreError::Invalid(format!("{location}: {message}")),

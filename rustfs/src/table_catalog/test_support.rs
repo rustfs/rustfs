@@ -555,9 +555,6 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) read_bytes: usize,
     pub(crate) metadata_calls: usize,
     pub(crate) pause_metadata: BTreeMap<(String, String), TestCatalogObjectPause>,
-    pub(crate) pause_after_metadata: BTreeMap<(String, String), TestCatalogObjectPause>,
-    pub(crate) fail_put_prefix: Option<(String, String)>,
-    pub(crate) corrupt_put_prefix: Option<(String, String)>,
     pub(crate) list_calls: usize,
     pub(crate) failed_inventory_prefixes: BTreeSet<String>,
     pub(crate) inventory_overrides: BTreeMap<String, Vec<TableCatalogCleanupObject>>,
@@ -800,23 +797,6 @@ impl TestCatalogObjectBackend {
         if let Some(fence) = fence {
             fence.ensure_held()?;
         }
-        let (fail_prefix, corrupt_prefix) = {
-            let mut state = self.state.lock().await;
-            let matches = |key: &(String, String)| key.0 == bucket && object.starts_with(&key.1);
-            let fail = state.fail_put_prefix.as_ref().is_some_and(matches);
-            let corrupt = state.corrupt_put_prefix.as_ref().is_some_and(matches);
-            if fail {
-                state.fail_put_prefix.take();
-            }
-            if corrupt {
-                state.corrupt_put_prefix.take();
-            }
-            (fail, corrupt)
-        };
-        if fail_prefix {
-            return Err(TableCatalogStoreError::Internal("injected candidate write failure".to_owned()));
-        }
-        let data = if corrupt_prefix { b"{}".to_vec() } else { data };
         let mut fail_put_object_path = self.fail_put_object_path.lock().await;
         if fail_put_object_path.as_deref() == Some(object) {
             fail_put_object_path.take();
@@ -1136,12 +1116,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             mod_time: record.mod_time,
             size: record.data.len() as u64,
         });
-        let pause = state.pause_after_metadata.remove(&key);
         drop(state);
-        if let Some(pause) = pause {
-            pause.started.notify_one();
-            pause.release.notified().await;
-        }
         Ok(metadata)
     }
 

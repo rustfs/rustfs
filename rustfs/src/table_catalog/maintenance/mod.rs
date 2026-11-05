@@ -20,7 +20,9 @@ mod planner;
 mod recovery;
 mod worker;
 
-pub(crate) use compaction::{run_compaction_output, run_compaction_worker, try_admit_compaction};
+pub(crate) use compaction::{
+    compaction_stored_input_ceiling_error, run_compaction_output, run_compaction_worker, try_admit_compaction,
+};
 pub(crate) use config::*;
 pub(crate) use periodic_runtime::{PeriodicMaintenanceConfig, PeriodicMaintenanceRuntime};
 pub(crate) use planner::*;

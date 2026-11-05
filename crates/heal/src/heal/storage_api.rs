@@ -22,8 +22,9 @@ pub(crate) use rustfs_ecstore::api::disk::error::{DiskError as EcstoreDiskError,
 pub(crate) use rustfs_ecstore::api::disk::{
     BUCKET_META_PREFIX as ECSTORE_BUCKET_META_PREFIX, Bytes as EcstoreDiskBytes,
     ConditionalFileUpdate as EcstoreConditionalFileUpdate, DeleteOptions as EcstoreDeleteOptions, DiskAPI as EcstoreDiskAPI,
-    DiskStore as EcstoreDiskStore, HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH,
-    RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET, ReplacementExecutionLease as EcstoreReplacementExecutionLease,
+    DiskStore as EcstoreDiskStore, HEAL_REPLACEMENT_RECOVERY_DIR as ECSTORE_HEAL_REPLACEMENT_RECOVERY_DIR,
+    HEALING_MARKER_PATH as ECSTORE_HEALING_MARKER_PATH, RUSTFS_META_BUCKET as ECSTORE_RUSTFS_META_BUCKET,
+    ReplacementExecutionLease as EcstoreReplacementExecutionLease,
 };
 #[cfg(test)]
 pub(crate) use rustfs_ecstore::api::disk::{
@@ -80,11 +81,11 @@ pub(crate) mod owner {
     pub(crate) use super::storage_contracts::{ObjectIO, ObjectOperations};
 
     pub(crate) use super::{
-        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME,
-        ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate, EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes,
-        EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore, EcstoreEndpoint, EcstoreErrorType,
-        EcstoreHealLifecycleExpiryContext, EcstoreStorageError, EcstoreStore, ecstore_is_reserved_or_invalid_bucket,
-        ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
+        ECSTORE_BUCKET_META_PREFIX, ECSTORE_DATA_USAGE_CACHE_NAME, ECSTORE_HEAL_REPLACEMENT_RECOVERY_DIR,
+        ECSTORE_HEALING_MARKER_PATH, ECSTORE_POOL_META_NAME, ECSTORE_RUSTFS_META_BUCKET, EcstoreConditionalFileUpdate,
+        EcstoreDeleteOptions, EcstoreDiskAPI, EcstoreDiskBytes, EcstoreDiskError, EcstoreDiskResult, EcstoreDiskStore,
+        EcstoreEndpoint, EcstoreErrorType, EcstoreHealLifecycleExpiryContext, EcstoreStorageError, EcstoreStore,
+        ecstore_is_reserved_or_invalid_bucket, ecstore_load_admin_data_usage_from_backend_cached, ecstore_local_disk_map_read,
     };
 
     pub(crate) use super::{EcstoreDiskOption, ecstore_new_disk};

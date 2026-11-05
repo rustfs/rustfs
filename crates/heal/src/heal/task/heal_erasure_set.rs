@@ -501,7 +501,11 @@ impl HealTask {
                     self.record_result_item(result).await;
                 }
                 Err(err) => {
-                    if let Some((_, manager, _)) = replacement_resume.as_ref() {
+                    // Cancellation and timeout keep their classification; only
+                    // a storage failure may be reclassified as a namespace change.
+                    if let Some((_, manager, _)) = replacement_resume.as_ref()
+                        && !matches!(err, Error::TaskCancelled | Error::TaskTimeout)
+                    {
                         manager.verify_replacement_bucket_pass(self.storage.as_ref()).await?;
                     }
                     warn!(

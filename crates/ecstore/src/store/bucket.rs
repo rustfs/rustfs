@@ -150,7 +150,7 @@ fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> Vec<String> {
 
     let mut prefixes = vec![table_bucket_catalog_metadata_prefix(bucket)];
     let root = format!("{BUCKET_META_PREFIX}/{bucket}");
-    if bucket != "ahm-replacement" {
+    if bucket != crate::disk::HEAL_REPLACEMENT_RECOVERY_DIR {
         prefixes.push(root);
         return prefixes;
     }

@@ -5227,7 +5227,12 @@ where
         for rewrite_group in &mut report.rewrite_groups {
             // The stored-input ceiling applies to one rewrite group: inputs are
             // released after each group, so a multi-group job must not fail late
-            // with outputs already written.
+            // with outputs already written. The planner packs groups under the
+            // same ceiling; a plan from another node or an older release is
+            // rejected before any output is written.
+            if rewrite_group.input_bytes > u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).unwrap_or(u64::MAX) {
+                return Err(compaction_stored_input_ceiling_error(&rewrite_group.group_id));
+            }
             let mut stored_input_bytes = 0_usize;
             let output_prefix = rewrite_group
                 .input_file_locations
@@ -5250,9 +5255,7 @@ where
                 stored_input_bytes = stored_input_bytes
                     .checked_add(input_object.data.len())
                     .filter(|size| *size <= TABLE_COMPACTION_MAX_STORED_BYTES)
-                    .ok_or_else(|| {
-                        TableCatalogStoreError::Invalid("compaction stored inputs exceed the server limit".to_owned())
-                    })?;
+                    .ok_or_else(|| compaction_stored_input_ceiling_error(&rewrite_group.group_id))?;
                 input_files.push((input_file.clone(), input_object.data));
             }
             let compacted_file = run_compaction_worker(input_files, Arc::clone(&admission)).await?;

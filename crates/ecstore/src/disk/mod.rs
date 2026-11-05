@@ -53,6 +53,10 @@ pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
+/// Directory under `BUCKET_META_PREFIX` that holds drive-replacement heal
+/// intents, seals and recovery proofs. It shares the bucket-metadata root with
+/// a user bucket of the same name, so bucket deletion must leave it in place.
+pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.

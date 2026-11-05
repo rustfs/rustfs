@@ -61,39 +61,49 @@ impl ResumeManager {
     pub(crate) async fn prepare_replacement_bucket_pass(&self, storage: &dyn HealStorageAPI) -> Result<Vec<String>> {
         let previous = self.get_state().await;
         let current = namespace_snapshot(storage, &previous).await?;
+        // Recorded identities that are gone or replaced. Only a durable deletion
+        // receipt discharges one; absence or a different identity alone does not.
+        let mut retired = BTreeMap::new();
         if let Some(identities) = previous.replacement_bucket_incarnations.as_ref() {
             for (bucket, expected) in identities {
-                if current.get(bucket) != Some(expected) && !storage.mrf_bucket_incarnation_retired(bucket, *expected).await? {
-                    // Absence or a different current identity alone is not a deletion receipt.
-                    return Err(Error::ReplacementNamespaceChanged);
+                if current.get(bucket) != Some(expected) {
+                    if !storage.mrf_bucket_incarnation_retired(bucket, *expected).await? {
+                        return Err(Error::ReplacementNamespaceChanged);
+                    }
+                    retired.insert(bucket.clone(), *expected);
                 }
             }
         }
-        if previous.replacement_bucket_incarnations.as_ref() != Some(&current) {
-            let mut state = self.state.write().await;
-            if let Some(identities) = previous.replacement_bucket_incarnations.as_ref() {
-                for (bucket, expected) in identities {
-                    if current.get(bucket) != Some(expected) {
-                        state
-                            .replacement_retired_bucket_incarnations
-                            .insert(bucket.clone(), *expected);
+        match previous.replacement_bucket_incarnations.as_ref() {
+            // The first pass of this generation, or a recorded bucket was deleted
+            // (and possibly recreated): the pass restarts over the current namespace.
+            None => self.restart_replacement_bucket_pass(current, retired).await?,
+            Some(_) if !retired.is_empty() => self.restart_replacement_bucket_pass(current, retired).await?,
+            // Buckets created since the snapshot join the pass so their identity
+            // is fenced like every other bucket, without discarding progress.
+            Some(identities) => {
+                let added = current
+                    .iter()
+                    .filter(|(bucket, _)| !identities.contains_key(*bucket))
+                    .map(|(bucket, incarnation)| (bucket.clone(), *incarnation))
+                    .collect::<Vec<_>>();
+                if !added.is_empty() {
+                    let mut state = self.state.write().await;
+                    if state.replacement_bucket_pass_order.is_empty() {
+                        state.replacement_bucket_pass_order = identities.keys().cloned().collect();
                     }
+                    for (bucket, incarnation) in added {
+                        state
+                            .replacement_bucket_incarnations
+                            .get_or_insert_with(BTreeMap::new)
+                            .insert(bucket.clone(), incarnation);
+                        state.replacement_bucket_pass_order.push(bucket.clone());
+                        state.pending_buckets.push(bucket);
+                    }
+                    drop(state);
+                    self.save_state_strict().await?;
                 }
             }
-            state.replacement_bucket_incarnations = Some(current.clone());
-            if state.replacement_generation.is_some() {
-                // Protocol-1 readers reject this before interpreting a new pass cursor.
-                state.replacement_execution_protocol = 2;
-            }
-            state.replacement_bucket_pass_reset_pending = true;
-            state.reset_for_retry();
-            state.pending_buckets = current.keys().cloned().collect();
-            state.total_objects = 0;
-            state.total_bytes = 0;
-            state.baseline_generation = None;
-            state.baseline_known = false;
-            drop(state);
-            self.save_state_strict().await?;
         }
         if self.get_state().await.replacement_bucket_pass_reset_pending {
             let checkpoint = if CheckpointManager::has_checkpoint(&self.disk, &previous.task_id).await {
@@ -106,13 +116,46 @@ impl ResumeManager {
             self.state.write().await.replacement_bucket_pass_reset_pending = false;
             self.save_state_strict().await?;
         }
-        Ok(current.into_keys().collect())
+        Ok(self.get_state().await.replacement_bucket_pass_buckets())
+    }
+
+    /// Bind a fresh pass to `current`, publishing the checkpoint rewind first.
+    async fn restart_replacement_bucket_pass(
+        &self,
+        current: BTreeMap<String, Uuid>,
+        retired: BTreeMap<String, Uuid>,
+    ) -> Result<()> {
+        let mut state = self.state.write().await;
+        state.replacement_retired_bucket_incarnations.extend(retired);
+        state.replacement_bucket_pass_order = current.keys().cloned().collect();
+        state.pending_buckets = current.keys().cloned().collect();
+        state.replacement_bucket_incarnations = Some(current);
+        if state.replacement_generation.is_some() {
+            // Protocol-1 readers reject this before interpreting a new pass cursor.
+            state.replacement_execution_protocol = 2;
+        }
+        state.replacement_bucket_pass_reset_pending = true;
+        state.reset_for_retry();
+        state.total_objects = 0;
+        state.total_bytes = 0;
+        state.baseline_generation = None;
+        state.baseline_known = false;
+        drop(state);
+        self.save_state_strict().await
     }
 
     pub(crate) async fn verify_replacement_bucket_pass(&self, storage: &dyn HealStorageAPI) -> Result<()> {
         let state = self.get_state().await;
         let current = namespace_snapshot(storage, &state).await?;
-        if state.replacement_bucket_incarnations.as_ref() != Some(&current) {
+        let Some(identities) = state.replacement_bucket_incarnations.as_ref() else {
+            return Err(Error::ReplacementNamespaceChanged);
+        };
+        // Buckets created during the pass have nothing the pass could have
+        // missed; only a recorded identity that is gone or replaced fails it.
+        if identities
+            .iter()
+            .any(|(bucket, expected)| current.get(bucket) != Some(expected))
+        {
             return Err(Error::ReplacementNamespaceChanged);
         }
         Ok(())
@@ -407,5 +450,126 @@ mod tests {
             .verify_replacement_bucket_pass(&storage)
             .await
             .expect("new pass matches current namespace");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_bucket_pass_keeps_progress_when_a_bucket_is_created_mid_pass() {
+        let (_directories, store) = Box::pin(isolated_store_over_temp_disks()).await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let recorded = "pass-recorded";
+        store
+            .make_bucket(recorded, &MakeBucketOptions::default())
+            .await
+            .expect("create the recorded bucket");
+        let storage = ECStoreHealStorage::new(store.clone());
+        let (_anchor_dir, disk) = super::super::tests::schema_test_disk().await;
+        let task_id = ResumeUtils::generate_task_id();
+        let manager = ResumeManager::new_replacement_intent(
+            disk.clone(),
+            task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec![recorded.to_owned()],
+            vec!["replacement-a".to_string()],
+            vec![ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("persist generation");
+        assert_eq!(
+            manager
+                .prepare_replacement_bucket_pass(&storage)
+                .await
+                .expect("admit the recorded pass"),
+            [recorded]
+        );
+        // Progress into the recorded bucket.
+        manager
+            .set_resume_cursor(Some("mid-pass-cursor".to_string()))
+            .await
+            .expect("persist mid-pass cursor");
+        let checkpoint = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+            .await
+            .expect("admitted checkpoint");
+        checkpoint.complete_page(0, 7).await.expect("persist mid-pass position");
+
+        // The new name sorts before the recorded one, so a sorted rebuild would
+        // move the recorded bucket away from the checkpoint's index.
+        let created = "pass-created";
+        store
+            .make_bucket(created, &MakeBucketOptions::default())
+            .await
+            .expect("create a bucket during the pass");
+        let created_identity = store
+            .bucket_incarnation_id_from_disk(created)
+            .await
+            .expect("created identity");
+
+        manager
+            .verify_replacement_bucket_pass(&storage)
+            .await
+            .expect("a bucket created mid-pass does not fail verification");
+        assert_eq!(
+            manager
+                .prepare_replacement_bucket_pass(&storage)
+                .await
+                .expect("additions extend the pass"),
+            [recorded, created],
+            "additions are appended so the checkpoint's bucket index keeps its meaning"
+        );
+        let state = manager.get_state().await;
+        assert_eq!(
+            state
+                .replacement_bucket_incarnations
+                .as_ref()
+                .and_then(|identities| identities.get(created))
+                .copied(),
+            Some(created_identity)
+        );
+        assert!(state.pending_buckets.contains(&created.to_string()));
+        assert_eq!(state.resume_cursor.as_deref(), Some("mid-pass-cursor"));
+        assert!(!state.replacement_bucket_pass_reset_pending);
+        assert_eq!(state.replacement_execution_protocol, 2);
+        let checkpoint = CheckpointManager::load_from_disk(disk.clone(), &task_id)
+            .await
+            .expect("checkpoint after the addition")
+            .get_checkpoint()
+            .await;
+        assert_eq!(
+            (checkpoint.current_bucket_index, checkpoint.current_object_index),
+            (0, 7),
+            "the checkpoint must not rewind"
+        );
+
+        // A restart reads the persisted order instead of rebuilding it sorted.
+        let restarted = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+            .await
+            .expect("restart the pass");
+        assert_eq!(
+            restarted
+                .prepare_replacement_bucket_pass(&storage)
+                .await
+                .expect("an unchanged namespace keeps the pass"),
+            [recorded, created]
+        );
+        restarted
+            .verify_replacement_bucket_pass(&storage)
+            .await
+            .expect("the extended pass matches the namespace");
+        assert_eq!(restarted.get_state().await.resume_cursor.as_deref(), Some("mid-pass-cursor"));
+
+        // Deleting the created bucket is still a namespace change for the pass.
+        store
+            .delete_bucket(created, &DeleteBucketOptions::default())
+            .await
+            .expect("delete the created bucket");
+        assert!(matches!(
+            restarted.verify_replacement_bucket_pass(&storage).await,
+            Err(Error::ReplacementNamespaceChanged)
+        ));
     }
 }

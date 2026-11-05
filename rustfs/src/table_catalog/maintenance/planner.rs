@@ -686,15 +686,25 @@ fn push_compaction_rewrite_groups_for_prefix(
 ) {
     let mut current_locations = Vec::new();
     let mut current_bytes = 0_u64;
+    let group_limit = compaction_rewrite_group_byte_limit(config);
     for candidate in candidates {
         let next_bytes = current_bytes.saturating_add(candidate.size_bytes);
-        if !current_locations.is_empty() && next_bytes > config.max_rewrite_bytes_per_job {
+        if !current_locations.is_empty() && next_bytes > group_limit {
             push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, sort_order_id, config);
         }
         current_locations.push(candidate.location.clone());
         current_bytes = current_bytes.saturating_add(candidate.size_bytes);
     }
     push_compaction_rewrite_group(groups, &mut current_locations, &mut current_bytes, sort_order_id, config);
+}
+
+/// The commit path holds one rewrite group's stored inputs in memory, so a
+/// group is never packed past that ceiling even when the configured
+/// `max-rewrite-bytes-per-job` is larger.
+fn compaction_rewrite_group_byte_limit(config: &TableCompactionPlanningConfig) -> u64 {
+    config
+        .max_rewrite_bytes_per_job
+        .min(u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).unwrap_or(u64::MAX))
 }
 
 pub(crate) fn compaction_data_file_rewrite_prefix(
@@ -1414,4 +1424,67 @@ fn unix_timestamp_millis(now: OffsetDateTime) -> i64 {
     now.unix_timestamp()
         .saturating_mul(1000)
         .saturating_add(i64::from(now.millisecond()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(index: usize, size_bytes: u64) -> TableCompactionDataFileCandidate {
+        TableCompactionDataFileCandidate {
+            location: format!("s3://warehouse/ns/t/data/part-{index:04}.parquet"),
+            size_bytes,
+            rewrite_prefix: "ns/t/data".to_string(),
+            sort_order_id: None,
+        }
+    }
+
+    #[test]
+    fn compaction_rewrite_groups_never_exceed_the_stored_input_ceiling() {
+        let config = TableCompactionPlanningConfig {
+            target_file_size_bytes: 512 * 1024 * 1024,
+            small_file_threshold_bytes: 64 * 1024 * 1024,
+            min_input_files: 2,
+            max_rewrite_bytes_per_job: 1024 * 1024 * 1024,
+        };
+        // 20 x 64 MiB = 1.25 GiB of candidates: a 1 GiB job limit alone would
+        // pack 16 files (1 GiB) into the first group, twice the stored ceiling.
+        let candidates = (0..20).map(|index| candidate(index, 64 * 1024 * 1024)).collect::<Vec<_>>();
+
+        let groups = compaction_rewrite_groups(&candidates, &config);
+
+        let ceiling = u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).expect("ceiling fits in u64");
+        assert!(groups.len() > 1, "candidates above the ceiling must split into several groups");
+        for group in &groups {
+            assert!(
+                group.input_bytes <= ceiling,
+                "group {} packs {} bytes above the {ceiling} byte ceiling",
+                group.group_id,
+                group.input_bytes
+            );
+            let input_file_count = u64::try_from(group.input_file_count).expect("file count fits in u64");
+            assert_eq!(group.input_bytes, 64 * 1024 * 1024 * input_file_count);
+        }
+        assert_eq!(groups.iter().map(|group| group.input_file_count).sum::<usize>(), 20);
+        assert_eq!(groups[0].input_file_count, 8);
+    }
+
+    #[test]
+    fn compaction_rewrite_groups_honor_a_job_limit_below_the_ceiling() {
+        let config = TableCompactionPlanningConfig {
+            target_file_size_bytes: 64 * 1024,
+            small_file_threshold_bytes: 16 * 1024,
+            min_input_files: 2,
+            max_rewrite_bytes_per_job: 128 * 1024,
+        };
+        let candidates = (0..5).map(|index| candidate(index, 48 * 1024)).collect::<Vec<_>>();
+
+        let groups = compaction_rewrite_groups(&candidates, &config);
+
+        assert_eq!(
+            groups.iter().map(|group| group.input_file_count).collect::<Vec<_>>(),
+            vec![2, 2],
+            "a configured limit below the ceiling still packs by that limit; the odd file is below min-input-files"
+        );
+    }
 }

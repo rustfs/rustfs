@@ -2052,22 +2052,6 @@ where
             })
     }
 
-    fn maintenance_cleanup_roots(entry: &TableEntry) -> TableCatalogStoreResult<Vec<String>> {
-        let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
-        let table_root = metadata_dir
-            .strip_suffix(&format!("/{METADATA_DIR}"))
-            .ok_or_else(|| TableCatalogStoreError::Invalid("maintenance metadata directory has no table root".to_string()))?;
-        let warehouse = table_warehouse_object_prefix(entry)?;
-        Ok(vec![
-            format!("{metadata_dir}/"),
-            format!("{table_root}/{DATA_DIR}/"),
-            format!("{table_root}/{DELETE_DIR}/"),
-            format!("{warehouse}{METADATA_DIR}/"),
-            format!("{warehouse}{DATA_DIR}/"),
-            format!("{warehouse}{DELETE_DIR}/"),
-        ])
-    }
-
     async fn maintenance_cleanup_entry(
         &self,
         table_bucket: &str,
@@ -2075,14 +2059,14 @@ where
         table: &str,
     ) -> TableCatalogStoreResult<TableEntry> {
         let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
-        let roots = Self::maintenance_cleanup_roots(&entry)?;
+        let roots = maintenance_cleanup_roots(&entry)?;
         let state = self.state.lock().await;
         for other in state.tables.values().filter(|other| {
             other.table_bucket == table_bucket
                 && other.state != TableCatalogEntryState::Deleted
                 && (other.namespace != entry.namespace || other.table != entry.table)
         }) {
-            let other_roots = Self::maintenance_cleanup_roots(other)?;
+            let other_roots = maintenance_cleanup_roots(other)?;
             if roots.iter().any(|root| {
                 other_roots
                     .iter()

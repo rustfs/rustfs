@@ -461,6 +461,7 @@ impl ResumeManager {
         if predecessor.replacement_execution_protocol == 2 {
             state.replacement_execution_protocol = 2;
             state.replacement_bucket_incarnations = predecessor.replacement_bucket_incarnations.clone();
+            state.replacement_bucket_pass_order = predecessor.replacement_bucket_pass_order.clone();
             state.replacement_retired_bucket_incarnations = predecessor.replacement_retired_bucket_incarnations.clone();
             state.replacement_bucket_pass_reset_pending = true;
         }

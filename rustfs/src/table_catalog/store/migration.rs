@@ -296,10 +296,20 @@ where
                 "table bucket has an active table-entry directory; roll it back before a backing migration".to_string(),
             ));
         }
+        let fence = Self::backing_migration_fence_from_object(table_bucket, &path, &object)?;
+        Ok(Some((fence, object.etag)))
+    }
+
+    /// Decode and validate a migration fence already read from its path.
+    fn backing_migration_fence_from_object(
+        table_bucket: &str,
+        path: &str,
+        object: &TableCatalogObject,
+    ) -> TableCatalogStoreResult<TableCatalogBackingMigrationFence> {
         let fence: TableCatalogBackingMigrationFence = serde_json::from_slice(&object.data)
             .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse catalog entry {path}: {err}")))?;
         Self::validate_backing_migration_fence(table_bucket, &fence)?;
-        Ok(Some((fence, object.etag)))
+        Ok(fence)
     }
 
     pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {
@@ -333,17 +343,25 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<()> {
+        // The directory state and the migration fence share one object: read
+        // it once and dispatch on its kind.
+        let path = self.paths.backing_migration_fence_path(table_bucket);
+        let Some(object) = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), &path, super::directory_index::DIRECTORY_STATE_MAX_SIZE)
+            .await?
+        else {
+            return Ok(());
+        };
         // The directory upgrade keeps legacy entries authoritative and requires
         // every compatible writer to publish its candidate before the entry.
-        if self.read_table_directory_state(table_bucket).await?.is_some() {
+        if self.table_directory_state_from_object(table_bucket, &object)?.is_some() {
             return Ok(());
         }
-        if self.read_backing_migration_fence(table_bucket).await?.is_some() {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
-            )));
-        }
-        Ok(())
+        Self::backing_migration_fence_from_object(table_bucket, &path, &object)?;
+        Err(TableCatalogStoreError::Conflict(format!(
+            "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
+        )))
     }
 
     async fn ensure_global_backing_migration_fence(
