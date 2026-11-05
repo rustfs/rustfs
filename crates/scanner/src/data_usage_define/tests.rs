@@ -3223,6 +3223,92 @@ fn test_reduce_children_of_usize_underflow_saturates() {
     assert!(cache.find("bucket/large/b").is_some());
 }
 
+#[test]
+fn test_force_compact_flattens_wide_root_above_limit() {
+    // Regression for #8961: a bucket root with fanout between the ordinary
+    // compact limit and the old hardcoded 250_000 ceiling must shrink.
+    // Before the fix, force_compact kept one entry per prefix forever.
+    const PREFIXES: usize = 64;
+    const LIMIT: usize = 16;
+    assert!(PREFIXES > LIMIT);
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(cache.find("bucket").map(|entry| entry.children.len()), Some(PREFIXES));
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(root_entry.compacted, "wide root must flatten under force_compact");
+    assert!(root_entry.children.is_empty(), "flattened root must drop per-prefix children");
+    assert_eq!((root_entry.objects, root_entry.size), (PREFIXES, PREFIXES));
+    assert_eq!(cache.cache.len(), 1, "prefix leaves must be released after root flatten");
+}
+
+#[test]
+fn test_force_compact_keeps_narrow_root_children() {
+    const PREFIXES: usize = 4;
+    const LIMIT: usize = 16;
+    assert!(PREFIXES < LIMIT);
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            objects: PREFIXES,
+            ..Default::default()
+        },
+    );
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted);
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+}
+
 #[tokio::test]
 async fn test_retry_save_op_times_out_and_returns_error_after_retries() {
     let attempts = Arc::new(AtomicUsize::new(0));

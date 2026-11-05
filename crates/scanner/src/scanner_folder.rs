@@ -2533,9 +2533,10 @@ impl FolderScanner {
             }
 
             // Checkpointed sweeps need child entries to validate their resume
-            // frontier. Keep the emergency compaction limit for large trees.
-            let should_compact = (self.new_cache.info.name != folder.name
-                && self.old_cache.info.scan_progress.is_none()
+            // frontier (#8292). Outside that, also compact a wide bucket root:
+            // excluding it left #8961's ~170k top-level prefixes unbounded until
+            // the emergency 250k ceiling. Keep FORCE as the absolute backstop.
+            let should_compact = (self.old_cache.info.scan_progress.is_none()
                 && queued_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
                 || queued_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
 
@@ -3204,13 +3205,15 @@ impl FolderScanner {
         self.compact_completed_folder(&folder, &this_hash, into);
 
         // Compact if too many children...
+        // Allow compact_self on the bucket root when this is not a checkpointed
+        // forward sweep so wide roots can flatten instead of retaining one
+        // entry per top-level prefix (#8961). Checkpointed sweeps keep the
+        // previous root exclusion so resume frontiers stay addressable (#8292).
         if !into.compacted {
             let done_compact = Metrics::time(Metric::CompactFolder);
-            self.new_cache.reduce_children_of(
-                &this_hash,
-                DATA_SCANNER_COMPACT_AT_CHILDREN,
-                self.new_cache.info.name != folder.name,
-            );
+            let compact_self = self.new_cache.info.name != folder.name || self.old_cache.info.scan_progress.is_none();
+            self.new_cache
+                .reduce_children_of(&this_hash, DATA_SCANNER_COMPACT_AT_CHILDREN, compact_self);
             done_compact();
         }
 
