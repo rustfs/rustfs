@@ -209,7 +209,8 @@ pub(crate) fn list_entry_is_orphan_data_dir_part(entry: &str) -> bool {
 }
 
 /// Classify the entire leaf before unlinking anything. UUID-shaped S3 prefixes
-/// and transaction witnesses share this namespace with erasure data dirs.
+/// and unknown files fail closed; only parts and committed delete markers
+/// are returned for non-recursive unlink.
 fn orphan_data_dir_parts(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let protected = || std::io::Error::new(ErrorKind::InvalidData, "orphan data directory contains protected entries");
     if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
@@ -7372,8 +7373,9 @@ impl LocalDisk {
             if opt.recursive || opt.old_data_dir.is_some() || opt.recoverable_delete || opt.undo_write || opt.undo_delete {
                 return Err(DiskError::FileCorrupt);
             }
-            // Unlink only classified part files, then rmdir. A child namespace
-            // published after classification is never removed recursively.
+            // Unlink classified part files and committed delete markers,
+            // then rmdir. A child namespace published after classification is
+            // never removed recursively.
             let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
             let data_path = file_path.clone();
             let sync = effective_durability(volume).syncs_commit_metadata();
@@ -13143,6 +13145,38 @@ mod test {
             assert!(
                 data_path.join("child").join(STORAGE_FORMAT_FILE).exists(),
                 "sibling child namespace must remain"
+            );
+
+            // Committed delete-data marker + part (no xl.meta) must still classify
+            // and reclaim; this matches Phase 1 of reclaim_orphan_data_dirs.
+            let marked_dir = Uuid::new_v4();
+            let marked = format!("{object}/{marked_dir}");
+            let marked_path = base.join(object).join(marked_dir.to_string());
+            let transaction = Uuid::new_v4();
+            fs::create_dir_all(&marked_path).await.expect("marked data dir");
+            fs::write(marked_path.join("part.1"), b"stale").await.expect("marked part");
+            fs::write(marked_path.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}")), [])
+                .await
+                .expect("committed delete marker");
+            assert!(
+                disk.is_plain_orphan_data_dir("orphan", &marked).await.expect("probe marked"),
+                "committed delete residue must classify as plain orphan"
+            );
+            disk.delete(
+                "orphan",
+                &marked,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("committed delete residue reclaim");
+            assert!(!marked_path.exists(), "committed delete residue must be removed");
+            assert!(
+                data_path.join("child").join(STORAGE_FORMAT_FILE).exists(),
+                "sibling child namespace must remain after marker reclaim"
             );
         }
 
