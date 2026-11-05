@@ -289,6 +289,119 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
 }
 
 #[tokio::test]
+async fn table_storage_credentials_are_rejected_by_catalog_authentication() {
+    let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    rustfs_iam::store::object::ObjectStore::new(store.clone())
+        .save_iam_config(
+            serde_json::json!({"version": 1}),
+            format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+        )
+        .await
+        .expect("seed request IAM format");
+    let iam = rustfs_iam::build_iam_sys(store.clone())
+        .await
+        .expect("initialize request IAM");
+    let parent_key = "storage-session-parent";
+    let parent_secret = "storage-session-parent-secret";
+    iam.create_user(
+        parent_key,
+        &AddOrUpdateUserReq {
+            secret_key: parent_secret.to_string(),
+            policy: None,
+            status: AccountStatus::Enabled,
+        },
+    )
+    .await
+    .expect("create session parent");
+    iam.set_policy(
+        "storage-session-parent-policy",
+        Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"admin:GetTable"}]}"#)
+            .expect("parse catalog read policy"),
+    )
+    .await
+    .expect("store parent policy");
+    iam.policy_db_set(parent_key, UserType::Reg, false, "storage-session-parent-policy")
+        .await
+        .expect("attach parent policy");
+    let root_key = "storage-session-root";
+    let root_secret = "storage-session-root-secret";
+    let context = Arc::new(AppContext::new(store, Arc::new(RequestIam { handle: iam.clone() }), Arc::new(RequestKms)));
+    assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+        access_key: root_key.to_string(),
+        secret_key: root_secret.to_string(),
+        status: "on".to_string(),
+        ..Default::default()
+    }));
+    for (key, secret) in [(root_key, root_secret), (parent_key, parent_secret)] {
+        authorize_table_catalog_request(
+            &table_catalog_handler_request(context.clone(), key, secret),
+            AdminAction::GetTableAction,
+        )
+        .await
+        .expect("ordinary catalog identities remain authorized");
+    }
+
+    for parent in [root_key, parent_key] {
+        let mut cases = vec![(None, serde_json::Value::Null)];
+        for marker in ["rustfs:table-bucket", "rustfs:table-id", "rustfs:credential-scope-prefix"] {
+            for value in [
+                serde_json::json!("table-scope"),
+                serde_json::json!(""),
+                serde_json::Value::Null,
+                serde_json::json!(7),
+                serde_json::json!([]),
+                serde_json::json!({}),
+            ] {
+                cases.push((Some(marker), value));
+            }
+        }
+        for (marker, value) in cases {
+            let expiration = OffsetDateTime::now_utc().saturating_add(Duration::minutes(15));
+            let mut claims = HashMap::from([
+                ("exp".to_string(), serde_json::json!(expiration.unix_timestamp())),
+                ("parent".to_string(), serde_json::json!(parent)),
+            ]);
+            if let Some(marker) = marker {
+                claims.insert(marker.to_string(), value);
+            }
+            let mut credential = get_new_credentials_with_metadata(&claims, root_secret).expect("sign a temporary credential");
+            credential.parent_user = parent.to_string();
+            iam.set_temp_user(&credential.access_key, &credential, None)
+                .await
+                .expect("store temporary credential");
+            let mut request = table_catalog_handler_request(context.clone(), &credential.access_key, &credential.secret_key);
+            request.headers.insert(
+                "x-amz-security-token",
+                HeaderValue::from_str(&credential.session_token).expect("session token header"),
+            );
+            let unscoped = authorize_table_catalog_request(&request, AdminAction::GetTableAction).await;
+            let scoped = authorize_table_catalog_resource_request(
+                &request,
+                &TableCatalogResource::warehouse("warehouse"),
+                AdminAction::GetTableAction,
+            )
+            .await;
+            if marker.is_some() {
+                assert_eq!(
+                    unscoped.expect_err("any storage marker must deny catalog access").code(),
+                    &S3ErrorCode::AccessDenied
+                );
+                assert_eq!(
+                    scoped
+                        .err()
+                        .expect("partial or malformed storage claims must fail closed")
+                        .code(),
+                    &S3ErrorCode::AccessDenied
+                );
+            } else {
+                unscoped.expect("ordinary temporary credentials retain catalog authorization");
+                scoped.expect("ordinary temporary credentials retain resource authorization");
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn warehouse_location_claim_checks_request_identity_and_relocation() {
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     rustfs_iam::store::object::ObjectStore::new(store.clone())
@@ -1147,6 +1260,30 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
             );
         }
     }
+    let delegated = &issued_json["storage-credentials"][0]["config"];
+    let mut storage_request = table_catalog_handler_request(
+        context.clone(),
+        delegated[S3_ACCESS_KEY_ID_CONFIG_KEY].as_str().expect("vended access key"),
+        delegated[S3_SECRET_ACCESS_KEY_CONFIG_KEY]
+            .as_str()
+            .expect("vended secret key"),
+    );
+    storage_request.headers.insert(
+        "x-amz-security-token",
+        HeaderValue::from_str(delegated[S3_SESSION_TOKEN_CONFIG_KEY].as_str().expect("vended session token"))
+            .expect("session token header"),
+    );
+    let error = call_load_table_handler(storage_request)
+        .await
+        .expect_err("vended storage credentials must not enter the catalog handler");
+    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+    let reloaded = call_load_table_handler(table_catalog_handler_request(context, vended_access_key, vended_secret_key))
+        .await
+        .expect("the parent catalog identity remains authorized");
+    let reloaded_json: serde_json::Value =
+        serde_json::from_slice(&reloaded.output.1.bytes().expect("reloaded table body")).expect("parse reloaded table");
+    assert_eq!(reloaded_json["metadata-location"], issued_json["metadata-location"]);
+    assert_eq!(reloaded_json["metadata"], issued_json["metadata"]);
 }
 
 #[test]
