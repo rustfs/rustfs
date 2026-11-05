@@ -27,6 +27,7 @@ mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub mod multipart_index;
 pub mod multipart_source;
 pub mod os;
 
@@ -52,6 +53,10 @@ pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
+/// Directory under `BUCKET_META_PREFIX` that holds drive-replacement heal
+/// intents, seals and recovery proofs. It shares the bucket-metadata root with
+/// a user bucket of the same name, so bucket deletion must leave it in place.
+pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
@@ -414,10 +419,11 @@ impl Disk {
         object: &str,
         transaction: Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
         match self {
             Self::Local(disk) => {
-                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
                     .await
             }
             Self::Remote(_) => Ok(None),
@@ -431,11 +437,19 @@ impl Disk {
         transaction: Uuid,
         journal: &DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<bool> {
         match self {
             Self::Local(disk) => {
-                disk.try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
-                    .await
+                disk.try_finish_and_finalize_prepared_delete_local(
+                    volume,
+                    object,
+                    transaction,
+                    journal,
+                    namespace_owner,
+                    work_budget,
+                )
+                .await
             }
             Self::Remote(_) => Ok(false),
         }
@@ -512,6 +526,17 @@ impl Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        match self {
+            Self::Local(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+            Self::Remote(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+        }
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
         match self {
             Self::Local(disk) => disk.supports_guarded_delete_versions().await,
@@ -555,6 +580,17 @@ impl DiskAPI for Disk {
             Self::Remote(disk) => disk.has_delete_transaction_evidence(volume, object).await,
         }
     }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        match self {
+            Self::Local(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+            Self::Remote(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+        }
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -565,6 +601,35 @@ impl DiskAPI for Disk {
         match self {
             Self::Local(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
             Self::Remote(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+        }
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        match self {
+            Self::Local(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+            Self::Remote(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+        }
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
         }
     }
     async fn inspect_delete_transaction(
@@ -1513,6 +1578,15 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn host_name(&self) -> String;
     fn endpoint(&self) -> Endpoint;
     async fn close(&self) -> Result<()>;
+    /// Return candidates only while this disk maintains complete boot-local coverage.
+    /// Unsupported or unready disks must never return an authoritative empty page.
+    async fn list_multipart_index_roots(
+        &self,
+        _bucket: &str,
+        _marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
@@ -1689,6 +1763,35 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         _limit: u32,
     ) -> Result<DeleteRecoveryPage> {
         Err(DiskError::MethodNotAllowed)
+    }
+    /// Bounded foreground inventory owns all traversal state until return or cancellation.
+    /// An implementation without the bounded protocol is an unsupported participant
+    /// (the same verdict a remote peer without it receives); callers must never fall
+    /// back to paginated discovery.
+    async fn discover_delete_transactions_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _request: BoundedDeleteRecoverySettlement,
+        _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        Err(DiskError::UnsupportedDisk)
     }
     /// A read-only capability check; unsupported implementations must fail closed.
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
@@ -2075,6 +2178,13 @@ pub struct WalkDirOptions {
     #[serde(default)]
     pub skip_hidden_prefix_check: bool,
 
+    /// Bound hidden metadata read while proving a non-recursive prefix visible.
+    #[serde(default)]
+    pub hidden_entry_budget: usize,
+    /// A prefix whose visibility was not established before the preceding cut.
+    #[serde(default)]
+    pub pending_prefix: Option<String>,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -2407,9 +2517,62 @@ pub enum DeleteRecoveryAction {
     AdoptCommit { authority: Box<DeleteRecoveryJournal> },
 }
 
+/// A complete inventory or a work-limit refusal. No public discovery cursor is allocated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryDiscovery {
+    pub transactions: Vec<DeleteTransactionId>,
+    pub visited: u32,
+    pub complete: bool,
+}
+
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlement {
+    pub object: String,
+    pub transaction: Uuid,
+    pub expected_fingerprint: DeleteRecoveryDigest,
+    pub action: DeleteRecoveryAction,
+    pub max_entries: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoverySettlementOutcome {
+    Inspected(Box<DeleteRecoveryInspection>),
+    ReceiptPublishedInspectionDeferred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlementReply {
+    pub outcome: DeleteRecoverySettlementOutcome,
+    pub visited: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryInspection {
+    pub inspection: DeleteRecoveryInspection,
+    pub visited: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum DeleteRecoveryRpcOperation {
+    SettleBounded(BoundedDeleteRecoverySettlement),
+    InspectBounded {
+        object: String,
+        transaction: Uuid,
+        max_entries: u32,
+    },
+    DiscoverBounded {
+        object: String,
+        max_entries: u32,
+    },
     InspectOrphanDataDir {
         path: String,
     },
@@ -2447,7 +2610,11 @@ impl DeleteRecoveryRpcOperation {
     /// Full metadata application and adoption share the existing mutation envelope.
     pub fn max_wire_payload_bytes(&self) -> usize {
         match self {
-            Self::ApplyVersion { .. }
+            Self::SettleBounded(BoundedDeleteRecoverySettlement {
+                action: DeleteRecoveryAction::AdoptCommit { .. },
+                ..
+            })
+            | Self::ApplyVersion { .. }
             | Self::ApplyVersions { .. }
             | Self::Settle {
                 action: DeleteRecoveryAction::AdoptCommit { .. },
@@ -2463,8 +2630,11 @@ impl DeleteRecoveryRpcOperation {
 pub enum DeleteRecoveryRpcReply {
     OrphanDataDir { plain: bool },
     Discovered(DeleteRecoveryPage),
+    DiscoveredBounded(BoundedDeleteRecoveryDiscovery),
     Inspected(DeleteRecoveryInspection),
+    InspectedBounded(BoundedDeleteRecoveryInspection),
     Settled(DeleteRecoveryInspection),
+    SettledBounded(BoundedDeleteRecoverySettlementReply),
     AppliedVersion,
     AppliedVersions(Vec<Option<u32>>),
     Evidence { present: bool },
@@ -2942,6 +3112,8 @@ mod tests {
             recursive: true,
             incl_deleted: false,
             skip_hidden_prefix_check: false,
+            hidden_entry_budget: 0,
+            pending_prefix: None,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),

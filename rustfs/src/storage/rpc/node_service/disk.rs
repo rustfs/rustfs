@@ -14,7 +14,8 @@
 
 use super::{LocalMutationTarget, NodeService};
 use crate::storage::storage_api::ecstore_disk::{
-    MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+    DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES, DELETE_RECOVERY_MAX_INSPECTION_ENTRIES, MULTIPART_SOURCE_PROTOCOL_VERSION,
+    MultipartSourceOperation, MultipartSourceRequest, POOL_META_NATIVE_CAS_METADATA_SUFFIX,
     PoolMetaNativeRecoveryRequest as NativeRecoveryRequest, QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET,
     RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET, is_quota_mutation_fence_path, require_source_condition,
 };
@@ -603,6 +604,64 @@ impl NodeService {
     }
 
     pub(super) async fn handle_disk_info(&self, request: Request<DiskInfoRequest>) -> Result<Response<DiskInfoResponse>, Status> {
+        use crate::storage::storage_api::ecstore_disk::{
+            MULTIPART_INDEX_RPC_MAX_BYTES, MULTIPART_INDEX_RPC_MAX_REQUEST_BYTES, MultipartIndexRpcReply,
+            MultipartIndexRpcRequest,
+        };
+        // Keep ordinary DiskInfo unchanged. Only the explicit additive operation
+        // opts into a fresh, signed candidate page; it never uses the info cache.
+        let is_index_request = serde_json::from_str::<serde_json::Value>(&request.get_ref().opts)
+            .is_ok_and(|value| value.get("multipart_index").is_some());
+        if is_index_request {
+            if request.get_ref().opts.len() > MULTIPART_INDEX_RPC_MAX_REQUEST_BYTES {
+                return Err(Status::resource_exhausted("multipart index options limit"));
+            }
+            // Decode the original bytes so duplicate fields also fail strict
+            // deserialization instead of being collapsed by a JSON value map.
+            let index_request: MultipartIndexRpcRequest = serde_json::from_str(&request.get_ref().opts)
+                .map_err(|_| Status::invalid_argument("invalid multipart index request"))?;
+            let canonical = index_request
+                .canonical_request(&request.get_ref().disk)
+                .map_err(|_| Status::invalid_argument("invalid multipart index request"))?;
+            verify_tonic_canonical_body_digest(&request, &canonical)
+                .map_err(|_| Status::unauthenticated("multipart index request authentication failed"))?;
+            let target = &request.get_ref().disk;
+            let Some(disk) = self.find_disk(target).await? else {
+                return Err(Status::not_found("multipart index disk unavailable"));
+            };
+            let query = &index_request.multipart_index;
+            let page = match disk.list_multipart_index_roots(&query.bucket, query.marker.as_deref()).await {
+                Ok(page) => page,
+                Err(error) => {
+                    return Ok(Response::new(DiskInfoResponse {
+                        success: false,
+                        disk_info: String::new(),
+                        error: Some(error.into()),
+                    }));
+                }
+            };
+            let body = index_request
+                .canonical_response(target, &page)
+                .map_err(|_| Status::internal("index response encoding failed"))?;
+            let proof = crate::storage::storage_api::sign_tonic_rpc_response_proof(&body)
+                .map_err(|_| Status::internal("index response authentication unavailable"))?;
+            let reply = MultipartIndexRpcReply {
+                operation: query.operation.clone(),
+                version: query.version,
+                challenge: query.challenge,
+                page,
+                proof,
+            };
+            let encoded = serde_json::to_string(&reply).map_err(|_| Status::internal("index response encoding failed"))?;
+            if encoded.len() > MULTIPART_INDEX_RPC_MAX_BYTES {
+                return Err(Status::resource_exhausted("multipart index response limit"));
+            }
+            return Ok(Response::new(DiskInfoResponse {
+                success: true,
+                disk_info: encoded,
+                error: None,
+            }));
+        }
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
             let opts = match serde_json::from_str::<DiskInfoOptions>(&request.opts) {
@@ -2200,6 +2259,25 @@ impl NodeService {
             {
                 return Err(Status::invalid_argument("recoverable batch delete exceeds 1000 object/version requests"));
             }
+            DeleteRecoveryRpcOperation::DiscoverBounded { max_entries, .. }
+                if *max_entries == 0 || *max_entries > DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES =>
+            {
+                return Err(Status::invalid_argument("invalid bounded delete discovery entry limit"));
+            }
+            DeleteRecoveryRpcOperation::InspectBounded {
+                transaction,
+                max_entries,
+                ..
+            } if transaction.is_nil() || *max_entries == 0 || *max_entries > DELETE_RECOVERY_MAX_INSPECTION_ENTRIES => {
+                return Err(Status::invalid_argument("invalid bounded delete inspection"));
+            }
+            DeleteRecoveryRpcOperation::SettleBounded(request)
+                if request.transaction.is_nil()
+                    || request.max_entries == 0
+                    || request.max_entries > DELETE_RECOVERY_MAX_INSPECTION_ENTRIES =>
+            {
+                return Err(Status::invalid_argument("invalid bounded delete settlement"));
+            }
             DeleteRecoveryRpcOperation::Discover { limit, .. } if *limit == 0 || *limit > 256 => {
                 return Err(Status::invalid_argument("delete recovery page limit must be between 1 and 256"));
             }
@@ -2259,14 +2337,30 @@ impl NodeService {
                         errors.into_iter().map(|error| error.map(|error| error.to_u32())).collect(),
                     ))
                 }
+                DeleteRecoveryRpcOperation::DiscoverBounded { object, max_entries } => disk
+                    .discover_delete_transactions_bounded(&request.volume, &object, max_entries)
+                    .await
+                    .map(DeleteRecoveryRpcReply::DiscoveredBounded),
                 DeleteRecoveryRpcOperation::Discover { object, cursor, limit } => disk
                     .discover_delete_transactions(&request.volume, object.as_deref(), cursor, limit)
                     .await
                     .map(DeleteRecoveryRpcReply::Discovered),
+                DeleteRecoveryRpcOperation::InspectBounded {
+                    object,
+                    transaction,
+                    max_entries,
+                } => disk
+                    .inspect_delete_transaction_bounded(&request.volume, &object, transaction, max_entries)
+                    .await
+                    .map(DeleteRecoveryRpcReply::InspectedBounded),
                 DeleteRecoveryRpcOperation::Inspect { object, transaction } => disk
                     .inspect_delete_transaction(&request.volume, &object, transaction)
                     .await
                     .map(DeleteRecoveryRpcReply::Inspected),
+                DeleteRecoveryRpcOperation::SettleBounded(operation) => disk
+                    .settle_delete_transaction_bounded(&request.volume, operation)
+                    .await
+                    .map(DeleteRecoveryRpcReply::SettledBounded),
                 DeleteRecoveryRpcOperation::Settle {
                     object,
                     transaction,
@@ -3334,6 +3428,153 @@ mod tests {
                     .expect("msgpack batch read version response should decode");
                 assert_eq!(decoded.path, responses[0].path);
             },
+        );
+    }
+}
+
+#[cfg(test)]
+mod multipart_index_tests {
+    use super::{DiskInfoOptions, DiskInfoRequest, FileInfo, RUSTFS_META_MULTIPART_BUCKET};
+    use crate::storage::storage_api::ecstore_disk::{MultipartIndexRpcReply, MultipartIndexRpcRequest};
+    use crate::storage::storage_api::{StorageDiskRpcExt as _, set_tonic_canonical_body_digest, verify_tonic_rpc_response_proof};
+    use sha2::{Digest, Sha256};
+    use tonic::Request;
+    use uuid::Uuid;
+
+    fn request(target: &str, query: &MultipartIndexRpcRequest) -> Request<DiskInfoRequest> {
+        let mut request = Request::new(DiskInfoRequest {
+            disk: target.into(),
+            opts: serde_json::to_string(query).expect("index request JSON"),
+        });
+        set_tonic_canonical_body_digest(&mut request, &query.canonical_request(target).expect("canonical index request"))
+            .expect("body digest");
+        request
+            .metadata_mut()
+            .insert("x-rustfs-rpc-auth-version", "2".parse().expect("version metadata"));
+        request
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn multipart_index_disk_info_handler_roundtrip_is_signed_fresh_and_keeps_ordinary_disk_info() {
+        let _ = rustfs_credentials::set_global_rpc_secret("multipart-index-handler-test-secret".to_owned());
+        let root = tempfile::tempdir().expect("RPC storage root");
+        let env = Box::pin(
+            rustfs_test_utils::TestECStoreEnv::builder()
+                .base_dir(root.path())
+                .init_bucket_metadata(false)
+                .build(),
+        )
+        .await;
+        let service = super::super::make_server();
+        let target = env.endpoint_pools.as_ref()[0].endpoints.as_ref()[0].to_string();
+        let disk = service.find_disk(&target).await.expect("disk lookup").expect("local disk");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::storage::storage_api::ecstore_disk::wait_for_multipart_index_bootstrap(&disk),
+        )
+        .await
+        .expect("bootstrap completes")
+        .expect("local bootstrap worker");
+        let bucket = "multipart-index-rpc-bucket";
+        disk.make_volume(bucket).await.expect("fixture bucket");
+        let query = MultipartIndexRpcRequest::new(bucket, None);
+        let first = service
+            .handle_disk_info(request(&target, &query))
+            .await
+            .expect("new operation handler")
+            .into_inner();
+        assert!(first.success);
+        let reply: MultipartIndexRpcReply = serde_json::from_str(&first.disk_info).expect("dedicated signed response");
+        let id = reply.page.disk_id;
+        reply.validate(&query, id).expect("validated page");
+        verify_tonic_rpc_response_proof(
+            &query.canonical_response(&target, &reply.page).expect("canonical response"),
+            &reply.proof,
+        )
+        .expect("actual handler response proof");
+        assert!(reply.page.roots.is_empty());
+
+        let key = "old-coordinator-write";
+        let sha = rustfs_utils::crypto::hex(Sha256::digest(format!("{bucket}/{key}")));
+        let path = format!("{sha}/{}x1", Uuid::new_v4());
+        let mut info = FileInfo::new(&path, 2, 2);
+        info.erasure.index = 1;
+        info.data_dir = Some(Uuid::new_v4());
+        info.mod_time = Some(time::OffsetDateTime::now_utc());
+        info.fresh = true;
+        info.metadata
+            .insert("x-rustfs-internal-multipart-bucket".into(), bucket.into());
+        info.metadata.insert("x-rustfs-internal-multipart-object".into(), key.into());
+        disk.write_metadata(bucket, RUSTFS_META_MULTIPART_BUCKET, &path, info)
+            .await
+            .expect("old disk write API");
+        let second_query = MultipartIndexRpcRequest::new(bucket, None);
+        let second = service
+            .handle_disk_info(request(&target, &second_query))
+            .await
+            .expect("fresh page")
+            .into_inner();
+        assert!(second.success);
+        let second: MultipartIndexRpcReply = serde_json::from_str(&second.disk_info).expect("fresh signed response");
+        second.validate(&second_query, id).expect("current challenge");
+        assert_eq!(second.page.roots, vec![sha]);
+        assert!(
+            reply.validate(&second_query, id).is_err(),
+            "prior empty page cannot replay as current readiness"
+        );
+        let ordinary = service
+            .handle_disk_info(Request::new(DiskInfoRequest {
+                disk: target,
+                opts: serde_json::to_string(&DiskInfoOptions::default()).expect("ordinary options"),
+            }))
+            .await
+            .expect("ordinary DiskInfo unchanged")
+            .into_inner();
+        assert!(ordinary.success);
+        serde_json::from_str::<crate::storage::storage_api::DiskInfo>(&ordinary.disk_info)
+            .expect("ordinary response schema unchanged");
+    }
+
+    #[tokio::test]
+    async fn multipart_index_disk_info_rejects_invalid_operation_or_unsigned_request() {
+        let service = super::super::make_server();
+        let query = MultipartIndexRpcRequest::new("bucket", None);
+        let unsigned = Request::new(DiskInfoRequest {
+            disk: "disk".into(),
+            opts: serde_json::to_string(&query).expect("query"),
+        });
+        assert_eq!(
+            service
+                .handle_disk_info(unsigned)
+                .await
+                .expect_err("mandatory body-bound authentication")
+                .code(),
+            tonic::Code::Unauthenticated
+        );
+        let mut invalid = query;
+        invalid.multipart_index.page_cap += 1;
+        let invalid = Request::new(DiskInfoRequest {
+            disk: "disk".into(),
+            opts: serde_json::to_string(&invalid).expect("query"),
+        });
+        assert_eq!(
+            service.handle_disk_info(invalid).await.expect_err("fixed page cap").code(),
+            tonic::Code::InvalidArgument
+        );
+        let duplicate = Request::new(DiskInfoRequest {
+            disk: "disk".into(),
+            opts: serde_json::to_string(&MultipartIndexRpcRequest::new("bucket", None))
+                .expect("valid query")
+                .replacen("\"version\":1", "\"version\":1,\"version\":1", 1),
+        });
+        assert_eq!(
+            service
+                .handle_disk_info(duplicate)
+                .await
+                .expect_err("duplicate query fields")
+                .code(),
+            tonic::Code::InvalidArgument
         );
     }
 }

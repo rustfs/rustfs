@@ -16,9 +16,38 @@
 
 use super::veeam_sosapi;
 use super::*;
+use crate::app::storage_api::object_usecase::access::replication_proxy_allowed;
 use crate::on_demand_migration::{
     BucketOdmState, HeadPolicy, OdmLookup, OdmOp, OdmOutcome, OnDemandMigrationSys, SourceClient, SourceError, SourceHead,
 };
+
+async fn head_metadata_action_allowed(req: &S3Request<HeadObjectInput>, action: S3Action) -> S3Result<bool> {
+    let Ok(info) = req_info_ref(req) else {
+        return Ok(false);
+    };
+    // No owner shortcut: an explicit bucket-policy Deny on these metadata
+    // actions binds the owner too (see `owner_can_bypass_policy_deny`).
+    let mut info = info.clone();
+    info.suppress_denial_log = true;
+    info.suppress_denial_audit = true;
+    let mut probe = S3Request {
+        input: (),
+        method: req.method.clone(),
+        uri: req.uri.clone(),
+        headers: req.headers.clone(),
+        extensions: req.extensions.clone(),
+        credentials: req.credentials.clone(),
+        region: req.region.clone(),
+        service: req.service.clone(),
+        trailing_headers: req.trailing_headers.clone(),
+    };
+    probe.extensions.insert(info);
+    match authorize_request(&mut probe, Action::S3Action(action)).await {
+        Ok(()) => Ok(true),
+        Err(err) if err.code() == &S3ErrorCode::AccessDenied => Ok(false),
+        Err(err) => Err(err),
+    }
+}
 
 /// Source HEAD seam for the on-demand migration passthrough: production goes
 /// through [`SourceClient`], tests script the answers.
@@ -413,7 +442,9 @@ impl DefaultObjectUsecase {
                     // Active-active replication lag window: an object missing
                     // locally may still be served by proxying the HEAD to a
                     // replication target (backlog#1675 P1-5).
-                    if let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await {
+                    if replication_proxy_allowed(&req.extensions)
+                        && let Some(output) = Self::proxy_head_object_to_replication_targets(&req, &bucket, &key, &opts).await
+                    {
                         let response = wrap_response_with_cors(&bucket, &req.method, &req.headers, output).await;
                         let result = Ok(response);
                         let _ = helper
@@ -615,7 +646,12 @@ impl DefaultObjectUsecase {
 
         // Add x-amz-tagging-count header if object has tags
         // Per S3 API spec, this header should be present in HEAD object response when tags exist
-        if tag_count > 0 {
+        let tagging_action = if req.input.version_id.is_some() {
+            S3Action::GetObjectVersionTaggingAction
+        } else {
+            S3Action::GetObjectTaggingAction
+        };
+        if tag_count > 0 && (replication_check || head_metadata_action_allowed(&req, tagging_action).await?) {
             let header_name = http::HeaderName::from_static(AMZ_TAG_COUNT);
             if let Ok(header_value) = tag_count.to_string().parse::<HeaderValue>() {
                 response.headers.insert(header_name, header_value);
@@ -623,9 +659,20 @@ impl DefaultObjectUsecase {
                 warn!("Failed to parse x-amz-tagging-count header; skipping");
             }
         }
+        let retention_allowed = replication_check
+            || ([
+                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+                AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE,
+                AMZ_OBJECT_LOCK_MODE_LOWER,
+                AMZ_OBJECT_LOCK_MODE,
+            ]
+            .iter()
+            .any(|key| metadata_map.contains_key(*key))
+                && head_metadata_action_allowed(&req, S3Action::GetObjectRetentionAction).await?);
         if let Some(retain_date) = metadata_map
             .get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER)
             .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE))
+            && retention_allowed
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(retain_date)
         {
@@ -634,6 +681,7 @@ impl DefaultObjectUsecase {
         if let Some(mode) = metadata_map
             .get(AMZ_OBJECT_LOCK_MODE_LOWER)
             .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_MODE))
+            && retention_allowed
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_MODE_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(mode)
         {
@@ -642,6 +690,7 @@ impl DefaultObjectUsecase {
         if let Some(legal_hold) = metadata_map
             .get(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER)
             .or_else(|| metadata_map.get(AMZ_OBJECT_LOCK_LEGAL_HOLD))
+            && (replication_check || head_metadata_action_allowed(&req, S3Action::GetObjectLegalHoldAction).await?)
             && let Ok(header_name) = http::HeaderName::from_bytes(AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.as_bytes())
             && let Ok(header_value) = HeaderValue::from_str(legal_hold)
         {
@@ -1059,6 +1108,102 @@ mod tests {
             .build()
             .unwrap();
         build_request(input, Method::HEAD)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn head_response_filters_lock_and_tag_metadata_by_permission() {
+        crate::app::gating_test_env::run_large_stack_test("head-metadata-permissions", || async {
+            use crate::app::runtime_sources::{AppContext, ServerContextSlot};
+            use crate::app::storage_api::test::ReqInfo;
+            use crate::app::storage_api::test::S3Access as _;
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::app::storage_api::test::ecfs::FS;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context.clone()));
+            let fs = FS::with_server_ctx(slot.clone());
+            let usecase = DefaultObjectUsecase::with_context(Some(context));
+            let bucket = format!("head-metadata-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            let object = store
+                .put_object(
+                    &bucket,
+                    "protected",
+                    &mut PutObjReader::from_vec(b"body".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        user_defined: HashMap::from([
+                            (AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER.to_owned(), "2099-01-01T00:00:00Z".to_owned()),
+                            (AMZ_OBJECT_LOCK_MODE_LOWER.to_owned(), "GOVERNANCE".to_owned()),
+                            (AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER.to_owned(), "ON".to_owned()),
+                            (AMZ_OBJECT_TAGGING.to_owned(), "classification=secret".to_owned()),
+                        ]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            for (grant, explicit_deny, replica) in [
+                (false, false, false),
+                (true, true, false),
+                (true, false, false),
+                (false, false, true),
+            ] {
+                let mut statements = vec![serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},
+                    "Action":["s3:GetObject","s3:GetObjectVersion","s3:ReplicateObject"],"Resource":format!("arn:aws:s3:::{bucket}/*")})];
+                for (enabled, effect) in [(grant, "Allow"), (explicit_deny, "Deny")] {
+                    if enabled {
+                        statements.push(serde_json::json!({"Effect":effect,"Principal":{"AWS":"*"},
+                        "Action":["s3:GetObjectRetention","s3:GetObjectLegalHold","s3:GetObjectTagging","s3:GetObjectVersionTagging"],
+                        "Resource":format!("arn:aws:s3:::{bucket}/*")}));
+                    }
+                }
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::app::storage_api::object_usecase::bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                for version in [None, object.version_id.map(|version| version.to_string())] {
+                    let mut req = head_input(&bucket, "protected", version);
+                    req.extensions.insert(ReqInfo::default());
+                    req.extensions.insert(slot.clone());
+                    if replica {
+                        req.headers
+                            .insert("x-rustfs-source-replication-check", HeaderValue::from_static("true"));
+                    }
+                    fs.head_object(&mut req).await.expect("ordinary HEAD read is permitted");
+                    let response = Box::pin(usecase.execute_head_object(req)).await.expect("HEAD succeeds");
+                    assert_eq!(response.output.content_length, Some(4));
+                    for header in [
+                        AMZ_TAG_COUNT,
+                        AMZ_OBJECT_LOCK_RETAIN_UNTIL_DATE_LOWER,
+                        AMZ_OBJECT_LOCK_MODE_LOWER,
+                        AMZ_OBJECT_LOCK_LEGAL_HOLD_LOWER,
+                    ] {
+                        assert_eq!(
+                            response.headers.contains_key(header),
+                            replica || (grant && !explicit_deny),
+                            "header {header}"
+                        );
+                    }
+                }
+            }
+        });
     }
 
     /// Drives `execute_head_object` against a real store with the global

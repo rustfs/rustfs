@@ -15,6 +15,7 @@
 //! CopyObject path.
 
 use super::*;
+use crate::app::storage_api::object_usecase::object_utils::to_s3s_xml_etag;
 use futures::FutureExt;
 use rustfs_utils::path::fold_object_name_path_separators;
 use tracing::Instrument;
@@ -142,7 +143,7 @@ impl DefaultObjectUsecase {
         Box::pin(self.execute_copy_object_body(req))
     }
 
-    async fn execute_copy_object_body(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+    async fn execute_copy_object_body(&self, mut req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -238,7 +239,7 @@ impl DefaultObjectUsecase {
 
         // Validate both source and destination keys
         validate_object_key(&src_key, "COPY (source)")?;
-        validate_object_key(&key, "COPY (dest)")?;
+        validate_new_object_key(&key, "COPY (dest)")?;
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let replaces_metadata = match metadata_directive.as_ref().map(|directive| directive.as_str()) {
@@ -487,6 +488,13 @@ impl DefaultObjectUsecase {
         let _source_cancellation_guard = source_cancellation.clone().drop_guard();
 
         let mut src_info = gr.object_info.clone();
+        let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
+        crate::app::storage_api::object_usecase::access::authorize_copy_object_tags(
+            &mut req,
+            &src_info.user_tags,
+            &effective_tags,
+        )
+        .await?;
 
         // A copy reads the source plaintext, so it needs the source key's decrypt permission
         // as well as the destination key's generate permission below. The source read resolves
@@ -568,7 +576,6 @@ impl DefaultObjectUsecase {
 
         // Extract user_defined from Arc for mutation; it will be re-wrapped after all edits.
         let mut user_defined = (*src_info.user_defined).clone();
-        let effective_tags = replacement_tags.unwrap_or_else(|| (*src_info.user_tags).clone());
         if !replaces_metadata {
             let source_expires = src_info.expires.map(Timestamp::from);
             insert_expires_metadata(&mut user_defined, source_expires.as_ref())?;
@@ -888,7 +895,7 @@ impl DefaultObjectUsecase {
             }
         }
         let copy_object_result = CopyObjectResult {
-            e_tag: oi.etag.as_ref().map(|etag| to_s3s_etag(etag)),
+            e_tag: oi.etag.as_ref().map(|etag| to_s3s_xml_etag(etag)),
             last_modified: oi.mod_time.map(Timestamp::from),
             checksum_crc32: response_checksums.crc32,
             checksum_crc32c: response_checksums.crc32c,
@@ -1514,6 +1521,71 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), &S3ErrorCode::InvalidRequest);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn metadata_only_copy_escapes_legacy_etags_in_xml() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use s3s::xml::{SerializeContent, Serializer};
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("copy-legacy-etag-{}", Uuid::new_v4());
+        let key = "owned.txt";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let etag = "</ETag><Injected>victim</Injected><ETag>&amp;";
+        let mut reader = PutObjReader::from_vec(b"legacy object".to_vec());
+        store
+            .put_object(
+                &bucket,
+                key,
+                &mut reader,
+                &ObjectOptions {
+                    preserve_etag: Some(etag.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed legacy ETag directly in storage");
+        let before = store
+            .get_object_info(&bucket, key, &ObjectOptions::default())
+            .await
+            .expect("legacy object");
+        assert_eq!(before.etag.as_deref(), Some(etag));
+        let input = CopyObjectInput::builder()
+            .bucket(bucket.clone())
+            .key(key.to_string())
+            .copy_source(CopySource::Bucket {
+                bucket: bucket.clone().into(),
+                key: key.into(),
+                version_id: None,
+            })
+            .metadata_directive(Some(s3s::dto::MetadataDirective::from_static("REPLACE")))
+            .build()
+            .expect("self-copy request");
+        let mut request = build_request(input, Method::PUT);
+        request.extensions.insert(ReqInfo::default());
+        let result = Box::pin(DefaultObjectUsecase::with_context(Some(context)).execute_copy_object(request))
+            .await
+            .expect("metadata-only self-copy");
+        let mut bytes = Vec::new();
+        result
+            .output
+            .copy_object_result
+            .expect("copy result")
+            .serialize_content(&mut Serializer::new(&mut bytes))
+            .expect("serialize copy result");
+        let xml = String::from_utf8(bytes).expect("XML UTF-8");
+        assert!(!xml.contains("<Injected>"), "{xml}");
+        assert!(xml.contains("&lt;Injected&gt;victim&lt;/Injected&gt;"), "{xml}");
+        let stored = store
+            .get_object_info(&bucket, key, &ObjectOptions::default())
+            .await
+            .expect("copied object");
+        assert_eq!(stored.etag.as_deref(), Some(etag), "escaping belongs only to the wire response");
     }
 
     #[tokio::test]

@@ -17,8 +17,9 @@ use datafusion::arrow::{
     error::ArrowError,
     json::reader::{ValueIter, infer_json_schema_from_iterator},
 };
+use rustfs_s3select_api::query::session::MAX_SELECT_COLUMNS;
 use serde::de::{self, DeserializeSeed, MapAccess, SeqAccess, Visitor};
-use std::{collections::HashMap, fmt, sync::Arc};
+use std::{cell::Cell, collections::HashMap, fmt, rc::Rc, sync::Arc};
 
 /// Infers a JSON LINES schema with Arrow's types and the source's first-seen
 /// key order.
@@ -27,10 +28,9 @@ use std::{collections::HashMap, fmt, sync::Arc};
 /// process-wide `serde_json/preserve_order` feature is enabled, so `SELECT *`
 /// would otherwise reorder fields and CSV output columns.
 pub(super) fn infer_schema(bytes: &[u8], max_records: usize) -> Result<Schema, ArrowError> {
-    let schema = infer_json_schema_from_iterator(ValueIter::new(bytes, Some(max_records)))?;
     let mut order = KeyOrder::default();
     // Same records as `ValueIter`: one value per line, blank lines skipped.
-    // Arrow has already rejected invalid UTF-8 and JSON within this prefix.
+    // Check width before Arrow merges records; retain its type inference.
     let records = bytes
         .split(|byte| *byte == b'\n')
         .filter_map(|line| std::str::from_utf8(line).ok())
@@ -43,6 +43,7 @@ pub(super) fn infer_schema(bytes: &[u8], max_records: usize) -> Result<Schema, A
             .deserialize(&mut deserializer)
             .map_err(|error| ArrowError::JsonError(format!("Not valid JSON: {error}")))?;
     }
+    let schema = infer_json_schema_from_iterator(ValueIter::new(bytes, Some(max_records)))?;
     Ok(Schema::new_with_metadata(order.reorder(schema.fields()), schema.metadata().clone()))
 }
 
@@ -52,16 +53,25 @@ pub(super) fn infer_schema(bytes: &[u8], max_records: usize) -> Result<Schema, A
 struct KeyOrder {
     positions: HashMap<String, usize>,
     children: Vec<KeyOrder>,
+    field_count: Rc<Cell<usize>>,
 }
 
 impl KeyOrder {
-    fn child(&mut self, key: String) -> &mut KeyOrder {
+    fn child<E: de::Error>(&mut self, key: String) -> Result<&mut KeyOrder, E> {
         let next = self.children.len();
         let position = *self.positions.entry(key).or_insert(next);
         if position == next {
-            self.children.push(KeyOrder::default());
+            let count = self.field_count.get();
+            if count >= MAX_SELECT_COLUMNS {
+                return Err(E::custom("S3 Select JSON schema exceeds 1024 fields"));
+            }
+            self.field_count.set(count + 1);
+            self.children.push(KeyOrder {
+                field_count: Rc::clone(&self.field_count),
+                ..Default::default()
+            });
         }
-        &mut self.children[position]
+        Ok(&mut self.children[position])
     }
 
     fn reorder(&self, fields: &Fields) -> Fields {
@@ -107,7 +117,7 @@ impl<'de> Visitor<'de> for &mut KeyOrder {
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
         while let Some(key) = map.next_key::<String>()? {
-            map.next_value_seed(self.child(key))?;
+            map.next_value_seed(self.child::<A::Error>(key)?)?;
         }
         Ok(())
     }
@@ -175,6 +185,22 @@ mod tests {
         let schema = infer_schema(b"{\"b\":1,\"a\":2}\nnot json\n", 1).expect("schema");
 
         assert_eq!(names(schema.fields()), ["b", "a"]);
+    }
+
+    #[test]
+    fn bounded_json_schema_counts_nested_fields_across_the_sample() {
+        let rows = (0..1023)
+            .map(|index| format!("{{\"outer\":{{\"f{index}\":1}}}}\n"))
+            .collect::<String>();
+        let schema = infer_schema(rows.as_bytes(), 2000).expect("1024 total fields");
+        assert_eq!(schema.fields().len(), 1);
+        let overflow = format!("{rows}{{\"outer\":{{\"extra\":1}}}}\n");
+        assert!(
+            infer_schema(overflow.as_bytes(), 2000)
+                .expect_err("nested width limit")
+                .to_string()
+                .contains("1024 fields")
+        );
     }
 
     #[test]

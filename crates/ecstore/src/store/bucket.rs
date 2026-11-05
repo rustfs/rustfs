@@ -14,7 +14,7 @@
 
 use super::*;
 use crate::bucket::{
-    metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState, table_bucket_catalog_metadata_prefix},
+    metadata::{BUCKET_TABLE_RESERVED_PREFIX, BUCKET_TAGGING_CONFIG, ConfigState},
     utils::is_meta_bucketname,
 };
 use crate::error::is_err_bucket_not_found;
@@ -145,11 +145,41 @@ async fn table_bucket_enabled_in(ctx: &crate::runtime::instance::InstanceContext
     }
 }
 
-fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> [String; 2] {
-    [
-        table_bucket_catalog_metadata_prefix(bucket),
-        format!("{BUCKET_META_PREFIX}/{bucket}"),
-    ]
+fn bucket_delete_metadata_cleanup_prefixes(bucket: &str) -> Vec<String> {
+    use crate::bucket::metadata::*;
+
+    let mut prefixes = vec![table_bucket_catalog_metadata_prefix(bucket)];
+    let root = format!("{BUCKET_META_PREFIX}/{bucket}");
+    if bucket != crate::disk::HEAL_REPLACEMENT_RECOVERY_DIR {
+        prefixes.push(root);
+        return prefixes;
+    }
+
+    // This valid user bucket shares its metadata directory with raw drive
+    // replacement intents, seals and recovery proofs. Delete only bucket-owned
+    // paths, including legacy standalone configuration, never the shared root.
+    // S3 objects live in the separate user volume; configuration APIs write the
+    // aggregate metadata file, so clients cannot populate arbitrary siblings.
+    prefixes.extend(
+        [
+            BUCKET_METADATA_FILE,
+            BUCKET_INCARNATION_FILE,
+            BUCKET_POLICY_CONFIG,
+            BUCKET_QUOTA_CONFIG_FILE,
+            BUCKET_TARGETS_FILE,
+            BUCKET_ACL_CONFIG,
+            BUCKET_TABLE_CONFIG,
+            BUCKET_DURABILITY_CONFIG,
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+            ".replication",
+            "integrity-jobs",
+            crate::data_usage::DATA_USAGE_CACHE_NAME,
+        ]
+        .into_iter()
+        .chain(XML_BUCKET_CONFIG_FILES)
+        .map(|file| format!("{root}/{file}")),
+    );
+    prefixes
 }
 
 fn bucket_deleted_marker_prefix(bucket: &str) -> String {
@@ -160,41 +190,48 @@ fn bucket_deleted_marker_volume(bucket: &str) -> String {
     format!("{RUSTFS_META_BUCKET}/{}", bucket_deleted_marker_prefix(bucket))
 }
 
-pub(crate) async fn await_bucket_namespace_operation<T, F>(
-    guard: Option<&rustfs_lock::NamespaceLockGuard>,
-    bucket: &str,
+// Box the child before constructing either lease wrapper. Keeping F inline in
+// nested select futures multiplies poll-frame temporaries along DELETE -> quota
+// cleanup -> metadata GET. This boundary must not inline back into that chain.
+#[inline(never)]
+pub(crate) fn await_bucket_namespace_operation<'a, T: 'a, F>(
+    guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    bucket: &'a str,
     operation: &'static str,
     future: F,
-) -> Result<T>
+) -> impl Future<Output = Result<T>> + 'a
 where
-    F: Future<Output = Result<T>>,
+    F: Future<Output = Result<T>> + 'a,
 {
-    let Some(guard) = guard else {
-        return future.await;
-    };
-    if guard.is_lock_lost() {
-        return Err(StorageError::other(format!(
-            "bucket namespace lock was lost before {operation}: {bucket}"
-        )));
-    }
-    tokio::select! {
-        biased;
-        _ = guard.lock_lost_notified() => Err(StorageError::other(format!(
-            "bucket namespace lock was lost during {operation}: {bucket}"
-        ))),
-        result = future => result,
+    let future = Box::pin(future);
+    async move {
+        let Some(guard) = guard else {
+            return future.await;
+        };
+        if guard.is_lock_lost() {
+            return Err(StorageError::other(format!(
+                "bucket namespace lock was lost before {operation}: {bucket}"
+            )));
+        }
+        tokio::select! {
+            biased;
+            _ = guard.lock_lost_notified() => Err(StorageError::other(format!(
+                "bucket namespace lock was lost during {operation}: {bucket}"
+            ))),
+            result = future => result,
+        }
     }
 }
 
-async fn await_bucket_lifecycle_operation<T, F>(
-    lifecycle_guard: Option<&rustfs_lock::NamespaceLockGuard>,
-    namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
-    bucket: &str,
+fn await_bucket_lifecycle_operation<'a, T: 'a, F>(
+    lifecycle_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    namespace_guard: Option<&'a rustfs_lock::NamespaceLockGuard>,
+    bucket: &'a str,
     operation: &'static str,
     future: F,
-) -> Result<T>
+) -> impl Future<Output = Result<T>> + 'a
 where
-    F: Future<Output = Result<T>>,
+    F: Future<Output = Result<T>> + 'a,
 {
     await_bucket_namespace_operation(
         lifecycle_guard,
@@ -202,7 +239,6 @@ where
         operation,
         await_bucket_namespace_operation(namespace_guard, bucket, operation, future),
     )
-    .await
 }
 
 fn bucket_recovery_lock_unavailable(bucket: &str, object: &str) -> StorageError {
@@ -478,10 +514,18 @@ impl ECStore {
         let mut tags = HashMap::with_capacity(tagging.tag_set.len());
         for tag in &tagging.tag_set {
             let (Some(key), Some(value)) = (&tag.key, &tag.value) else {
-                return Err(Error::other("stored bucket tag is missing a key or value"));
+                return Err(crate::bucket::metadata::unreadable_config_error(
+                    bucket,
+                    BUCKET_TAGGING_CONFIG,
+                    metadata.tagging_config_xml.len(),
+                ));
             };
             if key.is_empty() || tags.insert(key.clone(), value.clone()).is_some() {
-                return Err(Error::other("stored bucket tags contain empty or duplicate keys"));
+                return Err(crate::bucket::metadata::unreadable_config_error(
+                    bucket,
+                    BUCKET_TAGGING_CONFIG,
+                    metadata.tagging_config_xml.len(),
+                ));
             }
         }
         Ok(tags)
@@ -1673,7 +1717,17 @@ impl ECStore {
                 ns_guard.as_ref(),
                 bucket,
                 "bucket retirement publication",
-                crate::bucket::retirement::commit_retirement(store, bucket, incarnation, &record_opts),
+                crate::bucket::retirement::commit_retirement(store.clone(), bucket, incarnation, &record_opts),
+            )
+            .await?;
+            // The lifecycle fence excludes live reservation owners. A crash-left
+            // V1 ledger must not block quota admission after same-name recreation.
+            await_bucket_lifecycle_operation(
+                bucket_lifecycle_guard.as_ref(),
+                ns_guard.as_ref(),
+                bucket,
+                "retired bucket quota ledger cleanup",
+                crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(store, bucket, incarnation),
             )
             .await?;
         }
@@ -1822,6 +1876,20 @@ mod tests {
             .expect("delayed xl.meta scan should complete");
         assert!(xlmeta.xlmeta_found);
         assert!(!xlmeta.diagnostic_truncated);
+    }
+
+    #[tokio::test]
+    async fn bucket_namespace_operation_keeps_nested_future_state_off_the_poll_stack() {
+        let payload = std::hint::black_box([7u8; 128 * 1024]);
+        let operation = super::await_bucket_lifecycle_operation(None, None, "bucket", "large metadata operation", async move {
+            tokio::task::yield_now().await;
+            Ok(std::hint::black_box(payload)[0])
+        });
+        assert!(
+            std::mem::size_of_val(&operation) < 1024,
+            "nested lease wrappers must not retain the concrete storage future inline"
+        );
+        assert_eq!(operation.await.expect("the boxed operation must still execute"), 7);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2240,7 +2308,13 @@ mod tests {
             let result = store.get_bucket_tags_for_policy(bucket).await;
             match expected {
                 Some(tags) => assert_eq!(&result.expect("valid tag configuration"), tags),
-                None => assert!(result.is_err(), "corrupt tags must not become an untagged bucket: {xml:?}"),
+                None => assert!(
+                    crate::bucket::metadata::unreadable_config_refusal(
+                        &result.expect_err("corrupt tags must not become an untagged bucket")
+                    )
+                    .is_some_and(|failure| failure.config_file == super::BUCKET_TAGGING_CONFIG),
+                    "corrupt tags must carry a typed tagging refusal: {xml:?}"
+                ),
             }
         }
     }
@@ -2440,6 +2514,187 @@ mod tests {
 
         assert!(prefixes.contains(&table_bucket_catalog_metadata_prefix("analytics")));
         assert!(prefixes.contains(&"buckets/analytics".to_string()));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn replacement_named_bucket_delete_preserves_recovery_and_recreates_clean_metadata() {
+        use crate::bucket::metadata::{BUCKET_QUOTA_CONFIG_FILE, BUCKET_TAGGING_CONFIG, BUCKET_VERSIONING_CONFIG};
+
+        let (_temp, store) = setup_bucket_quorum_test_env(&[4], None).await;
+        metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "ahm-replacement";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create legal bucket");
+        let old_incarnation = store.bucket_incarnation_id_from_disk(bucket).await.expect("old incarnation");
+        for (config, bytes) in [
+            (BUCKET_QUOTA_CONFIG_FILE, br#"{"quota":1024,"quota_type":"Hard"}"#.as_slice()),
+            (
+                BUCKET_TAGGING_CONFIG,
+                b"<Tagging><TagSet><Tag><Key>old</Key><Value>value</Value></Tag></TagSet></Tagging>".as_slice(),
+            ),
+            (
+                BUCKET_VERSIONING_CONFIG,
+                b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".as_slice(),
+            ),
+        ] {
+            metadata_sys::update_in(&store.ctx, bucket, config, bytes.to_vec())
+                .await
+                .expect("persist old configuration");
+        }
+        let ledger_path = format!("config/quota-ledger/{bucket}.json");
+        // V1 precharges outstanding growth: four live bytes plus the
+        // crash-left reservation's 100 bytes must already be accounted.
+        let ledger = serde_json::to_vec(&serde_json::json!({
+            "version": 1, "bucket_incarnation": old_incarnation,
+            "quota_revision_unix_nanos": 0, "accounted_usage": 104,
+            "reservations": {Uuid::new_v4().to_string(): {
+                "object": "crashed-put", "old_size": 0, "new_size": 100,
+                "created_at": 0, "pool_index": 0, "set_index": 0, "commit_started": false
+            }}, "reconcile_required": true
+        }))
+        .expect("encode crash-left ledger");
+
+        // The storage API requires the same legacy-quota admission supplied
+        // by the S3 handler, even for this small fixture object.
+        let mut live_options = ObjectOptions {
+            versioned: true,
+            ..Default::default()
+        };
+        assert!(live_options.set_quota_admission(0, 1024));
+        // Failed deletion must leave both the live incarnation and its ledger alone.
+        store
+            .put_object(bucket, "live", &mut PutObjReader::from_vec(b"live".to_vec()), &live_options)
+            .await
+            .expect("write live object");
+        crate::config::com::save_config(store.clone(), &ledger_path, ledger.clone())
+            .await
+            .expect("persist old ledger");
+        assert!(matches!(
+            store.delete_bucket(bucket, &DeleteBucketOptions::default()).await,
+            Err(StorageError::BucketNotEmpty(_))
+        ));
+        assert_eq!(
+            crate::config::com::read_config(store.clone(), &ledger_path)
+                .await
+                .expect("live ledger remains"),
+            ledger
+        );
+        // Remove every version; the configured bucket is otherwise still empty.
+        let versions = store
+            .clone()
+            .list_object_versions(bucket, "", None, None, None, 100)
+            .await
+            .expect("list live versions");
+        for object in versions.objects {
+            store
+                .delete_object(
+                    bucket,
+                    &object.name,
+                    ObjectOptions {
+                        version_id: object.version_id.map(|id| id.to_string()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("remove live version");
+        }
+
+        let root = format!("{BUCKET_META_PREFIX}/{bucket}");
+        let task = Uuid::new_v4();
+        let recovery_names = [
+            "ahm_replacement_intent.json",
+            "ahm_replacement_intent_seal",
+            "ahm_replacement_completion_proof.json",
+        ]
+        .map(|suffix| format!("{task}_{suffix}"));
+        let disk_paths = store.pools[0].disk_set[0]
+            .disks
+            .read()
+            .await
+            .iter()
+            .flatten()
+            .map(|disk| PathBuf::from(disk.endpoint().to_string()))
+            .collect::<Vec<_>>();
+        for disk in &disk_paths {
+            let directory = disk.join(RUSTFS_META_BUCKET).join(&root);
+            for name in &recovery_names {
+                tokio::fs::write(directory.join(name), b"durable heal record")
+                    .await
+                    .expect("seed raw recovery record");
+            }
+            // Legacy standalone settings and bucket-owned subtrees must not survive.
+            for name in [
+                "quota.json",
+                "versioning.xml",
+                "policy.json",
+                "bucket-targets.json",
+                "integrity-jobs/job.json",
+                ".replication/resync.bin",
+                ".usage-cache.bin",
+            ] {
+                let path = directory.join(name);
+                tokio::fs::create_dir_all(path.parent().expect("fixture parent"))
+                    .await
+                    .expect("legacy parent");
+                tokio::fs::write(path, b"old bucket configuration")
+                    .await
+                    .expect("seed legacy configuration");
+            }
+        }
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete legal same-name bucket");
+        assert!(matches!(
+            crate::config::com::read_config(store.clone(), &ledger_path).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        for disk in &disk_paths {
+            let directory = disk.join(RUSTFS_META_BUCKET).join(&root);
+            for name in &recovery_names {
+                assert_eq!(
+                    tokio::fs::read(directory.join(name)).await.expect("recovery record survives"),
+                    b"durable heal record"
+                );
+            }
+            for prefix in bucket_delete_metadata_cleanup_prefixes(bucket)
+                .into_iter()
+                .filter(|p| p.starts_with(&root))
+            {
+                assert!(
+                    !disk.join(RUSTFS_META_BUCKET).join(prefix).exists(),
+                    "bucket-owned metadata must be removed"
+                );
+            }
+        }
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate legal bucket");
+        let fresh = metadata_sys::get_in(&store.ctx, bucket).await.expect("fresh metadata");
+        assert_ne!(fresh.bucket_incarnation_id, old_incarnation);
+        assert!(fresh.quota_config_json.is_empty());
+        assert!(fresh.tagging_config_xml.is_empty());
+        assert!(fresh.versioning_config_xml.is_empty());
+        assert!(fresh.policy_config_json.is_empty());
+        // The strict purge/recovery cleanup must share the same ownership boundary.
+        store
+            .cleanup_deleted_bucket_metadata_strict(bucket, true)
+            .await
+            .expect("strict metadata cleanup");
+        for disk in &disk_paths {
+            for name in &recovery_names {
+                assert_eq!(
+                    tokio::fs::read(disk.join(RUSTFS_META_BUCKET).join(&root).join(name))
+                        .await
+                        .expect("strict cleanup preserves recovery"),
+                    b"durable heal record"
+                );
+            }
+        }
     }
 
     #[test]

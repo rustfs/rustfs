@@ -3914,6 +3914,7 @@ impl SetDisks {
                 bucket,
                 object,
                 DeleteRecoveryContext {
+                    work_budget: opts.delete_recovery_work_budget.clone(),
                     explicit_delete: true,
                     transaction_guard: transaction_guard.cloned(),
                     namespace_owner: Some(Arc::new((
@@ -4798,6 +4799,27 @@ impl SetDisks {
                 .await?;
             }
 
+            // Lock order: lifecycle, metadata transaction, then object namespace.
+            // No body reads occur below this point. The snapshot must describe the
+            // configuration at commit, not the pre-body advisory object lookup.
+            let mut commit_opts;
+            let opts = if opts.defer_put_object_lock_snapshot {
+                commit_opts = opts.clone();
+                let expected = source_bucket_incarnation_id
+                    .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
+                let store = metadata_sys::object_store_in(&self.ctx).await?;
+                let snapshot = store.object_lock_config_snapshot_for_single_put(bucket).await?;
+                if !snapshot.is_valid_for_destructive_put(store.id, bucket, expected) {
+                    return Err(Error::other("PUT bucket generation or configuration changed while staging"));
+                }
+                snapshot.add_lock_fences(&mut commit_opts);
+                commit_opts.object_lock_config_snapshot = Some(snapshot);
+                commit_opts.defer_put_object_lock_snapshot = false;
+                &commit_opts
+            } else {
+                opts
+            };
+
             if let Some(store) = opts.decommission_capacity_admission.as_ref() {
                 #[cfg(test)]
                 {
@@ -5291,6 +5313,7 @@ impl SetDisks {
             let commit_decommission_object_lock_guard = decommission_object_lock_guard.take();
             let commit_publication_guard = publication_commit_guard.take();
             let commit_bucket_lifecycle_guard = bucket_lifecycle_guard.take();
+            let commit_object_lock_config_snapshot = opts.object_lock_config_snapshot.clone();
             let commit_decommission_capacity_guard = decommission_capacity_guard.take();
             let commit_scanner_publication_scope = opts.scanner_publication_commit_scope.clone();
             // A scanner publication scope owns the movement permit until the
@@ -5353,6 +5376,7 @@ impl SetDisks {
                 let mut _decommission_object_lock_guard = commit_decommission_object_lock_guard;
                 let mut _publication_guard = commit_publication_guard;
                 let mut _bucket_lifecycle_guard = commit_bucket_lifecycle_guard;
+                let mut _object_lock_config_snapshot = commit_object_lock_config_snapshot;
                 let mut _decommission_capacity_guard = commit_decommission_capacity_guard;
                 let mut quota_reservation = quota_reservation;
                 let rename_stage_start = Instant::now();
@@ -5686,6 +5710,7 @@ impl SetDisks {
                         let object_lock_guard = _object_lock_guard.take();
                         let publication_guard = _publication_guard.take();
                         let bucket_lifecycle_guard = _bucket_lifecycle_guard.take();
+                        let object_lock_config_snapshot = _object_lock_config_snapshot.take();
                         let decommission_object_lock_guard = _decommission_object_lock_guard.take();
                         let decommission_capacity_guard = _decommission_capacity_guard.take();
                         let cleanup_bucket = commit_bucket.clone();
@@ -5708,6 +5733,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                object_lock_config_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -5729,6 +5755,7 @@ impl SetDisks {
                                 write_context,
                                 publication_guard,
                                 bucket_lifecycle_guard,
+                                object_lock_config_snapshot,
                                 decommission_object_lock_guard,
                                 decommission_capacity_guard,
                             ),
@@ -5742,6 +5769,7 @@ impl SetDisks {
                                 drop(write_context);
                                 drop(publication_guard);
                                 drop(bucket_lifecycle_guard);
+                                drop(object_lock_config_snapshot);
                                 cleanup_runtime::run(cleanup_reservation, async move {
                                     let zero_target_cleanup = targets.is_empty();
                                     rustfs_io_metrics::record_put_object_stage_duration(
@@ -9156,6 +9184,9 @@ impl SetDisks {
                 &disks,
                 write_quorum,
                 DeleteRecoveryContext {
+                    work_budget: commit_context
+                        .options
+                        .and_then(|options| options.delete_recovery_work_budget.clone()),
                     recovery_ticket,
                     transaction_guard: commit_context.transaction_guard.clone(),
                     namespace_owner: namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>),
@@ -9719,9 +9750,26 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         if let Some(etag) = &src_info.etag {
             replacement_metadata.insert("etag".to_owned(), etag.clone());
         }
+        // ObjectInfo externalizes these fields; copy callers supply the effective
+        // values, including empty tags/absent expiry for explicit replacement.
+        if !src_info.user_tags.is_empty() {
+            replacement_metadata
+                .entry(rustfs_utils::http::headers::AMZ_OBJECT_TAGGING.to_string())
+                .or_insert_with(|| (*src_info.user_tags).clone());
+        }
+        if let Some(expires) = src_info.expires
+            && !replacement_metadata.contains_key("expires")
+        {
+            replacement_metadata.insert(
+                "expires".to_string(),
+                expires
+                    .format(&time::format_description::well_known::Rfc3339)
+                    .map_err(Error::other)?,
+            );
+        }
         fi.metadata = replacement_metadata.clone();
 
-        let mod_time = OffsetDateTime::now_utc();
+        let mod_time = dst_opts.mod_time.unwrap_or_else(OffsetDateTime::now_utc);
         fi.mod_time = Some(mod_time);
         fi.version_id = version_id;
         fi.versioned = src_opts.versioned || src_opts.version_suspended;
@@ -9844,6 +9892,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         objects: Vec<ObjectToDelete>,
         mut opts: ObjectOptions,
     ) -> (Vec<DeletedObject>, Vec<Option<Error>>, Vec<Option<DeleteAccounting>>) {
+        opts.ensure_delete_recovery_work_budget();
         let mut del_objects = vec![DeletedObject::default(); objects.len()];
         let mut accounting = vec![None; objects.len()];
         let delete_config_snapshot = opts
@@ -10115,6 +10164,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                         bucket,
                         &dobj.object_name,
                         DeleteRecoveryContext {
+                            work_budget: opts.delete_recovery_work_budget.clone(),
                             dry_run: !opts.no_lock,
                             transaction_guard: transaction_guards.get(lock_names[i].as_ref()).cloned(),
                             namespace_owner: opts.delete_mutation_owner.clone(),
@@ -10723,6 +10773,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                             disks,
                             self.set_drive_count / 2 + 1,
                             DeleteRecoveryContext {
+                                work_budget: opts.delete_recovery_work_budget.clone(),
                                 recovery_ticket,
                                 namespace_owner,
                                 transaction_guard,
@@ -10906,6 +10957,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket,
                     &object.object_name,
                     DeleteRecoveryContext {
+                        work_budget: opts.delete_recovery_work_budget.clone(),
                         explicit_delete,
                         namespace_owner: Some(Arc::new((
                             self.ctx.begin_namespace_commit(),
@@ -10964,6 +11016,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
 
     #[tracing::instrument(skip(self, opts))]
     async fn delete_object(&self, bucket: &str, object: &str, mut opts: ObjectOptions) -> Result<ObjectInfo> {
+        opts.ensure_delete_recovery_work_budget();
         let _scope_outcome_guard = opts
             .scanner_publication_commit_scope
             .clone()
@@ -11260,6 +11313,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     bucket,
                     object,
                     DeleteRecoveryContext {
+                        work_budget: opts.delete_recovery_work_budget.clone(),
                         transaction_guard: transaction_guard.clone(),
                         namespace_owner: Some(Arc::new((
                             self.ctx.begin_namespace_commit(),
@@ -11871,7 +11925,10 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
         // as a second object header set: forwarding SSE intent or wrapped DEKs
         // would request a second encryption pass and disclose local envelope
         // material to the remote provider.
-        transition_meta.retain(|key, _| !rustfs_utils::http::is_replication_stripped_encryption_key(key));
+        transition_meta.retain(|key, _| {
+            !rustfs_utils::http::is_replication_stripped_encryption_key(key)
+                && !rustfs_utils::http::is_snowball_transport_key(key)
+        });
         transition_meta.insert("name".to_string(), object.to_string());
         rustfs_utils::http::metadata_compat::insert_str(
             &mut transition_meta,
@@ -16348,6 +16405,170 @@ mod metadata_mutation_generation_tests {
     }
 
     #[tokio::test]
+    async fn restore_metadata_copy_preserves_tags_expiry_and_version_order() {
+        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+        use s3s::dto::RestoreRequest;
+        use time::format_description::well_known::Rfc3339;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "restore-metadata-preservation";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let old_time = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let latest_time = old_time + time::Duration::days(1);
+        let expires = latest_time + time::Duration::days(365);
+        for deleted in [false, true] {
+            let object = if deleted { "deleted" } else { "live" };
+            let tags = "classification=secret&owner=alice";
+            let old = set
+                .put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"old protected content".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        mod_time: Some(old_time),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        user_defined: HashMap::from([
+                            (AMZ_OBJECT_TAGGING.to_string(), tags.to_string()),
+                            ("x-amz-tagging".to_string(), tags.to_string()),
+                            ("expires".to_string(), expires.format(&Rfc3339).expect("expiry")),
+                        ]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write historical version");
+            let latest = if deleted {
+                let marker = FileInfo {
+                    version_id: Some(Uuid::new_v4()),
+                    mod_time: Some(latest_time),
+                    deleted: true,
+                    versioned: true,
+                    ..Default::default()
+                };
+                for disk in &disks {
+                    disk.write_metadata(bucket, bucket, object, marker.clone())
+                        .await
+                        .expect("publish current delete marker");
+                }
+                marker.version_id
+            } else {
+                set.put_object(
+                    bucket,
+                    object,
+                    &mut PutObjReader::from_vec(b"latest content".to_vec()),
+                    &ObjectOptions {
+                        versioned: true,
+                        mod_time: Some(latest_time),
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("write latest version")
+                .version_id
+            };
+            let opts = ObjectOptions {
+                version_id: old.version_id.map(|id| id.to_string()),
+                versioned: true,
+                mod_time: Some(old_time),
+                ..Default::default()
+            };
+            let mut source = set.get_object_info(bucket, object, &opts).await.expect("read old metadata");
+            assert_eq!(source.user_tags.as_str(), tags);
+            assert_eq!(source.expires, Some(expires));
+            assert!(!source.user_defined.contains_key(AMZ_OBJECT_TAGGING));
+            assert!(source.user_defined.contains_key("x-amz-tagging"));
+            source.metadata_only = true;
+            Arc::make_mut(&mut source.user_defined)
+                .insert(metadata_keys::RESTORE.to_string(), "ongoing-request=\"true\"".to_string());
+            set.copy_object(bucket, object, bucket, object, &mut source, &opts, &opts)
+                .await
+                .expect("restore metadata update");
+            let restored = set
+                .get_object_info(bucket, object, &opts)
+                .await
+                .expect("read restored metadata");
+            assert_eq!(restored.user_tags.as_str(), tags);
+            assert_eq!(restored.expires, Some(expires));
+            assert_eq!(restored.mod_time, Some(old_time));
+            for disk in &disks {
+                let bytes = disk
+                    .read_all(bucket, &format!("{object}/xl.meta"))
+                    .await
+                    .expect("persisted metadata");
+                let meta = FileMeta::load(&bytes).expect("decode versions");
+                let versions = meta.list_versions(bucket, object, false).expect("list versions");
+                assert_eq!(versions.len(), 2);
+                assert_eq!(versions[0].version_id, latest);
+                assert_eq!(versions[0].mod_time, Some(latest_time));
+                assert_eq!(versions[0].deleted, deleted);
+                assert_eq!(versions[1].version_id, old.version_id);
+                assert_eq!(versions[1].mod_time, Some(old_time));
+            }
+            let restore_opts = put_restore_opts(bucket, object, &RestoreRequest::default(), &restored)
+                .await
+                .expect("background restore options");
+            assert_eq!(restore_opts.user_defined.get(AMZ_OBJECT_TAGGING).map(String::as_str), Some(tags));
+            assert_eq!(restore_opts.user_defined.get("expires"), Some(&expires.format(&Rfc3339).expect("expiry")));
+            assert_eq!(restore_opts.mod_time, Some(old_time));
+        }
+    }
+
+    #[tokio::test]
+    async fn metadata_copy_honors_explicit_tag_and_expiry_replacement() {
+        use rustfs_utils::http::headers::AMZ_OBJECT_TAGGING;
+        use time::format_description::well_known::Rfc3339;
+
+        let (_temp_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "copy-metadata-replacement";
+        for disk in &disks {
+            disk.make_volume(bucket).await.expect("create bucket");
+        }
+        let old_time = OffsetDateTime::UNIX_EPOCH + time::Duration::days(1);
+        let expires = old_time + time::Duration::days(365);
+        set.put_object(
+            bucket,
+            "object",
+            &mut PutObjReader::from_vec(b"content".to_vec()),
+            &ObjectOptions {
+                mod_time: Some(old_time),
+                write_completion: crate::object_api::WriteCompletion::TailDrained,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("write original");
+        let opts = ObjectOptions::default();
+        let mut source = set.get_object_info(bucket, "object", &opts).await.expect("original metadata");
+        source.metadata_only = true;
+        source.user_tags = Arc::new("old=value".to_string());
+        source.expires = Some(expires - time::Duration::days(1));
+        let metadata = Arc::make_mut(&mut source.user_defined);
+        metadata.insert(AMZ_OBJECT_TAGGING.to_string(), "new=value".to_string());
+        metadata.insert("expires".to_string(), expires.format(&Rfc3339).expect("expiry"));
+        set.copy_object(bucket, "object", bucket, "object", &mut source, &opts, &opts)
+            .await
+            .expect("explicit metadata wins over externalized fields");
+        let mut copied = set.get_object_info(bucket, "object", &opts).await.expect("copied metadata");
+        assert_eq!(copied.user_tags.as_str(), "new=value");
+        assert_eq!(copied.expires, Some(expires));
+        assert!(copied.mod_time.is_some_and(|time| time > old_time));
+
+        copied.metadata_only = true;
+        copied.user_tags = Arc::new(String::new());
+        copied.expires = None;
+        set.copy_object(bucket, "object", bucket, "object", &mut copied, &opts, &opts)
+            .await
+            .expect("explicit empty replacement");
+        let cleared = set.get_object_info(bucket, "object", &opts).await.expect("cleared metadata");
+        assert!(cleared.user_tags.is_empty());
+        assert!(cleared.expires.is_none());
+    }
+
+    #[tokio::test]
     async fn metadata_only_copy_preserves_valid_part_checksums_and_rejects_conflicting_aliases() {
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "metadata-copy-part-checksums-bucket";
@@ -16799,6 +17020,19 @@ mod transition_commit_failure_tests {
             .collect();
         user_defined.insert("x-amz-meta-owner".to_string(), "finance".to_string());
 
+        let snowball_keys = [
+            "snowball-auto-extract",
+            "x-amz-meta-snowball-auto-extract",
+            "x-amz-snowball-auto-extract",
+            "snowball-prefix",
+            "x-amz-meta-rustfs-snowball-prefix",
+            "x-amz-meta-minio-snowball-ignore-dirs",
+            "other-vendor-snowball-ignore-errors",
+        ];
+        for key in snowball_keys {
+            user_defined.insert(key.to_string(), "true".to_string());
+        }
+
         let mut reader = PutObjReader::from_vec(b"stored bytes the tier keeps opaque ".repeat(64));
         set_disks
             .put_object(
@@ -16848,6 +17082,10 @@ mod transition_commit_failure_tests {
             .await
             .expect("the tier must have received the object");
 
+        for key in snowball_keys {
+            assert!(!remote_metadata.contains_key(key), "tier must receive opaque bytes, not {key}");
+            assert_eq!(transitioned.user_defined.get(key).map(String::as_str), Some("true"));
+        }
         for (key, _) in encryption_metadata {
             assert!(
                 !remote_metadata.keys().any(|stored| stored.eq_ignore_ascii_case(key)),

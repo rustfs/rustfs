@@ -58,6 +58,7 @@ const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS: &str =
     "Days must be a positive integer and Date must not be specified inside Expiration with ExpiredObjectAllVersions";
 const ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS: &str = "Days must be a positive integer with DelMarkerExpiration";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
+const ERR_LIFECYCLE_INVALID_RULE_ID_CHARS: &str = "Lifecycle rule ID must not contain control characters";
 const ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY: &str = "Rule ID must not be empty";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 const ERR_LIFECYCLE_DEL_MARKER_WITH_TAGS: &str = "Rule with DelMarkerExpiration cannot have tags based filtering";
@@ -582,6 +583,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
                 if id.len() > 255 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+                }
+                // The ID is echoed in the x-amz-expiration header; a control
+                // character there would make every object GET, HEAD and PUT fail.
+                if id.chars().any(char::is_control) {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_CHARS));
                 }
             }
             r.validate()?;
@@ -2044,6 +2050,34 @@ mod tests {
         let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
 
         assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG);
+    }
+
+    #[tokio::test]
+    async fn validate_rejects_rule_id_with_control_characters() {
+        for id in ["rule\nid", "rule\rid", "rule\tid", "rule\u{1b}id"] {
+            let lc = BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(30),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some(id.to_owned()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            };
+
+            let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+            assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_RULE_ID_CHARS, "{id:?}");
+        }
     }
 
     #[tokio::test]

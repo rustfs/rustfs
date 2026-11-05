@@ -31,7 +31,7 @@ use datafusion::{
         file_format::{DEFAULT_SCHEMA_INFER_MAX_RECORD, csv::CsvFormat, json::JsonFormat},
         listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl},
     },
-    error::Result as DFResult,
+    error::{DataFusionError, Result as DFResult},
     execution::{RecordBatchStream, SendableRecordBatchStream},
     object_store::ObjectStoreExt as _,
     sql::sqlparser::parser::ParserError,
@@ -65,10 +65,12 @@ use crate::{
     dispatcher::{json_document_table::JsonDocumentTable, json_lines_schema, parquet_table::ParquetSelectTable},
     execution::factory::QueryExecutionFactoryRef,
     instance::{DEFAULT_MAX_CONCURRENT_QUERIES, DEFAULT_QUERY_TIMEOUT_SECS},
-    metadata::{ContextProviderExtension, MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
+    metadata::{MetadataProvider, TableHandleProviderRef, base_table::BaseTableProvider},
     sql::logical::planner::DefaultLogicalPlanner,
-    sql::planner::prepare_s3_select_statement,
+    sql::planner::{prepare_s3_select_statement, validate_expanded_projection_width},
 };
+
+use super::schema_inference::{PrefixBoundary, infer_csv_schema, read_schema_prefix};
 
 static IGNORE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::IGNORE));
 static NONE: LazyLock<FileHeaderInfo> = LazyLock::new(|| FileHeaderInfo::from_static(FileHeaderInfo::NONE));
@@ -166,20 +168,27 @@ impl QueryDispatcher for SimpleQueryDispatcher {
                 let stmt = match query_state_machine.prepared_statement() {
                     Some(statement) => statement.clone(),
                     None => {
-                        let (statement, source) = self.prepare_query_statement(query.content())?;
+                        let (statement, source) = self
+                            .prepare_query_statement_in_worker(query.content(), &query_tracker)
+                            .await?;
                         if source_path_requires_expansion(source.path()) {
                             return Err(SelectError::DataSourcePathUnsupported.into());
                         }
                         statement
                     }
                 };
-                let scheme_provider = self.build_scheme_provider(session).await?;
-                let logical_planner = DefaultLogicalPlanner::new(&scheme_provider);
-
-                let logical_plan = self
-                    .statement_to_logical_plan(stmt, &logical_planner, Arc::clone(&query_state_machine))
-                    .await?;
-                Ok(logical_plan)
+                let scheme_provider = self.build_scheme_provider(session, &query_tracker).await?;
+                let machine = Arc::clone(&query_state_machine);
+                let runtime = tokio::runtime::Handle::current();
+                run_planning_worker(&query_tracker, "SQL plan", move || {
+                    validate_expanded_projection_width(&stmt, scheme_provider.source_column_count())?;
+                    let planner = DefaultLogicalPlanner::new(&scheme_provider);
+                    machine.begin_analyze();
+                    let plan = runtime.block_on(planner.prepared_statement_to_plan(stmt, &machine.session))?;
+                    machine.end_analyze();
+                    Ok(plan)
+                })
+                .await
             })
             .await?;
         if !is_json_document_input(&self.input) {
@@ -270,7 +279,10 @@ impl SimpleQueryDispatcher {
         // Keep parser and analyzer errors in the planning phase. Successful
         // preparation is cached here because the source path configures the
         // object store before schema inference starts.
-        let (prepared_statement, source) = match self.prepare_query_statement(query.content()) {
+        let (prepared_statement, source) = match self
+            .run_with_query_deadline(&query_tracker, self.prepare_query_statement_in_worker(query.content(), &query_tracker))
+            .await
+        {
             Ok((statement, source)) => (Some(statement), source),
             Err(_) => (None, JsonSource::default()),
         };
@@ -296,6 +308,20 @@ impl SimpleQueryDispatcher {
             None => QueryStateMachine::begin_tracked(query, session, query_tracker)?,
         };
         Ok(Arc::new(state_machine))
+    }
+
+    async fn prepare_query_statement_in_worker(
+        &self,
+        sql: &str,
+        tracker: &QueryExecutionTracker,
+    ) -> QueryResult<(ExtStatement, JsonSource)> {
+        // Reject before cloning the request into an owned blocking job.
+        if sql.len() > crate::sql::parser::MAX_SQL_EXPRESSION_BYTES {
+            return Err(ParserError::ParserError("S3 Select expression exceeds 256 KiB".to_owned()).into());
+        }
+        let dispatcher = self.clone();
+        let sql = sql.to_owned();
+        run_planning_worker(tracker, "SQL parse", move || dispatcher.prepare_query_statement(&sql)).await
     }
 
     fn prepare_query_statement(&self, sql: &str) -> QueryResult<(ExtStatement, JsonSource)> {
@@ -383,22 +409,6 @@ impl SimpleQueryDispatcher {
         }
     }
 
-    async fn statement_to_logical_plan<S: ContextProviderExtension + Send + Sync>(
-        &self,
-        stmt: ExtStatement,
-        logical_planner: &DefaultLogicalPlanner<'_, S>,
-        query_state_machine: Arc<QueryStateMachine>,
-    ) -> QueryResult<Plan> {
-        // begin analyze
-        query_state_machine.begin_analyze();
-        let logical_plan = logical_planner
-            .prepared_statement_to_plan(stmt, &query_state_machine.session)
-            .await?;
-        query_state_machine.end_analyze();
-
-        Ok(logical_plan)
-    }
-
     async fn start_logical_plan(&self, logical_plan: Plan, query_state_machine: Arc<QueryStateMachine>) -> QueryResult<Output> {
         let execution = self
             .query_execution_factory
@@ -408,7 +418,11 @@ impl SimpleQueryDispatcher {
         execution.start().await
     }
 
-    async fn build_scheme_provider(&self, session: &SessionCtx) -> QueryResult<MetadataProvider> {
+    async fn build_scheme_provider(
+        &self,
+        session: &SessionCtx,
+        tracker: &QueryExecutionTracker,
+    ) -> QueryResult<MetadataProvider> {
         if self.input.request.input_serialization.parquet.is_some() {
             let provider = ParquetSelectTable::try_new(session.inner(), self.input.as_ref()).await?;
             let current_session_table_provider = self.build_table_handle_provider()?;
@@ -431,6 +445,7 @@ impl SimpleQueryDispatcher {
 
         let path = format!("s3://{}/{}", self.input.bucket, self.input.key);
         let table_path = ListingTableUrl::parse(path)?;
+        let mut csv_format = None;
         let (listing_options, need_rename_volume_name, need_ignore_volume_name) =
             if let Some(csv) = self.input.request.input_serialization.csv.as_ref() {
                 let mut need_rename_volume_name = false;
@@ -493,6 +508,7 @@ impl SimpleQueryDispatcher {
                         .with_comment(None)
                         .with_newlines_in_values(true);
                 }
+                csv_format = Some(CsvFormat::default().with_options(file_format.options().clone()));
                 (
                     ListingOptions::new(Arc::new(file_format)).with_file_extension(EXACT_OBJECT_FILE_EXTENSION),
                     need_rename_volume_name,
@@ -509,11 +525,39 @@ impl SimpleQueryDispatcher {
                 return Err(SelectError::InvalidDataSource.into());
             };
 
-        let resolve_schema = if self.input.request.input_serialization.json.is_some() {
-            infer_json_lines_schema(session, &table_path).await?
-        } else {
-            listing_options.infer_schema(session.inner(), &table_path).await?
-        };
+        let store = session.inner().runtime_env().object_store(table_path.object_store())?;
+        let boundary = csv_format
+            .as_ref()
+            .map(PrefixBoundary::csv)
+            .unwrap_or_else(PrefixBoundary::json_lines);
+        let prefix = read_schema_prefix(
+            store
+                .get(table_path.prefix())
+                .await
+                .map_err(DataFusionError::from)?
+                .into_stream(),
+            &session.inner().runtime_env().memory_pool,
+            boundary,
+        )
+        .await?;
+        // Account for decoded values, temporary field maps and Arrow schema
+        // construction as well as the retained byte prefix.
+        prefix
+            .reservation
+            .try_resize(prefix.bytes.capacity() + prefix.bytes.len().saturating_mul(16))?;
+        let resolve_schema = run_planning_worker(tracker, "schema inference", move || {
+            let schema = if let Some(format) = csv_format {
+                infer_csv_schema(&prefix.bytes, &format)?
+            } else {
+                Arc::new(
+                    json_lines_schema::infer_schema(&prefix.bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)
+                        .map_err(DataFusionError::from)?,
+                )
+            };
+            drop(prefix);
+            Ok(schema)
+        })
+        .await?;
         let config = if need_rename_volume_name {
             let mut new_fields = Vec::new();
             for (i, field) in resolve_schema.fields().iter().enumerate() {
@@ -554,12 +598,48 @@ impl SimpleQueryDispatcher {
     }
 }
 
-/// Reads the object like DataFusion's `JsonFormat::infer_schema` does, but
-/// keeps the source key order (see `json_lines_schema::infer_schema`).
-async fn infer_json_lines_schema(session: &SessionCtx, table_path: &ListingTableUrl) -> DFResult<SchemaRef> {
-    let store = session.inner().runtime_env().object_store(table_path.object_store())?;
-    let bytes = store.get(table_path.prefix()).await?.bytes().await?;
-    Ok(Arc::new(json_lines_schema::infer_schema(&bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)?))
+#[cfg(test)]
+#[derive(Clone)]
+struct PlanningWorkerProbe {
+    phase: &'static str,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<Mutex<std::sync::mpsc::Receiver<()>>>,
+}
+
+#[cfg(test)]
+tokio::task_local! {
+    static PLANNING_WORKER_PROBE: PlanningWorkerProbe;
+}
+
+/// Admission is acquired before queueing and is owned by the worker, not its
+/// JoinHandle. Request cancellation cannot admit replacement CPU work while a
+/// detached parser, schema inference or planner is still queued/running.
+async fn run_planning_worker<T: Send + 'static>(
+    tracker: &QueryExecutionTracker,
+    phase: &'static str,
+    work: impl FnOnce() -> QueryResult<T> + Send + 'static,
+) -> QueryResult<T> {
+    let guard = tracker.query_guard().ok_or(QueryError::Cancel)?;
+    #[cfg(test)]
+    let probe = PLANNING_WORKER_PROBE
+        .try_with(|probe| probe.clone())
+        .ok()
+        .filter(|probe| probe.phase == phase);
+    tokio::task::spawn_blocking(move || {
+        let _guard = guard;
+        #[cfg(test)]
+        if let Some(probe) = probe {
+            probe.entered.notify_one();
+            probe
+                .release
+                .lock()
+                .recv_timeout(Duration::from_secs(10))
+                .expect("release planning worker");
+        }
+        work()
+    })
+    .await
+    .map_err(|error| DataFusionError::Execution(format!("S3 Select {phase} worker failed: {error}")))?
 }
 
 fn is_json_document_input(input: &SelectObjectContentInput) -> bool {
@@ -894,7 +974,7 @@ mod tests {
             },
         },
     };
-    use rustfs_test_utils::{PutObjectCommitBarrier, TestECStoreEnv};
+    use rustfs_test_utils::TestECStoreEnv;
     use s3s::dto::{
         CSVInput, CSVOutput, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput, JSONType,
         OutputSerialization, ParquetInput, SelectObjectContentInput, SelectObjectContentRequest,
@@ -1168,6 +1248,24 @@ mod tests {
             .expect("production query dispatcher should build")
     }
 
+    fn snapshot_marker_values(batch: &datafusion::arrow::record_batch::RecordBatch) -> Vec<String> {
+        use datafusion::arrow::array::cast::AsArray;
+        let column = batch.column(0);
+        match column.data_type() {
+            DataType::Utf8 => column
+                .as_string::<i32>()
+                .iter()
+                .map(|value| value.expect("marker").to_owned())
+                .collect(),
+            DataType::Utf8View => column
+                .as_string_view()
+                .iter()
+                .map(|value| value.expect("marker").to_owned())
+                .collect(),
+            other => panic!("unexpected marker type {other}"),
+        }
+    }
+
     async fn collect_utf8_output(output: Output) -> Vec<String> {
         let Output::StreamData(stream) = output else {
             panic!("snapshot query should return rows");
@@ -1177,16 +1275,7 @@ mod tests {
             .await
             .expect("collect snapshot query output")
             .iter()
-            .flat_map(|batch| {
-                batch
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<StringArray>()
-                    .expect("snapshot marker column should be Utf8")
-                    .iter()
-                    .map(|value| value.expect("snapshot marker should not be null").to_string())
-                    .collect::<Vec<_>>()
-            })
+            .flat_map(snapshot_marker_values)
             .collect()
     }
 
@@ -1219,32 +1308,24 @@ mod tests {
             .expect("infer old-generation schema")
             .expect("SELECT should produce a logical plan");
 
-        let commit_barrier = PutObjectCommitBarrier::before_namespace(&input.bucket, &input.key);
-        let writer_env = env;
-        let writer_bucket = input.bucket.clone();
-        let writer_object = input.key.clone();
-        let writer = tokio::spawn(async move {
-            writer_env
-                .put_object_bytes(&writer_bucket, &writer_object, new_generation)
-                .await;
-        });
-        commit_barrier.wait_until_paused().await;
-        commit_barrier.release_and_wait_until_namespace_pending().await;
-        assert!(!writer.is_finished(), "overwrite must wait for the SelectObjectContent snapshot");
-
-        let output = dispatcher
-            .execute_logical_plan(logical_plan, query_state_machine)
+        tokio::time::timeout(Duration::from_secs(5), env.put_object_bytes(&input.bucket, &input.key, new_generation))
             .await
-            .expect("scan old-generation rows");
-        let values = collect_utf8_output(output).await;
-        assert_eq!(values, expected_old_markers);
-        assert!(!writer.is_finished(), "overwrite must remain blocked while Query owns the snapshot");
+            .expect("overwrite must finish while the planned Query still owns its snapshot");
 
+        // A reader already pinned during planning may finish with old bytes.
+        // Any subsequent range must reject the replacement generation.
+        match dispatcher.execute_logical_plan(logical_plan, query_state_machine).await {
+            Ok(Output::StreamData(stream)) => match stream.try_collect::<Vec<_>>().await {
+                Ok(batches) => {
+                    let values: Vec<String> = batches.iter().flat_map(snapshot_marker_values).collect();
+                    assert_eq!(values, expected_old_markers);
+                }
+                Err(error) => assert!(error.to_string().contains("object read semantics changed"), "{error}"),
+            },
+            Err(error) => assert!(error.to_string().contains("object read semantics changed"), "{error}"),
+            Ok(_) => panic!("snapshot query must return rows or a consistency error"),
+        }
         drop(query);
-        tokio::time::timeout(Duration::from_secs(5), writer)
-            .await
-            .expect("overwrite should finish after snapshot release")
-            .expect("overwrite task should join");
     }
 
     fn json_snapshot_input() -> Arc<SelectObjectContentInput> {
@@ -1388,6 +1469,42 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn production_parquet_dictionary_select_keeps_views_and_single_row_filter_casts() {
+        use datafusion::arrow::array::cast::AsArray;
+        let mut input = parquet_snapshot_input();
+        let request = Arc::make_mut(&mut input);
+        request.bucket = "select-dictionary-budget".to_owned();
+        request.request.expression = "SELECT CAST(v AS VARCHAR) FROM S3Object WHERE length(v) > 0 LIMIT 2".to_owned();
+        let env = snapshot_test_env().await;
+        env.make_bucket(&input.bucket, false).await;
+        let bytes = crate::dispatcher::parquet_table::dictionary_parquet_for_test(1024 * 1024, 8192);
+        assert!(bytes.len() < 2 * 1024 * 1024);
+        env.put_object_bytes(&input.bucket, &input.key, bytes).await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let dispatcher = production_dispatcher(input);
+        let output = dispatcher.execute_query(&query).await.expect("production dictionary SELECT");
+        let mut stream = output.into_record_batch_stream().expect("record stream");
+        for _ in 0..2 {
+            let batch = stream.try_next().await.expect("budgeted decode").expect("row");
+            assert_eq!(batch.num_rows(), 1);
+            assert_eq!(batch.column(0).data_type(), &DataType::Utf8View);
+            assert_eq!(batch.column(0).as_string_view().value(0).len(), 1024 * 1024);
+            assert!(
+                batch.get_array_memory_size() < 2 * 1024 * 1024,
+                "dictionary references must not materialize 8 GiB"
+            );
+        }
+        assert!(stream.try_next().await.expect("EOF").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn json_schema_inference_and_scan_use_one_snapshot_generation() {
         run_snapshot_generation_race(
             json_snapshot_input(),
@@ -1410,7 +1527,7 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn planner_failure_drops_snapshot_and_unblocks_overwrite() {
+    async fn planner_failure_does_not_block_overwrite_while_query_is_alive() {
         let mut input = json_snapshot_input();
         let input_mut = Arc::make_mut(&mut input);
         input_mut.bucket = "s3select-planner-failure-snapshot".to_string();
@@ -1434,34 +1551,19 @@ mod tests {
             .await
             .expect("build production snapshot session");
 
-        let commit_barrier = PutObjectCommitBarrier::before_namespace(&input.bucket, &input.key);
-        let writer_env = env;
-        let writer_bucket = input.bucket.clone();
-        let writer_object = input.key.clone();
-        let writer = tokio::spawn(async move {
-            writer_env
-                .put_object_bytes(&writer_bucket, &writer_object, b"{\"new_schema_poison\":1629}\n".to_vec())
-                .await;
-        });
-        commit_barrier.wait_until_paused().await;
-        commit_barrier.release_and_wait_until_namespace_pending().await;
-        assert!(!writer.is_finished(), "overwrite must wait for the planner's snapshot");
-
         let Err(error) = dispatcher.build_logical_plan(Arc::clone(&query_state_machine)).await else {
             panic!("missing schema binding must fail planning");
         };
         assert!(error.to_string().contains("missing_binding"));
-        assert!(
-            !writer.is_finished(),
-            "planner failure must not release snapshots still owned by Query/qsm"
-        );
 
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            env.put_object_bytes(&input.bucket, &input.key, b"{\"new_schema_poison\":1629}\n".to_vec()),
+        )
+        .await
+        .expect("overwrite must finish even while failed planner and Query retain their snapshots");
         drop(query_state_machine);
         drop(query);
-        tokio::time::timeout(Duration::from_secs(5), writer)
-            .await
-            .expect("overwrite should finish after failed-plan snapshot release")
-            .expect("overwrite task should join");
     }
 
     fn test_query_tracker(
@@ -1739,6 +1841,350 @@ mod tests {
             }
             assert_eq!(values, ["selected"], "key={key}, json={json}");
         }
+    }
+
+    async fn bounded_inference_machine(
+        input: SelectObjectContentInput,
+        data: Vec<u8>,
+    ) -> (Arc<SimpleQueryDispatcher>, Arc<QueryStateMachine>) {
+        let input = Arc::new(input);
+        let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+        let dispatcher = test_dispatcher_for_input(
+            Arc::clone(&input),
+            Arc::new(Semaphore::new(1)),
+            Duration::from_secs(30),
+            Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))),
+        );
+        let query = Query::new(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("build query");
+        let url = ObjectStoreUrl::parse(format!("s3://{}", input.bucket)).expect("store URL");
+        let store = machine.session.inner().runtime_env().object_store(&url).expect("store");
+        store
+            .put(&Path::from(input.key.as_str()), data.into())
+            .await
+            .expect("put object");
+        (dispatcher, machine)
+    }
+
+    #[tokio::test]
+    async fn bounded_schema_inference_rejects_wide_csv_and_json_before_planning() {
+        for json in [false, true] {
+            let mut input = test_input();
+            input.request.expression = "SELECT * FROM S3Object".to_owned();
+            let data = if json {
+                input.request.input_serialization.csv = None;
+                input.request.input_serialization.json = Some(JSONInput {
+                    type_: Some(JSONType::from_static(JSONType::LINES)),
+                });
+                format!("{{{}}}\n", (0..1025).map(|index| format!("\"c{index}\":1")).collect::<Vec<_>>().join(","))
+            } else {
+                input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
+                    Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+                format!("{}\n", (0..1025).map(|index| format!("c{index}")).collect::<Vec<_>>().join(","))
+            };
+            let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
+            let error = dispatcher
+                .build_logical_plan(machine)
+                .await
+                .err()
+                .expect("wide schema rejected");
+            assert!(error.to_string().contains("1024"), "{error}");
+            assert_eq!(dispatcher.query_admission.available_permits(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_json_lines_prefix_accepts_complete_sample_before_byte_limit() {
+        for rows in [1, 1000, 600] {
+            let mut input = test_input();
+            input.request.expression = "SELECT * FROM S3Object LIMIT 1".to_owned();
+            input.request.input_serialization.csv = None;
+            input.request.input_serialization.json = Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::LINES)),
+            });
+            let input = Arc::new(input);
+            let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+            let dispatcher = SimpleQueryDispatcherBuilder::default()
+                .with_input(Arc::clone(&input))
+                .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+                .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+                .with_parser(Arc::new(DefaultParser::default()))
+                .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))))
+                .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+                .with_memory_limit_bytes(128 * 1024 * 1024)
+                .with_query_admission(Arc::new(Semaphore::new(1)))
+                .with_query_timeout(Duration::from_secs(30))
+                .build()
+                .expect("supported 128 MiB query budget");
+            let query = Query::new(
+                QueryContext {
+                    input: Arc::clone(&input),
+                },
+                input.request.expression.clone(),
+            );
+            let machine = dispatcher.build_query_state_machine(query).await.expect("query machine");
+            let url = ObjectStoreUrl::parse(format!("s3://{}", input.bucket)).expect("store URL");
+            let store = machine.session.inner().runtime_env().object_store(&url).expect("store");
+            let payload = "x".repeat(if rows == 1000 { 32 } else { 8192 });
+            let data = format!("{{\"payload\":\"{payload}\"}}\n").repeat(rows);
+            store
+                .put(&Path::from(input.key.as_str()), data.into_bytes().into())
+                .await
+                .expect("write valid JSON Lines object");
+            let plan = dispatcher
+                .build_logical_plan(Arc::clone(&machine))
+                .await
+                .unwrap_or_else(|error| panic!("{rows} valid records must plan from a complete bounded sample: {error}"))
+                .expect("SELECT plan");
+            let output = dispatcher.execute_logical_plan(plan, machine).await.expect("execute query");
+            let mut stream = output.into_record_batch_stream().expect("record batches");
+            let mut returned = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.expect("decode supported records");
+                returned += batch.num_rows();
+            }
+            assert_eq!(returned, 1, "LIMIT 1 yields one supported row for {rows} input records");
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_json_lines_prefix_rejects_overflow_without_truncating_records() {
+        let mut input = test_input();
+        input.request.expression = "SELECT * FROM S3Object".to_owned();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.json = Some(JSONInput {
+            type_: Some(JSONType::from_static(JSONType::LINES)),
+        });
+        // No complete record fits the inference prefix. Do not manufacture a
+        // partial record for the JSON parser at the byte limit.
+        let data = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(4 * 1024 * 1024));
+        let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
+        let error = dispatcher.build_logical_plan(machine).await.err().expect("prefix limit");
+        assert!(error.to_string().contains("4 MiB prefix"), "{error}");
+        assert_eq!(dispatcher.query_admission.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn bounded_csv_decoder_executes_maximum_width_in_small_batches() {
+        let mut input = test_input();
+        input.request.expression = "SELECT * FROM S3Object".to_owned();
+        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
+            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        let header = (0..1024).map(|index| format!("c{index}")).collect::<Vec<_>>().join(",");
+        let row = format!("{}\n", vec!["value"; 1024].join(","));
+        let data = format!("{header}\n{}", row.repeat(600));
+        let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
+        assert_eq!(machine.session.inner().config().batch_size(), 256);
+        let plan = dispatcher
+            .build_logical_plan(Arc::clone(&machine))
+            .await
+            .expect("plan")
+            .expect("SELECT plan");
+        let output = dispatcher.execute_logical_plan(plan, machine).await.expect("execute");
+        let mut stream = output.into_record_batch_stream().expect("batches");
+        let mut rows = 0;
+        while let Some(batch) = stream.next().await {
+            let batch = batch.expect("decode bounded CSV");
+            assert_eq!(batch.num_columns(), 1024);
+            assert!(batch.num_rows() <= 256);
+            assert_eq!(array_value_to_string(batch.column(1023), 0).expect("value"), "value");
+            rows += batch.num_rows();
+        }
+        assert_eq!(rows, 600);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bounded_json_lines_gzip_inference_does_not_read_the_object_tail() {
+        use std::io::{Read, Write};
+        let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+        for _ in 0..500_000 {
+            encoder.write_all(b"{\"z\":1,\"a\":\"value\"}\n").expect("gzip input");
+        }
+        let mut compressed = encoder.finish().expect("gzip");
+        // The original whole-object .bytes() path must encounter this invalid
+        // trailer; prefix inference and LIMIT 1 must not reach it.
+        let trailer = compressed.len() - 8;
+        compressed[trailer] ^= 1;
+        assert!(
+            flate2::read::GzDecoder::new(compressed.as_slice())
+                .read_to_end(&mut Vec::new())
+                .is_err()
+        );
+        let env = snapshot_test_env().await;
+        let mut input = (*json_snapshot_input()).clone();
+        input.bucket = "bounded-lines-gzip".to_owned();
+        input.key = "records.gz".to_owned();
+        input.request.expression = "SELECT * FROM S3Object LIMIT 1".to_owned();
+        input.request.input_serialization.compression_type =
+            Some(s3s::dto::CompressionType::from_static(s3s::dto::CompressionType::GZIP));
+        env.make_bucket(&input.bucket, false).await;
+        env.put_object_bytes(&input.bucket, &input.key, compressed).await;
+        let snapshot = env.prepare_select_object_snapshot(&input.bucket, &input.key).await;
+        let input = Arc::new(input);
+        let dispatcher = production_dispatcher(Arc::clone(&input));
+        let query = Query::new_with_snapshot(
+            QueryContext {
+                input: Arc::clone(&input),
+            },
+            input.request.expression.clone(),
+            snapshot,
+        );
+        let machine = dispatcher.build_query_state_machine(query).await.expect("machine");
+        let plan = dispatcher
+            .build_logical_plan(Arc::clone(&machine))
+            .await
+            .expect("bounded inference succeeds")
+            .expect("plan");
+        let output = dispatcher.execute_logical_plan(plan, machine).await.expect("execute");
+        let batches: Vec<_> = output
+            .into_record_batch_stream()
+            .expect("stream")
+            .try_collect()
+            .await
+            .expect("one row");
+        assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
+        assert_eq!(field_names(batches[0].schema().fields()), ["z", "a"]);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn blocking_select_planning_keeps_runtime_responsive_and_admission_after_cancel() {
+        for phase in ["SQL parse", "schema inference", "SQL plan"] {
+            let (release, receiver) = std::sync::mpsc::channel();
+            let probe = super::PlanningWorkerProbe {
+                phase,
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(parking_lot::Mutex::new(receiver)),
+            };
+            let entered = Arc::clone(&probe.entered);
+            let mut input = test_input();
+            input.request.expression = "SELECT * FROM S3Object".to_owned();
+            let (dispatcher, machine) = bounded_inference_machine(input, b"name\nvalue\n".to_vec()).await;
+            let admission = Arc::clone(&dispatcher.query_admission);
+            let task = if phase == "SQL parse" {
+                let query = machine.query.clone();
+                machine
+                    .query_tracker()
+                    .expect("tracker")
+                    .finish(&dispatcher.query_execution_owner);
+                tokio::spawn(super::PLANNING_WORKER_PROBE.scope(probe, async move {
+                    dispatcher.build_query_state_machine(query).await?;
+                    Ok::<_, QueryError>(())
+                }))
+            } else {
+                tokio::spawn(super::PLANNING_WORKER_PROBE.scope(probe, async move {
+                    dispatcher.build_logical_plan(machine).await?;
+                    Ok::<_, QueryError>(())
+                }))
+            };
+            tokio::time::timeout(Duration::from_secs(2), entered.notified())
+                .await
+                .expect("worker entered without blocking Tokio");
+            // The single-thread executor stays responsive while the worker is held.
+            tokio::time::timeout(Duration::from_secs(1), tokio::task::yield_now())
+                .await
+                .expect("runtime heartbeat");
+            assert_eq!(admission.available_permits(), 0, "{phase}");
+            task.abort();
+            assert!(task.await.expect_err("canceled request").is_cancelled());
+            assert_eq!(
+                admission.available_permits(),
+                0,
+                "cancellation must retain the {phase} worker's admission"
+            );
+            release.send(()).expect("release worker");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while admission.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("worker completion releases admission");
+        }
+    }
+
+    #[test]
+    fn blocking_select_parser_retains_admission_while_queued_after_cancel() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .max_blocking_threads(1)
+            .build()
+            .expect("runtime");
+        runtime.block_on(async {
+            let (release, receiver) = std::sync::mpsc::channel();
+            let entered = Arc::new(tokio::sync::Notify::new());
+            let signal = Arc::clone(&entered);
+            let blocker = tokio::task::spawn_blocking(move || {
+                signal.notify_one();
+                receiver
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("release occupied worker");
+            });
+            entered.notified().await;
+            let admission = Arc::new(Semaphore::new(1));
+            let (dispatcher, input) = test_dispatcher(Arc::clone(&admission), Duration::from_secs(30));
+            let query = Query::new(QueryContext { input }, "SELECT * FROM S3Object".to_owned());
+            let request = tokio::spawn(async move { dispatcher.build_query_state_machine(query).await.map(|_| ()) });
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while admission.available_permits() != 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("admission before worker queue");
+            request.abort();
+            assert!(request.await.expect_err("canceled request").is_cancelled());
+            assert_eq!(admission.available_permits(), 0, "queued worker must retain admission");
+            release.send(()).expect("unblock worker pool");
+            blocker.await.expect("blocking slot released");
+            tokio::time::timeout(Duration::from_secs(2), async {
+                while admission.available_permits() != 1 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("queued parser finished");
+        });
+    }
+
+    #[tokio::test]
+    async fn bounded_select_projection_checks_wildcard_expansion_before_planner() {
+        let mut input = test_input();
+        input.request.expression = "SELECT *, * FROM S3Object".to_owned();
+        input.request.input_serialization.csv.as_mut().expect("CSV").file_header_info =
+            Some(FileHeaderInfo::from_static(FileHeaderInfo::USE));
+        let data = format!("{}\n", (0..600).map(|index| format!("c{index}")).collect::<Vec<_>>().join(","));
+        let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
+        let error = dispatcher
+            .build_logical_plan(machine)
+            .await
+            .err()
+            .expect("expanded projection rejected");
+        assert!(error.to_string().contains("expanded projection exceeds 1024"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn bounded_select_projection_is_rejected_before_object_schema_access() {
+        let (dispatcher, input) = test_dispatcher(Arc::new(Semaphore::new(1)), Duration::from_secs(30));
+        let sql = format!(
+            "SELECT {} FROM S3Object",
+            (0..30_000).map(|index| format!("{index}")).collect::<Vec<_>>().join(",")
+        );
+        let machine = dispatcher
+            .build_query_state_machine(Query::new(QueryContext { input }, sql))
+            .await
+            .expect("deferred parser error");
+        // No object is present: a storage lookup would produce the wrong error.
+        let error = dispatcher
+            .build_logical_plan(machine)
+            .await
+            .err()
+            .expect("wide projection rejected");
+        assert!(error.to_string().contains("1024 columns"), "{error}");
     }
 
     async fn json_lines_plan_schema(data: &'static [u8], sql: &str) -> SchemaRef {

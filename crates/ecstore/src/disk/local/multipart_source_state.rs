@@ -117,6 +117,7 @@ pub(super) struct LoadedSource {
 }
 
 pub(super) struct SourceStore {
+    multipart_index: Arc<super::multipart_index::IndexOwner>,
     pub disk_id: Uuid,
     pub physical_slot: usize,
     pub disk_ids: Vec<Uuid>,
@@ -186,6 +187,7 @@ impl LocalDisk {
         let logical = self.get_object_path(RUSTFS_META_MULTIPART_BUCKET, path)?;
         let lease = os::acquire_namespace_mutation_lease_with_owner(&logical, owner.clone()).await;
         Ok(SourceStore {
+            multipart_index: self.multipart_index.clone(),
             disk_id,
             physical_slot,
             disk_ids,
@@ -755,6 +757,9 @@ impl SourceStore {
         os::sync_multipart_owned_record_parents_options(source, parent, existed, sync_source_root, base, root)
     }
     pub async fn replace_head(&self, bytes: &[u8]) -> Result<()> {
+        self.multipart_index
+            .record_head(&format!("{}/xl.meta", self.path), bytes)
+            .await?;
         invalidate_active_multipart_source_head(&self.source);
         let path = self.source.join(STORAGE_FORMAT_FILE);
         let base = self.base.clone();

@@ -574,6 +574,23 @@ pub trait ListOperations: Send + Sync + fmt::Debug {
 /// this capability does not provide a snapshot or retain a mutation lock.
 #[async_trait::async_trait]
 pub trait AuthoritativeListOperations: ListOperations {
+    /// A bounded, authoritative page of an unversioned internal namespace.
+    /// Unlike ordinary S3 listing, uncertainty or a versioned/deleted entry is
+    /// an error. A nontruncated result proves EOF; truncated results resume at
+    /// their last returned key. This does not weaken full-walk absence checks.
+    /// Cancellation drops the scan workers and publishes no persistent cursor.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid page size, unreadable metadata, insufficient
+    /// read quorum, or a producer cut that has no safe continuation key.
+    async fn list_unversioned_objects_authoritative(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        max_keys: i32,
+    ) -> Result<Self::ListObjectVersionsInfo, Self::Error>;
+
     /// Resolves every set at its version read quorum, including reserved prefixes.
     ///
     /// # Errors

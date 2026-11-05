@@ -476,6 +476,11 @@ impl EncryptionRequest<'_> {
                             .decode_to_vec(key_md5)
                             .is_ok_and(|decoded| decoded.len() == 16) =>
                 {
+                    if rustfs_utils::http::contains_key_str(user_defined, rustfs_utils::http::SUFFIX_PLAINTEXT_CHECKSUM) {
+                        return Err(ssec_invalid_request(
+                            "SSE-C multipart uploads with additional checksums require the customer key for completion.",
+                        ));
+                    }
                     Ok(())
                 }
                 _ => Err(ssec_invalid_request("The multipart upload contains invalid SSE-C metadata.")),
@@ -903,7 +908,7 @@ impl SseKmsPrincipal {
             conditions: cred.map(|cred| resource_free_condition_values(req, cred)).unwrap_or_default(),
             request_audit: request_context_from_req(req).and_then(|context| kms_request_audit(&context.request_id)),
             #[cfg(test)]
-            test_hooks: None,
+            test_hooks: req.extensions.get::<TestAuthorizationHooks>().cloned(),
         })
     }
 
@@ -931,9 +936,9 @@ impl SseKmsPrincipal {
 
 #[cfg(test)]
 #[derive(Clone)]
-struct TestAuthorizationHooks {
-    enforced: bool,
-    authorizer: Arc<dyn KmsKeyAuthorizer>,
+pub(crate) struct TestAuthorizationHooks {
+    pub(crate) enforced: bool,
+    pub(crate) authorizer: Arc<dyn KmsKeyAuthorizer>,
 }
 
 #[cfg(test)]
@@ -1128,6 +1133,87 @@ pub async fn authorize_sse_kms_object_read(
     }
 
     result
+}
+
+/// Authorize the current request to write under the upload's stored KMS key.
+/// Upload IDs do not confer the creator's KMS permissions on another caller.
+pub async fn authorize_sse_kms_multipart_write(
+    principal: Option<&SseKmsPrincipal>,
+    metadata: &HashMap<String, String>,
+) -> Result<(), ApiError> {
+    let Some((sse_type, key_id)) = stored_managed_encryption_key(metadata) else {
+        return Ok(());
+    };
+    let result = authorize_sse_kms_key(principal, sse_type, KmsAction::GenerateDataKeyAction, &key_id).await;
+    if let Err(error) = &result {
+        record_managed_kms_outcome(
+            principal,
+            sse_type,
+            Some(&key_id),
+            || stored_envelope_master_key_version(metadata),
+            Err(error),
+        );
+    }
+    result
+}
+
+/// Capture the request's encryption gate without exposing customer keys in
+/// ObjectOptions Debug output. Storage applies it to the source selected under
+/// completion locks, including recovered uploads and historical replay versions.
+pub(crate) fn multipart_completion_authorization(
+    request: EncryptionRequest<'_>,
+    replication_authorized: bool,
+) -> Arc<dyn super::storage_api::contract::multipart::MultipartCompletionAuthorization<Error = StorageError>> {
+    Arc::new(SseMultipartCompletionAuthorization {
+        bucket: request.bucket.to_string(),
+        key: request.key.to_string(),
+        principal: request.principal.cloned(),
+        algorithm: request.sse_customer_algorithm,
+        customer_key: request.sse_customer_key,
+        customer_md5: request.sse_customer_key_md5,
+        replication_authorized,
+    })
+}
+
+struct SseMultipartCompletionAuthorization {
+    bucket: String,
+    key: String,
+    principal: Option<SseKmsPrincipal>,
+    algorithm: Option<String>,
+    customer_key: Option<String>,
+    customer_md5: Option<String>,
+    replication_authorized: bool,
+}
+
+#[async_trait::async_trait]
+impl super::storage_api::contract::multipart::MultipartCompletionAuthorization for SseMultipartCompletionAuthorization {
+    type Error = StorageError;
+
+    async fn authorize(&self, metadata: &HashMap<String, String>) -> Result<(), StorageError> {
+        authorize_sse_kms_multipart_write(self.principal.as_ref(), metadata)
+            .await
+            .map_err(|error| StorageError::other(map_encryption_resolution_error(error)))?;
+        if self.customer_key.is_some()
+            || !self.replication_authorized
+            || !rustfs_utils::http::contains_key_str(metadata, rustfs_utils::http::SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT)
+        {
+            EncryptionRequest {
+                bucket: &self.bucket,
+                key: &self.key,
+                server_side_encryption: None,
+                ssekms_key_id: None,
+                ssekms_context: None,
+                sse_customer_algorithm: self.algorithm.clone(),
+                sse_customer_key: self.customer_key.clone(),
+                sse_customer_key_md5: self.customer_md5.clone(),
+                content_size: 0,
+                principal: self.principal.as_ref(),
+            }
+            .validate_complete_multipart_ssec(metadata)
+            .map_err(|error| StorageError::other(map_encryption_resolution_error(error)))?;
+        }
+        Ok(())
+    }
 }
 
 // ============================================================================
@@ -4187,7 +4273,7 @@ fn is_legacy_rustfs_managed_metadata(metadata: &HashMap<String, String>) -> bool
 /// detection only in builds that can actually read it — default builds keep
 /// the resolver's fail-closed diagnosis instead of demanding customer keys
 /// they could not use.
-fn stored_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
+pub(crate) fn stored_ssec_metadata(metadata: &HashMap<String, String>) -> bool {
     metadata.contains_key("x-amz-server-side-encryption-customer-algorithm") || minio_sealed_ssec_metadata(metadata)
 }
 
@@ -4404,7 +4490,7 @@ fn ssec_invalid_request(message: &str) -> ApiError {
 
 #[cfg(test)]
 #[allow(unused_imports)]
-mod tests {
+pub(crate) mod tests {
     use super::{
         ApiError, DataKey, DecryptionRequest, EncryptionKeyKind, EncryptionMaterial, EncryptionRequest,
         EncryptionResolutionError, EncryptionResolutionErrorKind, INTERNAL_ENCRYPTION_ALGORITHM_HEADER,
@@ -6878,6 +6964,35 @@ mod tests {
     }
 
     #[test]
+    fn ssec_checksum_completion_requires_key_for_both_metadata_aliases() {
+        let no_key = EncryptionRequest {
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            ..multipart_ssec_request(42)
+        };
+        for prefix in ["x-rustfs-internal-", "x-minio-internal-"] {
+            let mut metadata = multipart_ssec_metadata(42);
+            metadata.insert(format!("{prefix}plaintext-checksum"), "true".to_string());
+            assert_eq!(
+                no_key
+                    .validate_complete_multipart_ssec(&metadata)
+                    .expect_err("no key cannot compare or reveal plaintext checksums")
+                    .code,
+                S3ErrorCode::InvalidRequest
+            );
+            multipart_ssec_request(42)
+                .validate_complete_multipart_ssec(&metadata)
+                .expect("correct key");
+            assert!(
+                multipart_ssec_request(43)
+                    .validate_complete_multipart_ssec(&metadata)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
     fn test_validate_complete_multipart_ssec_still_validates_present_parameters() {
         let partial = EncryptionRequest {
             sse_customer_key: None,
@@ -7932,20 +8047,20 @@ mod tests {
     // Per-key KMS authorization on the SSE-KMS data path (rustfs/backlog#1582)
     // ------------------------------------------------------------------------
 
-    struct RecordingKmsKeyAuthorizer {
+    pub(crate) struct RecordingKmsKeyAuthorizer {
         allowed: bool,
         calls: std::sync::Mutex<Vec<(KmsAction, String)>>,
     }
 
     impl RecordingKmsKeyAuthorizer {
-        fn new(allowed: bool) -> Arc<Self> {
+        pub(crate) fn new(allowed: bool) -> Arc<Self> {
             Arc::new(Self {
                 allowed,
                 calls: std::sync::Mutex::new(Vec::new()),
             })
         }
 
-        fn calls(&self) -> Vec<(KmsAction, String)> {
+        pub(crate) fn calls(&self) -> Vec<(KmsAction, String)> {
             self.calls.lock().expect("authorizer call log").clone()
         }
     }
@@ -7986,7 +8101,7 @@ mod tests {
         }
     }
 
-    fn sse_kms_object_metadata() -> HashMap<String, String> {
+    pub(crate) fn sse_kms_object_metadata() -> HashMap<String, String> {
         HashMap::from([
             ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
             ("x-amz-server-side-encryption-aws-kms-key-id".to_string(), "finance-key".to_string()),
@@ -8154,6 +8269,80 @@ mod tests {
             authorizer.calls().is_empty(),
             "with the switch off the data path must not evaluate KMS key policy at all"
         );
+    }
+
+    #[tokio::test]
+    async fn completion_authorization_preserves_typed_denials_and_redacts_customer_keys() {
+        let key = multipart_ssec_request(42).sse_customer_key.expect("test key");
+        let mut metadata = multipart_ssec_metadata(42);
+        rustfs_utils::http::insert_str(&mut metadata, rustfs_utils::http::SUFFIX_PLAINTEXT_CHECKSUM, "true".to_string());
+        let no_key = super::multipart_completion_authorization(
+            EncryptionRequest {
+                sse_customer_algorithm: None,
+                sse_customer_key: None,
+                sse_customer_key_md5: None,
+                ..multipart_ssec_request(42)
+            },
+            false,
+        );
+        let error = no_key.authorize(&metadata).await.expect_err("customer key required");
+        assert_eq!(map_get_object_reader_error(error).code, S3ErrorCode::InvalidRequest);
+        let (denied, _) = enforcing_principal(false);
+        let denied = super::multipart_completion_authorization(
+            EncryptionRequest {
+                principal: Some(&denied),
+                ..multipart_ssec_request(42)
+            },
+            false,
+        );
+        let error = denied.authorize(&sse_kms_object_metadata()).await.expect_err("KMS denied");
+        assert_eq!(map_get_object_reader_error(error).code, S3ErrorCode::AccessDenied);
+        let valid = super::multipart_completion_authorization(multipart_ssec_request(42), false);
+        valid.authorize(&metadata).await.expect("correct customer key");
+        let opts = crate::storage::ObjectOptions {
+            multipart_completion_authorization: Some(valid),
+            ..Default::default()
+        };
+        assert!(
+            !format!("{opts:?}").contains(&key),
+            "ObjectOptions Debug must never expose the captured customer key"
+        );
+    }
+
+    #[tokio::test]
+    async fn multipart_write_authorization_uses_stored_key_and_current_principal() {
+        let (denied, denied_authorizer) = enforcing_principal(false);
+        let (allowed, allowed_authorizer) = enforcing_principal(true);
+        let metadata = sse_kms_object_metadata();
+        let error = super::authorize_sse_kms_multipart_write(Some(&denied), &metadata)
+            .await
+            .expect_err("upload ID must not grant its creator's KMS permission");
+        assert_eq!(error.code, S3ErrorCode::AccessDenied);
+        assert_eq!(
+            denied_authorizer.calls(),
+            vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string())]
+        );
+        super::authorize_sse_kms_multipart_write(Some(&allowed), &metadata)
+            .await
+            .expect("authorized writer");
+        assert_eq!(
+            allowed_authorizer.calls(),
+            vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string())]
+        );
+        for metadata in [HashMap::new(), sse_s3_object_metadata(), multipart_ssec_metadata(42)] {
+            super::authorize_sse_kms_multipart_write(Some(&denied), &metadata)
+                .await
+                .expect("non-KMS upload");
+        }
+        assert_eq!(denied_authorizer.calls().len(), 1);
+        let (off, off_authorizer) = permissive_principal_with_enforcement_off();
+        super::authorize_sse_kms_multipart_write(Some(&off), &metadata)
+            .await
+            .expect("enforcement off");
+        super::authorize_sse_kms_multipart_write(None, &metadata)
+            .await
+            .expect("trusted internal writer");
+        assert!(off_authorizer.calls().is_empty());
     }
 
     #[tokio::test]
