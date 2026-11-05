@@ -10,6 +10,10 @@ pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipar
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 
 pub(crate) const MULTIPART_INDEX_PAGE_SIZE: usize = 256;
+/// Pages one listing accepts from one disk. Pruned pages may carry few roots, so
+/// the cursor alone no longer bounds a peer's answer; a disk that keeps
+/// continuing past this many pages contributes no coverage.
+pub(crate) const MULTIPART_INDEX_MAX_PAGES_PER_DISK: usize = 4096;
 
 /// A bounded page from one disk's continuously maintained, boot-local index.
 /// `epoch` changes whenever coverage must be rebuilt; callers must not combine
@@ -168,7 +172,12 @@ where
     let mut epoch = None;
     let mut marker = None;
     let mut roots = Vec::new();
+    let mut pages = 0_usize;
     loop {
+        if pages >= MULTIPART_INDEX_MAX_PAGES_PER_DISK {
+            return Err(crate::disk::error::DiskError::FileCorrupt);
+        }
+        pages += 1;
         let page = fetch(marker.clone()).await?;
         page.validate(bucket, marker.as_deref(), identity)?;
         if epoch.is_some_and(|epoch| epoch != page.epoch) {
@@ -210,8 +219,12 @@ mod tests {
             "old challenge cannot replay"
         );
         assert!(reply.validate(&request, Uuid::new_v4()).is_err(), "physical disk identity cannot change");
+        reply.page.next_marker = Some("9".repeat(64));
+        assert!(reply.validate(&request, id).is_err(), "a cursor below the last root would re-list it");
         reply.page.next_marker = Some("a".repeat(64));
-        assert!(reply.validate(&request, id).is_err(), "short page cannot claim a continuation");
+        reply
+            .validate(&request, id)
+            .expect("a pruned short page continues from its last examined name");
         reply.page.next_marker = None;
         reply.page.roots = vec!["a".repeat(64); MULTIPART_INDEX_PAGE_SIZE + 1];
         assert!(reply.validate(&request, id).is_err(), "peer cannot enlarge the fixed page cap");
@@ -278,6 +291,27 @@ mod tests {
                 .is_err(),
             "the cursor is a marker name"
         );
+    }
+
+    #[tokio::test]
+    async fn multipart_index_page_collection_bounds_the_pages_one_disk_may_answer() {
+        let id = Uuid::new_v4();
+        let epoch = Uuid::new_v4();
+        let mut served = 0_usize;
+        let result = collect_pages("bucket", id, |marker| {
+            served += 1;
+            let next = marker.map_or(0_u64, |marker| u64::from_str_radix(&marker[48..], 16).expect("hex cursor") + 1);
+            std::future::ready(Ok(MultipartIndexPage {
+                bucket: "bucket".into(),
+                disk_id: id,
+                epoch,
+                roots: vec![],
+                next_marker: Some(format!("{next:064x}")),
+            }))
+        })
+        .await;
+        assert!(matches!(result, Err(crate::disk::error::DiskError::FileCorrupt)), "{result:?}");
+        assert_eq!(served, MULTIPART_INDEX_MAX_PAGES_PER_DISK, "the peer is cut off at the page cap");
     }
 
     #[tokio::test]
