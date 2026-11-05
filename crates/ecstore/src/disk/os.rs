@@ -2731,6 +2731,11 @@ pub(crate) struct NamespaceMutationLease {
 }
 
 impl NamespaceMutationLease {
+    #[cfg(test)]
+    pub(crate) fn blocking_queue_for_test(&self) -> Arc<DiskBlockingQueue> {
+        self.blocking_queue.clone()
+    }
+
     pub(crate) fn attach_external_guard(&self, guard: Arc<dyn Send + Sync>) {
         *self.external_guard.lock() = Some(guard);
     }
@@ -5397,6 +5402,29 @@ impl PublicationRoot {
             #[cfg(target_os = "linux")]
             io_path,
         })
+    }
+
+    /// Distinguish reconnects from replacement mounts before reusing disk-local state.
+    pub(crate) fn physical_identity(&self) -> io::Result<(u64, [u8; 16])> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            #[cfg(target_os = "linux")]
+            let metadata = self.directory.metadata()?;
+            #[cfg(not(target_os = "linux"))]
+            let metadata = std::fs::metadata(&*self.path)?;
+            let mut inode = [0; 16];
+            inode[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+            Ok((metadata.dev(), inode))
+        }
+        #[cfg(windows)]
+        {
+            windows_file_identity(&self.directory.handle)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "physical root identity unavailable"))
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {

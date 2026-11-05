@@ -10277,6 +10277,7 @@ dependencies = [
  "hotpath",
  "parking_lot 0.13.0",
  "rand 0.10.3",
+ "rustfs-common",
  "rustfs-io-metrics",
  "rustfs-utils",
  "serde",
@@ -10789,8 +10790,10 @@ version = "1.0.2"
 dependencies = [
  "async-trait",
  "bytes",
+ "csv-core",
  "datafusion",
  "derive_builder",
+ "flate2",
  "futures",
  "hotpath",
  "parking_lot 0.13.0",

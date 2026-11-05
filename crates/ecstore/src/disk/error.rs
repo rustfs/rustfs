@@ -172,6 +172,8 @@ pub enum DiskError {
 
     #[error("guarded batch deletion is not supported by this disk")]
     GuardedDeleteUnsupported,
+    #[error("foreground delete recovery work limit reached")]
+    DeleteRecoveryWorkLimit,
 
     #[error("erasure write quorum")]
     ErasureWriteQuorum,
@@ -770,6 +772,7 @@ impl Clone for DiskError {
             DiskError::MethodNotAllowed => DiskError::MethodNotAllowed,
             DiskError::ConditionalDeleteConflict => DiskError::ConditionalDeleteConflict,
             DiskError::GuardedDeleteUnsupported => DiskError::GuardedDeleteUnsupported,
+            DiskError::DeleteRecoveryWorkLimit => DiskError::DeleteRecoveryWorkLimit,
             DiskError::ErasureWriteQuorum => DiskError::ErasureWriteQuorum,
             DiskError::ErasureReadQuorum => DiskError::ErasureReadQuorum,
             DiskError::ShortWrite => DiskError::ShortWrite,
@@ -829,6 +832,7 @@ impl DiskError {
             DiskError::RemoteClientUnavailable(_) => 0x2B,
             DiskError::ConditionalDeleteConflict => 0x2C,
             DiskError::GuardedDeleteUnsupported => 0x2D,
+            DiskError::DeleteRecoveryWorkLimit => 0x2E,
         }
     }
 
@@ -879,6 +883,7 @@ impl DiskError {
             0x2B => Some(DiskError::RemoteClientUnavailable(String::new())),
             0x2C => Some(DiskError::ConditionalDeleteConflict),
             0x2D => Some(DiskError::GuardedDeleteUnsupported),
+            0x2E => Some(DiskError::DeleteRecoveryWorkLimit),
             _ => None,
         }
     }
@@ -1662,6 +1667,7 @@ mod tests {
         for (error, code) in [
             (DiskError::ConditionalDeleteConflict, 0x2C),
             (DiskError::GuardedDeleteUnsupported, 0x2D),
+            (DiskError::DeleteRecoveryWorkLimit, 0x2E),
         ] {
             assert_eq!(error.to_u32(), code);
             assert_eq!(DiskError::from_u32(code), Some(error.clone()));

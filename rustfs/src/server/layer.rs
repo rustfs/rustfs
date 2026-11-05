@@ -90,10 +90,6 @@ const SWIFT_API_PATH_PREFIX: &str = "/v1/";
 
 pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let path = uri.path();
-    if !is_object_zip_download_path(path) {
-        return uri.to_string();
-    }
-
     let Some(query) = uri.query() else {
         return uri.to_string();
     };
@@ -101,7 +97,11 @@ pub(crate) fn redact_sensitive_uri_query(uri: &http::Uri) -> String {
     let mut redacted_token = false;
     let mut serializer = form_urlencoded::Serializer::new(String::new());
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        if key == "token" {
+        if ["X-Amz-Signature", "X-Amz-Security-Token", "Signature"]
+            .iter()
+            .any(|sensitive| key.eq_ignore_ascii_case(sensitive))
+            || (key == "token" && is_object_zip_download_path(path))
+        {
             redacted_token = true;
             serializer.append_pair(&key, REDACTED_QUERY_VALUE);
         } else {
@@ -1045,6 +1045,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
                     let mut parts = parts;
@@ -1197,6 +1200,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let (rest_body, converted_status) = convert_iceberg_error_in_xml(
                         rest_body,
@@ -1371,6 +1377,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
 
@@ -2008,6 +2017,14 @@ fn is_bodyless_status(status: StatusCode) -> bool {
         || status == StatusCode::NO_CONTENT
         || status == StatusCode::RESET_CONTENT
         || status == StatusCode::NOT_MODIFIED
+}
+
+const MAX_XML_COMPAT_BODY_BYTES: u64 = 1024 * 1024;
+
+fn is_xml_compat_body<B: Body>(body: &B) -> bool {
+    body.size_hint()
+        .upper()
+        .is_some_and(|length| length <= MAX_XML_COMPAT_BODY_BYTES)
 }
 
 fn is_xml_response(headers: &HeaderMap) -> bool {
@@ -4557,66 +4574,112 @@ mod tests {
             async {
                 let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
                 let readiness = Arc::new(GlobalReadiness::new());
+                readiness.mark_stage(rustfs_common::SystemStage::IamReady);
                 let inner = CountingHybridService::default();
                 let calls = inner.calls();
-                let mut service = public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness))
-                    .await
-                    .layer(inner);
+                let public_health =
+                    public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness)).await;
+                let mut service =
+                    crate::server::ReadinessGateLayer::new(Arc::clone(&readiness)).layer(public_health.layer(inner));
 
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::GET)
-                            .uri(HEALTH_READY_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("readiness request before admission publication"),
-                    )
-                    .await
-                    .expect("readiness response before admission publication");
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                let body = BodyExt::collect(response.into_body())
-                    .await
-                    .expect("readiness body before admission publication")
-                    .to_bytes();
-                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
-                assert_eq!(payload["ready"], false);
-                assert_eq!(payload["details"]["storage"]["ready"], true);
-                assert_eq!(payload["details"]["iam"]["ready"], true);
-                assert_eq!(payload["details"]["lock"]["ready"], true);
-                assert_eq!(payload["degradedReasons"], serde_json::json!(["startup_finalization_pending"]));
+                // Cluster quorum can recover before this node publishes S3 admission.
+                for method in [Method::GET, Method::HEAD] {
+                    for path in [
+                        MINIO_HEALTH_CLUSTER_PATH,
+                        MINIO_HEALTH_CLUSTER_READ_PATH,
+                        HEALTH_COMPAT_LIVE_PATH,
+                    ] {
+                        let response = service
+                            .call(
+                                Request::builder()
+                                    .method(method.clone())
+                                    .uri(path)
+                                    .body(Full::<Bytes>::from(Bytes::new()))
+                                    .expect("probe request before admission publication"),
+                            )
+                            .await
+                            .expect("probe response before admission publication");
+                        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+                        let body = BodyExt::collect(response.into_body()).await.expect("probe body").to_bytes();
+                        if method == Method::HEAD {
+                            assert!(body.is_empty(), "HEAD {path}");
+                        } else {
+                            let payload: serde_json::Value = serde_json::from_slice(&body).expect("probe JSON");
+                            if path == HEALTH_COMPAT_LIVE_PATH {
+                                assert_eq!(payload["status"], "ok");
+                                assert!(payload.get("ready").is_none());
+                            } else {
+                                assert_eq!(payload["ready"], true, "{path}");
+                            }
+                        }
+                    }
+                }
 
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::GET)
-                            .uri(HEALTH_COMPAT_LIVE_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("liveness request before admission publication"),
-                    )
-                    .await
-                    .expect("liveness response before admission publication");
-                assert_eq!(response.status(), StatusCode::OK);
-                let body = BodyExt::collect(response.into_body())
-                    .await
-                    .expect("liveness body before admission publication")
-                    .to_bytes();
-                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
-                assert_eq!(payload["status"], "ok");
-                assert!(payload.get("ready").is_none());
-
-                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::HEAD)
-                            .uri(MINIO_HEALTH_READY_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("readiness request after admission publication"),
-                    )
-                    .await
-                    .expect("readiness response after admission publication");
-                assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                for published in [false, true] {
+                    if published {
+                        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                    }
+                    for method in [Method::GET, Method::HEAD] {
+                        for path in [HEALTH_READY_PATH, MINIO_HEALTH_READY_PATH] {
+                            let response = service
+                                .call(
+                                    Request::builder()
+                                        .method(method.clone())
+                                        .uri(path)
+                                        .body(Full::<Bytes>::from(Bytes::new()))
+                                        .expect("node readiness request"),
+                                )
+                                .await
+                                .expect("node readiness response");
+                            let expected = if published {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            };
+                            assert_eq!(response.status(), expected, "{method} {path}, published={published}");
+                            let body = BodyExt::collect(response.into_body())
+                                .await
+                                .expect("readiness body")
+                                .to_bytes();
+                            if method == Method::HEAD {
+                                assert!(body.is_empty(), "HEAD {path}");
+                            } else {
+                                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                                assert_eq!(payload["ready"], published);
+                                for component in ["storage", "iam", "lock"] {
+                                    assert_eq!(payload["details"][component]["ready"], true, "{component}");
+                                }
+                                let reasons = if published {
+                                    serde_json::json!([])
+                                } else {
+                                    serde_json::json!(["startup_finalization_pending"])
+                                };
+                                assert_eq!(payload["degradedReasons"], reasons);
+                            }
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0, "health probes bypass the inner service");
+                    for method in [Method::GET, Method::PUT] {
+                        let response = service
+                            .call(
+                                Request::builder()
+                                    .method(method.clone())
+                                    .uri("/bucket/object")
+                                    .body(Full::<Bytes>::from(Bytes::new()))
+                                    .expect("object request"),
+                            )
+                            .await
+                            .expect("object admission response");
+                        if published {
+                            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT, "{method} reaches the inner service");
+                        } else {
+                            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} stays gated");
+                            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+                            assert_eq!(response.headers()["x-rustfs-readiness-pending"], "startup_finalization");
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), if published { 2 } else { 0 });
+                }
             },
         )
         .await;
@@ -5484,6 +5547,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn xml_compat_layers_do_not_poll_large_or_unbounded_bodies() {
+        struct UnpolledXmlBody(Option<u64>);
+        impl From<Bytes> for UnpolledXmlBody {
+            fn from(_: Bytes) -> Self {
+                panic!("streaming bodies must not be rewritten")
+            }
+        }
+        impl Body for UnpolledXmlBody {
+            type Data = Bytes;
+            type Error = Infallible;
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Bytes>, Infallible>>> {
+                panic!("compatibility layer must not consume the object stream")
+            }
+            fn size_hint(&self) -> http_body::SizeHint {
+                let mut hint = http_body::SizeHint::new();
+                if let Some(length) = self.0 {
+                    hint.set_exact(length);
+                }
+                hint
+            }
+        }
+        #[derive(Clone)]
+        struct StreamingXmlResponse {
+            length: Option<u64>,
+            status: StatusCode,
+        }
+        impl Service<Request<()>> for StreamingXmlResponse {
+            type Response = Response<HybridBody<UnpolledXmlBody, Empty<Bytes>>>;
+            type Error = Infallible;
+            type Future = Ready<Result<Self::Response, Self::Error>>;
+            fn poll_ready(&mut self, _: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+                Poll::Ready(Ok(()))
+            }
+            fn call(&mut self, _: Request<()>) -> Self::Future {
+                ready(Ok(Response::builder()
+                    .status(self.status)
+                    .header(http::header::CONTENT_TYPE, "application/xml")
+                    .body(HybridBody::Rest {
+                        rest_body: UnpolledXmlBody(self.length),
+                    })
+                    .expect("streaming response")))
+            }
+        }
+        for length in [None, Some(MAX_XML_COMPAT_BODY_BYTES + 1)] {
+            for (layer, path, status) in [
+                (0, "/bucket/object", StatusCode::FORBIDDEN),
+                (1, "/iceberg/v1/warehouse/namespaces/ns/tables/table", StatusCode::FORBIDDEN),
+                (2, "/bucket/object?attributes", StatusCode::OK),
+            ] {
+                let inner = StreamingXmlResponse { length, status };
+                let request = Request::builder()
+                    .method(Method::GET)
+                    .uri(path)
+                    .body(())
+                    .expect("XML request");
+                let response = match layer {
+                    0 => S3ErrorMessageCompatLayer.layer(inner).call(request).await,
+                    1 => IcebergRestErrorCompatLayer.layer(inner).call(request).await,
+                    _ => ObjectAttributesEtagFixLayer.layer(inner).call(request).await,
+                }
+                .expect("stream passed through");
+                assert_eq!(response.status(), status);
+                assert_eq!(response.headers()[http::header::CONTENT_TYPE], "application/xml");
+            }
+        }
+    }
+
+    #[tokio::test]
     async fn s3_error_message_compat_fixes_regular_forbidden_xml() {
         let body = Bytes::from_static(b"<Error><Code>SignatureDoesNotMatch</Code></Error>");
         let mut service = S3ErrorMessageCompatLayer.layer(FixedHybridResponse {
@@ -6132,6 +6266,78 @@ mod tests {
         }
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn conditional_cors_uses_the_host_bucket_with_real_distinct_bucket_configs() {
+        crate::app::gating_test_env::run_large_stack_test("cors-bucket-authority", || async {
+            use crate::app::storage_api::bucket::{metadata::BUCKET_CORS_CONFIG, metadata_sys};
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let owner = format!("cors-owner-{suffix}");
+            let other = format!("cors-other-{suffix}");
+            for (bucket, origin) in [(&owner, "https://owner.example"), (&other, "https://other.example")] {
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("CORS bucket");
+                let xml = format!(
+                    "<CORSConfiguration><CORSRule><AllowedOrigin>{origin}</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>"
+                );
+                metadata_sys::update(bucket, BUCKET_CORS_CONFIG, xml.into_bytes())
+                    .await
+                    .expect("persist distinct bucket CORS rules");
+            }
+            let layer = ConditionalCorsLayer {
+                cors_origins: Some("*".to_owned()),
+                vh_domain_hosts: Arc::from(["s3.example".to_owned(), "website.example".to_owned()]),
+            };
+            let mut service = layer.layer(CorsOkService);
+            for (uri, host) in [
+                (format!("/{other}/q3.csv"), Some(format!("{owner}.s3.example"))),
+                (format!("/{other}/q3.csv"), Some(format!("{owner}.website.example"))),
+                (format!("http://{owner}.s3.example/{other}/q3.csv"), None),
+                ("/".to_owned(), Some(format!("{owner}.s3.example"))),
+                (format!("/{owner}/{other}/q3.csv"), Some("s3.example".to_owned())),
+            ] {
+                for method in [Method::GET, Method::OPTIONS] {
+                    for (origin, allowed) in [("https://owner.example", true), ("https://other.example", false)] {
+                        let mut request = Request::builder()
+                            .method(method.clone())
+                            .uri(&uri)
+                            .header(cors::standard::ORIGIN, origin);
+                        if let Some(host) = &host {
+                            request = request.header(http::header::HOST, host);
+                        }
+                        if method == Method::OPTIONS {
+                            request = request.header(cors::request::ACCESS_CONTROL_REQUEST_METHOD, "GET");
+                        }
+                        let response = service
+                            .call(request.body(()).expect("CORS request"))
+                            .await
+                            .expect("CORS service");
+                        assert_eq!(
+                            response
+                                .headers()
+                                .get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+                                .and_then(|value| value.to_str().ok()),
+                            allowed.then_some(origin),
+                            "{method} {uri}: the object owner's CORS rule must be authoritative"
+                        );
+                        assert_eq!(
+                            response.status(),
+                            if method == Method::OPTIONS && !allowed {
+                                StatusCode::FORBIDDEN
+                            } else {
+                                StatusCode::OK
+                            }
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     #[tokio::test]
     async fn conditional_cors_passthrough_without_origin() {
         let layer = ConditionalCorsLayer {
@@ -6727,6 +6933,36 @@ mod tests {
         let uri: http::Uri = "/rustfs/admin/v3/users?token=not-a-download-token".parse().expect("uri");
 
         assert_eq!(redact_sensitive_uri_query(&uri), "/rustfs/admin/v3/users?token=not-a-download-token");
+    }
+
+    #[test]
+    fn redact_sensitive_uri_query_removes_presigned_credentials() {
+        for path in ["/bucket/object", "/prefix/bucket/object", "/"] {
+            let uri: http::Uri = format!(
+                "{path}?X-Amz-Signature=secret-signature&x-amz-security-token=secret-session&Signature=secret-v2&partNumber=1"
+            )
+            .parse()
+            .expect("presigned URI");
+            let logged = redact_sensitive_uri_query(&uri);
+            assert_eq!(
+                logged,
+                format!("{path}?X-Amz-Signature=redacted&x-amz-security-token=redacted&Signature=redacted&partNumber=1")
+            );
+            assert!(!logged.contains("secret"));
+        }
+        let uri: http::Uri = "/bucket/object?%58-Amz-Signature=secret&X-Amz-Signature=another&signature=v2"
+            .parse()
+            .expect("URI");
+        assert_eq!(
+            redact_sensitive_uri_query(&uri),
+            "/bucket/object?X-Amz-Signature=redacted&X-Amz-Signature=redacted&signature=redacted"
+        );
+    }
+
+    #[test]
+    fn redact_sensitive_uri_query_preserves_ordinary_query_encoding() {
+        let uri: http::Uri = "/bucket?prefix=one%20two&delimiter=%2f".parse().expect("URI");
+        assert_eq!(redact_sensitive_uri_query(&uri), uri.to_string());
     }
 
     #[tokio::test(start_paused = true)]

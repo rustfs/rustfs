@@ -28,6 +28,19 @@ mod protocol;
 type FrameSender = mpsc::UnboundedSender<Result<Frame<Bytes>, io::Error>>;
 
 impl BodyReadControl {
+    pub(crate) async fn wait_until_pending_for_test(&self) {
+        tokio::time::timeout(Duration::from_secs(30), async {
+            loop {
+                if self.0.budget.lock().waiting_since.is_some() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("body must reach a pending network read");
+    }
+
     /// Elapse this body's active wait without advancing storage timers.
     /// The fixture must wake the raw body afterward so it polls the deadline.
     pub(crate) fn advance_wait_for_test(&self, elapsed: Duration) {
@@ -37,6 +50,7 @@ impl BodyReadControl {
             "body must already be waiting for raw input"
         );
         state.waited = state.waited.saturating_add(elapsed);
+        state.progress_waited = state.progress_waited.saturating_add(elapsed);
     }
 }
 
@@ -276,4 +290,185 @@ async fn native_body_errors_preserve_their_original_source() {
         .expect("body receiver");
     let error = reader.read_to_end(&mut Vec::new()).await.expect_err("native error");
     assert_eq!(ApiError::from(error).code, S3ErrorCode::InternalError);
+}
+
+fn progress_reader() -> (mpsc::UnboundedSender<Result<Bytes, io::Error>>, impl AsyncRead + Unpin) {
+    let (sender, receiver) = mpsc::unbounded_channel();
+    let (stream, control) = guard_upload_progress(
+        StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+        Duration::ZERO,
+        "bucket",
+        "object",
+        "request",
+        1024 * 1024,
+    );
+    let inner = StreamReader::new(stream.map(|item| item.map_err(io::Error::other)));
+    (sender, DemandReader::new(inner, control))
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_progress_rejects_trickle_empty_frames_and_late_revival() {
+    for empty in [false, true] {
+        let (sender, mut reader) = progress_reader();
+        let mut output = Vec::new();
+        let mut read = Box::pin(reader.read_to_end(&mut output));
+        assert!(poll!(read.as_mut()).is_pending());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            sender
+                .send(Ok(if empty { Bytes::new() } else { Bytes::from_static(b"x") }))
+                .unwrap();
+            assert!(poll!(read.as_mut()).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        // Even a full qualifying chunk arriving at the deadline is too late.
+        sender.send(Ok(Bytes::from(vec![0; UPLOAD_PROGRESS_BYTES as usize]))).unwrap();
+        let error = read.await.expect_err("small or empty frames must not renew the window");
+        assert_eq!(ApiError::from(error).code, S3ErrorCode::RequestTimeout);
+        let mut byte = [0];
+        assert_eq!(reader.read(&mut byte).await.unwrap(), 0, "expired reader cannot resume");
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_progress_allows_long_uploads_without_banking_burst_credit() {
+    let (sender, mut reader) = progress_reader();
+    let mut output = Vec::new();
+    let mut read = Box::pin(reader.read_to_end(&mut output));
+    assert!(poll!(read.as_mut()).is_pending());
+    for _ in 0..80 {
+        tokio::time::advance(Duration::from_secs(59)).await;
+        sender.send(Ok(Bytes::from(vec![7; UPLOAD_PROGRESS_BYTES as usize]))).unwrap();
+        assert!(poll!(read.as_mut()).is_pending());
+    }
+    drop(sender);
+    assert_eq!(
+        read.await.unwrap(),
+        usize::try_from(80 * UPLOAD_PROGRESS_BYTES).expect("bounded upload fixture size")
+    );
+
+    let (sender, mut reader) = progress_reader();
+    let mut output = Vec::new();
+    let mut read = Box::pin(reader.read_to_end(&mut output));
+    sender
+        .send(Ok(Bytes::from(vec![7; 4 * UPLOAD_PROGRESS_BYTES as usize])))
+        .unwrap();
+    assert!(poll!(read.as_mut()).is_pending());
+    tokio::time::advance(UPLOAD_PROGRESS_WINDOW).await;
+    assert_eq!(ApiError::from(read.await.unwrap_err()).code, S3ErrorCode::RequestTimeout);
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_progress_excludes_storage_and_buffered_transform_backpressure() {
+    // A transform may return buffered output after polling its input Pending.
+    struct BufferedOutput<R> {
+        inner: R,
+        first: bool,
+    }
+    impl<R: AsyncRead + Unpin> AsyncRead for BufferedOutput<R> {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<io::Result<()>> {
+            let result = Pin::new(&mut self.inner).poll_read(cx, buf);
+            if result.is_pending() && self.first {
+                self.first = false;
+                buf.put_slice(b"buffered");
+                return Poll::Ready(Ok(()));
+            }
+            result
+        }
+    }
+    let (sender, receiver) = mpsc::unbounded_channel::<Result<Bytes, io::Error>>();
+    let (stream, control) = guard_upload_progress(
+        StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+        Duration::from_secs(300),
+        "bucket",
+        "object",
+        "request",
+        8,
+    );
+    let inner = StreamReader::new(stream.map(|item| item.map_err(io::Error::other)));
+    let mut reader = DemandReader::new(BufferedOutput { inner, first: true }, control);
+    let mut buffer = [0; 8];
+    assert_eq!(reader.read(&mut buffer).await.unwrap(), 8);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    sender.send(Ok(Bytes::from_static(b"uploaded"))).unwrap();
+    assert_eq!(reader.read(&mut buffer).await.unwrap(), 8);
+    assert_eq!(&buffer, b"uploaded");
+    drop(sender);
+    assert_eq!(reader.read(&mut buffer).await.unwrap(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_progress_reclaims_foreground_and_multipart_admission_after_trickle() {
+    use crate::app::storage_api::object_usecase::concurrency::{ConcurrencyManager, ForegroundWriteAdmission};
+    let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+    for multipart in [false, true] {
+        let admission = if multipart {
+            manager.admit_multipart_part(65536).await.unwrap()
+        } else {
+            manager.admit_put_object(65536).await.unwrap()
+        };
+        let permit = match admission {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            _ => panic!("initial admission"),
+        };
+        let (sender, mut reader) = progress_reader();
+        let mut owner = Box::pin(async move {
+            let _permit = permit;
+            let mut output = Vec::new();
+            reader.read_to_end(&mut output).await
+        });
+        assert!(poll!(owner.as_mut()).is_pending());
+        assert!(matches!(
+            manager.admit_put_object(65536).await.unwrap(),
+            ForegroundWriteAdmission::Rejected
+        ));
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            sender.send(Ok(Bytes::from_static(b"x"))).unwrap();
+            assert!(poll!(owner.as_mut()).is_pending());
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert!(owner.await.is_err());
+        assert!(matches!(
+            manager.admit_multipart_part(65536).await.unwrap(),
+            ForegroundWriteAdmission::Admitted(_)
+        ));
+    }
+}
+
+#[tokio::test(start_paused = true)]
+async fn upload_progress_does_not_release_an_owned_commit_during_storage_io_or_cancellation() {
+    use crate::app::storage_api::object_usecase::concurrency::{ConcurrencyManager, ForegroundWriteAdmission};
+    let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+    let permit = match manager.admit_put_object(65536).await.unwrap() {
+        ForegroundWriteAdmission::Admitted(permit) => permit,
+        _ => panic!("initial admission"),
+    };
+    let (sender, mut reader) = progress_reader();
+    sender.send(Ok(Bytes::from_static(b"x"))).unwrap();
+    let (entered, at_io) = tokio::sync::oneshot::channel();
+    let (release, released) = tokio::sync::oneshot::channel();
+    let owner = tokio::spawn(async move {
+        let _permit = permit;
+        let mut byte = [0];
+        reader.read_exact(&mut byte).await.unwrap();
+        entered.send(()).unwrap();
+        released.await.unwrap();
+        reader.read_exact(&mut byte).await
+    });
+    at_io.await.unwrap();
+    // Dropping the request's join handle must leave the commit owner intact.
+    drop(owner);
+    tokio::time::advance(Duration::from_secs(3600)).await;
+    assert!(matches!(
+        manager.admit_put_object(65536).await.unwrap(),
+        ForegroundWriteAdmission::Rejected
+    ));
+    sender.send(Ok(Bytes::from_static(b"y"))).unwrap();
+    release.send(()).unwrap();
+    tokio::task::yield_now().await;
+    assert!(matches!(
+        manager.admit_put_object(65536).await.unwrap(),
+        ForegroundWriteAdmission::Admitted(_)
+    ));
 }

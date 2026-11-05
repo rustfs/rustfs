@@ -64,8 +64,13 @@ cd "$(dirname "$0")/.."
 # handlers from main (+3 invocation lines relative to release) and release's
 # other reductions. The merged tree measures 209 import files and 1586
 # invocation lines, tightening main's reviewed 1592-line baseline by six.
+# 1570 -> 1502 on 2026-11-05: the client-input scan batch (rustfs/rustfs#9172)
+# converted 75 invocation lines in rustfs/src/admin/router.rs to S3Error
+# constructors and added nine lines elsewhere (admin/utils.rs, app/object/put.rs,
+# storage/access.rs, auth.rs, storage/helper.rs); main measured 1569 against its
+# 1570 baseline, the merged tree measures 1502, retightened to the measurement.
 S3S_IMPORT_FILES_BASELINE=209
-S3_ERROR_LINES_BASELINE=1570
+S3_ERROR_LINES_BASELINE=1502
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not
 # know S3 wire/DTO types (ARCHITECTURE.md invariant 4). The S3-*consuming*
 # client was extracted to crates/s3-client, where s3s usage is legitimate;

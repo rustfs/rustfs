@@ -20,13 +20,229 @@ use std::sync::Arc;
 use std::time::Duration;
 use storage_api::contract_compat::ECStore;
 use storage_api::metadata_lock::{
-    BucketOperations, CompletePart, Error, MakeBucketOptions, MultipartOperations, NamespaceLocking, ObjectIO, ObjectOperations,
-    ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause, init_bucket_metadata_sys,
-    isolated_store_over_temp_disks,
+    BucketOperations, CompletePart, DeleteBucketOptions, Error, HashReader, MakeBucketOptions, MultipartOperations,
+    NamespaceLocking, ObjectIO, ObjectOperations, ObjectOptions, PutObjReader, PutObjectCommitBarrier, PutObjectCommitPause,
+    init_bucket_metadata_sys, isolated_store_over_temp_disks,
 };
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 use uuid::Uuid;
+
+struct ObservedPutBody {
+    inner: tokio::io::DuplexStream,
+    polled: Arc<tokio::sync::Notify>,
+}
+
+impl tokio::io::AsyncRead for ObservedPutBody {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        self.polled.notify_one();
+        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+#[tokio::test]
+async fn destructive_put_takes_bucket_locks_only_after_its_body_is_staged() {
+    use tokio::io::AsyncWriteExt;
+    for (object, version_id) in [("object", None), ("directory/", Some(Uuid::nil().to_string()))] {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "deferred-put-locks";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let encoded_object = if object.ends_with('/') { "directory__XLDIR__" } else { object };
+        let barrier = PutObjectCommitBarrier::install(bucket, encoded_object, PutObjectCommitPause::BeforeQuotaRename);
+        let (mut sender, inner) = tokio::io::duplex(16);
+        let polled = Arc::new(tokio::sync::Notify::new());
+        let body = ObservedPutBody {
+            inner,
+            polled: polled.clone(),
+        };
+        let put_store = store.clone();
+        let put = tokio::spawn(async move {
+            let mut reader = PutObjReader::new(HashReader::from_stream(body, 4, 4, None, None, false).expect("body"));
+            put_store
+                .put_object(
+                    bucket,
+                    object,
+                    &mut reader,
+                    &ObjectOptions {
+                        version_id,
+                        ..Default::default()
+                    },
+                )
+                .await
+        });
+        timeout(Duration::from_secs(5), polled.notified())
+            .await
+            .expect("PUT must be waiting for client data");
+        let lock = store
+            .new_ns_lock(".rustfs.sys", &format!("bucket-targets/{bucket}/transaction.lock"))
+            .await
+            .expect("metadata lock");
+        drop(
+            timeout(Duration::from_secs(2), lock.get_write_lock(Duration::from_secs(5)))
+                .await
+                .expect("body must not block metadata writers")
+                .expect("metadata write guard"),
+        );
+        drop(
+            timeout(Duration::from_secs(2), store.lock_bucket_for_recursive_delete(bucket))
+                .await
+                .expect("body must not retain lifecycle guard")
+                .expect("lifecycle writer"),
+        );
+        sender.write_all(b"body").await.expect("finish body");
+        sender.shutdown().await.expect("EOF");
+        timeout(Duration::from_secs(5), barrier.wait_until_paused())
+            .await
+            .expect("staged PUT reaches commit");
+        let writer = lock.get_write_lock(Duration::from_secs(5));
+        tokio::pin!(writer);
+        assert!(futures::poll!(&mut writer).is_pending(), "commit must fence metadata updates");
+        let lifecycle = store.lock_bucket_for_recursive_delete(bucket);
+        tokio::pin!(lifecycle);
+        assert!(futures::poll!(&mut lifecycle).is_pending(), "commit must fence bucket deletion");
+        barrier.release();
+        let release_metadata = async {
+            drop(writer.await.expect("metadata writer"));
+        };
+        let release_lifecycle = async {
+            drop(lifecycle.await.expect("lifecycle writer"));
+        };
+        timeout(Duration::from_secs(5), async {
+            let (put, (), ()) = tokio::join!(put, release_metadata, release_lifecycle);
+            put.expect("owner task").expect("commit");
+        })
+        .await
+        .expect("PUT and queued writers finish");
+    }
+}
+
+#[tokio::test]
+async fn staged_put_cannot_publish_into_a_recreated_bucket() {
+    use tokio::io::AsyncWriteExt;
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "deferred-put-generation";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("bucket");
+    let (mut sender, inner) = tokio::io::duplex(16);
+    let polled = Arc::new(tokio::sync::Notify::new());
+    let body = ObservedPutBody {
+        inner,
+        polled: polled.clone(),
+    };
+    let put_store = store.clone();
+    let put = tokio::spawn(async move {
+        let mut reader = PutObjReader::new(HashReader::from_stream(body, 4, 4, None, None, false).expect("body"));
+        put_store
+            .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+            .await
+    });
+    timeout(Duration::from_secs(5), polled.notified()).await.expect("body paused");
+    store
+        .delete_bucket(
+            bucket,
+            &DeleteBucketOptions {
+                force: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("remove old bucket while PUT stalls");
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("recreate bucket");
+    sender.write_all(b"body").await.expect("finish body");
+    sender.shutdown().await.expect("EOF");
+    let error = timeout(Duration::from_secs(5), put)
+        .await
+        .expect("commit gate")
+        .expect("owner")
+        .expect_err("old request generation must not publish");
+    assert!(
+        error.to_string().contains("generation") || matches!(error, Error::BucketNotFound(..)),
+        "{error:?}"
+    );
+    assert!(
+        store
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn staged_put_rechecks_current_object_lock_at_commit() {
+    use tokio::io::AsyncWriteExt;
+    let (_dirs, store) = isolated_store_over_temp_disks().await;
+    init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+    let bucket = "deferred-put-retention";
+    store
+        .make_bucket(
+            bucket,
+            &MakeBucketOptions {
+                lock_enabled: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("locked bucket");
+    let mut old = PutObjReader::from_vec(b"old".to_vec());
+    store
+        .put_object(bucket, "object", &mut old, &ObjectOptions::default())
+        .await
+        .expect("unlocked predecessor");
+    let (mut sender, inner) = tokio::io::duplex(16);
+    let polled = Arc::new(tokio::sync::Notify::new());
+    let body = ObservedPutBody {
+        inner,
+        polled: polled.clone(),
+    };
+    let put_store = store.clone();
+    let put = tokio::spawn(async move {
+        let mut reader = PutObjReader::new(HashReader::from_stream(body, 4, 4, None, None, false).expect("body"));
+        put_store
+            .put_object(bucket, "object", &mut reader, &ObjectOptions::default())
+            .await
+    });
+    timeout(Duration::from_secs(5), polled.notified()).await.expect("body paused");
+    let mut protected = PutObjReader::from_vec(b"protected".to_vec());
+    store
+        .put_object(
+            bucket,
+            "object",
+            &mut protected,
+            &ObjectOptions {
+                user_defined: std::collections::HashMap::from([("x-amz-object-lock-legal-hold".to_string(), "ON".to_string())]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("install a protected predecessor while the client stalls");
+    sender.write_all(b"body").await.expect("finish stale body");
+    sender.shutdown().await.expect("EOF");
+    let error = timeout(Duration::from_secs(5), put)
+        .await
+        .expect("commit gate")
+        .expect("task")
+        .expect_err("pre-body state cannot admit an overwrite of the newly protected version");
+    assert!(matches!(error, Error::PrefixAccessDenied(..)), "{error:?}");
+    let info = store
+        .get_object_info(bucket, "object", &ObjectOptions::default())
+        .await
+        .expect("protected object remains");
+    assert_eq!(info.size, 9);
+}
 
 #[tokio::test]
 async fn replica_put_completes_while_metadata_writer_waits_for_its_snapshot() {

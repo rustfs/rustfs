@@ -44,11 +44,11 @@ use super::storage_api::multipart_usecase::data_usage::{
 use super::storage_api::multipart_usecase::error::{
     StorageError, is_err_invalid_upload_id, is_err_object_not_found, is_err_version_not_found,
 };
-use super::storage_api::multipart_usecase::helper::OperationHelper;
+use super::storage_api::multipart_usecase::helper::{OperationHelper, run_owned_mutation};
 #[cfg(test)]
 use super::storage_api::multipart_usecase::io::{DecryptReader, EncryptReader, HardLimitReader, boxed_reader, wrap_reader};
 use super::storage_api::multipart_usecase::io::{HashReader, WriteEncryption, WritePlan, compression_metadata_value};
-use super::storage_api::multipart_usecase::object_utils::to_s3s_etag;
+use super::storage_api::multipart_usecase::object_utils::{to_s3s_etag, to_s3s_xml_etag};
 use super::storage_api::multipart_usecase::options::{
     copy_src_opts, extract_metadata_from_mime, get_complete_multipart_upload_opts_with_replication_authorization,
     get_content_sha256_with_query, get_opts, has_replication_retention_update, namespace_reserved_user_metadata,
@@ -62,20 +62,20 @@ use super::storage_api::multipart_usecase::s3_api::multipart::{
 use super::storage_api::multipart_usecase::set_disk::is_valid_storage_class;
 use super::storage_api::multipart_usecase::sse::{
     DecryptionRequest, EncryptionKeyKind, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal,
-    apply_bucket_default_lock_retention, authorize_sse_kms_object_read, build_ssec_read_headers, encryption_material_to_metadata,
-    extract_server_side_encryption_from_headers, extract_ssec_params_from_headers, extract_ssekms_context_from_headers,
-    get_buffer_size_opt_in, load_bucket_object_lock_config_state, map_get_object_reader_error, mark_encrypted_multipart_metadata,
-    sse_decryption, sse_prepare_encryption,
+    apply_bucket_default_lock_retention, authorize_sse_kms_multipart_write, authorize_sse_kms_object_read,
+    build_ssec_read_headers, encryption_material_to_metadata, extract_server_side_encryption_from_headers,
+    extract_ssec_params_from_headers, extract_ssekms_context_from_headers, get_buffer_size_opt_in,
+    load_bucket_object_lock_config_state, map_get_object_reader_error, mark_encrypted_multipart_metadata,
+    multipart_completion_authorization, sse_decryption, sse_prepare_encryption,
 };
 use super::storage_api::multipart_usecase::{
     StorageObjectInfo as ObjectInfo, StorageObjectOptions as ObjectOptions, StoragePutObjReader as PutObjReader,
-    validate_object_key,
+    validate_new_object_key,
 };
 use super::trailer_adapter::trailer_source;
 use crate::app::object::{
-    ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, guard_put_object_body_read_timeout,
-    put_object_body_read_timeout, reject_non_wildcard_write_if_none_match, reject_oversize_single_upload,
-    reject_veeam_sosapi_mutation,
+    ConcurrencyManager, ForegroundWriteAdmission, get_concurrency_manager, put_object_body_read_timeout,
+    reject_non_wildcard_write_if_none_match, reject_oversize_single_upload, reject_veeam_sosapi_mutation,
 };
 use crate::app::object_data_cache::{
     ObjectDataCacheAdapter, invalidate_object_data_cache_after_complete_multipart_success,
@@ -523,7 +523,7 @@ impl DefaultMultipartUsecase {
         get_concurrency_manager()
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_abort_multipart_upload(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
@@ -574,10 +574,17 @@ impl DefaultMultipartUsecase {
     #[hotpath::measure(impl_type = "MultipartUsecase")]
     pub async fn execute_complete_multipart_upload(
         &self,
+        req: S3Request<CompleteMultipartUploadInput>,
+    ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        let owner = self.clone();
+        run_owned_mutation(async move { Box::pin(owner.execute_complete_multipart_upload_owned(req)).await }).await
+    }
+
+    async fn execute_complete_multipart_upload_owned(
+        &self,
         mut req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
-        // Uploads created before the key was reserved must not publish it.
-        validate_object_key(&req.input.key, "CompleteMultipartUpload")?;
+        validate_new_object_key(&req.input.key, "CompleteMultipartUpload")?;
         reject_presigned_multipart_max_total_object_size_for_other_operation(
             &req.headers,
             req.uri.query(),
@@ -608,6 +615,7 @@ impl DefaultMultipartUsecase {
             ..
         } = input;
 
+        let customer_key_provided = sse_customer_key.is_some();
         reject_veeam_sosapi_mutation(|| self.object_store(), &bucket, &key).await?;
         reject_non_wildcard_write_if_none_match(if_none_match.as_ref(), &req.headers)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
@@ -693,25 +701,28 @@ impl DefaultMultipartUsecase {
             Err(err) if is_err_invalid_upload_id(&err) => None,
             Err(err) => return Err(multipart_upload_api_error(err)),
         };
-        // A ciphertext-passthrough session stores encrypted parts verbatim and
-        // completes without the customer key (the replication client has none),
-        // so the SSE-C completion check must be skipped for it.
+        let completion_principal = SseKmsPrincipal::from_request(&req);
+        let completion_authorization = multipart_completion_authorization(
+            EncryptionRequest {
+                bucket: &bucket,
+                key: &key,
+                server_side_encryption: None,
+                ssekms_key_id: None,
+                ssekms_context: None,
+                sse_customer_algorithm: sse_customer_algorithm.clone(),
+                sse_customer_key: sse_customer_key.clone(),
+                sse_customer_key_md5: sse_customer_key_md5.clone(),
+                content_size: 0,
+                principal: completion_principal.as_ref(),
+            },
+            replication_authorized,
+        );
+        opts.multipart_completion_authorization = Some(completion_authorization.clone());
         if let Some(info) = multipart_info.as_ref() {
-            if !contains_key_str(&info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
-                EncryptionRequest {
-                    bucket: &bucket,
-                    key: &key,
-                    server_side_encryption: None,
-                    ssekms_key_id: None,
-                    ssekms_context: None,
-                    sse_customer_algorithm: sse_customer_algorithm.clone(),
-                    sse_customer_key: sse_customer_key.clone(),
-                    sse_customer_key_md5: sse_customer_key_md5.clone(),
-                    content_size: 0,
-                    principal: None,
-                }
-                .validate_complete_multipart_ssec(&info.user_defined)?;
-            }
+            completion_authorization
+                .authorize(&info.user_defined)
+                .await
+                .map_err(map_get_object_reader_error)?;
             validate_complete_multipart_checksum_type(&req.headers, &info.user_defined)?;
         }
 
@@ -818,7 +829,7 @@ impl DefaultMultipartUsecase {
                     .clone()
                     .complete_multipart_upload(&bucket, &key, &upload_id, uploaded_parts, &opts)
                     .await
-                    .map_err(ApiError::from)?;
+                    .map_err(map_get_object_reader_error)?;
                 let _ = invalidate_object_data_cache_after_complete_multipart_success(&cache_adapter, &bucket, &key).await;
                 // Staging reclaim on a replay can free bytes; the dirty mark is
                 // not a usage counter. Quota, replication, lifecycle, and the
@@ -871,24 +882,11 @@ impl DefaultMultipartUsecase {
             )
         })??;
 
-        // The upload record is gone on a lost-response retry, so SSE-C is
-        // checked against the committed object instead of the staging metadata.
-        if upload_user_defined.is_none() && !contains_key_str(&obj_info.user_defined, SUFFIX_REPLICATION_PRESERVE_CIPHERTEXT) {
-            EncryptionRequest {
-                bucket: &bucket,
-                key: &key,
-                server_side_encryption: None,
-                ssekms_key_id: None,
-                ssekms_context: None,
-                sse_customer_algorithm,
-                sse_customer_key,
-                sse_customer_key_md5,
-                content_size: 0,
-                principal: None,
-            }
-            .validate_complete_multipart_ssec(obj_info.user_defined.as_ref())?;
-        }
+        #[cfg(test)]
+        super::storage_api::multipart_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
 
+        // Storage has authorized the actual source or committed replay candidate
+        // before comparing checksums/parts, recovery publication or replay effects.
         let encryption_metadata = upload_user_defined.as_ref().unwrap_or(obj_info.user_defined.as_ref());
         let server_side_encryption = encryption_metadata
             .get("x-amz-server-side-encryption")
@@ -916,24 +914,57 @@ impl DefaultMultipartUsecase {
         // checksum: stored (decrypted) values take precedence over the request input;
         // additional algorithms (XXHash3/64/128, SHA-512, MD5), which have no typed
         // CompleteMultipartUploadOutput field, are echoed as raw response headers (#1261).
-        let (checksums, is_multipart) = obj_info
-            .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
-            .map_err(ApiError::from)?;
-
-        let classified = crate::app::object_usecase::classify_response_checksums(checksums, is_multipart);
-        let checksum_crc32 = classified.crc32.or(input.checksum_crc32);
-        let checksum_crc32c = classified.crc32c.or(input.checksum_crc32c);
-        let checksum_sha1 = classified.sha1.or(input.checksum_sha1);
-        let checksum_sha256 = classified.sha256.or(input.checksum_sha256);
-        let checksum_crc64nvme = classified.crc64nvme.or(input.checksum_crc64nvme);
-        let checksum_type = classified.checksum_type.or(input.checksum_type);
+        // Keyless completion remains supported, but plaintext checksums are
+        // returned only after verifying that key (backlog#3050). The customer-key
+        // MD5 is a fingerprint of the key, not of the plaintext, and the S3
+        // conformance suite expects it on a keyless completion, so it is echoed
+        // unconditionally. Apply this equally to a new commit and a replay.
+        let disclose_checksums = (ssec_algorithm.is_none() && ssec_key_md5.is_none()) || customer_key_provided;
+        let classified = if disclose_checksums {
+            let (checksums, is_multipart) = obj_info
+                .decrypt_checksums(opts.part_number.unwrap_or(0), &req.headers)
+                .map_err(ApiError::from)?;
+            crate::app::object_usecase::classify_response_checksums(checksums, is_multipart)
+        } else {
+            Default::default()
+        };
+        let checksum_crc32 = if disclose_checksums {
+            classified.crc32.or(input.checksum_crc32)
+        } else {
+            None
+        };
+        let checksum_crc32c = if disclose_checksums {
+            classified.crc32c.or(input.checksum_crc32c)
+        } else {
+            None
+        };
+        let checksum_sha1 = if disclose_checksums {
+            classified.sha1.or(input.checksum_sha1)
+        } else {
+            None
+        };
+        let checksum_sha256 = if disclose_checksums {
+            classified.sha256.or(input.checksum_sha256)
+        } else {
+            None
+        };
+        let checksum_crc64nvme = if disclose_checksums {
+            classified.crc64nvme.or(input.checksum_crc64nvme)
+        } else {
+            None
+        };
+        let checksum_type = if disclose_checksums {
+            classified.checksum_type.or(input.checksum_type)
+        } else {
+            None
+        };
         let complete_extra_checksum_headers = classified.extra;
 
         let location = build_complete_multipart_location(&req.headers, &req.uri, &bucket, &key);
         let output = CompleteMultipartUploadOutput {
             bucket: Some(bucket.clone()),
             key: Some(key.clone()),
-            e_tag: obj_info.etag.clone().map(|etag| to_s3s_etag(&etag)),
+            e_tag: obj_info.etag.clone().map(|etag| to_s3s_xml_etag(&etag)),
             location: Some(location),
             server_side_encryption,
             ssekms_key_id,
@@ -984,7 +1015,7 @@ impl DefaultMultipartUsecase {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
-        validate_object_key(&req.input.key, "CreateMultipartUpload")?;
+        validate_new_object_key(&req.input.key, "CreateMultipartUpload")?;
         let multipart_max_total_object_size = parse_presigned_multipart_max_total_object_size(
             &req.headers,
             req.uri.query(),
@@ -1076,7 +1107,7 @@ impl DefaultMultipartUsecase {
         let sse_customer_key_md5 = sse_customer_key_md5.or(header_sse_customer_key_md5);
 
         // The session data key is generated here, so this is where a multipart upload is held
-        // to the KMS key it names. Parts and the completion reuse the resulting envelope.
+        // to the KMS key it names. Parts and completion also authorize their own caller.
         let session_principal = SseKmsPrincipal::from_request(&req);
         let encryption_request = PrepareEncryptionRequest {
             bucket: &bucket,
@@ -1243,6 +1274,7 @@ impl DefaultMultipartUsecase {
         normalize_presigned_part_checksums(&mut req)?;
         let mut opts = ObjectOptions::default();
         apply_bucket_generation_guard(&req, &req.input.bucket, &mut opts)?;
+        let part_principal = SseKmsPrincipal::from_request(&req);
         let input = req.input;
         let UploadPartInput {
             body,
@@ -1267,7 +1299,7 @@ impl DefaultMultipartUsecase {
         if let Some(size) = size {
             reject_oversize_single_upload(size)?;
         }
-        let mut body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
+        let body_stream = body.ok_or_else(|| s3_error!(IncompleteBody))?;
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
@@ -1275,6 +1307,7 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &opts)
             .await
             .map_err(multipart_upload_api_error)?;
+        authorize_sse_kms_multipart_write(part_principal.as_ref(), &fi.user_defined).await?;
         let max_total_object_size = multipart_max_total_object_size(&fi.user_defined)?;
         let mut size = require_upload_part_size(size, max_total_object_size.is_some())?;
         if let Some(limit) = max_total_object_size
@@ -1307,23 +1340,20 @@ impl DefaultMultipartUsecase {
             .map(|ctx| ctx.request_id.as_str())
             .unwrap_or_default();
         let timeout = upload_part_body_read_timeout(put_object_body_read_timeout(), max_total_object_size.is_some());
-        let raw_control = req.extensions.get::<super::object::request_body::BodyReadControl>().cloned();
-        let observe_read_demand = if let Some(control) = &raw_control {
-            control.activate(
-                timeout,
-                &bucket,
-                &key,
-                request_id,
-                u64::try_from(size).map_err(|_| s3_error!(UnexpectedContent))?,
-            )
-        } else {
-            // Direct protocol callers have no raw HTTP body. Retain their
-            // existing capped-session guard without inventing a client cause.
-            if max_total_object_size.is_some() {
-                body_stream = guard_put_object_body_read_timeout(body_stream, &bucket, &key, request_id, Some(size), timeout);
-            }
-            false
-        };
+        let (body_stream, progress_control) =
+            if let Some(control) = req.extensions.get::<super::object::request_body::BodyReadControl>() {
+                control.activate_upload(timeout, &bucket, &key, request_id, size.max(0) as u64);
+                (body_stream, control.clone())
+            } else {
+                super::object::request_body::guard_upload_progress(
+                    body_stream,
+                    timeout,
+                    &bucket,
+                    &key,
+                    request_id,
+                    size.max(0) as u64,
+                )
+            };
 
         let ingress_stage_start = rustfs_io_metrics::put_stage_metrics_enabled().then(std::time::Instant::now);
 
@@ -1444,8 +1474,8 @@ impl DefaultMultipartUsecase {
             write_plan = write_plan.with_encryption(ssec_write);
             (Some(ssec_material.server_side_encryption), ssec_material.kms_key_id)
         } else if let Some(server_side_encryption) = server_side_encryption {
-            // Reuses the envelope the create-multipart-upload call was authorized for; the
-            // KMS key was pinned into the session metadata then and cannot change here.
+            // Reuse the stored envelope after authorizing this caller against its
+            // pinned destination key above.
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
@@ -1469,10 +1499,11 @@ impl DefaultMultipartUsecase {
         };
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
-        if observe_read_demand && let Some(control) = raw_control {
+
+        {
             use rustfs_rio::HashReaderMut;
             let inner = reader.take_inner();
-            reader.inner = rustfs_rio::boxed_reader(super::object::request_body::DemandReader::new(inner, control));
+            reader.inner = rustfs_rio::boxed_reader(super::object::request_body::DemandReader::new(inner, progress_control));
         }
 
         let mut reader = PutObjReader::new(reader);
@@ -1787,6 +1818,7 @@ impl DefaultMultipartUsecase {
             .get_multipart_info(&bucket, &key, &upload_id, &dst_opts)
             .await
             .map_err(multipart_upload_api_error)?;
+        authorize_sse_kms_multipart_write(copy_principal.as_ref(), &mp_info.user_defined).await?;
         let destination_size_limit = multipart_max_total_object_size(&mp_info.user_defined)?;
         EncryptionRequest {
             bucket: &bucket,
@@ -1974,8 +2006,8 @@ impl DefaultMultipartUsecase {
                 mp_info.user_defined.clone(),
             )
         } else if let Some(server_side_encryption) = server_side_encryption {
-            // Destination side of the part copy: reuses the session envelope authorized at
-            // create-multipart-upload time. The source side is authorized above.
+            // Reuse the destination envelope after authorizing this caller against
+            // its pinned key above. The source read is separately authorized.
             let managed_material = sse_decryption(DecryptionRequest {
                 bucket: &bucket,
                 key: &key,
@@ -2040,7 +2072,7 @@ impl DefaultMultipartUsecase {
             checksum_sha1: checksum_value(rustfs_rio::ChecksumType::SHA1),
             checksum_sha256: checksum_value(rustfs_rio::ChecksumType::SHA256),
             checksum_crc64nvme: checksum_value(rustfs_rio::ChecksumType::CRC64_NVME),
-            e_tag: part_info.etag.map(|etag| to_s3s_etag(&etag)),
+            e_tag: part_info.etag.map(|etag| to_s3s_xml_etag(&etag)),
             last_modified: part_info.last_mod.map(Timestamp::from),
             ..Default::default()
         };
@@ -2718,7 +2750,15 @@ mod tests {
 
     #[tokio::test]
     async fn multipart_upload_rejects_reserved_directory_markers() {
-        for key in ["__XLDIR__", "prefix__XLDIR__/object", "object__XLDIR__"] {
+        for key in [
+            "__XLDIR__",
+            "prefix__XLDIR__/object",
+            "object__XLDIR__",
+            "parent/xl.meta",
+            "parent/uuid/xl.meta.bkp",
+            "parent/uuid/delete-prepared",
+            "parent/uuid/delete-quorum-committed",
+        ] {
             let create = CreateMultipartUploadInput::builder()
                 .bucket("bucket".to_owned())
                 .key(key.to_owned())
@@ -2996,6 +3036,117 @@ mod tests {
             Some("REPLICA"),
             "the committed xl.meta must retain REPLICA to prevent scanner cascades"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn ssec_completion_and_replay_require_key_before_disclosing_plaintext_checksums() {
+        crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
+            let (_store, bucket) =
+                crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
+            let usecase = DefaultMultipartUsecase::from_global();
+            let key = "customer-encrypted";
+            let customer_key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
+            let customer_md5 = "SaaDheEjzuynJH8eW6AEpQ==";
+            let plaintext_sha256 = "ungWv48Bz+pBQUDeXa4iI7ADYaOWF3qctBD/YfIAFa0=";
+            let mut create_input = CreateMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .build()
+                .expect("create");
+            create_input.sse_customer_algorithm = Some("AES256".to_string());
+            create_input.sse_customer_key = Some(customer_key.to_string());
+            create_input.sse_customer_key_md5 = Some(customer_md5.to_string());
+            create_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
+            let mut create = build_request(create_input, Method::POST);
+            create
+                .headers
+                .insert("x-amz-checksum-algorithm", HeaderValue::from_static("SHA256"));
+            create
+                .headers
+                .insert("x-amz-checksum-type", HeaderValue::from_static("COMPOSITE"));
+            let upload_id = usecase
+                .execute_create_multipart_upload(create)
+                .await
+                .expect("SSE-C create")
+                .output
+                .upload_id
+                .expect("upload id");
+            let mut part_input = UploadPartInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload_id.clone())
+                .part_number(1)
+                .build()
+                .expect("part");
+            part_input.body = Some(StreamingBlob::from(Bytes::from_static(b"abc")));
+            part_input.content_length = Some(3);
+            part_input.sse_customer_algorithm = Some("AES256".to_string());
+            part_input.sse_customer_key = Some(customer_key.to_string());
+            part_input.sse_customer_key_md5 = Some(customer_md5.to_string());
+            part_input.checksum_algorithm = Some(ChecksumAlgorithm::from_static("SHA256"));
+            part_input.checksum_sha256 = Some(plaintext_sha256.to_string());
+            let mut part = build_request(part_input, Method::PUT);
+            part.headers
+                .insert("x-amz-checksum-sha256", HeaderValue::from_static(plaintext_sha256));
+            let part = usecase.execute_upload_part(part).await.expect("SSE-C part").output;
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload_id)
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: part.e_tag,
+                        checksum_sha256: Some(plaintext_sha256.to_string()),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("complete");
+            // Reject keyless completion before checksum comparison, then enforce
+            // the same key boundary on a successful commit and its replay.
+            for (attempt, keyed) in [false, true, false, true].into_iter().enumerate() {
+                let mut input = complete.clone();
+                if keyed {
+                    input.sse_customer_algorithm = Some("AES256".to_string());
+                    input.sse_customer_key = Some(customer_key.to_string());
+                    input.sse_customer_key_md5 = Some(customer_md5.to_string());
+                }
+                if attempt == 2 {
+                    let part = &mut input
+                        .multipart_upload
+                        .as_mut()
+                        .expect("parts")
+                        .parts
+                        .as_mut()
+                        .expect("part list")[0];
+                    part.e_tag = Some(ETag::Strong("guessed-etag".to_string()));
+                    part.checksum_sha256 = Some("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string());
+                }
+                let result = usecase
+                    .execute_complete_multipart_upload(build_request(input, Method::POST))
+                    .await;
+                if keyed {
+                    let response = result.expect("verified key completes and replays");
+                    assert!(response.output.checksum_sha256.is_some(), "verified key retains checksum response");
+                    assert_eq!(
+                        response
+                            .headers
+                            .get("x-amz-server-side-encryption-customer-key-md5")
+                            .expect("key MD5"),
+                        customer_md5
+                    );
+                } else {
+                    assert_eq!(
+                        result
+                            .expect_err("keyless checksum completion must fail before disclosure")
+                            .code(),
+                        &S3ErrorCode::InvalidRequest
+                    );
+                }
+            }
+        });
     }
 
     #[test]
@@ -3500,6 +3651,80 @@ mod tests {
             .await
             .expect("moving an already-accounted multipart object between pools must have zero quota growth");
         assert_eq!(completed.size, 4096);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn cancelled_multipart_completion_emits_once_and_replay_does_not_emit() {
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let bucket = format!("mpu-owned-event-{}", Uuid::new_v4());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let upload = store
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("upload");
+        let mut reader = PutObjReader::from_vec(b"part".to_vec());
+        let part = store
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut reader, &ObjectOptions::default())
+            .await
+            .expect("part");
+        let input = CompleteMultipartUploadInput::builder()
+            .bucket(bucket.clone())
+            .key(object.to_owned())
+            .upload_id(upload.upload_id)
+            .multipart_upload(Some(CompletedMultipartUpload {
+                parts: Some(vec![CompletedPart {
+                    part_number: Some(1),
+                    e_tag: part.etag.map(|etag| to_s3s_etag(&etag)),
+                    ..Default::default()
+                }]),
+            }))
+            .build()
+            .expect("complete input");
+        let probe = crate::app::storage_api::multipart_usecase::helper::MutationCompletionProbe::install(&bucket);
+        let (entered, resume) = probe.pause_after_commit();
+        let request = |input| {
+            let mut request = build_request(input, Method::POST);
+            request.uri = format!("/{bucket}/{object}").parse().expect("complete URI");
+            request
+        };
+        let first = request(input.clone());
+        let completion = tokio::spawn(async move {
+            DefaultMultipartUsecase::from_global()
+                .execute_complete_multipart_upload(first)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), entered.wait())
+            .await
+            .expect("committed MPU");
+        completion.abort();
+        assert!(completion.await.expect_err("cancel waiter").is_cancelled());
+        resume.wait().await;
+        probe.wait_for(1, 1).await;
+        assert_eq!(
+            store
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .expect("committed object")
+                .size,
+            4
+        );
+        DefaultMultipartUsecase::from_global()
+            .execute_complete_multipart_upload(request(input))
+            .await
+            .expect("idempotent replay");
+        let audits = probe.audits.lock().expect("audits");
+        assert_eq!(audits.len(), 2);
+        assert!(audits.iter().all(|entry| entry.api.status.as_deref() == Some("success")));
+        let events = probe.events.lock().expect("events");
+        assert_eq!(events.len(), 1, "replay must not emit another creation event");
+        assert_eq!(events[0].event_name, EventName::ObjectCreatedCompleteMultipartUpload);
     }
 
     #[tokio::test]
@@ -4040,6 +4265,63 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn execute_upload_part_progress_timeout_releases_admission_and_leaves_no_part() {
+        use crate::app::object::request_body::{BodyReadControl, ObservedBody};
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+        let ambient = crate::app::runtime_sources::current_app_context().expect("test app context");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), ambient.iam(), ambient.kms()));
+        let bucket = format!("part-progress-{}", Uuid::new_v4().simple());
+        store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+        let manager = Arc::new(ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO));
+        let usecase = DefaultMultipartUsecase::with_context_and_concurrency_manager(Some(context), Arc::clone(&manager));
+        let upload = store
+            .new_multipart_upload(&bucket, "object", &ObjectOptions::default())
+            .await
+            .unwrap();
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, std::io::Error>>();
+        let control = BodyReadControl::default();
+        let body = StreamingBlob::from(s3s::Body::http_body_unsync(ObservedBody::new(
+            StreamBody::new(UnboundedReceiverStream::new(receiver)),
+            control.clone(),
+        )));
+        let input = UploadPartInput::builder()
+            .bucket(bucket.clone())
+            .key("object".to_owned())
+            .upload_id(upload.upload_id.clone())
+            .part_number(1)
+            .content_length(Some(65536))
+            .body(Some(body))
+            .build()
+            .unwrap();
+        let mut request = build_request(input, Method::PUT);
+        request.extensions.insert(control.clone());
+        let owner = tokio::spawn(async move { usecase.execute_upload_part(request).await });
+        control.wait_until_pending_for_test().await;
+        assert!(matches!(
+            manager.admit_put_object(65536).await.unwrap(),
+            ForegroundWriteAdmission::Rejected
+        ));
+        control.advance_wait_for_test(Duration::from_secs(60));
+        sender.send(Ok(Frame::data(Bytes::from_static(b"x")))).unwrap();
+        assert_eq!(owner.await.unwrap().unwrap_err().code(), &S3ErrorCode::RequestTimeout);
+        assert!(matches!(
+            manager.admit_put_object(65536).await.unwrap(),
+            ForegroundWriteAdmission::Admitted(_)
+        ));
+        let parts = store
+            .list_object_parts(&bucket, "object", &upload.upload_id, None, 1000, &ObjectOptions::default())
+            .await
+            .unwrap();
+        assert!(parts.parts.is_empty());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn execute_upload_part_rejects_when_foreground_write_admission_is_full() {
         use crate::app::storage_api::test::contract::bucket::{BucketOperations, MakeBucketOptions};
 
@@ -4105,5 +4387,167 @@ mod tests {
         assert_eq!(format_copy_source_version_id(None, true, false), Some("null".to_string()));
         assert_eq!(format_copy_source_version_id(Some(Uuid::nil()), false, true), Some("null".to_string()));
         assert_eq!(format_copy_source_version_id(Some(valid), true, false), Some(valid.to_string()));
+    }
+
+    // Lives in the app layer: the handlers under test are app use cases; the SSE
+    // helpers it borrows are infra test support (allowed downward dependency).
+    #[test]
+    #[serial_test::serial]
+    fn multipart_handlers_reject_another_callers_denied_kms_upload() {
+        crate::app::gating_test_env::run_large_stack_test("mpu-kms-current-caller", || async {
+            use crate::app::storage_api::test::ReqInfo;
+            use crate::app::storage_api::test::sse::{
+                RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+            };
+            use crate::storage::storage_api::contract::multipart::MultipartOperations as _;
+            use rustfs_policy::policy::action::KmsAction;
+            use s3s::S3ErrorCode;
+            use s3s::dto::{
+                CompleteMultipartUploadInput, CompletedMultipartUpload, CompletedPart, CopySource, StreamingBlob,
+                UploadPartCopyInput, UploadPartInput,
+            };
+            use std::sync::Arc;
+            let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("mpu-kms-current-caller", 16_384).await;
+            let usecase = DefaultMultipartUsecase::from_global();
+            let key = "kms-owned-upload";
+            let metadata = sse_kms_object_metadata();
+            let upload = store
+                .new_multipart_upload(
+                    &bucket,
+                    key,
+                    &crate::storage::ObjectOptions {
+                        user_defined: metadata,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed authorized upload envelope");
+            let authorizer = RecordingKmsKeyAuthorizer::new(false);
+            fn denied_request<T>(input: T, authorizer: Arc<RecordingKmsKeyAuthorizer>) -> s3s::S3Request<T> {
+                let mut req = s3s::S3Request {
+                    input,
+                    method: http::Method::PUT,
+                    uri: http::Uri::from_static("/"),
+                    headers: http::HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: None,
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                req.extensions.insert(ReqInfo {
+                    cred: Some(rustfs_credentials::Credentials {
+                        access_key: "denied-writer".to_string(),
+                        ..Default::default()
+                    }),
+                    ..Default::default()
+                });
+                req.extensions.insert(TestAuthorizationHooks {
+                    enforced: true,
+                    authorizer,
+                });
+                req
+            }
+            let mut part = UploadPartInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .part_number(1)
+                .build()
+                .expect("part");
+            part.body = Some(StreamingBlob::from(bytes::Bytes::from_static(b"abc")));
+            part.content_length = Some(3);
+            // Keep typed request construction separate: each real handler must
+            // consult the destination envelope before encryption or commit.
+            let error = usecase
+                .execute_upload_part(denied_request(part, authorizer.clone()))
+                .await
+                .expect_err("denied part");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let copy = UploadPartCopyInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .part_number(1)
+                .copy_source(CopySource::Bucket {
+                    bucket: bucket.clone().into(),
+                    key: "source".into(),
+                    version_id: None,
+                })
+                .build()
+                .expect("copy");
+            let copy_req = denied_request(copy, authorizer.clone());
+            let error = usecase
+                .execute_upload_part_copy(copy_req)
+                .await
+                .expect_err("denied destination copy");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            let complete = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id.clone())
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(s3s::dto::ETag::Strong("etag".to_string())),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("complete");
+            let complete_req = denied_request(complete, authorizer.clone());
+            let error = usecase
+                .execute_complete_multipart_upload(complete_req)
+                .await
+                .expect_err("denied completion");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(authorizer.calls(), vec![(KmsAction::GenerateDataKeyAction, "finance-key".to_string()); 3]);
+            assert!(
+                store
+                    .get_multipart_info(&bucket, key, &upload.upload_id, &crate::storage::ObjectOptions::default())
+                    .await
+                    .is_ok(),
+                "denials must retain the original upload"
+            );
+            let mut reader = crate::storage::PutObjReader::from_vec(b"abc".to_vec());
+            let uploaded_part = store
+                .put_object_part(&bucket, key, &upload.upload_id, 1, &mut reader, &crate::storage::ObjectOptions::default())
+                .await
+                .expect("trusted owner stages part");
+            store
+                .clone()
+                .complete_multipart_upload(
+                    &bucket,
+                    key,
+                    &upload.upload_id,
+                    vec![crate::storage::storage_api::contract::multipart::CompletePart {
+                        part_num: 1,
+                        etag: uploaded_part.etag,
+                        ..Default::default()
+                    }],
+                    &crate::storage::ObjectOptions::default(),
+                )
+                .await
+                .expect("trusted owner completes upload");
+            let replay = CompleteMultipartUploadInput::builder()
+                .bucket(bucket.clone())
+                .key(key.to_string())
+                .upload_id(upload.upload_id)
+                .multipart_upload(Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: Some(s3s::dto::ETag::Strong("guessed-etag".to_string())),
+                        ..Default::default()
+                    }]),
+                }))
+                .build()
+                .expect("replay");
+            let error = usecase
+                .execute_complete_multipart_upload(denied_request(replay, authorizer.clone()))
+                .await
+                .expect_err("replay must authorize before comparing guessed part metadata");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(authorizer.calls().len(), 4);
+        });
     }
 }

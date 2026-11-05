@@ -81,7 +81,9 @@ use super::storage_api::object_usecase::error::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
+use super::storage_api::object_usecase::helper::{
+    OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
@@ -112,8 +114,9 @@ use super::storage_api::object_usecase::timeout_wrapper::{GetObjectTimeoutPolicy
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
-    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
+    validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,
@@ -179,7 +182,7 @@ use s3s::dto::{
     WebsiteRedirectLocation,
 };
 use s3s::header::X_AMZ_RESTORE;
-use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
@@ -232,10 +235,7 @@ pub(crate) use self::on_demand_migration_put::*;
 #[cfg(test)]
 pub(crate) use self::put::PollCountingBody;
 use self::put::*;
-pub(crate) use self::put::{
-    guard_put_object_body_read_timeout, previous_current_size_from_backfill, put_object_body_read_timeout,
-    reject_oversize_single_upload,
-};
+pub(crate) use self::put::{previous_current_size_from_backfill, put_object_body_read_timeout, reject_oversize_single_upload};
 #[cfg(test)]
 pub(crate) use self::restore::RestoreStatusCommitBarrier;
 pub(crate) use self::shared::*;

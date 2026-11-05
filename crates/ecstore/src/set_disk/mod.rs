@@ -357,8 +357,7 @@ use crate::io_support::rio::HashReader;
 
 pub const DEFAULT_READ_BUFFER_SIZE: usize = MI_B; // 1 MiB = 1024 * 1024;
 pub const MAX_PARTS_COUNT: usize = 10000;
-pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
-pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
+pub(crate) use crate::disk::multipart_index::{RUSTFS_MULTIPART_BUCKET_KEY, RUSTFS_MULTIPART_OBJECT_KEY};
 pub(crate) const DATA_MOVEMENT_MULTIPART_PREFIX: &str = "data-movement";
 const ENV_ISSUE3031_DIAG_ENABLE: &str = "RUSTFS_ISSUE3031_DIAG_ENABLE";
 
@@ -5018,6 +5017,11 @@ impl DiskHealthEntry {
 #[derive(Debug, thiserror::Error)]
 #[error("committed system metadata write requires repair by its owning writer")]
 pub(crate) struct SystemMetadataRepairRequired;
+
+/// An inline metadata write was rejected before staging or commit began.
+#[derive(Debug, thiserror::Error)]
+#[error("system metadata write rejected before staging: {0}")]
+pub(crate) struct SystemMetadataWriteNotStarted(#[source] pub(crate) Error);
 
 impl SetDisks {
     pub(in crate::set_disk) async fn persist_delete_marker_purge(

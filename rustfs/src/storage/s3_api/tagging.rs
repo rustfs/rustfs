@@ -15,8 +15,6 @@
 use percent_encoding::percent_decode_str;
 use s3s::dto::{Tag, TaggingDirective};
 use s3s::{S3Error, S3ErrorCode, S3Result};
-use std::collections::HashSet;
-use std::sync::OnceLock;
 use url::form_urlencoded;
 
 use crate::storage::storage_api::encode_tags;
@@ -25,46 +23,18 @@ fn invalid_tag_error(message: &str) -> S3Error {
     S3Error::with_message(S3ErrorCode::InvalidTag, message.to_string())
 }
 
-fn is_valid_tag_text(value: &str) -> bool {
-    static VALID_OBJECT_TAG_TEXT: OnceLock<Result<regex::Regex, regex::Error>> = OnceLock::new();
-    VALID_OBJECT_TAG_TEXT
-        .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$"))
-        .as_ref()
-        .is_ok_and(|pattern| pattern.is_match(value))
-}
-
 pub(crate) fn validate_object_tag_set(tag_set: &[Tag]) -> S3Result<()> {
     if tag_set.len() > 10 {
         return Err(invalid_tag_error("Cannot have more than 10 tags per object"));
     }
+    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(tag_set).map_err(invalid_tag_error)
+}
 
-    let mut tag_keys = HashSet::with_capacity(tag_set.len());
-    for tag in tag_set {
-        let key = tag
-            .key
-            .as_deref()
-            .filter(|key| !key.is_empty())
-            .ok_or_else(|| invalid_tag_error("Tag key cannot be empty"))?;
-
-        if key.encode_utf16().count() > 128 || !is_valid_tag_text(key) {
-            return Err(invalid_tag_error("The TagKey you have provided is invalid"));
-        }
-
-        let value = tag
-            .value
-            .as_deref()
-            .ok_or_else(|| invalid_tag_error("Tag value cannot be null"))?;
-
-        if value.encode_utf16().count() > 256 || !is_valid_tag_text(value) {
-            return Err(invalid_tag_error("The TagValue you have provided is invalid"));
-        }
-
-        if !tag_keys.insert(key) {
-            return Err(invalid_tag_error("Cannot provide multiple Tags with the same key"));
-        }
+pub(crate) fn validate_bucket_tag_set(tag_set: &[Tag]) -> S3Result<()> {
+    if tag_set.len() > crate::storage::storage_api::ecstore_bucket::metadata::MAX_BUCKET_TAGS {
+        return Err(invalid_tag_error("Cannot have more than 50 tags per bucket"));
     }
-
-    Ok(())
+    crate::storage::storage_api::ecstore_bucket::metadata::validate_tag_set_entries(tag_set).map_err(invalid_tag_error)
 }
 
 fn validate_tag_component_encoding(component: &str) -> S3Result<()> {
