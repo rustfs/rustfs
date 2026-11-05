@@ -315,3 +315,11 @@ test_lifecycle_cloud_transition_target_by_bucket
 test_lifecycle_cloud_transition_target_by_bucket_multiple_buckets
 test_list_object_versions_restore_status
 test_list_objects_restore_status
+
+# Require per-account bucket ownership across distinct S3 accounts
+# A RustFS deployment owns one bucket namespace and records no bucket owner, so every
+# authorized requester is the bucket's owner: a duplicate CreateBucket returns the
+# legacy 200 in the default region and BucketAlreadyOwnedByYou elsewhere, never
+# BucketAlreadyExists for a second account. The deployment-level behavior is covered by
+# crates/e2e_test/src/create_bucket_region_test.rs.
+test_bucket_create_exists_nonowner
