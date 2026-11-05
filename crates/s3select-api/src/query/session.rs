@@ -299,12 +299,6 @@ pub struct SessionCtxFactory {
 
 pub const DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 
-/// Rows per Parquet batch for a query budget: the same two-offsets-per-cell
-/// reservation bound CSV uses at the maximum column width, capped at 256.
-pub(crate) fn parquet_batch_rows(memory_limit_bytes: usize) -> usize {
-    (memory_limit_bytes / 16 / (MAX_SELECT_COLUMNS * 2 * size_of::<usize>())).clamp(1, 256)
-}
-
 /// Maximum inferred fields and explicit projection expressions for S3 Select.
 pub const MAX_SELECT_COLUMNS: usize = 1024;
 
@@ -457,15 +451,10 @@ impl SessionCtxFactory {
             config
         };
         // Parquet's dictionary views can expand during an explicit SQL cast.
-        // Size each batch from the query budget at the maximum column width
-        // (as for CSV) instead of one row per batch, which multiplied the
-        // per-batch operator cost by the row count; keep decoding on one
-        // partition and disable the separate coalesce optimizer so no operator
-        // widens a batch past that bound.
+        // Keep every downstream operator (including FilterExec's internal
+        // coalescer) at one row, and disable the separate coalesce optimizer.
         let config = if context.input.request.input_serialization.parquet.is_some() {
-            let mut config = config
-                .with_batch_size(parquet_batch_rows(memory_limit_bytes))
-                .with_target_partitions(1);
+            let mut config = config.with_batch_size(1).with_target_partitions(1);
             config.options_mut().execution.coalesce_batches = false;
             config.options_mut().optimizer.repartition_file_scans = false;
             config
@@ -863,11 +852,7 @@ mod tests {
             .expect("Parquet ScanRange session should be created");
 
         assert!(!session.inner().config().options().optimizer.repartition_file_scans);
-        assert_eq!(
-            session.inner().config().batch_size(),
-            parquet_batch_rows(DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES),
-            "Parquet batches are budget-sized, not single-row"
-        );
+        assert_eq!(session.inner().config().batch_size(), 1);
         assert_eq!(session.inner().config().target_partitions(), 1);
     }
 
@@ -1049,7 +1034,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn decoder_batch_budgets_size_parquet_downstream_execution_from_the_budget() {
+    async fn decoder_batch_budgets_keep_parquet_downstream_execution_single_row() {
         let factory = SessionCtxFactory::new(true);
         for (budget, expected) in [(64 * 1024 * 1024, 256), (8 * 1024 * 1024, 32), (1024, 1)] {
             let session = factory
@@ -1072,11 +1057,7 @@ mod tests {
             let session = factory.create_session_ctx(&context).await.expect("non-CSV session");
             assert_eq!(
                 session.inner().config().batch_size(),
-                if parquet {
-                    parquet_batch_rows(DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES)
-                } else {
-                    SessionConfig::new().batch_size()
-                }
+                if parquet { 1 } else { SessionConfig::new().batch_size() }
             );
             if parquet {
                 assert!(!session.inner().config().options().execution.coalesce_batches);

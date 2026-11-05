@@ -1899,6 +1899,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn bounded_json_lines_prefix_accepts_complete_sample_before_byte_limit() {
+        for rows in [1, 1000, 600] {
+            let mut input = test_input();
+            input.request.expression = "SELECT * FROM S3Object LIMIT 1".to_owned();
+            input.request.input_serialization.csv = None;
+            input.request.input_serialization.json = Some(JSONInput {
+                type_: Some(JSONType::from_static(JSONType::LINES)),
+            });
+            let input = Arc::new(input);
+            let optimizer = Arc::new(CascadeOptimizerBuilder::default().build());
+            let dispatcher = SimpleQueryDispatcherBuilder::default()
+                .with_input(Arc::clone(&input))
+                .with_default_table_provider(Arc::new(BaseTableProvider::default()))
+                .with_session_factory(Arc::new(SessionCtxFactory::new(true)))
+                .with_parser(Arc::new(DefaultParser::default()))
+                .with_query_execution_factory(Arc::new(SqlQueryExecutionFactory::new(optimizer, Arc::new(LocalScheduler {}))))
+                .with_func_manager(Arc::new(SimpleFunctionMetadataManager::default()))
+                .with_memory_limit_bytes(128 * 1024 * 1024)
+                .with_query_admission(Arc::new(Semaphore::new(1)))
+                .with_query_timeout(Duration::from_secs(30))
+                .build()
+                .expect("supported 128 MiB query budget");
+            let query = Query::new(
+                QueryContext {
+                    input: Arc::clone(&input),
+                },
+                input.request.expression.clone(),
+            );
+            let machine = dispatcher.build_query_state_machine(query).await.expect("query machine");
+            let url = ObjectStoreUrl::parse(format!("s3://{}", input.bucket)).expect("store URL");
+            let store = machine.session.inner().runtime_env().object_store(&url).expect("store");
+            let payload = "x".repeat(if rows == 1000 { 32 } else { 8192 });
+            let data = format!("{{\"payload\":\"{payload}\"}}\n").repeat(rows);
+            store
+                .put(&Path::from(input.key.as_str()), data.into_bytes().into())
+                .await
+                .expect("write valid JSON Lines object");
+            let plan = dispatcher
+                .build_logical_plan(Arc::clone(&machine))
+                .await
+                .unwrap_or_else(|error| panic!("{rows} valid records must plan from a complete bounded sample: {error}"))
+                .expect("SELECT plan");
+            let output = dispatcher.execute_logical_plan(plan, machine).await.expect("execute query");
+            let mut stream = output.into_record_batch_stream().expect("record batches");
+            let mut returned = 0;
+            while let Some(batch) = stream.next().await {
+                let batch = batch.expect("decode supported records");
+                returned += batch.num_rows();
+            }
+            assert_eq!(returned, 1, "LIMIT 1 yields one supported row for {rows} input records");
+        }
+    }
+
+    #[tokio::test]
     async fn bounded_json_lines_prefix_rejects_overflow_without_truncating_records() {
         let mut input = test_input();
         input.request.expression = "SELECT * FROM S3Object".to_owned();
@@ -1906,9 +1960,9 @@ mod tests {
         input.request.input_serialization.json = Some(JSONInput {
             type_: Some(JSONType::from_static(JSONType::LINES)),
         });
-        // Individually valid records remain below the existing 1 MiB record
-        // limit. The 1000-record sample, however, cannot fit its byte budget.
-        let data = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(8192)).repeat(600);
+        // No complete record fits the inference prefix. Do not manufacture a
+        // partial record for the JSON parser at the byte limit.
+        let data = format!("{{\"payload\":\"{}\"}}\n", "x".repeat(4 * 1024 * 1024));
         let (dispatcher, machine) = bounded_inference_machine(input, data.into_bytes()).await;
         let error = dispatcher.build_logical_plan(machine).await.err().expect("prefix limit");
         assert!(error.to_string().contains("4 MiB prefix"), "{error}");

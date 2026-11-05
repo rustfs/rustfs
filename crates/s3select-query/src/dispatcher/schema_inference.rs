@@ -136,8 +136,10 @@ pub(super) async fn read_schema_prefix(
         while offset < chunk.len() {
             let remaining = MAX_SCHEMA_PREFIX_BYTES - bytes.len();
             if remaining == 0 {
-                if parsed > 0 {
-                    bytes.truncate(parsed);
+                if let PrefixBoundary::JsonLines { records, line_start } = &boundary
+                    && *records > 0
+                {
+                    bytes.truncate(*line_start);
                     return Ok(SchemaPrefix { bytes, reservation });
                 }
                 return Err(prefix_limit_error());
@@ -215,6 +217,65 @@ mod tests {
 
     fn pool() -> Arc<dyn MemoryPool> {
         Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024))
+    }
+
+    #[tokio::test]
+    async fn bounded_json_prefix_keeps_only_complete_records_at_byte_limit() {
+        let first = b"{\"a\":1}\n";
+        let mut input = first.to_vec();
+        input.extend_from_slice(b"{\"a\":\"");
+        input.extend(std::iter::repeat_n(b'x', MAX_SCHEMA_PREFIX_BYTES));
+        input.extend_from_slice(b"\"}\n");
+        for width in [8192, MAX_SCHEMA_PREFIX_BYTES + 128] {
+            let chunks = input
+                .chunks(width)
+                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                .collect::<Vec<_>>();
+            let prefix = read_schema_prefix(stream::iter(chunks).boxed(), &pool(), PrefixBoundary::json_lines())
+                .await
+                .expect("complete first record fits the inference sample");
+            let schema = super::super::json_lines_schema::infer_schema(&prefix.bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)
+                .expect("a complete JSON Lines object must not produce a truncated schema record");
+            assert_eq!(prefix.bytes, first, "the incomplete second record is outside the sample");
+            assert_eq!(schema.fields().len(), 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_json_prefix_empty_and_complete_record_controls() {
+        for input in [b"".as_slice(), b"{\"a\":1}\n".as_slice(), b"{\"a\":1}".as_slice()] {
+            let prefix = read_schema_prefix(
+                stream::iter([Ok(Bytes::copy_from_slice(input))]).boxed(),
+                &pool(),
+                PrefixBoundary::json_lines(),
+            )
+            .await
+            .expect("short complete input is accepted");
+            let schema = super::super::json_lines_schema::infer_schema(&prefix.bytes, DEFAULT_SCHEMA_INFER_MAX_RECORD)
+                .expect("short JSON Lines schema");
+            assert_eq!(schema.fields().len(), usize::from(!input.is_empty()));
+        }
+    }
+
+    #[tokio::test]
+    async fn bounded_schema_prefix_rejects_an_incomplete_first_record() {
+        for json in [true, false] {
+            let bytes = if json {
+                format!("{{\"payload\":\"{}\"}}\n", "x".repeat(MAX_SCHEMA_PREFIX_BYTES))
+            } else {
+                format!("\"{}\"\n", "x".repeat(MAX_SCHEMA_PREFIX_BYTES))
+            };
+            let boundary = if json {
+                PrefixBoundary::json_lines()
+            } else {
+                PrefixBoundary::csv(&CsvFormat::default())
+            };
+            let error = read_schema_prefix(stream::iter([Ok(Bytes::from(bytes))]).boxed(), &pool(), boundary)
+                .await
+                .err()
+                .expect("a partial first record cannot provide an inference sample");
+            assert!(error.to_string().contains("4 MiB prefix"), "{error}");
+        }
     }
 
     #[tokio::test]
