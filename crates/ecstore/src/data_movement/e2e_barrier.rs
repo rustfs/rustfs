@@ -31,6 +31,8 @@ use tokio::fs;
 use tokio::time::Instant;
 
 pub(crate) const BARRIER_DIR_ENV: &str = "RUSTFS_E2E_DATA_MOVEMENT_BARRIER_DIR";
+/// Rebalance holds its admission fence; no version of this entry has moved.
+pub(crate) const STAGE_AFTER_ENTRY_ADMISSION: &str = "after_entry_admission";
 /// Every target part is staged and the target version is not yet published.
 pub(crate) const STAGE_BEFORE_TARGET_COMMIT: &str = "before_target_commit";
 /// The target commit is durable and the source preflight matched; the source

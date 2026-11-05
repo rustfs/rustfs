@@ -48,6 +48,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 pub(crate) const MOVEMENT_BARRIER_DIR_ENV: &str = "RUSTFS_E2E_DATA_MOVEMENT_BARRIER_DIR";
+pub(crate) const STAGE_AFTER_ENTRY_ADMISSION: &str = "after_entry_admission";
 pub(crate) const STAGE_BEFORE_TARGET_COMMIT: &str = "before_target_commit";
 pub(crate) const STAGE_BEFORE_SOURCE_CLEANUP: &str = "before_source_cleanup";
 pub(crate) const STAGE_AFTER_RESPONSIBILITY_PERSISTED: &str = "after_responsibility_persisted";
