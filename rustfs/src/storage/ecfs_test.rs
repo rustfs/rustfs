@@ -14,6 +14,26 @@
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_key_rejects_reserved_directory_markers() {
+        for key in [
+            "__XLDIR__",
+            "prefix/__XLDIR__",
+            "stash__XLDIR__/blob",
+            "file__XLDIR__",
+            "file__XLDIR__/",
+            "a__XLDIR__b",
+        ] {
+            let error = crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect_err("client keys must not alias internal directory markers");
+            assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
+        }
+        for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
+            crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect("ordinary objects and directory objects remain valid");
+        }
+    }
+
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;

@@ -194,7 +194,9 @@ impl QueryExecutionTracker {
         }
     }
 
-    pub(crate) fn query_guard(&self) -> Option<QueryExecutionGuard> {
+    /// Retains admission for queued or running work that can outlive its request.
+    /// Returns `None` once the execution has finished or reached its deadline.
+    pub fn query_guard(&self) -> Option<QueryExecutionGuard> {
         let query_guard = self.inner.query_guard.lock();
         if Instant::now() >= self.inner.deadline || self.status() != QueryExecutionStatus::Active {
             return None;
@@ -296,6 +298,9 @@ pub struct SessionCtxFactory {
 }
 
 pub const DEFAULT_S3SELECT_MEMORY_LIMIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// Maximum inferred fields and explicit projection expressions for S3 Select.
+pub const MAX_SELECT_COLUMNS: usize = 1024;
 
 impl Default for SessionCtxFactory {
     fn default() -> Self {
@@ -436,6 +441,26 @@ impl SessionCtxFactory {
         };
         let rt = RuntimeEnvBuilder::new().with_memory_limit(memory_limit_bytes, 1.0).build()?;
         let config = SessionConfig::new().with_target_partitions(self.target_partitions);
+        // Arrow CSV reserves two usize offsets for every cell outside the
+        // DataFusion memory pool. Bound that reservation to at most 4 MiB and
+        // one sixteenth of the configured query budget, including narrow input.
+        let config = if context.input.request.input_serialization.csv.is_some() {
+            let batch_rows = (memory_limit_bytes / 16 / (MAX_SELECT_COLUMNS * 2 * size_of::<usize>())).clamp(1, 256);
+            config.with_batch_size(batch_rows)
+        } else {
+            config
+        };
+        // Parquet's dictionary views can expand during an explicit SQL cast.
+        // Keep every downstream operator (including FilterExec's internal
+        // coalescer) at one row, and disable the separate coalesce optimizer.
+        let config = if context.input.request.input_serialization.parquet.is_some() {
+            let mut config = config.with_batch_size(1).with_target_partitions(1);
+            config.options_mut().execution.coalesce_batches = false;
+            config.options_mut().optimizer.repartition_file_scans = false;
+            config
+        } else {
+            config
+        };
         let custom_two_byte_record_delimiter = context
             .input
             .request
@@ -810,7 +835,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parquet_scan_range_keeps_file_repartitioning() {
+    async fn parquet_scan_range_keeps_single_partition_decode() {
         let mut context = test_context();
         let request = &mut Arc::make_mut(&mut context.input).request;
         request.scan_range = Some(ScanRange {
@@ -826,7 +851,9 @@ mod tests {
             .await
             .expect("Parquet ScanRange session should be created");
 
-        assert!(session.inner().config().options().optimizer.repartition_file_scans);
+        assert!(!session.inner().config().options().optimizer.repartition_file_scans);
+        assert_eq!(session.inner().config().batch_size(), 1);
+        assert_eq!(session.inner().config().target_partitions(), 1);
     }
 
     #[tokio::test]
@@ -1004,6 +1031,39 @@ mod tests {
             .expect("session should be created with default target partitions");
 
         assert_eq!(session.inner().config().target_partitions(), SessionConfig::new().target_partitions());
+    }
+
+    #[tokio::test]
+    async fn decoder_batch_budgets_keep_parquet_downstream_execution_single_row() {
+        let factory = SessionCtxFactory::new(true);
+        for (budget, expected) in [(64 * 1024 * 1024, 256), (8 * 1024 * 1024, 32), (1024, 1)] {
+            let session = factory
+                .create_session_ctx_inner(&test_context(), None, JsonSource::default(), None, None, budget)
+                .await
+                .expect("CSV session");
+            assert_eq!(session.inner().config().batch_size(), expected);
+        }
+        for parquet in [false, true] {
+            let mut context = test_context();
+            let input = Arc::make_mut(&mut context.input);
+            input.request.input_serialization.csv = None;
+            if parquet {
+                input.request.input_serialization.parquet = Some(ParquetInput::default());
+            } else {
+                input.request.input_serialization.json = Some(JSONInput {
+                    type_: Some(JSONType::from_static(JSONType::LINES)),
+                });
+            }
+            let session = factory.create_session_ctx(&context).await.expect("non-CSV session");
+            assert_eq!(
+                session.inner().config().batch_size(),
+                if parquet { 1 } else { SessionConfig::new().batch_size() }
+            );
+            if parquet {
+                assert!(!session.inner().config().options().execution.coalesce_batches);
+                assert_eq!(session.inner().config().target_partitions(), 1);
+            }
+        }
     }
 
     #[tokio::test]

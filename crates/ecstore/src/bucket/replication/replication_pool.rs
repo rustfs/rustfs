@@ -16,8 +16,8 @@ use super::replication_config_store::ReplicationConfigStore;
 use super::replication_error_boundary::{Error as EcstoreError, is_err_object_not_found, is_err_version_not_found};
 use super::replication_filemeta_boundary::{
     MrfOpKind, MrfReplicateEntry, REPLICATE_HEAL_DELETE, ReplicateDecision, ReplicateObjectInfo, ReplicatedTargetInfo,
-    ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision, replicate_decision_for_admitted_targets,
-    replication_statuses_map, version_purge_statuses_map,
+    ReplicationGenerationSnapshot, ReplicationStatusType, ReplicationType, ReplicationWorkerOperation, ResyncDecision,
+    replicate_decision_for_admitted_targets, replication_statuses_map, version_purge_statuses_map,
 };
 use super::replication_lock_boundary::ReplicationLockTiming;
 use super::replication_logging::{EVENT_REPLICATION_CONFIG_LOOKUP_SKIPPED, LOG_COMPONENT_ECSTORE, LOG_SUBSYSTEM_REPLICATION};
@@ -1581,7 +1581,7 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 
     /// Queues a replica task
     pub async fn queue_replica_task(&self, ri: ReplicateObjectInfo) -> ReplicationQueueAdmission {
-        // A version that is already queued or being uploaded is not driven a
+        // A source generation already queued or being uploaded is not driven a
         // second time: the scanner heal pass sees it as PENDING until the
         // first upload lands and would otherwise re-queue it every cycle
         // (backlog#2362). The key is released when the worker finishes, or
@@ -2404,28 +2404,47 @@ impl<S: ReplicationStorage> ReplicationPool<S> {
 }
 
 /// Object versions currently queued or being uploaded, keyed by bucket,
-/// object name and version. `queue_replica_task` admits a version only once
+/// object name, version and source generation. `queue_replica_task` admits a generation only once
 /// while it is in flight; the scanner heal pass and MRF replays that arrive
 /// in the meantime are `Skipped` instead of driving a second complete upload
 /// (backlog#2362). Entries are removed when the worker finishes the task or
 /// when no worker accepted it.
 #[derive(Debug, Default)]
 pub(crate) struct ReplicationInFlight {
-    keys: std::sync::Mutex<std::collections::HashSet<(String, String, Option<uuid::Uuid>)>>,
+    keys: std::sync::Mutex<std::collections::HashSet<ReplicationInFlightKey>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct ReplicationInFlightKey {
+    bucket: String,
+    object: String,
+    version_id: Option<uuid::Uuid>,
+    generation: ReplicationGenerationSnapshot,
+}
+
+impl From<&ReplicateObjectInfo> for ReplicationInFlightKey {
+    fn from(info: &ReplicateObjectInfo) -> Self {
+        Self {
+            bucket: info.bucket.clone(),
+            object: info.name.clone(),
+            version_id: info.version_id,
+            generation: info.replication_generation.clone(),
+        }
+    }
 }
 
 impl ReplicationInFlight {
-    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<(String, String, Option<uuid::Uuid>)>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, std::collections::HashSet<ReplicationInFlightKey>> {
         self.keys.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    /// Claim `ri`; `false` when the same version is already in flight.
+    /// Claim `ri`; a metadata mutation is independent of its earlier generation.
     fn try_begin(&self, ri: &ReplicateObjectInfo) -> bool {
-        self.lock().insert((ri.bucket.clone(), ri.name.clone(), ri.version_id))
+        self.lock().insert(ReplicationInFlightKey::from(ri))
     }
 
     fn finish(&self, ri: &ReplicateObjectInfo) {
-        self.lock().remove(&(ri.bucket.clone(), ri.name.clone(), ri.version_id));
+        self.lock().remove(&ReplicationInFlightKey::from(ri));
     }
 
     #[cfg(test)]
@@ -2438,26 +2457,21 @@ impl ReplicationInFlight {
 /// including when replication panics.
 struct ReplicationInFlightGuard {
     in_flight: Arc<ReplicationInFlight>,
-    key: ReplicateObjectInfo,
+    key: ReplicationInFlightKey,
 }
 
 impl ReplicationInFlightGuard {
     fn new(in_flight: Arc<ReplicationInFlight>, ri: &ReplicateObjectInfo) -> Self {
         Self {
             in_flight,
-            key: ReplicateObjectInfo {
-                bucket: ri.bucket.clone(),
-                name: ri.name.clone(),
-                version_id: ri.version_id,
-                ..Default::default()
-            },
+            key: ReplicationInFlightKey::from(ri),
         }
     }
 }
 
 impl Drop for ReplicationInFlightGuard {
     fn drop(&mut self) {
-        self.in_flight.finish(&self.key);
+        self.in_flight.lock().remove(&self.key);
     }
 }
 
@@ -4052,6 +4066,48 @@ mod tests {
         pool.in_flight.finish(&ri);
         assert_eq!(pool.queue_replica_task(ri).await, ReplicationQueueAdmission::Queued);
         assert_eq!(current_queue(&pool, "in-flight-bucket").await, (3, 3 * 4096));
+    }
+
+    #[tokio::test]
+    async fn queue_replica_task_admits_metadata_changes_during_an_initial_upload() {
+        let pool = new_test_replication_pool(Arc::new(LoadResyncNodeStore::new("node-a", empty_resync_shared_state()))).await;
+        let (tx, mut rx) = mpsc::channel(4);
+        pool.workers.write().await.push(tx);
+        let initial = ReplicateObjectInfo {
+            bucket: "pending-tags-bucket".to_string(),
+            name: "object".to_string(),
+            version_id: Some(uuid::Uuid::new_v4()),
+            size: 4096,
+            replication_generation: ReplicationGenerationSnapshot {
+                mutation_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let metadata = ReplicateObjectInfo {
+            op_type: ReplicationType::Metadata,
+            user_tags: String::new(),
+            replication_generation: ReplicationGenerationSnapshot {
+                mutation_id: Some(uuid::Uuid::new_v4().to_string()),
+                ..Default::default()
+            },
+            ..initial.clone()
+        };
+        assert_eq!(pool.queue_replica_task(initial.clone()).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.queue_replica_task(metadata.clone()).await, ReplicationQueueAdmission::Queued);
+        assert_eq!(pool.queue_replica_task(metadata.clone()).await, ReplicationQueueAdmission::Skipped);
+        assert_eq!(pool.in_flight.len(), 2);
+        drop(ReplicationInFlightGuard::new(pool.in_flight.clone(), &initial));
+        assert_eq!(pool.in_flight.len(), 1);
+        assert_eq!(pool.queue_replica_task(metadata.clone()).await, ReplicationQueueAdmission::Skipped);
+        for expected in [&initial, &metadata] {
+            let ReplicationOperation::Object(queued) = rx.recv().await.expect("queued operation") else {
+                panic!("expected object replication");
+            };
+            assert_eq!(queued.replication_generation, expected.replication_generation);
+        }
+        drop(ReplicationInFlightGuard::new(pool.in_flight.clone(), &metadata));
+        assert_eq!(pool.in_flight.len(), 0);
     }
 
     #[tokio::test]

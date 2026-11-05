@@ -1532,9 +1532,19 @@ where
         }
     }
 
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn materialize_bucket_snapshot(
         &self,
         source: StrongTableCatalogBucketSnapshot,
+    ) -> TableCatalogStoreResult<(String, bool)> {
+        self.materialize_bucket_snapshot_with_fence(source, &TableCatalogObjectMutationFence::default())
+            .await
+    }
+
+    pub(in crate::table_catalog) async fn materialize_bucket_snapshot_with_fence(
+        &self,
+        source: StrongTableCatalogBucketSnapshot,
+        fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<(String, bool)> {
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
@@ -1562,7 +1572,8 @@ where
                 postcondition,
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition, postcondition).await?;
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, Some(fence))
+            .await?;
         self.hydrate_state().await?;
         let state = self.state.lock().await;
         let snapshot_etag = state
@@ -1572,11 +1583,27 @@ where
         Ok((snapshot_etag, true))
     }
 
+    #[cfg(test)]
     pub(in crate::table_catalog) async fn remove_bucket_snapshot_if_unchanged(
         &self,
         table_bucket: &str,
         expected_fingerprint: &str,
     ) -> TableCatalogStoreResult<()> {
+        self.remove_bucket_snapshot_if_unchanged_with_fence(
+            table_bucket,
+            expected_fingerprint,
+            &TableCatalogObjectMutationFence::default(),
+        )
+        .await
+    }
+
+    pub(in crate::table_catalog) async fn remove_bucket_snapshot_if_unchanged_with_fence(
+        &self,
+        table_bucket: &str,
+        expected_fingerprint: &str,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        fence.ensure_held()?;
         let _write_guard = self.write_lock.lock().await;
         self.hydrate_state().await?;
         let (snapshot, precondition, postcondition) = {
@@ -1597,7 +1624,8 @@ where
                 StrongSnapshotWritePostcondition::TableBucketAbsent(table_bucket.to_string()),
             )
         };
-        self.finalize_snapshot_write(snapshot, precondition, postcondition).await
+        self.finalize_snapshot_write_with_fence(snapshot, precondition, postcondition, Some(fence))
+            .await
     }
 
     pub(super) async fn restore_absent_migration_snapshot_baseline(&self) -> TableCatalogStoreResult<()> {
@@ -2024,22 +2052,6 @@ where
             })
     }
 
-    fn maintenance_cleanup_roots(entry: &TableEntry) -> TableCatalogStoreResult<Vec<String>> {
-        let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
-        let table_root = metadata_dir
-            .strip_suffix(&format!("/{METADATA_DIR}"))
-            .ok_or_else(|| TableCatalogStoreError::Invalid("maintenance metadata directory has no table root".to_string()))?;
-        let warehouse = table_warehouse_object_prefix(entry)?;
-        Ok(vec![
-            format!("{metadata_dir}/"),
-            format!("{table_root}/{DATA_DIR}/"),
-            format!("{table_root}/{DELETE_DIR}/"),
-            format!("{warehouse}{METADATA_DIR}/"),
-            format!("{warehouse}{DATA_DIR}/"),
-            format!("{warehouse}{DELETE_DIR}/"),
-        ])
-    }
-
     async fn maintenance_cleanup_entry(
         &self,
         table_bucket: &str,
@@ -2047,14 +2059,14 @@ where
         table: &str,
     ) -> TableCatalogStoreResult<TableEntry> {
         let entry = self.maintenance_table_entry(table_bucket, namespace, table).await?;
-        let roots = Self::maintenance_cleanup_roots(&entry)?;
+        let roots = maintenance_cleanup_roots(&entry)?;
         let state = self.state.lock().await;
         for other in state.tables.values().filter(|other| {
             other.table_bucket == table_bucket
                 && other.state != TableCatalogEntryState::Deleted
                 && (other.namespace != entry.namespace || other.table != entry.table)
         }) {
-            let other_roots = Self::maintenance_cleanup_roots(other)?;
+            let other_roots = maintenance_cleanup_roots(other)?;
             if roots.iter().any(|root| {
                 other_roots
                     .iter()

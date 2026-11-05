@@ -197,20 +197,8 @@ impl S3Auth for IAMAuth {
             return Err(s3_error!(UnauthorizedAccess, "Your account is not signed up"));
         }
 
-        // Check if this is a Keystone access key (from mixed auth scenario)
-        // Keystone credentials use token authentication, not signature verification
         if access_key.starts_with("keystone:") {
-            debug!(
-                event = EVENT_KEYSTONE_CREDENTIALS_DETECTED,
-                component = LOG_COMPONENT_AUTH,
-                subsystem = LOG_SUBSYSTEM_KEYSTONE,
-                access_key = %MaskedAccessKey(access_key),
-                result = "token_auth",
-                "Keystone token-auth access key detected"
-            );
-            // Return empty secret key - Keystone uses token validation, not AWS signatures
-            // The actual credentials are stored in task-local storage by KeystoneAuthMiddleware
-            return Ok(SecretKey::from(String::new()));
+            return Err(s3_error!(InvalidAccessKeyId, "Keystone authentication requires X-Auth-Token header"));
         }
 
         if access_key == self.access_key {
@@ -1735,6 +1723,39 @@ mod tests {
         };
 
         assert!(!has_root_access(&sys_cred, &oidc_cred));
+    }
+
+    #[tokio::test]
+    async fn keystone_secret_lookup_requires_validated_token_context() {
+        use rustfs_keystone::KEYSTONE_CREDENTIALS;
+        let auth = IAMAuth::new("root", "root-secret");
+        for key in ["keystone:x", "keystone:admin"] {
+            assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+            KEYSTONE_CREDENTIALS
+                .scope(None, async {
+                    assert_eq!(auth.get_secret_key(key).await.unwrap_err().code(), &S3ErrorCode::InvalidAccessKeyId);
+                })
+                .await;
+        }
+        let credentials = Credentials {
+            access_key: "keystone:validated".to_owned(),
+            ..Default::default()
+        };
+        KEYSTONE_CREDENTIALS
+            .scope(Some(credentials), async {
+                assert_eq!(
+                    auth.get_secret_key("keystone:validated")
+                        .await
+                        .expect("validated Keystone token")
+                        .expose(),
+                    ""
+                );
+            })
+            .await;
+        assert_eq!(
+            auth.get_secret_key("root").await.expect("regular root credential").expose(),
+            "root-secret"
+        );
     }
 
     #[test]

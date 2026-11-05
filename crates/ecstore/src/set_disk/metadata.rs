@@ -195,7 +195,14 @@ impl SetDisks {
             metadata.add_version(selected)?;
         }
         if metadata.versions.is_empty() {
-            return Ok(None);
+            // With no decodable version, the per-version quorum loop cannot
+            // reject corrupt or unavailable replicas. Only complete, readable
+            // evidence may establish that this key has no authoritative version.
+            return if complete {
+                Ok(None)
+            } else {
+                Err(DiskError::ErasureReadQuorum)
+            };
         }
         Ok(Some(MetaCacheEntry {
             name,

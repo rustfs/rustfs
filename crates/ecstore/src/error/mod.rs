@@ -269,6 +269,11 @@ pub enum StorageError {
     /// retained for operator inspection.
     #[error("delete recovery found an ambiguous legacy residue; operator inspection is required")]
     DeleteRecoveryLegacyAmbiguous,
+    /// Delete recovery exhausted the per-request work budget before it could
+    /// classify every residue. Retrying later makes progress, so callers treat
+    /// it like `SlowDown`; it stays distinct so the disk error round-trips.
+    #[error("delete recovery work limit reached; please retry")]
+    DeleteRecoveryWorkLimit,
     #[error("Decommission not started")]
     DecommissionNotStarted,
     #[error("Decommission already running")]
@@ -480,6 +485,7 @@ impl From<DiskError> for StorageError {
             DiskError::InvalidPath => StorageError::InvalidPath,
             DiskError::ConditionalDeleteConflict => StorageError::ConditionalDeleteConflict,
             DiskError::GuardedDeleteUnsupported => StorageError::GuardedDeleteUnsupported,
+            DiskError::DeleteRecoveryWorkLimit => StorageError::DeleteRecoveryWorkLimit,
             DiskError::RemoteClientUnavailable(detail) => StorageError::RemoteClientUnavailable(detail),
         }
     }
@@ -507,6 +513,7 @@ impl StorageError {
             StorageError::MethodNotAllowed => DiskError::MethodNotAllowed,
             StorageError::StorageFull => DiskError::DiskFull,
             StorageError::SlowDown => DiskError::TooManyOpenFiles,
+            StorageError::DeleteRecoveryWorkLimit => DiskError::DeleteRecoveryWorkLimit,
             StorageError::MaxVersionsExceeded => DiskError::MaxVersionsExceeded,
             StorageError::InconsistentDisk => DiskError::InconsistentDisk,
             StorageError::UnsupportedDisk => DiskError::UnsupportedDisk,
@@ -710,6 +717,7 @@ impl Clone for StorageError {
             StorageError::StorageFull => StorageError::StorageFull,
             StorageError::SlowDown => StorageError::SlowDown,
             StorageError::DeleteRecoveryLegacyAmbiguous => StorageError::DeleteRecoveryLegacyAmbiguous,
+            StorageError::DeleteRecoveryWorkLimit => StorageError::DeleteRecoveryWorkLimit,
             StorageError::PrefixAccessDenied(a, b) => StorageError::PrefixAccessDenied(a.clone(), b.clone()),
             StorageError::InvalidUploadIDKeyCombination(a, b) => {
                 StorageError::InvalidUploadIDKeyCombination(a.clone(), b.clone())
@@ -852,6 +860,7 @@ impl StorageError {
             StorageError::StorageFull => StorageErrorCode::StorageFull,
             StorageError::SlowDown => StorageErrorCode::SlowDown,
             StorageError::DeleteRecoveryLegacyAmbiguous => StorageErrorCode::DeleteRecoveryLegacyAmbiguous,
+            StorageError::DeleteRecoveryWorkLimit => StorageErrorCode::DeleteRecoveryWorkLimit,
             StorageError::PrefixAccessDenied(_, _) => StorageErrorCode::PrefixAccessDenied,
             StorageError::InvalidUploadIDKeyCombination(_, _) => StorageErrorCode::InvalidUploadIDKeyCombination,
             StorageError::MalformedUploadID(_) => StorageErrorCode::MalformedUploadID,
@@ -958,6 +967,7 @@ impl StorageError {
             StorageErrorCode::StorageFull => Some(StorageError::StorageFull),
             StorageErrorCode::SlowDown => Some(StorageError::SlowDown),
             StorageErrorCode::DeleteRecoveryLegacyAmbiguous => Some(StorageError::DeleteRecoveryLegacyAmbiguous),
+            StorageErrorCode::DeleteRecoveryWorkLimit => Some(StorageError::DeleteRecoveryWorkLimit),
             StorageErrorCode::PrefixAccessDenied => {
                 Some(StorageError::PrefixAccessDenied(Default::default(), Default::default()))
             }
@@ -1700,8 +1710,8 @@ mod tests {
         // covers every variant and picks up newly appended ones automatically.
         let all_variants: Vec<DiskError> = (1u32..).map_while(DiskError::from_u32).collect();
         assert!(
-            all_variants.len() >= 42,
-            "DiskError variant enumeration shrank: got {}, expected at least 42",
+            all_variants.len() >= 46,
+            "DiskError variant enumeration shrank: got {}, expected at least 46",
             all_variants.len()
         );
 

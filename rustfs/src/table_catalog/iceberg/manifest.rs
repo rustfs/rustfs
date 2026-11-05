@@ -17,6 +17,7 @@ use std::io::Read;
 use super::super::*;
 
 const AVRO_ZSTANDARD_MAX_WINDOW_LOG: u32 = 27;
+const AVRO_MANIFEST_MAX_SCHEMA_DEPTH: usize = 64;
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct ManifestDataFileReference {
@@ -182,6 +183,7 @@ pub(crate) fn decode_manifest_list_avro(data: &[u8]) -> TableCatalogStoreResult<
     let decoded_size = validate_avro_container(data)?;
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest list Avro: {err}")))?;
+    validate_manifest_writer_schema(reader.writer_schema())?;
     let format_version =
         avro_record_format_version(reader.writer_schema(), &["sequence_number", "min_sequence_number"], "manifest list")?;
     if format_version == 2 {
@@ -276,6 +278,7 @@ pub(crate) fn decode_manifest_avro(data: &[u8]) -> TableCatalogStoreResult<Decod
     let decoded_size = validate_avro_container(data)?;
     let reader = apache_avro::Reader::new(data)
         .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to read manifest Avro: {err}")))?;
+    validate_manifest_writer_schema(reader.writer_schema())?;
     let format_version =
         avro_record_format_version(reader.writer_schema(), &["sequence_number", "file_sequence_number"], "manifest")?;
     let partition_spec_id = reader
@@ -363,6 +366,79 @@ enum AvroContainerCodec {
     Deflate,
     Snappy,
     Zstandard,
+}
+
+// Iceberg manifests do not use recursive types. Bound resolved depth before any
+// value decoding; byte and record limits cannot bound recursive Avro values.
+fn validate_manifest_writer_schema(schema: &apache_avro::Schema) -> TableCatalogStoreResult<()> {
+    use apache_avro::schema::{Name, NamesRef, ResolvedSchema};
+    use std::collections::{HashMap, HashSet};
+
+    fn depth(
+        schema: &apache_avro::Schema,
+        names: &NamesRef<'_>,
+        active: &mut HashSet<Name>,
+        heights: &mut HashMap<Name, usize>,
+        nesting: usize,
+    ) -> TableCatalogStoreResult<usize> {
+        use apache_avro::Schema;
+        if nesting > AVRO_MANIFEST_MAX_SCHEMA_DEPTH {
+            return Err(TableCatalogStoreError::Invalid(
+                "manifest Avro schema exceeds the maximum nesting depth".to_string(),
+            ));
+        }
+        if let Schema::Ref { name } = schema {
+            let target = names.get(name).ok_or_else(|| {
+                TableCatalogStoreError::Invalid("manifest Avro schema has an unresolved type reference".to_string())
+            })?;
+            return depth(target, names, active, heights, nesting);
+        }
+        if let Some(name) = schema.name() {
+            if let Some(height) = heights.get(name) {
+                if nesting + height - 1 > AVRO_MANIFEST_MAX_SCHEMA_DEPTH {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "manifest Avro schema exceeds the maximum nesting depth".to_string(),
+                    ));
+                }
+                return Ok(*height);
+            }
+            if !active.insert(name.clone()) {
+                return Err(TableCatalogStoreError::Invalid(
+                    "manifest Avro schema contains a recursive type".to_string(),
+                ));
+            }
+        }
+        let mut height = 1;
+        let mut visit = |child| -> TableCatalogStoreResult<()> {
+            height = height.max(1 + depth(child, names, active, heights, nesting + 1)?);
+            Ok(())
+        };
+        match schema {
+            Schema::Record(record) => {
+                for field in &record.fields {
+                    visit(&field.schema)?;
+                }
+            }
+            Schema::Array(array) => visit(&array.items)?,
+            Schema::Map(map) => visit(&map.types)?,
+            Schema::Union(union) => {
+                for variant in union.variants() {
+                    visit(variant)?;
+                }
+            }
+            _ => {}
+        }
+        if let Some(name) = schema.name() {
+            active.remove(name);
+            heights.insert(name.clone(), height);
+        }
+        Ok(height)
+    }
+
+    let resolved = ResolvedSchema::try_from(schema)
+        .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid manifest Avro schema: {err}")))?;
+    depth(schema, resolved.get_names(), &mut HashSet::new(), &mut HashMap::new(), 1)?;
+    Ok(())
 }
 
 fn validate_avro_container(data: &[u8]) -> TableCatalogStoreResult<usize> {
@@ -664,6 +740,96 @@ fn avro_i64_value(value: &apache_avro::types::Value) -> Option<i64> {
 mod tests {
     use super::*;
     use std::assert_matches;
+
+    fn schema_container(schema: &serde_json::Value, record: &[u8]) -> Vec<u8> {
+        fn long(bytes: &mut Vec<u8>, value: usize) {
+            let mut encoded = u64::try_from(value).expect("fixture length") << 1;
+            while encoded >= 128 {
+                bytes.push((encoded as u8 & 0x7f) | 0x80);
+                encoded >>= 7;
+            }
+            bytes.push(encoded as u8);
+        }
+        let schema = serde_json::to_vec(schema).expect("schema JSON");
+        let mut bytes = b"Obj\x01".to_vec();
+        long(&mut bytes, 1);
+        long(&mut bytes, b"avro.schema".len());
+        bytes.extend_from_slice(b"avro.schema");
+        long(&mut bytes, schema.len());
+        bytes.extend_from_slice(&schema);
+        long(&mut bytes, 0);
+        bytes.extend_from_slice(&[0; 16]);
+        long(&mut bytes, 1);
+        long(&mut bytes, record.len());
+        bytes.extend_from_slice(record);
+        bytes.extend_from_slice(&[0; 16]);
+        bytes
+    }
+
+    #[test]
+    fn manifest_decoders_reject_recursive_writer_schemas_before_decoding_values() {
+        for child in [
+            serde_json::json!(["null", "example.manifest_file"]),
+            serde_json::json!({"type":"array", "items":"example.manifest_file"}),
+            serde_json::json!({"type":"map", "values":"example.manifest_file"}),
+            serde_json::json!({"type":"record", "name":"child", "fields":[{"name":"parent", "type":"example.manifest_file"}]}),
+        ] {
+            let schema = serde_json::json!({
+                "type":"record", "name":"manifest_file", "namespace":"example",
+                "fields":[{"name":"manifest_path","type":"string"}, {"name":"next", "type":child}]
+            });
+            // A valid self-referential union datum can drive thousands of decoder frames.
+            let mut record = [0, 2].repeat(10_000);
+            record.extend_from_slice(&[0, 0]);
+            let data = schema_container(&schema, &record);
+            assert!(
+                matches!(decode_manifest_list_avro(&data), Err(TableCatalogStoreError::Invalid(message)) if message.contains("recursive type"))
+            );
+            assert!(
+                matches!(decode_manifest_avro(&data), Err(TableCatalogStoreError::Invalid(message)) if message.contains("recursive type"))
+            );
+        }
+    }
+
+    #[test]
+    fn manifest_decoders_bound_resolved_schema_depth() {
+        let mut fields = vec![serde_json::json!({"name":"manifest_path", "type":"string"})];
+        for index in 0..AVRO_MANIFEST_MAX_SCHEMA_DEPTH {
+            let children = if index == 0 {
+                vec![]
+            } else {
+                vec![serde_json::json!({"name":"previous", "type":format!("node{}", index - 1)})]
+            };
+            fields.push(serde_json::json!({"name":format!("field{index}"), "type":{"type":"record", "name":format!("node{index}"), "fields":children}}));
+        }
+        let data = schema_container(&serde_json::json!({"type":"record", "name":"manifest_file", "fields":fields}), &[0]);
+        assert!(
+            matches!(decode_manifest_list_avro(&data), Err(TableCatalogStoreError::Invalid(message)) if message.contains("maximum nesting depth"))
+        );
+        assert!(
+            matches!(decode_manifest_avro(&data), Err(TableCatalogStoreError::Invalid(message)) if message.contains("maximum nesting depth"))
+        );
+    }
+
+    #[test]
+    fn manifest_decoder_accepts_reused_nonrecursive_named_types() {
+        let schema = serde_json::json!({
+            "type":"record", "name":"manifest_file", "namespace":"example",
+            "fields":[
+                {"name":"manifest_path", "type":"string"},
+                {"name":"first", "type":{"type":"record", "name":"detail", "fields":[{"name":"value", "type":"string"}]}},
+                {"name":"second", "type":"detail"}
+            ]
+        });
+        let path = "manifest.avro";
+        let mut record = vec![u8::try_from(path.len() * 2).expect("short path")];
+        record.extend_from_slice(path.as_bytes());
+        record.extend_from_slice(&[0, 0]);
+        let decoded =
+            decode_manifest_list_avro(&schema_container(&schema, &record)).expect("reused named types are not recursive");
+        assert_eq!(decoded.references.len(), 1);
+        assert_eq!(decoded.references[0].manifest_path, path);
+    }
 
     #[test]
     fn rejects_v2_manifest_lists_without_required_count_fields() {

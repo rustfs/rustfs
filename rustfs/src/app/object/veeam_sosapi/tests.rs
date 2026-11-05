@@ -877,6 +877,7 @@ fn veeam_sosapi_http_contract() {
                 )
                 .await
                 .expect("set quota on fresh bucket");
+            crate::app::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &quota_bucket).await.expect("bootstrap quota usage");
             snapshot.last_update = Some(std::time::SystemTime::now() + Duration::from_secs(2));
             snapshot.buckets_count = 2;
             let quota_incarnation = store.bucket_incarnation_id_from_disk(&quota_bucket).await.expect("quota bucket incarnation");

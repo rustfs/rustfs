@@ -171,10 +171,44 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let index_prefix = self.paths.warehouse_index_entries_prefix(&entry.table_bucket);
         // The backend must preserve system-bucket committed-read semantics as
         // well as completeness; ordinary S3 LIST is insufficient for cache hits.
-        let mut tables = self
-            .backend
-            .list_objects_for_cleanup(self.catalog_bucket(), &namespace_prefix)
-            .await?;
+        let directory = self.table_directory_objects(&entry.table_bucket, None).await?;
+        let directory_epoch = directory.as_ref().map(|scan| scan.activation_id);
+        let mut tables = match directory {
+            Some(scan) => {
+                // The directory proves which keys to inspect, but cached owners
+                // still require the current GET-equivalent committed ETag. Do
+                // not replace this exact version probe with an ordinary stat.
+                stream::iter(scan.objects)
+                    .map(|key| async move {
+                        let page = self
+                            .backend
+                            .list_catalog_objects_page(
+                                self.catalog_bucket(),
+                                &key,
+                                None,
+                                NonZeroUsize::new(2).ok_or_else(|| {
+                                    TableCatalogStoreError::Internal("exact inventory page size must be positive".to_string())
+                                })?,
+                            )
+                            .await?;
+                        if page.is_truncated || page.objects.len() > 1 || page.objects.iter().any(|object| object.key != key) {
+                            return Err(TableCatalogStoreError::Invalid(
+                                "table directory target has an ambiguous authoritative inventory".to_string(),
+                            ));
+                        }
+                        Ok(page.objects.into_iter().next())
+                    })
+                    .buffered(TABLE_REGISTRATION_READ_CONCURRENCY)
+                    .try_filter_map(|object| async move { Ok(object) })
+                    .try_collect::<Vec<_>>()
+                    .await?
+            }
+            None => {
+                self.backend
+                    .list_objects_for_cleanup(self.catalog_bucket(), &namespace_prefix)
+                    .await?
+            }
+        };
         let mut indexes = self
             .backend
             .list_objects_for_cleanup(self.catalog_bucket(), &index_prefix)
@@ -251,6 +285,9 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                     TableCatalogStoreError::Unavailable("warehouse index state changed during registration inventory".to_string())
                 })?;
             table_warehouse_index_state_ready(&state, &entry.table_bucket)?;
+        }
+        if let Some(epoch) = directory_epoch {
+            self.ensure_table_directory_epoch(&entry.table_bucket, epoch).await?;
         }
         if !publication.holds_table_bucket(&entry.table_bucket) {
             return Err(TableCatalogStoreError::Unavailable("registration publication fence was lost".to_string()));

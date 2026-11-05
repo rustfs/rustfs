@@ -368,7 +368,7 @@ impl ECStore {
             Some(expected) => expected,
             None => self.bucket_incarnation_id_from_disk(bucket).await?,
         };
-        let object = object.map(str::to_owned);
+        let object = object.map(encode_dir_object);
         let prefix = prefix.map(str::to_owned);
         self.run_bucket_heal_at_incarnation(bucket, expected, opts, |store, bucket, opts| async move {
             let scope = bucket_heal_scope(&bucket).ok_or(StorageError::PreconditionFailed)?;
@@ -430,7 +430,7 @@ impl ECStore {
                     HealItemType::Bucket
                 }
                 .to_string(),
-                object: object.or(prefix).unwrap_or_default(),
+                object: object.map(|object| decode_dir_object(&object)).or(prefix).unwrap_or_default(),
                 bucket,
                 detail: format!(
                     "delete recovery{}: discovered={}, committed={}, rolled_back={}, reclaimed={}, blocked={}, pending={}, failed={}",
@@ -656,10 +656,46 @@ impl ECStore {
         Ok(Arc::ptr_eq(&target_set, &pool.get_disks_by_key(POOL_META_NAME)))
     }
 
+    /// Read the published bucket identity without fabricating or migrating metadata.
+    /// Absence is distinct from quorum, corruption and transaction-fence failures.
+    pub async fn replacement_bucket_incarnation_from_disk(self: &Arc<Self>, bucket: &str) -> Result<Option<uuid::Uuid>> {
+        let transaction =
+            crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let incarnation = crate::bucket::metadata::load_bucket_incarnation(self.clone(), bucket).await?;
+        if transaction.is_lock_lost() {
+            return Err(Error::PreconditionFailed);
+        }
+        Ok(incarnation)
+    }
+
     /// Restore the bucket configuration and incarnation before retiring a replacement marker.
     pub async fn heal_replacement_bucket_metadata(
         self: &Arc<Self>,
         bucket: &str,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<()> {
+        // Reject an invalid request before touching the drives so callers keep
+        // the PreconditionFailed contract for bad buckets and options.
+        if opts.pool.is_none()
+            || opts.set.is_none()
+            || targets.is_empty()
+            || opts.dry_run
+            || opts.no_lock
+            || check_valid_bucket_name_strict(bucket).is_err()
+        {
+            return Err(Error::PreconditionFailed);
+        }
+        let expected = self.bucket_incarnation_id_from_disk(bucket).await?;
+        self.heal_replacement_bucket_metadata_at_incarnation(bucket, expected, opts, targets)
+            .await
+    }
+
+    /// Keep a replacement pass bound to its admitted bucket through metadata commit.
+    pub async fn heal_replacement_bucket_metadata_at_incarnation(
+        self: &Arc<Self>,
+        bucket: &str,
+        expected: uuid::Uuid,
         opts: &HealOpts,
         targets: &[String],
     ) -> Result<()> {
@@ -698,9 +734,8 @@ impl ECStore {
 
         // Read the persisted identity without lazy migration: a replacement
         // must never turn lost configuration into newly fabricated defaults.
-        let incarnation = self.bucket_incarnation_id_from_disk(bucket).await?;
         let targets = targets.to_vec();
-        self.run_bucket_heal_at_incarnation(bucket, incarnation, opts, move |store, bucket, opts| async move {
+        self.run_bucket_heal_at_incarnation(bucket, expected, opts, move |store, bucket, opts| async move {
             // Match config writers: lifecycle, metadata transaction, object locks.
             // Keep the transaction stable through target readback, including when
             // the caller is cancelled and the storage owner finishes its write.
@@ -1022,6 +1057,7 @@ impl ECStore {
         set_index: usize,
         targets: &[String],
     ) -> Result<bool> {
+        let object = encode_dir_object(object);
         let pool = self
             .pools
             .get(pool_index)
@@ -1034,7 +1070,7 @@ impl ECStore {
             )
         })?;
 
-        set.replacement_targets_have_version(bucket, object, version_id, targets)
+        set.replacement_targets_have_version(bucket, &object, version_id, targets)
             .await
             .map_err(Into::into)
     }
@@ -2857,6 +2893,105 @@ mod tests {
         ] {
             assert_eq!(bucket_metadata_owner(path), None, "unexpected bucket authority for {path}");
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn replacement_directory_object_readback_and_exact_recovery_use_encoded_key() {
+        let (_root, store, shutdown) = heal_store_with_pool_count(1).await;
+        let bucket = "directory-replacement-readback";
+        let object = "folder/";
+        let encoded = encode_dir_object(object);
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut PutObjReader::from_vec(Vec::new()),
+                &ObjectOptions {
+                    write_completion: crate::object_api::WriteCompletion::TailDrained,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write directory object through the public store entry");
+        let set = &store.pools[0].disk_set[0];
+        let targets = vec![set.set_endpoints[0].to_string()];
+        assert!(
+            store
+                .replacement_targets_have_version(bucket, object, "", 0, 0, &targets)
+                .await
+                .expect("readback")
+        );
+        let disk = set.disks.read().await[0].clone().expect("target disk");
+        disk.delete(
+            bucket,
+            &encoded,
+            DeleteOptions {
+                recursive: true,
+                immediate: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("remove target directory shard");
+        assert!(
+            !store
+                .replacement_targets_have_version(bucket, object, "", 0, 0, &targets)
+                .await
+                .expect("missing target")
+        );
+        let opts = HealOpts {
+            pool: Some(0),
+            set: Some(0),
+            ..Default::default()
+        };
+        let (result, error) = store
+            .heal_object(bucket, object, "", &opts)
+            .await
+            .expect("heal directory object");
+        assert!(error.is_none(), "heal failed: {error:?}");
+        assert_eq!(result.object, object);
+        assert!(
+            store
+                .replacement_targets_have_version(bucket, object, "", 0, 0, &targets)
+                .await
+                .expect("healed readback")
+        );
+        assert!(
+            store
+                .replacement_targets_have_version(bucket, &encoded, "", 0, 0, &targets)
+                .await
+                .expect("encoded readback")
+        );
+
+        // Exact-object recovery must inspect the same physical namespace and
+        // reject corrupt proof rather than silently report no transactions.
+        let metadata = disk
+            .read_all(bucket, &format!("{encoded}/xl.meta"))
+            .await
+            .expect("healed metadata");
+        disk.write_all(
+            bucket,
+            &format!("{encoded}/{}/delete-prepared", Uuid::new_v4()),
+            b"invalid proof".to_vec().into(),
+        )
+        .await
+        .expect("seed corrupt recovery proof");
+        store
+            .recover_delete_transactions_at_incarnation(bucket, Some(object), None, &HealOpts { dry_run: true, ..opts })
+            .await
+            .expect_err("directory recovery must discover and reject the corrupt proof");
+        assert_eq!(
+            disk.read_all(bucket, &format!("{encoded}/xl.meta"))
+                .await
+                .expect("unchanged metadata"),
+            metadata
+        );
+        shutdown.cancel();
     }
 
     #[tokio::test]

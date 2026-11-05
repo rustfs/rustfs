@@ -192,6 +192,12 @@ A successor that has already started retains its recorded scan plan.
 Keep the new binary for an unfinished schema 7 recovery. An older binary rejects
 that schema and cannot safely continue its ownership protocol. Finish and verify
 recovery before any downgrade; never edit the schema number to force acceptance.
+The same holds for a drive replacement pass in flight: this release runs the
+identity-bound bucket pass as replacement execution protocol 2 (recording the
+pass order in `replacement_bucket_pass_order`), and a previous release refuses
+such an intent with `replacement recovery conflict: replacement execution
+protocol or predecessor is invalid`. Finish drive replacements before a
+downgrade.
 
 ## Acceptance after a VM restart
 
