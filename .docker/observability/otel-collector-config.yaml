@@ -28,12 +28,15 @@ processors:
     check_interval: 1s
     limit_mib: 1024
     spike_limit_mib: 256
-  resource/metrics:
-    attributes:
+  transform/metrics:
+    error_mode: ignore
+    metric_statements:
       # RustFS process metrics already expose process_pid as a metric label.
-      # Promoting resource process.pid would create a duplicate Prometheus label.
-      - key: process.pid
-        action: delete
+      # Keep process.pid on other metrics (including lock histograms) so their
+      # Prometheus series remain attributable across process restarts.
+      - context: metric
+        statements:
+          - delete_key(resource.attributes, "process.pid") where IsMatch(name, "^rustfs_system_process_")
   transform/logs:
     error_mode: ignore
     log_statements:
@@ -118,7 +121,7 @@ service:
       exporters: [ otlp/tempo, otlp/jaeger ]
     metrics:
       receivers: [ otlp ]
-      processors: [ resource/metrics, memory_limiter, batch ]
+      processors: [ transform/metrics, memory_limiter, batch ]
       exporters: [ prometheus ]
     logs:
       receivers: [ otlp ]
