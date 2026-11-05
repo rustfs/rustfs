@@ -273,38 +273,6 @@ enum SetState {
     Unattainable,
 }
 
-fn peer_admits_set(drives: &[PeerDriveView], set: &ReadmissionSet) -> bool {
-    set.local_disks.iter().all(|disk_index| {
-        drives.iter().any(|drive| {
-            drive.pool_index == set.pool_index
-                && drive.set_index == set.set_index
-                && drive.disk_index == *disk_index
-                && drive.online
-        })
-    })
-}
-
-fn set_state(set: &ReadmissionSet, probes: &HashMap<String, PeerProbe>) -> SetState {
-    let (mut admitted, mut pending, mut unreachable) = (0usize, 0usize, 0usize);
-    for peer in &set.peers {
-        match probes.get(peer) {
-            Some(PeerProbe::Answered(drives)) if peer_admits_set(drives, set) => admitted += 1,
-            Some(PeerProbe::Answered(_)) => pending += 1,
-            Some(PeerProbe::Unsupported) => {}
-            Some(PeerProbe::Unreachable) | None => unreachable += 1,
-        }
-    }
-    if admitted >= set.required_peers {
-        SetState::Admitted
-    } else if admitted + pending + unreachable < set.required_peers {
-        SetState::Unattainable
-    } else if admitted + pending < set.required_peers {
-        SetState::NeedsUnreachablePeer
-    } else {
-        SetState::Waiting
-    }
-}
-
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct ReadmissionProgress {
     pub(super) total_sets: usize,
@@ -314,20 +282,161 @@ pub(super) struct ReadmissionProgress {
     pub(super) unattainable_sets: usize,
 }
 
-fn evaluate(plan: &ReadmissionPlan, probes: &HashMap<String, PeerProbe>) -> ReadmissionProgress {
-    let mut progress = ReadmissionProgress {
-        total_sets: plan.sets.len(),
-        ..Default::default()
-    };
-    for set in &plan.sets {
-        match set_state(set, probes) {
-            SetState::Admitted => progress.admitted_sets += 1,
-            SetState::Waiting => progress.waiting_sets += 1,
-            SetState::NeedsUnreachablePeer => progress.unreachable_sets += 1,
-            SetState::Unattainable => progress.unattainable_sets += 1,
+impl ReadmissionProgress {
+    fn unobserved(total_sets: usize) -> Self {
+        Self {
+            total_sets,
+            unreachable_sets: total_sets,
+            ..Self::default()
         }
     }
-    progress
+
+    fn count_mut(&mut self, state: SetState) -> &mut usize {
+        match state {
+            SetState::Admitted => &mut self.admitted_sets,
+            SetState::Waiting => &mut self.waiting_sets,
+            SetState::NeedsUnreachablePeer => &mut self.unreachable_sets,
+            SetState::Unattainable => &mut self.unattainable_sets,
+        }
+    }
+
+    fn replace(&mut self, before: SetState, after: SetState) {
+        if before != after {
+            *self.count_mut(before) -= 1;
+            *self.count_mut(after) += 1;
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PeerVote {
+    Admitted,
+    Waiting,
+    Unsupported,
+    Unreachable,
+}
+
+impl PeerVote {
+    fn counts(self) -> (usize, usize, usize) {
+        match self {
+            Self::Admitted => (1, 1, 0),
+            Self::Waiting => (0, 1, 0),
+            Self::Unsupported => (0, 0, 1),
+            Self::Unreachable => (0, 0, 0),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct SetVotes {
+    admitted: usize,
+    reachable: usize,
+    unsupported: usize,
+}
+
+impl SetVotes {
+    fn state(self, set: &ReadmissionSet) -> SetState {
+        if self.admitted >= set.required_peers {
+            SetState::Admitted
+        } else if set.peers.len() - self.unsupported < set.required_peers {
+            SetState::Unattainable
+        } else if self.reachable < set.required_peers {
+            SetState::NeedsUnreachablePeer
+        } else {
+            SetState::Waiting
+        }
+    }
+
+    fn replace(&mut self, before: PeerVote, after: PeerVote) {
+        let (admitted_before, reachable_before, unsupported_before) = before.counts();
+        let (admitted_after, reachable_after, unsupported_after) = after.counts();
+        self.admitted = self.admitted - admitted_before + admitted_after;
+        self.reachable = self.reachable - reachable_before + reachable_after;
+        self.unsupported = self.unsupported - unsupported_before + unsupported_after;
+    }
+}
+
+/// A compiled membership index and compact votes for one probe round.
+/// Reply payloads are consumed once and discarded; only affected sets change.
+struct ReadmissionRound<'a> {
+    plan: &'a ReadmissionPlan,
+    memberships: HashMap<&'a str, Vec<(usize, PeerVote)>>,
+    sets: Vec<SetVotes>,
+    progress: ReadmissionProgress,
+}
+
+impl<'a> ReadmissionRound<'a> {
+    fn new(plan: &'a ReadmissionPlan) -> Self {
+        let mut memberships: HashMap<&str, Vec<(usize, PeerVote)>> = HashMap::new();
+        for (index, set) in plan.sets.iter().enumerate() {
+            for host in &set.peers {
+                memberships
+                    .entry(host.as_str())
+                    .or_default()
+                    .push((index, PeerVote::Unreachable));
+            }
+        }
+        Self {
+            plan,
+            memberships,
+            sets: vec![SetVotes::default(); plan.sets.len()],
+            progress: ReadmissionProgress::unobserved(plan.sets.len()),
+        }
+    }
+
+    fn reset(&mut self) {
+        for edges in self.memberships.values_mut() {
+            for (_, vote) in edges {
+                *vote = PeerVote::Unreachable;
+            }
+        }
+        self.sets.fill(SetVotes::default());
+        self.progress = ReadmissionProgress::unobserved(self.plan.sets.len());
+    }
+
+    fn update_peer(&mut self, host: &str, mut classify: impl FnMut(&ReadmissionSet) -> PeerVote) {
+        let Some(edges) = self.memberships.get_mut(host) else { return };
+        for (index, vote) in edges {
+            // Indices and previous votes come only from the configured plan.
+            let set = &self.plan.sets[*index];
+            let counts = &mut self.sets[*index];
+            let before = counts.state(set);
+            let next = classify(set);
+            counts.replace(*vote, next);
+            *vote = next;
+            self.progress.replace(before, counts.state(set));
+        }
+    }
+
+    fn observe_drives(&mut self, host: &str, drives: impl IntoIterator<Item = PeerDriveView>) {
+        if !self.memberships.contains_key(host) {
+            return;
+        }
+        let online = drives
+            .into_iter()
+            .filter(|drive| drive.online)
+            .map(|drive| (drive.pool_index, drive.set_index, drive.disk_index))
+            .collect::<HashSet<_>>();
+        self.update_peer(host, |set| {
+            if set
+                .local_disks
+                .iter()
+                .all(|disk| online.contains(&(set.pool_index, set.set_index, *disk)))
+            {
+                PeerVote::Admitted
+            } else {
+                PeerVote::Waiting
+            }
+        });
+    }
+
+    fn observe(&mut self, host: &str, probe: PeerProbe) {
+        match probe {
+            PeerProbe::Answered(drives) => self.observe_drives(host, drives),
+            PeerProbe::Unsupported => self.update_peer(host, |_| PeerVote::Unsupported),
+            PeerProbe::Unreachable => self.update_peer(host, |_| PeerVote::Unreachable),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,7 +489,8 @@ where
     let started = tokio::time::Instant::now();
     let mut unreachable_since: Option<tokio::time::Instant> = None;
     let mut last_logged: Option<ReadmissionProgress> = None;
-    let mut progress = evaluate(plan, &HashMap::new());
+    let mut votes = ReadmissionRound::new(plan);
+    let mut progress = votes.progress;
     let give_up = |reason, progress| ReadmissionOutcome::GaveUp {
         reason,
         waited: tokio::time::Instant::now().saturating_duration_since(started),
@@ -401,7 +511,7 @@ where
         if tokio::time::Instant::now() >= bound {
             return give_up(reason, progress);
         }
-        let mut probes = HashMap::new();
+        votes.reset();
         let mut round = std::pin::pin!(probe());
         loop {
             let (bound, reason) = wait_bound(unreachable_since);
@@ -411,12 +521,18 @@ where
                 next = round.next() => next,
             };
             let complete = if let Some((host, reply)) = next {
-                probes.insert(host, reply);
+                votes.observe(&host, reply);
                 false
             } else {
                 true
             };
-            progress = evaluate(plan, &probes);
+            progress = votes.progress;
+            // A reply poll and its synchronous fold can consume the remaining
+            // budget after select polled its timer. Do not accept late work or
+            // clear the grace deadline that bounded this observation.
+            if tokio::time::Instant::now() >= bound {
+                return give_up(reason, progress);
+            }
             if progress.admitted_sets == progress.total_sets {
                 return ReadmissionOutcome::Admitted {
                     waited: tokio::time::Instant::now().saturating_duration_since(started),
@@ -696,7 +812,13 @@ mod tests {
     fn set_state_separates_waiting_unreachable_and_unattainable_shortfalls() {
         let plan = three_node_plan();
         let set = &plan.sets[0];
-        let state = |entries: &[(&str, PeerProbe)]| set_state(set, &probes(entries));
+        let state = |entries: &[(&str, PeerProbe)]| {
+            let mut round = ReadmissionRound::new(&plan);
+            for (host, probe) in entries {
+                round.observe(&format!("{host}:9000"), probe.clone());
+            }
+            round.sets[0].state(set)
+        };
 
         assert_eq!(state(&[("node-0", answered(true)), ("node-1", answered(true))]), SetState::Admitted);
         assert_eq!(state(&[("node-0", answered(true)), ("node-1", answered(false))]), SetState::Waiting);
@@ -1013,6 +1135,24 @@ mod tests {
                 online: true,
             }])
         };
+        // These peers belong only to set 0; matching foreign drive IDs must
+        // never let their replies supply votes for set 1.
+        let first_set_with_extra_views = || {
+            PeerProbe::Answered(vec![
+                PeerDriveView {
+                    pool_index: 0,
+                    set_index: 0,
+                    disk_index: 2,
+                    online: true,
+                },
+                PeerDriveView {
+                    pool_index: 0,
+                    set_index: 1,
+                    disk_index: 1,
+                    online: true,
+                },
+            ])
+        };
         let outcome = wait_for_peer_readmission_with(
             &plan,
             tokio::time::Instant::now() + Duration::from_secs(30),
@@ -1020,8 +1160,8 @@ mod tests {
             UNREACHABLE_PEER_GRACE,
             || {
                 vec![
-                    peer_reply("node-0", answered(true), Duration::ZERO),
-                    peer_reply("node-1", answered(true), Duration::ZERO),
+                    peer_reply("node-0", first_set_with_extra_views(), Duration::ZERO),
+                    peer_reply("node-1", first_set_with_extra_views(), Duration::ZERO),
                     peer_reply("node-3", second_set(), Duration::ZERO),
                     peer_reply("node-4", second_set(), Duration::from_secs(2)),
                 ]
@@ -1159,6 +1299,245 @@ mod tests {
         assert!(matches!(outcome, ReadmissionOutcome::GaveUp {
             reason: GiveUpReason::DeadlineElapsed, waited, ..
         } if waited == Duration::from_secs(2)));
+    }
+
+    #[test]
+    fn round_replaces_votes_ignores_unknown_hosts_and_resets() {
+        let plan = three_node_plan();
+        let mut round = ReadmissionRound::new(&plan);
+        let unreachable = ReadmissionProgress {
+            total_sets: 1,
+            unreachable_sets: 1,
+            ..Default::default()
+        };
+        assert_eq!(round.progress, unreachable);
+        round.observe("unknown:9000", answered(true));
+        assert_eq!(round.progress, unreachable);
+        round.observe("node-0:9000", answered(false));
+        round.observe("node-0:9000", answered(true));
+        assert_eq!(round.progress, unreachable, "one peer's replacements cannot create another vote");
+        round.observe("node-1:9000", answered(false));
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 1,
+                waiting_sets: 1,
+                ..Default::default()
+            }
+        );
+        round.observe("node-1:9000", PeerProbe::Unsupported);
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 1,
+                unattainable_sets: 1,
+                ..Default::default()
+            }
+        );
+        round.observe("node-1:9000", answered(true));
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 1,
+                admitted_sets: 1,
+                ..Default::default()
+            }
+        );
+        round.observe("node-0:9000", PeerProbe::Unreachable);
+        assert_eq!(round.progress, unreachable);
+        round.reset();
+        assert_eq!(round.progress, unreachable);
+        round.observe("node-1:9000", answered(true));
+        assert_eq!(round.progress, unreachable, "a new round cannot keep the prior node-0 vote");
+    }
+
+    #[test]
+    fn round_matches_all_local_slots_without_duplicate_or_cross_pool_votes() {
+        let mut plan = readmission_plan(&pools(
+            1,
+            4,
+            vec![
+                endpoint("node-0", false, 0, 0),
+                endpoint("node-1", false, 0, 1),
+                endpoint("node-2", true, 0, 2),
+                endpoint("node-2", true, 0, 3),
+            ],
+        ))
+        .expect("two local slots");
+        let mut second = plan.sets[0].clone();
+        second.pool_index = 1;
+        plan.sets.push(second);
+        let mut round = ReadmissionRound::new(&plan);
+        let drive = |pool_index, disk_index, online| PeerDriveView {
+            pool_index,
+            set_index: 0,
+            disk_index,
+            online,
+        };
+        round.observe_drives(
+            "node-0:9000",
+            vec![
+                drive(0, 2, true),
+                drive(0, 2, false),
+                drive(0, 2, true),
+                drive(0, 3, false),
+                drive(9, 3, true),
+            ],
+        );
+        round.observe_drives(
+            "node-1:9000",
+            vec![drive(0, 2, true), drive(0, 3, true), drive(1, 2, true), drive(1, 3, true)],
+        );
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 2,
+                waiting_sets: 2,
+                ..Default::default()
+            },
+            "duplicate and foreign slots cannot replace missing local slots"
+        );
+        round.observe_drives("node-0:9000", vec![drive(0, 2, false), drive(0, 2, true), drive(0, 3, true)]);
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 2,
+                admitted_sets: 1,
+                waiting_sets: 1,
+                ..Default::default()
+            },
+            "any online duplicate is valid, but only in its own pool and set"
+        );
+        round.observe_drives(
+            "node-0:9000",
+            vec![drive(0, 2, true), drive(0, 3, true), drive(1, 2, true), drive(1, 3, true)],
+        );
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 2,
+                admitted_sets: 2,
+                ..Default::default()
+            }
+        );
+    }
+
+    #[test]
+    fn round_visits_each_reply_drive_once() {
+        use std::cell::Cell;
+        let endpoints = (0..64)
+            .flat_map(|set_index| {
+                (0..16).map(move |disk_index| {
+                    let mut endpoint = endpoint(&format!("node-{disk_index}"), disk_index == 0, set_index, disk_index);
+                    endpoint.url.set_path(&format!("/set-{set_index}/disk-{disk_index}"));
+                    endpoint
+                })
+            })
+            .collect();
+        let plan = readmission_plan(&pools(64, 16, endpoints)).expect("valid 64-set topology");
+        let mut round = ReadmissionRound::new(&plan);
+        let visited = Cell::new(0);
+        for peer in 1..16 {
+            let drives = (0..64).map(|set_index| {
+                visited.set(visited.get() + 1);
+                PeerDriveView {
+                    pool_index: 0,
+                    set_index,
+                    disk_index: 0,
+                    online: false,
+                }
+            });
+            round.observe_drives(&format!("node-{peer}:9000"), drives);
+        }
+        assert_eq!(visited.get(), 15 * 64, "payload consumption is linear in received entries");
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 64,
+                waiting_sets: 64,
+                ..Default::default()
+            }
+        );
+        round.observe_drives(
+            "unknown:9000",
+            (0..64).map(|_| panic!("a host outside the topology must not have its payload inspected")),
+        );
+        assert_eq!(round.progress.waiting_sets, 64);
+        round.reset();
+        assert_eq!(
+            round.progress,
+            ReadmissionProgress {
+                total_sets: 64,
+                unreachable_sets: 64,
+                ..Default::default()
+            }
+        );
+    }
+
+    fn round_with_slow_final_poll(reply: PeerProbe) -> impl Stream<Item = (String, PeerProbe)> {
+        use std::task::Poll;
+        let mut item = 0;
+        futures::stream::poll_fn(move |cx| {
+            item += 1;
+            match item {
+                1 => Poll::Ready(Some(("node-0:9000".to_string(), answered(true)))),
+                2 => {
+                    // Model decoding/processing inside poll without yielding:
+                    // the select's timer branch was already polled this turn.
+                    let mut work = std::pin::pin!(tokio::time::advance(Duration::from_secs(2)));
+                    assert!(work.as_mut().poll(cx).is_pending());
+                    Poll::Ready(Some(("node-1:9000".to_string(), reply.clone())))
+                }
+                _ => Poll::Ready(None),
+            }
+        })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_rejects_quorum_when_reply_poll_consumes_the_budget() {
+        let plan = three_node_plan();
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || round_with_slow_final_poll(answered(true)),
+        )
+        .await;
+        assert!(
+            matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::DeadlineElapsed, waited, ..
+        } if waited == Duration::from_secs(2)),
+            "a late poll result cannot publish admission: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_rejects_grace_reset_when_reply_poll_consumes_the_bound() {
+        let plan = three_node_plan();
+        let rounds = AtomicUsize::new(0);
+        let gate = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(120),
+            Duration::from_secs(1),
+            Duration::from_secs(3),
+            || -> futures::stream::BoxStream<'static, (String, PeerProbe)> {
+                if rounds.fetch_add(1, Ordering::SeqCst) == 0 {
+                    futures::stream::iter(probes(&[("node-0", answered(true)), ("node-1", PeerProbe::Unreachable)])).boxed()
+                } else {
+                    round_with_slow_final_poll(answered(false)).boxed()
+                }
+            },
+        );
+        let outcome = tokio::time::timeout(Duration::from_secs(5), gate)
+            .await
+            .expect("a reply finishing at the grace bound cannot clear it");
+        assert!(
+            matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::PeersUnreachable, waited, ..
+        } if waited == Duration::from_secs(3)),
+            "captured grace bound must win: {outcome:?}"
+        );
     }
 
     #[test]
