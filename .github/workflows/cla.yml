@@ -95,7 +95,7 @@ jobs:
 
       - name: Run CLA Bot
         if: github.event_name != 'merge_group'
-        uses: overtrue/cla-bot@f054da99d5777e47e1af9933737b9c0c5584be8d # v0.1.0
+        uses: overtrue/cla-bot@4bd1387c19691168c42fcf5edfa17b15819b2ab3 # v0.1.1
         with:
           github-token: ${{ github.token }}
           registry-token: ${{ steps.registry-token.outputs.token }}
