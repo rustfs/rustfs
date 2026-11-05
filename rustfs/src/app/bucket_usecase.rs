@@ -1273,19 +1273,22 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
-fn create_bucket_exists_response(is_owner: bool, region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
-    if is_owner && region == RUSTFS_REGION {
-        // AWS preserves the legacy idempotent response for buckets recreated in
-        // us-east-1 (the default RustFS region).
+/// Answer a `CreateBucket` for a bucket that already exists.
+///
+/// A deployment owns one bucket namespace, so every requester that passed
+/// authorization belongs to the same owner as the bucket's creator; there is no
+/// second account that could trigger `BucketAlreadyExists`. That leaves the AWS
+/// account-owner semantics: the default region returns the legacy idempotent
+/// `200 OK`, any other region returns `BucketAlreadyOwnedByYou`.
+fn create_bucket_exists_response(region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
+    if region == RUSTFS_REGION {
         return Ok(S3Response::new(CreateBucketOutput::default()));
     }
 
-    let error_code = if is_owner {
-        S3ErrorCode::BucketAlreadyOwnedByYou
-    } else {
-        S3ErrorCode::BucketAlreadyExists
-    };
-    Err(S3Error::with_message(error_code, "The requested bucket already exists."))
+    Err(S3Error::with_message(
+        S3ErrorCode::BucketAlreadyOwnedByYou,
+        "The requested bucket already exists.",
+    ))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -1466,14 +1469,12 @@ impl DefaultBucketUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
-    fn create_bucket_exists_result(&self, requester_is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
-        // Match AWS CreateBucket semantics: an owned bucket is idempotent in
-        // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
+    fn create_bucket_exists_result(&self) -> S3Result<S3Response<CreateBucketOutput>> {
         let region = self
             .global_region()
             .map(|region| region.to_string())
             .unwrap_or_else(|| RUSTFS_REGION.to_string());
-        create_bucket_exists_response(requester_is_owner, &region)
+        create_bucket_exists_response(&region)
     }
 
     #[instrument(
@@ -1503,7 +1504,7 @@ impl DefaultBucketUsecase {
 
         // An existing bucket needs no mutation. Answer before the mutation queue and the
         // bucket's exclusive locks, which wait for every in-flight object write.
-        if let Ok(req_info) = req_info_ref(&req)
+        if req_info_ref(&req).is_ok()
             && let Some(store) = self.object_store()
             && store
                 .get_bucket_info(&req.input.bucket, &BucketOptions::default())
@@ -1511,7 +1512,7 @@ impl DefaultBucketUsecase {
                 .is_ok()
         {
             let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-            let result = self.create_bucket_exists_result(req_info.is_owner);
+            let result = self.create_bucket_exists_result();
             let _ = helper.complete(&result);
             return result;
         }
@@ -1529,12 +1530,9 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let requester_is_owner = match req_info_ref(&req) {
-            Ok(r) => r.is_owner,
-            Err(_) => {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
-            }
-        };
+        if req_info_ref(&req).is_err() {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
+        }
         let CreateBucketInput {
             bucket,
             object_lock_enabled_for_bucket,
@@ -1594,7 +1592,7 @@ impl DefaultBucketUsecase {
                 .await;
             }
             Err(StorageError::BucketExists(_)) => {
-                let result = self.create_bucket_exists_result(requester_is_owner);
+                let result = self.create_bucket_exists_result();
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -4484,20 +4482,14 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_exists_response_returns_ok_for_owner() {
-        let response = create_bucket_exists_response(true, RUSTFS_REGION).expect("owner recreate in us-east-1 should succeed");
+    fn create_bucket_exists_response_returns_ok_in_default_region() {
+        let response = create_bucket_exists_response(RUSTFS_REGION).expect("recreate in us-east-1 should succeed");
         assert_eq!(response.output.location, None);
     }
 
     #[test]
-    fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
-        let err = create_bucket_exists_response(false, RUSTFS_REGION).expect_err("non-owner recreate should fail");
-        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
-    }
-
-    #[test]
-    fn create_bucket_exists_response_returns_owned_by_you_outside_us_east_1() {
-        let err = create_bucket_exists_response(true, "eu-west-1").expect_err("owner recreate outside us-east-1 should fail");
+    fn create_bucket_exists_response_returns_owned_by_you_outside_default_region() {
+        let err = create_bucket_exists_response("eu-west-1").expect_err("recreate outside us-east-1 should report ownership");
         assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
     }
 
@@ -4560,9 +4552,11 @@ mod tests {
                 .expect("hold the bucket lifecycle lock");
             let usecase = DefaultBucketUsecase::with_context(Some(context));
 
-            for (is_owner, location, expected_error) in [
+            // The requester's owner flag must not change the duplicate response:
+            // one deployment has a single bucket owner.
+            for (requester_is_owner, location, expected_error) in [
                 (true, None, None),
-                (false, None, Some(S3ErrorCode::BucketAlreadyExists)),
+                (false, None, None),
                 (true, Some("ap-south-1"), Some(S3ErrorCode::InvalidLocationConstraint)),
             ] {
                 let input = CreateBucketInput {
@@ -4577,7 +4571,7 @@ mod tests {
                     input,
                     Method::PUT,
                     ReqInfo {
-                        is_owner,
+                        is_owner: requester_is_owner,
                         ..Default::default()
                     },
                 );
@@ -4585,9 +4579,9 @@ mod tests {
                     .await
                     .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock");
                 match expected_error {
-                    Some(code) => assert_eq!(result.expect_err("duplicate or invalid request must fail").code(), &code),
+                    Some(code) => assert_eq!(result.expect_err("invalid request must fail").code(), &code),
                     None => {
-                        result.expect("the owner recreating a bucket in us-east-1 gets the idempotent success");
+                        result.expect("recreating a bucket in us-east-1 returns the idempotent success");
                     }
                 }
             }
