@@ -34,9 +34,9 @@ processors:
       # RustFS process metrics already expose process_pid as a metric label.
       # Remove only the duplicate datapoint label and keep the shared resource
       # process.pid available to sibling metrics and lock histograms.
-      - context: metric
+      - context: datapoint
         statements:
-          - delete_key(attributes, "process_pid") where IsMatch(name, "^rustfs_system_process_")
+          - delete_key(attributes, "process_pid") where IsMatch(metric.name, "^rustfs_system_process_")
   transform/logs:
     error_mode: ignore
     log_statements:
