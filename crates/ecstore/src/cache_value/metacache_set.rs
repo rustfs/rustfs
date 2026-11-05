@@ -34,7 +34,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
@@ -376,7 +376,7 @@ async fn list_path_raw_inner(
         let disk_io_context_clone = disk_io_context.clone();
         let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
-        jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
+        let producer = with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
             if let Some(observer) = &opts_clone.test_disk_io_context_observed {
@@ -687,12 +687,13 @@ async fn list_path_raw_inner(
 
             // warn!("list_path_raw: while need_fallback done");
             Ok(())
-        }));
+        });
+        jobs.spawn(producer.in_current_span());
     }
 
     let revjob_rx = rx.clone();
     let mut revjobs = JoinSet::new();
-    revjobs.spawn(async move {
+    let merge = async move {
         // Consumer-side peek timeout, and a caveat worth understanding
         // (rustfs/backlog#1217).
         //
@@ -1035,7 +1036,8 @@ async fn list_path_raw_inner(
             }
         }
         Ok(ListPathRawOutcome { limit_reached })
-    });
+    };
+    revjobs.spawn(merge.in_current_span());
 
     let merge_started = std::time::Instant::now();
     let Some(revjob) = revjobs.join_next().await else {
@@ -1246,6 +1248,95 @@ mod tests {
         assert!(
             observed.load(std::sync::atomic::Ordering::Acquire),
             "the per-disk JoinSet producer must retain the scanner background class"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_path_raw_producer_and_merge_preserve_request_span() {
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        struct ProducerSpan(Arc<AtomicBool>);
+        #[derive(Default)]
+        struct StateField(bool);
+        impl tracing::field::Visit for StateField {
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0 |= field.name() == "state" && value == "walk_dir_missing_path";
+            }
+        }
+        impl<S> Layer<S> for ProducerSpan
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, context: tracing_subscriber::layer::Context<'_, S>) {
+                let mut state = StateField::default();
+                event.record(&mut state);
+                if state.0
+                    && context
+                        .lookup_current()
+                        .is_some_and(|span| span.name() == "flink_list_request")
+                {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+
+        // The subscriber is thread-local; keep the spawned tasks on this runtime thread.
+        let producer_observed = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(ProducerSpan(producer_observed.clone()));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let request = tracing::info_span!("flink_list_request", request_id = "list-span-regression");
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("UTF-8 disk path"))
+            .expect("parse disk endpoint");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("open local disk"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper)));
+        let error = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![Some(disk)],
+                bucket: "missing-bucket".to_owned(),
+                min_disks: 1,
+                ..Default::default()
+            },
+        )
+        .instrument(request.clone())
+        .await
+        .expect_err("missing bucket must fail the real disk producer");
+        assert_eq!(error, DiskError::VolumeNotFound);
+        assert!(
+            producer_observed.load(std::sync::atomic::Ordering::Acquire),
+            "disk error must retain the request span"
+        );
+
+        let merge_observed = Arc::new(AtomicBool::new(false));
+        let merge_sink = merge_observed.clone();
+        let request_id = request.id();
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![fallback_test_entry()])],
+                agreed: Some(Box::new(move |_| {
+                    merge_sink.store(tracing::Span::current().id() == request_id, std::sync::atomic::Ordering::Release);
+                    Box::pin(async { Ok(()) })
+                })),
+                ..Default::default()
+            },
+        )
+        .instrument(request)
+        .await
+        .expect("merge should deliver the test entry");
+        assert!(
+            merge_observed.load(std::sync::atomic::Ordering::Acquire),
+            "merge callback must retain the request span"
         );
     }
 

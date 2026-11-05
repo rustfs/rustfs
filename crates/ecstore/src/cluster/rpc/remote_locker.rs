@@ -42,6 +42,7 @@ use tonic::{Request, Response};
 use tracing::{debug, info, warn};
 
 const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
+const EVENT_REMOTE_LOCK_RPC_CLEANUP: &str = "remote_lock_rpc_cleanup";
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_REMOTE_LOCK: &str = "remote_lock";
 
@@ -49,22 +50,64 @@ fn attach_lock_mutation_body_digest<T: rustfs_protos::CanonicalMutationBody>(req
     set_tonic_rolling_mutation_body_digest(request)
 }
 
-/// Work to run if an RPC that already timed out for its caller completes later.
+/// Work to run if an RPC completes after its caller stops waiting.
 type LateCompletion<T> = Option<Box<dyn FnOnce(T) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>>;
 type LateFailure = LateCompletion<()>;
 
-struct RpcCleanup<T> {
-    late: LateCompletion<T>,
-    late_failure: LateFailure,
+/// Own admission before connecting as well as while an RPC is in flight.
+struct LockRequestGuard<'a> {
+    client: &'a RemoteClient,
+    op: &'static str,
     admission: Option<LockRequestAdmission>,
 }
 
-impl<T> RpcCleanup<T> {
-    fn new(late: LateCompletion<T>, late_failure: LateFailure, admission: Option<LockRequestAdmission>) -> Self {
+impl LockRequestGuard<'_> {
+    fn into_admission(mut self) -> Option<LockRequestAdmission> {
+        self.admission.take()
+    }
+}
+
+impl Drop for LockRequestGuard<'_> {
+    fn drop(&mut self) {
+        self.client.release_lock_request(self.op, self.admission.take());
+    }
+}
+
+struct RpcCleanup<'a, T> {
+    late: LateCompletion<T>,
+    late_failure: LateFailure,
+    admission: Option<LockRequestGuard<'a>>,
+}
+
+impl<'a, T> RpcCleanup<'a, T> {
+    fn new(late: LateCompletion<T>, late_failure: LateFailure, admission: Option<LockRequestGuard<'a>>) -> Self {
         Self {
             late,
             late_failure,
             admission,
+        }
+    }
+}
+
+/// A dropped caller hands its RPC and cleanup to the same bounded owner as a timeout.
+struct InFlightRpc<'a, T: Send + 'static> {
+    client: &'a RemoteClient,
+    op: &'static str,
+    resource_summary: &'a str,
+    handle: Option<JoinHandle<std::result::Result<T, tonic::Status>>>,
+    cleanup: Option<RpcCleanup<'a, T>>,
+}
+
+impl<T: Send + 'static> Drop for InFlightRpc<'_, T> {
+    fn drop(&mut self) {
+        let Some(mut cleanup) = self.cleanup.take() else {
+            return;
+        };
+        if let Some(handle) = self.handle.take() {
+            self.client.detach_rpc(self.op, self.resource_summary, handle, cleanup);
+        } else if let Some(late_failure) = cleanup.late_failure.take() {
+            // A completed ambiguous failure may still be awaiting channel eviction.
+            drop(tokio::spawn(late_failure(())));
         }
     }
 }
@@ -506,6 +549,14 @@ impl RemoteClient {
         admission
     }
 
+    fn admit_lock_request_guard(&self, op: &'static str) -> Option<LockRequestGuard<'_>> {
+        self.admit_lock_request(op).map(|admission| LockRequestGuard {
+            client: self,
+            op,
+            admission: Some(admission),
+        })
+    }
+
     fn release_lock_request(&self, op: &'static str, admission: Option<LockRequestAdmission>) {
         if is_request_breaker_operation(op) && admission.is_some() {
             with_lock_peer_health(&self.addr, |health| {
@@ -617,22 +668,26 @@ impl RemoteClient {
         );
     }
 
-    /// Keep a timed-out RPC running instead of cancelling its stream.
+    /// Keep an abandoned RPC running instead of cancelling its stream.
     ///
     /// Dropping the future sends `RST_STREAM`; under load those resets pile up
     /// in the server's pending-accept queue until it answers `GOAWAY
     /// too_many_resets` and kills every stream on the connection. A detached
     /// stream ends on its own within the internode RPC timeout, the number per
     /// peer is bounded, and a lock granted after its caller gave up is released.
-    fn detach_timed_out_rpc<T: Send + 'static>(
+    fn detach_rpc<T: Send + 'static>(
         &self,
         op: &'static str,
         resource_summary: &str,
         handle: JoinHandle<std::result::Result<T, tonic::Status>>,
-        late: LateCompletion<T>,
-        late_failure: LateFailure,
-        admission: Option<LockRequestAdmission>,
+        cleanup: RpcCleanup<'_, T>,
     ) {
+        let RpcCleanup {
+            late,
+            late_failure,
+            admission,
+        } = cleanup;
+        let admission = admission.and_then(LockRequestGuard::into_admission);
         let limit = Self::detached_rpc_limit();
         let admitted = with_lock_peer_health(&self.addr, |health| {
             if health.detached_rpcs >= limit {
@@ -650,11 +705,15 @@ impl RemoteClient {
             }
             rustfs_io_metrics::lock_metrics::record_remote_lock_rpc_detached(op, "aborted");
             debug!(
+                event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                state = "detached_budget_exhausted",
                 addr = %self.addr,
                 op,
                 resource_summary,
                 limit,
-                "Cancelled timed-out remote lock RPC because the detached stream budget is exhausted"
+                "Abandoned remote lock RPC cancelled"
             );
             return;
         }
@@ -688,11 +747,15 @@ impl RemoteClient {
                     }
                     rustfs_io_metrics::lock_metrics::record_remote_lock_rpc_late_completion(op, "error");
                     debug!(
+                        event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                        state = "late_rpc_failed",
                         addr = %addr,
                         op,
                         tonic_code = ?status.code(),
                         tonic_message = status.message(),
-                        "Detached remote lock RPC failed after its caller timed out"
+                        "Abandoned remote lock RPC failed"
                     );
                 }
                 Err(join_error) => {
@@ -700,7 +763,16 @@ impl RemoteClient {
                         late_failure(()).await;
                     }
                     rustfs_io_metrics::lock_metrics::record_remote_lock_rpc_late_completion(op, "join_error");
-                    debug!(addr = %addr, op, error = %join_error, "Detached remote lock RPC task ended abnormally");
+                    debug!(
+                        event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                        component = LOG_COMPONENT_ECSTORE,
+                        subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                        state = "late_rpc_join_failed",
+                        addr = %addr,
+                        op,
+                        error = %join_error,
+                        "Abandoned remote lock RPC task ended abnormally"
+                    );
                 }
             }
         });
@@ -788,16 +860,28 @@ impl RemoteClient {
         self.release_late_release();
         rustfs_io_metrics::lock_metrics::record_remote_lock_late_release(outcome);
         if outcome == "released" {
-            debug!(addr = %self.addr, count = original_count, "Released remote locks granted after their caller timed out");
+            debug!(
+                event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                component = LOG_COMPONENT_ECSTORE,
+                subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                state = "late_grants_released",
+                addr = %self.addr,
+                count = original_count,
+                "Released remote locks granted after their caller stopped waiting"
+            );
         } else {
             let (log_warning, suppressed_timeouts) = self.timeout_log_decision("late_release", Self::rpc_timeout());
             if log_warning {
                 warn!(
+                    event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                    state = "late_grants_unreleased",
                     addr = %self.addr,
                     count = original_count,
                     outcome,
                     suppressed_timeouts,
-                    "Could not release every remote lock granted after its caller timed out; the server lease will expire it"
+                    "Could not release every remote lock granted after its caller stopped waiting; the server lease will expire it"
                 );
             } else {
                 debug!(addr = %self.addr, count = original_count, outcome, suppressed_timeouts, "Suppressed repeated late remote lock release warning");
@@ -811,22 +895,38 @@ impl RemoteClient {
         resource_summary: &str,
         deadline: Duration,
         future: Fut,
-        cleanup: RpcCleanup<T>,
+        cleanup: RpcCleanup<'_, T>,
     ) -> std::result::Result<T, LockError>
     where
         Fut: Future<Output = std::result::Result<T, tonic::Status>> + Send + 'static,
         T: Send + 'static,
     {
-        let RpcCleanup {
-            late,
+        let mut rpc = InFlightRpc {
+            client: self,
+            op,
+            resource_summary,
+            handle: Some(tokio::spawn(future)),
+            cleanup: Some(cleanup),
+        };
+        let outcome = match rpc.handle.as_mut() {
+            Some(handle) => timeout(deadline, handle).await,
+            None => return Err(LockError::internal("remote lock RPC has no in-flight task")),
+        };
+        if outcome.is_ok() {
+            rpc.handle.take();
+        }
+        let Some(RpcCleanup {
+            late: _,
             late_failure,
             admission,
-        } = cleanup;
-        let mut handle = tokio::spawn(future);
-        match timeout(deadline, &mut handle).await {
+        }) = rpc.cleanup.as_mut()
+        else {
+            return Err(LockError::internal("remote lock RPC has no cleanup owner"));
+        };
+        let token = admission.as_ref().and_then(|guard| guard.admission);
+        let result = match outcome {
             Ok(Ok(Ok(response))) => {
-                self.record_rpc_success(op, admission);
-                self.release_lock_request(op, admission);
+                self.record_rpc_success(op, token);
                 Ok(response)
             }
             Ok(Ok(Err(err))) => {
@@ -864,8 +964,7 @@ impl RemoteClient {
                     }
                     self.maybe_evict_connection(op, &reason, resource_summary, EvictionTrigger::Timeout, deadline)
                         .await;
-                    self.release_lock_request(op, admission);
-                    if let Some(late_failure) = late_failure {
+                    if let Some(late_failure) = late_failure.take() {
                         drop(tokio::spawn(late_failure(())));
                     }
                     return Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), deadline));
@@ -931,8 +1030,7 @@ impl RemoteClient {
                     self.maybe_evict_connection(op, &reason, resource_summary, EvictionTrigger::Transport, deadline)
                         .await;
                 }
-                self.release_lock_request(op, admission);
-                if transport_failure && let Some(late_failure) = late_failure {
+                if transport_failure && let Some(late_failure) = late_failure.take() {
                     drop(tokio::spawn(late_failure(())));
                 }
                 Err(LockError::internal(format!("{op} RPC failed: {reason}")))
@@ -945,8 +1043,7 @@ impl RemoteClient {
                     error = %join_error,
                     "Remote lock RPC task ended abnormally"
                 );
-                self.release_lock_request(op, admission);
-                if let Some(late_failure) = late_failure {
+                if let Some(late_failure) = late_failure.take() {
                     drop(tokio::spawn(late_failure(())));
                 }
                 Err(LockError::internal(format!("{op} RPC task failed: {join_error}")))
@@ -985,10 +1082,13 @@ impl RemoteClient {
                 }
                 self.maybe_evict_connection(op, &reason, resource_summary, EvictionTrigger::Timeout, deadline)
                     .await;
-                self.detach_timed_out_rpc(op, resource_summary, handle, late, late_failure, admission);
                 Err(LockError::timeout(format!("remote lock RPC {op} on {}", self.addr), deadline))
             }
+        };
+        if rpc.handle.is_none() {
+            rpc.cleanup.take();
         }
+        result
     }
 
     fn rpc_timeout_failure_response(request: &LockRequest, err: &LockError) -> LockResponse {
@@ -1079,7 +1179,7 @@ impl RemoteClient {
 #[async_trait]
 impl LockClient for RemoteClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
-        let admission = match self.admit_lock_request("lock") {
+        let admission = match self.admit_lock_request_guard("lock") {
             Some(admission) => admission,
             None => return Ok(Self::rpc_backoff_failure_response(request)),
         };
@@ -1090,7 +1190,6 @@ impl LockClient for RemoteClient {
             Ok(client) => client,
             Err(err) => {
                 self.record_request_timeout("lock", rpc_timeout);
-                self.release_lock_request("lock", Some(admission));
                 return Err(err);
             }
         };
@@ -1098,14 +1197,12 @@ impl LockClient for RemoteClient {
         let args = match serde_json::to_string(&bounded_request) {
             Ok(args) => args,
             Err(err) => {
-                self.release_lock_request("lock", Some(admission));
                 return Err(LockError::internal(format!("Failed to serialize request: {err}")));
             }
         };
         let mut req = Request::new(GenerallyLockRequest { args });
         req.set_timeout(rpc_timeout);
         if let Err(err) = attach_lock_mutation_body_digest(&mut req) {
-            self.release_lock_request("lock", Some(admission));
             return Err(err.into());
         }
         let late = self.late_release_hook(request.lock_id.clone());
@@ -1147,7 +1244,7 @@ impl LockClient for RemoteClient {
             return Ok(Vec::new());
         }
 
-        let admission = match self.admit_lock_request("lock_batch") {
+        let admission = match self.admit_lock_request_guard("lock_batch") {
             Some(admission) => admission,
             None => return Ok(Self::rpc_backoff_failure_batch(requests)),
         };
@@ -1161,7 +1258,6 @@ impl LockClient for RemoteClient {
             Ok(client) => client,
             Err(err) => {
                 self.record_request_timeout("lock_batch", rpc_timeout);
-                self.release_lock_request("lock_batch", Some(admission));
                 return Err(err);
             }
         };
@@ -1175,14 +1271,12 @@ impl LockClient for RemoteClient {
         {
             Ok(args) => args,
             Err(err) => {
-                self.release_lock_request("lock_batch", Some(admission));
                 return Err(err);
             }
         };
         let mut req = Request::new(BatchGenerallyLockRequest { args });
         req.set_timeout(rpc_timeout);
         if let Err(err) = attach_lock_mutation_body_digest(&mut req) {
-            self.release_lock_request("lock_batch", Some(admission));
             return Err(err.into());
         }
         let late = self.late_release_batch_hook(requests.iter().map(|request| request.lock_id.clone()).collect());
@@ -1708,6 +1802,164 @@ mod tests {
             "only granted entries with a matching id are released"
         );
         assert!(acquired_lock_ids(&lock_ids, &[]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_remote_client_cancelled_connection_releases_request_admission() {
+        ensure_test_rpc_secret();
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind pending-handshake peer");
+        let addr = format!("http://{}", listener.local_addr().expect("pending-handshake peer address"));
+        let client = RemoteClient::new(addr.clone());
+        let request = test_lock_request(Duration::from_secs(30));
+
+        for batch in [false, true] {
+            reset_lock_peer_health_for_test(&addr);
+            with_lock_peer_health(&addr, |health| {
+                health.request_backoff_until = Some(Instant::now() - Duration::from_secs(1));
+            });
+            let mut acquisition = Box::pin(async {
+                if batch {
+                    client.acquire_locks_batch(std::slice::from_ref(&request)).await.map(|_| ())
+                } else {
+                    client.acquire_lock(&request).await.map(|_| ())
+                }
+            });
+            std::future::poll_fn(|cx| {
+                assert!(acquisition.as_mut().poll(cx).is_pending(), "peer must wait for its HTTP/2 handshake");
+                std::task::Poll::Ready(())
+            })
+            .await;
+            let pending = lock_peer_health_for_test(&addr);
+            assert_eq!(pending.request_in_flight, 1, "pending connection owns one request admission");
+            assert!(pending.request_probe_generation.is_some(), "the request is the half-open probe");
+
+            drop(acquisition);
+            let cancelled = lock_peer_health_for_test(&addr);
+            assert_eq!(cancelled.request_in_flight, 0, "cancellation must return request admission");
+            assert!(cancelled.request_probe_generation.is_none(), "cancellation must unblock the next probe");
+            let probe = client.admit_lock_request("lock").expect("cancelled peer can be probed again");
+            client.release_lock_request("lock", Some(probe));
+        }
+        reset_lock_peer_health_for_test(&addr);
+    }
+
+    #[tokio::test]
+    async fn test_remote_client_cancelled_rpc_runs_late_grant_cleanup() {
+        let addr = "http://cancelled-rpc-late-grant";
+        reset_lock_peer_health_for_test(addr);
+        let client = RemoteClient::new(addr.to_string());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (grant_tx, grant_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            let late: LateCompletion<bool> = Some(Box::new(move |granted| {
+                Box::pin(async move {
+                    released_tx.send(granted).expect("late grant observer remains alive");
+                })
+            }));
+            client
+                .execute_rpc(
+                    "lock",
+                    "bucket/object",
+                    Duration::from_secs(30),
+                    async move {
+                        started_tx.send(()).expect("caller observes RPC dispatch");
+                        Ok(grant_rx.await.expect("test decides when peer grants lock"))
+                    },
+                    RpcCleanup::new(late, None, None),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("RPC must dispatch")
+            .expect("dispatch signal");
+        caller.abort();
+        assert!(caller.await.expect_err("caller was cancelled").is_cancelled());
+        assert_eq!(
+            lock_peer_health_for_test(addr).detached_rpcs,
+            1,
+            "cancelled RPC uses bounded detached ownership"
+        );
+        grant_tx.send(true).expect("cancellation must preserve the running RPC");
+        assert!(
+            timeout(Duration::from_secs(1), released_rx)
+                .await
+                .expect("late grant must be cleaned up")
+                .expect("cleanup result")
+        );
+        assert_eq!(lock_peer_health_for_test(addr).detached_rpcs, 0, "completed cleanup returns its slot");
+        reset_lock_peer_health_for_test(addr);
+    }
+
+    #[tokio::test]
+    async fn test_remote_client_cancelled_rpc_runs_ambiguous_failure_cleanup() {
+        let addr = "http://cancelled-rpc-late-failure";
+        reset_lock_peer_health_for_test(addr);
+        let client = RemoteClient::new(addr.to_string());
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (failure_tx, failure_rx) = tokio::sync::oneshot::channel();
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            let late_failure: LateFailure = Some(Box::new(move |()| {
+                Box::pin(async move {
+                    released_tx.send(()).expect("ambiguous cleanup observer remains alive");
+                })
+            }));
+            client
+                .execute_rpc(
+                    "lock_batch",
+                    "bucket/object",
+                    Duration::from_secs(30),
+                    async move {
+                        started_tx.send(()).expect("caller observes RPC dispatch");
+                        failure_rx.await.expect("test decides when transport fails");
+                        Err::<(), _>(tonic::Status::cancelled("transport failure after caller cancellation"))
+                    },
+                    RpcCleanup::new(None, late_failure, None),
+                )
+                .await
+        });
+        timeout(Duration::from_secs(1), started_rx)
+            .await
+            .expect("RPC must dispatch")
+            .expect("dispatch signal");
+        caller.abort();
+        assert!(caller.await.expect_err("caller was cancelled").is_cancelled());
+        failure_tx.send(()).expect("cancellation must preserve the running RPC");
+        timeout(Duration::from_secs(1), released_rx)
+            .await
+            .expect("ambiguous grant must be cleaned up")
+            .expect("cleanup signal");
+        assert_eq!(lock_peer_health_for_test(addr).detached_rpcs, 0, "failed detached RPC returns its slot");
+        reset_lock_peer_health_for_test(addr);
+    }
+
+    #[tokio::test]
+    async fn test_remote_client_cancelled_completed_failure_runs_cleanup() {
+        let client = RemoteClient::new("http://cancelled-completed-failure".to_string());
+        let (released_tx, released_rx) = tokio::sync::oneshot::channel();
+        let late_failure: LateFailure = Some(Box::new(move |()| {
+            Box::pin(async move {
+                released_tx
+                    .send(())
+                    .expect("completed-failure cleanup observer remains alive");
+            })
+        }));
+        // The RPC result has already been consumed, but channel eviction may
+        // still suspend the caller before it transfers ambiguous-grant cleanup.
+        let rpc = InFlightRpc::<()> {
+            client: &client,
+            op: "lock",
+            resource_summary: "bucket/object",
+            handle: None,
+            cleanup: Some(RpcCleanup::new(None, late_failure, None)),
+        };
+        drop(rpc);
+        timeout(Duration::from_secs(1), released_rx)
+            .await
+            .expect("cancellation during channel eviction must preserve cleanup")
+            .expect("completed-failure cleanup signal");
     }
 
     #[tokio::test]
