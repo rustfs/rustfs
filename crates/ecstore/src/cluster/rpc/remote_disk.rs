@@ -996,21 +996,32 @@ fn internode_idempotent_read_retries() -> usize {
 static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+fn claim_control_channel_prewarm(addr: &str) -> bool {
+    let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+        return false;
+    };
+    prewarmed.insert(addr.to_owned())
+}
+
+fn release_control_channel_prewarm(addr: &str) {
+    if let Ok(mut prewarmed) = PREWARMED_PEERS.lock() {
+        prewarmed.remove(addr);
+    }
+}
+
 /// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
-/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+/// peer; a dial failure releases the marker so a later disk construction can retry the prewarm.
 fn spawn_control_channel_prewarm(addr: String) {
-    {
-        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
-            return;
-        };
-        if !prewarmed.insert(addr.clone()) {
-            return;
-        }
+    if !claim_control_channel_prewarm(&addr) {
+        return;
     }
     tokio::spawn(async move {
         match node_service_time_out_client_no_auth(&addr).await {
             Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
-            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+            Err(err) => {
+                release_control_channel_prewarm(&addr);
+                debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)");
+            }
         }
     });
 }
@@ -11974,5 +11985,16 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[test]
+    fn prewarm_claim_is_deduplicated_and_released_after_failure() {
+        let addr = "http://prewarm-retry-test.invalid:9000";
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        assert!(!claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
     }
 }
