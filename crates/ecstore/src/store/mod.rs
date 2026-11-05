@@ -3295,6 +3295,7 @@ mod tests {
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
         let (mut disks, errs) = init_disks(
+            &crate::runtime::global::current_ctx(),
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,

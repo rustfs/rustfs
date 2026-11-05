@@ -48,6 +48,7 @@ const SOURCE_BINARY_ENV: &str = "RUSTFS_UPGRADE_SOURCE_BINARY";
 const G09_EVIDENCE_DIR_ENV: &str = "RUSTFS_SCANNER_HEAL_G09_EVIDENCE_DIR";
 const RC5_COMMIT: &str = "40a2470feb567201165a5b809b7598bb4b1f68f5";
 const STABLE_1_0_1_COMMIT: &str = "6de965ae3c965a78ff819fbcd7acd4aa44177d92";
+const STABLE_1_0_4_COMMIT: &str = "46337942d55f3a8e6a97b147ca98d9ea8115555d";
 const SSE_MASTER_KEY_ENV: &str = "RUSTFS_SSE_S3_MASTER_KEY";
 const SSE_MASTER_KEY: &str = "QkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkJCQkI=";
 const PLAIN_BUCKET: &str = "upgrade-plain-data";
@@ -954,7 +955,8 @@ async fn exercise_mixed_cluster(
     phase: &str,
     current_node: usize,
     previous_node: usize,
-) -> TestResult {
+    previous_has_delete_recovery: bool,
+) -> Result<Option<String>, BoxError> {
     let clients = cluster.create_all_clients()?;
     wait_for_upgrade_write_readiness(&clients, MIXED_BUCKET, phase, LISTING_CONVERGENCE_TIMEOUT).await?;
     wait_for_drive_readmission(&clients, MIXED_BUCKET, phase, DRIVE_READMISSION_TIMEOUT).await?;
@@ -1009,6 +1011,30 @@ async fn exercise_mixed_cluster(
         vec![u8::try_from(MULTIPART_WORKERS - 1)?; 64 * 1024]
     );
 
+    // 1.0.4 already implements the delete decision protocol. Use a separate
+    // old-writer key so the original seed still spans the entire rollout.
+    if previous_has_delete_recovery {
+        let key = format!(".upgrade-delete/{phase}/previous-writer");
+        previous_client
+            .put_object()
+            .bucket(MIXED_BUCKET)
+            .key(&key)
+            .body(ByteStream::from_static(UPGRADE_READINESS_BODY))
+            .send()
+            .await?;
+        for client in &clients {
+            assert_eq!(read_object(client, MIXED_BUCKET, &key, None).await?.1, UPGRADE_READINESS_BODY);
+        }
+        upgrade_probe_client(current_client)
+            .delete_object()
+            .bucket(MIXED_BUCKET)
+            .key(&key)
+            .send()
+            .await?;
+        assert_mixed_deletes_visible(&clients, std::slice::from_ref(&key)).await?;
+        return Ok(Some(key));
+    }
+
     // Every online participant must understand the delete decision protocol.
     // An upgrade phase can serve reads/writes while intentionally refusing a
     // modern DELETE; rejecting it must leave the old writer's seed intact.
@@ -1029,6 +1055,31 @@ async fn exercise_mixed_cluster(
         );
     }
 
+    Ok(None)
+}
+
+async fn assert_mixed_deletes_visible(clients: &[Client], keys: &[String]) -> TestResult {
+    for (node, client) in clients.iter().enumerate() {
+        for key in keys {
+            let error = upgrade_probe_client(client)
+                .get_object()
+                .bucket(MIXED_BUCKET)
+                .key(key)
+                .send()
+                .await
+                .expect_err("a successful mixed-version DELETE must remain visible through every reader");
+            assert_eq!(
+                error.raw_response().map(|response| response.status().as_u16()),
+                Some(404),
+                "node {node}: {key}"
+            );
+            assert_eq!(
+                error.as_service_error().and_then(ProvideErrorMetadata::code),
+                Some("NoSuchKey"),
+                "node {node}: {key}"
+            );
+        }
+    }
     Ok(())
 }
 
@@ -2240,6 +2291,9 @@ async fn direct_upgrade_from_previous_release_preserves_object_contracts() -> Te
 async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts() -> TestResult {
     init_logging();
     let previous_binary = source_binary()?;
+    // Bind the expected protocol to the verified release source, never to the
+    // DELETE result itself. The older CI source pins retain their 503 contract.
+    let previous_has_delete_recovery = binary_source_revision(&previous_binary).await? == STABLE_1_0_4_COMMIT;
     let evidence_context = g09_evidence_context(&previous_binary).await?;
     let current_binary = rustfs_binary_path();
     let mut cluster = RustFSTestClusterEnvironment::new(MIXED_NODE_COUNT).await?;
@@ -2260,7 +2314,10 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
 
     cluster.stop_node(0)?;
     cluster.start_node_from_binary(0, &current_binary).await?;
-    exercise_mixed_cluster(&cluster, "one-current-node", 0, 1).await?;
+    let mut mixed_deleted_keys = Vec::new();
+    if let Some(key) = exercise_mixed_cluster(&cluster, "one-current-node", 0, 1, previous_has_delete_recovery).await? {
+        mixed_deleted_keys.push(key);
+    }
     // One controlled out-of-policy attempt proves fail-closed behavior below
     // native write quorum; positive MPU writers remain paused while mixed.
     assert_mixed_pending_refusal(&cluster, &pending, &sources).await?;
@@ -2268,7 +2325,9 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     for (node_idx, phase) in [(1, "two-current-nodes"), (2, "one-previous-node")] {
         cluster.stop_node(node_idx)?;
         cluster.start_node_from_binary(node_idx, &current_binary).await?;
-        exercise_mixed_cluster(&cluster, phase, 0, 3).await?;
+        if let Some(key) = exercise_mixed_cluster(&cluster, phase, 0, 3, previous_has_delete_recovery).await? {
+            mixed_deleted_keys.push(key);
+        }
     }
 
     cluster.stop_node(3)?;
@@ -2278,6 +2337,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     let completed_pending = finish_pending_multipart(&clients, &pending, pending_parts.concat()).await?;
     exercise_homogeneous_multipart(&cluster, "homogeneous-current").await?;
     verify_load_bodies(&clients, "homogeneous-previous", "multipart").await?;
+    assert_mixed_deletes_visible(&clients, &mixed_deleted_keys).await?;
 
     for (node_idx, client) in clients.iter().enumerate() {
         assert_eq!(
@@ -2326,6 +2386,7 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
     cluster.start_with_binary(&previous_binary).await?;
     prepare_release_baseline(&mut cluster, &previous_binary, "rollback").await?;
     let old_clients = cluster.create_all_clients()?;
+    assert_mixed_deletes_visible(&old_clients, &mixed_deleted_keys).await?;
     assert_resumed_multipart(&old_clients, &completed_pending).await?;
     for phase in ["homogeneous-previous", "homogeneous-current"] {
         verify_load_bodies(&old_clients, phase, "multipart").await?;
@@ -2390,6 +2451,8 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
                 "phases": phases,
                 "objects_per_phase": objects_per_phase,
                 "mixed_load": "plain-put",
+                "mixed_delete_protocol_supported": previous_has_delete_recovery,
+                "mixed_deleted_keys": mixed_deleted_keys,
                 "homogeneous_multipart_phases": ["homogeneous-previous", "homogeneous-current", "homogeneous-rollback"],
                 "multipart_objects_per_homogeneous_phase": MULTIPART_WORKERS * MULTIPART_UPLOADS_PER_WORKER,
                 "assertions": [
@@ -2422,7 +2485,11 @@ async fn rolling_upgrade_from_previous_release_preserves_mixed_version_contracts
                     "16x16 multipart load runs in homogeneous previous, current and rollback phases",
                     "one-current-node Complete returns typed 503 and preserves actual source authority and parts",
                     "the same legacy upload completes and replays once fully upgraded without adding a version",
-                    "modern DELETE fails closed and preserves every byte while old peers remain"
+                    if previous_has_delete_recovery {
+                        "mixed-version DELETE succeeds and stays absent through every reader after upgrade and rollback"
+                    } else {
+                        "modern DELETE fails closed and preserves every byte while old peers remain"
+                    }
                 ],
             }),
         )?;

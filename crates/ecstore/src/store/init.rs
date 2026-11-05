@@ -540,6 +540,7 @@ impl ECStore {
             // failures can still spawn recovery probes for peers that come up
             // after this node.
             let (mut disks, errs) = init_format::init_disks(
+                &instance_ctx,
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,

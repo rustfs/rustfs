@@ -21,6 +21,7 @@ const MAX_DEFERRED_OBJECTS: usize = 256;
 const MAX_DEFERRED_BYTES: usize = 256 * 1024;
 const MAX_DEFERRED_FORWARD_PAGES: u64 = 2;
 const MAX_DEFERRED_AGE: Duration = Duration::from_secs(30);
+const MAX_RATE_LIMITED_OBJECTS: usize = 3;
 
 struct DeferredObject {
     name: String,
@@ -29,6 +30,7 @@ struct DeferredObject {
     page: u64,
     first_failure: Option<tokio::time::Instant>,
     due: tokio::time::Instant,
+    rate_limited: bool,
 }
 
 impl DeferredObject {
@@ -40,6 +42,7 @@ impl DeferredObject {
             page,
             first_failure: None,
             due: tokio::time::Instant::now(),
+            rate_limited: false,
         }
     }
 
@@ -101,8 +104,15 @@ impl DeferredWindow {
         self.objects.iter().map(|item| item.due).min()
     }
 
+    fn can_admit_object(&self) -> bool {
+        // Probe past an isolated SlowDown, but do not start an entire page's
+        // retry age while several objects already report rate pressure.
+        self.objects.iter().filter(|item| item.rate_limited).count() < MAX_RATE_LIMITED_OBJECTS
+    }
+
     fn can_advance(&self, page: u64) -> bool {
-        self.objects.len() < MAX_DEFERRED_OBJECTS
+        self.can_admit_object()
+            && self.objects.len() < MAX_DEFERRED_OBJECTS
             && self.bytes < MAX_DEFERRED_BYTES
             && self
                 .objects
@@ -672,14 +682,17 @@ impl HealTask {
                             .is_some_and(|item| item.due <= tokio::time::Instant::now())
                         {
                             inline_retry.take()
-                        } else if inline_retry.is_none() {
+                        } else if inline_retry.is_none() && deferred.can_admit_object() {
                             pending.next().map(|item| DeferredObject::new(item, page_number))
                         } else {
                             None
                         }
                     });
                     let Some(mut item) = item else {
-                        let can_list = !listing_finished && inline_retry.is_none() && deferred.can_advance(page_number);
+                        let can_list = !listing_finished
+                            && pending.as_slice().is_empty()
+                            && inline_retry.is_none()
+                            && deferred.can_advance(page_number);
                         if can_list && listing_due <= tokio::time::Instant::now() {
                             let page = if let Some(set_disk_id) = set_disk_id.as_deref() {
                                 self.await_with_control(self.storage.list_versions_for_heal_page_disk_walk(
@@ -929,6 +942,7 @@ impl HealTask {
                                 "Heal bucket object retry scheduled"
                             );
                             item.defer(Self::bucket_object_retry_delay(&self.id, retry_attempt + 1));
+                            item.rate_limited |= err.is_slow_down();
                             if let Err(item) = deferred.push(item) {
                                 inline_retry = Some(item);
                             }

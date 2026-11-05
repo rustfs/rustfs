@@ -283,6 +283,17 @@ impl ECStore {
             arrived.notify_one();
             release.notified().await;
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        tokio::select! {
+            // Stop must drain this pause before taking the activation writer.
+            _ = cancel.cancelled() => return Err(Error::OperationCanceled),
+            result = data_movement::e2e_barrier::wait(
+                "rebalance",
+                bucket.as_str(),
+                entry.name.as_str(),
+                data_movement::e2e_barrier::STAGE_AFTER_ENTRY_ADMISSION,
+            ) => result.map_err(Error::from)?,
+        }
         let lock_lost_signal = run_guard.lock_lost_signal();
         #[cfg(test)]
         let _run_signal_test_fence = lock_lost_signal

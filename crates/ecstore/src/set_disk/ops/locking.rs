@@ -458,7 +458,10 @@ impl SetDisks {
                         return None;
                     }
 
-                    let _ = disk.close().await;
+                    // A failed remote reconnect must retain its existing recovery monitor.
+                    if disk.is_local() {
+                        let _ = disk.close().await;
+                    }
                 }
 
                 let endpoint = self.set_endpoints.get(i)?;
@@ -580,19 +583,26 @@ impl SetDisks {
         let _ = new_disk.set_disk_id(Some(fm.erasure.this)).await;
 
         if !new_disk.is_local() {
-            let mut disks = self.disks.write().await;
-            let slot = &mut disks[disk_idx];
-            let unchanged = match (slot.as_ref(), previous_disk.as_ref()) {
-                (None, None) => true,
-                (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
-                _ => false,
+            let displaced = {
+                let mut disks = self.disks.write().await;
+                let slot = &mut disks[disk_idx];
+                let unchanged = match (slot.as_ref(), previous_disk.as_ref()) {
+                    (None, None) => true,
+                    (Some(current), Some(previous)) => Arc::ptr_eq(current, previous),
+                    _ => false,
+                };
+                // A GET probe or another reconnect may have filled this slot while
+                // format I/O was pending. Only the successful publisher owns the
+                // displaced monitor; a failed or superseded probe must retain it.
+                if unchanged {
+                    new_disk.enable_health_check();
+                    slot.replace(new_disk)
+                } else {
+                    None
+                }
             };
-            // A GET probe or another reconnect may have filled this slot while
-            // format I/O was pending. Do not replace its handle or start a
-            // second health monitor for an unpublished handle.
-            if unchanged {
-                new_disk.enable_health_check();
-                *slot = Some(new_disk);
+            if let Some(disk) = displaced {
+                let _ = disk.close().await;
             }
             return false;
         }

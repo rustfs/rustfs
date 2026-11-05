@@ -28,7 +28,7 @@ use super::harness::{
     wait_for_rebalance_active, wait_for_rebalance_complete,
 };
 use super::scanner_heal_topology_fixture::{
-    LiveWorkload, MOVEMENT_ACTIVE_TIMEOUT, MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL,
+    LiveWorkload, MOVEMENT_ACTIVE_TIMEOUT, MOVEMENT_COMPLETE_TIMEOUT, MovementOperation, SEED_POOL, STAGE_AFTER_ENTRY_ADMISSION,
     STAGE_AFTER_RESPONSIBILITY_PERSISTED, STAGE_BEFORE_SOURCE_CLEANUP, STAGE_BEFORE_TARGET_COMMIT, TopologyManifest, TopologyRun,
     assert_bucket_durability_strict, assert_every_node_serves, assert_probe_objects, assert_process_durability_strict,
     assert_seed_pool_census_unchanged, assert_single_pool_placement, cancel_decommission, capture_seed_pool_census,
@@ -274,6 +274,7 @@ async fn wait_for_rebalance_stopped_or_completed(run: &TopologyRun, rebalance_id
 #[tokio::test]
 async fn scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart() -> TestResult {
     init_logging();
+    require_test_hooks();
     let mut run = TopologyRun::start("rebalance").await?;
     let manifest = seed_manifest(&run).await?;
     assert_bucket_durability_strict(&run.dist.cluster, &manifest.buckets()).await?;
@@ -288,23 +289,52 @@ async fn scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart()
         .map(|entry| (entry.key.clone(), entry.sha256.clone()))
         .collect();
 
-    let first_id = start_rebalance(&run.dist.cluster).await?;
-    wait_for_rebalance_active(&run.dist.cluster, &first_id, MOVEMENT_ACTIVE_TIMEOUT).await?;
-    let during_rebalance = put_probe_objects(&run.dist, &scratch, "during-rebalance", 4).await?;
-    let workload = tokio::spawn(run_live_workload(LiveWorkload {
-        clients: run.dist.clients()?,
-        bucket: scratch.clone(),
-        prefix: "live".to_string(),
-        writers: LIVE_WRITERS,
-        rounds: LIVE_ROUNDS,
-        baseline_bucket: manifest.plain_bucket.clone(),
-        baseline: baseline.clone(),
-        pause: Duration::from_millis(100),
-    }));
-    sleep(Duration::from_secs(2)).await;
-    stop_rebalance(&run.dist.cluster).await?;
-    let (first_outcome, first_status) = wait_for_rebalance_stopped_or_completed(&run, &first_id).await?;
-    let ops = workload.await??;
+    // Keep an admitted entry on the source until stop cancels admission. Start
+    // propagation may await that entry, so observe and stop before awaiting ACK.
+    let first_key = manifest.plain_key("external", 0)?;
+    run.movement_barrier
+        .arm_movement("rebalance", &manifest.plain_bucket, &first_key, STAGE_AFTER_ENTRY_ADMISSION)?;
+    let observe_first = async {
+        let (observed_id, reached) = tokio::time::timeout(MOVEMENT_ACTIVE_TIMEOUT, async {
+            let reached = run.movement_barrier.wait_reached(MOVEMENT_ACTIVE_TIMEOUT).await?;
+            let status = rebalance_status_json(&run.dist.cluster).await?;
+            let observed_id = status
+                .get("id")
+                .and_then(Value::as_str)
+                .ok_or("rebalance status omitted id")?;
+            wait_for_rebalance_active(&run.dist.cluster, observed_id, MOVEMENT_ACTIVE_TIMEOUT).await?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((observed_id.to_string(), reached))
+        })
+        .await??;
+        let probes = put_probe_objects(&run.dist, &scratch, "during-rebalance", 4).await?;
+        let workload = run_live_workload(LiveWorkload {
+            clients: run.dist.clients()?,
+            bucket: scratch.clone(),
+            prefix: "live".to_string(),
+            writers: LIVE_WRITERS,
+            rounds: LIVE_ROUNDS,
+            baseline_bucket: manifest.plain_bucket.clone(),
+            baseline: baseline.clone(),
+            pause: Duration::from_millis(100),
+        });
+        let stop = async {
+            sleep(Duration::from_secs(2)).await;
+            stop_rebalance(&run.dist.cluster, &observed_id).await?;
+            let (outcome, status) = wait_for_rebalance_stopped_or_completed(&run, &observed_id).await?;
+            if outcome != "stopped" {
+                return Err("rebalance completed before stop; mid-run stop was not exercised".into());
+            }
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((outcome, status))
+        };
+        let (ops, (outcome, status)) = tokio::try_join!(workload, stop)?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((observed_id, reached, probes, ops, outcome, status))
+    };
+    let (first_id, (observed_id, first_reached, during_rebalance, ops, first_outcome, first_status)) =
+        tokio::try_join!(start_rebalance(&run.dist.cluster), observe_first)?;
+    if first_id != observed_id {
+        return Err(format!("rebalance start acknowledged {first_id}, but the stopped run was {observed_id}").into());
+    }
+    run.movement_barrier.disarm()?;
     let live_state = expected_live_state(&ops);
 
     for node_idx in 0..run.dist.cluster.nodes.len() {
@@ -333,8 +363,40 @@ async fn scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart()
     verify_from_every_node(&run.dist, &manifest, "after restart following the stop").await?;
     verify_live_state(&run.dist.client(0)?, &scratch, &live_state, "after restart following the stop").await?;
 
-    let second_id = start_rebalance(&run.dist.cluster).await?;
-    wait_for_rebalance_active(&run.dist.cluster, &second_id, MOVEMENT_ACTIVE_TIMEOUT).await?;
+    // A short second run can finish before the start response reaches us.
+    // Hold one remaining source entry until its active state is observed.
+    let mut second_key = None;
+    for entry in manifest.plain_entries() {
+        if pools_holding(&run.dist, &manifest.plain_bucket, &entry.key, None)?.contains(&SEED_POOL) {
+            second_key = Some(entry.key.clone());
+            break;
+        }
+    }
+    let second_key = second_key.ok_or("no seed-pool object remains for the second rebalance")?;
+    let second_barrier = run.movement_barrier.next_phase();
+    second_barrier.arm_movement("rebalance", &manifest.plain_bucket, &second_key, STAGE_BEFORE_SOURCE_CLEANUP)?;
+    let observe_second = async {
+        let reached = second_barrier.wait_reached(MOVEMENT_ACTIVE_TIMEOUT).await?;
+        let status = rebalance_status_json(&run.dist.cluster).await?;
+        let observed_id = status
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or("rebalance status omitted id")?;
+        if observed_id == first_id {
+            return Err("the second rebalance reused the stopped run id".into());
+        }
+        wait_for_rebalance_active(&run.dist.cluster, observed_id, MOVEMENT_ACTIVE_TIMEOUT).await?;
+        second_barrier.disarm()?;
+        second_barrier.release_movement()?;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>((observed_id.to_string(), reached))
+    };
+    // Worker propagation can hold the start response until movement drains.
+    let (second_id, (observed_id, second_reached)) = tokio::try_join!(start_rebalance(&run.dist.cluster), async {
+        tokio::time::timeout(MOVEMENT_ACTIVE_TIMEOUT, observe_second).await?
+    })?;
+    if second_id != observed_id {
+        return Err(format!("rebalance start acknowledged {second_id}, but the active run was {observed_id}").into());
+    }
     wait_for_rebalance_complete(&run.dist.cluster, &second_id, MOVEMENT_COMPLETE_TIMEOUT).await?;
     verify_from_every_node(&run.dist, &manifest, "after the second rebalance completed").await?;
     verify_live_state(&run.dist.client(3)?, &scratch, &live_state, "after the second rebalance completed").await?;
@@ -351,8 +413,8 @@ async fn scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart()
         &json!({
             "gate": "G-REB",
             "manifest": manifest_summary(&manifest),
-            "first_run": { "id": first_id, "outcome": first_outcome, "status": first_status, "versions_held_by_two_pools_after_stop": retained_after_stop },
-            "second_run": { "id": second_id, "versions_off_seed_pool": moved },
+            "first_run": { "id": first_id, "outcome": first_outcome, "status": first_status, "versions_held_by_two_pools_after_stop": retained_after_stop, "barrier_object": first_key, "barrier": first_reached },
+            "second_run": { "id": second_id, "versions_off_seed_pool": moved, "barrier_object": second_key, "barrier": second_reached },
             "live_ops": ops,
             "probe_placement_during_rebalance": during_placement,
             "process_durability_strict_nodes": strict_nodes,
