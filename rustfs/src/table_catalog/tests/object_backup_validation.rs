@@ -18,6 +18,8 @@ use super::*;
 mod capture_bounds;
 #[path = "backup_commit_recovery_store_tests.rs"]
 mod commit_recovery_store;
+#[path = "backup_lookup_lock_order.rs"]
+mod lookup_lock_order;
 #[path = "backup_maintenance_store_tests.rs"]
 mod maintenance_store;
 #[path = "backup_reference_revalidation_store_tests.rs"]
@@ -1122,7 +1124,7 @@ async fn restore_catalog_finalization_failure_is_recoverable_after_all_target_wr
 
 #[tokio::test]
 async fn namespace_table_and_view_reads_cannot_cross_a_restore_with_identical_bucket_bytes() {
-    for resource in ["namespace", "table", "view"] {
+    for resource in ["namespace", "table", "view", "authorization"] {
         let (backend, _, _) = backup_fixture_with_backend(TestCatalogObjectBackend::content_addressed()).await;
         let paths = TableCatalogObjectPaths::default();
         let namespace = Namespace::parse("sales").expect("namespace");
@@ -1169,7 +1171,7 @@ async fn namespace_table_and_view_reads_cannot_cross_a_restore_with_identical_bu
             .expect("bucket exists");
         let read_path = match resource {
             "namespace" => paths.namespace_entry_path("analytics", &namespace),
-            "table" => paths.table_entry_path("analytics", &namespace, &table),
+            "table" | "authorization" => paths.table_entry_path("analytics", &namespace, &table),
             "view" => paths.view_entry_path("analytics", &namespace, &view),
             _ => unreachable!(),
         };
@@ -1181,6 +1183,10 @@ async fn namespace_table_and_view_reads_cannot_cross_a_restore_with_identical_bu
                 "namespace" => reader.get_namespace("analytics", "sales").await.map(|_| ()),
                 "table" => reader.load_table("analytics", "sales", "orders").await.map(|_| ()),
                 "view" => reader.load_view("analytics", "sales", "recent_orders").await.map(|_| ()),
+                "authorization" => reader
+                    .resolve_table_data_plane_resource_for_authorization("analytics", "tables/table-id/data/part.parquet")
+                    .await
+                    .map(|_| ()),
                 _ => unreachable!(),
             }
         });

@@ -6589,6 +6589,17 @@ async fn table_data_plane_resource_skips_stale_deeper_index_and_matches_parent()
         .unwrap();
     backend.reset_call_counts().await;
 
+    let before = backend.state.lock().await.objects.clone();
+    let read_only = store
+        .resolve_table_data_plane_resource_for_authorization(bucket, "tables/table-id/child/data/part-00001.parquet")
+        .await
+        .expect("read-only lookup tolerates a stale deeper index")
+        .expect("read-only lookup retains the parent protection");
+    assert_eq!(read_only.table, "orders");
+    assert_eq!(read_only.warehouse_object_prefix, "tables/table-id/");
+    assert_eq!(backend.state.lock().await.objects, before, "authorization must not remove stale indexes");
+    assert_eq!(backend.list_call_count().await, 0);
+
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/child/data/part-00001.parquet")
         .await
         .expect("stale deeper index should not fail lookup")
@@ -6729,6 +6740,10 @@ async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane
             .await;
     }
 
+    assert_matches!(
+        store.resolve_table_data_plane_resource_for_authorization(bucket, object).await,
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("4096-catalog-object safety limit")
+    );
     assert_matches!(
         table_data_plane_resource_for_object(&store, bucket, object).await,
         Err(TableCatalogStoreError::Unavailable(message)) if message.contains("4096-catalog-object safety limit")

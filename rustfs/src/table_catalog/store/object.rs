@@ -2282,6 +2282,7 @@ where
         &self,
         index_object: &str,
         index: TableWarehouseIndexEntry,
+        repair_index: bool,
     ) -> TableCatalogStoreResult<Option<(TableCatalogEntryState, TableDataPlaneResource)>> {
         validate_table_warehouse_index_entry_object(&self.paths, index_object, &index)?;
         if index.state == TableCatalogEntryState::Deleted {
@@ -2303,16 +2304,20 @@ where
                 .await;
         };
         if table.state != TableCatalogEntryState::Active {
-            self.delete_stale_table_warehouse_index(index_object, &index, "referenced table is inactive")
-                .await?;
+            if repair_index {
+                self.delete_stale_table_warehouse_index(index_object, &index, "referenced table is inactive")
+                    .await?;
+            }
             return Ok(None);
         }
         let current_prefix = table_warehouse_object_prefix(&table).map_err(|err| {
             TableCatalogStoreError::Invalid(format!("warehouse index table entry has invalid location {index_object}: {err}"))
         })?;
         if current_prefix != index.warehouse_object_prefix {
-            self.delete_stale_table_warehouse_index(index_object, &index, "referenced table moved warehouse prefix")
-                .await?;
+            if repair_index {
+                self.delete_stale_table_warehouse_index(index_object, &index, "referenced table moved warehouse prefix")
+                    .await?;
+            }
             return Ok(None);
         }
         if table.table_id != index.table_id {
@@ -2504,6 +2509,7 @@ where
         &self,
         table_bucket: &str,
         object: &str,
+        repair_index: bool,
     ) -> TableCatalogStoreResult<TableWarehouseIndexResolution> {
         let mut active: Option<TableDataPlaneResource> = None;
         let mut deleted: Option<TableDataPlaneResource> = None;
@@ -2522,7 +2528,7 @@ where
                 )));
             }
             if let Some((state, resource)) = self
-                .resolve_table_data_plane_resource_from_index_entry(&index_object, index)
+                .resolve_table_data_plane_resource_from_index_entry(&index_object, index, repair_index)
                 .await?
             {
                 let matched = match &state {
@@ -2561,22 +2567,60 @@ where
         }
     }
 
-    async fn resolve_table_data_plane_resource_with_scan(
+    /// Resolve authorization without repairing indexes or acquiring catalog mutation permits.
+    /// The caller may already hold a publication read lock needed by backup and restore.
+    pub(crate) async fn resolve_table_data_plane_resource_for_authorization(
         &self,
         table_bucket: &str,
         object: &str,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        if table_bucket.is_empty() || object.is_empty() {
+            return Ok(None);
+        }
+        self.with_catalog_restore_read(table_bucket, async {
+            let read_version = self.table_data_plane_read_version(table_bucket).await?;
+            let resource = if self.warehouse_index_ready(table_bucket).await? {
+                self.resolve_table_data_plane_resource_with_scan(table_bucket, object, false)
+                    .await
+            } else {
+                let indexed = self
+                    .resolve_table_data_plane_resource_from_index(table_bucket, object, false)
+                    .await?;
+                let scanned = self
+                    .scan_table_data_plane_resource_for_index_miss(table_bucket, object, false)
+                    .await?;
+                match indexed {
+                    TableWarehouseIndexResolution::Active(resource) if scanned.as_ref() != Some(&resource) => Err(
+                        TableCatalogStoreError::Unavailable("warehouse index changed during authorization lookup".to_string()),
+                    ),
+                    TableWarehouseIndexResolution::Deleted(tombstone) => Ok(scanned.or(Some(tombstone))),
+                    _ => Ok(scanned),
+                }
+            }?;
+            self.finish_table_rename_read(table_bucket, Some(&read_version)).await?;
+            Ok(resource)
+        })
+        .await
+    }
+
+    async fn resolve_table_data_plane_resource_with_scan(
+        &self,
+        table_bucket: &str,
+        object: &str,
+        repair_index: bool,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self
-            .resolve_table_data_plane_resource_from_index(table_bucket, object)
+            .resolve_table_data_plane_resource_from_index(table_bucket, object, repair_index)
             .await?
         {
             TableWarehouseIndexResolution::Active(resource) => Ok(Some(resource)),
             TableWarehouseIndexResolution::Deleted(tombstone) => Ok(self
-                .scan_table_data_plane_resource_for_index_miss(table_bucket, object)
+                .scan_table_data_plane_resource_for_index_miss(table_bucket, object, repair_index)
                 .await?
                 .or(Some(tombstone))),
             TableWarehouseIndexResolution::Missing => {
-                self.scan_table_data_plane_resource_for_index_miss(table_bucket, object).await
+                self.scan_table_data_plane_resource_for_index_miss(table_bucket, object, repair_index)
+                    .await
             }
         }
     }
@@ -2585,6 +2629,7 @@ where
         &self,
         table_bucket: &str,
         object: &str,
+        repair_index: bool,
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         let mut matched: Option<TableDataPlaneResource> = None;
         for table in self
@@ -2606,7 +2651,7 @@ where
             }
             matched = Some(table_data_plane_resource_from_entry(table, warehouse_object_prefix));
         }
-        if let Some(resource) = matched.as_ref() {
+        if repair_index && let Some(resource) = matched.as_ref() {
             let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
             self.backfill_active_table_warehouse_index_with_prefix_check(
                 &resource.table_bucket,
@@ -7228,17 +7273,22 @@ where
             let read_version = self.table_data_plane_read_version(table_bucket).await?;
 
             let resource = if self.warehouse_index_ready(table_bucket).await? {
-                self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
+                self.resolve_table_data_plane_resource_with_scan(table_bucket, object, true)
+                    .await
             } else {
                 match self.backfill_table_warehouse_index_for_data_plane(table_bucket).await {
-                    Ok(()) => self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await,
+                    Ok(()) => {
+                        self.resolve_table_data_plane_resource_with_scan(table_bucket, object, true)
+                            .await
+                    }
                     Err(err @ TableCatalogStoreError::Internal(_)) => {
                         tracing::warn!(
                             table_bucket = %table_bucket,
                             error = %err,
                             "failed to backfill table warehouse index; falling back to catalog scan"
                         );
-                        self.resolve_table_data_plane_resource_with_scan(table_bucket, object).await
+                        self.resolve_table_data_plane_resource_with_scan(table_bucket, object, true)
+                            .await
                     }
                     Err(err) => Err(err),
                 }

@@ -1497,6 +1497,20 @@ where
         }
     }
 
+    pub(crate) async fn resolve_table_data_plane_resource_for_authorization(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
+        match self {
+            Self::ObjectBacked(store) => {
+                store
+                    .resolve_table_data_plane_resource_for_authorization(table_bucket, object)
+                    .await
+            }
+        }
+    }
+
     pub(crate) async fn get_table_catalog_diagnostics_retention(
         &self,
         table_bucket: &str,
