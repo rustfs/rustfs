@@ -363,10 +363,15 @@ async fn list_path_raw_inner(
     let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
     let cancel_rx = CancellationToken::new();
+    let walk_options = Arc::new(walk_dir_options(&opts));
 
     for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
-        let opts_clone = opts.clone();
+        let walk_options = walk_options.clone();
+        #[cfg(test)]
+        let test_reader_behavior = opts.test_reader_behaviors.get(disk_idx).cloned();
+        #[cfg(test)]
+        let test_disk_io_context_observed = opts.test_disk_io_context_observed.clone();
         let fallback_claim_tracker = fallback_claim_tracker.clone();
         let fds_clone = fds.clone();
         #[cfg(test)]
@@ -379,14 +384,14 @@ async fn list_path_raw_inner(
         let producer = with_optional_disk_io_context(disk_io_context_clone, async move {
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
-            if let Some(observer) = &opts_clone.test_disk_io_context_observed {
+            if let Some(observer) = &test_disk_io_context_observed {
                 observer.store(
                     crate::disk::current_disk_io_context().is_some_and(|context| context.class == DiskIoClass::Background),
                     std::sync::atomic::Ordering::Release,
                 );
             }
             #[cfg(test)]
-            let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
+            let test_primary_error = if let Some(behavior) = test_reader_behavior {
                 match behavior {
                     TestReaderBehavior::Eof => return Ok(()),
                     TestReaderBehavior::Entries(entries) => {
@@ -443,8 +448,6 @@ async fn list_path_raw_inner(
                 None
             };
 
-            let wakl_opts = walk_dir_options(&opts_clone);
-
             let mut need_fallback = false;
             let mut last_err = None;
             #[cfg(test)]
@@ -459,7 +462,7 @@ async fn list_path_raw_inner(
 
             if !need_fallback && let Some(disk) = opdisk {
                 let primary_walk_started = std::time::Instant::now();
-                match disk.walk_dir(wakl_opts, &mut wr).await {
+                match disk.walk_dir((*walk_options).clone(), &mut wr).await {
                     Ok(_res) => {
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_primary",
@@ -483,8 +486,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "walk_dir_missing_path",
                                 error = ?err,
@@ -495,8 +498,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "walk_dir_failed",
                                 error = ?err,
@@ -598,8 +601,8 @@ async fn list_path_raw_inner(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
+                            bucket = %walk_options.bucket,
+                            path = %walk_options.base_dir,
                             disk_index = disk_idx,
                             state = "fallback_disk_missing_for_path",
                             error = ?err,
@@ -610,8 +613,8 @@ async fn list_path_raw_inner(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
+                            bucket = %walk_options.bucket,
+                            path = %walk_options.base_dir,
                             disk_index = disk_idx,
                             state = "fallback_disk_missing",
                             error = ?err,
@@ -626,7 +629,7 @@ async fn list_path_raw_inner(
                 }
 
                 let fallback_walk_started = std::time::Instant::now();
-                match disk.as_ref().walk_dir(walk_dir_options(&opts_clone), &mut wr).await {
+                match disk.as_ref().walk_dir((*walk_options).clone(), &mut wr).await {
                     Ok(_r) => {
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback",
@@ -652,8 +655,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "fallback_walk_dir_missing_path",
                                 error = ?err,
@@ -664,8 +667,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "fallback_walk_dir_failed",
                                 error = ?err,
@@ -1249,6 +1252,74 @@ mod tests {
             observed.load(std::sync::atomic::Ordering::Acquire),
             "the per-disk JoinSet producer must retain the scanner background class"
         );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_fanout_retains_only_linear_disk_references() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("UTF-8 disk path"))
+            .expect("parse disk endpoint");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("open local disk"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper)));
+        let baseline = Arc::strong_count(&disk);
+
+        for primary_count in [1, 4, 16] {
+            for fallback_count in [0, 2] {
+                let entered: Vec<_> = (0..primary_count).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+                let stopped: Vec<_> = (0..primary_count).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+                let behaviors = entered
+                    .iter()
+                    .zip(&stopped)
+                    .map(|(entered, stopped)| TestReaderBehavior::StallWithSignals {
+                        entered: entered.clone(),
+                        stopped: stopped.clone(),
+                    })
+                    .collect();
+                let cancel = CancellationToken::new();
+                let listing = tokio::spawn(list_path_raw(
+                    cancel.clone(),
+                    ListPathRawOptions {
+                        disks: vec![Some(disk.clone()); primary_count],
+                        fallback_disks: vec![Some(disk.clone()); fallback_count],
+                        min_disks: primary_count,
+                        test_reader_behaviors: behaviors,
+                        peek_timeout: Some(Duration::from_secs(60)),
+                        ..Default::default()
+                    },
+                ));
+                for signal in &entered {
+                    timeout(Duration::from_secs(2), signal.notified())
+                        .await
+                        .expect("every producer must enter the real fanout before counting references");
+                }
+
+                // The merge owns the configured primary/fallback slots, each producer
+                // owns its primary, and the shared fallback queue owns each fallback.
+                let expected = baseline + 2 * (primary_count + fallback_count);
+                let retained = Arc::strong_count(&disk);
+                cancel.cancel();
+                timeout(Duration::from_secs(2), listing)
+                    .await
+                    .expect("cancellation must stop the listing")
+                    .expect("listing task must join")
+                    .expect("external cancellation must finish cleanly");
+                for signal in &stopped {
+                    timeout(Duration::from_secs(2), signal.notified())
+                        .await
+                        .expect("cancellation must drop every producer");
+                }
+                assert_eq!(Arc::strong_count(&disk), baseline, "cancellation must release every fanout reference");
+                assert_eq!(
+                    retained, expected,
+                    "fanout must retain linear references for {primary_count} primary and {fallback_count} fallback slots"
+                );
+            }
+        }
     }
 
     #[tokio::test(flavor = "current_thread")]
