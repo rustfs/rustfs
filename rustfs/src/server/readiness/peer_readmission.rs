@@ -42,10 +42,10 @@ use crate::storage_api::server::readiness::contract::admin::{DiskSetSelector, St
 use crate::storage_api::server::readiness::{
     DiskStore, EndpointServerPools, PeerRestClient, disk_endpoint_snapshot, get_global_notification_sys, is_dist_erasure,
 };
+use futures::{Stream, StreamExt, stream::FuturesUnordered};
 use rustfs_madmin::BackendInfo;
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt;
-use std::future::Future;
 use std::time::Duration;
 use tracing::{debug, info, warn};
 
@@ -360,12 +360,13 @@ pub(super) enum ReadmissionOutcome {
     },
 }
 
-/// Poll `probe` until every planned set is re-admitted or the gate gives up.
+/// Poll current-round peer replies until every set is admitted or a bound expires.
 ///
-/// The loop always terminates: by `deadline`, by `unreachable_grace` of
-/// continuous unreachable shortfall, or immediately when peers that cannot
-/// report make the majority unattainable.
-pub(super) async fn wait_for_peer_readmission_with<P, Fut>(
+/// The owner enforces the shared startup deadline and continuous unreachable
+/// grace while polling RPCs and sleeping. Pending read-only RPCs are cancelled
+/// once all sets have quorum, an unsupported fleet cannot supply it, or a bound
+/// expires. Votes are never carried between rounds.
+pub(super) async fn wait_for_peer_readmission_with<P, S>(
     plan: &ReadmissionPlan,
     deadline: tokio::time::Instant,
     poll_interval: Duration,
@@ -373,40 +374,69 @@ pub(super) async fn wait_for_peer_readmission_with<P, Fut>(
     mut probe: P,
 ) -> ReadmissionOutcome
 where
-    P: FnMut() -> Fut,
-    Fut: Future<Output = HashMap<String, PeerProbe>>,
+    P: FnMut() -> S,
+    S: Stream<Item = (String, PeerProbe)>,
 {
     let started = tokio::time::Instant::now();
     let mut unreachable_since: Option<tokio::time::Instant> = None;
     let mut last_logged: Option<ReadmissionProgress> = None;
+    let mut progress = evaluate(plan, &HashMap::new());
+    let give_up = |reason, progress| ReadmissionOutcome::GaveUp {
+        reason,
+        waited: tokio::time::Instant::now().saturating_duration_since(started),
+        progress,
+    };
+    let wait_bound = |unreachable_since: Option<tokio::time::Instant>| {
+        if let Some(since) = unreachable_since {
+            let grace_deadline = since + unreachable_grace;
+            if grace_deadline <= deadline {
+                return (grace_deadline, GiveUpReason::PeersUnreachable);
+            }
+        }
+        (deadline, GiveUpReason::DeadlineElapsed)
+    };
 
     loop {
-        let probes = probe().await;
-        let progress = evaluate(plan, &probes);
-        let now = tokio::time::Instant::now();
-        let waited = now.saturating_duration_since(started);
-        let give_up = |reason| ReadmissionOutcome::GaveUp {
-            reason,
-            waited,
-            progress,
-        };
-
-        if progress.admitted_sets == progress.total_sets {
-            return ReadmissionOutcome::Admitted { waited };
+        let (bound, reason) = wait_bound(unreachable_since);
+        if tokio::time::Instant::now() >= bound {
+            return give_up(reason, progress);
         }
-        if progress.unattainable_sets > 0 {
-            return give_up(GiveUpReason::PeersCannotReport);
-        }
-        if progress.unreachable_sets > 0 {
-            let since = *unreachable_since.get_or_insert(now);
-            if now.saturating_duration_since(since) >= unreachable_grace {
-                return give_up(GiveUpReason::PeersUnreachable);
+        let mut probes = HashMap::new();
+        let mut round = std::pin::pin!(probe());
+        loop {
+            let (bound, reason) = wait_bound(unreachable_since);
+            let next = tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(bound) => return give_up(reason, progress),
+                next = round.next() => next,
+            };
+            let complete = if let Some((host, reply)) = next {
+                probes.insert(host, reply);
+                false
+            } else {
+                true
+            };
+            progress = evaluate(plan, &probes);
+            if progress.admitted_sets == progress.total_sets {
+                return ReadmissionOutcome::Admitted {
+                    waited: tokio::time::Instant::now().saturating_duration_since(started),
+                };
             }
-        } else {
-            unreachable_since = None;
-        }
-        if now >= deadline {
-            return give_up(GiveUpReason::DeadlineElapsed);
+            if progress.unattainable_sets > 0 {
+                return give_up(GiveUpReason::PeersCannotReport, progress);
+            }
+            if progress.unreachable_sets == 0 {
+                // Enough reachable replies disprove a previous shortfall even
+                // while another, unnecessary peer is still answering.
+                unreachable_since = None;
+            } else if complete {
+                // Pending replies are potential votes, not evidence that their
+                // hosts are unreachable. Only a finished round starts grace.
+                unreachable_since.get_or_insert_with(tokio::time::Instant::now);
+            }
+            if complete {
+                break;
+            }
         }
 
         if last_logged != Some(progress) {
@@ -423,44 +453,53 @@ where
             );
             last_logged = Some(progress);
         }
-        tokio::time::sleep(poll_interval.min(deadline.saturating_duration_since(now))).await;
+        let (bound, reason) = wait_bound(unreachable_since);
+        tokio::select! {
+            biased;
+            _ = tokio::time::sleep_until(bound) => return give_up(reason, progress),
+            _ = tokio::time::sleep(poll_interval) => {}
+        }
     }
 }
 
-async fn probe_peers(clients: &[(String, PeerRestClient)], local_host: &str, timeout: Duration) -> HashMap<String, PeerProbe> {
-    futures::future::join_all(clients.iter().map(|(host, client)| async move {
-        let probe = match tokio::time::timeout(timeout, client.peer_drive_admission(local_host)).await {
-            Ok(Ok(Some(drives))) => PeerProbe::Answered(
-                drives
-                    .into_iter()
-                    .map(|drive| PeerDriveView {
-                        pool_index: drive.pool_index,
-                        set_index: drive.set_index,
-                        disk_index: drive.disk_index,
-                        online: drive.online,
-                    })
-                    .collect(),
-            ),
-            Ok(Ok(None)) => PeerProbe::Unsupported,
-            Ok(Err(err)) => {
-                debug!(
-                    event = EVENT_STARTUP_PEER_READMISSION,
-                    component = LOG_COMPONENT_SERVER,
-                    subsystem = LOG_SUBSYSTEM_READINESS,
-                    result = "peer_error",
-                    peer = %host,
-                    error = %err,
-                    "peer re-admission probe failed"
-                );
-                PeerProbe::Unreachable
-            }
-            Err(_) => PeerProbe::Unreachable,
-        };
-        (host.clone(), probe)
-    }))
-    .await
-    .into_iter()
-    .collect()
+fn probe_peers<'a>(
+    clients: &'a [(String, PeerRestClient)],
+    local_host: &'a str,
+    timeout: Duration,
+) -> impl Stream<Item = (String, PeerProbe)> + 'a {
+    clients
+        .iter()
+        .map(|(host, client)| async move {
+            let probe = match tokio::time::timeout(timeout, client.peer_drive_admission(local_host)).await {
+                Ok(Ok(Some(drives))) => PeerProbe::Answered(
+                    drives
+                        .into_iter()
+                        .map(|drive| PeerDriveView {
+                            pool_index: drive.pool_index,
+                            set_index: drive.set_index,
+                            disk_index: drive.disk_index,
+                            online: drive.online,
+                        })
+                        .collect(),
+                ),
+                Ok(Ok(None)) => PeerProbe::Unsupported,
+                Ok(Err(err)) => {
+                    debug!(
+                        event = EVENT_STARTUP_PEER_READMISSION,
+                        component = LOG_COMPONENT_SERVER,
+                        subsystem = LOG_SUBSYSTEM_READINESS,
+                        result = "peer_error",
+                        peer = %host,
+                        error = %err,
+                        "peer re-admission probe failed"
+                    );
+                    PeerProbe::Unreachable
+                }
+                Err(_) => PeerProbe::Unreachable,
+            };
+            (host.clone(), probe)
+        })
+        .collect::<FuturesUnordered<_>>()
 }
 
 /// Run the startup re-admission gate against the live topology and peers.
@@ -550,8 +589,16 @@ pub(super) fn log_readmission_outcome(outcome: &ReadmissionOutcome) {
 mod tests {
     use super::*;
     use crate::storage_api::server::readiness::{Endpoint, Endpoints, PoolEndpoints};
+    use std::future::Future;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn probe_round<F>(round: F) -> impl Stream<Item = (String, PeerProbe)>
+    where
+        F: Future<Output = HashMap<String, PeerProbe>>,
+    {
+        futures::stream::once(round).flat_map(futures::stream::iter)
+    }
 
     fn endpoint(host: &str, is_local: bool, set_idx: i32, disk_idx: i32) -> Endpoint {
         Endpoint {
@@ -680,10 +727,10 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
             let poll = polls.fetch_add(1, Ordering::SeqCst);
-            async move {
+            probe_round(async move {
                 // node-1 keeps dialing the previous pod IP for five polls.
                 probes(&[("node-0", answered(true)), ("node-1", answered(poll >= 5))])
-            }
+            })
         })
         .await;
 
@@ -700,8 +747,8 @@ mod tests {
     async fn gate_gives_up_at_the_startup_deadline() {
         let plan = three_node_plan();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
-            probes(&[("node-0", answered(true)), ("node-1", answered(false))])
+        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+            probe_round(async { probes(&[("node-0", answered(true)), ("node-1", answered(false))]) })
         })
         .await;
 
@@ -722,8 +769,8 @@ mod tests {
     async fn dead_peer_releases_the_gate_after_the_unreachable_grace() {
         let plan = three_node_plan();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
-            probes(&[("node-0", answered(true)), ("node-1", PeerProbe::Unreachable)])
+        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+            probe_round(async { probes(&[("node-0", answered(true)), ("node-1", PeerProbe::Unreachable)]) })
         })
         .await;
 
@@ -741,14 +788,14 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
             let poll = polls.fetch_add(1, Ordering::SeqCst);
-            async move {
+            probe_round(async move {
                 let node_1 = match poll {
                     0..10 => PeerProbe::Unreachable,
                     10..30 => answered(false),
                     _ => answered(true),
                 };
                 probes(&[("node-0", answered(true)), ("node-1", node_1)])
-            }
+            })
         })
         .await;
 
@@ -764,8 +811,8 @@ mod tests {
     async fn older_peers_that_cannot_report_release_the_gate_immediately() {
         let plan = three_node_plan();
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
-            probes(&[("node-0", PeerProbe::Unsupported), ("node-1", PeerProbe::Unsupported)])
+        let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+            probe_round(async { probes(&[("node-0", PeerProbe::Unsupported), ("node-1", PeerProbe::Unsupported)]) })
         })
         .await;
 
@@ -774,6 +821,344 @@ mod tests {
         };
         assert_eq!(reason, GiveUpReason::PeersCannotReport);
         assert_eq!(waited, Duration::ZERO);
+    }
+
+    struct ProbeDrop(Arc<AtomicUsize>);
+
+    impl Drop for ProbeDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_expired_budget_does_not_start_a_probe() {
+        let plan = three_node_plan();
+        let polls = AtomicUsize::new(0);
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now(),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                polls.fetch_add(1, Ordering::SeqCst);
+                probe_round(async { probes(&[("node-0", answered(true)), ("node-1", answered(false))]) })
+            },
+        )
+        .await;
+        assert_eq!(polls.load(Ordering::SeqCst), 0, "an exhausted shared startup budget must start no RPCs");
+        assert!(matches!(
+            outcome,
+            ReadmissionOutcome::GaveUp {
+                reason: GiveUpReason::DeadlineElapsed,
+                waited: Duration::ZERO,
+                progress: ReadmissionProgress { total_sets: 1, .. },
+            }
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_deadline_cancels_a_suspended_round() {
+        let plan = three_node_plan();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+        let gate = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+            let guard = ProbeDrop(Arc::clone(&dropped));
+            probe_round(async move {
+                let _guard = guard;
+                std::future::pending::<HashMap<String, PeerProbe>>().await
+            })
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(3), gate)
+            .await
+            .expect("startup deadline must interrupt a suspended round");
+        assert!(matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::DeadlineElapsed,
+            waited,
+            progress: ReadmissionProgress { total_sets: 1, .. },
+        } if waited == Duration::from_secs(2)));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "deadline cancels the owned round");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_unreachable_grace_cancels_a_suspended_round() {
+        let plan = three_node_plan();
+        let polls = AtomicUsize::new(0);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+        let gate = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+            let first = polls.fetch_add(1, Ordering::SeqCst) == 0;
+            let guard = ProbeDrop(Arc::clone(&dropped));
+            probe_round(async move {
+                let _guard = guard;
+                if first {
+                    probes(&[("node-0", answered(true)), ("node-1", PeerProbe::Unreachable)])
+                } else {
+                    std::future::pending::<HashMap<String, PeerProbe>>().await
+                }
+            })
+        });
+        let outcome = tokio::time::timeout(UNREACHABLE_PEER_GRACE + Duration::from_secs(1), gate)
+            .await
+            .expect("unreachable grace must interrupt the next suspended round");
+        assert!(matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::PeersUnreachable,
+            waited,
+            ..
+        } if waited == UNREACHABLE_PEER_GRACE));
+        assert_eq!(dropped.load(Ordering::SeqCst), 2, "both completed and suspended rounds release ownership");
+    }
+
+    fn five_node_plan() -> ReadmissionPlan {
+        readmission_plan(&pools(1, 5, (0..5).map(|n| endpoint(&format!("node-{n}"), n == 2, 0, n)).collect()))
+            .expect("five-node plan")
+    }
+
+    fn peer_reply(host: &str, reply: PeerProbe, delay: Duration) -> futures::future::BoxFuture<'static, (String, PeerProbe)> {
+        use futures::FutureExt;
+        let host = format!("{host}:9000");
+        async move {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+            (host, reply)
+        }
+        .boxed()
+    }
+
+    fn suspended_peer(host: &str, dropped: Arc<AtomicUsize>) -> futures::future::BoxFuture<'static, (String, PeerProbe)> {
+        use futures::FutureExt;
+        let host = format!("{host}:9000");
+        let guard = ProbeDrop(dropped);
+        async move {
+            let _guard = guard;
+            let reply = std::future::pending::<PeerProbe>().await;
+            (host, reply)
+        }
+        .boxed()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_five_node_quorum_does_not_wait_for_a_surplus_peer() {
+        let plan = five_node_plan();
+        assert_eq!(plan.sets[0].required_peers, 3);
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                vec![
+                    suspended_peer("node-4", Arc::clone(&dropped)),
+                    peer_reply("node-0", answered(true), Duration::ZERO),
+                    peer_reply("node-1", answered(true), Duration::ZERO),
+                    peer_reply("node-3", answered(true), Duration::ZERO),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert_eq!(outcome, ReadmissionOutcome::Admitted { waited: Duration::ZERO });
+        assert_eq!(dropped.load(Ordering::SeqCst), 1, "surplus RPC is cancelled without a detached task");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_three_node_quorum_waits_for_both_peers() {
+        let plan = three_node_plan();
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                vec![
+                    peer_reply("node-0", answered(true), Duration::ZERO),
+                    peer_reply("node-1", answered(true), Duration::from_secs(2)),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ReadmissionOutcome::Admitted {
+                waited: Duration::from_secs(2)
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_waits_for_every_shared_set() {
+        let plan = readmission_plan(&pools(
+            2,
+            3,
+            vec![
+                endpoint("node-0", false, 0, 0),
+                endpoint("node-1", false, 0, 1),
+                endpoint("node-2", true, 0, 2),
+                endpoint("node-3", false, 1, 0),
+                endpoint("node-2", true, 1, 1),
+                endpoint("node-4", false, 1, 2),
+            ],
+        ))
+        .expect("two shared sets");
+        let second_set = || {
+            PeerProbe::Answered(vec![PeerDriveView {
+                pool_index: 0,
+                set_index: 1,
+                disk_index: 1,
+                online: true,
+            }])
+        };
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                vec![
+                    peer_reply("node-0", answered(true), Duration::ZERO),
+                    peer_reply("node-1", answered(true), Duration::ZERO),
+                    peer_reply("node-3", second_set(), Duration::ZERO),
+                    peer_reply("node-4", second_set(), Duration::from_secs(2)),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert_eq!(
+            outcome,
+            ReadmissionOutcome::Admitted {
+                waited: Duration::from_secs(2)
+            }
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_partial_reachability_resets_grace_before_round_completion() {
+        let plan = five_node_plan();
+        let polls = AtomicUsize::new(0);
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(60),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                let poll = polls.fetch_add(1, Ordering::SeqCst);
+                let recovering = poll == 1;
+                vec![
+                    peer_reply("node-0", answered(true), Duration::ZERO),
+                    peer_reply("node-1", answered(true), Duration::ZERO),
+                    peer_reply(
+                        "node-3",
+                        if recovering { answered(false) } else { PeerProbe::Unreachable },
+                        Duration::ZERO,
+                    ),
+                    peer_reply(
+                        "node-4",
+                        if recovering { answered(false) } else { PeerProbe::Unreachable },
+                        if recovering { Duration::from_secs(20) } else { Duration::ZERO },
+                    ),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::PeersUnreachable, waited, ..
+        } if waited == Duration::from_secs(37)),
+            "old grace must reset at 1s; a new shortfall starts at 22s: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_never_combines_votes_from_different_rounds() {
+        let plan = five_node_plan();
+        let polls = AtomicUsize::new(0);
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(4),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                let entries = if polls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    probes(&[
+                        ("node-0", answered(true)),
+                        ("node-1", answered(true)),
+                        ("node-3", answered(false)),
+                    ])
+                } else {
+                    probes(&[("node-3", answered(true))])
+                };
+                futures::stream::iter(entries)
+            },
+        )
+        .await;
+        assert!(
+            matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::DeadlineElapsed, waited, ..
+        } if waited == Duration::from_secs(4)),
+            "stale affirmative votes must not admit the node: {outcome:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_unsupported_quorum_cancels_other_pending_peers() {
+        let plan = three_node_plan();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(30),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                vec![
+                    suspended_peer("node-1", Arc::clone(&dropped)),
+                    peer_reply("node-0", PeerProbe::Unsupported, Duration::ZERO),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ReadmissionOutcome::GaveUp {
+                reason: GiveUpReason::PeersCannotReport,
+                waited: Duration::ZERO,
+                ..
+            }
+        ));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn gate_deadline_wins_over_a_simultaneous_quorum_reply() {
+        let plan = three_node_plan();
+        let outcome = wait_for_peer_readmission_with(
+            &plan,
+            tokio::time::Instant::now() + Duration::from_secs(2),
+            Duration::from_secs(1),
+            UNREACHABLE_PEER_GRACE,
+            || {
+                vec![
+                    peer_reply("node-0", answered(true), Duration::ZERO),
+                    peer_reply("node-1", answered(true), Duration::from_secs(2)),
+                ]
+                .into_iter()
+                .collect::<FuturesUnordered<_>>()
+            },
+        )
+        .await;
+        assert!(matches!(outcome, ReadmissionOutcome::GaveUp {
+            reason: GiveUpReason::DeadlineElapsed, waited, ..
+        } if waited == Duration::from_secs(2)));
     }
 
     #[test]

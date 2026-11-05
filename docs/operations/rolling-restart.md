@@ -69,6 +69,10 @@ On Kubernetes the dial itself is the slow part. A replaced pod gets a new IP, bu
 
 After a distributed node reaches local readiness, it asks the peers in every erasure set it serves how they currently see its drives. It uses the `PeerDriveAdmission` internode RPC, and each peer answers with the same predicate its own `/health/ready` uses for `unavailableDrives`. Startup readiness is published once a strict majority of each set's peers count all of this node's drives in that set as online. In a three-node set that means both peers. While the node waits, `/health/ready` stays `503` with `startup_finalization_pending` and the log shows `event="startup_peer_readmission" state="waiting"`.
 
+Both local dependency checks and peer re-admission rounds are bounded by the startup budget, including in-flight observations and polling delays. An exhausted peer-readmission budget starts no new probe round. Within a round, startup proceeds as soon as every shared set has its required peer majority; pending surplus read-only RPCs are cancelled. Votes are never carried across rounds. The unreachable-peer grace also bounds in-flight rounds: enough reachable replies clear an earlier shortfall before unrelated peers finish, and only a completed round can establish a new unreachable shortfall.
+
+After deferred IAM initialization succeeds, recovery retains that IAM owner while preparing the topology and claiming the application context once. A later local-readiness timeout retries publication with the prepared context; it does not reinitialize IAM or reinstall the context.
+
 The wait always ends in publication:
 
 - `result="admitted"`: the peers re-admitted the node.
@@ -103,7 +107,7 @@ When the whole cluster (or several nodes) went down and nodes are brought back o
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | How long startup waits for full readiness before continuing in degraded mode with background recovery. Raising it delays the listener during genuinely slow starts; lowering it surfaces degraded mode sooner. Recovery retries continue regardless of this limit. |
+| `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | Budget per readiness-publication attempt for local readiness and subsequent peer re-admission, including in-flight checks and polling delays. Local timeout returns an error to the startup/recovery caller; peer re-admission timeout publishes readiness with a warning. Raising it can delay S3 admission; the HTTP listeners are already bound. |
 | `RUSTFS_STARTUP_PEER_READMISSION_ENABLE` | `true` (`DEFAULT_STARTUP_PEER_READMISSION_ENABLE`) | Hold startup readiness until a strict majority of each erasure set's peers count this node's drives online. The wait is bounded by `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` and fails open. Set `false` to publish on this node's own view only. |
 | `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` | `2` (`DEFAULT_DRIVE_RETURNING_PROBE_INTERVAL_SECS`) | Interval between recovery probes to a remote drive that is `offline` or `returning`. |
 | `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` | `3` (`DEFAULT_DRIVE_RETURNING_SUCCESS_THRESHOLD`) | Consecutive successful probes before an `offline` remote drive is `online` again. Together with the interval this bounds how long survivors keep a restarted peer out after they can dial it. |
