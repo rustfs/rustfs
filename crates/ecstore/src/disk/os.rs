@@ -610,6 +610,26 @@ pub(crate) mod prepare_rename_test_hooks {
             hook();
         }
     }
+
+    /// Hooks keyed by a directory component name, run before a Windows
+    /// directory pin retries a transient sharing conflict on it.
+    #[cfg(windows)]
+    static BEFORE_COMPONENT_RETRY: LazyLock<Mutex<HashMap<std::ffi::OsString, Hook>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    #[cfg(windows)]
+    pub(crate) fn install_before_component_retry(component: &std::ffi::OsStr, hook: impl FnOnce() + Send + 'static) {
+        BEFORE_COMPONENT_RETRY.lock().insert(component.to_os_string(), Box::new(hook));
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn run_before_component_retry(component: &std::ffi::OsStr) {
+        let hook = BEFORE_COMPONENT_RETRY.lock().remove(component);
+        if let Some(hook) = hook {
+            let _pause = super::enter_blocking_test_hook();
+            hook();
+        }
+    }
 }
 
 /// Fsync a directory so recently created or renamed entries survive power loss.
@@ -6330,9 +6350,6 @@ fn lock_windows_directory_tree(path: &Path, publication_root: &PublicationRoot) 
 }
 
 #[cfg(windows)]
-// SAFETY: the object attributes borrow a checked UTF-16 component and live
-// parent handle for the duration of the synchronous NtCreateFile call.
-#[allow(unsafe_code)]
 fn open_windows_relative(
     parent: &winapi_util::Handle,
     component: &std::ffi::OsStr,
@@ -6343,6 +6360,64 @@ fn open_windows_relative(
     file_attributes: u32,
     dont_reparse: bool,
 ) -> io::Result<winapi_util::Handle> {
+    open_windows_relative_with_status(
+        parent,
+        component,
+        &WindowsRelativeOpen {
+            desired_access,
+            share_access,
+            create_disposition,
+            create_options,
+            file_attributes,
+            dont_reparse,
+        },
+    )
+    .map_err(|failure| failure.error)
+}
+
+/// `NtCreateFile` arguments for one handle-relative open.
+#[cfg(windows)]
+struct WindowsRelativeOpen {
+    desired_access: u32,
+    share_access: u32,
+    create_disposition: u32,
+    create_options: u32,
+    file_attributes: u32,
+    dont_reparse: bool,
+}
+
+/// A failed relative open that keeps the NTSTATUS, which tells transient
+/// states such as a pending delete apart from errors that share its Win32 code.
+#[cfg(windows)]
+struct WindowsRelativeOpenError {
+    status: Option<windows_sys::Win32::Foundation::NTSTATUS>,
+    error: io::Error,
+}
+
+#[cfg(windows)]
+impl From<io::Error> for WindowsRelativeOpenError {
+    fn from(error: io::Error) -> Self {
+        Self { status: None, error }
+    }
+}
+
+#[cfg(windows)]
+// SAFETY: the object attributes borrow a checked UTF-16 component and live
+// parent handle for the duration of the synchronous NtCreateFile call.
+#[allow(unsafe_code)]
+fn open_windows_relative_with_status(
+    parent: &winapi_util::Handle,
+    component: &std::ffi::OsStr,
+    request: &WindowsRelativeOpen,
+) -> std::result::Result<winapi_util::Handle, WindowsRelativeOpenError> {
+    let &WindowsRelativeOpen {
+        desired_access,
+        share_access,
+        create_disposition,
+        create_options,
+        file_attributes,
+        dont_reparse,
+    } = request;
     use std::{
         mem::size_of,
         os::windows::{ffi::OsStrExt, io::AsRawHandle, io::FromRawHandle},
@@ -6357,10 +6432,7 @@ fn open_windows_relative(
 
     let mut name = component.encode_wide().collect::<Vec<_>>();
     if name.is_empty() || name.contains(&0) {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "relative Windows file name is empty or contains a NUL",
-        ));
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "relative Windows file name is empty or contains a NUL").into());
     }
     let name_bytes = name
         .len()
@@ -6400,13 +6472,17 @@ fn open_windows_relative(
         )
     };
     if status < 0 {
-        return match i32::try_from(unsafe { RtlNtStatusToDosError(status) }) {
-            Ok(code) => Err(io::Error::from_raw_os_error(code)),
-            Err(_) => Err(io::Error::other(format!("Windows relative open failed with NTSTATUS {status:#x}"))),
+        let error = match i32::try_from(unsafe { RtlNtStatusToDosError(status) }) {
+            Ok(code) => io::Error::from_raw_os_error(code),
+            Err(_) => io::Error::other(format!("Windows relative open failed with NTSTATUS {status:#x}")),
         };
+        return Err(WindowsRelativeOpenError {
+            status: Some(status),
+            error,
+        });
     }
     if handle.is_null() {
-        return Err(io::Error::other("Windows relative open returned an invalid handle"));
+        return Err(io::Error::other("Windows relative open returned an invalid handle").into());
     }
 
     Ok(unsafe { winapi_util::Handle::from_raw_handle(handle) })
@@ -6705,6 +6781,14 @@ pub(crate) fn compare_and_update_control_file(
     Ok(ConditionalFileUpdate::Updated)
 }
 
+/// How often a directory pin retries a transient delete-access conflict.
+/// Six doubling delays from 1 ms wait about 63 ms in total, which outlasts a
+/// prune whose thread is preempted while it holds delete access.
+#[cfg(windows)]
+const WINDOWS_DIRECTORY_PIN_RETRIES: u32 = 6;
+#[cfg(windows)]
+const WINDOWS_DIRECTORY_PIN_FIRST_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(1);
+
 /// Pin one directory component of a guarded path.
 ///
 /// The handle shares reads and writes but never delete: renaming or removing
@@ -6717,6 +6801,15 @@ pub(crate) fn compare_and_update_control_file(
 /// ERROR_SHARING_VIOLATION. Write sharing does not unpin an ancestor: a
 /// pinned ancestor always contains its pinned child, and NTFS sets a
 /// name-surrogate reparse point only on an empty directory.
+///
+/// Excluding delete also means the open fails while another handle holds
+/// delete access. Pruning an empty prefix directory takes that access only
+/// briefly: `RemoveDirectoryW` opens the directory for delete and closes it
+/// again, whether or not the directory turns out to be empty. A sharing
+/// violation or a pending delete is therefore retried a bounded number of
+/// times. After a removal finishes, the retry sees the directory as missing
+/// and follows `create_disposition`, so `FILE_OPEN` still reports it missing
+/// and `FILE_OPEN_IF` creates it again.
 #[cfg(windows)]
 fn open_windows_directory_component(
     parent: &WindowsDirectoryHandle,
@@ -6725,22 +6818,41 @@ fn open_windows_directory_component(
 ) -> io::Result<WindowsDirectoryHandle> {
     use windows_sys::{
         Wdk::Storage::FileSystem::{FILE_DIRECTORY_FILE, FILE_OPEN_REPARSE_POINT},
-        Win32::Storage::FileSystem::{
-            FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            FILE_TRAVERSE,
+        Win32::{
+            Foundation::{STATUS_DELETE_PENDING, STATUS_SHARING_VIOLATION},
+            Storage::FileSystem::{
+                FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_READ, FILE_SHARE_WRITE,
+                FILE_TRAVERSE,
+            },
         },
     };
 
-    let anchor = open_windows_relative(
-        &parent.handle,
-        component,
-        FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
-        FILE_SHARE_READ | FILE_SHARE_WRITE,
+    let request = WindowsRelativeOpen {
+        desired_access: FILE_TRAVERSE | FILE_READ_ATTRIBUTES,
+        share_access: FILE_SHARE_READ | FILE_SHARE_WRITE,
         create_disposition,
-        FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
-        FILE_ATTRIBUTE_DIRECTORY,
-        true,
-    )?;
+        create_options: FILE_DIRECTORY_FILE | FILE_OPEN_REPARSE_POINT,
+        file_attributes: FILE_ATTRIBUTE_DIRECTORY,
+        dont_reparse: true,
+    };
+    let mut retry_delay = WINDOWS_DIRECTORY_PIN_FIRST_RETRY_DELAY;
+    let mut retries = 0;
+    let anchor = loop {
+        match open_windows_relative_with_status(&parent.handle, component, &request) {
+            Ok(anchor) => break anchor,
+            Err(WindowsRelativeOpenError {
+                status: Some(STATUS_SHARING_VIOLATION | STATUS_DELETE_PENDING),
+                ..
+            }) if retries < WINDOWS_DIRECTORY_PIN_RETRIES => {
+                #[cfg(test)]
+                prepare_rename_test_hooks::run_before_component_retry(component);
+                std::thread::sleep(retry_delay);
+                retry_delay = retry_delay.saturating_mul(2);
+                retries += 1;
+            }
+            Err(failure) => return Err(failure.error),
+        }
+    };
     let info = windows_file_attribute_tag(&anchor)?;
     if info.FileAttributes & FILE_ATTRIBUTE_DIRECTORY == 0 {
         return Err(io::Error::from(io::ErrorKind::NotADirectory));
@@ -9668,6 +9780,70 @@ mod tests {
     }
 
     #[cfg(windows)]
+    #[test]
+    fn windows_directory_pin_retries_a_transient_delete_holder_and_fails_closed_on_a_lasting_one() {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::{
+            Foundation::ERROR_SHARING_VIOLATION,
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE,
+                FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+            },
+        };
+
+        // Open the prefix the way `RemoveDirectoryW` does while it prunes an
+        // object prefix: delete access, every share mode granted.
+        let open_like_a_pruner = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .access_mode(DELETE | SYNCHRONIZE | FILE_READ_ATTRIBUTES)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(path)
+                .expect("open the prefix for delete")
+        };
+        let temp_dir = tempdir().expect("create temp dir");
+        let base = temp_dir.path().join("bucket");
+        let publication_root = PublicationRoot::new(temp_dir.path()).expect("open publication root");
+
+        let transient_name = uuid::Uuid::new_v4().to_string();
+        let transient_prefix = base.join(&transient_name);
+        std::fs::create_dir_all(&transient_prefix).expect("create transient prefix");
+        let holder = Arc::new(std::sync::Mutex::new(Some(open_like_a_pruner(&transient_prefix))));
+        let holder_for_hook = Arc::clone(&holder);
+        let released = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let released_for_hook = Arc::clone(&released);
+        prepare_rename_test_hooks::install_before_component_retry(std::ffi::OsStr::new(&transient_name), move || {
+            holder_for_hook.lock().expect("holder mutex poisoned").take();
+            released_for_hook.store(true, std::sync::atomic::Ordering::Release);
+        });
+        let child = transient_prefix.join("child");
+        let guard = super::mkdir_all_below_existing_base_std(&child, &base, &publication_root)
+            .expect("a pin must outlast a transient delete holder");
+        assert!(
+            released.load(std::sync::atomic::Ordering::Acquire),
+            "the pin must have met the delete holder"
+        );
+        assert!(child.is_dir(), "the retried walk must still create the child");
+        let err = std::fs::OpenOptions::new()
+            .access_mode(DELETE)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&transient_prefix)
+            .expect_err("the retried pin must still exclude deletion");
+        assert_eq!(err.raw_os_error(), i32::try_from(ERROR_SHARING_VIOLATION).ok());
+        drop(guard);
+
+        let lasting_prefix = base.join(uuid::Uuid::new_v4().to_string());
+        std::fs::create_dir_all(&lasting_prefix).expect("create lasting prefix");
+        let lasting_holder = open_like_a_pruner(&lasting_prefix);
+        let Err(err) = super::mkdir_all_below_existing_base_std(&lasting_prefix.join("child"), &base, &publication_root) else {
+            panic!("a pin must not wait forever on a lasting delete holder");
+        };
+        assert_eq!(err.raw_os_error(), i32::try_from(ERROR_SHARING_VIOLATION).ok());
+        drop(lasting_holder);
+    }
+
+    #[cfg(windows)]
     #[tokio::test]
     async fn windows_rename_all_supports_same_parent_publication() {
         let temp_dir = tempdir().expect("create temp dir");
@@ -10398,30 +10574,51 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn windows_rename_all_excludes_source_parent_reparse_writers() {
+    async fn windows_rename_all_keeps_the_source_parent_from_becoming_a_reparse_point() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::{
-            Foundation::GENERIC_WRITE,
-            Storage::FileSystem::{FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE},
+            Foundation::{ERROR_DIR_NOT_EMPTY, ERROR_SHARING_VIOLATION, GENERIC_WRITE},
+            Storage::FileSystem::{
+                DELETE, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+                FILE_SHARE_WRITE,
+            },
         };
 
         let temp_dir = tempdir().expect("create temp dir");
         let base = temp_dir.path().join("bucket");
         let source_parent = temp_dir.path().join("staging");
+        let outside = temp_dir.path().join("outside");
         let src = source_parent.join("staged-object");
         let dst = base.join("published-object");
         std::fs::create_dir(&base).expect("create destination base");
         std::fs::create_dir(&source_parent).expect("create source parent");
+        std::fs::create_dir(&outside).expect("create outside target");
         std::fs::write(&src, b"original").expect("write original staged object");
 
         let source_parent_for_hook = source_parent.clone();
+        let outside_for_hook = outside.clone();
         windows_rename_test_hooks::install_before_publication(&dst, move || {
-            std::fs::OpenOptions::new()
+            // The pin shares writes, so a writer can open the source parent,
+            // but the parent still holds the staged entry and NTFS refuses to
+            // turn a non-empty directory into a mount point.
+            let writable_parent = std::fs::OpenOptions::new()
                 .access_mode(GENERIC_WRITE)
                 .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
                 .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
                 .open(&source_parent_for_hook)
-                .expect_err("the source-parent guard must exclude a reparse writer");
+                .map(winapi_util::Handle::from_file)
+                .expect("a write-sharing pin admits a concurrent writer");
+            let err = try_set_windows_mount_point(&writable_parent, &outside_for_hook)
+                .expect_err("the pinned source parent must not become a mount point");
+            assert_eq!(err.raw_os_error(), i32::try_from(ERROR_DIR_NOT_EMPTY).ok());
+
+            let err = std::fs::OpenOptions::new()
+                .access_mode(DELETE)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+                .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+                .open(&source_parent_for_hook)
+                .expect_err("the source-parent guard must exclude deletion and rename");
+            assert_eq!(err.raw_os_error(), i32::try_from(ERROR_SHARING_VIOLATION).ok());
         });
 
         rename_all(&src, &dst, &base)
@@ -10430,6 +10627,7 @@ mod tests {
 
         assert!(!src.exists(), "the original staged entry must be moved");
         assert_eq!(std::fs::read(&dst).expect("read published original object"), b"original");
+        assert!(!outside.join("published-object").exists(), "publication must not escape the base");
     }
 
     #[cfg(windows)]
