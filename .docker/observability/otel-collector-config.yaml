@@ -28,6 +28,12 @@ processors:
     check_interval: 1s
     limit_mib: 1024
     spike_limit_mib: 256
+  resource/metrics:
+    attributes:
+      # RustFS process metrics already expose process_pid as a metric label.
+      # Promoting resource process.pid would create a duplicate Prometheus label.
+      - key: process.pid
+        action: delete
   transform/logs:
     error_mode: ignore
     log_statements:
@@ -112,7 +118,7 @@ service:
       exporters: [ otlp/tempo, otlp/jaeger ]
     metrics:
       receivers: [ otlp ]
-      processors: [ batch ]
+      processors: [ resource/metrics, memory_limiter, batch ]
       exporters: [ prometheus ]
     logs:
       receivers: [ otlp ]
