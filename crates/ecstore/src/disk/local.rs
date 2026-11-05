@@ -9992,12 +9992,7 @@ impl LocalDisk {
                         if !std::fs::symlink_metadata(&receipt_path)?.is_file() {
                             return Err(std::io::Error::new(ErrorKind::InvalidData, "delete receipt is not a regular file"));
                         }
-                        // Windows only flushes a handle opened for writing.
-                        #[cfg(windows)]
-                        let receipt = std::fs::OpenOptions::new().write(true).open(receipt_path)?;
-                        #[cfg(not(windows))]
-                        let receipt = std::fs::File::open(receipt_path)?;
-                        receipt
+                        os::open_file_for_sync_std(&receipt_path)?
                     }
                     Err(err) => return Err(err),
                 };
@@ -14518,11 +14513,7 @@ impl DiskAPI for LocalDisk {
                     return Ok(Err(DiskError::FileCorrupt));
                 }
                 let verify_and_sync = (|| -> std::io::Result<bool> {
-                    // Windows only flushes a handle opened for writing.
-                    #[cfg(windows)]
-                    let mut file = std::fs::OpenOptions::new().read(true).write(true).open(&source)?;
-                    #[cfg(not(windows))]
-                    let mut file = std::fs::File::open(&source)?;
+                    let mut file = os::open_file_for_sync_std(&source)?;
                     let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
                     std::io::Read::read_exact(&mut file, &mut header)?;
                     if header != integrity.index_header() {

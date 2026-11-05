@@ -198,12 +198,7 @@ pub(super) fn create_local_inline_rollback_backup(
             return Err(err);
         }
     } else if sync && !old_metadata.is_empty() {
-        // Windows only flushes a handle opened for writing.
-        #[cfg(windows)]
-        let backup = std::fs::OpenOptions::new().write(true).open(&backup_path)?;
-        #[cfg(not(windows))]
-        let backup = std::fs::File::open(&backup_path)?;
-        backup.sync_data()?;
+        os::open_file_for_sync_std(&backup_path)?.sync_data()?;
     }
     Ok(backup_path)
 }

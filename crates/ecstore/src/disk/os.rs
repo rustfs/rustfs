@@ -664,6 +664,16 @@ pub(crate) fn fsync_directory_handle_std(dir: &Path, opened: Option<&std::fs::Fi
     Ok(())
 }
 
+/// Open an existing file to read it and flush it. Windows flushes only a
+/// handle with write access, so the file is opened read-write there; other
+/// platforms keep the read-only open that `sync_all` already accepts.
+pub(crate) fn open_file_for_sync_std(path: &Path) -> io::Result<std::fs::File> {
+    #[cfg(windows)]
+    return std::fs::OpenOptions::new().read(true).write(true).open(path);
+    #[cfg(not(windows))]
+    std::fs::File::open(path)
+}
+
 /// Async wrapper around [`fsync_dir_std`]; runs the blocking Unix fsync off the runtime.
 pub async fn fsync_dir(dir: impl AsRef<Path>) -> io::Result<()> {
     fsync_dir_with_owner(dir.as_ref(), None).await
