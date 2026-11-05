@@ -14,11 +14,7 @@
 
 //! Lock optimization metrics recording functions.
 
-use std::sync::LazyLock;
 use std::time::Duration;
-
-const PROCESS_PID_LABEL: &str = "process_pid";
-static PROCESS_PID_VALUE: LazyLock<String> = LazyLock::new(|| std::process::id().to_string());
 
 /// Record lock optimization enabled.
 #[inline(always)]
@@ -153,8 +149,7 @@ pub fn record_object_lock_diag_acquire_duration(op: &'static str, mode: &'static
     histogram!(
         "rustfs_object_lock_diag_acquire_duration_seconds",
         "op" => op,
-        "mode" => mode,
-        PROCESS_PID_LABEL => PROCESS_PID_VALUE.as_str()
+        "mode" => mode
     )
     .record(duration.as_secs_f64());
 }
@@ -166,8 +161,7 @@ pub fn record_object_lock_diag_hold_duration(op: &'static str, mode: &'static st
     histogram!(
         "rustfs_object_lock_diag_hold_duration_seconds",
         "op" => op,
-        "mode" => mode,
-        PROCESS_PID_LABEL => PROCESS_PID_VALUE.as_str()
+        "mode" => mode
     )
     .record(duration.as_secs_f64());
 }
@@ -179,8 +173,7 @@ pub fn record_object_lock_diag_slow_acquire(op: &'static str, mode: &'static str
     counter!(
         "rustfs_object_lock_diag_slow_acquire_total",
         "op" => op,
-        "mode" => mode,
-        PROCESS_PID_LABEL => PROCESS_PID_VALUE.as_str()
+        "mode" => mode
     )
     .increment(1);
 }
@@ -192,8 +185,7 @@ pub fn record_object_lock_diag_slow_hold(op: &'static str, mode: &'static str) {
     counter!(
         "rustfs_object_lock_diag_slow_hold_total",
         "op" => op,
-        "mode" => mode,
-        PROCESS_PID_LABEL => PROCESS_PID_VALUE.as_str()
+        "mode" => mode
     )
     .increment(1);
 }
@@ -438,16 +430,6 @@ mod tests {
         assert!(
             recorder.saw_histogram_named("rustfs_object_lock_diag_acquire_duration_seconds"),
             "expected object lock diagnostics acquire histogram to be emitted"
-        );
-        let histogram_keys = recorder.histograms.lock().expect("histogram keys should be lockable");
-        let key = histogram_keys
-            .iter()
-            .find(|key| key.name() == "rustfs_object_lock_diag_acquire_duration_seconds")
-            .expect("acquire histogram key should be registered");
-        assert!(
-            key.labels()
-                .any(|label| label.key() == PROCESS_PID_LABEL && label.value() == std::process::id().to_string()),
-            "lock histogram must carry the emitting process PID"
         );
     }
 

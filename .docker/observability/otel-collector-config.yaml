@@ -32,11 +32,11 @@ processors:
     error_mode: ignore
     metric_statements:
       # RustFS process metrics already expose process_pid as a metric label.
-      # Keep process.pid on other metrics (including lock histograms) so their
-      # Prometheus series remain attributable across process restarts.
+      # Remove only the duplicate datapoint label and keep the shared resource
+      # process.pid available to sibling metrics and lock histograms.
       - context: metric
         statements:
-          - delete_key(resource.attributes, "process.pid") where IsMatch(name, "^rustfs_system_process_")
+          - delete_key(attributes, "process_pid") where IsMatch(name, "^rustfs_system_process_")
   transform/logs:
     error_mode: ignore
     log_statements:
