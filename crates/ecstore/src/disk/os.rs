@@ -3803,7 +3803,7 @@ pub(crate) async fn rename_reconciled_metadata(
     authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
 ) -> Result<()> {
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
-    run_blocking_namespace_operation(lease, move || {
+    run_blocking_namespace_operation_with_sync(lease, true, move || {
         let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
@@ -4797,6 +4797,23 @@ pub(crate) async fn run_cancellable_blocking_namespace_operation<T: Send + 'stat
     let queue = Arc::clone(&lease.blocking_queue);
     queue
         .run_cancellable(move |is_cancelled| {
+            let _lease = lease;
+            operation(is_cancelled)
+        })
+        .await
+}
+
+pub(crate) async fn run_cancellable_blocking_namespace_operation_with_sync<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    sync: bool,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    if !sync {
+        return run_cancellable_blocking_namespace_operation(lease, operation).await;
+    }
+    let queue = Arc::clone(&lease.blocking_queue);
+    queue
+        .run_fsync_cancellable(move |is_cancelled| {
             let _lease = lease;
             operation(is_cancelled)
         })
