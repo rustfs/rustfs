@@ -17,3 +17,4 @@ mod json_document_table;
 mod json_lines_schema;
 pub mod manager;
 mod parquet_table;
+mod schema_inference;

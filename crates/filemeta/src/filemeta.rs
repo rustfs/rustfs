@@ -3931,6 +3931,34 @@ mod test {
     }
 
     #[test]
+    fn add_version_rejects_mod_times_that_cannot_round_trip() {
+        for nanos in [0, i128::from(i64::MAX) + 1, i128::from(i64::MIN) - 1, 1_i128 << 64] {
+            for deleted in [false, true] {
+                let mut meta = FileMeta::new();
+                let mut info = crate::fileinfo::FileInfo::new("object", 2, 1);
+                info.deleted = deleted;
+                info.mod_time = Some(OffsetDateTime::from_unix_timestamp_nanos(nanos).expect("time within supported date range"));
+                assert!(
+                    meta.add_version(info).is_err(),
+                    "unrepresentable time {nanos} must be rejected before publication"
+                );
+            }
+        }
+        for nanos in [-1, 1, i64::MIN, i64::MAX] {
+            let mut meta = FileMeta::new();
+            let mut info = crate::fileinfo::FileInfo::new("object", 2, 1);
+            let time = OffsetDateTime::from_unix_timestamp_nanos(i128::from(nanos)).expect("valid codec time");
+            info.mod_time = Some(time);
+            meta.add_version(info).expect("representable times remain supported");
+            let reopened = FileMeta::load(&meta.marshal_msg().expect("serialize version")).expect("reopen version");
+            let versions = reopened
+                .get_file_info_versions("bucket", "object", false)
+                .expect("read version history");
+            assert_eq!(versions.versions[0].mod_time, Some(time));
+        }
+    }
+
+    #[test]
     fn test_data_integrity_validation() {
         // Test data integrity checks
         let mut fm = FileMeta::new();

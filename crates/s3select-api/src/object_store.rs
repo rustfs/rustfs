@@ -424,7 +424,7 @@ impl EcObjectStore {
 
     async fn object_reader(&self, range: Option<HTTPRangeSpec>) -> Result<SelectGetObjectReader> {
         #[cfg(test)]
-        self.reader_open_count.fetch_add(1, Ordering::Relaxed);
+        test::pause_before_reader_open(&self.input.bucket, self.reader_open_count.fetch_add(1, Ordering::Relaxed) + 1).await;
         self.snapshot(None)
             .await?
             .open_reader(range)
@@ -1416,7 +1416,6 @@ mod test {
     use futures::{StreamExt, TryStreamExt, stream};
     use http::HeaderMap;
     use parking_lot::Mutex;
-    use rustfs_test_utils::PutObjectCommitBarrier;
     use s3s::S3ErrorCode;
     use s3s::dto::{
         CSVInput, CSVOutput, CompressionType, ExpressionType, FileHeaderInfo, InputSerialization, JSONInput, JSONOutput,
@@ -1432,6 +1431,54 @@ mod test {
     };
 
     use tokio::{io::AsyncReadExt, sync::Semaphore};
+
+    struct ReaderOpenPause {
+        bucket: String,
+        ordinal: usize,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static READER_OPEN_PAUSE: Mutex<Option<Arc<ReaderOpenPause>>> = Mutex::new(None);
+
+    struct ReaderOpenPauseGuard(Arc<ReaderOpenPause>);
+
+    impl ReaderOpenPauseGuard {
+        fn install(bucket: &str, ordinal: usize) -> Self {
+            let hook = Arc::new(ReaderOpenPause {
+                bucket: bucket.to_owned(),
+                ordinal,
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            *READER_OPEN_PAUSE.lock() = Some(Arc::clone(&hook));
+            Self(hook)
+        }
+        async fn wait(&self) {
+            tokio::time::timeout(std::time::Duration::from_secs(10), self.0.reached.notified())
+                .await
+                .expect("query reached next range");
+        }
+    }
+
+    impl Drop for ReaderOpenPauseGuard {
+        fn drop(&mut self) {
+            *READER_OPEN_PAUSE.lock() = None;
+            self.0.release.notify_one();
+        }
+    }
+
+    pub(super) async fn pause_before_reader_open(bucket: &str, ordinal: usize) {
+        let hook = READER_OPEN_PAUSE
+            .lock()
+            .as_ref()
+            .filter(|hook| hook.bucket == bucket && hook.ordinal == ordinal)
+            .cloned();
+        if let Some(hook) = hook {
+            hook.reached.notify_one();
+            hook.release.notified().await;
+        }
+    }
 
     const JSON_DOCUMENT_TEST_MEMORY_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1705,7 +1752,7 @@ mod test {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[serial_test::serial]
-    async fn legacy_constructor_reuses_head_snapshot_for_body() {
+    async fn legacy_constructor_revalidates_head_snapshot_before_body() {
         const BUCKET: &str = "s3select-lazy-snapshot-head-body";
         const OBJECT: &str = "input.csv";
         const OLD_DATA: &[u8] = b"id,name\n1,old\n";
@@ -1727,34 +1774,15 @@ mod test {
             .expect("HEAD should lazily prepare the snapshot");
         assert_eq!(head.meta.size, u64::try_from(OLD_DATA.len()).expect("fixture length should fit in u64"));
 
-        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
-        let writer = tokio::spawn(async move {
-            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
-        });
-        commit_barrier.wait_until_paused().await;
-        commit_barrier.release_and_wait_until_namespace_pending().await;
-        assert!(!writer.is_finished(), "overwrite must wait for the lazy snapshot");
-
-        let result = store
+        tokio::time::timeout(std::time::Duration::from_secs(5), env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()))
+            .await
+            .expect("HEAD snapshot must not block overwrite");
+        let error = store
             .get_opts(&Path::from(OBJECT), GetOptions::default())
             .await
-            .expect("body should reuse the HEAD snapshot");
-        let GetResultPayload::Stream(stream) = result.payload else {
-            panic!("expected streaming snapshot body");
-        };
-        let bytes = stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect lazy snapshot body")
-            .concat();
-        assert_eq!(bytes, OLD_DATA);
+            .expect_err("first body open must revalidate HEAD generation");
+        assert!(error.to_string().contains("object read semantics changed"));
         assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 1);
-
-        drop(store);
-        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
-            .await
-            .expect("overwrite should finish after the lazy snapshot is released")
-            .expect("overwrite task should join");
         assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
     }
 
@@ -2089,39 +2117,23 @@ mod test {
             selected_start,
             selected_start,
         );
-        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
-        let writer = tokio::spawn(async move {
-            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
+        let store = Arc::new(store);
+        let pause = ReaderOpenPauseGuard::install(BUCKET, 2);
+        let reading = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.get_opts(&Path::from(OBJECT), GetOptions::default()).await }
         });
-        commit_barrier.wait_until_paused().await;
-        commit_barrier.release_and_wait_until_namespace_pending().await;
-        assert!(
-            !writer.is_finished(),
-            "overwrite must remain blocked while the SelectObjectContent snapshot is alive"
-        );
-
-        let result = store
-            .get_opts(&Path::from(OBJECT), GetOptions::default())
+        pause.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()))
             .await
-            .expect("read CSV header and body from one snapshot");
-        let GetResultPayload::Stream(stream) = result.payload else {
-            panic!("expected streaming CSV header/body payload");
+            .expect("writer must complete between Select range opens");
+        drop(pause);
+        let error = match reading.await.expect("query task") {
+            Ok(_) => panic!("query must not combine old context with replacement body"),
+            Err(error) => error,
         };
-        let bytes = stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect CSV header/body snapshot")
-            .concat();
-
-        assert_eq!(bytes, b"old_header,value\nold_body,1\n");
+        assert!(error.to_string().contains("object read semantics changed"));
         assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 2);
-        assert!(!writer.is_finished(), "overwrite must remain blocked after both snapshot readers finish");
-
-        drop(store);
-        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
-            .await
-            .expect("overwrite should finish after the snapshot is released")
-            .expect("overwrite task should join");
         assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
     }
 
@@ -2143,42 +2155,23 @@ mod test {
 
         let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
         let store = scan_range_csv_store(BUCKET, OBJECT, snapshot, "aa", None, 4, 5);
-        let commit_barrier = PutObjectCommitBarrier::before_namespace(BUCKET, OBJECT);
-        let writer = tokio::spawn(async move {
-            env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()).await;
+        let store = Arc::new(store);
+        let pause = ReaderOpenPauseGuard::install(BUCKET, 2);
+        let reading = tokio::spawn({
+            let store = Arc::clone(&store);
+            async move { store.get_opts(&Path::from(OBJECT), GetOptions::default()).await }
         });
-        commit_barrier.wait_until_paused().await;
-        commit_barrier.release_and_wait_until_namespace_pending().await;
-        assert!(
-            !writer.is_finished(),
-            "overwrite must remain blocked while the SelectObjectContent snapshot is alive"
-        );
-
-        let result = store
-            .get_opts(&Path::from(OBJECT), GetOptions::default())
+        pause.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(5), env.put_object_bytes(BUCKET, OBJECT, NEW_DATA.to_vec()))
             .await
-            .expect("read ScanRange context and main body from one snapshot");
-        let GetResultPayload::Stream(stream) = result.payload else {
-            panic!("expected streaming ScanRange context payload");
+            .expect("writer must complete between Select range opens");
+        drop(pause);
+        let error = match reading.await.expect("query task") {
+            Ok(_) => panic!("query must not combine old context with replacement body"),
+            Err(error) => error,
         };
-        let bytes = stream
-            .try_collect::<Vec<_>>()
-            .await
-            .expect("collect ScanRange context snapshot")
-            .concat();
-
-        assert_eq!(bytes, b"a222\r\n");
+        assert!(error.to_string().contains("object read semantics changed"));
         assert_eq!(store.reader_open_count.load(Ordering::Relaxed), 2);
-        assert!(
-            !writer.is_finished(),
-            "overwrite must remain blocked after context and main readers finish"
-        );
-
-        drop(store);
-        tokio::time::timeout(std::time::Duration::from_secs(5), writer)
-            .await
-            .expect("overwrite should finish after the snapshot is released")
-            .expect("overwrite task should join");
         assert_eq!(read_current_object(BUCKET, OBJECT).await, NEW_DATA);
     }
 
@@ -2466,6 +2459,117 @@ mod test {
     fn test_scan_range_start_after_end_is_rejected() {
         let err = scan_range_from_bounds(Some(20), Some(10), 100).unwrap_err();
         assert!(err.to_string().contains("ScanRange"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[serial_test::serial]
+    async fn parquet_snapshot_rejects_overwrite_between_footer_and_data_ranges() {
+        use datafusion::arrow::{
+            array::StringArray,
+            datatypes::{DataType, Field, Schema},
+            record_batch::RecordBatch,
+        };
+        use datafusion::object_store::ObjectStoreExt as _;
+        use datafusion::parquet::{
+            arrow::{
+                ArrowWriter,
+                arrow_reader::ArrowReaderOptions,
+                async_reader::{AsyncFileReader, ParquetRecordBatchStreamBuilder},
+            },
+            basic::Compression,
+            errors::{ParquetError, Result as ParquetResult},
+            file::{
+                metadata::{ParquetMetaData, ParquetMetaDataReader},
+                properties::WriterProperties,
+            },
+        };
+        use futures::future::BoxFuture;
+
+        struct SnapshotParquetReader {
+            store: Arc<EcObjectStore>,
+            path: Path,
+            file_size: u64,
+        }
+
+        impl AsyncFileReader for SnapshotParquetReader {
+            fn get_bytes(&mut self, range: std::ops::Range<u64>) -> BoxFuture<'_, ParquetResult<Bytes>> {
+                Box::pin(async move {
+                    self.store
+                        .get_range(&self.path, range)
+                        .await
+                        .map_err(|error| ParquetError::External(Box::new(error)))
+                })
+            }
+
+            fn get_metadata<'a>(
+                &'a mut self,
+                options: Option<&'a ArrowReaderOptions>,
+            ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
+                Box::pin(async move {
+                    let file_size = self.file_size;
+                    let metadata = ParquetMetaDataReader::new()
+                        .with_arrow_reader_options(options)
+                        .load_and_finish(self, file_size)
+                        .await?;
+                    Ok(Arc::new(metadata))
+                })
+            }
+        }
+        const BUCKET: &str = "select-parquet-range-generation";
+        const OBJECT: &str = "input.parquet";
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let values = (0..6000)
+            .map(|index| format!("{index:08}{}", "x".repeat(248)))
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(StringArray::from(values))]).expect("Parquet batch");
+        let props = WriterProperties::builder()
+            .set_dictionary_enabled(false)
+            .set_compression(Compression::UNCOMPRESSED)
+            .build();
+        let mut bytes = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut bytes, schema, Some(props)).expect("Parquet writer");
+        writer.write(&batch).expect("Parquet rows");
+        writer.close().expect("Parquet footer");
+        assert!(bytes.len() > 1024 * 1024, "fixture requires data outside the footer prefetch");
+        let env = crate::storage_api::select_test_ecstore_env().await;
+        env.make_bucket(BUCKET, false).await;
+        env.put_object_bytes(BUCKET, OBJECT, bytes.clone()).await;
+        let snapshot = prepare_test_snapshot(BUCKET, OBJECT).await;
+        let mut input = (*csv_input(BUCKET, OBJECT)).clone();
+        input.request.input_serialization.csv = None;
+        input.request.input_serialization.parquet = Some(s3s::dto::ParquetInput {});
+        let store = Arc::new(EcObjectStore::new_with_snapshot(Arc::new(input), Arc::clone(&snapshot)).expect("Parquet store"));
+        let (footer_ready, footer_loaded) = tokio::sync::oneshot::channel();
+        let (resume_data, data_ready) = tokio::sync::oneshot::channel();
+        let file_size = snapshot.logical_size();
+        let query_store = store.clone();
+        let query = tokio::spawn(async move {
+            let reader = SnapshotParquetReader {
+                store: query_store,
+                path: Path::from(OBJECT),
+                file_size,
+            };
+            let builder = ParquetRecordBatchStreamBuilder::new(reader).await?;
+            footer_ready.send(()).expect("signal fully decoded footer");
+            data_ready.await.expect("resume data ranges after overwrite");
+            let stream = builder.build()?;
+            stream.try_collect::<Vec<_>>().await
+        });
+        footer_loaded
+            .await
+            .expect("read and decode the original footer before overwriting");
+        // Same bytes, size and ETag still constitute a new generation (new data_dir).
+        tokio::time::timeout(std::time::Duration::from_secs(5), env.put_object_bytes(BUCKET, OBJECT, bytes))
+            .await
+            .expect("overwrite cannot wait for Parquet's next range");
+        resume_data.send(()).expect("resume the original query");
+        let error = query
+            .await
+            .expect("Parquet task")
+            .expect_err("footer and row data must not span generations");
+        assert!(error.to_string().contains("object read semantics changed"));
+        assert!(snapshot.ensure_valid().is_err());
+        assert!(store.reader_open_count.load(Ordering::Relaxed) >= 2);
     }
 
     #[test]

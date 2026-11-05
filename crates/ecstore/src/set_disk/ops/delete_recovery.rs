@@ -141,6 +141,7 @@ pub(crate) struct DeleteRecoverySummary {
 #[derive(Clone)]
 pub(crate) struct DeleteRecoveryContext<'a> {
     pub incarnation: Option<Uuid>,
+    pub work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     pub dry_run: bool,
     pub explicit_delete: bool,
     /// Only the locked heal path may repair a live marker-creation source.
@@ -156,6 +157,7 @@ impl<'a> DeleteRecoveryContext<'a> {
     pub(crate) fn new(incarnation: Option<Uuid>, can_commit: &'a (dyn Fn() -> bool + Sync)) -> Self {
         Self {
             incarnation,
+            work_budget: None,
             dry_run: false,
             explicit_delete: false,
             repair_marker_source: false,
@@ -230,17 +232,52 @@ async fn inspect(
     bucket: &str,
     object: &str,
     transaction: Uuid,
+    budget: Option<&crate::object_api::DeleteRecoveryWorkBudget>,
 ) -> Vec<Result<DeleteRecoveryInspection>> {
     join_all(disks.iter().map(|disk| async move {
-        let state = disk
-            .as_ref()
-            .ok_or(DiskError::DiskNotFound)?
-            .inspect_delete_transaction(bucket, object, transaction)
-            .await?;
+        let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
+        let state = if let Some(budget) = budget {
+            let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
+            let reply = disk
+                .inspect_delete_transaction_bounded(bucket, object, transaction, admitted)
+                .await?;
+            if reply.visited > admitted {
+                return Err(DiskError::FileCorrupt);
+            }
+            budget.charge(reply.visited);
+            reply.inspection
+        } else {
+            disk.inspect_delete_transaction(bucket, object, transaction).await?
+        };
         validate(&state, object, transaction)?;
         Ok(state)
     }))
     .await
+}
+
+async fn discover_bounded(
+    disk: &DiskStore,
+    bucket: &str,
+    object: &str,
+    budget: &crate::object_api::DeleteRecoveryWorkBudget,
+) -> Result<Vec<DeleteTransactionId>> {
+    let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES)?;
+    let page = disk.discover_delete_transactions_bounded(bucket, object, admitted).await?;
+    if page.visited > admitted
+        || page.transactions.len() > 256
+        || page
+            .transactions
+            .iter()
+            .any(|id| id.object != object || id.transaction.is_nil())
+        || (!page.complete && !page.transactions.is_empty())
+    {
+        return Err(DiskError::FileCorrupt);
+    }
+    budget.charge(page.visited);
+    if !page.complete {
+        return Err(DiskError::DeleteRecoveryWorkLimit);
+    }
+    Ok(page.transactions)
 }
 
 async fn discover(disk: &DiskStore, bucket: &str, object: Option<&str>) -> Result<Vec<DeleteTransactionId>> {
@@ -273,30 +310,92 @@ async fn discover(disk: &DiskStore, bucket: &str, object: Option<&str>) -> Resul
         .collect())
 }
 
+#[derive(Clone, Copy)]
+struct RecoveryWorkScope<'a> {
+    namespace_owner: Option<&'a Arc<dyn Send + Sync>>,
+    budget: Option<&'a crate::object_api::DeleteRecoveryWorkBudget>,
+}
+
+async fn settle_outcome(
+    disk: &DiskStore,
+    bucket: &str,
+    state: &DeleteRecoveryInspection,
+    action: DeleteRecoveryAction,
+    can_commit: &(impl Fn() -> bool + Sync + ?Sized),
+    scope: RecoveryWorkScope<'_>,
+) -> Result<crate::disk::DeleteRecoverySettlementOutcome> {
+    use crate::disk::DeleteRecoverySettlementOutcome;
+    if !can_commit() {
+        return Err(DiskError::other("delete recovery namespace fence was lost"));
+    }
+    let outcome = if let Some(budget) = scope.budget {
+        let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
+        let may_publish = matches!(&action, DeleteRecoveryAction::PublishCommit | DeleteRecoveryAction::AdoptCommit { .. });
+        let reply = disk
+            .settle_delete_transaction_bounded(
+                bucket,
+                crate::disk::BoundedDeleteRecoverySettlement {
+                    object: state.id.object.clone(),
+                    transaction: state.id.transaction,
+                    expected_fingerprint: state.fingerprint,
+                    action,
+                    max_entries: admitted,
+                },
+                scope.namespace_owner.cloned(),
+            )
+            .await?;
+        if reply.visited > admitted
+            || (!may_publish && matches!(&reply.outcome, DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred))
+        {
+            return Err(DiskError::FileCorrupt);
+        }
+        budget.charge(reply.visited);
+        reply.outcome
+    } else {
+        DeleteRecoverySettlementOutcome::Inspected(Box::new(
+            disk.settle_delete_transaction_with_namespace_owner(
+                bucket,
+                &state.id.object,
+                state.id.transaction,
+                state.fingerprint,
+                action,
+                scope.namespace_owner.cloned(),
+            )
+            .await?,
+        ))
+    };
+    if let DeleteRecoverySettlementOutcome::Inspected(next) = &outcome {
+        validate(next, &state.id.object, state.id.transaction)?;
+    }
+    Ok(outcome)
+}
+
 async fn settle(
     disk: &DiskStore,
     bucket: &str,
     state: &DeleteRecoveryInspection,
     action: DeleteRecoveryAction,
     can_commit: &(impl Fn() -> bool + Sync + ?Sized),
-    namespace_owner: Option<&Arc<dyn Send + Sync>>,
+    scope: RecoveryWorkScope<'_>,
 ) -> Result<DeleteRecoveryInspection> {
-    if !can_commit() {
-        return Err(DiskError::other("delete recovery namespace fence was lost"));
+    match settle_outcome(disk, bucket, state, action, can_commit, scope).await? {
+        crate::disk::DeleteRecoverySettlementOutcome::Inspected(inspection) => Ok(*inspection),
+        crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred => {
+            Err(DiskError::DeleteRecoveryWorkLimit)
+        }
     }
-    let result = disk
-        .settle_delete_transaction_with_namespace_owner(
-            bucket,
-            &state.id.object,
-            state.id.transaction,
-            state.fingerprint,
-            action,
-            namespace_owner.cloned(),
-        )
-        .await;
-    let next = result?;
-    validate(&next, &state.id.object, state.id.transaction)?;
-    Ok(next)
+}
+
+fn has_receipt_quorum(outcomes: &[Result<crate::disk::DeleteRecoverySettlementOutcome>], quorum: usize) -> bool {
+    outcomes.iter().filter(|outcome| published_receipt(outcome)).count() >= quorum
+}
+
+fn published_receipt(outcome: &Result<crate::disk::DeleteRecoverySettlementOutcome>) -> bool {
+    match outcome {
+        Ok(crate::disk::DeleteRecoverySettlementOutcome::Inspected(state)) => receipt(state.state),
+        Ok(crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred) => true,
+        Err(_) => false,
+    }
 }
 
 /// Each phase fans out across independent drives, and awaits all started work
@@ -307,23 +406,16 @@ async fn settle_group(
     copies: &mut [DeleteRecoveryInspection],
     action: impl Fn(&DeleteRecoveryInspection) -> Option<DeleteRecoveryAction> + Sync,
     can_commit: &(impl Fn() -> bool + Sync + ?Sized),
-    namespace_owner: Option<&Arc<dyn Send + Sync>>,
+    scope: RecoveryWorkScope<'_>,
     removed_versions: &mut HashSet<Uuid>,
 ) -> Result<bool> {
     let results = join_all(disks.iter().zip(copies.iter()).map(|(disk, copy)| {
         let action = action(copy);
         async move {
             match action {
-                Some(action) => settle(
-                    disk.as_ref().ok_or(DiskError::DiskNotFound)?,
-                    bucket,
-                    copy,
-                    action,
-                    can_commit,
-                    namespace_owner,
-                )
-                .await
-                .map(Some),
+                Some(action) => settle(disk.as_ref().ok_or(DiskError::DiskNotFound)?, bucket, copy, action, can_commit, scope)
+                    .await
+                    .map(Some),
                 None => Ok(None),
             }
         }
@@ -439,16 +531,31 @@ impl SetDisks {
                     true
                 }
             };
+        let mut fast_receipt_quorum = false;
         if can_try_local_fast_path && can_commit() {
             let fast_published = join_all(disks.iter().map(|disk| async {
                 if !can_commit() {
                     return Err(DiskError::other("delete recovery namespace fence was lost"));
                 }
                 let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
-                disk.try_publish_prepared_delete_local(bucket, object, transaction, context.namespace_owner.clone())
-                    .await
+                disk.try_publish_prepared_delete_local(
+                    bucket,
+                    object,
+                    transaction,
+                    context.namespace_owner.clone(),
+                    context.work_budget.clone(),
+                )
+                .await
             }))
             .await;
+            fast_receipt_quorum = fast_published.iter().filter(|result| matches!(result, Ok(Some(_)))).count() >= write_quorum;
+            if fast_receipt_quorum
+                && fast_published
+                    .iter()
+                    .any(|result| matches!(result, Err(DiskError::DeleteRecoveryWorkLimit)))
+            {
+                return Ok(());
+            }
             let all_fast_published = fast_published.len() == self.set_drive_count
                 && fast_published.iter().all(|res| matches!(res, Ok(Some((_, true, true)))));
             if all_fast_published && can_commit() {
@@ -456,6 +563,7 @@ impl SetDisks {
                 test_hooks::record_cleanup_attempt(bucket, object);
                 let finalized = join_all(disks.iter().zip(fast_published.iter()).map(|(disk, pub_res)| {
                     let ns_owner = context.namespace_owner.clone();
+                    let work_budget = context.work_budget.clone();
                     async move {
                         if !can_commit() {
                             return Ok(false);
@@ -466,11 +574,24 @@ impl SetDisks {
                         let Ok(Some((journal, _, _))) = pub_res else {
                             return Ok(false);
                         };
-                        disk.try_finish_and_finalize_prepared_delete_local(bucket, object, transaction, journal, ns_owner)
-                            .await
+                        disk.try_finish_and_finalize_prepared_delete_local(
+                            bucket,
+                            object,
+                            transaction,
+                            journal,
+                            ns_owner,
+                            work_budget,
+                        )
+                        .await
                     }
                 }))
                 .await;
+                if finalized
+                    .iter()
+                    .any(|result| matches!(result, Err(DiskError::DeleteRecoveryWorkLimit)))
+                {
+                    return Ok(());
+                }
                 if finalized.iter().all(|res| matches!(res, Ok(true))) {
                     if let Some(ticket) = context.recovery_ticket.as_ref() {
                         self.ctx.delete_recovery_hints().ack(ticket);
@@ -479,7 +600,17 @@ impl SetDisks {
                 }
             }
         }
-        let states = inspect(disks, bucket, object, transaction).await;
+        let states = inspect(disks, bucket, object, transaction, context.work_budget.as_deref()).await;
+        if states
+            .iter()
+            .any(|result| matches!(result, Err(DiskError::DeleteRecoveryWorkLimit)))
+        {
+            return if fast_receipt_quorum {
+                Ok(())
+            } else {
+                Err(DiskError::DeleteRecoveryWorkLimit)
+            };
+        }
         let untouched_absence = |state: &Result<DeleteRecoveryInspection>| matches!(state, Ok(state) if state.state == DeleteRecoveryState::Absent && state.current_digest.is_none());
         if states.iter().filter(|state| untouched_absence(state)).count() >= write_quorum
             && states.iter().all(|state| {
@@ -499,25 +630,50 @@ impl SetDisks {
             if state.state == DeleteRecoveryState::LegacyAmbiguous {
                 return Err(DiskError::FileCorrupt);
             }
-            settle(
+            settle_outcome(
                 disk,
                 bucket,
                 state,
                 DeleteRecoveryAction::PublishCommit,
                 can_commit,
-                context.namespace_owner.as_ref(),
+                RecoveryWorkScope {
+                    namespace_owner: context.namespace_owner.as_ref(),
+                    budget: context.work_budget.as_deref(),
+                },
             )
             .await
         }))
         .await;
-        if published
-            .iter()
-            .filter(|state| matches!(state, Ok(state) if receipt(state.state)))
-            .count()
-            < write_quorum
-        {
-            return Err(DiskError::ErasureWriteQuorum);
+        if !has_receipt_quorum(&published, write_quorum) {
+            return Err(
+                if published
+                    .iter()
+                    .any(|result| matches!(result, Err(DiskError::DeleteRecoveryWorkLimit)))
+                {
+                    DiskError::DeleteRecoveryWorkLimit
+                } else {
+                    DiskError::ErasureWriteQuorum
+                },
+            );
         }
+        if published.iter().any(|outcome| {
+            matches!(
+                outcome,
+                Ok(crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred)
+            )
+        }) {
+            return Ok(());
+        }
+        let published = published
+            .into_iter()
+            .map(|outcome| match outcome {
+                Ok(crate::disk::DeleteRecoverySettlementOutcome::Inspected(state)) => Ok(*state),
+                Ok(crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred) => {
+                    Err(DiskError::DeleteRecoveryWorkLimit)
+                }
+                Err(error) => Err(error),
+            })
+            .collect::<Vec<_>>();
         // Physical cleanup is retryable after the certified decision. An
         // unavailable participant retains the decision for its eventual return.
         let ticket = context.recovery_ticket.clone();
@@ -670,6 +826,7 @@ impl SetDisks {
         }
         let DeleteRecoveryContext {
             incarnation,
+            work_budget,
             dry_run,
             explicit_delete,
             repair_marker_source,
@@ -681,7 +838,13 @@ impl SetDisks {
         } = context;
         let disks = self.disk_inventory().await;
         let complete_inventory = disks.len() == self.set_drive_count && disks.iter().all(Option::is_some);
-        let pages = join_all(disks.iter().flatten().map(|disk| discover(disk, bucket, Some(object)))).await;
+        let pages = join_all(disks.iter().flatten().map(|disk| async {
+            match work_budget.as_deref() {
+                Some(budget) => discover_bounded(disk, bucket, object, budget).await,
+                None => discover(disk, bucket, Some(object)).await,
+            }
+        }))
+        .await;
         let mut transactions = BTreeSet::new();
         let mut inspected = 0;
         let mut offline = !complete_inventory;
@@ -712,6 +875,7 @@ impl SetDisks {
             ..Default::default()
         };
         let mut all_states = BTreeMap::new();
+        let mut registered_evidence_hint = false;
         for transaction in transactions {
             let mut complete = Vec::with_capacity(disks.len());
             let inspections = if let Some((published_tx, published_states)) = published_hint
@@ -723,8 +887,14 @@ impl SetDisks {
             {
                 published_states.to_vec()
             } else {
-                inspect(&disks, bucket, object, transaction).await
+                inspect(&disks, bucket, object, transaction, work_budget.as_deref()).await
             };
+            if inspections
+                .iter()
+                .any(|result| matches!(result, Err(DiskError::DeleteRecoveryWorkLimit)))
+            {
+                return Err(DiskError::DeleteRecoveryWorkLimit);
+            }
             for state in inspections {
                 match state {
                     Ok(state) => {
@@ -735,6 +905,33 @@ impl SetDisks {
                             if incarnation.is_some_and(|expected| journal.bucket_incarnation != Some(expected) && !witness) {
                                 summary.blocked += 1;
                                 return Ok(summary);
+                            }
+                            // Candidate UUID directories are not evidence. Only a bound, inspected
+                            // journal can create a foreground hint; empty/partial scans rely on the
+                            // existing raw anti-entropy obligation instead of queuing arbitrary prefixes.
+                            if work_budget.is_some()
+                                && !registered_evidence_hint
+                                && journal.protocol_version == DELETE_RECOVERY_PROTOCOL_VERSION
+                                && journal.volume == bucket
+                                && journal.object == object
+                                && journal.transaction == transaction
+                                && matches!(
+                                    state.state,
+                                    DeleteRecoveryState::NewPrepared
+                                        | DeleteRecoveryState::QuorumCommitted
+                                        | DeleteRecoveryState::CommitFinished
+                                )
+                            {
+                                self.ctx.delete_recovery_hints().register(
+                                    crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                                        pool: self.pool_index,
+                                        set: self.set_index,
+                                        bucket: bucket.to_owned(),
+                                        object: object.to_owned(),
+                                        incarnation,
+                                    },
+                                );
+                                registered_evidence_hint = true;
                             }
                         }
                         complete.push(state);
@@ -767,7 +964,7 @@ impl SetDisks {
         };
         if let Some((transaction, source)) = prerequisite {
             Box::pin(self.heal_delete_recovery_source(bucket, object, &source, can_commit, namespace_owner.as_ref())).await?;
-            let refreshed = inspect(&disks, bucket, object, transaction)
+            let refreshed = inspect(&disks, bucket, object, transaction, work_budget.as_deref())
                 .await
                 .into_iter()
                 .collect::<Result<Vec<_>>>()?;
@@ -853,7 +1050,7 @@ impl SetDisks {
             if mutated {
                 // A sibling may have restored metadata or reclaimed shared
                 // evidence. Refresh fingerprints before acting on this group.
-                *copies = inspect(&disks, bucket, object, transaction)
+                *copies = inspect(&disks, bucket, object, transaction, work_budget.as_deref())
                     .await
                     .into_iter()
                     .collect::<Result<Vec<_>>>()?;
@@ -876,7 +1073,10 @@ impl SetDisks {
                             (copy.state == DeleteRecoveryState::LegacyAmbiguous).then_some(DeleteRecoveryAction::DiscardLegacy)
                         },
                         can_commit,
-                        namespace_owner.as_ref(),
+                        RecoveryWorkScope {
+                            namespace_owner: namespace_owner.as_ref(),
+                            budget: work_budget.as_deref(),
+                        },
                         &mut summary.removed_versions,
                     )
                     .await?
@@ -987,7 +1187,10 @@ impl SetDisks {
                         )
                     },
                     can_commit,
-                    namespace_owner.as_ref(),
+                    RecoveryWorkScope {
+                        namespace_owner: namespace_owner.as_ref(),
+                        budget: work_budget.as_deref(),
+                    },
                     &mut summary.removed_versions,
                 )
                 .await?;
@@ -1001,7 +1204,10 @@ impl SetDisks {
                                 .then_some(DeleteRecoveryAction::FinishCommit)
                         },
                         can_commit,
-                        namespace_owner.as_ref(),
+                        RecoveryWorkScope {
+                            namespace_owner: namespace_owner.as_ref(),
+                            budget: work_budget.as_deref(),
+                        },
                         &mut summary.removed_versions,
                     )
                     .await?;
@@ -1048,7 +1254,10 @@ impl SetDisks {
                     copies,
                     |copy| (copy.state == DeleteRecoveryState::NewPrepared).then_some(DeleteRecoveryAction::Rollback),
                     can_commit,
-                    namespace_owner.as_ref(),
+                    RecoveryWorkScope {
+                        namespace_owner: namespace_owner.as_ref(),
+                        budget: work_budget.as_deref(),
+                    },
                     &mut summary.removed_versions,
                 )
                 .await?
@@ -1076,7 +1285,7 @@ impl SetDisks {
                 settled.push(copies);
             } else {
                 for transaction in all_states.keys() {
-                    let fresh = inspect(&disks, bucket, object, *transaction).await;
+                    let fresh = inspect(&disks, bucket, object, *transaction, work_budget.as_deref()).await;
                     if fresh.iter().any(|state| !matches!(state, Ok(state) if matches!(state.state, DeleteRecoveryState::Absent | DeleteRecoveryState::CommitFinished))) {
                         summary.pending += 1;
                         return Ok(summary);
@@ -1086,7 +1295,7 @@ impl SetDisks {
             }
             for (index, mut copies) in settled.into_iter().enumerate() {
                 if index > 0 {
-                    copies = inspect(&disks, bucket, object, copies[0].id.transaction)
+                    copies = inspect(&disks, bucket, object, copies[0].id.transaction, work_budget.as_deref())
                         .await
                         .into_iter()
                         .collect::<Result<Vec<_>>>()?;
@@ -1106,7 +1315,10 @@ impl SetDisks {
                     &mut copies,
                     |copy| (copy.state == DeleteRecoveryState::CommitFinished).then_some(DeleteRecoveryAction::FinalizeCommit),
                     can_commit,
-                    namespace_owner.as_ref(),
+                    RecoveryWorkScope {
+                        namespace_owner: namespace_owner.as_ref(),
+                        budget: work_budget.as_deref(),
+                    },
                     &mut summary.removed_versions,
                 )
                 .await?
@@ -1356,6 +1568,459 @@ mod tests {
             .await
             .expect("read exact recovered bytes");
         body
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_mixed_inspected_and_deferred_receipts_count_only_real_quorum() {
+        let bucket = "recover-bounded-mixed-quorum";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![73; 4096], false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        let mut outcomes = Vec::new();
+        for (index, disk) in disks.iter().enumerate() {
+            let state = disk
+                .inspect_delete_transaction_bounded(bucket, "object", transaction, 65536)
+                .await
+                .expect("preparation inspection");
+            let max_entries = match index {
+                0 => 65536,
+                1 | 2 => state.visited,
+                _ => 1,
+            };
+            outcomes.push(
+                disk.settle_delete_transaction_bounded(
+                    bucket,
+                    crate::disk::BoundedDeleteRecoverySettlement {
+                        object: "object".to_owned(),
+                        transaction,
+                        expected_fingerprint: state.inspection.fingerprint,
+                        action: DeleteRecoveryAction::PublishCommit,
+                        max_entries,
+                    },
+                    None,
+                )
+                .await
+                .map(|reply| reply.outcome),
+            );
+        }
+        assert!(
+            matches!(&outcomes[0], Ok(crate::disk::DeleteRecoverySettlementOutcome::Inspected(state)) if receipt(state.state))
+        );
+        assert!(matches!(
+            &outcomes[1],
+            Ok(crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred)
+        ));
+        assert!(matches!(outcomes[3], Err(crate::disk::error::DiskError::DeleteRecoveryWorkLimit)));
+        assert!(has_receipt_quorum(&outcomes, 3));
+        assert!(!has_receipt_quorum(&outcomes, 4));
+        outcomes[2] = Err(DiskError::FileAccessDenied);
+        assert!(
+            !has_receipt_quorum(&outcomes, 3),
+            "a write failure cannot substitute for a durable receipt"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_single_and_batch_share_bounded_work_across_versions_and_retries() {
+        use crate::object_api::DeleteRecoveryWorkBudget;
+        use crate::storage_api_contracts::object::ObjectToDelete;
+        let bucket = "recover-bounded-request";
+        let (dirs, store, _) = fixture(bucket).await;
+        for dir in &dirs {
+            let prefix = dir.path().join(bucket).join("prefix");
+            std::fs::create_dir_all(&prefix).expect("physical prefix");
+            for _ in 0..64 {
+                std::fs::create_dir(prefix.join(Uuid::new_v4().to_string())).expect("legitimate child");
+            }
+        }
+        let error = store
+            .delete_object(
+                bucket,
+                "prefix",
+                ObjectOptions {
+                    delete_recovery_work_budget: Some(Arc::new(DeleteRecoveryWorkBudget::new(8))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("incomplete discovery is not absence");
+        assert!(matches!(error, StorageError::DeleteRecoveryWorkLimit), "{error:?}");
+        for incarnation in [
+            None,
+            Some(
+                store
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("bucket incarnation"),
+            ),
+        ] {
+            assert!(
+                !store
+                    .ctx
+                    .delete_recovery_hints()
+                    .is_pending(&crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                        pool: 0,
+                        set: 0,
+                        bucket: bucket.to_owned(),
+                        object: "prefix".to_owned(),
+                        incarnation,
+                    }),
+                "an unproven prefix must not move its scan into background recovery"
+            );
+        }
+        for distinct_versions in [false, true] {
+            let budget = Arc::new(DeleteRecoveryWorkBudget::new(32_768));
+            let objects = (0..1000)
+                .map(|_| ObjectToDelete {
+                    object_name: "prefix".to_owned(),
+                    version_id: distinct_versions.then(Uuid::new_v4),
+                    ..Default::default()
+                })
+                .collect();
+            let (_, errors) = store
+                .delete_objects(
+                    bucket,
+                    objects,
+                    ObjectOptions {
+                        delete_recovery_work_budget: Some(Arc::clone(&budget)),
+                        ..Default::default()
+                    },
+                )
+                .await;
+            assert!(
+                errors
+                    .iter()
+                    .any(|error| matches!(error, Some(StorageError::DeleteRecoveryWorkLimit))),
+                "repeated actions must not each obtain a new allowance: {distinct_versions}"
+            );
+            assert!(dirs.iter().all(|dir| {
+                std::fs::read_dir(dir.path().join(bucket).join("prefix"))
+                    .map(|entries| entries.count() == 64)
+                    .unwrap_or(false)
+            }));
+        }
+        let error = store
+            .delete_object(bucket, "prefix", ObjectOptions::default())
+            .await
+            .expect_err("ordinary missing key");
+        assert!(
+            crate::error::is_err_object_not_found(&error),
+            "small complete inventory retains no-op semantics: {error:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_batch_budget_survives_pool_and_set_fanout() {
+        use crate::layout::endpoint::Endpoint;
+        use crate::layout::endpoints::{EndpointServerPools, Endpoints, PoolEndpoints};
+        use crate::runtime::instance::InstanceContext;
+        let mut dirs = Vec::new();
+        let mut pools = Vec::new();
+        for pool_index in 0..2 {
+            let mut endpoints = Vec::new();
+            for set_index in 0..2 {
+                for disk_index in 0..4 {
+                    let dir = tempfile::tempdir().expect("temporary disk");
+                    let mut endpoint = Endpoint::try_from(dir.path().to_str().expect("disk path")).expect("endpoint");
+                    endpoint.set_pool_index(pool_index);
+                    endpoint.set_set_index(set_index);
+                    endpoint.set_disk_index(disk_index);
+                    endpoints.push(endpoint);
+                    dirs.push(dir);
+                }
+            }
+            pools.push(PoolEndpoints {
+                legacy: false,
+                set_count: 2,
+                drives_per_set: 4,
+                endpoints: Endpoints::from(endpoints),
+                cmd_line: format!("bounded-recovery-{pool_index}"),
+                platform: "test".to_owned(),
+            });
+        }
+        let endpoints = EndpointServerPools(pools);
+        let ctx = Arc::new(InstanceContext::new());
+        crate::store::init_local_disks_with_instance_ctx(&ctx, endpoints.clone())
+            .await
+            .expect("local disks");
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let store = ECStore::new_with_instance_ctx("127.0.0.1:0".parse().expect("address"), endpoints, cancel.clone(), ctx)
+            .await
+            .expect("two pools with two sets");
+        cancel.cancel();
+        init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        let bucket = "recover-bounded-fanout";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let candidates = (0..100).map(|index| format!("prefix-{index}")).collect::<Vec<_>>();
+        let mut keys = BTreeSet::new();
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                keys.insert(
+                    candidates
+                        .iter()
+                        .find(|key| Arc::ptr_eq(&pool.get_disks_by_key(key), set))
+                        .expect("fixture key for set")
+                        .clone(),
+                );
+            }
+        }
+        let keys = keys.into_iter().collect::<Vec<_>>();
+        for pool in &store.pools {
+            for set in &pool.disk_set {
+                assert!(
+                    keys.iter().any(|key| Arc::ptr_eq(&pool.get_disks_by_key(key), set)),
+                    "fixture must cover every set"
+                );
+            }
+        }
+        for dir in &dirs {
+            for key in &keys {
+                let prefix = dir.path().join(bucket).join(key);
+                std::fs::create_dir_all(&prefix).expect("physical prefix");
+                for _ in 0..8 {
+                    std::fs::create_dir(prefix.join(Uuid::new_v4().to_string())).expect("child");
+                }
+            }
+        }
+        let budget = Arc::new(crate::object_api::DeleteRecoveryWorkBudget::new(32_768));
+        let objects = (0..1000)
+            .map(|index| crate::storage_api_contracts::object::ObjectToDelete {
+                object_name: keys[index % keys.len()].clone(),
+                version_id: Some(Uuid::new_v4()),
+                ..Default::default()
+            })
+            .collect();
+        let (_, errors) = store
+            .delete_objects(
+                bucket,
+                objects,
+                ObjectOptions {
+                    delete_recovery_work_budget: Some(Arc::clone(&budget)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        assert!(
+            errors
+                .iter()
+                .any(|error| matches!(error, Some(StorageError::DeleteRecoveryWorkLimit))),
+            "all pools and sets must share the finite allowance"
+        );
+        assert!(budget.remaining() < 32_768, "fanout must debit the original request allowance");
+        assert!(dirs.iter().all(|dir| {
+            std::fs::read_dir(dir.path().join(bucket).join(&keys[0]))
+                .map(|entries| entries.count() == 8)
+                .unwrap_or(false)
+        }));
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_fast_commit_keeps_success_when_cleanup_budget_is_empty() {
+        let bucket = "recover-bounded-fast-commit";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![74; 2 * 1024 * 1024], false).await;
+        // Inline cleanup needs no directory enumeration and may legitimately
+        // finish with zero scan credits. Require real part files here.
+        for disk in &disks {
+            let info = disk
+                .read_version("", bucket, "object", "", &ReadOptions::default())
+                .await
+                .expect("read non-inline source");
+            assert!(!info.inline_data(), "the fixture must require physical part cleanup");
+            let data_dir = info.data_dir.expect("physical data directory");
+            let part = std::path::PathBuf::from(disk.endpoint().to_string())
+                .join(bucket)
+                .join("object")
+                .join(data_dir.to_string())
+                .join("part.1");
+            assert!(part.is_file(), "the cleanup scan must encounter a real part");
+        }
+        store
+            .delete_object(
+                bucket,
+                "object",
+                ObjectOptions {
+                    delete_recovery_work_budget: Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::new(0))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("a cached prepared receipt commits independently of cleanup budget");
+        assert!(
+            store
+                .ctx
+                .delete_recovery_hints()
+                .is_pending(&crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                    pool: 0,
+                    set: 0,
+                    bucket: bucket.to_owned(),
+                    object: "object".to_owned(),
+                    incarnation: Some(
+                        store
+                            .bucket_incarnation_id_from_disk(bucket)
+                            .await
+                            .expect("bucket incarnation")
+                    ),
+                })
+        );
+        assert!(
+            !disks[0]
+                .discover_delete_transactions(bucket, Some("object"), None, 128)
+                .await
+                .expect("retained recovery proof")
+                .transactions
+                .is_empty()
+        );
+        store
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect("background finishes committed cleanup");
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_unverified_uuid_candidate_does_not_enqueue_background_work() {
+        let bucket = "recover-bounded-candidate";
+        let (dirs, store, _) = fixture(bucket).await;
+        let transaction = Uuid::new_v4();
+        for directory in &dirs {
+            let candidate = directory.path().join(bucket).join("candidate").join(transaction.to_string());
+            std::fs::create_dir_all(&candidate).expect("candidate path");
+            std::fs::write(candidate.join("delete-prepared"), b"not a bound journal").expect("unverified candidate");
+        }
+        assert!(
+            store
+                .delete_object(bucket, "candidate", ObjectOptions::default())
+                .await
+                .is_err()
+        );
+        for incarnation in [
+            None,
+            Some(
+                store
+                    .bucket_incarnation_id_from_disk(bucket)
+                    .await
+                    .expect("bucket incarnation"),
+            ),
+        ] {
+            assert!(
+                !store
+                    .ctx
+                    .delete_recovery_hints()
+                    .is_pending(&crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+                        pool: 0,
+                        set: 0,
+                        bucket: bucket.to_owned(),
+                        object: "candidate".to_owned(),
+                        incarnation,
+                    })
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_budget_refusal_preserves_evidence_for_background_replay() {
+        let bucket = "recover-bounded-evidence";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        let payload = vec![71; 4096];
+        put(&store, bucket, &payload, false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        let before = disks[0]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("before refusal");
+        let error = store
+            .delete_object(
+                bucket,
+                "object",
+                ObjectOptions {
+                    delete_recovery_work_budget: Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::new(1))),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect_err("no incomplete recovery admission");
+        assert!(matches!(error, StorageError::DeleteRecoveryWorkLimit), "{error:?}");
+        let after = disks[0]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("after refusal");
+        assert_eq!(before.fingerprint, after.fingerprint);
+        store
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect("background-compatible recovery");
+        assert_eq!(body(&store, bucket, None).await, payload);
+    }
+
+    #[tokio::test]
+    async fn delete_recovery_committed_delete_defers_exhausted_cleanup_without_rollback() {
+        let bucket = "recover-bounded-commit";
+        let (_dirs, store, disks) = fixture(bucket).await;
+        put(&store, bucket, &vec![72; 4096], false).await;
+        let transaction = applied(&store, &disks, bucket, None, disks.len()).await;
+        let set = &store.pools[0].disk_set[0];
+        let key = crate::store::delete_recovery_runtime::DeleteRecoveryKey {
+            pool: 0,
+            set: 0,
+            bucket: bucket.to_owned(),
+            object: "object".to_owned(),
+            incarnation: None,
+        };
+        let ticket = set.ctx.delete_recovery_hints().register(key.clone());
+        let budget = Arc::new(crate::object_api::DeleteRecoveryWorkBudget::default());
+        let exhausted_after_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // This hook disables local fast cleanup and runs only after receipt
+        // publication and the shared recovery path's key-wide GC inspection.
+        // Exhausting preparation instead would correctly reject the delete.
+        test_hooks::before_gc_finalize(bucket, "object", {
+            let budget = Arc::clone(&budget);
+            let exhausted_after_commit = Arc::clone(&exhausted_after_commit);
+            Arc::new(move || {
+                let budget = Arc::clone(&budget);
+                let exhausted_after_commit = Arc::clone(&exhausted_after_commit);
+                Box::pin(async move {
+                    assert!(budget.reserve(u32::MAX).expect("credits remain until committed cleanup") > 0);
+                    exhausted_after_commit.store(true, std::sync::atomic::Ordering::Release);
+                })
+            })
+        });
+        set.publish_delete_commit(
+            bucket,
+            "object",
+            transaction,
+            &set.disk_inventory().await,
+            set.set_drive_count / 2 + 1,
+            DeleteRecoveryContext {
+                work_budget: Some(Arc::clone(&budget)),
+                recovery_ticket: ticket,
+                ..DeleteRecoveryContext::new(None, &|| true)
+            },
+        )
+        .await
+        .expect("the durable decision still succeeds");
+        assert!(exhausted_after_commit.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(budget.remaining(), 0);
+        assert!(set.ctx.delete_recovery_hints().is_pending(&key));
+        let state = disks[0]
+            .inspect_delete_transaction(bucket, "object", transaction)
+            .await
+            .expect("retained decision");
+        assert!(receipt(state.state));
+        store
+            .recover_delete_transactions_at_incarnation(bucket, Some("object"), None, &HealOpts::default())
+            .await
+            .expect("eventual cleanup");
+        assert!(
+            disks[0]
+                .discover_delete_transactions(bucket, Some("object"), None, 128)
+                .await
+                .expect("cleaned proofs")
+                .transactions
+                .is_empty()
+        );
     }
 
     #[tokio::test]

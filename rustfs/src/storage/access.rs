@@ -168,6 +168,10 @@ struct RequestedObjectTags(Tagging);
 #[derive(Clone, Debug)]
 struct PostObjectPolicyHeaders(http::HeaderMap);
 
+/// Copy source as the handler resolves it (percent-decoded, versionId canonical).
+#[derive(Clone)]
+struct RequestedCopySource(String);
+
 /// These operations stage upload state without publishing an object. Keep this
 /// separate from the marker controlling multipart publication fences.
 #[derive(Clone, Copy, Debug)]
@@ -754,6 +758,12 @@ impl ObjectTagConditions {
     }
 }
 
+/// Local tag evidence cannot authorize an object that only exists on a replica.
+/// Keep the local miss whenever authorization needed existing-object tags.
+pub(crate) fn replication_proxy_allowed(extensions: &http::Extensions) -> bool {
+    extensions.get::<ObjectTagConditions>().is_none()
+}
+
 const AMZ_WRITE_OFFSET_BYTES_HEADER: &str = "x-amz-write-offset-bytes";
 
 fn has_write_offset_bytes_header(headers: &http::HeaderMap) -> bool {
@@ -785,13 +795,13 @@ fn classify_bucket_policy_raw_load_error(err: &StorageError) -> BucketPolicyRawL
     }
 }
 
-/// Load and parse bucket policy once for ExistingObjectTag hint checks.
+/// Reuse the parsed bucket metadata policy for ExistingObjectTag hint checks.
 async fn load_bucket_policy_existing_object_tag_hint(
     store: &ECStore,
     bucket: &str,
     action: Action,
 ) -> BucketPolicyExistingObjectTagHint {
-    let (policy_str, _) = match store.get_bucket_policy_raw(bucket).await {
+    let (policy, _) = match store.get_bucket_policy(bucket).await {
         Ok(v) => v,
         Err(err) => match classify_bucket_policy_raw_load_error(&err) {
             BucketPolicyRawLoadErrorKind::PolicyMissing => {
@@ -822,23 +832,10 @@ async fn load_bucket_policy_existing_object_tag_hint(
             }
         },
     };
-    match serde_json::from_str::<BucketPolicy>(policy_str.as_str()) {
-        Ok(policy) => {
-            if bucket_policy_uses_existing_object_tag_conditions(&policy) {
-                BucketPolicyExistingObjectTagHint::Parsed(policy)
-            } else {
-                BucketPolicyExistingObjectTagHint::NoTagRequirement
-            }
-        }
-        Err(err) => {
-            tracing::warn!(
-                bucket = %bucket,
-                ?action,
-                error = %err,
-                "malformed bucket policy while checking ExistingObjectTag hint; conservatively enabling tag fetch"
-            );
-            BucketPolicyExistingObjectTagHint::ConservativeTagRequired
-        }
+    if bucket_policy_uses_existing_object_tag_conditions(&policy) {
+        BucketPolicyExistingObjectTagHint::Parsed(policy)
+    } else {
+        BucketPolicyExistingObjectTagHint::NoTagRequirement
     }
 }
 
@@ -877,28 +874,34 @@ fn action_tag_metric_label(action: &Action) -> &'static str {
     }
 }
 
-fn merge_list_bucket_query_conditions(action: Action, query: Option<&str>, conditions: &mut HashMap<String, Vec<String>>) {
+fn merge_list_bucket_query_conditions(
+    action: Action,
+    query: Option<&str>,
+    conditions: &mut HashMap<String, Vec<String>>,
+) -> S3Result<()> {
     if !matches!(
         action,
         Action::S3Action(
             S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
         )
     ) {
-        return;
+        return Ok(());
     }
-
+    for key in ["prefix", "delimiter", "max-keys"] {
+        conditions.remove(key);
+    }
     let Some(query) = query else {
-        return;
+        return Ok(());
     };
 
     for (key, value) in form_urlencoded::parse(query.as_bytes()) {
-        match key.as_ref() {
-            "prefix" | "delimiter" | "max-keys" => {
-                conditions.entry(key.into_owned()).or_default().push(value.into_owned());
-            }
-            _ => {}
+        if matches!(key.as_ref(), "prefix" | "delimiter" | "max-keys")
+            && conditions.insert(key.to_string(), vec![value.into_owned()]).is_some()
+        {
+            return Err(s3_error!(InvalidRequest, "duplicate query: {key}"));
         }
     }
+    Ok(())
 }
 
 fn merge_request_object_tag_conditions(
@@ -969,8 +972,11 @@ fn authorization_conditions<T>(
     {
         conditions.insert("LocationConstraint".to_string(), vec![location]);
     }
-    merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions);
+    merge_list_bucket_query_conditions(action, req.uri.query(), &mut conditions)?;
     merge_request_object_tag_conditions(action, headers, &mut conditions)?;
+    if let Some(RequestedCopySource(source)) = req.extensions.get::<RequestedCopySource>() {
+        conditions.insert("x-amz-copy-source".to_string(), vec![source.clone()]);
+    }
     if let Some(RequestedObjectLegalHold(legal_hold)) = req.extensions.get::<RequestedObjectLegalHold>() {
         // Standalone legal hold writes apply the XML body, so headers must not
         // supply a different value to the policy decision.
@@ -1087,6 +1093,7 @@ fn set_post_object_policy_headers(req: &mut S3Request<PutObjectInput>) -> S3Resu
         ("x-amz-server-side-encryption-customer-algorithm", input.sse_customer_algorithm.as_deref()),
         ("x-amz-grant-full-control", input.grant_full_control.as_deref()),
         ("x-amz-grant-read", input.grant_read.as_deref()),
+        ("x-amz-grant-write", None),
         ("x-amz-grant-read-acp", input.grant_read_acp.as_deref()),
         ("x-amz-grant-write-acp", input.grant_write_acp.as_deref()),
     ] {
@@ -1096,6 +1103,17 @@ fn set_post_object_policy_headers(req: &mut S3Request<PutObjectInput>) -> S3Resu
                 .parse()
                 .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid form field"))?;
             headers.insert(key, value);
+        }
+    }
+    for (key, value) in [("if-match", &input.if_match), ("if-none-match", &input.if_none_match)] {
+        headers.remove(key);
+        if let Some(value) = value {
+            headers.insert(
+                key,
+                value
+                    .to_http_header()
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Invalid form field"))?,
+            );
         }
     }
     req.extensions.insert(PostObjectPolicyHeaders(headers));
@@ -1518,6 +1536,72 @@ pub async fn authorize_request<T>(req: &mut S3Request<T>, action: Action) -> S3R
     // shape (rustfs/rustfs#9142).
     crate::auth::hoist_signed_query_params(&mut req.headers, req.uri.query())?;
     authorize_request_with_location_constraint(req, action, None).await
+}
+
+/// Authorize the exact tag set selected by CopyObject's source reader before publication.
+/// The access hook also calls this with a preliminary snapshot, so tag-dependent
+/// destination Allow statements can be evaluated before opening either object.
+pub(crate) async fn authorize_copy_object_tags(
+    req: &mut S3Request<CopyObjectInput>,
+    source_tags: &str,
+    effective_tags: &str,
+) -> S3Result<()> {
+    // Direct internal use-case calls with no tags retain their existing contract.
+    // Public CopyObject requests always carry the access hook's requested-tag snapshot.
+    if effective_tags.is_empty() && req.extensions.get::<RequestedObjectTags>().is_none() {
+        return Ok(());
+    }
+    let tag_set = crate::storage::s3_api::tagging::parse_object_tag_header(effective_tags)?;
+    let copies_tags = req.input.tagging_directive.as_ref().map(TaggingDirective::as_str) != Some(TaggingDirective::REPLACE);
+    if copies_tags && !tag_set.is_empty() {
+        let CopySource::Bucket { bucket, key, version_id } = &req.input.copy_source else {
+            return Err(s3_error!(NotImplemented));
+        };
+        let (bucket, key, version_id) = (bucket.to_string(), key.to_string(), version_id.as_ref().map(ToString::to_string));
+        let destination = req_info_ref(req)?.clone();
+        let destination_tags = req.extensions.remove::<ObjectTagConditions>();
+        req.extensions.remove::<RequestedObjectTags>();
+        // Reuse the reader's metadata instead of reopening the source under its
+        // read guard (or the self-copy write guard). These are the tags being copied.
+        let source_conditions = crate::storage::s3_api::tagging::parse_object_tag_header(source_tags)?
+            .into_iter()
+            .filter_map(|tag| Some((format!("ExistingObjectTag/{}", tag.key?), vec![tag.value?])))
+            .collect();
+        req.extensions
+            .insert(ObjectTagConditions::new(&bucket, &key, version_id.as_deref(), source_conditions));
+        let info = req_info_mut(req)?;
+        info.bucket = Some(bucket);
+        info.object = Some(key);
+        info.version_id = version_id.clone();
+        let result =
+            authorize_request(req, versioned_tagging_action(S3Action::GetObjectTaggingAction, version_id.as_deref())).await;
+        req.extensions.insert(destination);
+        req.extensions.remove::<ObjectTagConditions>();
+        if let Some(tags) = destination_tags {
+            req.extensions.insert(tags);
+        }
+        result?;
+    }
+    req.extensions.insert(RequestedObjectTags(Tagging { tag_set }));
+    authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await
+}
+
+/// A specific destination ETag reveals stored content and requires read access.
+/// Wildcard existence conditions retain the existing write-only contract.
+async fn authorize_write_etag_condition<T>(req: &mut S3Request<T>, specific_dto_etag: bool) -> S3Result<()> {
+    let headers = req
+        .extensions
+        .get::<PostObjectPolicyHeaders>()
+        .map_or(&req.headers, |form| &form.0);
+    let specific_header_etag = headers
+        .get_all(http::header::IF_MATCH)
+        .iter()
+        .any(|value| value.to_str().map_or(true, |value| value.trim() != "*"));
+    if specific_dto_etag || specific_header_etag {
+        let action = versioned_read_action(req_info_ref(req)?.version_id.as_deref());
+        authorize_request(req, action).await?;
+    }
+    Ok(())
 }
 
 async fn authorize_request_with_location_constraint<T>(
@@ -2134,6 +2218,16 @@ fn table_list_catalog_error(err: crate::table_catalog::TableCatalogStoreError) -
     }
 }
 
+pub(crate) async fn authorize_bucket_listing<T>(req: &mut S3Request<T>, bucket: &str, action: S3Action) -> S3Result<()> {
+    authorize_request(req, Action::S3Action(action)).await?;
+    if action == S3Action::ListBucketAction
+        && get_header(&req.headers, rustfs_utils::http::SUFFIX_INCLUDE_DELETED).as_deref() == Some("true")
+    {
+        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
+    }
+    prepare_table_data_plane_list_access(req, bucket, action).await
+}
+
 async fn prepare_table_data_plane_list_access<T>(req: &mut S3Request<T>, bucket: &str, action: S3Action) -> S3Result<()> {
     if !table_bucket_enabled_for_data_plane(req, bucket).await? {
         return Ok(());
@@ -2548,6 +2642,8 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
 
         authorize_request(req, complete_multipart_upload_authorize_action()).await?;
+        let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
+        authorize_write_etag_condition(req, specific_etag).await?;
         authorize_replication_only_put_headers(req).await?;
         req.extensions.insert(bucket_generation?);
         Ok(())
@@ -2566,6 +2662,11 @@ impl S3Access for FS {
                 (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
             }
         };
+        let source = match version_id.as_deref() {
+            Some(version) => format!("{src_bucket}/{src_key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
+            None => format!("{src_bucket}/{src_key}"),
+        };
+        req.extensions.insert(RequestedCopySource(source));
         let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
 
         {
@@ -2584,11 +2685,60 @@ impl S3Access for FS {
 
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
+        req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
 
         let requested_retain_until = req.input.object_lock_retain_until_date.clone();
         set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
-        authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+        let replacement = crate::storage::s3_api::tagging::resolve_copy_object_tags(
+            req.input.tagging.as_deref(),
+            req.input.tagging_directive.as_ref(),
+        )?;
+        let store = request_object_store(req)?;
+        let source_tags = if replacement.is_none() {
+            use crate::storage::storage_api::contract::object::ObjectOperations as _;
+            match store
+                .get_object_tags(
+                    &src_bucket,
+                    &src_key,
+                    &ObjectOptions {
+                        // Keep the explicit version in the policy context, but
+                        // address its storage representation just like COPY's reader.
+                        version_id: version_id.as_deref().map(|version| {
+                            let version = version.trim();
+                            if version.eq_ignore_ascii_case("null") {
+                                uuid::Uuid::nil().to_string()
+                            } else {
+                                version.to_owned()
+                            }
+                        }),
+                        ..Default::default()
+                    },
+                )
+                .await
+            {
+                Ok(tags) => tags,
+                Err(error) if super::is_err_object_not_found(&error) || super::is_err_version_not_found(&error) => String::new(),
+                Err(error) => return Err(ApiError::from(error).into()),
+            }
+        } else {
+            String::new()
+        };
+        // Self-copy later holds the destination write lock. Capture its existing
+        // tags now, including when only the final requested tags activate a policy.
+        if src_bucket == req.input.bucket && src_key == req.input.key {
+            let destination_version = req_info_ref(req)?.version_id.clone();
+            get_or_fetch_object_tag_conditions(
+                req,
+                store.as_ref(),
+                &src_bucket,
+                &src_key,
+                destination_version.as_deref(),
+                Action::S3Action(S3Action::PutObjectAction),
+            )
+            .await?;
+        }
+        req.extensions.insert(RequestedObjectTags(Tagging::default()));
+        authorize_copy_object_tags(req, &source_tags, replacement.as_deref().unwrap_or(&source_tags)).await?;
 
         authorize_replication_only_put_headers(req).await?;
 
@@ -2611,6 +2761,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
+        req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
 
         let requested_retain_until = req.input.object_lock_retain_until_date.clone();
         set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
@@ -2755,7 +2906,12 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_bucket_config_mutation(self, req, Action::S3Action(S3Action::PutBucketTaggingAction)).await
+        rustfs_iam::sys::with_bucket_tag_deletion(authorize_bucket_config_mutation(
+            self,
+            req,
+            Action::S3Action(S3Action::PutBucketTaggingAction),
+        ))
+        .await
     }
 
     /// Checks whether the DeleteBucketWebsite request has accesses to the resources.
@@ -2787,10 +2943,24 @@ impl S3Access for FS {
             ));
         }
 
+        let replica_request = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
+        // A replica delete may name its version through the source-version
+        // header; the policy decision must see the same version storage deletes.
+        // Storage consumes that header only for a replica request, so any other
+        // request is authorized for the version it names in the query alone.
+        let version_id = if replica_request {
+            super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers)
+        } else {
+            req.input.version_id.clone()
+        };
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
-        req_info.version_id = req.input.version_id.clone();
+        req_info.version_id = version_id;
         let authenticated = req_info.is_owner || req_info.cred.is_some();
         let action = delete_object_authorize_action(req_info.version_id.as_deref());
 
@@ -2800,11 +2970,6 @@ impl S3Access for FS {
             Ok(value) => value.unwrap_or(false),
             Err(_) => return Err(invalid_force_delete_header()),
         };
-        let replica_request = req
-            .headers
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
         // The REPLICA header is caller-supplied, so it must not skip this
         // check. s3:ReplicateDelete is still required separately for replica
         // deletes; s3:* does not grant s3:ForceDeleteObject.
@@ -3211,18 +3376,14 @@ impl S3Access for FS {
         req_info.object = Some(req.input.key.clone());
         req_info.version_id = req.input.version_id.clone();
 
-        // A replication convergence check HEADs the replica to compare
-        // etag/size/mtime. For SSE-C replicas the worker holds no customer key,
-        // so authorize it as a replication action and let the handler skip the
-        // SSE-C read validation.
+        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
+        // Replication permission additionally unlocks the SSE-C convergence
+        // check; it does not replace permission to read this version's metadata.
         if get_header(&req.headers, SUFFIX_SOURCE_REPLICATION_CHECK).as_deref() == Some("true") {
             authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await?;
             req_info_mut(req)?.replication_request_authorized = true;
-            req.extensions.insert(source_generation);
-            return Ok(());
         }
 
-        authorize_request(req, versioned_read_action(req.input.version_id.as_deref())).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -3298,8 +3459,7 @@ impl S3Access for FS {
         let bucket = req.input.bucket.clone();
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
-        authorize_request(req, Action::S3Action(S3Action::ListBucketVersionsAction)).await?;
-        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketVersionsAction).await
+        authorize_bucket_listing(req, &bucket, S3Action::ListBucketVersionsAction).await
     }
 
     /// Checks whether the ListObjects request has accesses to the resources.
@@ -3310,8 +3470,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
-        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketAction).await
+        authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await
     }
 
     /// Checks whether the ListObjectsV2 request has accesses to the resources.
@@ -3323,8 +3482,7 @@ impl S3Access for FS {
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
 
-        authorize_request(req, Action::S3Action(S3Action::ListBucketAction)).await?;
-        prepare_table_data_plane_list_access(req, &bucket, S3Action::ListBucketAction).await?;
+        authorize_bucket_listing(req, &bucket, S3Action::ListBucketAction).await?;
         req.extensions.insert(source_generation);
         Ok(())
     }
@@ -3546,7 +3704,7 @@ impl S3Access for FS {
             let req_info = ext_req_info_mut(&mut req.extensions)?;
             req_info.bucket = Some(req.input.bucket.clone());
             req_info.object = Some(req.input.key.clone());
-            req_info.version_id = req.input.version_id.clone();
+            req_info.version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
 
             if has_write_offset_bytes_header(&req.headers) {
                 return Err(S3Error::with_message(
@@ -3569,6 +3727,8 @@ impl S3Access for FS {
             set_requested_object_lock_retain_until(req, requested_retain_until.as_ref());
             set_post_object_policy_headers(req)?;
             authorize_request(req, Action::S3Action(S3Action::PutObjectAction)).await?;
+            let specific_etag = req.input.if_match.as_ref().is_some_and(|etag| !etag.is_any());
+            authorize_write_etag_condition(req, specific_etag).await?;
             req.extensions.insert(bucket_generation?);
 
             if req.method != http::Method::POST {
@@ -3733,6 +3893,11 @@ impl S3Access for FS {
                 (bucket.to_string(), key.to_string(), version_id.as_ref().map(|v| v.to_string()))
             }
         };
+        let source = match version_id.as_deref() {
+            Some(version) => format!("{src_bucket}/{src_key}?versionId={}", crate::auth::canonical_policy_version_id(version)),
+            None => format!("{src_bucket}/{src_key}"),
+        };
+        req.extensions.insert(RequestedCopySource(source));
         let source_bucket_generation = load_copy_source_bucket_generation(self, &src_bucket).await;
 
         {
@@ -3805,6 +3970,306 @@ mod tests {
     use serial_test::serial;
     use std::{collections::HashMap, sync::Arc};
     use time::OffsetDateTime;
+
+    #[test]
+    fn replication_head_checks_read_permissions_before_replication_permissions() {
+        crate::app::gating_test_env::run_large_stack_test("replication-head-permissions", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("replica-head-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+            let fs = FS::with_server_ctx(slot.clone());
+            for (grant_read, deny_read) in [(false, false), (true, true), (true, false)] {
+                let mut statements = vec![
+                    serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:ReplicateObject","Resource":format!("arn:aws:s3:::{bucket}/*")}),
+                ];
+                for (enabled, effect) in [(grant_read, "Allow"), (deny_read, "Deny")] {
+                    if enabled {
+                        statements.push(serde_json::json!({"Effect":effect,"Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/*")}));
+                    }
+                }
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                    )
+                    .await
+                    .expect("publish policy");
+                for version in [None, Some("null"), Some("12345678-1234-1234-1234-123456789abc")] {
+                    for header in ["x-rustfs-source-replication-check", "x-minio-source-replication-check"] {
+                        let mut req = build_request(
+                            HeadObjectInput {
+                                bucket: bucket.clone(),
+                                key: "object".to_owned(),
+                                version_id: version.map(str::to_owned),
+                                ..Default::default()
+                            },
+                            Method::HEAD,
+                        );
+                        ensure_req_info(&mut req);
+                        req.extensions.insert(slot.clone());
+                        req.headers.insert(header, HeaderValue::from_static("true"));
+                        let result = fs.head_object(&mut req).await;
+                        if grant_read && !deny_read {
+                            result.expect("read and replication permissions allow metadata check");
+                            assert!(super::replication_request_authorized(&req));
+                        } else {
+                            assert_eq!(
+                                result.expect_err("replication cannot replace read permission").code(),
+                                &S3ErrorCode::AccessDenied
+                            );
+                            assert!(!super::replication_request_authorized(&req));
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn replication_write_hooks_authorize_the_destination_version_and_tags() {
+        crate::app::gating_test_env::run_large_stack_test("replication-version-permissions", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("replica-write-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create versioned bucket");
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+            let fs = FS::with_server_ctx(slot.clone());
+            let mut versions = Vec::new();
+            for (body, tags) in [
+                (b"secret".to_vec(), "classification=secret"),
+                (b"public".to_vec(), "classification=public"),
+            ] {
+                let object = store
+                    .put_object(
+                        &bucket,
+                        "target",
+                        &mut crate::storage::PutObjReader::from_vec(body),
+                        &crate::storage::ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed version");
+                let version = object.version_id.expect("UUID version").to_string();
+                store
+                    .put_object_tags(
+                        &bucket,
+                        "target",
+                        tags,
+                        &crate::storage::ObjectOptions {
+                            version_id: Some(version.clone()),
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("tag version");
+                versions.push(version);
+            }
+            for condition in [
+                serde_json::json!({"s3:versionid":versions[0]}),
+                serde_json::json!({"s3:ExistingObjectTag/classification":"secret"}),
+            ] {
+                let policy = serde_json::json!({"Version":"2012-10-17","Statement":[
+                    {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*","Resource":format!("arn:aws:s3:::{bucket}/*")},
+                    {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/target"),"Condition":{"StringEquals":condition}}
+                ]});
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&policy).unwrap(),
+                    )
+                    .await
+                    .expect("publish version policy");
+                for (index, version) in versions.iter().enumerate() {
+                    for header in [None, Some("x-rustfs-source-version-id"), Some("x-minio-source-version-id")] {
+                        for operation in ["put", "copy", "multipart"] {
+                            let query_version = header.is_none().then(|| version.clone());
+                            let mut base = build_request((), Method::PUT);
+                            ensure_req_info(&mut base);
+                            base.extensions.insert(slot.clone());
+                            // A query version alone also requires replication authorization.
+                            base.headers
+                                .insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
+                            if let Some(header) = header {
+                                base.headers.insert(header, HeaderValue::from_str(version).unwrap());
+                            }
+                            let (result, info) = match operation {
+                                "put" => {
+                                    let mut req = base.map_input(|_| PutObjectInput {
+                                        bucket: bucket.clone(),
+                                        key: "target".to_owned(),
+                                        version_id: query_version,
+                                        ..Default::default()
+                                    });
+                                    let result = fs.put_object(&mut req).await;
+                                    (result, req.extensions.get::<ReqInfo>().unwrap().clone())
+                                }
+                                "copy" => {
+                                    let mut req = base.map_input(|_| {
+                                        CopyObjectInput::builder()
+                                            .bucket(bucket.clone())
+                                            .key("target".to_owned())
+                                            .version_id(query_version)
+                                            .copy_source(CopySource::parse(&format!("/{bucket}/source")).expect("copy source"))
+                                            .build()
+                                            .expect("copy input")
+                                    });
+                                    let result = fs.copy_object(&mut req).await;
+                                    (result, req.extensions.get::<ReqInfo>().unwrap().clone())
+                                }
+                                _ => {
+                                    let mut req = base.map_input(|_| CreateMultipartUploadInput {
+                                        bucket: bucket.clone(),
+                                        key: "target".to_owned(),
+                                        version_id: query_version,
+                                        ..Default::default()
+                                    });
+                                    let result = fs.create_multipart_upload(&mut req).await;
+                                    (result, req.extensions.get::<ReqInfo>().unwrap().clone())
+                                }
+                            };
+                            assert_eq!(info.version_id.as_deref(), Some(version.as_str()), "{operation}");
+                            if index == 0 {
+                                assert_eq!(
+                                    result.expect_err("protected destination version must be denied").code(),
+                                    &S3ErrorCode::AccessDenied,
+                                    "{operation}"
+                                );
+                            } else {
+                                result.expect("unprotected destination version remains authorized");
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn replication_delete_hook_authorizes_the_header_selected_version() {
+        crate::app::gating_test_env::run_large_stack_test("replication-delete-version-permissions", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let bucket = format!("replica-delete-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create versioned bucket");
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+            let fs = FS::with_server_ctx(slot.clone());
+            let mut versions = Vec::new();
+            for body in [b"protected".to_vec(), b"disposable".to_vec()] {
+                let object = store
+                    .put_object(
+                        &bucket,
+                        "target",
+                        &mut crate::storage::PutObjReader::from_vec(body),
+                        &crate::storage::ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("seed version");
+                versions.push(object.version_id.expect("UUID version").to_string());
+            }
+            let policy = serde_json::json!({"Version":"2012-10-17","Statement":[
+                {"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:*","Resource":format!("arn:aws:s3:::{bucket}/*")},
+                {"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:DeleteObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/target"),"Condition":{"StringEquals":{"s3:versionid":versions[0]}}}
+            ]});
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    serde_json::to_vec(&policy).unwrap(),
+                )
+                .await
+                .expect("publish version policy");
+            // The version named only by the replication header must be the one
+            // the policy sees: a plain `s3:DeleteObject` evaluation would let a
+            // replica delete remove the protected version. A request without
+            // the REPLICA status is authorized for the query version alone,
+            // because storage ignores the header for it (a stray header must
+            // not switch the evaluated action to `s3:DeleteObjectVersion`).
+            for (header, version, replica, expect_denied) in [
+                ("x-rustfs-source-version-id", &versions[0], true, true),
+                ("x-minio-source-version-id", &versions[0], true, true),
+                ("x-rustfs-source-version-id", &versions[0], false, false),
+                ("x-rustfs-source-version-id", &versions[1], true, false),
+            ] {
+                let mut req = build_request(
+                    DeleteObjectInput {
+                        bucket: bucket.clone(),
+                        key: "target".to_owned(),
+                        ..Default::default()
+                    },
+                    Method::DELETE,
+                );
+                ensure_req_info(&mut req);
+                req.extensions.insert(slot.clone());
+                if replica {
+                    req.headers
+                        .insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
+                    req.headers.insert(
+                        rustfs_utils::http::headers::AMZ_BUCKET_REPLICATION_STATUS,
+                        HeaderValue::from_static("REPLICA"),
+                    );
+                }
+                req.headers.insert(header, HeaderValue::from_str(version).unwrap());
+                let result = fs.delete_object(&mut req).await;
+                let info = req.extensions.get::<ReqInfo>().unwrap();
+                let expected_version = replica.then_some(version.as_str());
+                assert_eq!(info.version_id.as_deref(), expected_version, "{header} replica={replica}");
+                if expect_denied {
+                    assert_eq!(
+                        result
+                            .expect_err("protected version named by the header must be denied")
+                            .code(),
+                        &S3ErrorCode::AccessDenied,
+                        "{header}"
+                    );
+                } else {
+                    result.expect("a plain delete, or a replica delete of the unprotected version, succeeds");
+                }
+            }
+            store
+                .get_object_info(
+                    &bucket,
+                    "target",
+                    &crate::storage::ObjectOptions {
+                        version_id: Some(versions[0].clone()),
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("the protected version survives the denied replica deletes");
+        });
+    }
 
     #[test]
     fn terminal_iam_denial_is_access_denied_and_backend_failure_stays_internal() {
@@ -4580,7 +5045,8 @@ mod tests {
             Action::S3Action(S3Action::ListBucketAction),
             Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10&encoding-type=url"),
             &mut conditions,
-        );
+        )
+        .expect("valid listing query");
 
         assert_eq!(conditions.get("prefix"), Some(&vec!["photos/2024/".to_string()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
@@ -4595,7 +5061,8 @@ mod tests {
             Action::S3Action(S3Action::ListBucketVersionsAction),
             Some("prefix=&delimiter=%2F"),
             &mut conditions,
-        );
+        )
+        .expect("valid listing query");
 
         assert_eq!(conditions.get("prefix"), Some(&vec![String::new()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
@@ -4608,9 +5075,34 @@ mod tests {
             Action::S3Action(S3Action::GetObjectAction),
             Some("prefix=photos%2F2024%2F&delimiter=%2F&max-keys=10"),
             &mut conditions,
-        );
+        )
+        .expect("non-list query ignored");
 
         assert!(conditions.is_empty());
+    }
+
+    #[test]
+    fn listing_conditions_reject_repeated_query_and_ignore_headers() {
+        for action in [
+            S3Action::ListBucketAction,
+            S3Action::ListBucketVersionsAction,
+            S3Action::ListBucketMultipartUploadsAction,
+        ] {
+            for key in ["prefix", "delimiter", "max-keys"] {
+                let mut req = build_request((), Method::GET);
+                req.headers.insert(key, HeaderValue::from_static("allowed"));
+                let action = Action::S3Action(action);
+                let credentials = rustfs_credentials::Credentials::default();
+                let conditions = authorization_conditions(&req, &credentials, None, None, None, None, action).unwrap();
+                assert!(!conditions.contains_key(key), "{key} must come from the applied query");
+                req.uri = format!("/bucket?{key}=actual").parse().unwrap();
+                let conditions = authorization_conditions(&req, &credentials, None, None, None, None, action).unwrap();
+                assert_eq!(conditions.get(key), Some(&vec!["actual".to_string()]));
+                req.uri = format!("/bucket?{key}=actual&{key}=allowed").parse().unwrap();
+                let error = authorization_conditions(&req, &credentials, None, None, None, None, action).unwrap_err();
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            }
+        }
     }
 
     #[test]
@@ -5020,6 +5512,252 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn copy_source_conditions_use_the_decoded_source_for_both_copy_operations() {
+        use rustfs_policy::policy::{Args, BucketPolicy, BucketPolicyArgs, Policy};
+        let mut document = serde_json::json!({"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*"},
+            {"Effect":"Deny","Action":"s3:PutObject","Resource":"arn:aws:s3:::bucket/*",
+             "Condition":{"StringLike":{"s3:x-amz-copy-source":"secret/*"}}}
+        ]});
+        let identity =
+            Policy::parse_config(&serde_json::to_vec(&document).expect("encode identity policy")).expect("parse policy");
+        for statement in document["Statement"].as_array_mut().expect("statements") {
+            statement["Principal"] = serde_json::json!("*");
+        }
+        let bucket: BucketPolicy =
+            serde_json::from_slice(&serde_json::to_vec(&document).expect("encode bucket policy")).expect("parse bucket policy");
+        for spelling in [
+            "secret/report.txt",
+            "%73ecret/report.txt",
+            "secret%2Freport.txt",
+            "/secret/report.txt",
+            "%2Fsecret%2Freport.txt?versionId=00000000-0000-0000-0000-000000000000",
+            "public/report.txt",
+            "/public%2Freport.txt",
+        ] {
+            for multipart in [false, true] {
+                let source = CopySource::parse(spelling).expect("parse source exactly as the request parser does");
+                let mut req = if multipart {
+                    let input = UploadPartCopyInput::builder()
+                        .bucket("bucket".to_string())
+                        .key("copy".to_string())
+                        .copy_source(source)
+                        .upload_id("unused".to_string())
+                        .part_number(1)
+                        .build()
+                        .expect("part copy input");
+                    let mut req = build_request(input, Method::PUT);
+                    ensure_req_info(&mut req);
+                    let _ = FS::new().upload_part_copy(&mut req).await;
+                    req.map_input(|_| ())
+                } else {
+                    let input = CopyObjectInput::builder()
+                        .bucket("bucket".to_string())
+                        .key("copy".to_string())
+                        .copy_source(source)
+                        .build()
+                        .expect("copy input");
+                    let mut req = build_request(input, Method::PUT);
+                    ensure_req_info(&mut req);
+                    let _ = FS::new().copy_object(&mut req).await;
+                    req.map_input(|_| ())
+                };
+                req.headers
+                    .insert("x-amz-copy-source", HeaderValue::from_str(spelling).expect("source header"));
+                let action = Action::S3Action(S3Action::PutObjectAction);
+                let conditions = remaining_retention_days_conditions(&req, action);
+                let canonical = &conditions["x-amz-copy-source"];
+                assert_eq!(canonical.len(), 1, "one semantic source, independent of header spelling");
+                let expected = if spelling.contains("public") {
+                    "public/report.txt"
+                } else if spelling.contains('?') {
+                    "secret/report.txt?versionId=null"
+                } else {
+                    "secret/report.txt"
+                };
+                assert_eq!(canonical[0], expected, "{spelling}, multipart={multipart}");
+                let allowed = expected.starts_with("public/");
+                assert_eq!(
+                    identity
+                        .is_allowed(&Args {
+                            account: "user",
+                            groups: &None,
+                            action,
+                            bucket: "bucket",
+                            object: "copy",
+                            conditions: &conditions,
+                            claims: &HashMap::new(),
+                            is_owner: false,
+                            deny_only: false
+                        })
+                        .await,
+                    allowed
+                );
+                assert_eq!(
+                    bucket
+                        .is_allowed(&BucketPolicyArgs {
+                            account: "user",
+                            groups: &None,
+                            action,
+                            bucket: "bucket",
+                            object: "copy",
+                            conditions: &conditions,
+                            is_owner: false
+                        })
+                        .await,
+                    allowed
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legal_hold_policy_checks_xml_body() {
+        let action = Action::S3Action(S3Action::PutObjectLegalHoldAction);
+        for header in [None, Some("ON")] {
+            let mut req = build_request(
+                PutObjectLegalHoldInput {
+                    bucket: "bucket".to_string(),
+                    key: "object".to_string(),
+                    legal_hold: Some(ObjectLockLegalHold {
+                        status: Some(ObjectLockLegalHoldStatus::from_static("OFF")),
+                    }),
+                    ..Default::default()
+                },
+                Method::PUT,
+            );
+            ensure_req_info(&mut req);
+            if let Some(header) = header {
+                req.headers
+                    .insert("x-amz-object-lock-legal-hold", HeaderValue::from_static(header));
+            }
+            let _ = FS::new().put_object_legal_hold(&mut req).await;
+            let conditions = remaining_retention_days_conditions(&req, action);
+            assert_eq!(conditions.get("object-lock-legal-hold"), Some(&vec!["OFF".to_string()]));
+            assert_requested_value_denied(action, "s3:object-lock-legal-hold", "OFF", &conditions).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn tagging_policy_checks_xml_body() {
+        for version in [None, Some("version")] {
+            let mut req = build_request(
+                PutObjectTaggingInput {
+                    bucket: "bucket".to_string(),
+                    key: "object".to_string(),
+                    version_id: version.map(str::to_string),
+                    tagging: Tagging {
+                        tag_set: vec![Tag {
+                            key: Some("classification".to_string()),
+                            value: Some("public".to_string()),
+                        }],
+                    },
+                    checksum_algorithm: None,
+                    content_md5: None,
+                    expected_bucket_owner: None,
+                    request_payer: None,
+                },
+                Method::PUT,
+            );
+            ensure_req_info(&mut req);
+            req.headers
+                .insert("x-amz-tagging", HeaderValue::from_static("classification=secret&spoofed=yes"));
+            let _ = FS::new().put_object_tagging(&mut req).await;
+            let action = versioned_tagging_action(S3Action::PutObjectTaggingAction, version);
+            let conditions = remaining_retention_days_conditions(&req, action);
+            assert_eq!(conditions.get("RequestObjectTag/classification"), Some(&vec!["public".to_string()]));
+            assert_eq!(conditions.get("RequestObjectTagKeys"), Some(&vec!["classification".to_string()]));
+            assert!(!conditions.contains_key("RequestObjectTag/spoofed"));
+            assert_requested_value_denied(action, "s3:RequestObjectTag/classification", "public", &conditions).await;
+        }
+    }
+
+    async fn assert_requested_value_denied(action: Action, key: &str, value: &str, conditions: &HashMap<String, Vec<String>>) {
+        let document = serde_json::json!({
+            "Version": "2012-10-17",
+            "Statement": [
+                {"Effect": "Allow", "Action": action, "Resource": "arn:aws:s3:::bucket/*"},
+                {"Effect": "Deny", "Action": action, "Resource": "arn:aws:s3:::bucket/*",
+                 "Condition": {"StringEquals": {key: value}}}
+            ]
+        });
+        let policy = rustfs_policy::policy::Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let claims = HashMap::new();
+        let args = rustfs_policy::policy::Args {
+            account: "writer",
+            groups: &None,
+            action,
+            bucket: "bucket",
+            conditions,
+            is_owner: false,
+            object: "object",
+            claims: &claims,
+            deny_only: false,
+        };
+        assert!(!policy.is_allowed(&args).await, "the applied request value must trigger Deny");
+    }
+
+    #[tokio::test]
+    async fn post_object_policy_checks_form_fields() {
+        let mut req = build_request(
+            PutObjectInput {
+                bucket: "bucket".to_string(),
+                key: "object".to_string(),
+                object_lock_mode: Some(ObjectLockMode::from_static("COMPLIANCE")),
+                object_lock_legal_hold_status: Some(ObjectLockLegalHoldStatus::from_static("ON")),
+                object_lock_retain_until_date: Some(Timestamp::parse(TimestampFormat::DateTime, "2035-01-01T00:00:00Z").unwrap()),
+                storage_class: Some(StorageClass::from_static("STANDARD_IA")),
+                tagging: Some("classification=public".to_string()),
+                ..Default::default()
+            },
+            Method::POST,
+        );
+        ensure_req_info(&mut req);
+        for (key, value) in [
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-legal-hold", "OFF"),
+            ("x-amz-object-lock-retain-until-date", "2029-01-01T00:00:00Z"),
+            ("x-amz-storage-class", "STANDARD"),
+            ("x-amz-tagging", "classification=secret&spoofed=yes"),
+            ("x-amz-acl", "public-read"),
+        ] {
+            req.headers.insert(key, HeaderValue::from_static(value));
+        }
+        let _ = FS::new().put_object(&mut req).await;
+        let action = Action::S3Action(S3Action::PutObjectAction);
+        let conditions = remaining_retention_days_conditions(&req, action);
+        for (key, value) in [
+            ("object-lock-mode", "COMPLIANCE"),
+            ("object-lock-legal-hold", "ON"),
+            ("object-lock-retain-until-date", "2035-01-01T00:00:00Z"),
+            ("x-amz-storage-class", "STANDARD_IA"),
+            ("RequestObjectTag/classification", "public"),
+        ] {
+            assert_eq!(conditions.get(key), Some(&vec![value.to_string()]));
+        }
+        assert!(!conditions.contains_key("x-amz-acl"));
+        assert!(!conditions.contains_key("RequestObjectTag/spoofed"));
+        assert_requested_value_denied(action, "s3:object-lock-mode", "COMPLIANCE", &conditions).await;
+        assert_requested_value_denied(action, "s3:RequestObjectTag/classification", "public", &conditions).await;
+        let post_req = req.map_input(|input| PostObjectInput {
+            bucket: input.bucket,
+            key: input.key,
+            object_lock_mode: input.object_lock_mode,
+            object_lock_legal_hold_status: input.object_lock_legal_hold_status,
+            object_lock_retain_until_date: input.object_lock_retain_until_date,
+            storage_class: input.storage_class,
+            tagging: input.tagging,
+            ..Default::default()
+        });
+        let post_conditions = remaining_retention_days_conditions(&post_req, action);
+        assert_eq!(post_conditions.get("object-lock-mode"), conditions.get("object-lock-mode"));
+        assert_eq!(
+            post_conditions.get("RequestObjectTag/classification"),
+            conditions.get("RequestObjectTag/classification")
+        );
+    }
+
+    #[tokio::test]
     async fn retention_policy_checks_body_instead_of_conflicting_headers() {
         use rustfs_policy::policy::{Args, Policy};
         let mut req = build_request(
@@ -5264,6 +6002,23 @@ mod tests {
         assert!(!conditions.contains_key("RequestObjectTagKeys"));
     }
 
+    #[test]
+    fn replication_proxy_requires_authorization_independent_of_local_tags() {
+        let mut extensions = http::Extensions::new();
+        assert!(super::replication_proxy_allowed(&extensions));
+        // A local miss produces an empty tag map, but still establishes that the
+        // policy needs tags. Neither anonymous nor authenticated callers may proxy.
+        extensions.insert(ObjectTagConditions::new("bucket", "missing", None, HashMap::new()));
+        assert!(!super::replication_proxy_allowed(&extensions));
+        extensions.insert(ObjectTagConditions::new(
+            "bucket",
+            "missing",
+            Some("version"),
+            HashMap::from([("ExistingObjectTag/protected".to_string(), vec!["yes".to_string()])]),
+        ));
+        assert!(!super::replication_proxy_allowed(&extensions));
+    }
+
     #[tokio::test]
     async fn test_required_existing_object_tags_are_merged_into_authorization_conditions() {
         let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
@@ -5296,6 +6051,7 @@ mod tests {
         .expect("merge required existing object tags into authorization conditions");
 
         assert_eq!(conditions.get("ExistingObjectTag/security"), Some(&vec!["restricted".to_string()]));
+        assert!(!super::replication_proxy_allowed(&request.extensions));
         assert_eq!(conditions.get("ExistingObjectTag/project"), Some(&vec!["webapp".to_string()]));
         assert_eq!(conditions.get("delimiter"), Some(&vec!["/".to_string()]));
     }
@@ -5352,6 +6108,42 @@ mod tests {
             .map(|p| bucket_policy_uses_existing_object_tag_conditions(&p))
             .unwrap_or(true);
         assert!(conservative_with_tag_keys);
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn existing_tag_hint_reuses_parsed_metadata_and_fails_closed_without_it() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let bucket = format!("cached-policy-hint-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create hint bucket");
+        let document = serde_json::json!({"Version":"2012-10-17","Statement":[{
+            "Effect":"Deny","Principal":"*","Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{bucket}/*"),
+            "Condition":{"StringEquals":{"s3:ExistingObjectTag/classification":"secret"}}
+        }]});
+        let mut metadata = (*crate::storage::get_bucket_metadata(&bucket).await.expect("bucket metadata")).clone();
+        metadata.policy_config =
+            Some(serde_json::from_slice(&serde_json::to_vec(&document).expect("policy JSON")).expect("parsed policy"));
+        // A cached parsed snapshot is the authority used by actual policy
+        // evaluation; the tag hint must consult that same snapshot.
+        metadata.policy_config_json = b"invalid raw JSON".to_vec();
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata.clone())
+            .await
+            .expect("publish parsed snapshot");
+        assert!(matches!(
+            load_bucket_policy_existing_object_tag_hint(&store, &bucket, Action::S3Action(S3Action::GetObjectAction)).await,
+            super::BucketPolicyExistingObjectTagHint::Parsed(_)
+        ));
+        metadata.policy_config = None;
+        crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+            .await
+            .expect("publish unreadable snapshot");
+        assert!(matches!(
+            load_bucket_policy_existing_object_tag_hint(&store, &bucket, Action::S3Action(S3Action::GetObjectAction)).await,
+            super::BucketPolicyExistingObjectTagHint::ConservativeTagRequired
+        ));
     }
 
     #[test]
@@ -6139,6 +6931,179 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn tag_dependent_access_hooks_preserve_local_miss_for_replication_proxy() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+        let bucket = format!("tag-proxy-boundary-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let policy_json = format!(
+            r#"{{"Version":"2012-10-17","Statement":[
+            {{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:GetObject","s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::{bucket}/*"]}},
+            {{"Effect":"Deny","Principal":{{"AWS":"*"}},"Action":["s3:GetObject","s3:GetObjectTagging","s3:PutObjectTagging","s3:DeleteObjectTagging"],"Resource":["arn:aws:s3:::{bucket}/*"],"Condition":{{"StringEquals":{{"s3:ExistingObjectTag/protected":"yes"}}}}}}
+        ]}}"#
+        );
+        let policy_bytes = policy_json.into_bytes();
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                policy_bytes,
+            )
+            .await
+            .expect("publish policy");
+        macro_rules! check_hook {
+            ($input:expr, $method:expr, $hook:ident) => {{
+                let mut req = build_request($input, $method);
+                ensure_req_info(&mut req);
+                req.extensions.insert(fs.server_ctx().clone());
+                fs.$hook(&mut req)
+                    .await
+                    .expect("local miss does not match the tag deny");
+                let evidence = req
+                    .extensions
+                    .get::<ObjectTagConditions>()
+                    .expect("authorization must retain tag dependency");
+                assert!(evidence.values.is_empty(), "missing local object has no tags");
+                assert!(
+                    !super::replication_proxy_allowed(&req.extensions),
+                    "local absence cannot authorize a tagged replica"
+                );
+            }};
+        }
+        check_hook!(
+            GetObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("missing".to_string())
+                .build()
+                .expect("GET"),
+            Method::GET,
+            get_object
+        );
+        check_hook!(
+            HeadObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("missing".to_string())
+                .build()
+                .expect("HEAD"),
+            Method::HEAD,
+            head_object
+        );
+        check_hook!(
+            GetObjectTaggingInput::builder()
+                .bucket(bucket.clone())
+                .key("missing".to_string())
+                .build()
+                .expect("get tags"),
+            Method::GET,
+            get_object_tagging
+        );
+        check_hook!(
+            DeleteObjectTaggingInput::builder()
+                .bucket(bucket.clone())
+                .key("missing".to_string())
+                .build()
+                .expect("delete tags"),
+            Method::DELETE,
+            delete_object_tagging
+        );
+        check_hook!(
+            PutObjectTaggingInput::builder()
+                .bucket(bucket.clone())
+                .key("missing".to_string())
+                .tagging(s3s::dto::Tagging { tag_set: Vec::new() })
+                .build()
+                .expect("put tags"),
+            Method::PUT,
+            put_object_tagging
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn conditional_writes_require_read_permission_only_for_specific_etags() {
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)))));
+        let fs = FS::with_server_ctx(server_ctx);
+        for readable in [false, true] {
+            let bucket = format!("etag-oracle-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            let read_effect = if readable { "Allow" } else { "Deny" };
+            let policy_json = format!(
+                r#"{{"Version":"2012-10-17","Statement":[
+                {{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:PutObject"],"Resource":["arn:aws:s3:::{bucket}/*"]}},
+                {{"Effect":"{read_effect}","Principal":{{"AWS":"*"}},"Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":["arn:aws:s3:::{bucket}/*"]}}
+            ]}}"#
+            );
+            let policy_bytes = policy_json.into_bytes();
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    policy_bytes,
+                )
+                .await
+                .expect("publish policy");
+            for condition in ["absent", "wildcard", "dto", "header"] {
+                let specific = matches!(condition, "dto" | "header");
+                let dto = match condition {
+                    "dto" => Some(s3s::dto::ETagCondition::ETag(s3s::dto::ETag::Strong("guessed-etag".to_string()))),
+                    "wildcard" => Some(s3s::dto::ETagCondition::Any),
+                    _ => None,
+                };
+                let mut put_input = PutObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key("object".to_string())
+                    .build()
+                    .expect("put");
+                put_input.if_match = dto.clone();
+                let mut put = build_request(put_input, Method::PUT);
+                ensure_req_info(&mut put);
+                put.extensions.insert(fs.server_ctx().clone());
+                let mut complete_input = CompleteMultipartUploadInput::builder()
+                    .bucket(bucket.clone())
+                    .key("object".to_string())
+                    .upload_id("upload".to_string())
+                    .build()
+                    .expect("complete");
+                complete_input.if_match = dto;
+                let mut complete = build_request(complete_input, Method::POST);
+                ensure_req_info(&mut complete);
+                complete.extensions.insert(fs.server_ctx().clone());
+                if condition == "header" {
+                    for headers in [&mut put.headers, &mut complete.headers] {
+                        headers.insert(http::header::IF_MATCH, HeaderValue::from_static("\"guessed-etag\""));
+                    }
+                }
+                for result in [
+                    fs.put_object(&mut put).await,
+                    fs.complete_multipart_upload(&mut complete).await,
+                ] {
+                    if specific && !readable {
+                        assert_eq!(
+                            result
+                                .expect_err("a write-only caller must not compare content fingerprints")
+                                .code(),
+                            &S3ErrorCode::AccessDenied
+                        );
+                    } else {
+                        result.expect("readable or wildcard/ordinary writes remain authorized");
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn put_object_access_captures_authorized_bucket_incarnation() {
         let store = crate::app::gating_test_env::shared_gating_ecstore().await;
         let server_ctx = ServerContextSlot::new();
@@ -6186,6 +7151,107 @@ mod tests {
                     .expect("bucket incarnation should remain readable")
             )
         );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn include_deleted_listing_enforces_version_permissions() {
+        use rustfs_iam::store::Store as _;
+        use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+        struct ReadyIam(Arc<IamSys<ObjectStore>>);
+        impl IamInterface for ReadyIam {
+            fn handle(&self) -> Arc<IamSys<ObjectStore>> {
+                self.0.clone()
+            }
+            fn is_ready(&self) -> bool {
+                true
+            }
+        }
+        let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        ObjectStore::new(store.clone())
+            .save_iam_config(
+                serde_json::json!({"version":1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("seed IAM format");
+        let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("initialize IAM");
+        iam.create_user(
+            "list-reader",
+            &AddOrUpdateUserReq {
+                secret_key: "list-reader-secret".to_string(),
+                policy: None,
+                status: AccountStatus::Enabled,
+            },
+        )
+        .await
+        .expect("create reader");
+        let user = iam.get_user("list-reader").await.expect("reader identity").credentials;
+        iam.set_policy(
+            "list-only",
+            rustfs_policy::policy::Policy::parse_config(
+                br#"{"Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::*"}]}"#,
+            )
+            .expect("list policy"),
+        )
+        .await
+        .expect("store identity policy");
+        iam.policy_db_set("list-reader", rustfs_iam::store::UserType::Reg, false, "list-only")
+            .await
+            .expect("attach list policy");
+        let bucket = format!("deleted-list-auth-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(Arc::new(AppContext::new(Arc::clone(&store), Arc::new(ReadyIam(iam)), Arc::new(TestKms)))));
+        for (grant_versions, deny_versions) in [(false, false), (true, false), (true, true)] {
+            let mut statements = vec![serde_json::json!({
+                "Effect": "Allow", "Principal": {"AWS": "*"}, "Action": ["s3:ListBucket"], "Resource": format!("arn:aws:s3:::{bucket}")
+            })];
+            if grant_versions {
+                statements.push(serde_json::json!({
+                    "Effect": "Allow", "Principal": {"AWS": "*"}, "Action": ["s3:ListBucketVersions"], "Resource": format!("arn:aws:s3:::{bucket}")
+                }));
+            }
+            if deny_versions {
+                statements.push(serde_json::json!({
+                    "Effect": "Deny", "Principal": {"AWS": "*"}, "Action": ["s3:ListBucketVersions"], "Resource": format!("arn:aws:s3:::{bucket}")
+                }));
+            }
+            let policy = serde_json::json!({"Version": "2012-10-17", "Statement": statements});
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                    serde_json::to_vec(&policy).unwrap(),
+                )
+                .await
+                .expect("publish listing policy");
+            for header in ["x-rustfs-include-deleted", "x-minio-include-deleted"] {
+                for (value, authenticated) in [("true", true), ("false", true), ("true", false), ("false", false)] {
+                    let mut req = build_request((), Method::GET);
+                    req.extensions.insert(slot.clone());
+                    req.extensions.insert(ReqInfo {
+                        bucket: Some(bucket.clone()),
+                        cred: authenticated.then(|| user.clone()),
+                        ..Default::default()
+                    });
+                    req.headers.insert(header, HeaderValue::from_static(value));
+                    let result = super::authorize_bucket_listing(&mut req, &bucket, S3Action::ListBucketAction).await;
+                    if value == "true" && (deny_versions || (authenticated && !grant_versions)) {
+                        assert_eq!(
+                            result.expect_err("version visibility requires permission").code(),
+                            &S3ErrorCode::AccessDenied
+                        );
+                    } else {
+                        result.expect("authorized listings remain available");
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
@@ -6458,6 +7524,285 @@ mod tests {
             .get_object_info(&bucket, "object", &crate::storage::ObjectOptions::default())
             .await
             .expect("the new-generation object must survive the stale request");
+    }
+
+    #[test]
+    fn copy_tags_authorize_source_and_effective_destination_tags() {
+        crate::app::gating_test_env::run_large_stack_test("copy-tag-authorization", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let slot = ServerContextSlot::new();
+            let context = Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)));
+            assert!(slot.install(context.clone()));
+            let fs = FS::with_server_ctx(slot.clone());
+            let bucket = format!("copy-tags-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket");
+            let mut reader = crate::storage::PutObjReader::from_vec(b"confidential source".to_vec());
+            let source = store
+                .put_object(
+                    &bucket,
+                    "source",
+                    &mut reader,
+                    &crate::storage::ObjectOptions {
+                        versioned: true,
+                        user_defined: HashMap::from([(
+                            rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(),
+                            "visibility=private".to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("tagged historical source");
+            let historical = source.version_id.expect("versioned source").to_string();
+            let mut reader = crate::storage::PutObjReader::from_vec(b"current source".to_vec());
+            store
+                .put_object(
+                    &bucket,
+                    "source",
+                    &mut reader,
+                    &crate::storage::ObjectOptions {
+                        versioned: true,
+                        user_defined: HashMap::from([(
+                            rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(),
+                            "visibility=private".to_string(),
+                        )]),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("current tagged source");
+            for (key, tags) in [("source-null", "visibility=private"), ("source-empty", "")] {
+                let mut reader = crate::storage::PutObjReader::from_vec(b"unversioned source".to_vec());
+                store
+                    .put_object(
+                        &bucket,
+                        key,
+                        &mut reader,
+                        &crate::storage::ObjectOptions {
+                            user_defined: HashMap::from([(rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(), tags.to_string())]),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("unversioned source");
+            }
+            for (index, (directive, replacement, explicit_version, tag_permission, deny_public, expected)) in [
+                (None, None, None, "missing", false, false),
+                (Some("COPY"), None, None, "deny", false, false),
+                (None, None, None, "current", false, true),
+                (Some("COPY"), None, Some("historical"), "current", false, false),
+                (Some("COPY"), None, Some("historical"), "version", false, true),
+                (Some("COPY"), None, Some("null"), "current", false, false),
+                (Some("COPY"), None, Some("null"), "version", false, true),
+                (None, None, None, "empty", false, true),
+                (Some("REPLACE"), Some("visibility=private"), None, "deny", false, true),
+                (Some("REPLACE"), Some(""), None, "deny", false, true),
+                (Some("REPLACE"), Some("visibility=public"), None, "deny", true, false),
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                let mut statements = vec![
+                    serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:GetObject","s3:GetObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/source*")}),
+                    serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/copied-*")}),
+                ];
+                if !matches!(tag_permission, "missing" | "empty") {
+                    let action = if tag_permission == "version" {
+                        "s3:GetObjectVersionTagging"
+                    } else {
+                        "s3:GetObjectTagging"
+                    };
+                    statements.push(serde_json::json!({"Effect":if tag_permission == "deny" { "Deny" } else { "Allow" },"Principal":{"AWS":"*"},"Action":action,"Resource":format!("arn:aws:s3:::{bucket}/source*")}));
+                }
+                if deny_public {
+                    statements.push(serde_json::json!({"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/*"),"Condition":{"StringEquals":{"s3:RequestObjectTag/visibility":"public"}}}));
+                }
+                let policy =
+                    serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).expect("policy");
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        policy,
+                    )
+                    .await
+                    .expect("policy publication");
+                let destination = format!("copied-{index}");
+                let input = CopyObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(destination.clone())
+                    .copy_source(CopySource::Bucket {
+                        bucket: bucket.clone().into(),
+                        key: (if tag_permission == "empty" {
+                            "source-empty"
+                        } else if explicit_version == Some("null") {
+                            "source-null"
+                        } else {
+                            "source"
+                        })
+                        .into(),
+                        version_id: explicit_version.map(|version| {
+                            if version == "historical" {
+                                historical.clone().into()
+                            } else {
+                                "null".into()
+                            }
+                        }),
+                    })
+                    .tagging_directive(directive.map(|value| TaggingDirective::from(value.to_string())))
+                    .tagging(replacement.map(str::to_string))
+                    .build()
+                    .expect("copy input");
+                let mut request = build_request(input, Method::PUT);
+                ensure_req_info(&mut request);
+                request.extensions.insert(slot.clone());
+                let access = fs.copy_object(&mut request).await;
+                if !expected {
+                    assert_eq!(
+                        access.expect_err("copy must enforce tagging and destination policy").code(),
+                        &S3ErrorCode::AccessDenied,
+                        "case {index}"
+                    );
+                    assert!(
+                        store
+                            .get_object_info(&bucket, &destination, &crate::storage::ObjectOptions::default())
+                            .await
+                            .is_err()
+                    );
+                    continue;
+                }
+                access.expect("authorized copy");
+                crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(context.clone()))
+                    .execute_copy_object(request)
+                    .await
+                    .expect("copy preserves allowed tags");
+                assert_eq!(
+                    store
+                        .get_object_tags(&bucket, &destination, &crate::storage::ObjectOptions::default())
+                        .await
+                        .expect("destination tags"),
+                    replacement.unwrap_or(if tag_permission == "empty" { "" } else { "visibility=private" })
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn copy_tags_rechecks_actual_source_after_access_snapshot() {
+        crate::app::gating_test_env::run_large_stack_test("copy-tag-snapshot", || async {
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let slot = ServerContextSlot::new();
+            let context = Arc::new(AppContext::new(store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)));
+            assert!(slot.install(context.clone()));
+            let fs = FS::with_server_ctx(slot.clone());
+            for mode in ["tag-change", "new-tags", "allowed-tags", "source-tag-change", "self-copy"] {
+                let bucket = format!("copy-snapshot-{}", uuid::Uuid::new_v4());
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket");
+                let destination = if mode == "self-copy" { "source" } else { "destination" };
+                let initial = if mode == "new-tags" { "" } else { "visibility=private" };
+                let mut reader = crate::storage::PutObjReader::from_vec(b"source".to_vec());
+                store
+                    .put_object(
+                        &bucket,
+                        "source",
+                        &mut reader,
+                        &crate::storage::ObjectOptions {
+                            user_defined: HashMap::from([(
+                                rustfs_utils::http::AMZ_OBJECT_TAGGING.to_string(),
+                                initial.to_string(),
+                            )]),
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("source");
+                let mut statements = vec![
+                    serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{bucket}/source")}),
+                    serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/{destination}")}),
+                    serde_json::json!({"Effect":"Deny","Principal":{"AWS":"*"},"Action":"s3:PutObject","Resource":format!("arn:aws:s3:::{bucket}/*"),"Condition":{"StringEquals":{"s3:RequestObjectTag/visibility":"public"}}}),
+                ];
+                if mode != "new-tags" {
+                    statements.push(serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObjectTagging","Resource":format!("arn:aws:s3:::{bucket}/source")}));
+                    // A conditional Allow must work at the preliminary hook as well.
+                    statements[1]["Condition"] = serde_json::json!({"StringEquals":{"s3:RequestObjectTag/visibility":"private"}});
+                    if mode == "source-tag-change" {
+                        statements[1].as_object_mut().expect("statement").remove("Condition");
+                        statements.remove(2);
+                        statements.last_mut().expect("tag read statement")["Condition"] =
+                            serde_json::json!({"StringEquals":{"s3:ExistingObjectTag/visibility":"private"}});
+                    } else if mode == "self-copy" {
+                        statements[1]["Condition"]["StringEquals"]["s3:ExistingObjectTag/visibility"] =
+                            serde_json::json!("private");
+                        statements.last_mut().expect("tag read statement")["Condition"] =
+                            serde_json::json!({"StringEquals":{"s3:ExistingObjectTag/visibility":"private"}});
+                    }
+                }
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).expect("policy"),
+                    )
+                    .await
+                    .expect("publish policy");
+                let input = CopyObjectInput::builder()
+                    .bucket(bucket.clone())
+                    .key(destination.to_string())
+                    .copy_source(CopySource::Bucket {
+                        bucket: bucket.clone().into(),
+                        key: "source".into(),
+                        version_id: None,
+                    })
+                    .metadata_directive((mode == "self-copy").then(|| MetadataDirective::from_static(MetadataDirective::REPLACE)))
+                    .build()
+                    .expect("copy");
+                let mut request = build_request(input, Method::PUT);
+                ensure_req_info(&mut request);
+                request.extensions.insert(slot.clone());
+                fs.copy_object(&mut request).await.expect("preliminary snapshot permits copy");
+                if !matches!(mode, "allowed-tags" | "self-copy") {
+                    store
+                        .put_object_tags(&bucket, "source", "visibility=public", &crate::storage::ObjectOptions::default())
+                        .await
+                        .expect("change source after access hook");
+                }
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    crate::app::object_usecase::DefaultObjectUsecase::with_context(Some(context.clone()))
+                        .execute_copy_object(request),
+                )
+                .await
+                .expect("copy authorization must not reacquire its own object lock");
+                if matches!(mode, "allowed-tags" | "self-copy") {
+                    result.expect("unchanged allowed tags complete");
+                    assert_eq!(
+                        store
+                            .get_object_tags(&bucket, destination, &crate::storage::ObjectOptions::default())
+                            .await
+                            .expect("copied tags"),
+                        "visibility=private"
+                    );
+                } else {
+                    assert_eq!(
+                        result.expect_err("actual source tags require fresh authorization").code(),
+                        &S3ErrorCode::AccessDenied
+                    );
+                    assert!(
+                        store
+                            .get_object_info(&bucket, "destination", &crate::storage::ObjectOptions::default())
+                            .await
+                            .is_err(),
+                        "denial must precede destination publication"
+                    );
+                }
+            }
+        });
     }
 
     #[tokio::test]

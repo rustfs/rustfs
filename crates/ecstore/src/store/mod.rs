@@ -423,8 +423,6 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
     !is_meta_bucketname(&oi.bucket)
 }
 
-const MAX_UPLOADS_LIST: usize = 10000;
-
 mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
@@ -3295,6 +3293,7 @@ mod tests {
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
         let (mut disks, errs) = init_disks(
+            &crate::runtime::global::current_ctx(),
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,

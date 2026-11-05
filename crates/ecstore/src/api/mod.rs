@@ -192,6 +192,7 @@ pub mod bucket {
             table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+        pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
     }
 
     pub mod config_parse_mode {
@@ -331,8 +332,8 @@ pub mod bucket {
     pub mod utils {
         pub use crate::bucket::utils::{
             check_bucket_and_object_names, check_list_objs_args, check_object_name_for_length_and_slash,
-            check_valid_bucket_name_strict, deserialize, has_bad_path_component, is_meta_bucketname, is_valid_object_prefix,
-            serialize,
+            check_valid_bucket_name_strict, deserialize, has_bad_path_component, has_xml_invalid_control_characters,
+            is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 
@@ -451,9 +452,15 @@ pub mod disk {
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
     pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
+    #[cfg(feature = "test-util")]
+    pub use crate::disk::disk_store::wait_for_multipart_index_bootstrap;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(feature = "test-util")]
     pub use crate::disk::local::{local_durability_modes, set_local_rename_data_fail_after_metadata_commit};
+    pub use crate::disk::multipart_index::{
+        MULTIPART_INDEX_RPC_MAX_BYTES, MULTIPART_INDEX_RPC_MAX_REQUEST_BYTES, MultipartIndexPage, MultipartIndexRpcReply,
+        MultipartIndexRpcRequest,
+    };
     pub use crate::disk::multipart_source::{
         MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
         MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceResponse,
@@ -466,13 +473,15 @@ pub mod disk {
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, CurrentDeleteTransition,
+        BoundedDeleteRecoveryDiscovery, BoundedDeleteRecoveryInspection, BoundedDeleteRecoverySettlement,
+        BoundedDeleteRecoverySettlementReply, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration,
+        CurrentDeleteTransition, DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES, DELETE_RECOVERY_MAX_INSPECTION_ENTRIES,
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
-        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup, PoolMetaNativeInspection,
-        PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEAL_REPLACEMENT_RECOVERY_DIR, HEALING_MARKER_PATH,
+        NsScannerOpenRequest, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup,
+        PoolMetaNativeInspection, PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
@@ -617,7 +626,7 @@ pub mod rebalance {
 pub mod rio {
     pub use crate::io_support::rio::{
         DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
-        boxed_reader, compression_metadata_value, wrap_reader,
+        boxed_reader, compression_metadata_value, validate_compression_scheme, wrap_reader,
     };
 }
 
@@ -654,7 +663,9 @@ pub mod set_disk {
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
-        pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::bucket::quota::reservation::{
+            fail_next_quota_ledger_save_for_test, initialize_quota_ledger_for_test, retry_quota_reconciliation_for_test,
+        };
         pub use crate::set_disk::ConditionalReadBenchmarkMetadataGuard;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 

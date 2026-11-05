@@ -75,6 +75,7 @@ Explicit per-operation overrides always win over the profile, so you can select
 | `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS` | `5` | `60` | Timeout for metadata reads such as `read_metadata`. |
 | `RUSTFS_DRIVE_DISK_INFO_TIMEOUT_SECS` | `5` | `60` | Timeout for `disk_info()` calls. |
 | `RUSTFS_OBJECT_DISK_READ_TIMEOUT` | `10` | `60` | Per-read stall budget while streaming an object body from disk. |
+| `RUSTFS_GET_DISK_READ_IDLE_TIMEOUT_SECS` | `120` | `30` floor | How long a GET body may make no downstream progress before its disk-read admission is released and the stream fails; a client that resumes within the window is unaffected. The effective value is never below 30 seconds or twice `RUSTFS_OBJECT_DISK_READ_TIMEOUT`. |
 | `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3` | `60` | Base cooperative budget for an object-capacity disk scan. |
 | `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15` | `60` | Upper bound for the dynamically adjusted object-capacity scan budget. |
 | `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` | `30` | — | Deprecated global fallback for every per-operation knob without an explicit override. Prefer the per-operation knobs. |

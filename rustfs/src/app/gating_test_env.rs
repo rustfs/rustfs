@@ -158,6 +158,9 @@ pub(crate) async fn durable_quota_test_bucket(prefix: &str, limit: u64) -> (Arc<
         .set_quota_config(&bucket, BucketQuota::new(Some(limit)))
         .await
         .expect("configure durable quota test bucket");
+    super::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &bucket)
+        .await
+        .expect("bootstrap authoritative quota usage");
     (store, bucket)
 }
 

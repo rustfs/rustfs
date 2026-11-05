@@ -3424,6 +3424,7 @@ where
         runtime_config_generation_seen = scanner_runtime_config_generation();
     }
 
+    let mut maintenance_wait_deadline: Option<Instant> = None;
     loop {
         if ctx.is_cancelled() {
             break;
@@ -3486,6 +3487,10 @@ where
             convergence_retry_interval = Some(pause_backlog_delay.max(Duration::from_secs(1)));
         }
         wait_plan = usage_bootstrap_rebuild.wait_plan(wait_plan, convergence_retry_interval);
+        let wait_started = Instant::now();
+        let wait_deadline = maintenance_wait_deadline
+            .map_or(wait_started + wait_plan.delay, |deadline| deadline.min(wait_started + wait_plan.delay));
+        wait_plan.delay = wait_deadline.saturating_duration_since(wait_started);
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
         let maintenance_generation_before_wait = scanner_maintenance_generation();
@@ -3559,6 +3564,7 @@ where
                 break;
             }
             ScannerCycleWakeReason::RuntimeConfig => {
+                maintenance_wait_deadline = None;
                 runtime_config_generation_seen = scanner_runtime_config_generation();
                 maintenance_generation_seen = None;
                 scanner_activity_seen = None;
@@ -3566,6 +3572,7 @@ where
                 continue;
             }
             ScannerCycleWakeReason::MaintenanceConfig => {
+                maintenance_wait_deadline = Some(wait_deadline);
                 maintenance_generation_seen = None;
                 scanner_activity_seen = None;
                 clean_idle_backoff.reset();
@@ -3584,6 +3591,7 @@ where
             | ScannerCycleWakeReason::ClusterActivityUnavailable
             | ScannerCycleWakeReason::Recovery => {}
         }
+        maintenance_wait_deadline = None;
 
         if wake_reason == ScannerCycleWakeReason::DirtyUsage {
             debug!(

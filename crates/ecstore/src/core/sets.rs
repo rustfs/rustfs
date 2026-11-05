@@ -317,8 +317,9 @@ impl Sets {
         &self.ctx
     }
 
-    #[cfg(test)]
-    pub(crate) async fn stop_endpoint_monitor_for_test(&self) {
+    /// Stop endpoint reconnection and wait for any in-flight pass before a test owns disk probes.
+    #[cfg(any(test, feature = "test-util"))]
+    pub async fn stop_endpoint_monitor_for_test(&self) {
         if let Some(exit_signal) = &self.exit_signal {
             let _ = exit_signal.send(());
             // Wait for an in-flight reconnect pass as well as its receiver to exit.

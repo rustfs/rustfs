@@ -15,10 +15,11 @@
 //! PutObject write path: body admission, eager commit, zero-copy tuning.
 
 use super::*;
+use futures::FutureExt;
 
 use crate::app::trailer_adapter::trailer_source;
 use crate::auth::{RUSTFS_MAX_CONTENT_LENGTH_QUERY, VerifiedPresignedRequest, parse_presigned_put_max_content_length};
-use crate::error::{ClientBodyReadTimeout, UploadLimitExceeded};
+use crate::error::UploadLimitExceeded;
 static PUT_FAILURE_LOGS: rustfs_utils::LogThrottle = rustfs_utils::LogThrottle::new(5_000);
 
 #[cfg(test)]
@@ -92,10 +93,9 @@ static CACHED_SMALL_EAGER_PUT_MAX_SIZE_BYTES: std::sync::OnceLock<usize> = std::
 const EVENT_PUT_OBJECT_STORE_INFLIGHT_SLOW: &str = "put_object_store_inflight_slow";
 
 const EVENT_PUT_OBJECT_STORE_RETURNED: &str = "put_object_store_returned";
+const EVENT_PUT_OBJECT_REQUEST_COMPLETED: &str = "put_object_request_completed";
 
 const EVENT_PUT_OBJECT_COMMIT_OWNER_DEADLINE: &str = "put_object_commit_owner_deadline";
-
-const EVENT_PUT_OBJECT_BODY_READ_STALLED: &str = "put_object_body_read_stalled";
 
 const PUT_OBJECT_STORE_WARN_THRESHOLD: Duration = Duration::from_secs(5);
 
@@ -148,44 +148,13 @@ pub(crate) fn reject_oversize_single_upload(size: i64) -> S3Result<()> {
 
 /// Resolve the S3 request-body inter-chunk read timeout from the environment.
 ///
-/// Returns `Duration::ZERO` when disabled (`RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT=0`),
-/// in which case [`guard_put_object_body_read_timeout`] passes the body through
-/// untouched.
+/// Zero disables inactivity detection; the independent minimum-progress
+/// policy still bounds uploads that retain scarce resources.
 pub(crate) fn put_object_body_read_timeout() -> Duration {
     Duration::from_secs(rustfs_utils::get_env_u64(
         rustfs_config::ENV_HTTP_REQUEST_BODY_READ_TIMEOUT,
         rustfs_config::DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT,
     ))
-}
-
-/// A [`ByteStream`] decorator that aborts a request body whose peer stops
-/// sending bytes without closing the connection.
-///
-/// A well-behaved short body ends with EOF and is rejected promptly by the
-/// eager/streaming readers. The failure this guards against is different: a
-/// reverse proxy or CDN forwards a *partial* body and then goes silent while
-/// holding the connection open, so the inner stream neither yields more bytes
-/// nor reports EOF. Without a bound, RustFS would wait forever for bytes that
-/// never arrive and the client eventually sees a hang/abort with no server-side
-/// explanation (issue #3076).
-///
-/// The timer resets on every chunk, so slow-but-progressing uploads are not
-/// penalized; it only fires after `timeout` of complete silence. On timeout the
-/// stall is logged with the received/expected byte counts and the read fails
-/// with an `ErrorKind::TimedOut` error instead of hanging.
-///
-/// `remaining_length` and `size_hint` are forwarded from the inner stream so
-/// wrapping is transparent to length/content handling downstream.
-struct RequestBodyReadTimeout {
-    inner: DynByteStream,
-    timeout: Duration,
-    timer: Option<Pin<Box<tokio::time::Sleep>>>,
-    received: u64,
-    expected: Option<u64>,
-    bucket: String,
-    key: String,
-    request_id: String,
-    timed_out: bool,
 }
 
 /// Enforces a maximum size on the decoded request entity while preserving the
@@ -238,110 +207,6 @@ impl ByteStream for MaxContentLengthStream {
             .map(|exact| RemainingLength::new_exact(exact.min(remaining)))
             .unwrap_or_else(RemainingLength::unknown)
     }
-}
-
-impl Stream for RequestBodyReadTimeout {
-    type Item = Result<Bytes, StdError>;
-
-    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = self.get_mut();
-
-        // Once we have surfaced a stall error, treat the stream as terminated so
-        // we never poll the abandoned inner stream again.
-        if this.timed_out {
-            return Poll::Ready(None);
-        }
-
-        match Pin::new(&mut this.inner).poll_next(cx) {
-            Poll::Ready(Some(Ok(chunk))) => {
-                this.timer = None;
-                this.received = this.received.saturating_add(chunk.len() as u64);
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            Poll::Ready(other) => {
-                this.timer = None;
-                Poll::Ready(other)
-            }
-            Poll::Pending => {
-                if this.timeout.is_zero() {
-                    return Poll::Pending;
-                }
-
-                if this.timer.is_none() {
-                    this.timer = Some(Box::pin(tokio::time::sleep(this.timeout)));
-                }
-
-                if let Some(timer) = this.timer.as_mut()
-                    && std::future::Future::poll(timer.as_mut(), cx).is_ready()
-                {
-                    this.timer = None;
-                    this.timed_out = true;
-                    let expected_display = this.expected.map(|v| v.to_string()).unwrap_or_else(|| "unknown".to_string());
-                    warn!(
-                        target: "rustfs::app::object_usecase",
-                        event = EVENT_PUT_OBJECT_BODY_READ_STALLED,
-                        component = LOG_COMPONENT_APP,
-                        subsystem = LOG_SUBSYSTEM_OBJECT,
-                        request_id = %this.request_id,
-                        bucket = %this.bucket,
-                        key = %this.key,
-                        received_bytes = this.received,
-                        expected_bytes = %expected_display,
-                        timeout_secs = this.timeout.as_secs(),
-                        state = "stall_timeout",
-                        "PutObject request body read stalled; aborting. A proxy/CDN likely forwarded a partial body without closing the connection."
-                    );
-                    return Poll::Ready(Some(Err(Box::new(std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        ClientBodyReadTimeout {
-                            timeout: this.timeout,
-                            raw_bytes_received: this.received,
-                        },
-                    )) as StdError)));
-                }
-
-                Poll::Pending
-            }
-        }
-    }
-
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
-    }
-}
-
-impl ByteStream for RequestBodyReadTimeout {
-    fn remaining_length(&self) -> RemainingLength {
-        self.inner.remaining_length()
-    }
-}
-
-/// Wrap an incoming request body with [`RequestBodyReadTimeout`] unless the
-/// feature is disabled (`timeout == 0`), in which case the body is returned
-/// untouched. `remaining_length` is preserved via [`StreamingBlob::new`].
-pub(crate) fn guard_put_object_body_read_timeout(
-    body: StreamingBlob,
-    bucket: &str,
-    key: &str,
-    request_id: &str,
-    expected: Option<i64>,
-    timeout: Duration,
-) -> StreamingBlob {
-    if timeout.is_zero() {
-        return body;
-    }
-
-    StreamingBlob::new(RequestBodyReadTimeout {
-        inner: body.into(),
-        timeout,
-        timer: None,
-        received: 0,
-        expected: expected.and_then(|v| u64::try_from(v).ok()),
-        bucket: bucket.to_string(),
-        key: key.to_string(),
-        request_id: request_id.to_string(),
-        timed_out: false,
-    })
 }
 
 pub(super) struct PooledBufferReader {
@@ -700,7 +565,10 @@ async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &By
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = pool.acquire_buffer(size).await;
+    // A stalled body cannot pin pool capacity (the progress floor expires it),
+    // so a full pool is a burst, not an attack: hand out an unpooled buffer
+    // rather than refusing the upload.
+    let mut buf = pool.try_acquire_buffer(size).unwrap_or_else(|| PooledBuffer::unpooled(size));
     read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
@@ -1134,57 +1002,53 @@ pub(super) struct PutObjectCommitted {
     pub(super) sse_customer_algorithm: Option<SSECustomerAlgorithm>,
     pub(super) sse_customer_key_md5: Option<SSECustomerKeyMD5>,
     pub(super) put_extra_checksum_headers: Vec<(&'static str, String)>,
-    completion: PutObjectCompletion,
+    completion: Option<PutObjectCompletion>,
     put_request_guard: PutObjectGuard,
     bucket: String,
     key: String,
+    concurrent_put_requests: usize,
+    buffer_size: usize,
     start_time: Instant,
     size: i64,
     use_zero_copy_eager_put_path: bool,
-    concurrent_put_requests: usize,
-    buffer_size: usize,
 }
 
 impl PutObjectCommitted {
     /// Publish the audit entry / creation event for `result`, record the
     /// request-level PutObject metrics and release the request guard.
-    pub(super) fn finish<T>(self, result: &S3Result<S3Response<T>>) {
-        let Self {
-            completion,
-            mut put_request_guard,
-            bucket,
-            key,
-            start_time,
-            size,
-            use_zero_copy_eager_put_path,
-            concurrent_put_requests,
-            buffer_size,
-            ..
-        } = self;
-        let _ = completion.complete(result);
-
-        // Record PutObject metrics via zero-copy-metrics
-        {
-            let duration_ms = start_time.elapsed().as_millis() as f64;
-            rustfs_io_metrics::record_put_object(
-                duration_ms,
-                size,
-                use_zero_copy_eager_put_path, // Track if zero-copy was enabled
-            );
+    pub(super) fn finish<T>(mut self, result: &S3Result<S3Response<T>>) {
+        if let Some(completion) = self.completion.take() {
+            let _ = completion.complete(result);
         }
+    }
+}
 
+impl Drop for PutObjectCommitted {
+    fn drop(&mut self) {
+        // This value exists only after the owned storage operation succeeds.
+        // A lost HTTP receiver must not discard the committed write's event.
+        if let Some(completion) = self.completion.take() {
+            let result = Ok(S3Response::new(()));
+            let _ = completion.complete(&result);
+        }
+        rustfs_io_metrics::record_put_object(
+            self.start_time.elapsed().as_millis() as f64,
+            self.size,
+            self.use_zero_copy_eager_put_path,
+        );
         debug!(
             target: "rustfs::app::object_usecase",
-            component = "app",
-            subsystem = "object",
-            bucket = %bucket,
-            key = %key,
-            concurrent_put_requests,
-            buffer_size,
+            event = EVENT_PUT_OBJECT_REQUEST_COMPLETED,
+            component = LOG_COMPONENT_APP,
+            subsystem = LOG_SUBSYSTEM_OBJECT,
+            result = "success",
+            bucket = %self.bucket,
+            key = %self.key,
+            concurrent_put_requests = self.concurrent_put_requests,
+            buffer_size = self.buffer_size,
             "PutObject request completed"
         );
-
-        put_request_guard.finish_ok();
+        self.put_request_guard.finish_ok();
     }
 }
 
@@ -1315,7 +1179,7 @@ impl DefaultObjectUsecase {
         let server_side_encryption = server_side_encryption.or(extract_server_side_encryption_from_headers(&req.headers)?);
 
         // Validate object key
-        validate_object_key(&key, request_method_name)?;
+        validate_new_object_key(&key, request_method_name)?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
 
         // Validate archive content encoding (reject when strict mode is enabled)
@@ -1327,18 +1191,6 @@ impl DefaultObjectUsecase {
         rustfs_io_metrics::record_put_object_stage_duration_from("app_request_shape", request_shape_stage_start);
 
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
-
-        // Guard against a proxy/CDN that forwards a partial body then goes silent
-        // without closing the connection: bound the inter-chunk wait so the read
-        // fails (with a diagnostic log) instead of hanging forever (issue #3076).
-        let body = {
-            let request_id = req
-                .extensions
-                .get::<request_context::RequestContext>()
-                .map(|ctx| ctx.request_id.clone())
-                .unwrap_or_default();
-            guard_put_object_body_read_timeout(body, &bucket, &key, &request_id, content_length, put_object_body_read_timeout())
-        };
 
         let body = match max_content_length {
             Some(limit) => StreamingBlob::new(MaxContentLengthStream {
@@ -1501,6 +1353,33 @@ impl DefaultObjectUsecase {
             sse_customer_key,
             sse_customer_key_md5,
         } = sse;
+
+        // The same network budget covers eager and streaming reads. Internal
+        // server-generated bodies do not represent a client upload.
+        let (body, progress_control) = match &origin {
+            PutObjectOrigin::S3 { req, .. } => {
+                let request_id = req
+                    .extensions
+                    .get::<request_context::RequestContext>()
+                    .map(|context| context.request_id.as_str())
+                    .unwrap_or_default();
+                let (body, control) = if let Some(control) = req.extensions.get::<super::request_body::BodyReadControl>() {
+                    control.activate_upload(put_object_body_read_timeout(), &bucket, &key, request_id, size.max(0) as u64);
+                    (body, control.clone())
+                } else {
+                    super::request_body::guard_upload_progress(
+                        body,
+                        put_object_body_read_timeout(),
+                        &bucket,
+                        &key,
+                        request_id,
+                        size.max(0) as u64,
+                    )
+                };
+                (super::request_body::demand_upload_body(body, control.clone()), Some(control))
+            }
+            PutObjectOrigin::Internal { .. } => (body, None),
+        };
 
         reject_veeam_sosapi_mutation(|| self.object_store(), bucket.as_str(), key.as_str()).await?;
 
@@ -1999,6 +1878,11 @@ impl DefaultObjectUsecase {
         }
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
+        if let Some(control) = progress_control {
+            use rustfs_rio::HashReaderMut;
+            let inner = reader.take_inner();
+            reader.inner = rustfs_rio::boxed_reader(super::request_body::DemandReader::new(inner, control));
+        }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
         let reader = PutObjReader::new(reader);
@@ -2262,54 +2146,55 @@ impl DefaultObjectUsecase {
             rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
             put_commit_future,
         );
-        let put_commit = spawn_traced_join(put_commit_future);
-        let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
-        let put_commit_result = if let Some(cancellation) = eager_put_commit_cancellation {
+        let put_commit = spawn_traced_join(async move {
+            let commit_stage_start = put_stage_metrics_enabled.then(Instant::now);
+            let result = std::panic::AssertUnwindSafe(put_commit_future).catch_unwind().await;
+            rustfs_io_metrics::record_put_object_stage_duration_from("store_commit", commit_stage_start);
+            let PutObjectCommitResult { obj_info, put_versioned } = match result {
+                Ok(Ok(result)) => result,
+                Ok(Err(err)) => {
+                    put_request_guard.finish_err();
+                    return Err(fail_put_object(completion, err));
+                }
+                Err(_) => {
+                    put_request_guard.finish_err();
+                    return Err(fail_put_object(
+                        completion,
+                        s3_error!(InternalError, "put object commit owner task panicked"),
+                    ));
+                }
+            };
+            completion = completion.object(obj_info.clone());
+            if let Some(version_id) = obj_info.version_id {
+                completion = completion.version_id(version_id.to_string());
+            }
+            Ok(PutObjectCommitted {
+                obj_info,
+                put_versioned,
+                effective_sse,
+                effective_kms_key_id,
+                sse_customer_algorithm,
+                sse_customer_key_md5,
+                put_extra_checksum_headers,
+                completion: Some(completion),
+                put_request_guard,
+                bucket,
+                key,
+                concurrent_put_requests,
+                buffer_size,
+                start_time,
+                size,
+                use_zero_copy_eager_put_path,
+            })
+        });
+        let result = if let Some(cancellation) = eager_put_commit_cancellation {
             EagerPutCommitOwner::new(put_commit, cancellation, EAGER_PUT_COMMIT_CANCELLATION_GRACE)
                 .join()
                 .await
         } else {
             put_commit.await
         };
-        rustfs_io_metrics::record_put_object_stage_duration_from("store_commit", commit_stage_start);
-        let PutObjectCommitResult { obj_info, put_versioned } = match put_commit_result {
-            Ok(Ok(result)) => result,
-            Ok(Err(err)) => {
-                put_request_guard.finish_err();
-                return Err(fail_put_object(completion, err));
-            }
-            Err(err) => {
-                put_request_guard.finish_err();
-                return Err(fail_put_object(
-                    completion,
-                    S3Error::with_message(S3ErrorCode::InternalError, format!("put object commit owner task failed: {err}")),
-                ));
-            }
-        };
-
-        completion = completion.object(obj_info.clone());
-        if let Some(version_id) = obj_info.version_id {
-            completion = completion.version_id(version_id.to_string());
-        }
-
-        Ok(PutObjectCommitted {
-            obj_info,
-            put_versioned,
-            effective_sse,
-            effective_kms_key_id,
-            sse_customer_algorithm,
-            sse_customer_key_md5,
-            put_extra_checksum_headers,
-            completion,
-            put_request_guard,
-            bucket,
-            key,
-            start_time,
-            size,
-            use_zero_copy_eager_put_path,
-            concurrent_put_requests,
-            buffer_size,
-        })
+        result.map_err(|_| s3_error!(InternalError, "put object commit owner task failed"))?
     }
 }
 
@@ -2434,7 +2319,9 @@ mod tests {
                     .content_length(Some(12))
                     .build()
                     .expect("quorum probe input must build");
+                let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
                 let mut req = build_request(input, method.clone());
+                req.uri = format!("/{bucket}/{key}").parse().expect("PUT URI");
                 if method == Method::POST {
                     req.extensions.insert(PostObjectRequestMarker);
                 }
@@ -2445,6 +2332,14 @@ mod tests {
                     )
                     .await
                     .expect_err("read quorum failure must refuse the upload");
+                if stage == PutStorageTestStage::Commit {
+                    probe.wait_for(1, 0).await;
+                    let audits = probe.audits.lock().expect("audits");
+                    assert_eq!(audits.len(), 1);
+                    assert_eq!(audits[0].api.status.as_deref(), Some("failure"));
+                    assert_eq!(audits[0].api.status_code, Some(503));
+                    assert!(probe.events.lock().expect("events").is_empty());
+                }
                 assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable, "stage {index}, method {method}");
                 assert_eq!(err.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
                 assert_eq!(err.message(), Some("The service is unavailable. Please retry."));
@@ -2836,6 +2731,7 @@ mod tests {
         let (store, context) = real_cold_fill_test_context().await;
         let bucket = format!("put-owner-tail-{}", Uuid::new_v4());
         let object = "object.bin";
+        let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
         store
             .make_bucket(&bucket, &MakeBucketOptions::default())
             .await
@@ -2859,11 +2755,9 @@ mod tests {
             .build()
             .expect("PUT input must build");
         let put_usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
-        let put = tokio::spawn(async move {
-            put_usecase
-                .execute_put_object(&FS::new(), build_request(put_input, Method::PUT))
-                .await
-        });
+        let mut request = build_request(put_input, Method::PUT);
+        request.uri = format!("/{bucket}/{object}").parse().expect("PUT URI");
+        let put = tokio::spawn(async move { put_usecase.execute_put_object(&FS::new(), request).await });
 
         tokio::time::timeout(Duration::from_secs(10), post_store_entered.wait())
             .await
@@ -2896,6 +2790,27 @@ mod tests {
             .await
             .expect("cancelled request's owned commit must still publish the object");
         assert_eq!(recovered.size, i64::try_from(payload.len()).expect("test payload length must fit i64"));
+        probe.wait_for(1, 1).await;
+        let normal_input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("normal.bin".to_owned())
+            .body(Some(StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"normal")))))
+            .content_length(Some(6))
+            .build()
+            .expect("normal PUT");
+        let mut normal_request = build_request(normal_input, Method::PUT);
+        normal_request.uri = format!("/{bucket}/normal.bin").parse().expect("URI");
+        DefaultObjectUsecase::with_context(Some(context))
+            .execute_put_object(&FS::new(), normal_request)
+            .await
+            .expect("normal response completion");
+        let audits = probe.audits.lock().expect("audits");
+        assert_eq!(audits.len(), 2, "both cancelled and returned commits audit exactly once");
+        assert_eq!(audits[0].api.status.as_deref(), Some("success"));
+        let events = probe.events.lock().expect("events");
+        assert_eq!(events.len(), 2, "explicit completion and Drop must not double publish");
+        assert_eq!(events[0].event_name, EventName::ObjectCreatedPut);
+        assert_eq!(events[0].object.name, object);
     }
 
     #[tokio::test]
@@ -3044,13 +2959,13 @@ mod tests {
         // Inner stream never yields and never reports EOF (a proxy that forwarded
         // a partial body then went silent while holding the connection open).
         let inner = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let mut guarded = guard_put_object_body_read_timeout(
+        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
             inner,
+            Duration::from_millis(1),
             "test-bucket",
             "stalled-object",
             "req-1",
-            Some(1024),
-            Duration::from_millis(1),
+            1024,
         );
 
         let err = guarded
@@ -3076,8 +2991,14 @@ mod tests {
         let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"hello world")));
         assert_eq!(body.remaining_length().exact(), Some(11));
 
-        let mut guarded =
-            guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-2", Some(11), Duration::from_secs(60));
+        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
+            body,
+            Duration::from_secs(60),
+            "test-bucket",
+            "ok-object",
+            "req-2",
+            11,
+        );
         // remaining_length must be forwarded, not reset to unknown.
         assert_eq!(guarded.remaining_length().exact(), Some(11));
 
@@ -3091,7 +3012,8 @@ mod tests {
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_disabled_passthrough() {
         let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"data")));
-        let mut guarded = guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-3", Some(4), Duration::ZERO);
+        let (mut guarded, _) =
+            super::super::request_body::guard_upload_progress(body, Duration::ZERO, "test-bucket", "ok-object", "req-3", 4);
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {
@@ -3391,6 +3313,164 @@ mod tests {
                 .set_position(u64::try_from(position + copied).expect("test cursor position should fit u64"));
             Poll::Ready(Ok(()))
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn execute_put_object_expires_stalled_body_without_creating_object() {
+        use super::super::request_body::{BodyReadControl, ObservedBody};
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http_body::Frame;
+        use http_body_util::StreamBody;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-progress-{}", Uuid::new_v4().simple());
+        store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+        for size in [8192, 2 * 1024 * 1024, 32 * 1024 * 1024] {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Frame<Bytes>, std::io::Error>>();
+            let control = BodyReadControl::default();
+            let body = StreamingBlob::from(s3s::Body::http_body_unsync(ObservedBody::new(
+                StreamBody::new(UnboundedReceiverStream::new(receiver)),
+                control.clone(),
+            )));
+            let key = format!("object-{size}.bin");
+            let input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key(key.clone())
+                .body(Some(body))
+                .content_length(Some(size))
+                .build()
+                .unwrap();
+            let mut request = build_request(input, Method::PUT);
+            request.extensions.insert(control.clone());
+            let usecase = DefaultObjectUsecase::with_context(Some(Arc::clone(&context)));
+            let owner = tokio::spawn(async move { usecase.execute_put_object(&FS::new(), request).await });
+            control.wait_until_pending_for_test().await;
+            control.advance_wait_for_test(Duration::from_secs(60));
+            sender.send(Ok(Frame::data(Bytes::new()))).unwrap();
+            let error = owner.await.unwrap().expect_err("stalled eager/zero-copy/streaming body");
+            assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+            assert!(is_err_object_not_found(
+                &store
+                    .get_object_info(&bucket, &key, &ObjectOptions::default())
+                    .await
+                    .unwrap_err()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pooled_upload_keeps_admission_and_buffer_during_real_commit_after_caller_cancel() {
+        use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use rustfs_io_core::BytesPoolConfig;
+        let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("upload-commit-owner", 16384).await;
+        let manager = ConcurrencyManager::with_put_admission_for_test(true, 1, Duration::ZERO);
+        let admission = manager.admit_put_object(8192).await.unwrap();
+        let permit = match admission {
+            ForegroundWriteAdmission::Admitted(permit) => permit,
+            _ => panic!("initial permit"),
+        };
+        let pool = Arc::new(BytesPool::with_config(BytesPoolConfig {
+            small_max: 1,
+            ..Default::default()
+        }));
+        let (body, control) = super::super::request_body::guard_upload_progress(
+            StreamingBlob::from(s3s::Body::from(Bytes::from(vec![7; 8192]))),
+            Duration::ZERO,
+            &bucket,
+            "object",
+            "request",
+            8192,
+        );
+        let buffer =
+            read_small_put_body_exact_pooled(StreamReader::new(body.map(|item| item.map_err(s3s_body_error_to_io))), 8192, &pool)
+                .await
+                .unwrap();
+        let reader = super::super::request_body::DemandReader::new(PooledBufferReader::new(buffer, 8192), control);
+        let mut reader = PutObjReader::new(HashReader::from_stream(reader, 8192, 8192, None, None, false).unwrap());
+        let barrier = PutObjectCommitBarrier::install(&bucket, "object", PutObjectCommitPause::BeforeQuotaRename);
+        let write_store = Arc::clone(&store);
+        let write_bucket = bucket.clone();
+        let (finished, completion) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let permit_guard = permit;
+            let result = write_store
+                .put_object(&write_bucket, "object", &mut reader, &ObjectOptions::default())
+                .await;
+            drop(reader);
+            drop(permit_guard);
+            finished.send(result).unwrap();
+        });
+        barrier.wait_until_paused().await;
+        drop(owner);
+        assert!(pool.try_acquire_buffer(8192).is_none());
+        assert!(matches!(
+            manager.admit_put_object(8192).await.unwrap(),
+            ForegroundWriteAdmission::Rejected
+        ));
+        barrier.release();
+        completion.await.unwrap().unwrap();
+        assert!(pool.try_acquire_buffer(8192).is_some());
+        assert!(matches!(
+            manager.admit_put_object(8192).await.unwrap(),
+            ForegroundWriteAdmission::Admitted(_)
+        ));
+        assert_eq!(
+            store
+                .get_object_info(&bucket, "object", &ObjectOptions::default())
+                .await
+                .unwrap()
+                .size,
+            8192
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pooled_upload_exhaustion_falls_back_to_unpooled_and_recovers_after_stall() {
+        use futures::poll;
+        use rustfs_io_core::BytesPoolConfig;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        let pool = BytesPool::with_config(BytesPoolConfig {
+            small_max: 1,
+            ..Default::default()
+        });
+        let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+        let (body, _control) = super::super::request_body::guard_upload_progress(
+            StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+            Duration::ZERO,
+            "bucket",
+            "object",
+            "request",
+            8192,
+        );
+        let mut owner = Box::pin(read_small_put_body_exact_pooled(
+            StreamReader::new(body.map(|item| item.map_err(s3s_body_error_to_io))),
+            8192,
+            &pool,
+        ));
+        assert!(poll!(owner.as_mut()).is_pending());
+        let fallback = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![0; 8192]), 8192, &pool)
+            .await
+            .expect("a full pool hands out an unpooled buffer instead of refusing");
+        assert_eq!(&fallback[..], &[0; 8192]);
+        drop(fallback);
+        assert!(pool.try_acquire_buffer(8192).is_none(), "the unpooled buffer never touched pool capacity");
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            sender.send(Ok(Bytes::from_static(b"x"))).unwrap();
+            assert!(poll!(owner.as_mut()).is_pending());
+            assert!(pool.try_acquire_buffer(8192).is_none());
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        assert_eq!(owner.await.err().expect("trickle must expire").code(), &S3ErrorCode::RequestTimeout);
+        let healthy = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![1; 8192]), 8192, &pool)
+            .await
+            .expect("timed-out buffer must be reusable");
+        assert_eq!(&healthy[..], &[1; 8192]);
+        assert!(pool.try_acquire_buffer(8192).is_none(), "commit reader still owns capacity");
+        drop(healthy);
+        assert!(pool.try_acquire_buffer(8192).is_some());
     }
 
     #[tokio::test]
@@ -4273,6 +4353,9 @@ mod tests {
             .set_quota_config(&bucket, BucketQuota::new(Some(LIMIT)))
             .await
             .expect("configure durable quota");
+        crate::app::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &bucket)
+            .await
+            .expect("bootstrap authoritative quota usage");
 
         let payload = Bytes::from(vec![0x42; 1024]);
         let input = PutObjectInput::builder()
@@ -4456,7 +4539,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn cancelled_put_after_commit_marker_is_reconciled() {
+    async fn cancelled_put_before_rename_releases_marked_quota_reservation() {
         use crate::app::storage_api::test::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
 
         let (store, bucket) = crate::app::gating_test_env::durable_quota_test_bucket("cancelled-spawned-put-quota", 4096).await;
@@ -4470,6 +4553,12 @@ mod tests {
                 .await
         });
         commit_barrier.wait_until_paused().await;
+        let mut denied = PutObjReader::from_vec(vec![0x54; 4096]);
+        let error = store
+            .put_object(&bucket, "replacement", &mut denied, &ObjectOptions::default())
+            .await
+            .expect_err("the live commit marker must still reserve the entire quota");
+        assert!(matches!(error, StorageError::QuotaExceeded { .. }));
         first.abort();
         assert!(first.await.is_err(), "the outer request task must be cancelled");
         drop(commit_barrier);
@@ -4478,11 +4567,25 @@ mod tests {
             .get_object_info(&bucket, "object", &ObjectOptions::default())
             .await
             .expect_err("cancelling before rename must not commit the object");
+        // The owned pre-rename cancellation path proves no publication occurred,
+        // releases the mutation fences, and aborts the reservation before unlock.
         let mut replacement = PutObjReader::from_vec(vec![0x54; 4096]);
         store
             .put_object(&bucket, "replacement", &mut replacement, &ObjectOptions::default())
             .await
-            .expect("the next admission must reap the abandoned commit marker");
+            .expect("safe pre-rename rollback must release the marked reservation without a scan");
+        let mut excess = PutObjReader::from_vec(vec![0x55]);
+        let error = store
+            .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
+            .await
+            .expect_err("the replacement must consume the reclaimed quota exactly once");
+        assert!(matches!(
+            error,
+            StorageError::QuotaExceeded {
+                current: 4096,
+                limit: 4096
+            }
+        ));
     }
 
     #[tokio::test]
@@ -4580,6 +4683,9 @@ mod tests {
             .set_quota_config(&bucket, BucketQuota::new(Some(4096)))
             .await
             .expect("lower bucket quota");
+        crate::app::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &bucket)
+            .await
+            .expect("bootstrap authoritative quota usage");
         let mut excess = PutObjReader::from_vec(vec![0x72]);
         let err = store
             .put_object(&bucket, "excess", &mut excess, &ObjectOptions::default())
@@ -4640,6 +4746,9 @@ mod tests {
             .await
             .expect("quota update task should not panic")
             .expect("quota update should proceed after commit");
+        crate::app::storage_api::test::set_disk::initialize_quota_ledger_for_test(Arc::clone(&store), &bucket)
+            .await
+            .expect("bootstrap authoritative quota usage");
 
         let mut excess = PutObjReader::from_vec(vec![0x74]);
         let err = store

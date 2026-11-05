@@ -175,12 +175,17 @@ pub const ENV_HTTP_SOCKET_RECV_BUFFER_BYTES: &str = "RUSTFS_HTTP_SOCKET_RECV_BUF
 pub const DEFAULT_HTTP_SOCKET_RECV_BUFFER_BYTES: usize = 0;
 
 /// Environment variable for the S3 request-body inter-chunk read timeout
-/// (seconds). Default: 300. Set to 0 to disable.
+/// (seconds). Default: 300. Set to 0 to disable the inactivity timeout.
 ///
 /// This bounds how long a `PutObject`/upload may wait for the *next* body chunk
 /// while more bytes are still expected. It resets on every chunk, so it does not
 /// penalize slow-but-progressing uploads — it only fires when a peer sends a
 /// partial body and then goes silent *without* closing the connection (no EOF).
+/// Independently of this knob, `PutObject` and `UploadPart` require at least
+/// 64 KiB of body progress per 60 seconds of server wait (the minimum-progress
+/// floor, logged as `upload_body_progress_stalled`); it bounds trickle uploads
+/// that would otherwise pin upload admission indefinitely, and it stays in
+/// force when this timeout is set to 0.
 /// A reverse proxy or CDN that forwards a truncated body this way would
 /// otherwise make RustFS wait forever for bytes that never arrive; with this
 /// timeout the stalled read is aborted and logged with the received/expected

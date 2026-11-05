@@ -3629,3 +3629,129 @@ async fn blocked_checkpoint_is_not_revalidated_before_its_schedule() {
     assert_eq!(serde_json::from_slice::<serde_json::Value>(&retained).expect("marker JSON"), marker);
     temp_dir.close().expect("remove scheduled revalidation fixture");
 }
+
+#[test]
+fn replacement_candidate_merge_rejects_protocol_downgrade_in_either_read_order() {
+    for downgrade in [false, true] {
+        for reverse in [false, true] {
+            let task_id = ResumeUtils::generate_task_id();
+            let mut protocol_one = replacement_candidate_state(&task_id);
+            protocol_one.replacement_revision = if downgrade { 11 } else { 9 };
+            let mut protocol_two = replacement_candidate_state(&task_id);
+            protocol_two.replacement_execution_protocol = 2;
+            protocol_two.replacement_bucket_incarnations = Some(Default::default());
+            protocol_two.replacement_revision = 10;
+            let (first, second) = if reverse {
+                (protocol_two, protocol_one)
+            } else {
+                (protocol_one, protocol_two)
+            };
+            let mut selected = None;
+            merge_replacement_recovery_candidate(
+                &mut selected,
+                ReplacementRecoveryCandidate::new(first, "anchor-a", false).expect("first durable copy"),
+            )
+            .expect("initial observation");
+            let result = merge_replacement_recovery_candidate(
+                &mut selected,
+                ReplacementRecoveryCandidate::new(second, "anchor-b", true).expect("second durable copy"),
+            );
+            if downgrade {
+                assert!(
+                    matches!(result, Err(Error::ReplacementGenerationConflict { .. })),
+                    "protocol 1 at a newer revision must not erase protocol 2, reverse={reverse}"
+                );
+            } else {
+                result.expect("protocol 1 at an older revision may advance to protocol 2");
+                let state = selected.expect("selected upgraded generation").state;
+                assert_eq!(state.replacement_execution_protocol, 2);
+                assert_eq!(state.replacement_revision, 10);
+            }
+        }
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn replacement_recovery_survives_same_named_bucket_deletion_and_recreation() {
+    use crate::heal::storage_api::{
+        storage::{BucketOperations as _, DeleteBucketOptions, DiskSetSelector, MakeBucketOptions, StorageAdminApi as _},
+        test_support::{init_bucket_metadata_sys, isolated_store_over_temp_disks},
+    };
+
+    let (_directories, store) = Box::pin(isolated_store_over_temp_disks()).await;
+    init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+    let bucket = "ahm-replacement";
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("create legal same-name bucket");
+    let disk = store
+        .disk_set_inventory(DiskSetSelector::new(0, 0))
+        .await
+        .expect("survivor inventory")
+        .into_iter()
+        .flatten()
+        .next()
+        .expect("survivor disk");
+    let task_id = ResumeUtils::generate_task_id();
+    let manager = ResumeManager::new_replacement_intent(
+        disk.clone(),
+        task_id.clone(),
+        "pool_0_set_0".to_string(),
+        vec!["other-bucket".to_string()],
+        vec!["replacement-a".to_string()],
+        vec![ReplacementTargetIdentity {
+            endpoint: "replacement-a".to_string(),
+            canonical_path: "/mnt/replacement-a".to_string(),
+            physical_device_ids: vec!["device-a".to_string()],
+            filesystem_identity: "1:2:3".to_string(),
+        }],
+    )
+    .await
+    .expect("persist sealed replacement intent");
+    let expected = manager.get_state().await;
+    store
+        .delete_bucket(bucket, &DeleteBucketOptions::default())
+        .await
+        .expect("delete same-name user bucket");
+    let resumed = ResumeManager::load_replacement_intent(disk.clone(), &task_id)
+        .await
+        .expect("sealed intent remains recoverable");
+    assert_eq!(resumed.get_state().await, expected);
+    assert_eq!(
+        ResumeUtils::get_replacement_intent_tasks(&disk)
+            .await
+            .expect("scanner recovery enumeration"),
+        std::slice::from_ref(&task_id)
+    );
+    resumed
+        .mark_replacement_completed_and_verified()
+        .await
+        .expect("replacement can finish after deletion");
+    resumed
+        .ensure_replacement_completion_proof()
+        .await
+        .expect("persist completion proof");
+    store
+        .make_bucket(bucket, &MakeBucketOptions::default())
+        .await
+        .expect("recreate same-name user bucket");
+    store
+        .delete_bucket(bucket, &DeleteBucketOptions::default())
+        .await
+        .expect("delete recreated bucket");
+    let proof = ResumeManager::load_replacement_completion_proof(disk.clone(), &task_id)
+        .await
+        .expect("completion proof survives recreation");
+    assert_eq!(proof.task_id, task_id);
+    assert_eq!(
+        ResumeManager::load_replacement_intent(disk, &task_id)
+            .await
+            .expect("verified intent survives")
+            .get_state()
+            .await
+            .replacement_phase,
+        ReplacementPhase::Verified
+    );
+}

@@ -40,7 +40,9 @@ use aws_smithy_runtime_api::client::http::{
     HttpConnector as SmithyHttpConnector, HttpConnectorFuture, SharedHttpConnector, http_client_fn,
 };
 use aws_smithy_runtime_api::client::interceptors::Intercept;
-use aws_smithy_runtime_api::client::interceptors::context::BeforeTransmitInterceptorContextMut;
+use aws_smithy_runtime_api::client::interceptors::context::{
+    BeforeDeserializationInterceptorContextMut, BeforeTransmitInterceptorContextMut,
+};
 use aws_smithy_runtime_api::client::orchestrator::{HttpRequest, HttpResponse};
 use aws_smithy_runtime_api::client::result::ConnectorError;
 use aws_smithy_runtime_api::client::runtime_components::RuntimeComponents;
@@ -155,6 +157,8 @@ pub struct RemoteS3EndpointSpec {
     pub ca_cert_pem: Option<String>,
     pub connect_timeout: Option<Duration>,
     pub read_timeout: Option<Duration>,
+    /// Entire SDK call, including non-streaming response bodies and retries.
+    pub operation_timeout: Option<Duration>,
     /// How many wire requests one logical call may cost. Every consumer
     /// declares it; see [`RemoteS3RetryPolicy`].
     pub retry: RemoteS3RetryPolicy,
@@ -252,6 +256,78 @@ pub(crate) fn remote_sdk_credentials(credentials: &RemoteCredentials, now: Syste
     Ok(builder.build())
 }
 
+/// Only installed on non-streaming upload operations. The budget begins at
+/// response headers, independently of the potentially long request upload.
+#[derive(Debug)]
+pub(crate) struct UploadResponseDeadline(pub Duration);
+
+impl Intercept for UploadResponseDeadline {
+    fn name(&self) -> &'static str {
+        "RustfsUploadResponseDeadline"
+    }
+
+    fn modify_before_deserialization(
+        &self,
+        context: &mut BeforeDeserializationInterceptorContextMut<'_>,
+        _runtime_components: &RuntimeComponents,
+        _cfg: &mut ConfigBag,
+    ) -> Result<(), BoxError> {
+        let response = context.response_mut();
+        let inner = std::mem::replace(response.body_mut(), SdkBody::taken());
+        *response.body_mut() = SdkBody::from_body_1_x(UploadResponseBody {
+            inner: Some(inner),
+            deadline: Box::pin(tokio::time::sleep(self.0)),
+        });
+        Ok(())
+    }
+}
+
+struct UploadResponseBody {
+    inner: Option<SdkBody>,
+    deadline: std::pin::Pin<Box<tokio::time::Sleep>>,
+}
+
+impl http_body::Body for UploadResponseBody {
+    type Data = bytes::Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        use std::future::Future as _;
+        use std::task::Poll;
+        if self.inner.is_none() {
+            return Poll::Ready(None);
+        }
+        // The absolute response budget never renews on data, empty frames,
+        // or trailers. A retry gets its own bounded response window.
+        if self.deadline.as_mut().poll(cx).is_ready() {
+            self.inner.take();
+            return Poll::Ready(Some(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "replication response body deadline exceeded",
+            )
+            .into())));
+        }
+        let Some(inner) = self.inner.as_mut() else {
+            return Poll::Ready(None);
+        };
+        let result = std::pin::Pin::new(inner).poll_frame(cx);
+        if matches!(result, Poll::Ready(None) | Poll::Ready(Some(Err(_)))) {
+            self.inner.take();
+        }
+        result
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.as_ref().is_none_or(http_body::Body::is_end_stream)
+    }
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.as_ref().map(http_body::Body::size_hint).unwrap_or_default()
+    }
+}
+
 /// Appends a caller-identifying token to the SDK `User-Agent`. Runs after
 /// signing: SigV4 excludes `user-agent` from the canonical request, so the
 /// signature stays valid.
@@ -309,13 +385,16 @@ pub async fn build_remote_s3_config(spec: &RemoteS3EndpointSpec) -> Result<aws_s
         config_builder = config_builder.http_client(http_client);
     }
 
-    if spec.connect_timeout.is_some() || spec.read_timeout.is_some() {
+    if spec.connect_timeout.is_some() || spec.read_timeout.is_some() || spec.operation_timeout.is_some() {
         let mut timeouts = TimeoutConfig::builder();
         if let Some(connect_timeout) = spec.connect_timeout {
             timeouts = timeouts.connect_timeout(connect_timeout);
         }
         if let Some(read_timeout) = spec.read_timeout {
             timeouts = timeouts.read_timeout(read_timeout);
+        }
+        if let Some(operation_timeout) = spec.operation_timeout {
+            timeouts = timeouts.operation_timeout(operation_timeout);
         }
         config_builder = config_builder.timeout_config(timeouts.build());
     }
@@ -674,6 +753,7 @@ mod tests {
             ca_cert_pem: None,
             connect_timeout: None,
             read_timeout: None,
+            operation_timeout: None,
             retry: RemoteS3RetryPolicy::Disabled,
             user_agent_suffix: "",
         }
@@ -1027,11 +1107,16 @@ mod tests {
         spec.user_agent_suffix = "RustFS-Test/0.0";
         spec.connect_timeout = Some(Duration::from_secs(5));
         spec.read_timeout = Some(Duration::from_secs(5));
+        spec.operation_timeout = Some(Duration::from_secs(12));
         let config = build_remote_s3_config(&spec)
             .await
             .expect("spec should build")
             .http_client(http_client)
             .build();
+        assert_eq!(
+            config.timeout_config().and_then(TimeoutConfig::operation_timeout),
+            Some(Duration::from_secs(12))
+        );
         S3Client::from_conf(config)
             .head_bucket()
             .bucket("bucket")

@@ -68,7 +68,6 @@ use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::task::{Context, Poll};
@@ -79,7 +78,6 @@ use std::{
 };
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tracing::{error, trace, warn};
 use url::{Url, form_urlencoded};
@@ -156,7 +154,7 @@ where
 
 async fn collect_response_body_inner<B>(
     body: B,
-    limit: Option<usize>,
+    limit: usize,
     idle_timeout: Option<StdDuration>,
 ) -> Result<Vec<u8>, std::io::Error>
 where
@@ -169,7 +167,7 @@ where
         let Some(new_len) = body_vec.len().checked_add(data.len()) else {
             return Err(response_body_exceeds_limit_error());
         };
-        if limit.is_some_and(|limit| new_len > limit) {
+        if new_len > limit {
             return Err(response_body_exceeds_limit_error());
         }
         body_vec.extend_from_slice(&data);
@@ -182,7 +180,22 @@ where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    collect_response_body_inner(body, Some(limit), None).await
+    collect_response_body_inner(body, limit, None).await
+}
+
+/// Keep the remote body with its reader; idle and range errors surface while reading.
+pub(crate) fn response_body_reader(body: Incoming, limit: Option<usize>, idle_timeout: StdDuration) -> ReadCloser {
+    let stream = futures::stream::try_unfold((Box::pin(body), 0_usize), move |(mut body, received)| async move {
+        let Some(data) = next_response_body_data(body.as_mut(), Some(idle_timeout)).await? else {
+            return Ok::<_, std::io::Error>(None);
+        };
+        let received = received
+            .checked_add(data.len())
+            .filter(|size| limit.is_none_or(|limit| *size <= limit))
+            .ok_or_else(response_body_exceeds_limit_error)?;
+        Ok(Some((data, (body, received))))
+    });
+    ReadCloser::new(tokio_util::io::StreamReader::new(Box::pin(stream)))
 }
 
 const C_UNKNOWN: i32 = -1;
@@ -217,9 +230,9 @@ fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> s
     signer_error::signer_error_to_io_error(scope, error)
 }
 
-/// Streaming object body handed to the client by the storage engine. The
-/// client only ever reads it to completion, so the engine-side reader type
-/// (e.g. ecstore's `GetObjectReader`) stays behind this boxed `AsyncRead`.
+/// Streaming object body shared by the client and storage engine. The concrete
+/// reader (e.g. ecstore's `GetObjectReader` or a remote response body) stays
+/// behind this boxed `AsyncRead`.
 pub struct ObjectReader(Box<dyn AsyncRead + Send + Sync + Unpin>);
 
 impl ObjectReader {
@@ -255,7 +268,8 @@ pub enum ReaderImpl {
     ObjectBody(ObjectReader),
 }
 
-pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
+/// Remote object reader. Dropping it releases the response body without collecting it.
+pub type ReadCloser = ObjectReader;
 
 #[derive(Debug)]
 pub struct TransitionClient {
@@ -814,15 +828,7 @@ impl TransitionClient {
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        collect_response_body_inner(body, Some(limit), Some(self.timeouts.response_body_idle_timeout)).await
-    }
-
-    pub async fn collect_response_body_unbounded<B>(&self, body: B) -> Result<Vec<u8>, std::io::Error>
-    where
-        B: Body<Data = Bytes>,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        collect_response_body_inner(body, None, Some(self.timeouts.response_body_idle_timeout)).await
+        collect_response_body_inner(body, limit, Some(self.timeouts.response_body_idle_timeout)).await
     }
 
     async fn new_request(
@@ -1776,7 +1782,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             StdDuration::from_millis(200),
-            collect_response_body_inner(body, Some(1), Some(StdDuration::from_millis(50))),
+            collect_response_body_inner(body, 1, Some(StdDuration::from_millis(50))),
         )
         .await
         .expect("the collector should enforce its own body idle timeout")

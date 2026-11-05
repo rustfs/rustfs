@@ -26,6 +26,7 @@ use rustfs_audit::{
     entity::{ApiDetailsBuilder, AuditEntryBuilder},
     global::AuditLogger,
 };
+use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
 use rustfs_io_metrics::record_s3_op;
 use rustfs_notify::EventArgsBuilder;
 use rustfs_policy::policy::action::Action;
@@ -94,6 +95,31 @@ where
     }
 }
 
+/// Own a parsed mutation through its storage and event/audit completion.
+/// Dropping the HTTP waiter does not cancel the operation. Streaming bodies
+/// must use their bounded upload owner instead of this entry point.
+pub(crate) async fn run_owned_mutation<T, F>(operation: F) -> S3Result<S3Response<T>>
+where
+    T: Send + 'static,
+    F: Future<Output = S3Result<S3Response<T>>> + Send + 'static,
+{
+    let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
+    let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
+    #[cfg(feature = "diagnostic-read-version-caller")]
+    let operation = ecstore_diagnostic::with_captured_read_version_context(
+        ecstore_diagnostic::ReadVersionContextBoundary::BackgroundTask,
+        operation,
+    );
+    #[cfg(not(feature = "diagnostic-read-version-caller"))]
+    let operation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        operation,
+    );
+    super::request_context::spawn_traced_join(operation)
+        .await
+        .map_err(|_| s3s::s3_error!(InternalError, "object mutation owner task failed"))?
+}
+
 /// Builds S3-compatible notification response elements with the canonical request ID.
 pub(crate) fn build_event_resp_elements<T>(response: &S3Response<T>, request_id: &str) -> HashMap<String, String> {
     let mut resp_elements = extract_resp_elements(response);
@@ -133,8 +159,101 @@ fn request_audit_builder<T>(
         .filter(|cred| !cred.access_key.is_empty())
     {
         builder = builder.access_key(&cred.access_key);
+        if !cred.parent_user.is_empty() {
+            builder = builder.parent_user(&cred.parent_user);
+        }
+        if let Some(claims) = cred.claims.as_ref().filter(|claims| is_rustfs_oidc_claims(claims)) {
+            let identity_claims = ["sub", "iss", OIDC_ISSUER_CLAIM, "oidc_provider"]
+                .into_iter()
+                .filter_map(|key| {
+                    claims
+                        .get(key)
+                        .filter(|value| value.as_str().is_some_and(|value| !value.is_empty()))
+                        .map(|value| (key.to_string(), value.clone()))
+                })
+                .collect();
+            builder = builder.req_claims(identity_claims);
+        }
     }
     builder
+}
+
+#[cfg(test)]
+type MutationCompletionPause = (std::sync::Arc<tokio::sync::Barrier>, std::sync::Arc<tokio::sync::Barrier>);
+#[cfg(test)]
+type MutationCompletionProbes = HashMap<String, std::sync::Weak<MutationCompletionProbe>>;
+
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct MutationCompletionProbe {
+    pub(crate) audits: std::sync::Mutex<Vec<AuditEntry>>,
+    pub(crate) events: std::sync::Mutex<Vec<rustfs_notify::EventArgs>>,
+    changed: tokio::sync::Notify,
+    pause: std::sync::Mutex<Option<MutationCompletionPause>>,
+}
+
+#[cfg(test)]
+fn completion_probes() -> &'static std::sync::Mutex<MutationCompletionProbes> {
+    static PROBES: std::sync::OnceLock<std::sync::Mutex<MutationCompletionProbes>> = std::sync::OnceLock::new();
+    PROBES.get_or_init(Default::default)
+}
+
+#[cfg(test)]
+fn completion_probe(bucket: &str) -> Option<std::sync::Arc<MutationCompletionProbe>> {
+    completion_probes()
+        .lock()
+        .expect("completion probes")
+        .get(bucket)
+        .and_then(std::sync::Weak::upgrade)
+}
+
+#[cfg(test)]
+impl MutationCompletionProbe {
+    pub(crate) fn install(bucket: &str) -> std::sync::Arc<Self> {
+        let probe = std::sync::Arc::new(Self::default());
+        let mut probes = completion_probes().lock().expect("completion probes");
+        probes.retain(|_, value| value.strong_count() > 0);
+        probes.insert(bucket.to_owned(), std::sync::Arc::downgrade(&probe));
+        probe
+    }
+
+    pub(crate) fn pause_after_commit(&self) -> MutationCompletionPause {
+        let entered = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        let resume = std::sync::Arc::new(tokio::sync::Barrier::new(2));
+        *self.pause.lock().expect("completion pause") = Some((entered.clone(), resume.clone()));
+        (entered, resume)
+    }
+
+    pub(crate) async fn wait_for(&self, audits: usize, events: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let changed = self.changed.notified();
+                if self.audits.lock().expect("audits").len() >= audits && self.events.lock().expect("events").len() >= events {
+                    break;
+                }
+                changed.await;
+            }
+        })
+        .await
+        .expect("committed mutation must dispatch its audit and events");
+    }
+}
+
+#[cfg(test)]
+pub(crate) async fn pause_committed_mutation_for_test(bucket: &str) {
+    let pause = completion_probe(bucket).and_then(|probe| probe.pause.lock().expect("completion pause").take());
+    if let Some((entered, resume)) = pause {
+        entered.wait().await;
+        resume.wait().await;
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn capture_mutation_event_for_test(event: &rustfs_notify::EventArgs) {
+    if let Some(probe) = completion_probe(&event.bucket_name) {
+        probe.events.lock().expect("events").push(event.clone());
+        probe.changed.notify_one();
+    }
 }
 
 /// A unified helper structure for building and distributing audit logs and event notifications via RAII mode at the end of an S3 operation scope.
@@ -191,8 +310,20 @@ impl OperationHelper {
             );
         }
 
+        #[cfg(test)]
+        let probe_enabled = completion_probe(
+            req.extensions
+                .get::<ReqInfo>()
+                .and_then(|info| info.bucket.as_deref())
+                .unwrap_or_else(|| req.uri.path().trim_start_matches('/').split('/').next().unwrap_or_default()),
+        )
+        .is_some();
         let audit_enabled = is_audit_module_enabled();
         let notify_enabled = !audit_only && should_build_notification_event(is_notify_module_enabled());
+        #[cfg(test)]
+        let audit_enabled = audit_enabled || probe_enabled;
+        #[cfg(test)]
+        let notify_enabled = notify_enabled || (!audit_only && probe_enabled);
         if audit_only && !audit_enabled {
             // Nothing to record and no metric to bump: skip the path parsing below.
             return Self::Disabled;
@@ -547,13 +678,39 @@ impl Drop for OperationHelper {
             return;
         };
 
+        // An early error or panic must have an outcome, but is never proof
+        // of a successful mutation. Committed owners complete explicitly.
+        if state.api_builder.0.status.is_none() {
+            let elapsed = state.start_time.elapsed();
+            state.api_builder = state
+                .api_builder
+                .clone()
+                .status("failure".to_string())
+                .status_code(StatusCode::INTERNAL_SERVER_ERROR.as_u16() as i32)
+                .time_to_response(format!("{elapsed:.2?}"))
+                .time_to_response_in_ns(elapsed.as_nanos().to_string());
+            if let Some(builder) = state.audit_builder.take() {
+                state.audit_builder = Some(
+                    builder
+                        .api(state.api_builder.clone().build())
+                        .error("Operation ended before reporting its outcome".to_string()),
+                );
+            }
+        }
+
         // Distribute audit logs
         if state.audit_enabled
             && let Some(builder) = state.audit_builder.take()
         {
+            let entry = builder.build();
+            #[cfg(test)]
+            if let Some(probe) = entry.api.bucket.as_deref().and_then(completion_probe) {
+                probe.audits.lock().expect("audits").push(entry.clone());
+                probe.changed.notify_one();
+            }
             let ctx = Some(state.request_context.clone());
             spawn_background_with_context(ctx, async move {
-                AuditLogger::log(builder.build()).await;
+                AuditLogger::log(entry).await;
             });
         }
 
@@ -565,6 +722,8 @@ impl Drop for OperationHelper {
             let event_args = builder.build();
             // Avoid generating notifications for copy requests
             if !event_args.is_replication_request() {
+                #[cfg(test)]
+                capture_mutation_event_for_test(&event_args);
                 let ctx = Some(state.request_context.clone());
                 spawn_background_with_context(ctx, async move {
                     runtime_sources::current_notify_interface().notify(event_args).await;
@@ -644,6 +803,48 @@ mod tests {
                 .expect("unscoped observer remains live");
         });
         assert_eq!(rx.await.expect("unscoped task completes"), (None, None));
+    }
+
+    #[tokio::test]
+    async fn owned_mutation_keeps_keystone_context_and_audits_panics_as_failure() {
+        let bucket = "owned-mutation-panic";
+        let probe = super::MutationCompletionProbe::install(bucket);
+        let credentials = Credentials {
+            access_key: "keystone:test".to_owned(),
+            ..Default::default()
+        };
+        let result: S3Result<S3Response<()>> = rustfs_keystone::KEYSTONE_CREDENTIALS
+            .scope(Some(credentials), async {
+                super::run_owned_mutation(async {
+                    assert_eq!(
+                        rustfs_keystone::KEYSTONE_CREDENTIALS
+                            .with(|credentials| credentials.as_ref().map(|value| value.access_key.clone())),
+                        Some("keystone:test".to_owned())
+                    );
+                    let req = S3Request {
+                        input: (),
+                        method: Method::DELETE,
+                        uri: Uri::from_static("/owned-mutation-panic/object"),
+                        headers: HeaderMap::new(),
+                        extensions: Extensions::new(),
+                        credentials: None,
+                        region: None,
+                        service: None,
+                        trailing_headers: None,
+                    };
+                    let _helper = OperationHelper::new(&req, EventName::ObjectRemovedDelete, S3Operation::DeleteObject);
+                    panic!("injected mutation panic before reporting a commit");
+                })
+                .await
+            })
+            .await;
+        assert_eq!(result.expect_err("join failure").code(), &S3ErrorCode::InternalError);
+        probe.wait_for(1, 0).await;
+        let audits = probe.audits.lock().expect("audits");
+        assert_eq!(audits.len(), 1);
+        assert_eq!(audits[0].api.status.as_deref(), Some("failure"));
+        assert_eq!(audits[0].api.status_code, Some(500));
+        assert!(probe.events.lock().expect("events").is_empty());
     }
 
     #[cfg(feature = "diagnostic-read-version-caller")]
@@ -1037,6 +1238,17 @@ mod tests {
                                 secret_key: "audit-secret-must-not-leak".to_string(),
                                 session_token: "audit-token-must-not-leak".to_string(),
                                 parent_user: parent_user.to_string(),
+                                claims: match key {
+                                    "service-account" => Some(std::collections::HashMap::from([(
+                                        rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                                        serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
+                                    )])),
+                                    "sts-session" => Some(std::collections::HashMap::from([(
+                                        "sessionPolicy".to_string(),
+                                        serde_json::json!("private-session-policy"),
+                                    )])),
+                                    _ => None,
+                                },
                                 ..Default::default()
                             }),
                             ..Default::default()
@@ -1057,13 +1269,193 @@ mod tests {
                         assert_eq!(entry.access_key.as_deref(), expected_access_key);
                         let json = serde_json::to_value(&entry).expect("audit entry should serialize");
                         assert_eq!(json.get("accessKey").and_then(|key| key.as_str()), expected_access_key);
+                        let expected_parent_user = (!parent_user.is_empty()).then_some(parent_user);
+                        assert_eq!(entry.parent_user.as_deref(), expected_parent_user);
+                        assert_eq!(json.get("parentUser").and_then(|value| value.as_str()), expected_parent_user);
+                        assert!(!json.as_object().unwrap().contains_key("requestClaims"));
                         let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
                         assert!(!rendered.contains("audit-secret-must-not-leak"));
                         assert!(!rendered.contains("audit-token-must-not-leak"));
+                        assert!(!rendered.contains("private-session-policy"));
                     }
                 }
             },
         );
+    }
+
+    fn oidc_audit_credentials(issuer: Option<&str>) -> Credentials {
+        let mut claims = std::collections::HashMap::from([
+            ("sub".to_string(), serde_json::json!(" subject-9170 ")),
+            ("iss".to_string(), serde_json::json!("rustfs-oidc")),
+            ("oidc_provider".to_string(), serde_json::json!("default")),
+            ("email".to_string(), serde_json::json!("private@example.test")),
+            ("preferred_username".to_string(), serde_json::json!("private-user")),
+            ("groups".to_string(), serde_json::json!(["private-group"])),
+            ("roles".to_string(), serde_json::json!(["private-role"])),
+            ("policy".to_string(), serde_json::json!("private-policy")),
+            ("sessionPolicy".to_string(), serde_json::json!("private-encoded-policy")),
+            ("sessionPolicy-extracted".to_string(), serde_json::json!("private-decoded-policy")),
+            ("custom".to_string(), serde_json::json!({"token": "private-custom-token"})),
+        ]);
+        if let Some(issuer) = issuer {
+            claims.insert(rustfs_iam::sys::OIDC_ISSUER_CLAIM.to_string(), serde_json::json!(issuer));
+        }
+        Credentials {
+            access_key: "oidc-session".to_string(),
+            parent_user: "oidc-parent".to_string(),
+            secret_key: "audit-secret-must-not-leak".to_string(),
+            session_token: "audit-token-must-not-leak".to_string(),
+            claims: Some(claims),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn operation_helper_preserves_oidc_audit_identity_without_sensitive_claims() {
+        with_vars(
+            [
+                (rustfs_config::ENV_NOTIFY_ENABLE, Some("false")),
+                (rustfs_config::ENV_AUDIT_ENABLE, Some("true")),
+            ],
+            || {
+                refresh_notify_module_enabled();
+                refresh_audit_module_enabled();
+
+                for issuer in [Some("https://idp-a.example.test"), Some("https://idp-b.example.test"), None] {
+                    for service_account in [false, true] {
+                        let mut credentials = oidc_audit_credentials(issuer);
+                        if service_account {
+                            credentials.access_key = "oidc-service-account".to_string();
+                            credentials.claims.as_mut().unwrap().insert(
+                                rustfs_credentials::IAM_POLICY_CLAIM_NAME_SA.to_string(),
+                                serde_json::json!(rustfs_credentials::INHERITED_POLICY_TYPE),
+                            );
+                        }
+                        let before = serde_json::to_value(&credentials).expect("credentials should serialize");
+                        let mut expected_claims = serde_json::json!({
+                            "sub": " subject-9170 ",
+                            "iss": "rustfs-oidc",
+                            "oidc_provider": "default"
+                        });
+                        if let Some(issuer) = issuer {
+                            expected_claims["x-rustfs-internal-oidc-issuer"] = serde_json::json!(issuer);
+                        }
+
+                        for outcome in [None, Some(true), Some(false)] {
+                            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+                            req.extensions.insert(ReqInfo {
+                                cred: Some(credentials.clone()),
+                                ..Default::default()
+                            });
+                            let mut helper = OperationHelper::new(&req, EventName::ObjectAccessedGet, S3Operation::GetObject);
+                            if let Some(success) = outcome {
+                                let result = if success {
+                                    Ok(S3Response::new(GetObjectOutput::default()))
+                                } else {
+                                    Err(S3Error::new(S3ErrorCode::NoSuchKey))
+                                };
+                                helper = helper.complete(&result);
+                            }
+                            let OperationHelper::Enabled(state) = &mut helper else {
+                                panic!("audit helper should be enabled");
+                            };
+                            let entry = state.audit_builder.take().expect("audit builder should exist").build();
+                            let json = serde_json::to_value(&entry).expect("audit entry should serialize");
+                            assert_eq!(json["accessKey"], credentials.access_key);
+                            assert_eq!(json["parentUser"], "oidc-parent");
+                            assert_eq!(json["requestClaims"], expected_claims);
+                            let rendered = serde_json::to_string(&entry).expect("audit entry should serialize");
+                            assert!(!rendered.contains("private-"));
+                            assert!(!rendered.contains("private@example.test"));
+                            assert!(!rendered.contains("audit-secret-must-not-leak"));
+                            assert!(!rendered.contains("audit-token-must-not-leak"));
+                            assert_eq!(
+                                serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
+                                before
+                            );
+                        }
+                    }
+                }
+            },
+        );
+    }
+
+    #[test]
+    fn authorization_denial_preserves_oidc_audit_identity() {
+        use rustfs_policy::policy::action::{Action, S3Action};
+
+        let credentials = oidc_audit_credentials(Some("https://idp.example.test"));
+        let before = serde_json::to_value(&credentials).unwrap();
+        let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+        req.extensions.insert(ReqInfo {
+            cred: Some(credentials),
+            ..Default::default()
+        });
+        let entry = super::authorization_denial_entry(
+            &req,
+            &Action::S3Action(S3Action::GetObjectAction),
+            "iam_explicit_deny",
+            super::DenialScope::Request,
+        );
+        let json = serde_json::to_value(entry).expect("denial should serialize");
+        assert_eq!(json["parentUser"], "oidc-parent");
+        assert_eq!(
+            json["requestClaims"],
+            serde_json::json!({
+                "sub": " subject-9170 ",
+                "iss": "rustfs-oidc",
+                "oidc_provider": "default",
+                "x-rustfs-internal-oidc-issuer": "https://idp.example.test"
+            })
+        );
+        assert_eq!(json["api"]["status_code"], 403);
+        assert_eq!(json["tags"]["denialReason"], "iam_explicit_deny");
+        let rendered = json.to_string();
+        assert!(!rendered.contains("private"));
+        assert!(!rendered.contains("audit-secret-must-not-leak"));
+        assert!(!rendered.contains("audit-token-must-not-leak"));
+        assert_eq!(
+            serde_json::to_value(req.extensions.get::<ReqInfo>().unwrap().cred.as_ref().unwrap()).unwrap(),
+            before
+        );
+    }
+
+    #[test]
+    fn request_audit_identity_omits_non_oidc_and_empty_claims() {
+        for (key, value, expected_oidc) in [
+            (rustfs_iam::sys::OIDC_ISSUER_CLAIM, serde_json::json!(""), true),
+            (rustfs_iam::sys::OIDC_ISSUER_CLAIM, serde_json::json!(["https://idp.example.test"]), true),
+            ("iss", serde_json::json!("other-session"), false),
+            ("sub", serde_json::json!(""), false),
+            ("oidc_provider", serde_json::Value::Null, false),
+        ] {
+            let mut credentials = oidc_audit_credentials(None);
+            credentials.claims.as_mut().unwrap().insert(key.to_string(), value);
+            let mut req = build_request((), Method::GET, Uri::from_static("/audit-bucket/object.txt"));
+            req.extensions.insert(ReqInfo {
+                cred: Some(credentials),
+                ..Default::default()
+            });
+            let entry = super::request_audit_builder(
+                &req,
+                req.extensions.get::<ReqInfo>(),
+                EventName::ObjectAccessedGet,
+                "GetObject",
+                rustfs_audit::ApiDetails::default(),
+                "audit-identity-boundary",
+            )
+            .build();
+            let json = serde_json::to_value(entry).expect("audit entry should serialize");
+            assert_eq!(json["parentUser"], "oidc-parent");
+            if expected_oidc {
+                assert_eq!(
+                    json["requestClaims"],
+                    serde_json::json!({"sub": " subject-9170 ", "iss": "rustfs-oidc", "oidc_provider": "default"})
+                );
+            } else {
+                assert!(!json.as_object().unwrap().contains_key("requestClaims"));
+            }
+        }
     }
 
     #[test]

@@ -23,7 +23,9 @@ use super::{
 };
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
 use crate::error::{ApiError, ApiErrorDiagnostic};
-use crate::storage::access::{apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header};
+use crate::storage::access::{
+    apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header, replication_proxy_allowed,
+};
 use crate::storage::helper::{OperationHelper, audit_only_operation};
 use crate::storage::options::get_opts;
 use crate::storage::s3_api::{self, acl};
@@ -722,7 +724,7 @@ impl FS {
 
 #[async_trait::async_trait]
 impl S3 for FS {
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn abort_multipart_upload(
         &self,
         req: S3Request<AbortMultipartUploadInput>,
@@ -775,7 +777,7 @@ impl S3 for FS {
         usecase.execute_delete_bucket(req).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket_cors(&self, req: S3Request<DeleteBucketCorsInput>) -> S3Result<S3Response<DeleteBucketCorsOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::DeleteBucketCors, |req| usecase.execute_delete_bucket_cors(req)).await
@@ -792,7 +794,7 @@ impl S3 for FS {
         .await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket_lifecycle(
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
@@ -819,7 +821,7 @@ impl S3 for FS {
         audit_only_operation(req, S3Operation::DeleteBucketReplication, |req| self.delete_bucket_replication_inner(req)).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_bucket_tagging(
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
@@ -849,7 +851,7 @@ impl S3 for FS {
         Ok(S3Response::new(DeleteBucketWebsiteOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_public_access_block(
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
@@ -877,7 +879,7 @@ impl S3 for FS {
         result
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn delete_object_tagging(
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
@@ -916,6 +918,7 @@ impl S3 for FS {
                 // (backlog#1675 P1-5). No local object exists, so no bucket
                 // notification event is emitted for the proxied write.
                 if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && replication_proxy_allowed(&req.extensions)
                     && Self::proxy_delete_object_tagging(&bucket, &object, version_id.clone(), &req.headers)
                         .await
                         .is_some()
@@ -1045,7 +1048,7 @@ impl S3 for FS {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<S3Response<GetBucketCorsOutput>> {
         record_s3_op(S3Operation::GetBucketCors);
         let usecase = s3_api::bucket_usecase_for(self);
@@ -1061,7 +1064,7 @@ impl S3 for FS {
         usecase.execute_get_bucket_encryption(req).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
@@ -1136,14 +1139,14 @@ impl S3 for FS {
         }
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<S3Response<GetBucketTaggingOutput>> {
         record_s3_op(S3Operation::GetBucketTagging);
         let usecase = s3_api::bucket_usecase_for(self);
         usecase.execute_get_bucket_tagging(req).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_public_access_block(
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
@@ -1153,7 +1156,7 @@ impl S3 for FS {
         usecase.execute_get_public_access_block(req).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
@@ -1296,7 +1299,7 @@ impl S3 for FS {
         result
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_object_lock_configuration(
         &self,
         req: S3Request<GetObjectLockConfigurationInput>,
@@ -1388,7 +1391,7 @@ impl S3 for FS {
         result
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
         use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 
@@ -1436,6 +1439,7 @@ impl S3 for FS {
                 // replication target even though it is missing locally —
                 // proxy the tagging read there (backlog#1675 P1-5).
                 if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && replication_proxy_allowed(&req.extensions)
                     && let Some(output) =
                         Self::proxy_get_object_tagging(bucket, object, req.input.version_id.clone(), &req.headers).await
                 {
@@ -1516,7 +1520,7 @@ impl S3 for FS {
         usecase.execute_head_object(req).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         // List buckets not associated with a bucket, give it bucket label "*" to denote "all".
         record_s3_op(S3Operation::ListBuckets);
@@ -1595,7 +1599,7 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketAccelerateConfigurationOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_cors(&self, req: S3Request<PutBucketCorsInput>) -> S3Result<S3Response<PutBucketCorsOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::PutBucketCors, |req| usecase.execute_put_bucket_cors(req)).await
@@ -1632,7 +1636,7 @@ impl S3 for FS {
         audit_only_operation(req, S3Operation::PutBucketEncryption, |req| usecase.execute_put_bucket_encryption(req)).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
@@ -1694,7 +1698,7 @@ impl S3 for FS {
         Ok(S3Response::new(PutBucketRequestPaymentOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_public_access_block(
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
@@ -1703,13 +1707,13 @@ impl S3 for FS {
         audit_only_operation(req, S3Operation::PutPublicAccessBlock, |req| usecase.execute_put_public_access_block(req)).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_tagging(&self, req: S3Request<PutBucketTaggingInput>) -> S3Result<S3Response<PutBucketTaggingOutput>> {
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::PutBucketTagging, |req| usecase.execute_put_bucket_tagging(req)).await
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -1885,7 +1889,7 @@ impl S3 for FS {
         result
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     async fn put_object_lock_configuration(
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
@@ -2052,6 +2056,7 @@ impl S3 for FS {
                 // (backlog#1675 P1-5). No local object exists, so no bucket
                 // notification event is emitted for the proxied write.
                 if (is_err_object_not_found(&e) || is_err_version_not_found(&e))
+                    && replication_proxy_allowed(&req.extensions)
                     && Self::proxy_put_object_tagging(&bucket, &object, version_id.clone(), &req.headers, &tagging.tag_set)
                         .await
                         .is_some()

@@ -72,6 +72,22 @@ fn insert_referenced_object_report(
     report.reasons.insert(reason);
 }
 
+pub(crate) fn maintenance_cleanup_roots(entry: &TableEntry) -> TableCatalogStoreResult<Vec<String>> {
+    let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
+    let table_root = metadata_dir
+        .strip_suffix(&format!("/{METADATA_DIR}"))
+        .ok_or_else(|| TableCatalogStoreError::Invalid("maintenance metadata directory has no table root".to_string()))?;
+    let warehouse = table_warehouse_object_prefix(entry)?;
+    Ok(vec![
+        format!("{metadata_dir}/"),
+        format!("{table_root}/{DATA_DIR}/"),
+        format!("{table_root}/{DELETE_DIR}/"),
+        format!("{warehouse}{METADATA_DIR}/"),
+        format!("{warehouse}{DATA_DIR}/"),
+        format!("{warehouse}{DELETE_DIR}/"),
+    ])
+}
+
 #[derive(Clone, Copy)]
 enum TableMaintenanceObjectScope<'a> {
     Logical {
@@ -795,7 +811,7 @@ where
             table_metadata_maintenance_reason_for_object_kind(&object_kind),
             TableMetadataMaintenanceReason::NoCurrentReachability,
         ]);
-        let state = match backend.read_object(table_bucket, &object_location).await? {
+        let state = match backend.object_metadata(table_bucket, &object_location).await? {
             Some(object) if metadata_candidate_is_past_safety_window(object.mod_time, now) => {
                 reasons.insert(TableMetadataMaintenanceReason::SafetyWindowSatisfied);
                 cleanup_candidate_locations.push(object_location.clone());
