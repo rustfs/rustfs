@@ -3629,7 +3629,13 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response = match client.batch_read_version(request).await {
+                    let response_result = client.batch_read_version(request).await;
+                    if let Some(rpc_started) = rpc_started {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
+                            rpc_started.elapsed(),
+                        );
+                    }
+                    let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
                             response.into_inner()
@@ -4556,7 +4562,10 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let response = client.read_multiple(request).await?.into_inner();
+                let rpc_started = Instant::now();
+                let response = client.read_multiple(request).await;
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = response?.into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -4607,6 +4616,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4615,6 +4625,7 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -4712,6 +4723,7 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4719,6 +4731,8 @@ impl DiskAPI for RemoteDisk {
                         return Err(err.into());
                     }
                 };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
