@@ -2666,6 +2666,22 @@ where
         .map_err(catalog_store_error)
 }
 
+/// A create's initial metadata file sits under a root no table owns until its
+/// entry is published, and its name embeds this request's fresh table id, so
+/// nothing else can reference it. When registration fails before any catalog
+/// write may have begun, remove it; the publication fence is already released,
+/// and a failure here (or a crash before this point) leaves a small orphan.
+async fn remove_unpublished_initial_metadata(
+    metadata_backend: &impl crate::table_catalog::TableCatalogObjectBackend,
+    bucket: &str,
+    metadata_location: &str,
+) {
+    if crate::table_catalog::TableCommitPublication::preparation_budget(metadata_backend).mutation_started() {
+        return;
+    }
+    let _ = metadata_backend.delete_object(bucket, metadata_location).await;
+}
+
 /// Recheck the bucket registered before the publication lock. A missing entry
 /// here can indicate retirement while queued; do not recreate it under the fence.
 async fn require_table_bucket_for_publication<S>(
@@ -6193,10 +6209,10 @@ where
         )
         .await
         .map_err(catalog_store_already_exists_error)?;
-    store
-        .register_table_with_publication(entry.clone(), metadata_backend)
-        .await
-        .map_err(catalog_store_already_exists_error)?;
+    if let Err(err) = store.register_table_with_publication(entry.clone(), metadata_backend).await {
+        remove_unpublished_initial_metadata(metadata_backend, bucket, &entry.metadata_location).await;
+        return Err(catalog_store_already_exists_error(err));
+    }
     Ok(create_table_response_from_entry(entry, metadata, false))
 }
 
@@ -7036,10 +7052,10 @@ where
         )
         .await
         .map_err(catalog_store_already_exists_error)?;
-    store
-        .register_table_with_publication(entry.clone(), metadata_backend)
-        .await
-        .map_err(catalog_store_already_exists_error)?;
+    if let Err(err) = store.register_table_with_publication(entry.clone(), metadata_backend).await {
+        remove_unpublished_initial_metadata(metadata_backend, bucket, &entry.metadata_location).await;
+        return Err(catalog_store_already_exists_error(err));
+    }
 
     Ok(RestCommitTableResponse {
         metadata_location: table_metadata_location_for_client(bucket, &entry.metadata_location),

@@ -18,7 +18,7 @@ use super::*;
 const DIRECTORY_KIND: &str = "table-entry-directory";
 const DIRECTORY_VERSION: u16 = 1;
 const DIRECTORY_PAGE_SIZE: usize = 128;
-const DIRECTORY_STATE_MAX_SIZE: usize = 16 * 1024;
+pub(super) const DIRECTORY_STATE_MAX_SIZE: usize = 16 * 1024;
 const ENV_DIRECTORY_ENABLE: &str = "RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX";
 const ENV_DIRECTORY_FLEET: &str = "RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX_FLEET_CONFIRMED";
 
@@ -111,6 +111,16 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         else {
             return Ok(None);
         };
+        self.table_directory_state_from_object(table_bucket, &object)
+    }
+
+    /// Decode the object stored on the migration-fence path as directory
+    /// state; `None` when it is some other kind, such as a migration fence.
+    pub(super) fn table_directory_state_from_object(
+        &self,
+        table_bucket: &str,
+        object: &TableCatalogObject,
+    ) -> TableCatalogStoreResult<Option<TableDirectoryState>> {
         let value: serde_json::Value = serde_json::from_slice(&object.data)
             .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid catalog migration fence: {err}")))?;
         if value.get("kind").and_then(serde_json::Value::as_str) != Some(DIRECTORY_KIND) {
@@ -136,7 +146,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             ));
         }
         state.etag =
-            Some(object.etag.ok_or_else(|| {
+            Some(object.etag.clone().ok_or_else(|| {
                 TableCatalogStoreError::Unavailable("directory state has no conditional-write ETag".to_string())
             })?);
         Ok(Some(state))

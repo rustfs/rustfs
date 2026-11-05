@@ -24,6 +24,8 @@ mod object;
 mod publication_deadline;
 mod registration_cache;
 pub(crate) use publication_deadline::TablePublicationPreparation;
+#[cfg(test)]
+pub(crate) use publication_deadline::publication_preparation_timeout;
 use publication_deadline::{
     begin_publication_mutation, publication_preparation, publication_recovery, retain_publication_preparation_fence,
 };
@@ -38,7 +40,7 @@ pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
 use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
-pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
+pub(super) use object::{bounded_table_entry_objects_for_data_plane_scan, maintenance_subtree_skip_cursor};
 #[cfg(test)]
 pub(super) use strong::{
     STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
@@ -942,8 +944,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     /// Write an object that precedes the catalog transaction, such as the
     /// initial metadata file of a create. It is authorized and fenced like
     /// `put_object`, but a publication-aware backend must not treat it as the
-    /// first durable catalog mutation: an orphan is reclaimed by maintenance,
-    /// so the preparation deadline keeps bounding the work that follows.
+    /// first durable catalog mutation, so the preparation deadline keeps
+    /// bounding the work that follows. The caller removes the object when the
+    /// transaction fails before any catalog write may have begun; nothing else
+    /// references it, since its root belongs to no table.
     async fn put_object_before_publication(
         &self,
         bucket: &str,

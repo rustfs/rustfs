@@ -281,20 +281,25 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<(TableCatalogBackingMigrationFence, Option<String>)>> {
+        let path = self.paths.backing_migration_fence_path(table_bucket);
+        let Some(object) = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), &path, super::directory_index::DIRECTORY_STATE_MAX_SIZE)
+            .await?
+        else {
+            return Ok(None);
+        };
         // The table-entry directory keeps its state on this path; its presence
         // excludes a backing migration rather than being a malformed fence.
-        if self.read_table_directory_state(table_bucket).await?.is_some() {
+        if self.table_directory_state_from_object(table_bucket, &object)?.is_some() {
             return Err(TableCatalogStoreError::Conflict(
                 "table bucket has an active table-entry directory; roll it back before a backing migration".to_string(),
             ));
         }
-        let fence = self
-            .read_entry(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
-            .await?;
-        if let Some((fence, _)) = fence.as_ref() {
-            Self::validate_backing_migration_fence(table_bucket, fence)?;
-        }
-        Ok(fence)
+        let fence: TableCatalogBackingMigrationFence = serde_json::from_slice(&object.data)
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse catalog entry {path}: {err}")))?;
+        Self::validate_backing_migration_fence(table_bucket, &fence)?;
+        Ok(Some((fence, object.etag)))
     }
 
     pub(super) async fn acquire_table_bucket_registry_write_permit(&self) -> TableCatalogStoreResult<TableCatalogLockGuard> {

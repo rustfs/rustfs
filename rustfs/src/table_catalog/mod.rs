@@ -113,10 +113,12 @@ pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING
 /// Seconds a create, register, or commit may spend preparing (queueing for the
 /// bucket publication fence, validating references, inventories) before it is
 /// refused with 503 so object writes in the bucket are admitted. Never below
-/// the object lock-acquire timeout.
+/// the object lock-acquire timeout and never above one day, so the deadline
+/// instant cannot overflow.
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS";
 pub(crate) const DEFAULT_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: u64 = 30;
+pub(crate) const MAX_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: u64 = 86_400;
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2: &str = "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2";

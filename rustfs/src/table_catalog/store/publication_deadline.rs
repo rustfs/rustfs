@@ -36,13 +36,15 @@ tokio::task_local! {
 }
 
 /// Budget for one publication preparation: the configured interval, never
-/// shorter than the lock-acquire timeout that queueing alone may consume.
+/// shorter than the lock-acquire timeout that queueing alone may consume and
+/// never longer than the ceiling, so `Instant + Duration` cannot overflow.
 pub(crate) fn publication_preparation_timeout() -> std::time::Duration {
-    std::time::Duration::from_secs(rustfs_utils::get_env_u64(
+    let configured = rustfs_utils::get_env_u64(
         crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS,
         crate::table_catalog::DEFAULT_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS,
-    ))
-    .max(get_lock_acquire_timeout())
+    )
+    .min(crate::table_catalog::MAX_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS);
+    std::time::Duration::from_secs(configured).max(get_lock_acquire_timeout())
 }
 
 impl TablePublicationPreparation {
@@ -66,6 +68,11 @@ impl TablePublicationPreparation {
     /// Fail once the budget is spent without committing the transaction.
     pub(crate) fn check_deadline(&self) -> TableCatalogStoreResult<()> {
         self.check()
+    }
+
+    /// Whether a durable catalog write may already have begun.
+    pub(crate) fn mutation_started(&self) -> bool {
+        self.mutation_started.load(Ordering::Acquire)
     }
 
     pub(crate) fn begin_mutation(&self) -> TableCatalogStoreResult<()> {

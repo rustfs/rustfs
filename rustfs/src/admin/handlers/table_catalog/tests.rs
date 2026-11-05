@@ -4559,32 +4559,40 @@ async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct
         .rsplit_once('/')
         .map(|(prefix, _)| format!("{prefix}/"))
         .expect("metadata location should contain a file name");
+    // Both creates wrote a distinct initial metadata file under their own
+    // fresh table id; the loser's registration failed before any catalog
+    // write, so its file was removed again and only the winner's remains.
     let metadata_objects = metadata_backend
         .list_objects("warehouse", &metadata_prefix)
         .await
         .expect("metadata listing should succeed");
-    assert_eq!(metadata_objects.len(), 2);
-    assert_ne!(metadata_objects[0], metadata_objects[1]);
+    assert_eq!(metadata_objects, vec![winner_entry.metadata_location.clone()]);
+    let state = metadata_backend.state.lock().await;
+    let written = state
+        .put_attempts
+        .keys()
+        .filter(|(bucket, object)| bucket == "warehouse" && object.starts_with(&metadata_prefix))
+        .map(|(_, object)| object.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(written.len(), 2, "each create wrote its own initial metadata file: {written:?}");
+    let removed = state
+        .delete_attempts
+        .keys()
+        .filter(|(bucket, object)| bucket == "warehouse" && object.starts_with(&metadata_prefix))
+        .map(|(_, object)| object.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(removed.len(), 1, "only the loser's file is removed: {removed:?}");
+    assert_ne!(removed[0], winner_entry.metadata_location);
+    assert!(written.contains(&removed[0]));
+    drop(state);
 
-    let mut table_uuids = Vec::with_capacity(metadata_objects.len());
-    for metadata_object in metadata_objects {
-        let metadata = metadata_backend
-            .read_object("warehouse", &metadata_object)
-            .await
-            .expect("metadata lookup should succeed")
-            .expect("metadata object should exist");
-        let metadata: serde_json::Value = serde_json::from_slice(&metadata.data).expect("metadata object should contain JSON");
-        table_uuids.push(
-            metadata["table-uuid"]
-                .as_str()
-                .expect("metadata should contain table uuid")
-                .to_string(),
-        );
-    }
-    table_uuids.sort();
-    table_uuids.dedup();
-    assert_eq!(table_uuids.len(), 2);
-    assert!(table_uuids.contains(&winner_entry.table_uuid));
+    let metadata = metadata_backend
+        .read_object("warehouse", &winner_entry.metadata_location)
+        .await
+        .expect("metadata lookup should succeed")
+        .expect("metadata object should exist");
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.data).expect("metadata object should contain JSON");
+    assert_eq!(metadata["table-uuid"].as_str(), Some(winner_entry.table_uuid.as_str()));
 }
 
 #[tokio::test]
@@ -17685,6 +17693,90 @@ async fn publication_deadline_first_fenced_metadata_put_finishes_after_budget() 
         .unwrap();
     assert!(publication.holds_table_bucket("warehouse"));
     publication.complete();
+}
+
+#[tokio::test(start_paused = true)]
+async fn publication_deadline_expired_create_removes_its_initial_metadata_file() {
+    use crate::table_catalog::{
+        ObjectTableCatalogStore, TableCatalogObjectBackend, TableCatalogObjectPaths, TableCatalogStore, TableCommitPublication,
+        publication_preparation_timeout,
+    };
+    let backend = TestTableCatalogObjectBackend::content_addressed();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    ensure_table_bucket_entry(&store, "warehouse", true)
+        .await
+        .expect("table bucket entry should be seeded");
+    create_namespace_response(
+        &store,
+        "warehouse",
+        CreateNamespaceRequest {
+            namespace: vec!["analytics".to_string()],
+            properties: BTreeMap::new(),
+        },
+        true,
+    )
+    .await
+    .expect("namespace should be created");
+    let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+        "name": "events",
+        "schema": {"type": "struct", "schema-id": 0, "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}
+    }))
+    .expect("create table request should parse");
+    let publication = TableCommitObjectBackend::trusted(backend.clone());
+    // Pause the registration inventory, which runs after the initial metadata file is written.
+    let entry_path = TableCatalogObjectPaths::default().table_entry_path(
+        "warehouse",
+        &namespace,
+        &crate::table_catalog::IdentifierSegment::parse("events").expect("table should parse"),
+    );
+    let pause = backend
+        .pause_before_next_read(crate::admin::storage_api::RUSTFS_META_BUCKET, &entry_path)
+        .await;
+    let creating = {
+        let store = store.clone();
+        let publication = publication.clone();
+        let namespace = namespace.clone();
+        tokio::spawn(async move { create_table_response(&store, &publication, "warehouse", &namespace, request, true).await })
+    };
+    pause.wait_started().await;
+    let metadata_files = |state: &crate::table_catalog::test_support::TestCatalogObjectState| {
+        state
+            .objects
+            .keys()
+            .filter(|(bucket, object)| bucket == "warehouse" && object.ends_with(".metadata.json"))
+            .map(|(_, object)| object.clone())
+            .collect::<Vec<_>>()
+    };
+    let written = metadata_files(&*backend.state.lock().await);
+    assert_eq!(written.len(), 1, "the initial metadata file precedes registration");
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
+    let error = creating
+        .await
+        .unwrap()
+        .expect_err("the expired preparation must refuse the create");
+    assert_eq!(error.status_code(), Some(StatusCode::SERVICE_UNAVAILABLE));
+    pause.release();
+    assert!(
+        metadata_files(&*backend.state.lock().await).is_empty(),
+        "the unpublished metadata file is removed"
+    );
+    assert_eq!(
+        backend
+            .state
+            .lock()
+            .await
+            .delete_attempts
+            .get(&("warehouse".to_string(), written[0].clone())),
+        Some(&1)
+    );
+    assert!(store.load_table("warehouse", "analytics", "events").await.unwrap().is_none());
+    assert!(!publication.holds_table_bucket("warehouse"));
+    // The bucket is writable again: nothing of the expired create remains to collide with.
+    let _writer = backend
+        .acquire_read_lock("warehouse", &crate::table_catalog::default_table_bucket_publication_lock_path())
+        .await
+        .unwrap();
 }
 
 #[tokio::test(start_paused = true)]

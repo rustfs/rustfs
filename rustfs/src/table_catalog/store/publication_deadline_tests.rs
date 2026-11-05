@@ -329,3 +329,30 @@ async fn publication_deadline_active_rename_recovery_finishes_before_rejecting_n
         .await
         .unwrap();
 }
+
+#[tokio::test]
+#[serial_test::serial]
+async fn publication_deadline_timeout_is_clamped_to_its_ceiling() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS,
+            Some(u64::MAX.to_string().as_str()),
+        )],
+        async {
+            let ceiling = StdDuration::from_secs(crate::table_catalog::MAX_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS);
+            assert_eq!(publication_preparation_timeout(), ceiling.max(get_lock_acquire_timeout()));
+            // `Instant + Duration` must not overflow for the first deadline.
+            let preparation = TablePublicationPreparation::default();
+            assert!(preparation.deadline() > tokio::time::Instant::now());
+            preparation.check_deadline().unwrap();
+        },
+    )
+    .await;
+    temp_env::async_with_vars(
+        [(crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS, Some("0"))],
+        async {
+            assert_eq!(publication_preparation_timeout(), get_lock_acquire_timeout());
+        },
+    )
+    .await;
+}
