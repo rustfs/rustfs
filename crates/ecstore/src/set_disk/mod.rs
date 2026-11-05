@@ -10653,6 +10653,12 @@ mod tests {
         .expect("committed delete marker should be written");
 
         let set = make_set_disks_with(vec![Some(disk)]).await;
+        assert_eq!(
+            set.dry_run_reclaim_orphan_data_dirs("bucket", "obj").await.expect("dry run"),
+            1,
+            "committed residue should be eligible without deleting it"
+        );
+        assert!(stale_dir.join("part.1").exists(), "dry run must preserve data");
         let removed = set
             .reclaim_orphan_data_dirs("bucket", "obj")
             .await

@@ -201,10 +201,11 @@ fn is_metadata_less_data_dir_entry(entry: &str) -> bool {
             || is_delete_transaction_marker(entry, RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX))
 }
 
-/// List-dir view of a plain orphan data dir leaf (parts only). Used by remote
+/// List-dir view of a reclaimable part or committed delete marker. Used by remote
 /// peers that cannot open the directory locally.
 pub(crate) fn list_entry_is_orphan_data_dir_part(entry: &str) -> bool {
-    !entry.ends_with(SLASH_SEPARATOR) && delete_recovery_part_file(entry)
+    !entry.ends_with(SLASH_SEPARATOR)
+        && (delete_recovery_part_file(entry) || is_delete_transaction_marker(entry, DELETE_DATA_DIR_MARKER_PREFIX))
 }
 
 /// Classify the entire leaf before unlinking anything. UUID-shaped S3 prefixes
@@ -217,11 +218,17 @@ fn orphan_data_dir_parts(path: &Path) -> std::io::Result<Vec<PathBuf>> {
     let mut parts = Vec::new();
     for entry in std::fs::read_dir(path)? {
         let entry = entry?;
-        if !entry.file_type()?.is_file() || !entry.file_name().to_str().is_some_and(delete_recovery_part_file) {
+        if !entry.file_type()?.is_file() || !entry.file_name().to_str().is_some_and(list_entry_is_orphan_data_dir_part) {
             return Err(protected());
         }
         parts.push(entry.path());
     }
+    // Keep committed witnesses until every data part has been removed.
+    parts.sort_by_key(|part| {
+        part.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| is_delete_transaction_marker(name, DELETE_DATA_DIR_MARKER_PREFIX))
+    });
     Ok(parts)
 }
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -7376,7 +7383,18 @@ impl LocalDisk {
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
                     Err(err) => return Err(err),
                 };
+                let mut removing_markers = false;
                 for part in parts {
+                    let is_marker = part
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .is_some_and(|name| is_delete_transaction_marker(name, DELETE_DATA_DIR_MARKER_PREFIX));
+                    if is_marker && !removing_markers {
+                        if sync {
+                            os::fsync_dir_std(&data_path)?;
+                        }
+                        removing_markers = true;
+                    }
                     match std::fs::remove_file(&part) {
                         Ok(()) => {}
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
@@ -13041,6 +13059,24 @@ mod test {
             (disk, dir)
         }
 
+        #[test]
+        fn orphan_data_dir_probe_accepts_only_committed_markers() {
+            let transaction = Uuid::new_v4();
+            assert!(list_entry_is_orphan_data_dir_part(&format!(
+                "{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"
+            )));
+            for entry in [
+                format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"),
+                format!("{RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"),
+                format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::nil()),
+                format!("{DELETE_DATA_DIR_MARKER_PREFIX}{transaction}/"),
+                format!("{DELETE_DATA_DIR_MARKER_PREFIX}invalid"),
+                STORAGE_FORMAT_FILE.to_owned(),
+            ] {
+                assert!(!list_entry_is_orphan_data_dir_part(&entry), "protected entry: {entry}");
+            }
+        }
+
         #[tokio::test]
         async fn orphan_data_dir_delete_preserves_child_namespace() {
             let fixture = new_disk().await;
@@ -13055,6 +13091,9 @@ mod test {
             fs::write(data_path.join("child").join(STORAGE_FORMAT_FILE), b"child-meta")
                 .await
                 .expect("child metadata");
+            fs::write(data_path.join(format!("{DELETE_DATA_DIR_MARKER_PREFIX}{}", Uuid::new_v4())), [])
+                .await
+                .expect("committed marker beside child");
             fs::write(data_path.join("part.1"), b"stale-part")
                 .await
                 .expect("stale part beside child");

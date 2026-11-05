@@ -1811,7 +1811,7 @@ pub struct DeleteOptions {
     pub delete_recovery_bucket_incarnation: Option<Uuid>,
     #[serde(default)]
     pub recoverable_delete: bool,
-    /// Reclaim only plain erasure-part leaves, preserving every other entry.
+    /// Reclaim only regular erasure parts and committed delete markers.
     /// Keep `recursive` false so an older peer cannot widen this operation.
     #[serde(default)]
     pub orphan_data_dir: bool,

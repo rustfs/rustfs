@@ -6209,8 +6209,8 @@ impl SetDisks {
     ///   never removed. A data dir carrying a committed delete-transaction marker
     ///   remains reclaimable after a downgrade/re-upgrade cleanup interruption.
     /// * Only subdirectories whose names parse as a UUID are ever considered;
-    ///   removal is non-recursive-safe via a recursive delete of the full stray
-    ///   data-dir path only.
+    ///   removal unlinks only regular parts and committed delete markers, then
+    ///   removes the empty directory without recursion.
     ///
     /// Returns the number of stray data directories removed across the set. This
     /// is best-effort maintenance: individual delete failures are logged and
@@ -6323,8 +6323,8 @@ impl SetDisks {
         }
 
         // Phase 2: delete every physical data dir not referenced by the union.
-        // Only plain erasure-part leaves are eligible: a UUID directory that
-        // holds a child S3 key (or any non-part entry) must be preserved.
+        // Only parts and committed delete markers are eligible: a UUID directory
+        // holding a child S3 key or another transaction witness must be preserved.
         let mut removed = 0usize;
         for (i, physical) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
