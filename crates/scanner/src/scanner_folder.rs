@@ -3519,7 +3519,13 @@ pub(crate) async fn scan_data_folder_scoped(
                     || !new_cache.info.size_reconciliation.is_empty()
                 {
                     if new_cache.root().is_some() {
-                        new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
+                        // Interrupted sweeps seal a resume frontier after this.
+                        // Flattening the root at the ordinary 10k limit would
+                        // drop frontier-named children and force the next cycle
+                        // to replay completed prefixes (#8292 / review on #9193).
+                        // Keep only the emergency FORCE ceiling here; successful
+                        // completions above apply DATA_SCANNER_COMPACT_AT_CHILDREN.
+                        new_cache.force_compact(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS);
                     }
                     new_cache.info.last_update = Some(SystemTime::now());
                     new_cache.info.next_cycle = next_cycle;

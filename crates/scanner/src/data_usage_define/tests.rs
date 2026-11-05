@@ -3230,7 +3230,6 @@ fn test_force_compact_flattens_wide_root_above_limit() {
     // Before the fix, force_compact kept one entry per prefix forever.
     const PREFIXES: usize = 64;
     const LIMIT: usize = 16;
-    assert!(PREFIXES > LIMIT);
 
     let root = hash_path("bucket");
     let mut cache = DataUsageCache {
@@ -3270,7 +3269,6 @@ fn test_force_compact_flattens_wide_root_above_limit() {
 fn test_force_compact_keeps_narrow_root_children() {
     const PREFIXES: usize = 4;
     const LIMIT: usize = 16;
-    assert!(PREFIXES < LIMIT);
 
     let root = hash_path("bucket");
     let mut cache = DataUsageCache {
@@ -3307,6 +3305,52 @@ fn test_force_compact_keeps_narrow_root_children() {
     assert!(!root_entry.compacted);
     assert_eq!(root_entry.children.len(), PREFIXES);
     assert_eq!(cache.cache.len(), PREFIXES + 1);
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_retains_wide_root_children() {
+    // Interrupted sweeps pass the emergency FORCE ceiling into force_compact so
+    // a resume frontier under a 10k–250k-wide root stays addressable.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(INTERRUPTED_CEILING);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted, "interrupted ceiling must not flatten a 64-wide root");
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+    // Sanity: the ordinary completion limit would have flattened this layout.
+    let mut completed = cache.clone();
+    completed.force_compact(ORDINARY_LIMIT);
+    assert!(
+        completed.find("bucket").is_some_and(|entry| entry.compacted),
+        "ordinary limit still flattens the same wide root after completion"
+    );
 }
 
 #[tokio::test]
