@@ -58,6 +58,14 @@ pub(crate) fn compaction_stored_input_ceiling_error(group_id: &str) -> TableCata
     ))
 }
 
+/// The same ceiling, reached while reading a group's inputs (defence in depth
+/// behind the planner cap and the commit pre-check).
+fn compaction_stored_inputs_ceiling_error() -> TableCatalogStoreError {
+    TableCatalogStoreError::Invalid(format!(
+        "compaction stored inputs exceed the {TABLE_COMPACTION_MAX_STORED_BYTES} byte server ceiling; lower max-rewrite-bytes-per-job to at most that value and replan"
+    ))
+}
+
 fn add_budget(total: &mut usize, amount: usize, limit: usize) -> TableCatalogStoreResult<()> {
     *total = total
         .checked_add(amount)
@@ -513,7 +521,7 @@ fn compact_parquet_with_budgets(
         stored = stored
             .checked_add(data.len())
             .filter(|total| *total <= TABLE_COMPACTION_MAX_STORED_BYTES)
-            .ok_or_else(|| compaction_stored_input_ceiling_error("input"))?;
+            .ok_or_else(compaction_stored_inputs_ceiling_error)?;
         let data = Bytes::from(data);
         validate_footer_metadata(&data, limit).map_err(|err| match err {
             TableCatalogStoreError::Invalid(message) => TableCatalogStoreError::Invalid(format!("{location}: {message}")),

@@ -1151,15 +1151,42 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
     let object = ledger_object(bucket);
     let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
     let guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    let retired = match load_ledger_locked(Arc::clone(&store), &object).await {
-        Ok(ledger) if ledger.bucket_incarnation == incarnation => ledger.bucket_incarnation,
+    let ledger = match load_ledger_locked(Arc::clone(&store), &object).await {
+        Ok(ledger) if ledger.bucket_incarnation == incarnation => Some(ledger.bucket_incarnation),
         Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {
-            ledger.bucket_incarnation
+            Some(ledger.bucket_incarnation)
         }
         Ok(_) => return Err(StorageError::PreconditionFailed),
-        Err(StorageError::ConfigNotFound) => return Ok(()),
+        Err(StorageError::ConfigNotFound) => None,
         Err(error) => return Err(error),
     };
+    // The reconciliation throttle object of the retiring incarnation goes first,
+    // so a crash after the ledger delete cannot leave it behind; the requested
+    // incarnation is cleaned even when its ledger is already gone.
+    for retired in [Some(incarnation), ledger.filter(|retired| *retired != incarnation)]
+        .into_iter()
+        .flatten()
+    {
+        let control = reconcile_control_object(&object, retired);
+        match store
+            .delete_object(
+                RUSTFS_META_BUCKET,
+                &control,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_err_object_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if ledger.is_none() {
+        return Ok(());
+    }
     if guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "quota_ledger_retirement",
@@ -1175,26 +1202,17 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
     };
     options.add_namespace_lock_guard(&guard);
     match store.delete_object(RUSTFS_META_BUCKET, &object, options).await {
-        Ok(_) => {}
-        Err(error) if is_err_object_not_found(&error) => {}
-        Err(error) => return Err(error),
+        Ok(_) => Ok(()),
+        Err(error) if is_err_object_not_found(&error) => Ok(()),
+        Err(error) => Err(error),
     }
-    // The reconciliation throttle objects of this incarnation are residue once
-    // the ledger is gone; a job still finishing for it fails its configuration
-    // check before publishing.
-    let controls = ObjectOptions {
-        delete_prefix_object: true,
-        no_lock: true,
-        ..Default::default()
-    };
-    store
-        .delete_prefix(RUSTFS_META_BUCKET, &reconcile_control_prefix(&object, retired), &controls)
-        .await
 }
 
-/// Prefix of the reconciliation control objects of one bucket incarnation.
-fn reconcile_control_prefix(ledger_object: &str, incarnation: Uuid) -> String {
-    format!("{ledger_object}.reconcile/{incarnation}/")
+/// The reconciliation throttle object of one bucket incarnation. One object per
+/// incarnation: a quota revision change replaces the throttle instead of
+/// leaving the previous revision's object behind.
+fn reconcile_control_object(ledger_object: &str, incarnation: Uuid) -> String {
+    format!("{ledger_object}.reconcile/{incarnation}")
 }
 
 async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_object: &str) -> Result<()> {
@@ -1359,11 +1377,7 @@ impl ReconcileJob {
     }
 
     fn control_object(&self) -> String {
-        format!(
-            "{}{}",
-            reconcile_control_prefix(&ledger_object(&self.bucket), self.bucket_incarnation),
-            self.quota_revision.unix_timestamp_nanos()
-        )
+        reconcile_control_object(&ledger_object(&self.bucket), self.bucket_incarnation)
     }
 
     async fn save_control(&self, object: &str, control: &ReconcileControl, guard: &Arc<NamespaceLockGuard>) -> Result<()> {
@@ -1392,12 +1406,14 @@ impl ReconcileJob {
         match read_config_no_lock(Arc::clone(&self.store), &control_object).await {
             Ok(bytes) => {
                 let control: ReconcileControl = serde_json::from_slice(&bytes)?;
-                if control.bucket_incarnation != self.bucket_incarnation
-                    || control.quota_revision_unix_nanos != self.quota_revision.unix_timestamp_nanos()
-                {
+                if control.bucket_incarnation != self.bucket_incarnation {
                     return Err(StorageError::PartMissingOrCorrupt);
                 }
-                if control.next_attempt_at > now {
+                // A previous quota revision's throttle does not apply: the new
+                // revision needs its own scan and overwrites the object below.
+                if control.quota_revision_unix_nanos == self.quota_revision.unix_timestamp_nanos()
+                    && control.next_attempt_at > now
+                {
                     return Ok(());
                 }
             }
@@ -1415,9 +1431,13 @@ impl ReconcileJob {
         let result = self.scan_and_publish(&guard).await;
         // The throttle outlives a successful scan on purpose: denied requests
         // keep scheduling the job, and they must not rescan a full bucket more
-        // than once per interval.
-        control.next_attempt_at = now_unix().saturating_add(RECONCILE_RETRY_SECONDS);
-        self.save_control(&control_object, &control, &guard).await?;
+        // than once per interval. A scan refused because the bucket generation
+        // or its quota no longer matches writes nothing back: the retirement
+        // cleanup may already have removed this object.
+        if !matches!(result, Err(StorageError::PreconditionFailed)) {
+            control.next_attempt_at = now_unix().saturating_add(RECONCILE_RETRY_SECONDS);
+            self.save_control(&control_object, &control, &guard).await?;
+        }
         result
     }
 
@@ -2426,7 +2446,8 @@ mod tests {
         let object = job.control_object();
         let lock = job.store.new_ns_lock(RUSTFS_META_BUCKET, &object).await.expect("owner lock");
         let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await.expect("owner guard"));
-        // A completed scan removes its control object, which is already "expired".
+        // No control object exists before the first scan took the owner lock,
+        // or after a retirement cleanup; there is nothing to expire then.
         let Ok(bytes) = read_config_no_lock(Arc::clone(&job.store), &object).await else {
             return;
         };
@@ -2842,6 +2863,22 @@ mod tests {
             ),
             "the retired generation's reconciliation control object goes with its ledger"
         );
+        // A control object written back after the ledger was already gone (a scan
+        // that was mid-flight during retirement) is removed by the next cleanup.
+        crate::config::com::save_config(
+            Arc::clone(&store),
+            &stale_control,
+            serde_json::to_vec(&control).expect("encode control"),
+        )
+        .await
+        .expect("persist late reconciliation control");
+        cleanup_retired_bucket_ledger(Arc::clone(&store), &bucket, old_incarnation)
+            .await
+            .expect("cleanup without a ledger still removes the generation's control object");
+        assert!(matches!(
+            read_config_no_lock(Arc::clone(&store), &stale_control).await,
+            Err(StorageError::ConfigNotFound)
+        ));
         let replacement =
             load_current_ledger_locked(Arc::clone(&store), &ledger_path, new_incarnation, OffsetDateTime::now_utc())
                 .await

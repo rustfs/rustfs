@@ -130,12 +130,12 @@ impl IndexDirectory {
             std::fs::metadata(self.path.join(name))?.modified()
         }
     }
-    /// Whether the marker is still inside the publication grace period.
+    /// Whether the marker is still inside the publication grace period. A
+    /// marker dated in the future (clock stepped back) is never a leftover.
     fn marker_is_young(&self, name: &str) -> bool {
         self.modified(name)
             .ok()
-            .and_then(|modified| modified.elapsed().ok())
-            .is_some_and(|age| age < MULTIPART_INDEX_PRUNE_GRACE)
+            .is_some_and(|modified| modified.elapsed().map_or(true, |age| age < MULTIPART_INDEX_PRUNE_GRACE))
     }
     fn remove_file(&self, name: &str) -> io::Result<()> {
         #[cfg(unix)]
@@ -405,8 +405,14 @@ impl IndexOwner {
                     }
                 }
                 Err(rustix::io::Errno::EXIST) => {
-                    let marker = openat(parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
-                    std::fs::File::from(marker).set_modified(std::time::SystemTime::now())?;
+                    // Best effort: a filesystem that refuses to set times keeps
+                    // the previous upload's age, which only shortens the prune
+                    // grace for this key; index completeness does not depend on it.
+                    if let Ok(marker) =
+                        openat(parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                    {
+                        let _ = std::fs::File::from(marker).set_modified(std::time::SystemTime::now());
+                    }
                 }
                 Err(error) => return Err(error.into()),
             }
@@ -645,7 +651,9 @@ impl IndexOwner {
         let marker = owner.base.join(&bucket_directory).join(root);
         let root = root.to_owned();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
-        os::run_blocking_namespace_operation(lease, move || {
+        // Durable-mutation lane: a page may prune up to 256 markers, which must
+        // not queue behind every other mutation on the one-worker foreground lane.
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
             owner.ensure_current_root()?;
             match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
                 Ok(_) => return Ok(()),
@@ -884,18 +892,25 @@ mod tests {
         let live = format!("{:064x}", 1);
         let finished = format!("{:064x}", 2);
         let in_flight = format!("{:064x}", 3);
-        for name in [&live, &finished, &in_flight] {
+        let clock_stepped = format!("{:064x}", 4);
+        for name in [&live, &finished, &in_flight, &clock_stepped] {
             std::fs::write(directory.join(name), b"1").expect("marker");
         }
         // Completion and abort remove the staging root and leave the marker.
         std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&live)).expect("live staging root");
-        age_marker(&directory.join(&finished));
+        set_marker_modified(&directory.join(&finished), std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2);
+        // A marker dated after a backwards clock step is never a leftover.
+        set_marker_modified(
+            &directory.join(&clock_stepped),
+            std::time::SystemTime::now() + MULTIPART_INDEX_PRUNE_GRACE * 2,
+        );
         let page = disk.multipart_index.page("bucket", None, Uuid::new_v4()).await.expect("page");
         // The in-flight marker has no staging root yet but is young: a candidate, not a leftover.
-        assert_eq!(page.roots, vec![live.clone(), in_flight.clone()]);
+        assert_eq!(page.roots, vec![live.clone(), in_flight.clone(), clock_stepped.clone()]);
         assert!(page.next_marker.is_none());
         assert!(directory.join(&live).exists(), "a live root keeps its marker");
         assert!(directory.join(&in_flight).exists(), "a marker inside the grace period is kept");
+        assert!(directory.join(&clock_stepped).exists(), "a future-dated marker is kept");
         assert!(!directory.join(&finished).exists(), "a finished root's marker is pruned");
         // The next page no longer pays for the pruned marker.
         let page = disk
@@ -903,17 +918,21 @@ mod tests {
             .page("bucket", None, Uuid::new_v4())
             .await
             .expect("page after pruning");
-        assert_eq!(page.roots, vec![live, in_flight]);
+        assert_eq!(page.roots, vec![live, in_flight, clock_stepped]);
     }
 
     /// Move a marker's modification time outside the publication grace period.
     fn age_marker(marker: &Path) {
+        set_marker_modified(marker, std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2);
+    }
+
+    fn set_marker_modified(marker: &Path, modified: std::time::SystemTime) {
         std::fs::File::options()
             .write(true)
             .open(marker)
             .expect("marker")
-            .set_modified(std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2)
-            .expect("age marker");
+            .set_modified(modified)
+            .expect("set marker time");
     }
 
     #[tokio::test]

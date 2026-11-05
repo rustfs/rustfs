@@ -352,7 +352,7 @@ impl ECStore {
         Ok(())
     }
 
-    pub(crate) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
+    pub(super) async fn delete_prefix(&self, bucket: &str, object: &str, opts: &ObjectOptions) -> Result<()> {
         let dispatch_scope = if opts.tier_delete_journal_api.is_some() {
             let incarnation = opts.expected_bucket_incarnation_id.ok_or(StorageError::PreconditionFailed)?;
             let authorization = opts

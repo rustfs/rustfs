@@ -5223,16 +5223,17 @@ where
         let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
         let warehouse_object_prefix = table_warehouse_object_prefix(&entry)?;
         let compaction_id = Uuid::new_v4().to_string();
+        // The stored-input ceiling applies to one rewrite group: inputs are
+        // released after each group, so a multi-group job must not fail late
+        // with outputs already written. The planner packs groups under the
+        // same ceiling; a plan from another node or an older release is
+        // rejected here, before any group's output is written.
+        let ceiling = u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).unwrap_or(u64::MAX);
+        if let Some(oversized) = report.rewrite_groups.iter().find(|group| group.input_bytes > ceiling) {
+            return Err(compaction_stored_input_ceiling_error(&oversized.group_id));
+        }
         let mut compacted_files = Vec::with_capacity(report.rewrite_groups.len());
         for rewrite_group in &mut report.rewrite_groups {
-            // The stored-input ceiling applies to one rewrite group: inputs are
-            // released after each group, so a multi-group job must not fail late
-            // with outputs already written. The planner packs groups under the
-            // same ceiling; a plan from another node or an older release is
-            // rejected before any output is written.
-            if rewrite_group.input_bytes > u64::try_from(TABLE_COMPACTION_MAX_STORED_BYTES).unwrap_or(u64::MAX) {
-                return Err(compaction_stored_input_ceiling_error(&rewrite_group.group_id));
-            }
             let mut stored_input_bytes = 0_usize;
             let output_prefix = rewrite_group
                 .input_file_locations
