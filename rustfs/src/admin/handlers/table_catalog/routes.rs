@@ -41,6 +41,21 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::GET,
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&GetTableDirectoryHandler {}),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&AdvanceTableDirectoryHandler {}),
+    )?;
+    r.insert(
+        Method::DELETE,
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&DisableTableDirectoryHandler {}),
+    )?;
+    r.insert(
+        Method::GET,
         format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
         AdminOperation(&GET_TABLE_CATALOG_MIGRATION_HANDLER),
     )?;
