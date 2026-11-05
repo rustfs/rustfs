@@ -2943,9 +2943,20 @@ impl S3Access for FS {
             ));
         }
 
-        // A replication delete may name its version through the source-version
+        let replica_request = req
+            .headers
+            .get(AMZ_BUCKET_REPLICATION_STATUS)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
+        // A replica delete may name its version through the source-version
         // header; the policy decision must see the same version storage deletes.
-        let version_id = super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers);
+        // Storage consumes that header only for a replica request, so any other
+        // request is authorized for the version it names in the query alone.
+        let version_id = if replica_request {
+            super::options::destination_version_id(req.input.version_id.as_deref(), &req.headers)
+        } else {
+            req.input.version_id.clone()
+        };
         let req_info = ext_req_info_mut(&mut req.extensions)?;
         req_info.bucket = Some(req.input.bucket.clone());
         req_info.object = Some(req.input.key.clone());
@@ -2959,11 +2970,6 @@ impl S3Access for FS {
             Ok(value) => value.unwrap_or(false),
             Err(_) => return Err(invalid_force_delete_header()),
         };
-        let replica_request = req
-            .headers
-            .get(AMZ_BUCKET_REPLICATION_STATUS)
-            .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| value == ReplicationStatusType::Replica.as_str());
         // The REPLICA header is caller-supplied, so it must not skip this
         // check. s3:ReplicateDelete is still required separately for replica
         // deletes; s3:* does not grant s3:ForceDeleteObject.
@@ -4205,11 +4211,15 @@ mod tests {
                 .expect("publish version policy");
             // The version named only by the replication header must be the one
             // the policy sees: a plain `s3:DeleteObject` evaluation would let a
-            // replica delete remove the protected version.
-            for (header, version, expect_denied) in [
-                ("x-rustfs-source-version-id", &versions[0], true),
-                ("x-minio-source-version-id", &versions[0], true),
-                ("x-rustfs-source-version-id", &versions[1], false),
+            // replica delete remove the protected version. A request without
+            // the REPLICA status is authorized for the query version alone,
+            // because storage ignores the header for it (a stray header must
+            // not switch the evaluated action to `s3:DeleteObjectVersion`).
+            for (header, version, replica, expect_denied) in [
+                ("x-rustfs-source-version-id", &versions[0], true, true),
+                ("x-minio-source-version-id", &versions[0], true, true),
+                ("x-rustfs-source-version-id", &versions[0], false, false),
+                ("x-rustfs-source-version-id", &versions[1], true, false),
             ] {
                 let mut req = build_request(
                     DeleteObjectInput {
@@ -4221,16 +4231,19 @@ mod tests {
                 );
                 ensure_req_info(&mut req);
                 req.extensions.insert(slot.clone());
-                req.headers
-                    .insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
-                req.headers.insert(
-                    rustfs_utils::http::headers::AMZ_BUCKET_REPLICATION_STATUS,
-                    HeaderValue::from_static("REPLICA"),
-                );
+                if replica {
+                    req.headers
+                        .insert("x-rustfs-source-replication-request", HeaderValue::from_static("true"));
+                    req.headers.insert(
+                        rustfs_utils::http::headers::AMZ_BUCKET_REPLICATION_STATUS,
+                        HeaderValue::from_static("REPLICA"),
+                    );
+                }
                 req.headers.insert(header, HeaderValue::from_str(version).unwrap());
                 let result = fs.delete_object(&mut req).await;
                 let info = req.extensions.get::<ReqInfo>().unwrap();
-                assert_eq!(info.version_id.as_deref(), Some(version.as_str()), "{header}");
+                let expected_version = replica.then_some(version.as_str());
+                assert_eq!(info.version_id.as_deref(), expected_version, "{header} replica={replica}");
                 if expect_denied {
                     assert_eq!(
                         result
@@ -4240,7 +4253,7 @@ mod tests {
                         "{header}"
                     );
                 } else {
-                    result.expect("unprotected version named by the header is deleted");
+                    result.expect("a plain delete, or a replica delete of the unprotected version, succeeds");
                 }
             }
             store

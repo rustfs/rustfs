@@ -25,11 +25,8 @@ async fn head_metadata_action_allowed(req: &S3Request<HeadObjectInput>, action: 
     let Ok(info) = req_info_ref(req) else {
         return Ok(false);
     };
-    // The bucket owner holds every object permission; skip the probe and its
-    // request clone on the most common HEAD caller.
-    if info.is_owner {
-        return Ok(true);
-    }
+    // No owner shortcut: an explicit bucket-policy Deny on these metadata
+    // actions binds the owner too (see `owner_can_bypass_policy_deny`).
     let mut info = info.clone();
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;

@@ -957,9 +957,9 @@ pub struct DeleteRecoveryWorkBudget {
     remaining: std::sync::atomic::AtomicU32,
 }
 
-/// Entries one disk may reserve up front per recovery step (discovery plus
-/// inspection). Every disk of every set a request fans out to reserves this
-/// much before any refund arrives, so a budget must cover that many disks.
+/// Entries one disk may visit per recovery step (discovery plus inspection).
+/// Every disk of every set a request fans out to is admitted up to this much
+/// and charged on completion, so a budget must cover that many disks.
 const DELETE_RECOVERY_RESERVATION_PER_DISK: u32 = 4096 + 65_536;
 
 impl Default for DeleteRecoveryWorkBudget {

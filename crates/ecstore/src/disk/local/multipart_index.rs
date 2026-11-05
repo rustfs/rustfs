@@ -115,6 +115,16 @@ impl IndexDirectory {
             std::fs::File::open(self.path.join(name))
         }
     }
+    fn remove_file(&self, name: &str) -> io::Result<()> {
+        #[cfg(unix)]
+        {
+            Ok(rustix::fs::unlinkat(&self.directory, name, rustix::fs::AtFlags::empty())?)
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::remove_file(self.path.join(name))
+        }
+    }
 }
 
 /// Resume the same pinned iterators, rather than reopening and rescanning a
@@ -530,7 +540,7 @@ impl IndexOwner {
         let owner = self.clone();
         let bucket = bucket.to_owned();
         let marker = marker.map(str::to_owned);
-        crate::disk::io_admission::spawn_blocking_with_disk_io_permit(None, move || {
+        let (page, stale) = crate::disk::io_admission::spawn_blocking_with_disk_io_permit(None, move || {
             owner.ensure_current_root()?;
             let directory = match owner.directory(&Path::new(INDEX).join(sha(&bucket))) {
                 Ok(directory) => Some(directory),
@@ -556,17 +566,72 @@ impl IndexOwner {
             if more {
                 roots.pop_last();
             }
+            // The marker advances past every examined name, live or stale, so a
+            // pruned name never stalls pagination.
             let next_marker = more.then(|| roots.last().cloned()).flatten();
-            Ok(MultipartIndexPage {
-                bucket,
-                disk_id,
-                epoch: owner.epoch,
-                roots: roots.into_iter().collect(),
-                next_marker,
-            })
+            // Completion and abort remove the staging root, not the marker, so
+            // markers outlive their uploads. Drop the ones whose staging root is
+            // gone, keeping the index proportional to live uploads rather than
+            // to every key ever multipart-initiated on this drive.
+            let mut live = Vec::with_capacity(roots.len());
+            let mut stale = Vec::new();
+            for root in roots {
+                match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
+                    Ok(_) => live.push(root),
+                    Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
+                        stale.push(root)
+                    }
+                    Err(error) => return Err(DiskError::from(error)),
+                }
+            }
+            Ok((
+                MultipartIndexPage {
+                    bucket,
+                    disk_id,
+                    epoch: owner.epoch,
+                    roots: live,
+                    next_marker,
+                },
+                stale,
+            ))
         })
         .await
-        .map_err(DiskError::from)?
+        .map_err(DiskError::from)??;
+        for root in stale {
+            self.prune_marker(&page.bucket, &root).await?;
+        }
+        Ok(page)
+    }
+
+    /// Remove one marker whose staging root was gone when a page examined it.
+    /// The marker's own namespace lease serializes this with `record_info`, and
+    /// the staging root is re-checked under that lease, so an upload created in
+    /// between keeps its marker.
+    async fn prune_marker(self: &Arc<Self>, bucket: &str, root: &str) -> Result<()> {
+        let owner = self.clone();
+        let bucket_directory = Path::new(INDEX).join(sha(bucket));
+        let marker = owner.base.join(&bucket_directory).join(root);
+        let root = root.to_owned();
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
+        os::run_blocking_namespace_operation(lease, move || {
+            owner.ensure_current_root()?;
+            match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
+                Ok(_) => return Ok(()),
+                Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {}
+                Err(error) => return Err(error),
+            }
+            let directory = match owner.directory(&bucket_directory) {
+                Ok(directory) => directory,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+                Err(error) => return Err(error),
+            };
+            match directory.remove_file(&root) {
+                Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+                _ => Ok(()),
+            }
+        })
+        .await?;
+        Ok(())
     }
 }
 
@@ -753,6 +818,8 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("seed ready candidates");
         for i in 0..(MULTIPART_INDEX_PAGE_SIZE + 2) {
             std::fs::write(directory.join(format!("{i:064x}")), b"1").expect("candidate marker");
+            std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(format!("{i:064x}")))
+                .expect("live staging root");
         }
         // A foreign bucket's unreadable layout must not enter this page's walk.
         std::fs::write(root.path().join(INDEX).join(sha("foreign")), b"not a directory").expect("foreign layout");
@@ -773,6 +840,33 @@ mod tests {
         assert!(second.next_marker.is_none());
         assert!(first.roots.last() < second.roots.first());
     }
+    #[tokio::test]
+    async fn multipart_index_pages_prune_markers_whose_staging_root_is_gone() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = open(root.path()).await;
+        let directory = root.path().join(INDEX).join(sha("bucket"));
+        std::fs::create_dir_all(&directory).expect("marker directory");
+        let live = format!("{:064x}", 1);
+        let finished = format!("{:064x}", 2);
+        for name in [&live, &finished] {
+            std::fs::write(directory.join(name), b"1").expect("marker");
+        }
+        // Completion and abort remove the staging root and leave the marker.
+        std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&live)).expect("live staging root");
+        let page = disk.multipart_index.page("bucket", None, Uuid::new_v4()).await.expect("page");
+        assert_eq!(page.roots, vec![live.clone()]);
+        assert!(page.next_marker.is_none());
+        assert!(directory.join(&live).exists(), "a live root keeps its marker");
+        assert!(!directory.join(&finished).exists(), "a finished root's marker is pruned");
+        // The next page no longer pays for the pruned marker.
+        let page = disk
+            .multipart_index
+            .page("bucket", None, Uuid::new_v4())
+            .await
+            .expect("page after pruning");
+        assert_eq!(page.roots, vec![live]);
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn multipart_index_aliases_share_readiness_and_root_replacement_cannot_return_empty() {

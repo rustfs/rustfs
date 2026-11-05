@@ -1711,9 +1711,14 @@ where
                 return Ok(control_body_digest_error("MissingContentMD5"));
             }
             if !required && !has_md5 {
-                if sig_v2 {
-                    // SigV2 signs no body: a configuration PUT without a digest
-                    // could be replayed with another body.
+                // SigV2 signs no body: a configuration PUT without a digest
+                // could be replayed with another body. A declared empty body
+                // (a canned-ACL PUT, for example) has nothing to replay.
+                let declared_empty = headers
+                    .get("content-length")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|value| value.trim() == "0");
+                if sig_v2 && !declared_empty {
                     return Ok(control_body_digest_error("MissingContentMD5"));
                 }
                 return inner.call(request.map(control_request_body)).await;
@@ -4220,6 +4225,17 @@ mod tests {
         *request.method_mut() = Method::PUT;
         *request.uri_mut() = "/bucket?versioning".parse().unwrap();
         digest_error(service.clone().oneshot(request).await.unwrap(), "MissingContentMD5").await;
+        // A SigV2 configuration PUT that declares an empty body carries nothing
+        // to replay (a canned-ACL PUT), so it needs no digest.
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bucket?acl")
+            .header("authorization", "AWS digest-key:c2lnbmF0dXJl")
+            .header("x-amz-acl", "private")
+            .header("content-length", "0")
+            .body(s3s::Body::empty())
+            .unwrap();
+        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
         // A SigV4 configuration PUT keeps its optional-MD5 contract (the payload
         // hash binds the body) and streams through without buffering.
         let request = HttpRequest::builder()
@@ -4240,7 +4256,8 @@ mod tests {
             .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
             .unwrap();
         digest_error(service.oneshot(request).await.unwrap(), "BadDigest").await;
-        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        // The declared-empty SigV2 PUT, the SigV4 PUT and the matching-MD5 PUT reached the service.
+        assert_eq!(calls.load(Ordering::SeqCst), 3);
     }
 
     type RateLimitTestCore = tower::util::BoxCloneService<

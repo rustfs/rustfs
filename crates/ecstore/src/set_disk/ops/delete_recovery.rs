@@ -1780,8 +1780,7 @@ mod tests {
             for key in &keys {
                 let prefix = dir.path().join(bucket).join(key);
                 std::fs::create_dir_all(&prefix).expect("physical prefix");
-                for child in 0..8 {
-                    let _ = child;
+                for _ in 0..8 {
                     std::fs::create_dir(prefix.join(Uuid::new_v4().to_string())).expect("child");
                 }
             }
