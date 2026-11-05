@@ -41,7 +41,7 @@ use crate::disk::{
 use crate::disk::{
     disk_store::DiskHealthTracker,
     error::{DiskError, is_terminal_read_error, terminal_read_error_to_io},
-    local::ScanGuard,
+    local::{ScanGuard, list_entry_is_orphan_data_dir_part},
 };
 use crate::set_disk::DEFAULT_READ_BUFFER_SIZE;
 use bytes::Bytes;
@@ -2444,6 +2444,16 @@ impl RemoteDisk {
         )
         .await
     }
+
+    /// Heuristic probe for 1.0.x peers that lack InspectOrphanDataDir RPC:
+    /// list the directory and accept only erasure-part leaf names.
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self.list_dir("", volume, path, -1).await {
+            Ok(entries) => Ok(entries.iter().all(|e| list_entry_is_orphan_data_dir_part(e))),
+            Err(DiskError::FileNotFound | DiskError::FileVersionNotFound | DiskError::VolumeNotFound) => Ok(false),
+            Err(err) => Err(err),
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -4438,6 +4448,7 @@ mod tests {
                     assert_eq!(decoded.expected_delete_marker, expected_delete_marker, "{encoding} marker precondition");
                     assert!(decoded.delete_recovery_bucket_incarnation.is_none(), "{encoding} omitted incarnation");
                     assert!(!decoded.recoverable_delete, "{encoding} omitted recovery flag");
+                    assert!(!decoded.orphan_data_dir, "{encoding} omitted orphan_data_dir flag");
                 }
                 for incarnation in [None, Some(Uuid::new_v4())] {
                     let current = DeleteOptions {

@@ -200,6 +200,30 @@ fn is_metadata_less_data_dir_entry(entry: &str) -> bool {
             || is_delete_transaction_marker(entry, RESERVED_DELETE_DATA_DIR_MARKER_PREFIX)
             || is_delete_transaction_marker(entry, RECOVERY_DELETE_DATA_DIR_MARKER_PREFIX))
 }
+
+/// List-dir view of a plain orphan data dir leaf (parts only). Used by remote
+/// peers that cannot open the directory locally.
+pub(crate) fn list_entry_is_orphan_data_dir_part(entry: &str) -> bool {
+    !entry.ends_with(SLASH_SEPARATOR) && delete_recovery_part_file(entry)
+}
+
+/// Classify the entire leaf before unlinking anything. UUID-shaped S3 prefixes
+/// and transaction witnesses share this namespace with erasure data dirs.
+fn orphan_data_dir_parts(path: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let protected = || std::io::Error::new(ErrorKind::InvalidData, "orphan data directory contains protected entries");
+    if !std::fs::symlink_metadata(path)?.file_type().is_dir() {
+        return Err(protected());
+    }
+    let mut parts = Vec::new();
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_file() || !entry.file_name().to_str().is_some_and(delete_recovery_part_file) {
+            return Err(protected());
+        }
+        parts.push(entry.path());
+    }
+    Ok(parts)
+}
 const STARTUP_CLEANUP_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const ENV_BITROT_SIZE_MISMATCH_RETRY_COUNT: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_COUNT";
 const ENV_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS: &str = "RUSTFS_BITROT_SIZE_MISMATCH_RETRY_DELAY_MS";
@@ -6526,6 +6550,18 @@ impl LocalDisk {
         true
     }
 
+    pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        let path = self.io_get_object_path(volume, path)?;
+        let permit = acquire_context_disk_io_permit().await.map_err(DiskError::Io)?;
+        spawn_blocking_with_disk_io_permit(permit, move || match orphan_data_dir_parts(&path) {
+            Ok(_) => Ok(true),
+            Err(err) if matches!(err.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => Ok(false),
+            Err(err) => Err(to_file_error(err).into()),
+        })
+        .await
+        .map_err(DiskError::from)?
+    }
+
     async fn delete_data_dir_with_namespace_owner(
         &self,
         volume: &str,
@@ -7325,6 +7361,48 @@ impl LocalDisk {
 
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
+        if opt.orphan_data_dir {
+            if opt.recursive || opt.old_data_dir.is_some() || opt.recoverable_delete || opt.undo_write || opt.undo_delete {
+                return Err(DiskError::FileCorrupt);
+            }
+            // Unlink only classified part files, then rmdir. A child namespace
+            // published after classification is never removed recursively.
+            let lease = os::acquire_namespace_mutation_lease_with_owner(&file_path, namespace_owner).await;
+            let data_path = file_path.clone();
+            let sync = effective_durability(volume).syncs_commit_metadata();
+            os::run_blocking_namespace_operation(lease, move || {
+                let parts = match orphan_data_dir_parts(&data_path) {
+                    Ok(parts) => parts,
+                    Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+                    Err(err) => return Err(err),
+                };
+                for part in parts {
+                    match std::fs::remove_file(&part) {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(err),
+                    }
+                }
+                if sync {
+                    os::fsync_dir_std(&data_path)?;
+                }
+                match std::fs::remove_dir(&data_path) {
+                    Ok(()) => Ok(()),
+                    Err(err) if is_benign_object_rmdir_error(&err) => Ok(()),
+                    Err(err) => Err(err),
+                }
+            })
+            .await
+            .map_err(|err| {
+                if err.kind() == ErrorKind::InvalidData {
+                    DiskError::FileCorrupt
+                } else {
+                    to_file_error(err).into()
+                }
+            })?;
+            self.io_backend.invalidate_cached_fds_under(volume, path);
+            return Ok(());
+        }
         let mut recursive = opt.recursive;
         if recursive
             && let Some(transaction) = opt.old_data_dir
@@ -12961,6 +13039,72 @@ mod test {
                 Endpoint::try_from(dir.path().to_str().expect("temp dir should be utf8")).expect("endpoint should parse");
             let disk = LocalDisk::new(&endpoint, false).await.expect("local disk should be created");
             (disk, dir)
+        }
+
+        #[tokio::test]
+        async fn orphan_data_dir_delete_preserves_child_namespace() {
+            let fixture = new_disk().await;
+            let (disk, _dir) = &fixture;
+            ensure_test_volume(disk, "orphan").await;
+            let data_dir = Uuid::new_v4();
+            let object = "parent";
+            let stray = format!("{object}/{data_dir}");
+            let base = disk.get_bucket_path("orphan").expect("resolve volume");
+            let data_path = base.join(object).join(data_dir.to_string());
+            fs::create_dir_all(data_path.join("child")).await.expect("child namespace");
+            fs::write(data_path.join("child").join(STORAGE_FORMAT_FILE), b"child-meta")
+                .await
+                .expect("child metadata");
+            fs::write(data_path.join("part.1"), b"stale-part")
+                .await
+                .expect("stale part beside child");
+
+            assert!(
+                !disk.is_plain_orphan_data_dir("orphan", &stray).await.expect("probe"),
+                "directory with a child key must not classify as plain orphan"
+            );
+            let err = disk
+                .delete(
+                    "orphan",
+                    &stray,
+                    DeleteOptions {
+                        orphan_data_dir: true,
+                        immediate: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect_err("protected entries must refuse orphan delete");
+            assert!(matches!(err, DiskError::FileCorrupt), "got {err:?}");
+            assert!(
+                data_path.join("child").join(STORAGE_FORMAT_FILE).exists(),
+                "child namespace must survive the refused orphan delete"
+            );
+            assert!(data_path.join("part.1").exists(), "refused delete must not unlink parts either");
+
+            // Plain part-only leaf is reclaimable without touching siblings.
+            let plain_dir = Uuid::new_v4();
+            let plain = format!("{object}/{plain_dir}");
+            let plain_path = base.join(object).join(plain_dir.to_string());
+            fs::create_dir_all(&plain_path).await.expect("plain data dir");
+            fs::write(plain_path.join("part.1"), b"part").await.expect("part");
+            assert!(disk.is_plain_orphan_data_dir("orphan", &plain).await.expect("probe plain"));
+            disk.delete(
+                "orphan",
+                &plain,
+                DeleteOptions {
+                    orphan_data_dir: true,
+                    immediate: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("plain orphan delete");
+            assert!(!plain_path.exists(), "plain orphan data dir must be removed");
+            assert!(
+                data_path.join("child").join(STORAGE_FORMAT_FILE).exists(),
+                "sibling child namespace must remain"
+            );
         }
 
         #[tokio::test]
@@ -23658,6 +23802,7 @@ mod test {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            orphan_data_dir: false,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)
             .await

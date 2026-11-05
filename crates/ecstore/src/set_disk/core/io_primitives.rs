@@ -6323,6 +6323,8 @@ impl SetDisks {
         }
 
         // Phase 2: delete every physical data dir not referenced by the union.
+        // Only plain erasure-part leaves are eligible: a UUID directory that
+        // holds a child S3 key (or any non-part entry) must be preserved.
         let mut removed = 0usize;
         for (i, physical) in per_disk_dirs {
             let Some(disk) = disks[i].as_ref() else { continue };
@@ -6331,6 +6333,9 @@ impl SetDisks {
                     continue;
                 }
                 let stray = format!("{object}/{dir}");
+                if !disk.is_plain_orphan_data_dir(bucket, &stray).await.unwrap_or(false) {
+                    continue;
+                }
                 if dry_run {
                     removed += 1;
                     debug!(
@@ -6350,7 +6355,7 @@ impl SetDisks {
                         bucket,
                         &stray,
                         DeleteOptions {
-                            recursive: true,
+                            orphan_data_dir: true,
                             immediate: true,
                             ..Default::default()
                         },
@@ -6365,7 +6370,7 @@ impl SetDisks {
                             "reclaim_orphan_data_dirs: removed orphaned data directory"
                         );
                     }
-                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound) => {}
+                    Err(DiskError::FileNotFound | DiskError::VolumeNotFound | DiskError::DiskOngoingReq) => {}
                     Err(err) => {
                         warn!(
                             target: "rustfs_ecstore::set_disk",

@@ -353,6 +353,14 @@ impl Disk {
             Disk::Remote(remote_disk) => remote_disk.get_disk_id().await.ok().flatten(),
         }
     }
+
+    /// A read-only probe; the physical delete repeats the same leaf checks.
+    pub async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
+        match self {
+            Disk::Local(local_disk) => local_disk.get_disk().is_plain_orphan_data_dir(volume, path).await,
+            Disk::Remote(remote_disk) => remote_disk.is_plain_orphan_data_dir(volume, path).await,
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -1803,6 +1811,10 @@ pub struct DeleteOptions {
     pub delete_recovery_bucket_incarnation: Option<Uuid>,
     #[serde(default)]
     pub recoverable_delete: bool,
+    /// Reclaim only plain erasure-part leaves, preserving every other entry.
+    /// Keep `recursive` false so an older peer cannot widen this operation.
+    #[serde(default)]
+    pub orphan_data_dir: bool,
 }
 
 pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
@@ -1833,6 +1845,7 @@ pub(crate) fn validate_delete_recovery_options(opts: &DeleteOptions) -> Result<(
         || opts.undo_delete
         || opts.recursive
         || opts.immediate
+        || opts.orphan_data_dir
         || opts.expected_delete_marker.is_some()
         || opts.delete_recovery_bucket_incarnation.is_some_and(|id| id.is_nil())
     {
@@ -2354,6 +2367,7 @@ mod tests {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            orphan_data_dir: false,
         };
 
         assert!(opts.recursive);

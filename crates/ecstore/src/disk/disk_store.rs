@@ -1841,6 +1841,7 @@ impl LocalDiskWrapper {
                     expected_delete_marker: None,
                     recoverable_delete: false,
                     delete_recovery_bucket_incarnation: None,
+                    orphan_data_dir: false,
                 },
             )
             .await?;
