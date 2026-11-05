@@ -35,11 +35,21 @@ tokio::task_local! {
     static PUBLICATION_PREPARATION: Arc<TablePublicationPreparation>;
 }
 
+/// Budget for one publication preparation: the configured interval, never
+/// shorter than the lock-acquire timeout that queueing alone may consume.
+pub(crate) fn publication_preparation_timeout() -> std::time::Duration {
+    std::time::Duration::from_secs(rustfs_utils::get_env_u64(
+        crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS,
+        crate::table_catalog::DEFAULT_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS,
+    ))
+    .max(get_lock_acquire_timeout())
+}
+
 impl TablePublicationPreparation {
     pub(super) fn deadline(&self) -> tokio::time::Instant {
         *self
             .deadline
-            .get_or_init(|| tokio::time::Instant::now() + get_lock_acquire_timeout())
+            .get_or_init(|| tokio::time::Instant::now() + publication_preparation_timeout())
     }
 
     fn expired() -> TableCatalogStoreError {
@@ -51,6 +61,11 @@ impl TablePublicationPreparation {
             return Err(Self::expired());
         }
         Ok(())
+    }
+
+    /// Fail once the budget is spent without committing the transaction.
+    pub(crate) fn check_deadline(&self) -> TableCatalogStoreResult<()> {
+        self.check()
     }
 
     pub(crate) fn begin_mutation(&self) -> TableCatalogStoreResult<()> {

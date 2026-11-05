@@ -56,6 +56,200 @@ fn add_budget(total: &mut usize, amount: usize, limit: usize) -> TableCatalogSto
     Ok(())
 }
 
+/// Sizes read from one Parquet page header (Thrift compact encoding).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct PageHeaderSizes {
+    uncompressed: usize,
+    compressed: usize,
+}
+
+const THRIFT_COMPACT_STOP: u8 = 0;
+const THRIFT_COMPACT_BOOL_TRUE: u8 = 1;
+const THRIFT_COMPACT_BOOL_FALSE: u8 = 2;
+const THRIFT_COMPACT_BYTE: u8 = 3;
+const THRIFT_COMPACT_I16: u8 = 4;
+const THRIFT_COMPACT_I32: u8 = 5;
+const THRIFT_COMPACT_I64: u8 = 6;
+const THRIFT_COMPACT_DOUBLE: u8 = 7;
+const THRIFT_COMPACT_BINARY: u8 = 8;
+const THRIFT_COMPACT_LIST: u8 = 9;
+const THRIFT_COMPACT_SET: u8 = 10;
+const THRIFT_COMPACT_MAP: u8 = 11;
+const THRIFT_COMPACT_STRUCT: u8 = 12;
+const THRIFT_MAX_NESTING: usize = 16;
+const PAGE_HEADER_FIELD_UNCOMPRESSED_SIZE: i16 = 2;
+const PAGE_HEADER_FIELD_COMPRESSED_SIZE: i16 = 3;
+
+/// Minimal Thrift compact-protocol cursor: enough to read a `PageHeader`'s
+/// size fields and skip everything else so the next header can be located.
+struct ThriftCompactCursor<'a> {
+    bytes: &'a [u8],
+    pos: usize,
+}
+
+impl ThriftCompactCursor<'_> {
+    fn error() -> TableCatalogStoreError {
+        TableCatalogStoreError::Invalid("compaction parquet page header is malformed".to_owned())
+    }
+
+    fn byte(&mut self) -> TableCatalogStoreResult<u8> {
+        let byte = *self.bytes.get(self.pos).ok_or_else(Self::error)?;
+        self.pos += 1;
+        Ok(byte)
+    }
+
+    fn skip_bytes(&mut self, count: usize) -> TableCatalogStoreResult<()> {
+        self.pos = self
+            .pos
+            .checked_add(count)
+            .filter(|end| *end <= self.bytes.len())
+            .ok_or_else(Self::error)?;
+        Ok(())
+    }
+
+    fn varint(&mut self) -> TableCatalogStoreResult<u64> {
+        let mut value = 0_u64;
+        for shift in (0..64).step_by(7) {
+            let byte = self.byte()?;
+            value |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return Ok(value);
+            }
+        }
+        Err(Self::error())
+    }
+
+    fn zigzag(&mut self) -> TableCatalogStoreResult<i64> {
+        let raw = self.varint()?;
+        Ok(((raw >> 1) as i64) ^ -((raw & 1) as i64))
+    }
+
+    fn skip_value(&mut self, kind: u8, depth: usize) -> TableCatalogStoreResult<()> {
+        if depth > THRIFT_MAX_NESTING {
+            return Err(Self::error());
+        }
+        match kind {
+            THRIFT_COMPACT_BOOL_TRUE | THRIFT_COMPACT_BOOL_FALSE => Ok(()),
+            THRIFT_COMPACT_BYTE => self.skip_bytes(1),
+            THRIFT_COMPACT_I16 | THRIFT_COMPACT_I32 | THRIFT_COMPACT_I64 => self.varint().map(drop),
+            THRIFT_COMPACT_DOUBLE => self.skip_bytes(8),
+            THRIFT_COMPACT_BINARY => {
+                let len = usize::try_from(self.varint()?).map_err(|_| Self::error())?;
+                self.skip_bytes(len)
+            }
+            THRIFT_COMPACT_LIST | THRIFT_COMPACT_SET => {
+                let header = self.byte()?;
+                let element = header & 0x0f;
+                let count = match header >> 4 {
+                    15 => usize::try_from(self.varint()?).map_err(|_| Self::error())?,
+                    short => usize::from(short),
+                };
+                for _ in 0..count {
+                    self.skip_value(element, depth + 1)?;
+                }
+                Ok(())
+            }
+            THRIFT_COMPACT_MAP => {
+                let count = usize::try_from(self.varint()?).map_err(|_| Self::error())?;
+                if count == 0 {
+                    return Ok(());
+                }
+                let kinds = self.byte()?;
+                for _ in 0..count {
+                    self.skip_value(kinds >> 4, depth + 1)?;
+                    self.skip_value(kinds & 0x0f, depth + 1)?;
+                }
+                Ok(())
+            }
+            THRIFT_COMPACT_STRUCT => self.skip_struct(depth + 1),
+            _ => Err(Self::error()),
+        }
+    }
+
+    fn skip_struct(&mut self, depth: usize) -> TableCatalogStoreResult<()> {
+        let mut field_id = 0_i16;
+        loop {
+            let header = self.byte()?;
+            if header == THRIFT_COMPACT_STOP {
+                return Ok(());
+            }
+            let kind = header & 0x0f;
+            field_id = match header >> 4 {
+                0 => i16::try_from(self.zigzag()?).map_err(|_| Self::error())?,
+                delta => field_id.checked_add(i16::from(delta)).ok_or_else(Self::error)?,
+            };
+            self.skip_value(kind, depth)?;
+        }
+    }
+
+    /// Read a `PageHeader` struct, returning its sizes and leaving the cursor at
+    /// the first page byte.
+    fn page_header(&mut self) -> TableCatalogStoreResult<PageHeaderSizes> {
+        let mut sizes = PageHeaderSizes::default();
+        let mut field_id = 0_i16;
+        loop {
+            let header = self.byte()?;
+            if header == THRIFT_COMPACT_STOP {
+                return Ok(sizes);
+            }
+            let kind = header & 0x0f;
+            field_id = match header >> 4 {
+                0 => i16::try_from(self.zigzag()?).map_err(|_| Self::error())?,
+                delta => field_id.checked_add(i16::from(delta)).ok_or_else(Self::error)?,
+            };
+            match (field_id, kind) {
+                (PAGE_HEADER_FIELD_UNCOMPRESSED_SIZE, THRIFT_COMPACT_I32) => {
+                    sizes.uncompressed = usize::try_from(self.zigzag()?).map_err(|_| Self::error())?;
+                }
+                (PAGE_HEADER_FIELD_COMPRESSED_SIZE, THRIFT_COMPACT_I32) => {
+                    sizes.compressed = usize::try_from(self.zigzag()?).map_err(|_| Self::error())?;
+                }
+                _ => self.skip_value(kind, 1)?,
+            }
+        }
+    }
+}
+
+/// Sum the page headers of one column chunk (`[start, end)` in the file) and
+/// hold every page and the chunk total to `limit`. Pages are never decompressed.
+fn validate_page_headers_in_range(chunk: &[u8], chunk_declared: usize, limit: usize) -> TableCatalogStoreResult<usize> {
+    let mut cursor = ThriftCompactCursor { bytes: chunk, pos: 0 };
+    let mut total = 0_usize;
+    while cursor.pos < chunk.len() {
+        let sizes = cursor.page_header()?;
+        add_budget(&mut total, sizes.uncompressed, limit)?;
+        if total > chunk_declared.max(limit.min(chunk_declared.saturating_mul(2))) {
+            return Err(TableCatalogStoreError::Invalid(
+                "compaction parquet page headers exceed the footer's declared chunk size".to_owned(),
+            ));
+        }
+        cursor.skip_bytes(sizes.compressed)?;
+    }
+    Ok(total)
+}
+
+fn validate_column_chunk_page_headers(
+    data: &Bytes,
+    column: &datafusion::parquet::file::metadata::ColumnChunkMetaData,
+    chunk_declared: usize,
+    limit: usize,
+    location: &str,
+) -> TableCatalogStoreResult<()> {
+    let start = column
+        .dictionary_page_offset()
+        .map_or(column.data_page_offset(), |dictionary| dictionary.min(column.data_page_offset()));
+    let start = usize::try_from(start).map_err(|_| budget_error())?;
+    let length = usize::try_from(column.compressed_size()).map_err(|_| budget_error())?;
+    let end = start.checked_add(length).filter(|end| *end <= data.len()).ok_or_else(|| {
+        TableCatalogStoreError::Invalid(format!("compaction parquet {location} column chunk lies outside the file"))
+    })?;
+    validate_page_headers_in_range(&data[start..end], chunk_declared, limit).map_err(|err| match err {
+        TableCatalogStoreError::Invalid(message) => TableCatalogStoreError::Invalid(format!("{location}: {message}")),
+        other => other,
+    })?;
+    Ok(())
+}
+
 fn view_field(field: &Field, depth: usize, fields: &mut usize) -> TableCatalogStoreResult<Arc<Field>> {
     add_budget(fields, 1, COMPACTION_SCHEMA_FIELDS)?;
     Ok(Arc::new(field.clone().with_data_type(view_type(field.data_type(), depth, fields)?)))
@@ -241,11 +435,12 @@ fn compact_parquet_with_budgets(
         for group in builder.metadata().row_groups() {
             let mut columns = 0;
             for column in group.columns() {
-                add_budget(
-                    &mut columns,
-                    usize::try_from(column.uncompressed_size()).map_err(|_| budget_error())?,
-                    limit,
-                )?;
+                let chunk_declared = usize::try_from(column.uncompressed_size()).map_err(|_| budget_error())?;
+                add_budget(&mut columns, chunk_declared, limit)?;
+                // The footer is one claim; the page headers the decoder actually
+                // sizes its buffers from are another. Walk them without
+                // decompressing and hold both to the budget.
+                validate_column_chunk_page_headers(&data, column, chunk_declared, limit, &location)?;
             }
             let group_bytes = usize::try_from(group.total_byte_size()).map_err(|_| budget_error())?;
             add_budget(&mut declared, group_bytes.max(columns), limit)?;
@@ -411,6 +606,69 @@ mod tests {
         let mut writer = ArrowWriter::try_new(Vec::new(), schema, Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.into_inner().unwrap()
+    }
+
+    fn compact_i32_field(field_delta: u8, value: i64) -> Vec<u8> {
+        let mut out = vec![(field_delta << 4) | THRIFT_COMPACT_I32];
+        let mut zigzag = ((value << 1) ^ (value >> 63)) as u64;
+        loop {
+            let byte = (zigzag & 0x7f) as u8;
+            zigzag >>= 7;
+            if zigzag == 0 {
+                out.push(byte);
+                break;
+            }
+            out.push(byte | 0x80);
+        }
+        out
+    }
+
+    #[test]
+    fn compaction_page_header_walker_matches_the_footer_of_an_honest_file() {
+        let file = Bytes::from(parquet_strings("value", 1024, true));
+        let builder = ParquetRecordBatchReaderBuilder::try_new(file.clone()).unwrap();
+        for group in builder.metadata().row_groups() {
+            for column in group.columns() {
+                let declared = usize::try_from(column.uncompressed_size()).unwrap();
+                validate_column_chunk_page_headers(&file, column, declared, usize::MAX, "honest.parquet")
+                    .expect("an honest file's page headers fit its footer");
+                let start = usize::try_from(column.dictionary_page_offset().unwrap_or(column.data_page_offset())).unwrap();
+                let end = start + usize::try_from(column.compressed_size()).unwrap();
+                let total = validate_page_headers_in_range(&file[start..end], declared, usize::MAX).unwrap();
+                // The footer's uncompressed size also counts the page headers themselves.
+                assert!(total > 0 && total <= declared, "page payload sizes ({total}) fit the footer's {declared}");
+            }
+        }
+    }
+
+    #[test]
+    fn compaction_page_header_walker_rejects_a_page_that_lies_about_its_size() {
+        // PageHeader { type: 0, uncompressed_page_size: 2 GiB - 1, compressed_page_size: 4 } + 4 bytes of "page".
+        let mut chunk = compact_i32_field(1, 0);
+        chunk.extend(compact_i32_field(1, i64::from(i32::MAX)));
+        chunk.extend(compact_i32_field(1, 4));
+        // data_page_header struct (field 5, delta 2): one BOOL field, then STOP.
+        chunk.extend([
+            (2 << 4) | THRIFT_COMPACT_STRUCT,
+            (1 << 4) | THRIFT_COMPACT_BOOL_TRUE,
+            THRIFT_COMPACT_STOP,
+        ]);
+        chunk.push(THRIFT_COMPACT_STOP);
+        chunk.extend([0_u8; 4]);
+        let error = validate_page_headers_in_range(&chunk, 4096, 64 * 1024 * 1024)
+            .expect_err("a page header above the budget must be rejected before any allocation");
+        assert!(matches!(error, TableCatalogStoreError::Invalid(_)), "{error:?}");
+        // The same header within budget but far above the footer's chunk size is also a lie.
+        let mut chunk = compact_i32_field(1, 0);
+        chunk.extend(compact_i32_field(1, 1024 * 1024));
+        chunk.extend(compact_i32_field(1, 4));
+        chunk.push(THRIFT_COMPACT_STOP);
+        chunk.extend([0_u8; 4]);
+        let error = validate_page_headers_in_range(&chunk, 4096, 64 * 1024 * 1024)
+            .expect_err("page headers far above the footer's chunk size are rejected");
+        assert!(matches!(error, TableCatalogStoreError::Invalid(message) if message.contains("footer")));
+        // Truncated header: the cursor must fail closed, never read past the chunk.
+        assert!(validate_page_headers_in_range(&compact_i32_field(1, 0), 4096, 4096).is_err());
     }
 
     #[test]

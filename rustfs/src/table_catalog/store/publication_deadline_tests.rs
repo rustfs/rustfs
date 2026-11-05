@@ -55,7 +55,7 @@ async fn publication_deadline_registration_inventory_releases_fence_without_writ
     };
     tokio::task::yield_now().await;
     assert!(!writer.is_finished());
-    tokio::time::advance(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
     assert!(is_preparation_timeout(&registering.await.unwrap()));
     writer.await.unwrap().unwrap();
     pause.release();
@@ -127,7 +127,7 @@ async fn publication_deadline_commit_metadata_read_does_not_publish_object_backi
         tokio::spawn(async move { store.commit_table(request).await })
     };
     pause.wait_started().await;
-    tokio::time::advance(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
     assert!(is_preparation_timeout(&committing.await.unwrap()));
     assert_eq!(backend.state.lock().await.put_attempts, before);
     assert_eq!(
@@ -176,7 +176,7 @@ async fn publication_deadline_create_finishes_after_first_write_on_either_backin
             tokio::spawn(async move { store.create_table(candidate).await })
         };
         pause.wait_started().await;
-        tokio::time::advance(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+        tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
         tokio::task::yield_now().await;
         assert!(!creating.is_finished(), "deadline must not cancel a possible durable write");
         pause.release();
@@ -191,7 +191,7 @@ async fn publication_deadline_queueing_and_repeated_prepare_share_one_budget() {
     let publication = TableCommitLockPublication::new(&backend);
     let budget = publication.preparation_budget();
     let first_deadline = budget.deadline();
-    tokio::time::advance(get_lock_acquire_timeout() - StdDuration::from_millis(1)).await;
+    tokio::time::advance(publication_preparation_timeout() - StdDuration::from_millis(1)).await;
     publication.begin_table_bucket("analytics").await.unwrap();
     publication.prepare("analytics", "sales", "orders").await.unwrap();
     assert_eq!(budget.deadline(), first_deadline);
@@ -217,7 +217,7 @@ async fn publication_deadline_completed_recovery_cannot_exempt_a_new_transaction
             backend
                 .put_object("analytics", "recovery", b"recovered".to_vec(), TableCatalogPutPrecondition::IfAbsent)
                 .await?;
-            tokio::time::sleep(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+            tokio::time::sleep(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
             Ok(())
         })
         .await?;
@@ -253,7 +253,7 @@ async fn publication_deadline_create_queue_wait_cannot_restart_after_admission()
     while backend.write_lock_acquisition_count("analytics", &key).await == attempts {
         tokio::task::yield_now().await;
     }
-    tokio::time::advance(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
     assert!(is_preparation_timeout(&creating.await.unwrap()));
     drop(blocker);
     assert!(store.load_table("analytics", "sales", "queued").await.unwrap().is_none());
@@ -292,7 +292,7 @@ async fn publication_deadline_active_rename_recovery_finishes_before_rejecting_n
         tokio::spawn(async move { store.register_table(candidate).await })
     };
     pause.wait_started().await;
-    tokio::time::advance(get_lock_acquire_timeout() + StdDuration::from_millis(1)).await;
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
     tokio::task::yield_now().await;
     assert!(
         !registering.is_finished(),

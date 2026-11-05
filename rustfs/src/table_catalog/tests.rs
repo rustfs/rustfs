@@ -32,16 +32,17 @@ fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
         "catalog/table-2/table-entry.json".to_string(),
     ];
 
+    // Only table entries count toward the limit; the namespace object is free.
     assert_eq!(
-        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 3).unwrap(),
+        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 2).unwrap(),
         vec![
             "catalog/table-1/table-entry.json".to_string(),
             "catalog/table-2/table-entry.json".to_string(),
         ]
     );
     assert_matches!(
-        bounded_table_entry_objects_for_data_plane_scan(objects, false, 2),
-        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("2-catalog-object safety limit")
+        bounded_table_entry_objects_for_data_plane_scan(objects, false, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
     );
     assert_matches!(
         bounded_table_entry_objects_for_data_plane_scan(vec!["catalog/table-entry.json".to_string()], true, 1),
@@ -8140,10 +8141,26 @@ async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane
         .delete_object(RUSTFS_META_BUCKET, &index_path)
         .await
         .expect("warehouse index entry should be removed");
-    let catalog_prefix = store.paths.namespace_entries_prefix(bucket);
+    // Only table entries count toward the data-plane limit; seed enough real
+    // entries that, with the table under test, the catalog exceeds it.
+    let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
     for index in 0..TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS {
+        let noise_table = IdentifierSegment::parse(format!("noise-{index}")).expect("table should parse");
+        let mut entry = test_table_entry(
+            bucket,
+            &noise_namespace,
+            &noise_table,
+            default_table_metadata_file_path(&noise_namespace, &noise_table, "00001.metadata.json"),
+        );
+        entry.table_id = format!("noise-{index}");
+        entry.table_uuid = format!("noise-uuid-{index}");
+        entry.warehouse_location = format!("s3://{bucket}/tables/noise-{index}");
         backend
-            .seed_object(RUSTFS_META_BUCKET, &format!("{catalog_prefix}noise-{index}.json"), b"{}".to_vec())
+            .seed_object(
+                RUSTFS_META_BUCKET,
+                &store.paths.table_entry_path(bucket, &noise_namespace, &noise_table),
+                serde_json::to_vec(&entry).expect("entry should encode"),
+            )
             .await;
     }
 
@@ -18736,7 +18753,7 @@ async fn strong_catalog_snapshot_rejects_unknown_fields_and_versions() {
         .as_object_mut()
         .expect("snapshot should be an object")
         .remove("future-field");
-    // Physical version 3 identifies the bucket registry. Version 4 is unknown.
+    // Only snapshot versions up to the current one are readable.
     value["version"] = serde_json::Value::from(4);
     backend
         .seed_object(

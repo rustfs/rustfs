@@ -415,15 +415,19 @@ pub(in crate::table_catalog) fn bounded_table_entry_objects_for_data_plane_scan(
     is_truncated: bool,
     max_catalog_objects: usize,
 ) -> TableCatalogStoreResult<Vec<String>> {
-    if is_truncated || objects.len() > max_catalog_objects {
+    // Only table entries count: maintenance reports, bridges and other
+    // per-table objects share the prefix and are controlled by table-scoped
+    // principals, so they must not be able to trip the data-plane limit.
+    let entries: Vec<String> = objects
+        .into_iter()
+        .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+        .collect();
+    if is_truncated || entries.len() > max_catalog_objects {
         return Err(TableCatalogStoreError::Unavailable(format!(
             "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
         )));
     }
-    Ok(objects
-        .into_iter()
-        .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
-        .collect())
+    Ok(entries)
 }
 
 #[derive(Clone)]
@@ -2626,15 +2630,17 @@ where
         max_catalog_objects: usize,
     ) -> TableCatalogStoreResult<Vec<String>> {
         let mut objects = Vec::new();
+        let mut entries = 0_usize;
+        let mut pages = 0_usize;
         let mut cursor = None;
+        let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
+            .ok_or_else(|| TableCatalogStoreError::Internal("table catalog listing page size must be positive".to_string()))?;
         loop {
-            let remaining = max_catalog_objects.saturating_sub(objects.len());
-            let page_size = remaining.min(TABLE_CATALOG_LIST_MAX_KEYS);
-            let limit = NonZeroUsize::new(page_size).ok_or_else(|| {
-                TableCatalogStoreError::Unavailable(format!(
-                    "table data-plane warehouse-index miss scan exceeds the {max_catalog_objects}-catalog-object safety limit"
-                ))
-            })?;
+            if pages >= TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES {
+                return Err(TableCatalogStoreError::Unavailable(format!(
+                    "table data-plane warehouse-index miss scan exceeds the {TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES}-page listing budget"
+                )));
+            }
             let page = self
                 .backend
                 .list_objects_page(
@@ -2644,12 +2650,18 @@ where
                     limit,
                 )
                 .await?;
+            pages += 1;
             let next_cursor = page.objects.last().cloned();
+            entries += page
+                .objects
+                .iter()
+                .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
+                .count();
             objects.extend(page.objects);
             if !page.is_truncated {
                 return bounded_table_entry_objects_for_data_plane_scan(objects, false, max_catalog_objects);
             }
-            if objects.len() >= max_catalog_objects {
+            if entries > max_catalog_objects {
                 return bounded_table_entry_objects_for_data_plane_scan(objects, true, max_catalog_objects);
             }
             if next_cursor.is_none() || next_cursor == cursor {
@@ -5190,8 +5202,11 @@ where
         let warehouse_object_prefix = table_warehouse_object_prefix(&entry)?;
         let compaction_id = Uuid::new_v4().to_string();
         let mut compacted_files = Vec::with_capacity(report.rewrite_groups.len());
-        let mut stored_input_bytes = 0_usize;
         for rewrite_group in &mut report.rewrite_groups {
+            // The stored-input ceiling applies to one rewrite group: inputs are
+            // released after each group, so a multi-group job must not fail late
+            // with outputs already written.
+            let mut stored_input_bytes = 0_usize;
             let output_prefix = rewrite_group
                 .input_file_locations
                 .first()
@@ -5418,7 +5433,7 @@ where
     ) -> TableCatalogStoreResult<()> {
         let roots = maintenance_cleanup_roots(entry)?;
         for other in self
-            .list_all_table_entries_with_limit(&entry.table_bucket, None, locked_table_entry, 1)
+            .list_all_table_entries_with_limit(&entry.table_bucket, None, locked_table_entry, TABLE_REGISTRATION_READ_CONCURRENCY)
             .await?
         {
             if other.state == TableCatalogEntryState::Deleted

@@ -442,29 +442,12 @@ pub(crate) struct TestCatalogObjectPause {
 }
 
 impl TestCatalogObjectPause {
-    pub(crate) async fn pause(&self) {
-        self.started.notify_one();
-        self.release.notified().await;
-    }
-
     pub(crate) async fn wait_started(&self) {
         self.started.notified().await;
     }
 
     pub(crate) fn release(&self) {
         self.release.notify_one();
-    }
-}
-
-tokio::task_local! {
-    pub(crate) static CATALOG_MIGRATION_READ_PAUSE: TestCatalogObjectPause;
-    pub(crate) static CATALOG_ROOT_HEAD_PAUSE: Arc<std::sync::OnceLock<TestCatalogObjectPause>>;
-    pub(crate) static CATALOG_PUT_AUTHORIZATION_PAUSE: Arc<std::sync::OnceLock<TestCatalogObjectPause>>;
-}
-
-pub(crate) async fn pause_before_catalog_migration_read() {
-    if let Ok(pause) = CATALOG_MIGRATION_READ_PAUSE.try_with(Clone::clone) {
-        pause.pause().await;
     }
 }
 

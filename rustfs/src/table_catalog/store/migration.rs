@@ -281,6 +281,13 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<(TableCatalogBackingMigrationFence, Option<String>)>> {
+        // The table-entry directory keeps its state on this path; its presence
+        // excludes a backing migration rather than being a malformed fence.
+        if self.read_table_directory_state(table_bucket).await?.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "table bucket has an active table-entry directory; roll it back before a backing migration".to_string(),
+            ));
+        }
         let fence = self
             .read_entry(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
             .await?;

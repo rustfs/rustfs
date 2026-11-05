@@ -1303,13 +1303,6 @@ async fn authorize_table_catalog_s3_actions(
 
     let mut result = Ok(());
     for action in actions {
-        #[cfg(test)]
-        if *action == S3Action::PutObjectAction
-            && let Ok(Some(pause)) =
-                crate::table_catalog::test_support::CATALOG_PUT_AUTHORIZATION_PAUSE.try_with(|slot| slot.get().cloned())
-        {
-            pause.pause().await;
-        }
         if let Err(err) = authorize_internal_object_request(req, Action::S3Action(*action)).await {
             result = Err(err);
             break;
@@ -1467,6 +1460,19 @@ where
         object: &str,
         data: &[u8],
     ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
+        self.prepare_put_observation_with(bucket, object, data, true).await
+    }
+
+    /// `begins_mutation` is false for a write that precedes the catalog
+    /// transaction (see `put_object_before_publication`): it is still fenced
+    /// and authorized, but it leaves the preparation deadline armed.
+    async fn prepare_put_observation_with(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: &[u8],
+        begins_mutation: bool,
+    ) -> crate::table_catalog::TableCatalogStoreResult<TableCommitObservedObject> {
         let fence = {
             let publication = self.publication.lock();
             publication.bucket_fence.as_ref().map(|_| {
@@ -1495,7 +1501,11 @@ where
             // An unfenced candidate write precedes the publication transaction. Only a PUT
             // under the bucket fence commits this preparation to finishing its durable tail.
             fence.ensure_held()?;
-            self.preparation.begin_mutation()?;
+            if begins_mutation {
+                self.preparation.begin_mutation()?;
+            } else {
+                self.preparation.check_deadline()?;
+            }
         }
         Ok(observation)
     }
@@ -1947,6 +1957,18 @@ where
         // The existing generated-metadata readback binds the written bytes to
         // their revision. Until then, keep the original SHA expectation and
         // enforce the fallback budget before publication preparation.
+        self.record_observation(bucket, object, observation, false)
+    }
+
+    async fn put_object_before_publication(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        let observation = self.prepare_put_observation_with(bucket, object, &data, false).await?;
+        self.backend.put_object(bucket, object, data, precondition).await?;
         self.record_observation(bucket, object, observation, false)
     }
 
@@ -6163,7 +6185,7 @@ where
     let metadata_data = serde_json::to_vec(&metadata)
         .map_err(|err| s3_error!(InternalError, "failed to serialize initial table metadata: {}", err))?;
     metadata_backend
-        .put_object(
+        .put_object_before_publication(
             bucket,
             &entry.metadata_location,
             metadata_data,
@@ -7006,7 +7028,7 @@ where
         S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize initial table metadata: {err}"))
     })?;
     metadata_backend
-        .put_object(
+        .put_object_before_publication(
             bucket,
             &entry.metadata_location,
             metadata_data,

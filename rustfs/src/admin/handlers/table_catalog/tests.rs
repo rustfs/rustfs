@@ -17046,6 +17046,13 @@ async fn cleanup_empty_table_bucket_validates_directory_candidate_path_and_body_
     let bucket_entry = paths.table_bucket_entry_path(&bucket);
     let directory = format!("{}/table-entry-directory/v1/", bucket_entry.rsplit_once('/').unwrap().0);
     let real = format!("{directory}analytics/tables/events_00/table-entry.json");
+    // Entry writers add candidates only while the directory is active; seed the
+    // one a backfill would have written so cleanup has a valid candidate to keep.
+    let real_target = format!("{}analytics/tables/events_00/table-entry.json", paths.namespace_entries_prefix(&bucket));
+    backend
+        .put_object(RUSTFS_META_BUCKET, &real, real_target.into_bytes(), TableCatalogPutPrecondition::IfAbsent)
+        .await
+        .unwrap();
     assert!(backend.object_exists(RUSTFS_META_BUCKET, &real).await.unwrap());
     for (suffix, target_suffix) in [
         ("bad segment/tables/x/table-entry.json", "bad segment/tables/x/table-entry.json"),

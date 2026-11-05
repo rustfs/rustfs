@@ -26,7 +26,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | `/_iceberg/v1` | Supported compatibility alias | MinIO AIStor-style alias; smoke profile defaults to signing name `s3tables`. |
 | S3 object data plane | Supported | Data, metadata, manifest, and delete files are ordinary S3 objects with table-aware policy checks on warehouse paths. |
 | S3 table-bucket listings | Supported | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, metadata-list extensions, and multipart-upload listings omit warehouse objects unless the caller has `admin:GetTableMetadata` for that table, and always omit internal `.rustfs-table` keys. Protected cursors are encrypted with a key derived from the cluster root credentials, so rotating those credentials invalidates cursors already issued. |
-| Object-backed warehouse-index recovery | Supported with bounded request fallback | Data-plane requests repair or verify a missing warehouse-prefix index against bounded pages totaling at most 4,096 catalog objects. Larger catalogs fail closed with a retryable service error and require `POST /iceberg/v1/{warehouse}/catalog/warehouse-index/backfill` with `admin:MigrateTableCatalog` instead of allowing one S3 request to trigger an unbounded scan. |
+| Object-backed warehouse-index recovery | Supported with bounded request fallback | Data-plane requests repair or verify a missing warehouse-prefix index by listing the catalog prefix. Only table entries count toward the 4,096-object limit, so maintenance reports and other per-table objects cannot exhaust it; the listing itself is bounded to 64 pages. Larger catalogs fail closed with a retryable service error and require operator backfill. An optional table-entry directory (see Maintenance Matrix) answers these lookups without the prefix listing. |
 | Table bucket enablement | Supported | A regular bucket is enabled for catalog use and addressed as the REST catalog warehouse. |
 | Catalog-vended table credentials | Automated when enabled | Disabled by default. LoadTable vends credentials only when `X-Iceberg-Access-Delegation` contains the exact `vended-credentials` token; the dedicated credentials endpoint uses the same issuer path. |
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and warehouse ARN shape for migration docs. API parity not claimed. |
@@ -106,13 +106,23 @@ expiration and compaction plan/commit, remains object-backed only. A configured
 server has opt-in, allowlisted periodic queue admission; see the
 [scheduler runbook](../operations/s3-tables-maintenance-scheduler.md).
 
-Renamed tables retain their original metadata paths. Durable-strong scheduling
-and cleanup fail closed with a conflict if another table shares a scanned
-metadata or warehouse directory, including a recreated source name after rename.
-Such tables require disjoint cleanup roots before maintenance can run; enabling
+Renamed tables retain their original metadata paths. Scheduling, planning,
+and cleanup on both backings fail closed with a conflict if another table
+shares a scanned metadata or warehouse directory, including a recreated source
+name after rename. The object backing rechecks this ownership inventory under
+the bucket publication fence before every delete pass; the inventory reads every
+table entry in the bucket, so maintenance cost grows with the table count. Such
+tables require disjoint cleanup roots before maintenance can run; enabling
 deletion does not override this ownership check.
 
-Create, register, and commit publication share one preparation deadline derived from the existing lock-acquisition timeout. Migration and bucket-lock queueing, reference HEAD validation, ownership inventories, metadata parsing, and snapshot preparation consume that same interval; repeated preparation does not renew it. Expiry before a possible durable catalog write returns HTTP 503 and releases the preparation locks. A valid large operation that cannot finish within the interval may continue to fail on retry; smaller operations or less contention are required. Once a catalog write may have begun, this deadline no longer cancels that transaction. A preceding rename recovery completes under its existing protocol, then the new operation checks the original deadline. Individual PUT completion and persisted commit/rename recovery retain their existing cancellation guarantees; the entire multi-write catalog operation is not newly detached from client cancellation. This is a preparation limit, not a hard bound on disk I/O or the durable tail: snapshot write/reload and rename maintenance copy verification/cleanup can still scale with stored state. Rename maintenance inventory isolation remains a separate limitation.
+Object-backed create, register, and commit publication share one preparation deadline, `RUSTFS_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS` (default 30, never below the object lock-acquire timeout). Migration and bucket-lock queueing, reference HEAD validation, ownership inventories, metadata parsing, and snapshot preparation consume that same interval; repeated preparation does not renew it. A create writes its initial metadata file before registration without ending the deadline, so an orphaned file (reclaimed by maintenance) is the worst outcome of an expired create. Expiry before a possible durable catalog write returns HTTP 503 and releases the preparation locks; a valid large operation that cannot finish within the interval keeps failing on retry until the interval is raised. Once a catalog write may have begun, this deadline no longer cancels that transaction. Individual PUT completion and persisted commit/rename recovery retain their existing cancellation guarantees. This is a preparation limit, not a hard bound on disk I/O or the durable tail. The durable-strong backing does not implement this deadline; it is being retired. A rename that the client abandons mid-flight completes or recovers on a detached task, so the bucket's `active_rename_id` is always cleared.
+
+Compaction commits hold inputs to a 512 MiB stored and decoded budget per rewrite group, validate the footer and every page header before decoding a page (a recursive or over-deep Iceberg manifest Avro schema and a Parquet page that exceeds its budget are refused with HTTP 400), and run one compaction per node at a time; a concurrent request receives HTTP 503.
+
+### Table-entry directory
+
+An optional per-bucket directory of table entries under `.rustfs.sys` answers data-plane index-miss lookups without listing the catalog prefix. It is off by default: `RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX=true` and `RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX_FLEET_CONFIRMED=true` on every node, then `POST /iceberg/v1/{warehouse}/catalog/directory` (`admin:MigrateTableCatalog`) advances a backfill of 128 catalog objects per call until the directory reports `Ready`; `GET` reports the phase and `DELETE` rolls the directory back. Entry writers add a directory candidate only while the directory exists, and the backfill covers earlier entries. The directory state occupies the backing-migration fence object: nodes without this feature answer catalog mutations on that bucket with a parse error until they are upgraded, which is what the fleet-confirmed flag attests, and a backing migration is refused with a conflict while the directory is active.
+
 
 Durable-strong rename preserves maintenance configuration, job identifiers,
 current/latest aliases, history, audit events, and quarantine state. A persisted

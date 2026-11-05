@@ -939,6 +939,21 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()>;
 
+    /// Write an object that precedes the catalog transaction, such as the
+    /// initial metadata file of a create. It is authorized and fenced like
+    /// `put_object`, but a publication-aware backend must not treat it as the
+    /// first durable catalog mutation: an orphan is reclaimed by maintenance,
+    /// so the preparation deadline keeps bounding the work that follows.
+    async fn put_object_before_publication(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object(bucket, object, data, precondition).await
+    }
+
     async fn put_object_unlocked(
         &self,
         bucket: &str,
@@ -2383,8 +2398,6 @@ where
     ) -> TableCatalogStoreResult<Vec<TableCatalogLockGuard>> {
         // Handlers discover and publish objects through one publication object. Keep the
         // migration read permits ahead of its publication lock, matching store mutations.
-        #[cfg(test)]
-        crate::table_catalog::test_support::pause_before_catalog_migration_read().await;
         let paths = TableCatalogObjectPaths::default();
         let global = self
             .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
@@ -2442,14 +2455,6 @@ where
     }
 
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
-        #[cfg(test)]
-        if bucket == RUSTFS_META_BUCKET
-            && object == StrongTableCatalogStore::<Self>::snapshot_object_path()
-            && let Ok(Some(pause)) =
-                crate::table_catalog::test_support::CATALOG_ROOT_HEAD_PAUSE.try_with(|slot| slot.get().cloned())
-        {
-            pause.pause().await;
-        }
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
                 body_revision: info.data_dir.filter(|id| !id.is_nil()),

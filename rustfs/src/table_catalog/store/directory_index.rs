@@ -165,6 +165,12 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let entry: TableEntry = serde_json::from_slice(data)
             .map_err(|err| TableCatalogStoreError::Invalid(format!("invalid table entry for directory publication: {err}")))?;
         validate_table_entry_object(&self.paths, object, &entry)?;
+        // Without an activated directory there is nothing to keep consistent, and
+        // activation backfills every existing entry; writing candidates regardless
+        // would grow an unreclaimed set on every cluster.
+        if self.read_table_directory_state(&entry.table_bucket).await?.is_none() {
+            return Ok(());
+        }
         let candidate = self.paths.table_directory_candidate(&entry)?;
         let expected = object.as_bytes();
         if let Some(current) = self

@@ -110,6 +110,13 @@ pub(crate) const TABLE_MAINTENANCE_CONFIG_VERSION: u16 = 1;
 pub(crate) const TABLE_EXTERNAL_CATALOG_BRIDGE_VERSION: u16 = 1;
 pub(crate) const TABLE_CATALOG_BACKING_MANIFEST_VERSION: u16 = 1;
 pub(crate) const ENV_TABLE_CATALOG_BACKING: &str = "RUSTFS_TABLE_CATALOG_BACKING";
+/// Seconds a create, register, or commit may spend preparing (queueing for the
+/// bucket publication fence, validating references, inventories) before it is
+/// refused with 503 so object writes in the bucket are admitted. Never below
+/// the object lock-acquire timeout.
+pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: &str =
+    "RUSTFS_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS";
+pub(crate) const DEFAULT_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS: u64 = 30;
 pub(crate) const ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED: &str =
     "RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED";
 pub(crate) const ENV_TABLE_CATALOG_STRONG_SNAPSHOT_V2: &str = "RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2";
@@ -175,6 +182,10 @@ const WAREHOUSE_INDEX_STATE_FILE: &str = "state.json";
 const TABLE_RENAME_ROOT: &str = "renames";
 const WAREHOUSE_INDEX_MAX_PREFIX_DEPTH: usize = 64;
 const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS: usize = 4096;
+/// Listing pages an index-miss scan may consume before failing closed. Only
+/// table entries count toward the object limit, so maintenance reports and
+/// other catalog objects cannot trip it; this bounds the listing work itself.
+const TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES: usize = 64;
 const EXTERNAL_CATALOG_ROOT: &str = "external-catalog";
 const EXTERNAL_CATALOG_BRIDGE_FILE: &str = "bridge.json";
 const MAINTENANCE_ROOT: &str = "maintenance";
