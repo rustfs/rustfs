@@ -237,14 +237,14 @@ async fn inspect(
     join_all(disks.iter().map(|disk| async move {
         let disk = disk.as_ref().ok_or(DiskError::DiskNotFound)?;
         let state = if let Some(budget) = budget {
-            let reserved = budget.reserve(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
+            let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
             let reply = disk
-                .inspect_delete_transaction_bounded(bucket, object, transaction, reserved)
+                .inspect_delete_transaction_bounded(bucket, object, transaction, admitted)
                 .await?;
-            if reply.visited > reserved {
+            if reply.visited > admitted {
                 return Err(DiskError::FileCorrupt);
             }
-            budget.refund(reserved - reply.visited.max(1));
+            budget.charge(reply.visited);
             reply.inspection
         } else {
             disk.inspect_delete_transaction(bucket, object, transaction).await?
@@ -261,9 +261,9 @@ async fn discover_bounded(
     object: &str,
     budget: &crate::object_api::DeleteRecoveryWorkBudget,
 ) -> Result<Vec<DeleteTransactionId>> {
-    let reserved = budget.reserve(crate::disk::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES)?;
-    let page = disk.discover_delete_transactions_bounded(bucket, object, reserved).await?;
-    if page.visited > reserved
+    let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES)?;
+    let page = disk.discover_delete_transactions_bounded(bucket, object, admitted).await?;
+    if page.visited > admitted
         || page.transactions.len() > 256
         || page
             .transactions
@@ -273,7 +273,7 @@ async fn discover_bounded(
     {
         return Err(DiskError::FileCorrupt);
     }
-    budget.refund(reserved - page.visited.max(1));
+    budget.charge(page.visited);
     if !page.complete {
         return Err(DiskError::DeleteRecoveryWorkLimit);
     }
@@ -329,7 +329,7 @@ async fn settle_outcome(
         return Err(DiskError::other("delete recovery namespace fence was lost"));
     }
     let outcome = if let Some(budget) = scope.budget {
-        let reserved = budget.reserve(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
+        let admitted = budget.admit(crate::disk::DELETE_RECOVERY_MAX_INSPECTION_ENTRIES)?;
         let may_publish = matches!(&action, DeleteRecoveryAction::PublishCommit | DeleteRecoveryAction::AdoptCommit { .. });
         let reply = disk
             .settle_delete_transaction_bounded(
@@ -339,17 +339,17 @@ async fn settle_outcome(
                     transaction: state.id.transaction,
                     expected_fingerprint: state.fingerprint,
                     action,
-                    max_entries: reserved,
+                    max_entries: admitted,
                 },
                 scope.namespace_owner.cloned(),
             )
             .await?;
-        if reply.visited > reserved
+        if reply.visited > admitted
             || (!may_publish && matches!(&reply.outcome, DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred))
         {
             return Err(DiskError::FileCorrupt);
         }
-        budget.refund(reserved - reply.visited.max(1));
+        budget.charge(reply.visited);
         reply.outcome
     } else {
         DeleteRecoverySettlementOutcome::Inspected(Box::new(
@@ -1629,8 +1629,8 @@ mod tests {
         for dir in &dirs {
             let prefix = dir.path().join(bucket).join("prefix");
             std::fs::create_dir_all(&prefix).expect("physical prefix");
-            for index in 0..64 {
-                std::fs::create_dir(prefix.join(format!("child-{index}"))).expect("legitimate child");
+            for _ in 0..64 {
+                std::fs::create_dir(prefix.join(Uuid::new_v4().to_string())).expect("legitimate child");
             }
         }
         let error = store
@@ -1693,10 +1693,11 @@ mod tests {
                     .any(|error| matches!(error, Some(StorageError::DeleteRecoveryWorkLimit))),
                 "repeated actions must not each obtain a new allowance: {distinct_versions}"
             );
-            assert!(
-                dirs.iter()
-                    .all(|dir| dir.path().join(bucket).join("prefix/child-63").is_dir())
-            );
+            assert!(dirs.iter().all(|dir| {
+                std::fs::read_dir(dir.path().join(bucket).join("prefix"))
+                    .map(|entries| entries.count() == 64)
+                    .unwrap_or(false)
+            }));
         }
         let error = store
             .delete_object(bucket, "prefix", ObjectOptions::default())
@@ -1780,7 +1781,8 @@ mod tests {
                 let prefix = dir.path().join(bucket).join(key);
                 std::fs::create_dir_all(&prefix).expect("physical prefix");
                 for child in 0..8 {
-                    std::fs::create_dir(prefix.join(format!("child-{child}"))).expect("child");
+                    let _ = child;
+                    std::fs::create_dir(prefix.join(Uuid::new_v4().to_string())).expect("child");
                 }
             }
         }
@@ -1809,10 +1811,11 @@ mod tests {
             "all pools and sets must share the finite allowance"
         );
         assert!(budget.remaining() < 32_768, "fanout must debit the original request allowance");
-        assert!(
-            dirs.iter()
-                .all(|dir| dir.path().join(bucket).join(&keys[0]).join("child-7").is_dir())
-        );
+        assert!(dirs.iter().all(|dir| {
+            std::fs::read_dir(dir.path().join(bucket).join(&keys[0]))
+                .map(|entries| entries.count() == 8)
+                .unwrap_or(false)
+        }));
     }
 
     #[tokio::test]

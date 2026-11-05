@@ -2183,7 +2183,7 @@ fn validate_replication_check_config_targets(
         if !configured_arns.contains(role) {
             return Err(S3Error::with_message(
                 S3ErrorCode::InvalidRequest,
-                "replication config has stale target {role}",
+                format!("replication config has stale target {role}"),
             ));
         }
         return Ok(());

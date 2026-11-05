@@ -95,8 +95,6 @@ impl ObjectLockState {
         // Reset atomic state
         self.atomic_state = crate::fast_lock::state::AtomicLockState::new();
 
-        self.publication = std::sync::OnceLock::new();
-
         // Clear owners
         *self.current_owner.write() = None;
         self.shared_owners.write().clear();

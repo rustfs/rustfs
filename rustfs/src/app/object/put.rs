@@ -578,9 +578,10 @@ async fn read_small_put_body_exact_pooled<R>(mut body: R, size: usize, pool: &By
 where
     R: AsyncRead + Unpin,
 {
-    let mut buf = pool.try_acquire_buffer(size).ok_or_else(|| {
-        S3Error::with_message(S3ErrorCode::SlowDown, "upload buffer pool is full, please reduce your request rate")
-    })?;
+    // A stalled body cannot pin pool capacity (the progress floor expires it),
+    // so a full pool is a burst, not an attack: hand out an unpooled buffer
+    // rather than refusing the upload.
+    let mut buf = pool.try_acquire_buffer(size).unwrap_or_else(|| PooledBuffer::unpooled(size));
     read_small_put_body_into(&mut body, &mut *buf, size).await?;
     Ok(buf)
 }
@@ -3432,7 +3433,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn pooled_upload_exhaustion_rejects_without_allocating_and_recovers_after_stall() {
+    async fn pooled_upload_exhaustion_falls_back_to_unpooled_and_recovers_after_stall() {
         use futures::poll;
         use rustfs_io_core::BytesPoolConfig;
         use tokio_stream::wrappers::UnboundedReceiverStream;
@@ -3455,8 +3456,12 @@ mod tests {
             &pool,
         ));
         assert!(poll!(owner.as_mut()).is_pending());
-        let denied = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![0; 8192]), 8192, &pool).await;
-        assert_eq!(denied.err().expect("full pool must reject immediately").code(), &S3ErrorCode::SlowDown);
+        let fallback = read_small_put_body_exact_pooled(std::io::Cursor::new(vec![0; 8192]), 8192, &pool)
+            .await
+            .expect("a full pool hands out an unpooled buffer instead of refusing");
+        assert_eq!(&fallback[..], &[0; 8192]);
+        drop(fallback);
+        assert!(pool.try_acquire_buffer(8192).is_none(), "the unpooled buffer never touched pool capacity");
         for _ in 0..5 {
             tokio::time::advance(Duration::from_secs(10)).await;
             sender.send(Ok(Bytes::from_static(b"x"))).unwrap();

@@ -1021,7 +1021,6 @@ impl DefaultMultipartUsecase {
             req.uri.query(),
             req.extensions.get::<VerifiedSigV4Request>().is_some(),
         )?;
-        validate_new_object_key(&req.input.key, "CreateMultipartUpload")?;
         reject_presigned_put_max_content_length_for_other_operation(
             &req.headers,
             req.uri.query(),

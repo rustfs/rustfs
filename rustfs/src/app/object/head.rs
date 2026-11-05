@@ -22,9 +22,15 @@ use crate::on_demand_migration::{
 };
 
 async fn head_metadata_action_allowed(req: &S3Request<HeadObjectInput>, action: S3Action) -> S3Result<bool> {
-    let Ok(mut info) = req_info_ref(req).cloned() else {
+    let Ok(info) = req_info_ref(req) else {
         return Ok(false);
     };
+    // The bucket owner holds every object permission; skip the probe and its
+    // request clone on the most common HEAD caller.
+    if info.is_owner {
+        return Ok(true);
+    }
+    let mut info = info.clone();
     info.suppress_denial_log = true;
     info.suppress_denial_audit = true;
     let mut probe = S3Request {

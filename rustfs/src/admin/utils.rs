@@ -24,6 +24,9 @@ use tokio::sync::Semaphore;
 // Each compatible request can run two 64 MiB derivations. Keep both CPU and
 // memory bounded without occupying runtime workers or queueing unbounded jobs.
 static ADMIN_DECRYPT_PERMITS: Semaphore = Semaphore::const_new(2);
+/// How long a compat admin request queues for a decryption slot before it is
+/// told to retry; a burst of a few requests completes instead of failing.
+const ADMIN_DECRYPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Returns `true` if `s` contains any whitespace character.
 ///
@@ -50,8 +53,10 @@ pub(crate) async fn read_compatible_admin_body(
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
     if is_compat_admin_request(path) {
-        let permit = ADMIN_DECRYPT_PERMITS
-            .try_acquire()
+        let permit = ADMIN_DECRYPT_PERMITS.acquire();
+        let permit = tokio::time::timeout(ADMIN_DECRYPT_WAIT, permit)
+            .await
+            .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?
             .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?;
         let secret_key = secret_key.to_owned();
         tokio::task::spawn_blocking(move || {

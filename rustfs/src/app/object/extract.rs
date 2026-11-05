@@ -457,9 +457,9 @@ where
     }
 
     let pool = get_concurrency_manager().bytes_pool();
-    let mut buffer = pool.try_acquire_buffer(size).ok_or_else(|| {
-        S3Error::with_message(S3ErrorCode::SlowDown, "upload buffer pool is full, please reduce your request rate")
-    })?;
+    let mut buffer = pool
+        .try_acquire_buffer(size)
+        .unwrap_or_else(|| rustfs_io_core::PooledBuffer::unpooled(size));
     super::put::read_small_put_body_into(body, &mut *buffer, size).await?;
     Ok(ExtractStagedBody {
         reader: Some(super::put::PooledBufferReader::new(buffer, size)),

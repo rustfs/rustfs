@@ -671,7 +671,21 @@ impl GetObjectBodyLifecycle {
 }
 
 // Bound downstream inactivity without imposing a fixed limit on large downloads.
+// The floor also caps the watchdog's timer arithmetic.
 const GET_DISK_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Seconds a GET body may make no progress before its disk-read admission is
+/// released and the stream fails; a paused client within this window resumes
+/// normally. Never below the floor above or twice the disk read timeout.
+const ENV_GET_DISK_READ_IDLE_TIMEOUT_SECS: &str = "RUSTFS_GET_DISK_READ_IDLE_TIMEOUT_SECS";
+const DEFAULT_GET_DISK_READ_IDLE_TIMEOUT_SECS: u64 = 120;
+
+fn configured_get_disk_read_idle_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        ENV_GET_DISK_READ_IDLE_TIMEOUT_SECS,
+        DEFAULT_GET_DISK_READ_IDLE_TIMEOUT_SECS,
+    ))
+    .max(GET_DISK_READ_IDLE_TIMEOUT)
+}
 const GET_DISK_READ_MIN_WINDOW_BYTES: usize = 64 * 1024;
 
 struct DiskReadLease<R> {
@@ -758,7 +772,7 @@ impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
         // downstream lease, including the high-latency drive profile.
         let idle_timeout = get_object_disk_read_timeout()
             .saturating_mul(2)
-            .max(GET_DISK_READ_IDLE_TIMEOUT);
+            .max(configured_get_disk_read_idle_timeout());
         Self::with_idle_timeout(inner, disk_permit, idle_timeout)
     }
 
@@ -7182,7 +7196,7 @@ mod tests {
         tokio::time::advance(
             get_object_disk_read_timeout()
                 .saturating_mul(2)
-                .max(GET_DISK_READ_IDLE_TIMEOUT)
+                .max(configured_get_disk_read_idle_timeout())
                 + Duration::from_secs(1),
         )
         .await;

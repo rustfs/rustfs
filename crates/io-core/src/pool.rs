@@ -467,6 +467,19 @@ impl PoolTier {
     }
 }
 
+impl PooledBuffer {
+    /// A buffer outside the pool: it holds no permit and is never returned to
+    /// a tier. Callers use it when the pool is at capacity but the request
+    /// must not be refused.
+    pub fn unpooled(size: usize) -> Self {
+        Self {
+            buffer: ManuallyDrop::new(BytesMut::with_capacity(size)),
+            tier: None,
+            _permit: None,
+        }
+    }
+}
+
 impl Drop for PooledBuffer {
     // SAFETY: Drop has exclusive access to `self`; taking the `ManuallyDrop`
     // buffer moves it exactly once into the pool when a tier still owns it.

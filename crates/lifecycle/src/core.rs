@@ -58,6 +58,7 @@ const ERR_LIFECYCLE_INVALID_EXPIRED_OBJECT_ALL_VERSIONS: &str =
     "Days must be a positive integer and Date must not be specified inside Expiration with ExpiredObjectAllVersions";
 const ERR_LIFECYCLE_INVALID_DEL_MARKER_EXPIRATION_DAYS: &str = "Days must be a positive integer with DelMarkerExpiration";
 const ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG: &str = "Rule ID must be at most 255 characters";
+const ERR_LIFECYCLE_INVALID_RULE_ID_CHARS: &str = "Lifecycle rule ID must not contain control characters";
 const ERR_LIFECYCLE_INVALID_RULE_ID_EMPTY: &str = "Rule ID must not be empty";
 const ERR_LIFECYCLE_INVALID_RULE_STATUS: &str = "Rule status must be either Enabled or Disabled";
 const ERR_LIFECYCLE_DEL_MARKER_WITH_TAGS: &str = "Rule with DelMarkerExpiration cannot have tags based filtering";
@@ -582,6 +583,11 @@ impl Lifecycle for BucketLifecycleConfiguration {
                 }
                 if id.len() > 255 {
                     return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_TOO_LONG));
+                }
+                // The ID is echoed in the x-amz-expiration header; a control
+                // character there would make every object GET, HEAD and PUT fail.
+                if id.chars().any(char::is_control) {
+                    return Err(std::io::Error::other(ERR_LIFECYCLE_INVALID_RULE_ID_CHARS));
                 }
             }
             r.validate()?;

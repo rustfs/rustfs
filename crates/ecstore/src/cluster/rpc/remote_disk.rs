@@ -4356,7 +4356,8 @@ impl DiskAPI for RemoteDisk {
         object: &str,
         max_entries: u32,
     ) -> Result<crate::disk::BoundedDeleteRecoveryDiscovery> {
-        // Older peers reject this variant. Do not retry through the unbounded protocol.
+        // Older peers reject this variant. Do not retry through the unbounded protocol;
+        // they are reported as unsupported participants (rolling-upgrade contract).
         match self
             .recover_delete_transaction(
                 volume,
@@ -4374,7 +4375,9 @@ impl DiskAPI for RemoteDisk {
                     || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
                     .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
             {
-                Err(Error::DeleteRecoveryWorkLimit)
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
             }
             Err(error) => Err(error),
         }
@@ -4431,7 +4434,9 @@ impl DiskAPI for RemoteDisk {
                     || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
                     .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
             {
-                Err(Error::DeleteRecoveryWorkLimit)
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
             }
             Err(error) => Err(error),
         }
@@ -4461,7 +4466,9 @@ impl DiskAPI for RemoteDisk {
                     || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
                     .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
             {
-                Err(Error::DeleteRecoveryWorkLimit)
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
             }
             Err(error) => Err(error),
         }
@@ -5059,7 +5066,7 @@ mod tests {
                 .discover_delete_transactions_bounded("bucket", "prefix", 4096)
                 .await
                 .expect_err("old peer cannot prove a bounded inventory"),
-            DiskError::DeleteRecoveryWorkLimit
+            DiskError::UnsupportedDisk
         );
         let transaction = Uuid::new_v4();
         assert_eq!(
@@ -5067,7 +5074,7 @@ mod tests {
                 .inspect_delete_transaction_bounded("bucket", "prefix", transaction, 65536)
                 .await
                 .expect_err("old peer cannot inspect with a budget"),
-            DiskError::DeleteRecoveryWorkLimit
+            DiskError::UnsupportedDisk
         );
         assert_eq!(
             remote
@@ -5084,7 +5091,7 @@ mod tests {
                 )
                 .await
                 .expect_err("old peer cannot settle with a budget"),
-            DiskError::DeleteRecoveryWorkLimit
+            DiskError::UnsupportedDisk
         );
         assert_eq!(
             *peer.peer.unsupported_methods.lock().expect("observed methods"),
