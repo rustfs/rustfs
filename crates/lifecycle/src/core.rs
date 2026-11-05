@@ -2053,6 +2053,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validate_rejects_rule_id_with_control_characters() {
+        for id in ["rule\nid", "rule\rid", "rule\tid", "rule\u{1b}id"] {
+            let lc = BucketLifecycleConfiguration {
+                expiry_updated_at: None,
+                rules: vec![LifecycleRule {
+                    status: ExpirationStatus::from_static(ExpirationStatus::ENABLED),
+                    expiration: Some(LifecycleExpiration {
+                        days: Some(30),
+                        ..Default::default()
+                    }),
+                    abort_incomplete_multipart_upload: None,
+                    del_marker_expiration: None,
+                    filter: None,
+                    id: Some(id.to_owned()),
+                    noncurrent_version_expiration: None,
+                    noncurrent_version_transitions: None,
+                    prefix: None,
+                    transitions: None,
+                }],
+            };
+
+            let err = lc.validate(&ObjectLockConfiguration::default()).await.unwrap_err();
+
+            assert_eq!(err.to_string(), ERR_LIFECYCLE_INVALID_RULE_ID_CHARS, "{id:?}");
+        }
+    }
+
+    #[tokio::test]
     async fn validate_rejects_duplicate_rule_ids() {
         let lc = BucketLifecycleConfiguration {
             expiry_updated_at: None,

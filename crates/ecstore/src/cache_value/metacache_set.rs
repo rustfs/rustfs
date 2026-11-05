@@ -1237,8 +1237,8 @@ mod tests {
             forward_to: Some("pending/0099".to_owned()),
             ..Default::default()
         };
-        // Primary and fallback readers both construct their walk from the
-        // per-job clone, rather than directly from the request options.
+        // Both walks are built once from the shared options; the per-job clone
+        // must carry every field that the walk derives from the request.
         let job = request.clone();
         let walk = walk_dir_options(&job);
         assert_eq!(walk.hidden_entry_budget, 100);

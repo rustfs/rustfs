@@ -154,7 +154,7 @@ where
 
 async fn collect_response_body_inner<B>(
     body: B,
-    limit: Option<usize>,
+    limit: usize,
     idle_timeout: Option<StdDuration>,
 ) -> Result<Vec<u8>, std::io::Error>
 where
@@ -167,7 +167,7 @@ where
         let Some(new_len) = body_vec.len().checked_add(data.len()) else {
             return Err(response_body_exceeds_limit_error());
         };
-        if limit.is_some_and(|limit| new_len > limit) {
+        if new_len > limit {
             return Err(response_body_exceeds_limit_error());
         }
         body_vec.extend_from_slice(&data);
@@ -180,7 +180,7 @@ where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    collect_response_body_inner(body, Some(limit), None).await
+    collect_response_body_inner(body, limit, None).await
 }
 
 /// Keep the remote body with its reader; idle and range errors surface while reading.
@@ -828,7 +828,7 @@ impl TransitionClient {
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        collect_response_body_inner(body, Some(limit), Some(self.timeouts.response_body_idle_timeout)).await
+        collect_response_body_inner(body, limit, Some(self.timeouts.response_body_idle_timeout)).await
     }
 
     async fn new_request(
@@ -1782,7 +1782,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             StdDuration::from_millis(200),
-            collect_response_body_inner(body, Some(1), Some(StdDuration::from_millis(50))),
+            collect_response_body_inner(body, 1, Some(StdDuration::from_millis(50))),
         )
         .await
         .expect("the collector should enforce its own body idle timeout")

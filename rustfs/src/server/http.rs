@@ -1734,10 +1734,19 @@ where
             let deadline = tokio::time::Instant::now() + total_timeout;
             let collected = tokio::time::timeout_at(deadline, async {
                 let mut bytes = bytes::BytesMut::new();
-                while let Some(frame) = tokio::time::timeout(idle_timeout, request.body_mut().frame())
-                    .await
-                    .map_err(|_| "RequestTimeout")?
-                {
+                loop {
+                    // Zero disables inactivity detection, as everywhere else this knob is read.
+                    let next_frame = request.body_mut().frame();
+                    let frame = if idle_timeout.is_zero() {
+                        next_frame.await
+                    } else {
+                        tokio::time::timeout(idle_timeout, next_frame)
+                            .await
+                            .map_err(|_| "RequestTimeout")?
+                    };
+                    let Some(frame) = frame else {
+                        break;
+                    };
                     if tokio::time::Instant::now() >= deadline {
                         return Err("RequestTimeout");
                     }

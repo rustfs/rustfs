@@ -5120,6 +5120,13 @@ fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<
 // slot indefinitely. Timeout drops the primary and lets the tee drain to disk.
 const ODM_INLINE_CLIENT_IDLE_BUDGET: Duration = Duration::from_secs(30);
 const ODM_INLINE_CLIENT_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+/// An honest client is granted at least this rate before the total budget ends
+/// its inline body; the flat floor above still applies to small objects.
+const ODM_INLINE_CLIENT_MIN_BYTES_PER_SEC: u64 = 64 * 1024;
+
+fn odm_inline_client_total_budget(size_bytes: u64) -> Duration {
+    ODM_INLINE_CLIENT_TOTAL_BUDGET.max(Duration::from_secs(size_bytes.div_ceil(ODM_INLINE_CLIENT_MIN_BYTES_PER_SEC)))
+}
 
 /// Feeds the tee primary through a channel because its source is `!Sync`.
 /// Dropping the body or exhausting a downstream budget drops the primary and
@@ -5262,7 +5269,7 @@ async fn odm_get_inline<S: OdmGetSource>(
         &head,
         content_length,
         content_range,
-        odm_inline_client_body(primary, ODM_INLINE_CLIENT_IDLE_BUDGET, ODM_INLINE_CLIENT_TOTAL_BUDGET),
+        odm_inline_client_body(primary, ODM_INLINE_CLIENT_IDLE_BUDGET, odm_inline_client_total_budget(head.size)),
     ));
     let commit_state = Arc::clone(state);
     let commit_key = key.to_string();

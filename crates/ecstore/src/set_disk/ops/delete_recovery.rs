@@ -1610,7 +1610,7 @@ mod tests {
             &outcomes[1],
             Ok(crate::disk::DeleteRecoverySettlementOutcome::ReceiptPublishedInspectionDeferred)
         ));
-        assert!(outcomes[3].is_err());
+        assert!(matches!(outcomes[3], Err(crate::disk::error::DiskError::DeleteRecoveryWorkLimit)));
         assert!(has_receipt_quorum(&outcomes, 3));
         assert!(!has_receipt_quorum(&outcomes, 4));
         outcomes[2] = Err(DiskError::FileAccessDenied);

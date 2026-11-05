@@ -209,19 +209,6 @@ impl ByteStream for MaxContentLengthStream {
     }
 }
 
-#[cfg(test)]
-pub(super) fn guard_put_object_body_read_timeout(
-    body: StreamingBlob,
-    bucket: &str,
-    key: &str,
-    request_id: &str,
-    expected: Option<i64>,
-    timeout: Duration,
-) -> StreamingBlob {
-    super::request_body::guard_upload_progress(body, timeout, bucket, key, request_id, expected.unwrap_or_default().max(0) as u64)
-        .0
-}
-
 pub(super) struct PooledBufferReader {
     buffer: PooledBuffer,
     len: usize,
@@ -2972,13 +2959,13 @@ mod tests {
         // Inner stream never yields and never reports EOF (a proxy that forwarded
         // a partial body then went silent while holding the connection open).
         let inner = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let mut guarded = guard_put_object_body_read_timeout(
+        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
             inner,
+            Duration::from_millis(1),
             "test-bucket",
             "stalled-object",
             "req-1",
-            Some(1024),
-            Duration::from_millis(1),
+            1024,
         );
 
         let err = guarded
@@ -3004,8 +2991,14 @@ mod tests {
         let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"hello world")));
         assert_eq!(body.remaining_length().exact(), Some(11));
 
-        let mut guarded =
-            guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-2", Some(11), Duration::from_secs(60));
+        let (mut guarded, _) = super::super::request_body::guard_upload_progress(
+            body,
+            Duration::from_secs(60),
+            "test-bucket",
+            "ok-object",
+            "req-2",
+            11,
+        );
         // remaining_length must be forwarded, not reset to unknown.
         assert_eq!(guarded.remaining_length().exact(), Some(11));
 
@@ -3019,7 +3012,8 @@ mod tests {
     #[tokio::test]
     async fn put_object_body_read_timeout_guard_disabled_passthrough() {
         let body = StreamingBlob::from(s3s::Body::from(Bytes::from_static(b"data")));
-        let mut guarded = guard_put_object_body_read_timeout(body, "test-bucket", "ok-object", "req-3", Some(4), Duration::ZERO);
+        let (mut guarded, _) =
+            super::super::request_body::guard_upload_progress(body, Duration::ZERO, "test-bucket", "ok-object", "req-3", 4);
 
         let mut collected = Vec::new();
         while let Some(chunk) = guarded.next().await {

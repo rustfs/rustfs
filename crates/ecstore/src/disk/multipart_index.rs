@@ -9,7 +9,7 @@ use uuid::Uuid;
 pub(crate) const RUSTFS_MULTIPART_BUCKET_KEY: &str = "x-rustfs-internal-multipart-bucket";
 pub(crate) const RUSTFS_MULTIPART_OBJECT_KEY: &str = "x-rustfs-internal-multipart-object";
 
-pub const MULTIPART_INDEX_PAGE_SIZE: usize = 256;
+pub(crate) const MULTIPART_INDEX_PAGE_SIZE: usize = 256;
 
 /// A bounded page from one disk's continuously maintained, boot-local index.
 /// `epoch` changes whenever coverage must be rebuilt; callers must not combine
@@ -127,10 +127,13 @@ impl MultipartIndexPage {
                 .iter()
                 .any(|root| !valid_root(root) || marker.is_some_and(|marker| root.as_str() <= marker))
             || self.roots.windows(2).any(|pair| pair[0] >= pair[1])
-            || self
-                .next_marker
-                .as_ref()
-                .is_some_and(|marker| self.roots.last() != Some(marker) || self.roots.len() != MULTIPART_INDEX_PAGE_SIZE)
+            // The cursor names the last examined marker; pruning may leave fewer
+            // live roots than examined names, so it only has to bound them.
+            || self.next_marker.as_ref().is_some_and(|next| {
+                !valid_root(next)
+                    || marker.is_some_and(|marker| next.as_str() <= marker)
+                    || self.roots.last().is_some_and(|last| last > next)
+            })
         {
             return Err(crate::disk::error::DiskError::FileCorrupt);
         }
@@ -240,6 +243,43 @@ mod tests {
         page.epoch = Uuid::new_v4();
         assert!(verify(&request, &page).is_err(), "boot-local coverage epoch is signed");
     }
+    #[test]
+    fn multipart_index_page_cursor_bounds_roots_without_requiring_a_full_page() {
+        let disk = Uuid::new_v4();
+        let page = |roots: Vec<String>, next_marker: Option<String>| MultipartIndexPage {
+            bucket: "bucket".into(),
+            disk_id: disk,
+            epoch: Uuid::new_v4(),
+            roots,
+            next_marker,
+        };
+        // Pruning leaves fewer live roots than examined names; the cursor still advances.
+        page(vec![format!("{:064x}", 1)], Some(format!("{:064x}", 5)))
+            .validate("bucket", None, disk)
+            .expect("short page with a cursor");
+        page(vec![], Some(format!("{:064x}", 5)))
+            .validate("bucket", Some(&format!("{:064x}", 2)), disk)
+            .expect("all examined names pruned");
+        assert!(
+            page(vec![format!("{:064x}", 6)], Some(format!("{:064x}", 5)))
+                .validate("bucket", None, disk)
+                .is_err(),
+            "a root beyond the cursor would be re-listed"
+        );
+        assert!(
+            page(vec![], Some(format!("{:064x}", 2)))
+                .validate("bucket", Some(&format!("{:064x}", 2)), disk)
+                .is_err(),
+            "the cursor must advance past the request marker"
+        );
+        assert!(
+            page(vec![], Some("not-a-sha".to_owned()))
+                .validate("bucket", None, disk)
+                .is_err(),
+            "the cursor is a marker name"
+        );
+    }
+
     #[tokio::test]
     async fn multipart_index_page_collection_rejects_replaced_disk_or_restarted_epoch() {
         let id = Uuid::new_v4();
@@ -268,7 +308,17 @@ mod tests {
                 std::future::ready(Ok(page))
             })
             .await;
-            assert!(result.is_err(), "changed physical source cannot contribute partial coverage");
+            // A replaced disk fails the page's identity check; a restarted
+            // epoch fails the cross-page continuity check.
+            let expected_corrupt = replace_disk;
+            assert!(
+                match &result {
+                    Err(crate::disk::error::DiskError::FileCorrupt) => expected_corrupt,
+                    Err(crate::disk::error::DiskError::DiskNotFound) => !expected_corrupt,
+                    _ => false,
+                },
+                "changed physical source cannot contribute partial coverage: {result:?}"
+            );
             assert!(replies.is_empty(), "exercise the continuation response");
         }
     }

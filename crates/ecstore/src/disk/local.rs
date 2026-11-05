@@ -185,13 +185,14 @@ const DELETE_RESIDUE_PROBE_LIMIT: i32 = 8;
 /// large residue tree, which then hides one level at a time instead.
 const DELETE_RESIDUE_PROBE_READ_BUDGET: usize = 32;
 
-/// One directory read owed by the delete-residue probe.
+/// What one bounded directory read found under a prefix.
 enum PrefixListingProbe {
     Visible,
     Empty,
     Cut(Vec<MetaCacheEntry>),
 }
 
+/// One directory read owed by the delete-residue probe.
 enum ResidueProbeStep {
     /// Read a bounded batch of `dir` and probe what it holds.
     Sample(String),

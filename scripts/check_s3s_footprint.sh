@@ -64,6 +64,10 @@ cd "$(dirname "$0")/.."
 # handlers from main (+3 invocation lines relative to release) and release's
 # other reductions. The merged tree measures 209 import files and 1586
 # invocation lines, tightening main's reviewed 1592-line baseline by six.
+# 1570 -> 1502 on 2026-11-05: the client-input scan batch (rustfs/rustfs#9172)
+# converted the admin router's existing s3_error! sites to S3Error constructors
+# while adding twelve new invocation lines elsewhere; measured 1502 on the
+# merged tree and retightened to it.
 S3S_IMPORT_FILES_BASELINE=209
 S3_ERROR_LINES_BASELINE=1502
 # ecstore-scoped ratchet (rustfs/backlog#1842): the storage engine must not

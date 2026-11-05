@@ -69,9 +69,6 @@ use tracing::{Instrument, debug, error, info, warn};
 use uuid::Uuid;
 
 const MAX_OBJECT_LIST: i32 = 1000;
-// const MAX_DELETE_LIST: i32 = 1000;
-// const MAX_UPLOADS_LIST: i32 = 10000;
-// const MAX_PARTS_LIST: i32 = 10000;
 
 const METACACHE_SHARE_PREFIX: bool = false;
 

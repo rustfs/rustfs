@@ -1151,13 +1151,15 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
     let object = ledger_object(bucket);
     let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
     let guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    match load_ledger_locked(Arc::clone(&store), &object).await {
-        Ok(ledger) if ledger.bucket_incarnation == incarnation => {}
-        Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {}
+    let retired = match load_ledger_locked(Arc::clone(&store), &object).await {
+        Ok(ledger) if ledger.bucket_incarnation == incarnation => ledger.bucket_incarnation,
+        Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {
+            ledger.bucket_incarnation
+        }
         Ok(_) => return Err(StorageError::PreconditionFailed),
         Err(StorageError::ConfigNotFound) => return Ok(()),
         Err(error) => return Err(error),
-    }
+    };
     if guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
             mode: "quota_ledger_retirement",
@@ -1173,10 +1175,26 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
     };
     options.add_namespace_lock_guard(&guard);
     match store.delete_object(RUSTFS_META_BUCKET, &object, options).await {
-        Ok(_) => Ok(()),
-        Err(error) if is_err_object_not_found(&error) => Ok(()),
-        Err(error) => Err(error),
+        Ok(_) => {}
+        Err(error) if is_err_object_not_found(&error) => {}
+        Err(error) => return Err(error),
     }
+    // The reconciliation throttle objects of this incarnation are residue once
+    // the ledger is gone; a job still finishing for it fails its configuration
+    // check before publishing.
+    let controls = ObjectOptions {
+        delete_prefix_object: true,
+        no_lock: true,
+        ..Default::default()
+    };
+    store
+        .delete_prefix(RUSTFS_META_BUCKET, &reconcile_control_prefix(&object, retired), &controls)
+        .await
+}
+
+/// Prefix of the reconciliation control objects of one bucket incarnation.
+fn reconcile_control_prefix(ledger_object: &str, incarnation: Uuid) -> String {
+    format!("{ledger_object}.reconcile/{incarnation}/")
 }
 
 async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_object: &str) -> Result<()> {
@@ -1342,9 +1360,8 @@ impl ReconcileJob {
 
     fn control_object(&self) -> String {
         format!(
-            "{}.reconcile/{}/{}",
-            ledger_object(&self.bucket),
-            self.bucket_incarnation,
+            "{}{}",
+            reconcile_control_prefix(&ledger_object(&self.bucket), self.bucket_incarnation),
             self.quota_revision.unix_timestamp_nanos()
         )
     }
@@ -1396,6 +1413,9 @@ impl ReconcileJob {
         // Persist the throttle before work, including bootstrap and failed scans.
         self.save_control(&control_object, &control, &guard).await?;
         let result = self.scan_and_publish(&guard).await;
+        // The throttle outlives a successful scan on purpose: denied requests
+        // keep scheduling the job, and they must not rescan a full bucket more
+        // than once per interval.
         control.next_attempt_at = now_unix().saturating_add(RECONCILE_RETRY_SECONDS);
         self.save_control(&control_object, &control, &guard).await?;
         result
@@ -2406,9 +2426,11 @@ mod tests {
         let object = job.control_object();
         let lock = job.store.new_ns_lock(RUSTFS_META_BUCKET, &object).await.expect("owner lock");
         let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await.expect("owner guard"));
-        let mut control: ReconcileControl =
-            serde_json::from_slice(&read_config_no_lock(Arc::clone(&job.store), &object).await.expect("control"))
-                .expect("control JSON");
+        // A completed scan removes its control object, which is already "expired".
+        let Ok(bytes) = read_config_no_lock(Arc::clone(&job.store), &object).await else {
+            return;
+        };
+        let mut control: ReconcileControl = serde_json::from_slice(&bytes).expect("control JSON");
         control.next_attempt_at = 0;
         fence_namespace_mutations(&job.store, RUSTFS_META_BUCKET, &object, None)
             .await
@@ -2779,6 +2801,21 @@ mod tests {
         crate::config::com::save_config(Arc::clone(&store), &ledger_path, serde_json::to_vec(&stale).expect("encode ledger"))
             .await
             .expect("persist crash-left reservation fixture");
+        // A throttled reconciliation of the old generation left its control object behind.
+        let stale_control =
+            ReconcileJob::new(Arc::clone(&store), bucket.clone(), old_incarnation, OffsetDateTime::now_utc()).control_object();
+        let control = ReconcileControl {
+            bucket_incarnation: old_incarnation,
+            quota_revision_unix_nanos: 0,
+            next_attempt_at: i64::MAX,
+        };
+        crate::config::com::save_config(
+            Arc::clone(&store),
+            &stale_control,
+            serde_json::to_vec(&control).expect("encode control"),
+        )
+        .await
+        .expect("persist stale reconciliation control");
 
         assert!(matches!(
             load_current_ledger_locked(Arc::clone(&store), &ledger_path, new_incarnation, OffsetDateTime::now_utc()).await,
@@ -2798,6 +2835,13 @@ mod tests {
             load_ledger_locked(Arc::clone(&store), &ledger_path).await,
             Err(StorageError::ConfigNotFound)
         ));
+        assert!(
+            matches!(
+                read_config_no_lock(Arc::clone(&store), &stale_control).await,
+                Err(StorageError::ConfigNotFound)
+            ),
+            "the retired generation's reconciliation control object goes with its ledger"
+        );
         let replacement =
             load_current_ledger_locked(Arc::clone(&store), &ledger_path, new_incarnation, OffsetDateTime::now_utc())
                 .await

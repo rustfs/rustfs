@@ -951,7 +951,8 @@ pub enum ShardIntegrityWriteMode {
 
 /// Shared foreground recovery allowance. Clones of ObjectOptions retain one request budget.
 /// Credits cover directory entries (including a minimum charge for an empty probe) and
-/// transaction inspections. Failed/cancelled probes keep their worst-case reservation.
+/// transaction inspections. Each bounded call is admitted while credits remain and is
+/// charged for the entries it visited when it completes.
 #[derive(Debug)]
 pub struct DeleteRecoveryWorkBudget {
     remaining: std::sync::atomic::AtomicU32,
@@ -971,7 +972,7 @@ impl Default for DeleteRecoveryWorkBudget {
 }
 
 impl DeleteRecoveryWorkBudget {
-    /// A per-request budget sized for `disks` concurrent up-front reservations.
+    /// A per-request budget sized for `disks` concurrently admitted recovery steps.
     pub(crate) fn for_disks(disks: usize) -> Self {
         let per_disk = u64::from(DELETE_RECOVERY_RESERVATION_PER_DISK) * 2;
         let scaled = u64::try_from(disks).unwrap_or(u64::MAX).saturating_mul(per_disk);

@@ -1761,14 +1761,15 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         Err(DiskError::MethodNotAllowed)
     }
     /// Bounded foreground inventory owns all traversal state until return or cancellation.
-    /// Unsupported peers must fail closed; callers must never fall back to paginated discovery.
+    /// An implementation without the bounded protocol is an unsupported participant;
+    /// callers must never fall back to paginated discovery.
     async fn discover_delete_transactions_bounded(
         &self,
         _volume: &str,
         _object: &str,
         _max_entries: u32,
     ) -> Result<BoundedDeleteRecoveryDiscovery> {
-        Err(DiskError::DeleteRecoveryWorkLimit)
+        Err(DiskError::MethodNotAllowed)
     }
     async fn inspect_delete_transaction_bounded(
         &self,
@@ -1777,7 +1778,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         _transaction: Uuid,
         _max_entries: u32,
     ) -> Result<BoundedDeleteRecoveryInspection> {
-        Err(DiskError::DeleteRecoveryWorkLimit)
+        Err(DiskError::MethodNotAllowed)
     }
     async fn settle_delete_transaction_bounded(
         &self,
@@ -1785,7 +1786,7 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         _request: BoundedDeleteRecoverySettlement,
         _namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Result<BoundedDeleteRecoverySettlementReply> {
-        Err(DiskError::DeleteRecoveryWorkLimit)
+        Err(DiskError::MethodNotAllowed)
     }
     /// A read-only capability check; unsupported implementations must fail closed.
     async fn supports_guarded_delete_versions(&self) -> Result<()> {

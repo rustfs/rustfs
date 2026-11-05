@@ -21012,6 +21012,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
     async fn seed_retained_null_version(
         store: &Arc<crate::store::ECStore>,
         bucket: &str,
@@ -21069,6 +21070,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "test-util")]
     async fn assert_retained_null_version_body(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
         let mut reader = store
             .get_object_reader(
@@ -21092,6 +21094,10 @@ mod tests {
         assert_eq!(body, b"protected null version");
     }
 
+    /// A versionless delete removes the null version, so the Object Lock check
+    /// must judge that version even when a UUID version or delete marker is
+    /// the key's latest entry (rustfs/backlog#3017).
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn null_version_object_lock_delete_checks_actual_target() {
@@ -21229,6 +21235,11 @@ mod tests {
         }
     }
 
+    /// A versionless PUT or multipart completion replaces the null version in
+    /// place, so the commit-time WORM gate must judge that version even when a
+    /// UUID version or delete marker is the key's latest entry
+    /// (rustfs/backlog#3019).
+    #[cfg(feature = "test-util")]
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn null_version_object_lock_put_and_multipart_preserve_retained_target() {

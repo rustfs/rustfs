@@ -1710,8 +1710,8 @@ mod tests {
         // covers every variant and picks up newly appended ones automatically.
         let all_variants: Vec<DiskError> = (1u32..).map_while(DiskError::from_u32).collect();
         assert!(
-            all_variants.len() >= 42,
-            "DiskError variant enumeration shrank: got {}, expected at least 42",
+            all_variants.len() >= 46,
+            "DiskError variant enumeration shrank: got {}, expected at least 46",
             all_variants.len()
         );
 

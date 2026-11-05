@@ -3841,7 +3841,7 @@ mod tests {
         time::advance(SLOW_DISK_OPERATION_THRESHOLD - Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut operation).is_pending());
         assert!(
-            !logs.contents().contains("disk_operation_slow"),
+            !logs.contents().contains("disk_operation_slow") && !logs.contents().contains("WARN"),
             "normal disk latency should not warn: {}",
             logs.contents()
         );

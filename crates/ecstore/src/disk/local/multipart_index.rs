@@ -1,7 +1,9 @@
 // Copyright 2026 RustFS Team
 // SPDX-License-Identifier: Apache-2.0
 
-//! Append-only bucket-to-staging-root candidates. Source metadata stays authoritative.
+//! Bucket-to-staging-root candidates: one marker per staging root, recorded
+//! before the root is published and pruned once the root is gone. Source
+//! metadata stays authoritative.
 
 use super::{LocalDisk, read_metadata_only_std};
 use crate::disk::{
@@ -27,6 +29,9 @@ use uuid::Uuid;
 
 const INDEX: &str = ".rustfs.sys/multipart-index-v1";
 const REBUILD_DIRENTS_PER_JOB: usize = 64;
+/// A marker is recorded before its staging root is published. A marker younger
+/// than this without a root is an upload in flight, never a leftover to prune.
+const MULTIPART_INDEX_PRUNE_GRACE: std::time::Duration = std::time::Duration::from_secs(300);
 type DirectoryEntries = Box<dyn Iterator<Item = io::Result<String>> + Send>;
 type PhysicalRoot = (u64, [u8; 16]);
 static OWNERS: LazyLock<parking_lot::Mutex<HashMap<PhysicalRoot, Weak<IndexOwner>>>> =
@@ -114,6 +119,23 @@ impl IndexDirectory {
         {
             std::fs::File::open(self.path.join(name))
         }
+    }
+    fn modified(&self, name: &str) -> io::Result<std::time::SystemTime> {
+        #[cfg(unix)]
+        {
+            self.open_file(name)?.metadata()?.modified()
+        }
+        #[cfg(not(unix))]
+        {
+            std::fs::metadata(self.path.join(name))?.modified()
+        }
+    }
+    /// Whether the marker is still inside the publication grace period.
+    fn marker_is_young(&self, name: &str) -> bool {
+        self.modified(name)
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .is_some_and(|age| age < MULTIPART_INDEX_PRUNE_GRACE)
     }
     fn remove_file(&self, name: &str) -> io::Result<()> {
         #[cfg(unix)]
@@ -369,7 +391,8 @@ impl IndexOwner {
             // The index is boot-local: every start rescans the staging area
             // before serving it, so a marker lost to a crash is recreated before
             // it can be consulted. Creation is enough; no fsync of the marker or
-            // its ancestors, and an existing marker costs one failed open.
+            // its ancestors. An existing marker is touched so pruning sees the
+            // new upload's age, not the previous one's.
             match openat(
                 parent,
                 source_root,
@@ -381,7 +404,10 @@ impl IndexOwner {
                         return Err(io::Error::other("index marker is not a file"));
                     }
                 }
-                Err(rustix::io::Errno::EXIST) => {}
+                Err(rustix::io::Errno::EXIST) => {
+                    let marker = openat(parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())?;
+                    std::fs::File::from(marker).set_modified(std::time::SystemTime::now())?;
+                }
                 Err(error) => return Err(error.into()),
             }
         }
@@ -579,7 +605,13 @@ impl IndexOwner {
                 match owner.directory(&Path::new(RUSTFS_META_MULTIPART_BUCKET).join(&root)) {
                     Ok(_) => live.push(root),
                     Err(error) if matches!(error.kind(), io::ErrorKind::NotFound | io::ErrorKind::NotADirectory) => {
-                        stale.push(root)
+                        // The marker precedes its staging root; a young one is an
+                        // upload in flight and stays a candidate.
+                        if directory.as_ref().is_some_and(|index| index.marker_is_young(&root)) {
+                            live.push(root);
+                        } else {
+                            stale.push(root);
+                        }
                     }
                     Err(error) => return Err(DiskError::from(error)),
                 }
@@ -604,9 +636,9 @@ impl IndexOwner {
     }
 
     /// Remove one marker whose staging root was gone when a page examined it.
-    /// The marker's own namespace lease serializes this with `record_info`, and
-    /// the staging root is re-checked under that lease, so an upload created in
-    /// between keeps its marker.
+    /// The marker's own namespace lease serializes this with `record_info`; the
+    /// staging root and the marker's age are re-checked under that lease, so an
+    /// upload recorded in between keeps its marker.
     async fn prune_marker(self: &Arc<Self>, bucket: &str, root: &str) -> Result<()> {
         let owner = self.clone();
         let bucket_directory = Path::new(INDEX).join(sha(bucket));
@@ -625,6 +657,9 @@ impl IndexOwner {
                 Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
                 Err(error) => return Err(error),
             };
+            if directory.marker_is_young(&root) {
+                return Ok(());
+            }
             match directory.remove_file(&root) {
                 Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
                 _ => Ok(()),
@@ -848,15 +883,19 @@ mod tests {
         std::fs::create_dir_all(&directory).expect("marker directory");
         let live = format!("{:064x}", 1);
         let finished = format!("{:064x}", 2);
-        for name in [&live, &finished] {
+        let in_flight = format!("{:064x}", 3);
+        for name in [&live, &finished, &in_flight] {
             std::fs::write(directory.join(name), b"1").expect("marker");
         }
         // Completion and abort remove the staging root and leave the marker.
         std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&live)).expect("live staging root");
+        age_marker(&directory.join(&finished));
         let page = disk.multipart_index.page("bucket", None, Uuid::new_v4()).await.expect("page");
-        assert_eq!(page.roots, vec![live.clone()]);
+        // The in-flight marker has no staging root yet but is young: a candidate, not a leftover.
+        assert_eq!(page.roots, vec![live.clone(), in_flight.clone()]);
         assert!(page.next_marker.is_none());
         assert!(directory.join(&live).exists(), "a live root keeps its marker");
+        assert!(directory.join(&in_flight).exists(), "a marker inside the grace period is kept");
         assert!(!directory.join(&finished).exists(), "a finished root's marker is pruned");
         // The next page no longer pays for the pruned marker.
         let page = disk
@@ -864,7 +903,58 @@ mod tests {
             .page("bucket", None, Uuid::new_v4())
             .await
             .expect("page after pruning");
-        assert_eq!(page.roots, vec![live]);
+        assert_eq!(page.roots, vec![live, in_flight]);
+    }
+
+    /// Move a marker's modification time outside the publication grace period.
+    fn age_marker(marker: &Path) {
+        std::fs::File::options()
+            .write(true)
+            .open(marker)
+            .expect("marker")
+            .set_modified(std::time::SystemTime::now() - MULTIPART_INDEX_PRUNE_GRACE * 2)
+            .expect("age marker");
+    }
+
+    #[tokio::test]
+    async fn multipart_index_pruned_page_keeps_a_valid_cursor() {
+        let root = tempfile::tempdir().expect("disk root");
+        let disk = open(root.path()).await;
+        let directory = root.path().join(INDEX).join(sha("bucket"));
+        std::fs::create_dir_all(&directory).expect("marker directory");
+        let stale = format!("{:064x}", 7);
+        for i in 0..(MULTIPART_INDEX_PAGE_SIZE + 2) {
+            let name = format!("{i:064x}");
+            std::fs::write(directory.join(&name), b"1").expect("marker");
+            if name != stale {
+                std::fs::create_dir_all(root.path().join(RUSTFS_META_MULTIPART_BUCKET).join(&name)).expect("staging root");
+            }
+        }
+        age_marker(&directory.join(&stale));
+        let disk_id = Uuid::new_v4();
+        let first = disk.multipart_index.page("bucket", None, disk_id).await.expect("first page");
+        first
+            .validate("bucket", None, disk_id)
+            .expect("a pruned page still validates");
+        assert_eq!(first.roots.len(), MULTIPART_INDEX_PAGE_SIZE - 1, "the stale marker is not a root");
+        assert!(!first.roots.contains(&stale));
+        let cursor = first.next_marker.clone().expect("more markers follow");
+        assert_eq!(
+            cursor,
+            format!("{:064x}", MULTIPART_INDEX_PAGE_SIZE - 1),
+            "the cursor is the last examined name"
+        );
+        assert!(!directory.join(&stale).exists(), "the stale marker is pruned");
+        let second = disk
+            .multipart_index
+            .page("bucket", Some(&cursor), disk_id)
+            .await
+            .expect("second page");
+        second
+            .validate("bucket", Some(&cursor), disk_id)
+            .expect("continuation validates");
+        assert_eq!(second.roots.len(), 2);
+        assert!(second.next_marker.is_none());
     }
 
     #[cfg(unix)]

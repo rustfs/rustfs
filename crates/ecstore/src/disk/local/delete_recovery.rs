@@ -1404,7 +1404,10 @@ impl LocalDisk {
         let lease = os::acquire_namespace_mutation_lease_with_owner(&root, Some(owner)).await;
         let volume = volume.to_owned();
         let object = object.to_owned();
-        os::run_blocking_namespace_operation(lease, move || {
+        // Same lane as the unbounded inspection: a bulk delete inspects one
+        // transaction per key on every drive, and the one-worker foreground
+        // namespace lane would serialize those behind every other mutation.
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || {
             let budget = crate::object_api::DeleteRecoveryWorkBudget::new(max_entries);
             Ok(
                 inspection_with_markers_bounded(&root, &volume, &object, transaction, Some(&budget)).map(|(inspection, _)| {

@@ -5117,13 +5117,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn snowball_extract_body_guard_aborts_stalled_upload() {
         let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let mut guarded = guard_put_object_body_read_timeout(
+        let (mut guarded, _) = super::request_body::guard_upload_progress(
             body,
+            Duration::from_millis(1),
             "test-bucket",
             "archive.tar",
             "snowball-timeout",
-            Some(512),
-            Duration::from_millis(1),
+            512,
         );
 
         let err = guarded

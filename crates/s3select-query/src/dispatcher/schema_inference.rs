@@ -98,7 +98,7 @@ impl PrefixBoundary {
                         reader.read_record(&input[consumed..], &mut output, &mut ends[..MAX_SELECT_COLUMNS + 1 - *fields]);
                     consumed += read;
                     *fields += count;
-                    if *fields > MAX_SELECT_COLUMNS || result == ReadRecordResult::OutputEndsFull {
+                    if *fields > MAX_SELECT_COLUMNS {
                         return Err(DataFusionError::ResourcesExhausted(
                             "S3 Select CSV schema exceeds 1024 columns".to_owned(),
                         ));
