@@ -302,7 +302,7 @@ async fn scanner_heal_topology_rebalance_survives_live_writes_stop_and_restart()
         pause: Duration::from_millis(100),
     }));
     sleep(Duration::from_secs(2)).await;
-    stop_rebalance(&run.dist.cluster).await?;
+    stop_rebalance(&run.dist.cluster, &first_id).await?;
     let (first_outcome, first_status) = wait_for_rebalance_stopped_or_completed(&run, &first_id).await?;
     let ops = workload.await??;
     let live_state = expected_live_state(&ops);
