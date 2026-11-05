@@ -2446,7 +2446,7 @@ impl RemoteDisk {
     }
 
     /// Heuristic probe for 1.0.x peers that lack InspectOrphanDataDir RPC:
-    /// list the directory and accept only erasure-part leaf names.
+    /// list the directory and accept erasure parts plus delete-transaction witnesses.
     pub(crate) async fn is_plain_orphan_data_dir(&self, volume: &str, path: &str) -> Result<bool> {
         match self.list_dir("", volume, path, -1).await {
             Ok(entries) => Ok(entries.iter().all(|e| list_entry_is_orphan_data_dir_part(e))),
