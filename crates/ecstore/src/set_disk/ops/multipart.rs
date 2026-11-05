@@ -1989,12 +1989,19 @@ impl SetDisks {
                 roots.insert(Self::get_multipart_sha_dir(bucket, &encode_dir_object(prefix)));
             }
             let mut candidates = Vec::new();
-            for root in roots {
-                let (_, paths, _, _) = self
-                    .discover_multipart_upload_paths_on_disks(disks.clone(), bucket, prefix, &root, false)
-                    .await?;
+            let mut discoveries = futures::stream::iter(roots.into_iter().map(|root| {
+                let disks = disks.clone();
+                async move {
+                    self.discover_multipart_upload_paths_on_disks(disks, bucket, prefix, &root, false)
+                        .await
+                }
+            }))
+            .buffer_unordered(MULTIPART_LIST_IO_CONCURRENCY);
+            while let Some(discovered) = discoveries.next().await {
+                let (_, paths, _, _) = discovered?;
                 candidates.extend(paths);
             }
+            drop(discoveries);
             (disks, candidates, quorum, false)
         } else {
             self.discover_multipart_upload_paths(bucket, prefix, &root, false).await?

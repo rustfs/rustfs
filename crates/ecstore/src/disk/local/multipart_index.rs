@@ -356,18 +356,23 @@ impl IndexOwner {
                 directories.push(std::fs::File::from(directory));
             }
             let parent = directories.last().ok_or_else(|| io::Error::other("index parent missing"))?;
-            let marker = std::fs::File::from(openat(
+            // The index is boot-local: every start rescans the staging area
+            // before serving it, so a marker lost to a crash is recreated before
+            // it can be consulted. Creation is enough; no fsync of the marker or
+            // its ancestors, and an existing marker costs one failed open.
+            match openat(
                 parent,
                 source_root,
-                OFlags::CREATE | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
-            )?);
-            if !marker.metadata()?.is_file() {
-                return Err(io::Error::other("index marker is not a file"));
-            }
-            marker.sync_all()?;
-            for directory in directories.iter().rev() {
-                directory.sync_all()?;
+            ) {
+                Ok(marker) => {
+                    if !std::fs::File::from(marker).metadata()?.is_file() {
+                        return Err(io::Error::other("index marker is not a file"));
+                    }
+                }
+                Err(rustix::io::Errno::EXIST) => {}
+                Err(error) => return Err(error.into()),
             }
         }
         #[cfg(not(unix))]

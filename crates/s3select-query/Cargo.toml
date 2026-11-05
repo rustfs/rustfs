@@ -58,7 +58,7 @@ tracing = { workspace = true }
 
 [dev-dependencies]
 flate2.workspace = true
-rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
+rustfs-test-utils = { workspace = true }
 
 [lib]
 doctest = false

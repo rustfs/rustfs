@@ -999,8 +999,24 @@ impl DeleteRecoveryWorkBudget {
         self.remaining.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    pub(crate) fn refund(&self, unused: u32) {
-        self.remaining.fetch_add(unused, std::sync::atomic::Ordering::Release);
+    /// Admit one bounded disk call: refuse once the budget is spent, otherwise
+    /// cap the call at `maximum` or what remains. The work actually performed is
+    /// charged on completion with `charge`, so concurrent calls never exhaust
+    /// the budget by reservation alone (a bulk delete fans out dozens of
+    /// inspections per key); each call is still bounded by its own cap.
+    pub(crate) fn admit(&self, maximum: u32) -> crate::disk::error::Result<u32> {
+        match self.remaining() {
+            0 => Err(crate::disk::error::DiskError::DeleteRecoveryWorkLimit),
+            remaining => Ok(remaining.min(maximum)),
+        }
+    }
+
+    /// Record the entries a bounded call visited (at least one per call).
+    pub(crate) fn charge(&self, visited: u32) {
+        use std::sync::atomic::Ordering;
+        let _ = self.remaining.try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            Some(remaining.saturating_sub(visited.max(1)))
+        });
     }
 }
 

@@ -1552,10 +1552,10 @@ fn control_body_digest_required<B>(request: &HttpRequest<B>, virtual_host: Optio
     {
         return None;
     }
-    // Other configuration APIs keep their existing optional-MD5 contract, but
-    // an MD5 that is supplied (and signed by SigV2) must actually match.
+    // Other configuration APIs keep their optional-MD5 contract for SigV4,
+    // whose payload hash binds the body. A supplied MD5 must match, and a
+    // SigV2 request (which signs no body) must supply one.
     if request.method() == Method::PUT
-        && request.headers().contains_key("content-md5")
         && query.clone().any(|(key, value)| {
             (key == "x-id" && value.starts_with("Put") && value != "PutObject")
                 || matches!(
@@ -1706,8 +1706,17 @@ where
                 || url::form_urlencoded::parse(request.uri().query().unwrap_or_default().as_bytes())
                     .any(|(key, _)| key == "AWSAccessKeyId");
             let has_checksum = CONTROL_BODY_CHECKSUM_HEADERS.iter().any(|name| headers.contains_key(*name));
-            if required && !headers.contains_key("content-md5") && (sig_v2 || !has_checksum) {
+            let has_md5 = headers.contains_key("content-md5");
+            if required && !has_md5 && (sig_v2 || !has_checksum) {
                 return Ok(control_body_digest_error("MissingContentMD5"));
+            }
+            if !required && !has_md5 {
+                if sig_v2 {
+                    // SigV2 signs no body: a configuration PUT without a digest
+                    // could be replayed with another body.
+                    return Ok(control_body_digest_error("MissingContentMD5"));
+                }
+                return inner.call(request.map(control_request_body)).await;
             }
             if headers
                 .get("content-length")
@@ -4205,6 +4214,21 @@ mod tests {
             async { Ok::<_, Infallible>(Response::new(s3s::Body::empty())) }
         });
         let service = ControlBodyDigestService::new(inner, Duration::from_secs(1));
+        // SigV2 signs no body: a configuration PUT without Content-MD5 could be
+        // replayed with any other body, so it is refused.
+        let mut request = digest_v2_request(false, false, "digest-secret");
+        *request.method_mut() = Method::PUT;
+        *request.uri_mut() = "/bucket?versioning".parse().unwrap();
+        digest_error(service.clone().oneshot(request).await.unwrap(), "MissingContentMD5").await;
+        // A SigV4 configuration PUT keeps its optional-MD5 contract (the payload
+        // hash binds the body) and streams through without buffering.
+        let request = HttpRequest::builder()
+            .method("PUT")
+            .uri("/bucket?versioning")
+            .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
+            .unwrap();
+        assert_eq!(service.clone().oneshot(request).await.unwrap().status(), StatusCode::OK);
+        // A supplied MD5 must match on either signature version.
         let mut request = digest_v2_request(false, true, "digest-secret");
         *request.method_mut() = Method::PUT;
         *request.uri_mut() = "/bucket?versioning".parse().unwrap();
@@ -4216,7 +4240,7 @@ mod tests {
             .body(s3s::Body::from(String::from("<VersioningConfiguration/>")))
             .unwrap();
         digest_error(service.oneshot(request).await.unwrap(), "BadDigest").await;
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 
     type RateLimitTestCore = tower::util::BoxCloneService<

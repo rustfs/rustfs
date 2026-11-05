@@ -41,6 +41,11 @@ struct DiscoverySession {
     touched: Instant,
 }
 
+/// Plain (non-transaction) children of an object-scoped discovery root cost one
+/// budget entry per this many names: enough to bound a hostile prefix without
+/// making a real folder prefix undeletable.
+const PLAIN_CHILDREN_PER_BUDGET_ENTRY: u32 = 64;
+
 impl DiscoverySession {
     /// Consume one bounded step, returning ownership only when traversal remains.
     fn advance(self, limit: u32) -> std::io::Result<(Vec<DeleteTransactionId>, Option<Self>)> {
@@ -61,6 +66,7 @@ impl DiscoverySession {
         let mut transactions = BTreeSet::new();
         let mut seen_candidates = HashSet::new();
         let mut visited = 0u32;
+        let mut plain_children = 0u32;
         while !self.frames.is_empty()
             && transactions.len() < usize::try_from(limit).map_err(|_| std::io::Error::from(ErrorKind::InvalidInput))?
             && visited < max_entries
@@ -76,7 +82,6 @@ impl DiscoverySession {
                     continue;
                 }
             };
-            visited += 1;
             let name = entry
                 .file_name()
                 .into_string()
@@ -84,6 +89,19 @@ impl DiscoverySession {
             if !safe_path(&name, false) || name.contains('/') {
                 return Err(std::io::Error::from(ErrorKind::InvalidData));
             }
+            // An object-scoped scan only ever descends into transaction (UUID)
+            // directories at the root. Plain child keys of a prefix directory are
+            // skipped by name without a stat; they are charged at one entry per
+            // readdir batch so the work stays bounded while deleting a missing key
+            // that names a prefix with thousands of children can still complete.
+            if self.object.is_some() && parent.is_empty() && !canonical_uuid(&name).is_some_and(|id| !id.is_nil()) {
+                plain_children += 1;
+                if plain_children.is_multiple_of(PLAIN_CHILDREN_PER_BUDGET_ENTRY) {
+                    visited += 1;
+                }
+                continue;
+            }
+            visited += 1;
             let relative = if parent.is_empty() {
                 name.clone()
             } else {
@@ -6193,8 +6211,9 @@ mod tests {
         let (_temp, disk, _, _) = fixture().await;
         let path = disk.delete_discovery_path("recovery", Some("prefix")).expect("prefix path");
         fs::create_dir_all(&path).await.expect("physical prefix");
-        for index in 0..64 {
-            fs::create_dir(path.join(format!("child-{index}")))
+        // Transaction-shaped children are the entries a bounded probe pays for.
+        for _ in 0..64 {
+            fs::create_dir(path.join(Uuid::new_v4().to_string()))
                 .await
                 .expect("legitimate child");
         }

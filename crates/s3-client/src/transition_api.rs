@@ -831,14 +831,6 @@ impl TransitionClient {
         collect_response_body_inner(body, Some(limit), Some(self.timeouts.response_body_idle_timeout)).await
     }
 
-    pub async fn collect_response_body_unbounded<B>(&self, body: B) -> Result<Vec<u8>, std::io::Error>
-    where
-        B: Body<Data = Bytes>,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        collect_response_body_inner(body, None, Some(self.timeouts.response_body_idle_timeout)).await
-    }
-
     async fn new_request(
         &self,
         method: &http::Method,

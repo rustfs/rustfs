@@ -120,8 +120,9 @@ impl PrefixBoundary {
     }
 }
 
-/// Reads only complete inference records. Hitting the byte bound is an error,
-/// never a shorter successful sample that can silently omit later fields.
+/// Reads only complete inference records. Hitting the byte bound with no
+/// complete record is an error; with at least one complete record the sample
+/// is cut there, exactly as a short object or the record count would cut it.
 pub(super) async fn read_schema_prefix(
     mut stream: BoxStream<'static, std::result::Result<Bytes, ObjectStoreError>>,
     memory_pool: &Arc<dyn MemoryPool>,
@@ -135,6 +136,10 @@ pub(super) async fn read_schema_prefix(
         while offset < chunk.len() {
             let remaining = MAX_SCHEMA_PREFIX_BYTES - bytes.len();
             if remaining == 0 {
+                if parsed > 0 {
+                    bytes.truncate(parsed);
+                    return Ok(SchemaPrefix { bytes, reservation });
+                }
                 return Err(prefix_limit_error());
             }
             let end = chunk.len().min(offset + remaining);
