@@ -1331,9 +1331,9 @@ async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<Tabl
         .iter()
         .any(|claim| credentials.claims_or_empty().contains_key(*claim))
     {
-        return Err(s3_error!(
-            AccessDenied,
-            "table-scoped storage credentials cannot access the catalog control plane"
+        return Err(S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "table-scoped storage credentials cannot access the catalog control plane",
         ));
     }
     let iam = context.iam();
