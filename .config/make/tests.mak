@@ -28,7 +28,7 @@ script-tests: ## Run shell script tests
 	./scripts/test_build_rustfs_options.sh
 	./scripts/test_docker_runtime_timezone.sh
 	./scripts/test_entrypoint_credentials.sh
-	./scripts/test_entrypoint_log_directory.sh
+	./scripts/test_entrypoint_directories.sh
 	./scripts/test_internode_grpc_ab_bench.sh
 	./scripts/test_object_batch_bench_enhanced.sh
 	./scripts/test_package_service_scripts.sh
