@@ -205,7 +205,7 @@ impl super::Erasure {
         // the survivors. Reconstruction correctness is still guaranteed by the
         // read-side quorum check and parity cross-checks below, which are unaffected.
         let write_quorum = 1;
-        let mut writers = MultiWriter::new(writers, write_quorum);
+        let mut writers = MultiWriter::new(writers, super::encode::ShardWritePolicy::object(write_quorum));
         let read_timeout = get_object_disk_read_timeout();
         let shard_file_size = self.shard_file_size(total_length as i64) as usize;
 

@@ -359,6 +359,16 @@ impl LockClient for LocalClient {
         }
     }
 
+    async fn cleanup_grant(&self, lock_id: &LockId) -> Result<super::LockCleanupOutcome> {
+        self.release(lock_id).await.map(|released| {
+            if released {
+                super::LockCleanupOutcome::Released
+            } else {
+                super::LockCleanupOutcome::AlreadyAbsent
+            }
+        })
+    }
+
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
         let shard = self.get_shard(lock_id);
         let expired_entry = {
