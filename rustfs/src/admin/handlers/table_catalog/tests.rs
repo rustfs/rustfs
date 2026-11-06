@@ -1098,6 +1098,41 @@ async fn table_catalog_authentication_and_credentials_use_the_request_context() 
     assert!(Arc::ptr_eq(&resolved_store, &store));
 
     let mut request = request;
+    iam.set_policy(policy_name, Policy::parse_config(br#"{
+        "Version":"2012-10-17","Statement":[
+            {"Effect":"Allow","Action":["admin:GetTable","admin:CreatePluginDelegation"]},
+            {"Effect":"Deny","Action":["admin:GetTable","admin:CreatePluginDelegation"],"Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}
+        ]
+    }"#).unwrap()).await.unwrap();
+    request
+        .extensions
+        .insert(Some(crate::server::RemoteAddr("10.1.2.3:4567".parse().unwrap())));
+    request.headers.insert("x-forwarded-for", "10.1.2.3".parse().unwrap());
+    for (client, allowed) in [
+        (None, true),
+        (Some("203.0.113.17:7890"), false),
+        (Some("10.8.7.6:7890"), true),
+    ] {
+        request.extensions.remove::<rustfs_trusted_proxies::ClientInfo>();
+        if let Some(client) = client {
+            request
+                .extensions
+                .insert(rustfs_trusted_proxies::ClientInfo::direct(client.parse().unwrap()));
+        }
+        let unscoped = authorize_table_catalog_request(&request, AdminAction::GetTableAction).await;
+        let scoped = authorize_table_catalog_resource_request(&request, &resource, AdminAction::GetTableAction).await;
+        let delegated =
+            crate::admin::handlers::plugin_delegation::owner(&request, AdminAction::CreatePluginDelegationAction).await;
+        if allowed {
+            unscoped.expect("verified private address authorizes table catalog access");
+            scoped.expect("verified private address authorizes scoped table access");
+            delegated.expect("verified private address authorizes delegation");
+        } else {
+            assert_eq!(unscoped.expect_err("external client is denied").code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(scoped.err().expect("external client is denied").code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(delegated.err().expect("external client is denied").code(), &S3ErrorCode::AccessDenied);
+        }
+    }
     request.method = Method::POST;
     request.uri = "/iceberg/v1/request-warehouse/namespaces/analytics/tables/events/maintenance/worker/run"
         .parse()
@@ -6052,32 +6087,40 @@ async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct
         .rsplit_once('/')
         .map(|(prefix, _)| format!("{prefix}/"))
         .expect("metadata location should contain a file name");
+    // Both creates wrote a distinct initial metadata file under their own
+    // fresh table id; the loser's registration failed before any catalog
+    // write, so its file was removed again and only the winner's remains.
     let metadata_objects = metadata_backend
         .list_objects("warehouse", &metadata_prefix)
         .await
         .expect("metadata listing should succeed");
-    assert_eq!(metadata_objects.len(), 2);
-    assert_ne!(metadata_objects[0], metadata_objects[1]);
+    assert_eq!(metadata_objects, vec![winner_entry.metadata_location.clone()]);
+    let state = metadata_backend.state.lock().await;
+    let written = state
+        .put_attempts
+        .keys()
+        .filter(|(bucket, object)| bucket == "warehouse" && object.starts_with(&metadata_prefix))
+        .map(|(_, object)| object.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(written.len(), 2, "each create wrote its own initial metadata file: {written:?}");
+    let removed = state
+        .delete_attempts
+        .keys()
+        .filter(|(bucket, object)| bucket == "warehouse" && object.starts_with(&metadata_prefix))
+        .map(|(_, object)| object.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(removed.len(), 1, "only the loser's file is removed: {removed:?}");
+    assert_ne!(removed[0], winner_entry.metadata_location);
+    assert!(written.contains(&removed[0]));
+    drop(state);
 
-    let mut table_uuids = Vec::with_capacity(metadata_objects.len());
-    for metadata_object in metadata_objects {
-        let metadata = metadata_backend
-            .read_object("warehouse", &metadata_object)
-            .await
-            .expect("metadata lookup should succeed")
-            .expect("metadata object should exist");
-        let metadata: serde_json::Value = serde_json::from_slice(&metadata.data).expect("metadata object should contain JSON");
-        table_uuids.push(
-            metadata["table-uuid"]
-                .as_str()
-                .expect("metadata should contain table uuid")
-                .to_string(),
-        );
-    }
-    table_uuids.sort();
-    table_uuids.dedup();
-    assert_eq!(table_uuids.len(), 2);
-    assert!(table_uuids.contains(&winner_entry.table_uuid));
+    let metadata = metadata_backend
+        .read_object("warehouse", &winner_entry.metadata_location)
+        .await
+        .expect("metadata lookup should succeed")
+        .expect("metadata object should exist");
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.data).expect("metadata object should contain JSON");
+    assert_eq!(metadata["table-uuid"].as_str(), Some(winner_entry.table_uuid.as_str()));
 }
 
 #[tokio::test]
@@ -18548,6 +18591,17 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
         (
             "directory-denied",
             serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:*"]},{"Effect":"Deny","Action":["admin:MigrateTableCatalog"]}]}),
+            false,
+        ),
+        (
+            "directory-warehouse-denied",
+            serde_json::json!({
+                "Version":"2012-10-17",
+                "Statement":[
+                    {"Effect":"Allow","Action":["admin:*"],"Resource":"*"},
+                    {"Effect":"Deny","Action":["admin:MigrateTableCatalog"],"Resource":"arn:aws:s3:::warehouse"}
+                ]
+            }),
             false,
         ),
         (

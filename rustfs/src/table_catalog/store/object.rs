@@ -532,6 +532,17 @@ where
         Ok(guard)
     }
 
+    async fn metadata_maintenance_publication(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCommitLockPublication<'_, B>> {
+        let publication = TableCommitLockPublication::new(&self.backend);
+        publication.attach_catalog_migration_read_guard(self.acquire_object_backed_catalog_write_permit(table_bucket).await?)?;
+        let bucket_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
+        publication.attach_maintenance_bucket_read_guard(table_bucket, bucket_guard)?;
+        Ok(publication)
+    }
+
     async fn list_entry_page<T, P, V>(
         &self,
         prefix: &str,
@@ -4669,8 +4680,8 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
-        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
+        let publication = self.metadata_maintenance_publication(table_bucket).await?;
+        let _completion = TableCommitPublicationCompletion::new(&publication);
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let namespace_name = namespace.public_name();
         let table_name = table.as_str().to_string();
@@ -4717,7 +4728,7 @@ where
             .await?
         };
 
-        let (report, effective, delete) = {
+        let (report, effective) = {
             let _guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
             let Some((entry, _)) = self.read_table_with_etag_unlocked(table_bucket, &namespace, &table).await? else {
                 return Err(TableCatalogStoreError::NotFound(format!(
@@ -4801,11 +4812,10 @@ where
             );
             self.put_table_metadata_maintenance_report_for_entry(&report, &entry).await?;
 
-            let delete = matches!(report.job.operation, TableMetadataMaintenanceOperation::Delete);
-            (report, effective, delete)
+            (report, effective)
         };
 
-        self.finish_table_metadata_maintenance_run(table_bucket, &namespace_name, &table_name, delete, &effective, report)
+        self.finish_table_metadata_maintenance_run(table_bucket, &namespace_name, &table_name, &publication, &effective, report)
             .await
     }
 
@@ -5726,32 +5736,21 @@ where
         table: &str,
         retain_recent_metadata_files: usize,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let namespace = parse_namespace_for_store(namespace)?;
-        let table = parse_table_for_store(table)?;
-        let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
-            return Err(TableCatalogStoreError::NotFound(format!(
-                "table {}/{}/{}",
-                table_bucket,
-                namespace.public_name(),
-                table.as_str()
-            )));
-        };
-        self.ensure_exclusive_maintenance_roots(&entry, None).await?;
-        self.plan_table_metadata_maintenance_for_entry_with_scope(&entry, retain_recent_metadata_files, false)
-            .await
-    }
-
-    #[allow(
-        dead_code,
-        reason = "helper for scoped planning; public planner uses with_scope(false) after exclusive-root checks"
-    )]
-    pub(super) async fn plan_table_metadata_maintenance_for_entry(
-        &self,
-        entry: &TableEntry,
-        retain_recent_metadata_files: usize,
-    ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        self.plan_table_metadata_maintenance_for_entry_with_scope(entry, retain_recent_metadata_files, true)
-            .await
+        self.with_table_maintenance_read(table_bucket, async {
+            let namespace = parse_namespace_for_store(namespace)?;
+            let table = parse_table_for_store(table)?;
+            let Some((entry, _)) = self.read_table_with_etag(table_bucket, &namespace, &table).await? else {
+                return Err(TableCatalogStoreError::NotFound(format!(
+                    "table {}/{}/{}",
+                    table_bucket,
+                    namespace.public_name(),
+                    table.as_str()
+                )));
+            };
+            self.plan_table_metadata_maintenance_for_entry(&entry, retain_recent_metadata_files)
+                .await
+        })
+        .await
     }
 
     async fn ensure_exclusive_metadata_cleanup_scope(
@@ -5759,7 +5758,7 @@ where
         entry: &TableEntry,
         publication_fenced: bool,
     ) -> TableCatalogStoreResult<()> {
-        let directory = table_metadata_dir_path_for_entry(entry)?;
+        let roots = maintenance_cleanup_roots(entry)?;
         let owners = if publication_fenced {
             // Cleanup already holds the bucket publication permit. Every table
             // entry mutation needs its write side, so these entries are stable.
@@ -5792,40 +5791,34 @@ where
             .await?
         };
         for owner in owners {
-            if owner.state != TableCatalogEntryState::Active
+            if owner.state == TableCatalogEntryState::Deleted
                 || (owner.namespace == entry.namespace && owner.table == entry.table && owner.table_id == entry.table_id)
             {
                 continue;
             }
-            let other_directory = table_metadata_dir_path_for_entry(&owner)?;
-            if directory == other_directory
-                || directory.starts_with(&format!("{other_directory}/"))
-                || other_directory.starts_with(&format!("{directory}/"))
-            {
+            let other_roots = maintenance_cleanup_roots(&owner)?;
+            if roots.iter().any(|root| {
+                other_roots
+                    .iter()
+                    .any(|other_root| warehouse_object_prefixes_overlap(root, other_root))
+            }) {
                 return Err(TableCatalogStoreError::Conflict(
-                    "metadata cleanup directory overlaps another active table owner".to_string(),
+                    "table maintenance requires exclusive metadata and warehouse roots".to_string(),
                 ));
             }
         }
         Ok(())
     }
 
-    async fn plan_table_metadata_maintenance_for_entry_with_scope(
+    async fn plan_table_metadata_maintenance_for_entry(
         &self,
         entry: &TableEntry,
         retain_recent_metadata_files: usize,
-        entry_aware: bool,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let table_bucket = &entry.table_bucket;
         let namespace = parse_namespace_for_store(&entry.namespace)?;
         let table = parse_table_for_store(&entry.table)?;
-        let is_valid_location = |location: &str| {
-            if entry_aware {
-                is_valid_table_metadata_location_for_entry(entry, location)
-            } else {
-                is_valid_table_metadata_location(&namespace, &table, location)
-            }
-        };
+        let is_valid_location = |location: &str| is_valid_table_metadata_location_for_entry(entry, location);
         if !is_valid_location(&entry.metadata_location) {
             return Err(TableCatalogStoreError::Invalid(
                 "current metadata location must be inside the table metadata directory".to_string(),
@@ -5861,20 +5854,11 @@ where
         );
 
         let mut metadata_locations = Vec::new();
-        let metadata_dir = if entry_aware {
-            table_metadata_dir_path_for_entry(entry)?
-        } else {
-            default_table_metadata_dir_path(&namespace, &table)
-        };
+        let metadata_dir = table_metadata_dir_path_for_entry(entry)?;
         let metadata_prefix = format!("{metadata_dir}/");
         for object in self.backend.list_objects(table_bucket, &metadata_prefix).await? {
-            let metadata_location = if entry_aware {
-                is_valid_location(&object).then_some(object)
-            } else {
-                metadata_location_from_metadata_file_path(&namespace, &table, &object)
-            };
-            if let Some(metadata_location) = metadata_location {
-                metadata_locations.push(metadata_location);
+            if is_valid_location(&object) {
+                metadata_locations.push(object);
             }
         }
         metadata_locations.sort();
@@ -5891,26 +5875,14 @@ where
                 );
             }
         }
-        let protected_refs = if entry_aware {
-            metadata_locations_for_protected_snapshot_refs_matching(
-                &self.backend,
-                table_bucket,
-                &current_metadata,
-                &metadata_locations,
-                is_valid_location,
-            )
-            .await?
-        } else {
-            metadata_locations_for_protected_snapshot_refs(
-                &self.backend,
-                table_bucket,
-                &namespace,
-                &table,
-                &current_metadata,
-                &metadata_locations,
-            )
-            .await?
-        };
+        let protected_refs = metadata_locations_for_protected_snapshot_refs_matching(
+            &self.backend,
+            table_bucket,
+            &current_metadata,
+            &metadata_locations,
+            is_valid_location,
+        )
+        .await?;
         for metadata_location in protected_refs {
             retained.insert(metadata_location.clone());
             insert_metadata_maintenance_reason(
@@ -5961,51 +5933,25 @@ where
         let current_metadata_location = entry.metadata_location.clone();
         let retained_metadata_locations = retained.into_iter().collect::<Vec<_>>();
         let object_reports = metadata_maintenance_object_reports(maintenance_reasons);
-        let referenced_object_reports = if entry_aware {
-            metadata_maintenance_referenced_object_reports_for_entry(
-                &self.backend,
-                entry,
-                warehouse_object_prefix.as_deref(),
-                &current_metadata,
-                &retained_metadata_locations,
-            )
-            .await?
-        } else {
-            metadata_maintenance_referenced_object_reports(
-                &self.backend,
-                table_bucket,
-                &namespace,
-                &table,
-                warehouse_object_prefix.as_deref(),
-                &current_metadata,
-                &retained_metadata_locations,
-            )
-            .await?
-        };
+        let referenced_object_reports = metadata_maintenance_referenced_object_reports_for_entry(
+            &self.backend,
+            entry,
+            warehouse_object_prefix.as_deref(),
+            &current_metadata,
+            &retained_metadata_locations,
+        )
+        .await?;
         let reachability_graph =
             metadata_maintenance_reachability_graph_report(planned_metadata_file_count, &referenced_object_reports);
         let (planned_object_file_count, cleanup_object_candidate_locations, deletable_object_locations, object_cleanup_reports) =
-            if entry_aware {
-                metadata_maintenance_object_cleanup_reports_for_entry(
-                    &self.backend,
-                    entry,
-                    warehouse_object_prefix.as_deref(),
-                    &referenced_object_reports,
-                    now,
-                )
-                .await?
-            } else {
-                metadata_maintenance_object_cleanup_reports(
-                    &self.backend,
-                    table_bucket,
-                    &namespace,
-                    &table,
-                    warehouse_object_prefix.as_deref(),
-                    &referenced_object_reports,
-                    now,
-                )
-                .await?
-            };
+            metadata_maintenance_object_cleanup_reports_for_entry(
+                &self.backend,
+                entry,
+                warehouse_object_prefix.as_deref(),
+                &referenced_object_reports,
+                now,
+            )
+            .await?;
 
         let mut report = table_maintenance_report_with_recommended_actions(TableMetadataMaintenanceReport {
             job: TableMetadataMaintenanceJob {
@@ -6138,8 +6084,8 @@ where
         worker_id: Option<String>,
         effective: TableMaintenanceEffectiveConfig,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
-        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
+        let publication = self.metadata_maintenance_publication(table_bucket).await?;
+        let _completion = TableCommitPublicationCompletion::new(&publication);
         let mut report = self
             .plan_table_metadata_maintenance(table_bucket, namespace, table, effective.config.retain_recent_metadata_files)
             .await?;
@@ -6176,7 +6122,7 @@ where
         );
         self.put_table_metadata_maintenance_report_unfenced(&report).await?;
 
-        self.finish_table_metadata_maintenance_run(table_bucket, namespace, table, delete, &effective, report)
+        self.finish_table_metadata_maintenance_run(table_bucket, namespace, table, &publication, &effective, report)
             .await
     }
 
@@ -6185,10 +6131,11 @@ where
         table_bucket: &str,
         namespace: &str,
         table: &str,
-        delete: bool,
+        publication: &TableCommitLockPublication<'_, B>,
         effective: &TableMaintenanceEffectiveConfig,
         mut report: TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
+        let delete = report.job.operation == TableMetadataMaintenanceOperation::Delete;
         if delete && !effective.config.delete_enabled {
             let finished_at = OffsetDateTime::now_utc();
             let before_status = Some(report.job.status.clone());
@@ -6214,7 +6161,7 @@ where
         if delete {
             let running_report = report.clone();
             let mut deleted = match self
-                .delete_table_metadata_maintenance_report_unfenced(table_bucket, namespace, table, report)
+                .delete_table_metadata_maintenance_report_with_bucket_permit(table_bucket, namespace, table, report, publication)
                 .await
             {
                 Ok(report) => report,
@@ -6399,25 +6346,22 @@ where
         table: &str,
         report: TableMetadataMaintenanceReport,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
-        let _migration_guard = self.acquire_object_backed_catalog_write_permit(table_bucket).await?;
-        let _publication_guard = self.acquire_table_maintenance_publication_permit(table_bucket).await?;
-        self.delete_table_metadata_maintenance_report_unfenced(table_bucket, namespace, table, report)
+        let publication = self.metadata_maintenance_publication(table_bucket).await?;
+        let _completion = TableCommitPublicationCompletion::new(&publication);
+        self.delete_table_metadata_maintenance_report_with_bucket_permit(table_bucket, namespace, table, report, &publication)
             .await
     }
 
-    async fn delete_table_metadata_maintenance_report_unfenced(
+    async fn delete_table_metadata_maintenance_report_with_bucket_permit(
         &self,
         table_bucket: &str,
         namespace: &str,
         table: &str,
         report: TableMetadataMaintenanceReport,
+        publication: &TableCommitLockPublication<'_, B>,
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         let namespace = parse_namespace_for_store(namespace)?;
         let table = parse_table_for_store(table)?;
-
-        let publication = TableCommitLockPublication::new(&self.backend);
-        publication.begin_table_bucket(table_bucket).await?;
-        let _publication_completion = TableCommitPublicationCompletion::new(&publication);
         self.ensure_no_active_table_rename(table_bucket).await?;
         let table_path = self.paths.table_entry_path(table_bucket, &namespace, &table);
         let guard = self.backend.acquire_write_lock(self.catalog_bucket(), &table_path).await?;
@@ -6433,8 +6377,7 @@ where
                 table.as_str()
             )));
         };
-        self.ensure_exclusive_maintenance_roots(&entry, Some(&table_path)).await?;
-        self.delete_table_metadata_maintenance_report_for_entry_with_publication(&entry, report, Some(&publication))
+        self.delete_table_metadata_maintenance_report_for_entry_with_publication(&entry, report, Some(publication))
             .await
     }
 

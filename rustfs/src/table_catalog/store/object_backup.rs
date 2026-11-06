@@ -307,6 +307,11 @@ where
         Ok(backup)
     }
 
+    fn is_catalog_directory_sidecar(&self, table_bucket: &str, object: &str) -> bool {
+        object == self.paths.backing_migration_fence_path(table_bucket)
+            || object.starts_with(&self.paths.table_directory_prefix(table_bucket))
+    }
+
     fn validate_object_catalog_backup_objects(
         &self,
         table_bucket: &str,
@@ -343,7 +348,7 @@ where
                 }
                 continue;
             }
-            if !object.object.starts_with(&prefix) {
+            if !object.object.starts_with(&prefix) || self.is_catalog_directory_sidecar(table_bucket, &object.object) {
                 return Err(TableCatalogStoreError::Invalid(
                     "catalog backup object is outside its catalog prefix".to_string(),
                 ));
@@ -496,16 +501,23 @@ where
 
     async fn reject_legacy_catalog_control_state(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
         self.reject_legacy_catalog_global_state().await?;
-        let paths = &self.paths;
-        for (label, object) in [
-            ("legacy per-bucket catalog fence", paths.legacy_backing_migration_fence_path(table_bucket)),
-            ("legacy catalog restore intent", paths.legacy_catalog_restore_intent_path(table_bucket)),
-        ] {
-            if self.backend.object_exists(self.catalog_bucket(), &object).await? {
-                return Err(TableCatalogStoreError::Unavailable(format!(
-                    "{label} is present for table bucket {table_bucket}; explicit catalog recovery is required"
-                )));
-            }
+        let path = self.paths.legacy_backing_migration_fence_path(table_bucket);
+        if self.backend.object_exists(self.catalog_bucket(), &path).await?
+            && let Some(object) = self
+                .backend
+                .read_object_limited(self.catalog_bucket(), &path, super::directory_index::DIRECTORY_STATE_MAX_SIZE)
+                .await?
+            && !matches!(self.table_directory_state_from_object(table_bucket, &object), Ok(Some(_)))
+        {
+            return Err(TableCatalogStoreError::Unavailable(format!(
+                "legacy per-bucket catalog fence is present for table bucket {table_bucket}; explicit catalog recovery is required"
+            )));
+        }
+        let path = self.paths.legacy_catalog_restore_intent_path(table_bucket);
+        if self.backend.object_exists(self.catalog_bucket(), &path).await? {
+            return Err(TableCatalogStoreError::Unavailable(format!(
+                "legacy catalog restore intent is present for table bucket {table_bucket}; explicit catalog recovery is required"
+            )));
         }
         Ok(())
     }
@@ -760,8 +772,10 @@ where
                         "catalog backup listing escaped its prefix or did not advance".to_string(),
                     ));
                 }
-                let payload = self.capture_backup_object(self.catalog_bucket(), &object).await?;
-                append_backup_object(&mut objects, &mut encoded_bytes, payload)?;
+                if !self.is_catalog_directory_sidecar(table_bucket, &object) {
+                    let payload = self.capture_backup_object(self.catalog_bucket(), &object).await?;
+                    append_backup_object(&mut objects, &mut encoded_bytes, payload)?;
+                }
                 cursor = Some(object);
             }
             if !page.is_truncated {
@@ -977,7 +991,8 @@ where
         self.validate_catalog_backup_reference_graph(backup).await?;
         fence.ensure_held()?;
         let target_prefix = self.paths.table_bucket_root_prefix(table_bucket);
-        let current = self.backend.list_objects(self.catalog_bucket(), &target_prefix).await?;
+        let mut current = self.backend.list_objects(self.catalog_bucket(), &target_prefix).await?;
+        current.retain(|object| !self.is_catalog_directory_sidecar(table_bucket, object));
         let target_paths = backup
             .objects
             .iter()
@@ -1076,6 +1091,7 @@ where
                 !intent.allow_replace
                     || !delete.object.starts_with(&prefix)
                     || !safe_object_key(&delete.object)
+                    || self.is_catalog_directory_sidecar(&intent.table_bucket, &delete.object)
                     || delete.expected_etag.is_empty()
                     || backup
                         .objects
@@ -1106,6 +1122,7 @@ where
             .list_objects(self.catalog_bucket(), &self.paths.table_bucket_root_prefix(&backup.table_bucket))
             .await?
             .into_iter()
+            .filter(|object| !self.is_catalog_directory_sidecar(&backup.table_bucket, object))
             .collect::<BTreeSet<_>>();
         let expected = backup
             .objects
@@ -1206,7 +1223,10 @@ where
             .backend
             .list_objects(self.catalog_bucket(), &self.paths.table_bucket_root_prefix(table_bucket))
             .await?;
-        if current.is_empty() {
+        if current
+            .iter()
+            .all(|object| self.is_catalog_directory_sidecar(table_bucket, object))
+        {
             return Ok(None);
         }
         let objects = self.capture_object_catalog_backup_objects(table_bucket).await?;
@@ -1304,6 +1324,13 @@ where
             ));
         }
 
+        // Restore publishes authoritative entries directly; require rollback to those entries
+        // before changing them. A completed restore's receipt may still be replayed above.
+        if self.read_table_directory_state(table_bucket).await?.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "disable the table directory before restoring the catalog".to_string(),
+            ));
+        }
         // Receipt replay above must remain valid after later maintenance work.
         // A new or interrupted restore may publish only stable source authority.
         self.validate_backup_commit_recovery(table_bucket, &backup.objects)?;

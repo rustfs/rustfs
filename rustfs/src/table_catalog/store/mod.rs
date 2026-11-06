@@ -40,7 +40,7 @@ pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatu
 use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
-pub(super) use object::bounded_table_entry_objects_for_data_plane_scan;
+pub(super) use object::{bounded_table_entry_objects_for_data_plane_scan, maintenance_subtree_skip_cursor};
 
 struct PeriodicTableMaintenanceQueueGuard<'a> {
     table_id: &'a str,
@@ -541,6 +541,25 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
             ));
         }
         state.migration_read_guard = Some(guard);
+        Ok(())
+    }
+
+    fn attach_maintenance_bucket_read_guard(
+        &self,
+        table_bucket: &str,
+        guard: TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<()> {
+        if guard.is_lock_lost() {
+            return Err(TableCatalogStoreError::Conflict("table maintenance bucket permit was lost".to_string()));
+        }
+        let mut state = self.state.lock();
+        if state.table_bucket.is_some() || state.table.is_some() {
+            return Err(TableCatalogStoreError::Internal(
+                "table maintenance bucket permit must be attached before table publication".to_string(),
+            ));
+        }
+        state.table_bucket = Some(table_bucket.to_string());
+        state.guards.push(guard);
         Ok(())
     }
 
@@ -1484,12 +1503,8 @@ impl TableCatalogObjectPaths {
     }
 
     pub fn catalog_backup_fence_lock_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}/{}/{}/fence.lock",
-            self.catalog_root,
-            TABLE_CATALOG_BACKUP_ROOT,
-            table_catalog_path_hash(table_bucket)
-        )
+        // Coordinate with directory activation, rollback, and writers from before the backing retirement.
+        self.backing_migration_fence_lock_path(table_bucket)
     }
 
     pub fn catalog_restore_state_path(&self, table_bucket: &str) -> String {
@@ -1540,22 +1555,6 @@ impl TableCatalogObjectPaths {
         format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.json")
     }
 
-    #[allow(
-        dead_code,
-        reason = "path helpers retained for directory/migration-fence compatibility with main"
-    )]
-    pub fn backing_migration_global_fence_path(&self) -> String {
-        self.legacy_backing_migration_global_fence_path()
-    }
-
-    #[allow(
-        dead_code,
-        reason = "path helpers retained for directory/migration-fence compatibility with main"
-    )]
-    pub fn backing_migration_global_fence_lock_path(&self) -> String {
-        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.lock")
-    }
-
     pub fn legacy_catalog_restore_intent_path(&self, table_bucket: &str) -> String {
         format!(
             "{}/{}/{}/intent.json",
@@ -1570,7 +1569,8 @@ impl TableCatalogObjectPaths {
     }
 
     pub fn catalog_backup_global_fence_lock_path(&self) -> String {
-        format!("{}/{}/global-fence.lock", self.catalog_root, TABLE_CATALOG_BACKUP_ROOT)
+        // Older object-backed registry writers use this lock during a rolling upgrade.
+        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.lock")
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {

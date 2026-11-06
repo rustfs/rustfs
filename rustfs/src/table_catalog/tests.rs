@@ -1796,20 +1796,58 @@ fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
         "catalog/table-2/table-entry.json".to_string(),
     ];
 
+    // Only table entries count toward the limit; the namespace object is free.
     assert_eq!(
-        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 3).unwrap(),
+        bounded_table_entry_objects_for_data_plane_scan(objects.clone(), false, 2).unwrap(),
         vec![
             "catalog/table-1/table-entry.json".to_string(),
             "catalog/table-2/table-entry.json".to_string(),
         ]
     );
     assert_matches!(
-        bounded_table_entry_objects_for_data_plane_scan(objects, false, 2),
-        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("2-catalog-object safety limit")
+        bounded_table_entry_objects_for_data_plane_scan(objects, false, 1),
+        Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
     );
     assert_matches!(
         bounded_table_entry_objects_for_data_plane_scan(vec!["catalog/table-entry.json".to_string()], true, 1),
         Err(TableCatalogStoreError::Unavailable(message)) if message.contains("1-catalog-object safety limit")
+    );
+}
+
+#[test]
+fn table_data_plane_index_miss_scan_skips_only_a_table_maintenance_subtree() {
+    let prefix = "catalog/namespaces/";
+    let skip = |object: &str| maintenance_subtree_skip_cursor(prefix, &format!("{prefix}{object}"));
+    assert_eq!(
+        skip("sales/tables/orders/maintenance/hash/jobs/job.json").as_deref(),
+        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
+    );
+    assert_eq!(
+        skip("sales/tables/orders/maintenance/hash/config.json").as_deref(),
+        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
+    );
+    // A table or namespace literally named "maintenance" is not a subtree.
+    assert_eq!(skip("sales/tables/maintenance/table-entry.json"), None);
+    assert_eq!(skip("maintenance/tables/orders/table-entry.json"), None);
+    assert_eq!(
+        skip("maintenance/tables/maintenance/maintenance/hash/jobs/job.json").as_deref(),
+        Some("catalog/namespaces/maintenance/tables/maintenance/maintenance/\u{10ffff}")
+    );
+    // Entries, bridges, views and a bare file named maintenance never jump.
+    assert_eq!(skip("sales/tables/orders/table-entry.json"), None);
+    assert_eq!(skip("sales/tables/orders/external-catalog/bridge.json"), None);
+    assert_eq!(skip("sales/views/report/maintenance/hash/jobs/job.json"), None);
+    assert_eq!(skip("sales/tables/orders/maintenance"), None);
+    assert_eq!(skip("sales/namespace.json"), None);
+    assert_eq!(maintenance_subtree_skip_cursor(prefix, "other/sales/tables/orders/maintenance/x/y"), None);
+    // The jump lands before the entry that follows the subtree.
+    assert!(
+        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
+            < "catalog/namespaces/sales/tables/orders/table-entry.json"
+    );
+    assert!(
+        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
+            < "catalog/namespaces/sales/tables/orders0/table-entry.json"
     );
 }
 
@@ -5645,6 +5683,7 @@ async fn table_metadata_data_plane_resource_resolves_only_current_metadata() {
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend.reset_call_counts().await;
+    backend.state.lock().await.read_attempts.clear();
 
     let resource = table_metadata_data_plane_resource_for_object(&store, bucket, &current)
         .await
@@ -5653,7 +5692,20 @@ async fn table_metadata_data_plane_resource_resolves_only_current_metadata() {
     assert_eq!(resource.namespace, "sales");
     assert_eq!(resource.table, "orders");
     assert_eq!(backend.list_call_count().await, 1);
-    assert_eq!(backend.read_call_count().await, 2);
+    let paths = TableCatalogObjectPaths::default();
+    // One bucket generation read, one directory mode probe, and one authoritative
+    // table entry. The legacy fixture must never load a candidate object.
+    assert_eq!(
+        backend.state.lock().await.read_attempts,
+        [
+            paths.table_bucket_entry_path(bucket),
+            paths.backing_migration_fence_path(bucket),
+            paths.table_entry_path(bucket, &namespace, &table),
+        ]
+        .into_iter()
+        .map(|key| ((RUSTFS_META_BUCKET.to_owned(), key), 1))
+        .collect()
+    );
     assert_eq!(backend.metadata_call_count().await, 1);
 
     let historical = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
@@ -6734,10 +6786,26 @@ async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane
         .delete_object(RUSTFS_META_BUCKET, &index_path)
         .await
         .expect("warehouse index entry should be removed");
-    let catalog_prefix = store.paths.namespace_entries_prefix(bucket);
+    // Only table entries count toward the data-plane limit; seed enough real
+    // entries that, with the table under test, the catalog exceeds it.
+    let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
     for index in 0..TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_CATALOG_OBJECTS {
+        let noise_table = IdentifierSegment::parse(format!("noise-{index}")).expect("table should parse");
+        let mut entry = test_table_entry(
+            bucket,
+            &noise_namespace,
+            &noise_table,
+            default_table_metadata_file_path(&noise_namespace, &noise_table, "00001.metadata.json"),
+        );
+        entry.table_id = format!("noise-{index}");
+        entry.table_uuid = format!("noise-uuid-{index}");
+        entry.warehouse_location = format!("s3://{bucket}/tables/noise-{index}");
         backend
-            .seed_object(RUSTFS_META_BUCKET, &format!("{catalog_prefix}noise-{index}.json"), b"{}".to_vec())
+            .seed_object(
+                RUSTFS_META_BUCKET,
+                &store.paths.table_entry_path(bucket, &noise_namespace, &noise_table),
+                serde_json::to_vec(&entry).expect("entry should encode"),
+            )
             .await;
     }
 
@@ -6769,6 +6837,121 @@ async fn operator_backfill_reconciles_a_missing_ready_index_above_the_data_plane
         .expect("reconciled index should retain table-aware protection");
     assert_eq!(resource.table, "orders");
     assert_eq!(backend.list_call_count().await, 0);
+}
+
+async fn seed_noise_table_with_job_reports(
+    store: &ObjectTableCatalogStore<TestCatalogObjectBackend>,
+    bucket: &str,
+    namespace: &Namespace,
+    table: &IdentifierSegment,
+    table_id: &str,
+    reports: usize,
+) {
+    let mut entry = test_table_entry(
+        bucket,
+        namespace,
+        table,
+        default_table_metadata_file_path(namespace, table, "00001.metadata.json"),
+    );
+    entry.table_id = table_id.to_string();
+    entry.table_uuid = format!("{table_id}-uuid");
+    entry.warehouse_location = format!("s3://{bucket}/tables/{table_id}");
+    store
+        .backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.table_entry_path(bucket, namespace, table),
+            serde_json::to_vec(&entry).expect("entry should encode"),
+        )
+        .await;
+    for job in 0..reports {
+        store
+            .backend
+            .seed_object(
+                RUSTFS_META_BUCKET,
+                &store
+                    .paths
+                    .table_maintenance_job_path(bucket, namespace, table, table_id, &format!("job-{job}")),
+                b"{}".to_vec(),
+            )
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn table_data_plane_index_miss_scan_pages_scale_with_entries_not_job_reports() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+        .await
+        .expect("warehouse index entry should be removed");
+    // 1000 honest tables with 80 historical job reports each: ~80 pages of
+    // objects, beyond the fixed page budget on its own, yet well within one
+    // extra page per table entry.
+    let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
+    for index in 0..1000 {
+        let noise_table = IdentifierSegment::parse(format!("noise-{index:04}")).expect("table should parse");
+        seed_noise_table_with_job_reports(&store, bucket, &noise_namespace, &noise_table, &format!("noise-{index}"), 80).await;
+    }
+    backend.reset_call_counts().await;
+
+    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("job history must not exhaust the index-miss listing budget")
+        .expect("the scan must retain table-aware protection");
+    assert_eq!(resource.table, "orders");
+    let pages = backend.list_call_count().await;
+    assert!(
+        pages > TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES && pages <= TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES + 1001,
+        "the honest catalog needs {pages} pages: more than the fixed budget, at most one extra per entry"
+    );
+}
+
+#[tokio::test]
+async fn table_data_plane_index_miss_scan_bounds_a_job_report_flood_under_one_table() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").expect("namespace should parse");
+    let table = IdentifierSegment::parse("orders").expect("table should parse");
+    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let object = "tables/table-id/data/part-00001.parquet";
+
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    backend
+        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+        .await
+        .expect("warehouse index entry should be removed");
+    // A table-scoped principal floods one table's job history: 70 reports per
+    // page budget would have exhausted the old fixed budget bucket-wide.
+    for job in 0..70_000 {
+        backend
+            .seed_object(
+                RUSTFS_META_BUCKET,
+                &store
+                    .paths
+                    .table_maintenance_job_path(bucket, &namespace, &table, "table-id", &format!("job-{job}")),
+                b"{}".to_vec(),
+            )
+            .await;
+    }
+    backend.reset_call_counts().await;
+
+    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+        .await
+        .expect("a report flood under one table must not exhaust the listing budget")
+        .expect("the scan must retain table-aware protection");
+    assert_eq!(resource.table, "orders");
+    let pages = backend.list_call_count().await;
+    assert!(pages <= 2, "the page that ends inside the flood skips the rest of it, not {pages} pages");
 }
 
 #[tokio::test]
@@ -14142,58 +14325,108 @@ fn table_metadata_pointer_json_round_trips() {
 
 #[test]
 fn object_mutation_entrypoints_call_reserved_prefix_guard() {
-    let source = [
-        include_str!("../app/object/mod.rs"),
-        include_str!("../app/object/shared.rs"),
-        include_str!("../app/object/extract.rs"),
-        include_str!("../app/object/put.rs"),
-        include_str!("../app/object/copy.rs"),
-        include_str!("../app/object/delete.rs"),
-        include_str!("../app/object/head.rs"),
-        include_str!("../app/object/restore.rs"),
-    ]
-    .concat();
-    let delete_module = include_str!("../app/object/delete.rs");
-    let delete_object = delete_module
-        .split_once("pub async fn execute_delete_object")
-        .map(|(_, remainder)| {
-            remainder
-                .split_once("\nmod tests")
-                .map_or(remainder, |(entrypoints, _)| entrypoints)
-        })
-        .expect("delete object entrypoints should remain in app/object/delete.rs");
-
-    for expected in [
-        "validate_object_key(&key, request_method_name)?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
-        "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await",
-        "validate_table_catalog_object_mutation(&bucket, &object).await?;",
-        "validate_object_key(&key, \"PUT\")?;\n        validate_table_catalog_object_mutation(&bucket, &key).await?;",
-        "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
-    ] {
-        assert!(source.contains(expected), "missing object mutation guard: {expected}");
+    // Scope every assertion to one implementation method: a guard in a sibling
+    // method (or its tests) must not satisfy another entrypoint's contract.
+    fn method<'a>(source: &'a str, signature: &str) -> &'a str {
+        source
+            .split_once(signature)
+            .unwrap_or_else(|| panic!("missing object mutation method: {signature}"))
+            .1
+            .split_once("\n    }\n")
+            .unwrap_or_else(|| panic!("missing method boundary: {signature}"))
+            .0
     }
-    let copy_object = include_str!("../app/object/copy.rs")
-        .split_once("async fn execute_copy_object_body(")
-        .map(|(_, body)| body.split_once("\n#[cfg(test)]").map_or(body, |(entrypoint, _)| entrypoint))
-        .expect("copy object entrypoint should remain in app/object/copy.rs");
-    let copy_key = copy_object
-        .find("validate_object_key(&key, \"COPY (dest)\")?;")
-        .expect("copy destination key validation");
-    let copy_guard = copy_object
-        .find("validate_table_catalog_object_mutation(&bucket, &key).await?;")
-        .expect("copy destination catalog guard");
-    let copy_store = copy_object
-        .find("let Some(store) = self.object_store()")
-        .expect("copy object store resolution");
-    assert!(
-        copy_key < copy_guard && copy_guard < copy_store,
-        "copy must guard the destination before store access"
-    );
 
-    assert!(
-        delete_object.contains("validate_object_key(&key, \"DELETE\")?;")
-            && delete_object.contains("validate_table_catalog_object_mutation(&bucket, &key).await?;"),
-        "delete object entrypoint must validate the object key and reserved catalog prefix"
+    fn assert_ordered(body: &str, expected: &[&str]) {
+        let mut remainder = body;
+        for statement in expected {
+            remainder = remainder
+                .split_once(statement)
+                .unwrap_or_else(|| panic!("missing or out-of-order object mutation guard: {statement}"))
+                .1;
+        }
+    }
+
+    let put = include_str!("../app/object/put.rs");
+    let copy = include_str!("../app/object/copy.rs");
+    let delete = include_str!("../app/object/delete.rs");
+    let extract = include_str!("../app/object/extract.rs");
+    let restore = include_str!("../app/object/restore.rs");
+
+    for (source, signature, delegate) in [
+        (put, "fn execute_put_object(", "self.execute_put_object_boxed(_fs, req)"),
+        (put, "fn execute_put_object_boxed<'a>(", "self.execute_put_object_inner(_fs, req)"),
+        (put, "fn execute_put_object_inner(", "self.execute_put_object_extract(req)"),
+        (copy, "fn execute_copy_object(", "self.execute_copy_object_body_boxed(req)"),
+        (copy, "fn execute_copy_object_body_boxed(", "self.execute_copy_object_body(req)"),
+        (delete, "fn execute_delete_object(", "owner.execute_delete_object_owned(req)"),
+        (delete, "fn execute_delete_objects(", "owner.execute_delete_objects_owned(req)"),
+        (extract, "fn execute_put_object_extract(", "self.execute_put_object_extract_boxed(req)"),
+        (
+            extract,
+            "fn execute_put_object_extract_boxed(",
+            "self.execute_put_object_extract_inner(req)",
+        ),
+    ] {
+        assert!(
+            method(source, signature).contains(delegate),
+            "{signature} must call its guarded implementation"
+        );
+    }
+
+    let key_guard = "validate_table_catalog_object_mutation(&bucket, &key).await?;";
+    let store_resolution = "let Some(store) = self.object_store()";
+    for (source, signature, key_validation, mutation_boundary) in [
+        (
+            put,
+            "fn execute_put_object_inner(",
+            "validate_new_object_key(&key, request_method_name)?;",
+            "self.put_object_core(write, body, start_time).await?;",
+        ),
+        (
+            copy,
+            "fn execute_copy_object_body(",
+            "validate_new_object_key(&key, \"COPY (dest)\")?;",
+            store_resolution,
+        ),
+        (
+            delete,
+            "fn execute_delete_object_owned(",
+            "validate_object_key(&key, \"DELETE\")?;",
+            store_resolution,
+        ),
+        (
+            extract,
+            "fn execute_put_object_extract_inner(",
+            "validate_new_object_key(&key, \"PUT\")?;",
+            store_resolution,
+        ),
+    ] {
+        assert_ordered(method(source, signature), &[key_validation, key_guard, mutation_boundary]);
+    }
+    assert_ordered(
+        method(restore, "fn execute_restore_object("),
+        &[
+            "validate_table_catalog_object_mutation(&bucket, &object).await?;",
+            store_resolution,
+        ],
+    );
+    assert_ordered(
+        method(delete, "fn execute_delete_objects_owned("),
+        &[
+            "validate_object_key(&obj_id.key, \"DeleteObjects\")",
+            "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {",
+            "continue;\n            }",
+            "authorized_deletes.push(AuthorizedDelete { idx, object });",
+        ],
+    );
+    assert_ordered(
+        method(extract, "fn execute_put_object_extract_inner("),
+        &[
+            "validate_extract_member_key(&fpath, extract_limits)",
+            "extract_try!(validate_table_catalog_object_mutation(&bucket, &fpath).await);",
+            "batch.push(ExtractPreparedMember {",
+        ],
     );
 }
 
@@ -15767,6 +16000,7 @@ async fn object_maintenance_refuses_roots_shared_after_cross_namespace_rename() 
         .seed_object(bucket, &replacement_metadata, br#"{"metadata-log":[]}"#.to_vec())
         .await;
     store.create_table(replacement).await.unwrap();
+    let delete_attempts_before = backend.state.lock().await.delete_attempts.clone();
     assert_matches!(store.plan_table_metadata_maintenance(bucket, "sales", "orders", 0).await,
         Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
     assert_matches!(store.delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0).await,
@@ -15781,7 +16015,7 @@ async fn object_maintenance_refuses_roots_shared_after_cross_namespace_rename() 
             .metadata_location,
         original_metadata
     );
-    assert!(backend.state.lock().await.delete_attempts.is_empty());
+    assert_eq!(backend.state.lock().await.delete_attempts, delete_attempts_before);
 }
 
 #[tokio::test]

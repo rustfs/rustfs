@@ -348,7 +348,8 @@ pub struct AdvanceTableDirectoryHandler {}
 impl Operation for AdvanceTableDirectoryHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let response = store.advance_table_directory(&warehouse).await.map_err(catalog_store_error)?;
@@ -362,7 +363,8 @@ pub struct DisableTableDirectoryHandler {}
 impl Operation for DisableTableDirectoryHandler {
     async fn call(&self, req: S3Request<Body>, params: Params<'_, '_>) -> S3Result<S3Response<(StatusCode, Body)>> {
         let warehouse = warehouse_from_params(&params)?;
-        authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;
+        let resource = TableCatalogResource::warehouse(&warehouse);
+        authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
         let store = table_catalog_object_store_from_extensions(&req.extensions)?;
         let response = store.disable_table_directory(&warehouse).await.map_err(catalog_store_error)?;
