@@ -290,7 +290,15 @@ process_log_directory() {
   echo "Initializing log directory: $LOG_DIR"
   if [ ! -d "$LOG_DIR" ]; then
     echo "  mkdir -p $LOG_DIR"
-    mkdir -p "$LOG_DIR"
+    if ! mkdir -p "$LOG_DIR"; then
+      echo "ERROR: Cannot create RUSTFS_OBS_LOG_DIRECTORY. Check the configured path and write permissions for the container user (10001:10001 in official images)." >&2
+      case "$LOG_DIR" in
+        \"*\"|\'*\')
+          echo 'HINT: RUSTFS_OBS_LOG_DIRECTORY contains literal surrounding quotes. In Docker Compose, use map syntax: RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/", or list syntax without inner quotes: - RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/' >&2
+          ;;
+      esac
+      exit 1
+    fi
     # If target user is specified, try to set directory owner to that user (non-recursive to avoid large disk overhead)
     if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
       chown "$RUSTFS_UID:$RUSTFS_GID" "$LOG_DIR" 2>/dev/null || true
