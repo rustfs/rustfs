@@ -25,6 +25,12 @@ Cleanup of a previously confirmed grant is idempotent for its exact `LockId`: `R
 
 An absence response cannot settle an acquisition that may still grant the same ID later. Pending acquisition completion retains its own cleanup owner, and uncertain remote acquisition failures keep their conservative late-release retries. Only a completed, confirmed grant can use authoritative absence to stop retrying.
 
+## Local grant registration
+
+The local guard registry uses nonblocking native-lock attempts for short map operations and async notifications when the table is occupied. An unpolled metadata waiter does not reserve the table, so currently running peers can register compatible grants without inheriting that waiter's scheduling delay. Notification registration precedes the retry, and unlocking precedes waking waiters. Every registry access and contention retry retains cooperative scheduling points; no executor thread waits on a blocking table-lock acquisition.
+
+Physical acquisition and registry contention share the peer's existing acquisition deadline. An expired registration releases its unpublished physical guard and returns retryable contention, including when the table becomes available after the deadline. Replaced, removed, and reclaimed physical guards are dropped outside the registry lock. This does not change object-lock fairness, quorum, lease duration, or caller cancellation handling.
+
 ## Configuration
 
 | Environment variable | Default | Behavior |

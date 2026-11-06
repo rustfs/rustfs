@@ -879,10 +879,10 @@ impl DistributedLock {
                         component = LOG_COMPONENT_LOCK,
                         subsystem = LOG_SUBSYSTEM_NAMESPACE,
                         state = "peer_completed",
+                        result = response.as_ref().is_ok_and(|response| response.success),
                         resource = %request.resource,
                         lock_id = %request.lock_id,
                         peer_index = idx,
-                        result = response.as_ref().is_ok_and(|response| response.success),
                         queue_ms = entered.duration_since(scheduled).as_millis(),
                         acquire_ms = entered.elapsed().as_millis(),
                         "Namespace peer lock acquisition completed slowly"
@@ -1260,6 +1260,7 @@ impl DistributedLock {
             u32::try_from(self.clients.len().max(1)).map_err(|_| LockError::internal("lock voter count exceeds u32"))?;
         let required_quorum = self.required_quorum(request.lock_type);
         let attempt_started = Instant::now();
+        let quorum_deadline = attempt_started.checked_add(quorum_timeout).unwrap_or(attempt_started);
         let grant_valid_until = attempt_started.checked_add(request.ttl).unwrap_or(attempt_started);
         let mut round = LockAcquireRound {
             pending: JoinSet::new(),
@@ -1280,7 +1281,7 @@ impl DistributedLock {
         let mut last_failure_kind = None;
         let mut last_hard_failure_kind = None;
         let mut hard_failures = 0usize;
-        let start = Instant::now();
+        let start = attempt_started;
         // A silent prefix must not hide healthy voters later in the list.
         // Spread additional hedges across the existing attempt budget; fast
         // quorums still use only the initial quorum-plus-spare requests.
@@ -1426,6 +1427,26 @@ impl DistributedLock {
             }
 
             if round.grants.len() >= required_quorum {
+                // Timeout polls its inner join first. A ready last vote must
+                // not override the acquisition deadline after a delayed poll.
+                if Instant::now() >= quorum_deadline {
+                    Self::spawn_release_cleanup(
+                        round.grants.iter().map(HeldLockEntry::release_entry).collect(),
+                        "distributed_lock_attempt_timeout",
+                    );
+                    Self::spawn_pending_cleanup(
+                        std::mem::take(&mut round.pending),
+                        self.clients.clone(),
+                        round.fallback_lock_id.clone(),
+                        "distributed_lock_attempt_timeout_cleanup",
+                    );
+                    return Ok(Self::lock_acquire_attempt_timeout_result(
+                        quorum_timeout,
+                        std::mem::take(&mut round.grants),
+                        last_failure,
+                        last_failure_kind,
+                    ));
+                }
                 // Slow delivery must not turn grants whose conservative lease
                 // deadline already passed into a successful quorum.
                 if Instant::now() >= grant_valid_until {
@@ -3304,6 +3325,66 @@ mod tests {
             Duration::from_secs(5),
             "pending peers must not extend the caller's budget"
         );
+        wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_quorum_rejects_ready_final_vote_after_deadline() {
+        use futures::poll;
+        use std::task::Poll;
+
+        let clients = (0..3)
+            .map(|index| {
+                Arc::new(SequencedClient::new(
+                    vec![AcquirePlan::Success {
+                        delay: if index == 0 { Duration::ZERO } else { Duration::from_secs(5) },
+                    }],
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let lock = DistributedLock::new(
+            "ready-after-deadline".to_string(),
+            clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+            3,
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket", "ready-after-deadline"), LockType::Shared, "owner")
+            .with_acquire_timeout(Duration::from_secs(5));
+        let mut attempt = Box::pin(tokio::task::unconstrained(
+            lock.acquire_lock_quorum_once(&request, request.acquire_timeout),
+        ));
+        assert!(matches!(poll!(&mut attempt), Poll::Pending));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while clients
+                .iter()
+                .any(|client| client.requested_acquires.load(Ordering::SeqCst) == 0)
+                || clients[0].completed_acquires.load(Ordering::SeqCst) == 0
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("initial voters must start before delaying the coordinator");
+        // Consume the first vote, then leave the coordinator inside its
+        // timeout-wrapped join while the remaining responses become ready.
+        assert!(matches!(poll!(&mut attempt), Poll::Pending));
+        tokio::time::advance(Duration::from_secs(6)).await;
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while clients
+                .iter()
+                .any(|client| client.completed_acquires.load(Ordering::SeqCst) == 0)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("late votes must be queued before the coordinator resumes");
+        let result = attempt.await.expect("an expired round should return a response");
+        assert!(
+            !result.response.success,
+            "ready join results must not override the caller's expired budget"
+        );
+        assert!(result.attempt_timed_out);
         wait_for_acquisition_cleanup(&clients).await;
     }
 
