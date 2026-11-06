@@ -3504,12 +3504,10 @@ pub(crate) async fn scan_data_folder_scoped(
                     // Retain observations, then verify from the beginning under
                     // the latest plan. A clean tail cannot certify an old prefix.
                     progress.started_plan = progress.requested_plan;
+                    new_cache.info.scan_plan_digest = None;
                 }
-            }
-            if !new_cache.info.snapshot_complete {
-                // Legacy sweeps also reuse compacted children by sampling.
-                // Invalidate that baseline after gaps so the next preparation
-                // cannot certify an unvisited subtree from cached totals.
+            } else if coverage_gap {
+                // Legacy sampling must not certify an incomplete namespace.
                 new_cache.info.scan_plan_digest = None;
             }
             let had_scan_checkpoint = had_scan_checkpoint || new_cache.info.scan_checkpoint.is_some();
@@ -3556,6 +3554,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 let root_hash = hash_path(&bucket_name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
+                let legacy_coverage_gap = scanner.coverage_gap && scanner.old_cache.info.scan_progress.is_none();
                 let raw_enumeration_path_page_indexes = scanner.raw_enumeration_path_page_indexes();
                 let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
                 let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
@@ -3601,6 +3600,9 @@ pub(crate) async fn scan_data_folder_scoped(
                     new_cache.info.last_update = Some(SystemTime::now());
                     new_cache.info.next_cycle = next_cycle;
                     new_cache.info.snapshot_complete = false;
+                    if legacy_coverage_gap {
+                        new_cache.info.scan_plan_digest = None;
+                    }
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
                     }

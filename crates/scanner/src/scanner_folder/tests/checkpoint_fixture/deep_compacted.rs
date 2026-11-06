@@ -727,3 +727,73 @@ async fn wide_root_legacy_symlink_lookup_failure_isolated_to_child() {
     assert_eq!((summary.objects, summary.size), (1, 7));
     assert_eq!(wide.cache.len(), 1);
 }
+
+#[tokio::test]
+#[serial]
+async fn legacy_failed_object_keeps_retry_history_after_partial_scan() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_test_object_metadata_bytes(&root, "bucket", "broken/object", &[]).await;
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 100).await;
+    let ScannerDiskScanOutcome::Partial(partial) = outcome else {
+        panic!("a failed metadata read must keep the sweep partial");
+    };
+    assert_eq!(partial.info.failed_objects.len(), 1, "failed metadata should enter the retry cache");
+    let mut reloaded = save_reload(&FixtureStore::new(), &partial).await;
+    reloaded.prepare_for_scan("bucket", 12, 7, SOURCE, PLAN, false);
+    assert_eq!(
+        reloaded.info.failed_objects, partial.info.failed_objects,
+        "same-plan retry must retain the timestamp that suppresses repeated repair attempts"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn interrupted_legacy_gap_requires_fresh_verification_before_sampling() {
+    use std::os::unix::fs::symlink;
+
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for (object, size) in [("prefix/a-bad/object", 101), ("prefix/z-good", 7), ("z-tail/object", 11)] {
+        write_checkpoint_object(&root, object, &[(None, size)]).await;
+    }
+    let regular_file = root.join("regular-file");
+    std::fs::write(&regular_file, b"not a directory").expect("create regular symlink ancestor");
+    let broken_link = root.join("bucket/prefix/a-bad/bad-link");
+    symlink(regular_file.join("child"), &broken_link).expect("create symlink through non-directory");
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 2).await;
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+    let ScannerDiskScanOutcome::Partial(partial) = outcome else {
+        panic!("the tail must interrupt the scan after the prefix was compacted");
+    };
+    let prefix = partial.find(PREFIX).expect("incomplete compacted prefix");
+    assert!(prefix.compacted);
+    assert_eq!((prefix.objects, prefix.size), (1, 7));
+
+    let mut reloaded = save_reload(&FixtureStore::new(), &partial).await;
+    std::fs::remove_file(broken_link).expect("restore namespace traversal");
+    let next_cycle = (12_u32..28)
+        .find(|cycle| !hash_path(PREFIX).mod_(*cycle, data_usage_update_dir_cycles()))
+        .expect("choose a cycle that would otherwise sample the incomplete prefix");
+    reloaded.prepare_for_scan("bucket", u64::from(next_cycle), 7, SOURCE, PLAN, false);
+    reloaded.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, reloaded, HealScanMode::Normal, 4).await;
+    let ScannerDiskScanOutcome::Complete(verified) = outcome else {
+        panic!("retry must complete after the namespace is repaired");
+    };
+    let total = verified.checked_flatten("bucket").expect("verified retry accounting");
+    assert_eq!((total.objects, total.size), (3, 119));
+}
