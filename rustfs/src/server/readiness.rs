@@ -75,6 +75,9 @@ fn startup_runtime_readiness_max_wait() -> Duration {
         Duration::from_secs(secs)
     }
 }
+const EVENT_STARTUP_RUNTIME_READINESS: &str = "startup_runtime_readiness";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_READINESS: &str = "readiness";
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
 const METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL: &str = "rustfs_pool_metadata_check_timeouts_total";
@@ -1273,6 +1276,15 @@ async fn collect_lock_quorum_observation_uncached() -> LockQuorumObservation {
     }
 }
 
+/// Wait for local runtime dependencies without exceeding the observation budget.
+///
+/// The budget covers both observations and polling sleeps. An immediately ready
+/// observation can succeed with a zero budget. Cancellation drops the in-flight
+/// observation; only success invokes `on_ready`.
+///
+/// # Errors
+/// Returns an error on expiry, retaining the last completed observation when
+/// available. The readiness callback is never invoked after a timeout.
 pub async fn wait_for_runtime_readiness_with<F, Fut, ReadyFn>(
     max_wait: Duration,
     poll_interval: Duration,
@@ -1285,35 +1297,60 @@ where
     ReadyFn: FnMut(DependencyReadiness),
 {
     let startup_deadline = tokio::time::Instant::now() + max_wait;
-
-    loop {
-        let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready && readiness.peer_health_ready {
-            on_ready(readiness);
-            return Ok(());
-        }
-
-        if tokio::time::Instant::now() >= startup_deadline {
-            let reason = format!(
-                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
-                max_wait.as_secs(),
-                readiness.storage_ready,
-                readiness.iam_ready,
-                readiness.lock_quorum_ready,
-                readiness.peer_health_ready
+    let mut last_readiness = None;
+    let result = tokio::time::timeout_at(startup_deadline, async {
+        loop {
+            // Tokio timeouts poll the observation first. Keep the initial
+            // zero-budget observation, but start no later one at expiry.
+            if last_readiness.is_some() && tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            let readiness = load_readiness().await;
+            last_readiness = Some(readiness);
+            if readiness.storage_ready
+                && readiness.iam_ready
+                && readiness.lock_quorum_ready
+                && readiness.peer_health_ready
+                && (max_wait.is_zero() || tokio::time::Instant::now() < startup_deadline)
+            {
+                return Some(readiness);
+            }
+            if tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            info!(
+                event = EVENT_STARTUP_RUNTIME_READINESS,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_READINESS,
+                state = "waiting",
+                storage_ready = readiness.storage_ready,
+                iam_ready = readiness.iam_ready,
+                lock_quorum_ready = readiness.lock_quorum_ready,
+                peer_health_ready = readiness.peer_health_ready,
+                "Runtime node readiness has not been reached yet; delaying ready state publication"
             );
-            return Err(std::io::Error::other(reason));
+            tokio::time::sleep(poll_interval).await;
         }
-
-        info!(
-            target: "rustfs::server::readiness",
-            storage_ready = readiness.storage_ready,
-            iam_ready = readiness.iam_ready,
-            lock_quorum_ready = readiness.lock_quorum_ready,
-            peer_health_ready = readiness.peer_health_ready,
-            "Runtime node readiness has not been reached yet; delaying ready state publication"
-        );
-        tokio::time::sleep(poll_interval).await;
+    })
+    .await;
+    match result {
+        Ok(Some(readiness)) => {
+            on_ready(readiness);
+            Ok(())
+        }
+        Ok(None) | Err(_) => {
+            let detail = match last_readiness {
+                Some(readiness) => format!(
+                    "storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
+                    readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready, readiness.peer_health_ready
+                ),
+                None => "no readiness observation completed".to_string(),
+            };
+            Err(std::io::Error::other(format!(
+                "startup readiness timed out after {}s: {detail}",
+                max_wait.as_secs()
+            )))
+        }
     }
 }
 
@@ -1618,6 +1655,7 @@ mod tests {
     /// predicate counts node-2's drive online, then publish.
     #[tokio::test(start_paused = true)]
     async fn restarted_node_stays_unready_until_survivor_counts_its_drive_online() {
+        use futures::StreamExt;
         use peer_readmission::{
             PeerDriveView, PeerProbe, ReadmissionOutcome, UNREACHABLE_PEER_GRACE, host_drive_observations, readmission_plan,
             wait_for_peer_readmission_with,
@@ -1654,8 +1692,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
 
         let gate = async {
-            let outcome =
-                wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
+            let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+                futures::stream::once(async {
                     let mut online_hosts = HashSet::from(["node-0:9000".to_string(), "node-1:9000".to_string()]);
                     if survivor_reaches_restarted.load(Ordering::SeqCst) {
                         online_hosts.insert("node-2:9000".to_string());
@@ -1677,7 +1715,9 @@ mod tests {
                     );
                     HashMap::from([("node-0:9000".to_string(), view.clone()), ("node-1:9000".to_string(), view)])
                 })
-                .await;
+                .flat_map(futures::stream::iter)
+            })
+            .await;
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             outcome
         };
@@ -1977,6 +2017,150 @@ mod tests {
         assert!(result.is_ok(), "all runtime dependencies should publish readiness");
         assert!(readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_cancels_a_suspended_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ObservationDrop(Arc<AtomicUsize>);
+        impl Drop for ObservationDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let guard = ObservationDrop(Arc::clone(&dropped));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<DependencyReadiness>().await
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds a suspended dependency observation")
+            .expect_err("no dependency observation completed");
+        assert!(err.to_string().contains("no readiness observation completed"));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_bounds_the_poll_sleep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            || {
+                polls.fetch_add(1, Ordering::SeqCst);
+                future::ready(DependencyReadiness::default())
+            },
+            |_| panic!("an unready observation must never publish"),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds the poll sleep")
+            .expect_err("unready observation");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "expiry must not start another observation");
+        assert!(err.to_string().contains("lock_quorum_ready=false"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_publishes_once_before_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) > 0;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("dependencies recovered before expiry");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_starts_no_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) >= 2;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("expiry must prevent a third observation even when immediately ready");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_does_not_publish_an_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("an observation completing at the deadline must not publish");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(published.load(Ordering::SeqCst), 0);
     }
 
     #[test]

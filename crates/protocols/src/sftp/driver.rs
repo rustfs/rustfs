@@ -831,14 +831,10 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
 
     /// SSH_FXP_MKDIR, SFTP Internet Draft section 6.6. Bucket-level path
     /// (only the bucket component is set) issues CreateBucket. Sub-bucket
-    /// path issues PutObject of a zero-byte object at the encoded
-    /// directory marker key. MKDIR at the SFTP root returns Failure
-    /// because there is no parent into which a new top-level entity could
-    /// be added.
-    ///
-    /// The directory-marker key is built with rustfs_utils::path::
-    /// encode_dir_object so the key format matches the convention used
-    /// by the rest of RustFS (S3, Swift, WebDAV).
+    /// path issues PutObject of a zero-byte object at the logical prefix
+    /// plus a trailing slash. Storage encodes that client key into the
+    /// directory marker. MKDIR at the SFTP root returns Failure because
+    /// there is no parent into which a new top-level entity could be added.
     #[tracing::instrument(level = "info", skip(self, _attrs), fields(id, path = %sanitise_control_bytes(&path)), err(Debug))]
     async fn mkdir(&mut self, id: u32, path: String, _attrs: FileAttributes) -> Result<Status, Self::Error> {
         self.enforce_server_readonly()?;
@@ -858,8 +854,9 @@ impl<S: StorageBackend + Send + Sync + 'static> russh_sftp::server::Handler for 
     /// SSH_FXP_RMDIR, SFTP Internet Draft section 6.6. Empty check then
     /// delete. Bucket-level path lists the bucket with max_keys=1 and,
     /// on an empty result, calls DeleteBucket. Sub-bucket path lists the
-    /// prefix and, on an empty result, calls DeleteObject on the encoded
-    /// directory marker.
+    /// prefix and, on an empty result, calls DeleteObject on the
+    /// trailing-slash directory key. Storage encodes that key to the
+    /// on-disk marker.
     ///
     /// validate_directory_empty propagates the list error rather than
     /// swallowing it. Without that, a transient backend error during

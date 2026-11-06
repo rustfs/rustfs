@@ -4574,66 +4574,112 @@ mod tests {
             async {
                 let object_traffic_health = Arc::new(ObjectTrafficHealth::enabled_for_test(Duration::ZERO));
                 let readiness = Arc::new(GlobalReadiness::new());
+                readiness.mark_stage(rustfs_common::SystemStage::IamReady);
                 let inner = CountingHybridService::default();
                 let calls = inner.calls();
-                let mut service = public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness))
-                    .await
-                    .layer(inner);
+                let public_health =
+                    public_health_layer_with_tracker_and_readiness(object_traffic_health, Arc::clone(&readiness)).await;
+                let mut service =
+                    crate::server::ReadinessGateLayer::new(Arc::clone(&readiness)).layer(public_health.layer(inner));
 
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::GET)
-                            .uri(HEALTH_READY_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("readiness request before admission publication"),
-                    )
-                    .await
-                    .expect("readiness response before admission publication");
-                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
-                let body = BodyExt::collect(response.into_body())
-                    .await
-                    .expect("readiness body before admission publication")
-                    .to_bytes();
-                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
-                assert_eq!(payload["ready"], false);
-                assert_eq!(payload["details"]["storage"]["ready"], true);
-                assert_eq!(payload["details"]["iam"]["ready"], true);
-                assert_eq!(payload["details"]["lock"]["ready"], true);
-                assert_eq!(payload["degradedReasons"], serde_json::json!(["startup_finalization_pending"]));
+                // Cluster quorum can recover before this node publishes S3 admission.
+                for method in [Method::GET, Method::HEAD] {
+                    for path in [
+                        MINIO_HEALTH_CLUSTER_PATH,
+                        MINIO_HEALTH_CLUSTER_READ_PATH,
+                        HEALTH_COMPAT_LIVE_PATH,
+                    ] {
+                        let response = service
+                            .call(
+                                Request::builder()
+                                    .method(method.clone())
+                                    .uri(path)
+                                    .body(Full::<Bytes>::from(Bytes::new()))
+                                    .expect("probe request before admission publication"),
+                            )
+                            .await
+                            .expect("probe response before admission publication");
+                        assert_eq!(response.status(), StatusCode::OK, "{method} {path}");
+                        let body = BodyExt::collect(response.into_body()).await.expect("probe body").to_bytes();
+                        if method == Method::HEAD {
+                            assert!(body.is_empty(), "HEAD {path}");
+                        } else {
+                            let payload: serde_json::Value = serde_json::from_slice(&body).expect("probe JSON");
+                            if path == HEALTH_COMPAT_LIVE_PATH {
+                                assert_eq!(payload["status"], "ok");
+                                assert!(payload.get("ready").is_none());
+                            } else {
+                                assert_eq!(payload["ready"], true, "{path}");
+                            }
+                        }
+                    }
+                }
 
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::GET)
-                            .uri(HEALTH_COMPAT_LIVE_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("liveness request before admission publication"),
-                    )
-                    .await
-                    .expect("liveness response before admission publication");
-                assert_eq!(response.status(), StatusCode::OK);
-                let body = BodyExt::collect(response.into_body())
-                    .await
-                    .expect("liveness body before admission publication")
-                    .to_bytes();
-                let payload: serde_json::Value = serde_json::from_slice(&body).expect("liveness JSON");
-                assert_eq!(payload["status"], "ok");
-                assert!(payload.get("ready").is_none());
-
-                readiness.mark_stage(rustfs_common::SystemStage::FullReady);
-                let response = service
-                    .call(
-                        Request::builder()
-                            .method(Method::HEAD)
-                            .uri(MINIO_HEALTH_READY_PATH)
-                            .body(Full::<Bytes>::from(Bytes::new()))
-                            .expect("readiness request after admission publication"),
-                    )
-                    .await
-                    .expect("readiness response after admission publication");
-                assert_eq!(response.status(), StatusCode::OK);
-                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                for published in [false, true] {
+                    if published {
+                        readiness.mark_stage(rustfs_common::SystemStage::FullReady);
+                    }
+                    for method in [Method::GET, Method::HEAD] {
+                        for path in [HEALTH_READY_PATH, MINIO_HEALTH_READY_PATH] {
+                            let response = service
+                                .call(
+                                    Request::builder()
+                                        .method(method.clone())
+                                        .uri(path)
+                                        .body(Full::<Bytes>::from(Bytes::new()))
+                                        .expect("node readiness request"),
+                                )
+                                .await
+                                .expect("node readiness response");
+                            let expected = if published {
+                                StatusCode::OK
+                            } else {
+                                StatusCode::SERVICE_UNAVAILABLE
+                            };
+                            assert_eq!(response.status(), expected, "{method} {path}, published={published}");
+                            let body = BodyExt::collect(response.into_body())
+                                .await
+                                .expect("readiness body")
+                                .to_bytes();
+                            if method == Method::HEAD {
+                                assert!(body.is_empty(), "HEAD {path}");
+                            } else {
+                                let payload: serde_json::Value = serde_json::from_slice(&body).expect("readiness JSON");
+                                assert_eq!(payload["ready"], published);
+                                for component in ["storage", "iam", "lock"] {
+                                    assert_eq!(payload["details"][component]["ready"], true, "{component}");
+                                }
+                                let reasons = if published {
+                                    serde_json::json!([])
+                                } else {
+                                    serde_json::json!(["startup_finalization_pending"])
+                                };
+                                assert_eq!(payload["degradedReasons"], reasons);
+                            }
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), 0, "health probes bypass the inner service");
+                    for method in [Method::GET, Method::PUT] {
+                        let response = service
+                            .call(
+                                Request::builder()
+                                    .method(method.clone())
+                                    .uri("/bucket/object")
+                                    .body(Full::<Bytes>::from(Bytes::new()))
+                                    .expect("object request"),
+                            )
+                            .await
+                            .expect("object admission response");
+                        if published {
+                            assert_eq!(response.status(), StatusCode::IM_A_TEAPOT, "{method} reaches the inner service");
+                        } else {
+                            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{method} stays gated");
+                            assert_eq!(response.headers()[http::header::RETRY_AFTER], "5");
+                            assert_eq!(response.headers()["x-rustfs-readiness-pending"], "startup_finalization");
+                        }
+                    }
+                    assert_eq!(calls.load(Ordering::SeqCst), if published { 2 } else { 0 });
+                }
             },
         )
         .await;

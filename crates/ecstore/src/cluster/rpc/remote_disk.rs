@@ -996,21 +996,32 @@ fn internode_idempotent_read_retries() -> usize {
 static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+fn claim_control_channel_prewarm(addr: &str) -> bool {
+    let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+        return false;
+    };
+    prewarmed.insert(addr.to_owned())
+}
+
+fn release_control_channel_prewarm(addr: &str) {
+    if let Ok(mut prewarmed) = PREWARMED_PEERS.lock() {
+        prewarmed.remove(addr);
+    }
+}
+
 /// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
-/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+/// peer; a dial failure releases the marker so a later disk construction can retry the prewarm.
 fn spawn_control_channel_prewarm(addr: String) {
-    {
-        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
-            return;
-        };
-        if !prewarmed.insert(addr.clone()) {
-            return;
-        }
+    if !claim_control_channel_prewarm(&addr) {
+        return;
     }
     tokio::spawn(async move {
         match node_service_time_out_client_no_auth(&addr).await {
             Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
-            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+            Err(err) => {
+                release_control_channel_prewarm(&addr);
+                debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)");
+            }
         }
     });
 }
@@ -3680,7 +3691,13 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response = match client.batch_read_version(request).await {
+                    let response_result = client.batch_read_version(request).await;
+                    if let Some(rpc_started) = rpc_started {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
+                            rpc_started.elapsed(),
+                        );
+                    }
+                    let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
                             response.into_inner()
@@ -4695,7 +4712,10 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let response = client.read_multiple(request).await?.into_inner();
+                let rpc_started = Instant::now();
+                let response = client.read_multiple(request).await;
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = response?.into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -4746,6 +4766,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4754,6 +4775,7 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -4851,6 +4873,7 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4858,6 +4881,8 @@ impl DiskAPI for RemoteDisk {
                         return Err(err.into());
                     }
                 };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
@@ -11974,5 +11999,16 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[test]
+    fn prewarm_claim_is_deduplicated_and_released_after_failure() {
+        let addr = "http://prewarm-retry-test.invalid:9000";
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        assert!(!claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
     }
 }
