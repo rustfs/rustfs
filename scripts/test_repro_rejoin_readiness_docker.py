@@ -36,10 +36,17 @@ class FakeDocker(repro.Commands):
         self.mutations = []
 
     def inspect(self, resource, name, *, optional=False):
-        return self.objects.get((resource, name))
+        direct = self.objects.get((resource, name))
+        if direct is not None:
+            return direct
+        return next((value for (kind, _), value in self.objects.items() if kind == resource and value.get("Id") == name), None)
 
     def docker(self, *args, **kwargs):
         self.mutations.append(args)
+        if args[:2] == ("container", "stop"):
+            for info in self.objects.values():
+                if info.get("Id") in args[4:]:
+                    info["State"]["Running"] = False
         return subprocess.CompletedProcess(args, 0, b"", b"")
 
 
@@ -132,6 +139,18 @@ class ImageGuards(unittest.TestCase):
                                         ("s390x", "s390x"), ("arm64", "ppc64le"), (None, "arm64")):
             with self.subTest(image_arch=image_arch, daemon_arch=daemon_arch), self.assertRaises(repro.ReproError):
                 repro.validate_image({**image_info(), "Architecture": image_arch}, SOURCE, expected_arch=daemon_arch)
+
+    def test_inherited_controls_are_rejected_without_exposing_values(self):
+        for environment in (["RUSTFS_RUNTIME_WORKER_THREADS=2"], ["RUST_LOG=trace"], ["RUSTFS_SECRET_KEY=private-base-secret"]):
+            info = image_info()
+            info["Config"]["Env"] = environment
+            with self.subTest(environment=environment), self.assertRaises(repro.ReproError) as error:
+                repro.validate_image(info, SOURCE, expected_arch="arm64")
+            self.assertNotIn(environment[0], str(error.exception))
+            self.assertNotIn("private-base-secret", str(error.exception))
+        neutral = image_info()
+        neutral["Config"]["Env"] = ["PATH=/usr/bin", "LANG=C.UTF-8", "PYTHON_VERSION=3.13", "RUST_LOG_STYLE=never"]
+        self.assertEqual(repro.validate_image(neutral, SOURCE, expected_arch="arm64")["id"], IMAGE)
 
     def test_preflight_uses_daemon_architecture_and_records_the_actual_host(self):
         class PreflightCommands(repro.Commands):
@@ -343,14 +362,11 @@ class RequestsAndOracles(unittest.TestCase):
                     "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": n != 5},
                     "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
 
-            def post_stop_snapshot(phase, *, nodes):
-                self.assertEqual(phase, "retained-stopped")
-                self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", *(str(n) * 64 for n in range(1, 5)))])
-                for node in nodes.values():
-                    node["running"] = False
-
-            with patch.object(value, "snapshot", side_effect=post_stop_snapshot):
-                value.stop_retained_nodes()
+            value.stop_retained_nodes()
+            self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", *(str(n) * 64 for n in range(1, 5)))])
+            snapshot = json.loads((value.out / "containers-retained-stopped.json").read_text())
+            self.assertEqual(len(snapshot), 5)
+            self.assertTrue(all(not item["state"]["Running"] for item in snapshot))
             self.assertTrue(value.summary["retained_nodes_stopped"])
             commands.mutations.clear()
             foreign = commands.objects[("container", value.nodes[5]["id"])]
@@ -390,14 +406,8 @@ class RequestsAndOracles(unittest.TestCase):
                     "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": True},
                     "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
 
-            def post_stop_snapshot(phase, *, nodes):
-                self.assertEqual(set(nodes), {2, 3, 4, 5})
-                for node in nodes.values():
-                    node["running"] = False
-
             with patch.object(value, "preflight"), patch.object(value, "setup"), patch.object(value, "sequence"), \
                  patch.object(value, "recover"), patch.object(value, "capture"), \
-                 patch.object(value, "snapshot", side_effect=post_stop_snapshot), \
                  patch.object(repro, "cleanup_resources", side_effect=repro.ReproError("partial cleanup failure")), \
                  contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(value.run(), 2)
@@ -407,16 +417,42 @@ class RequestsAndOracles(unittest.TestCase):
             self.assertTrue(summary["retained_nodes_stopped"])
             self.assertTrue(summary["resources_retained"])
 
-    def test_missing_container_is_distinguished_from_transport_and_permission_errors(self):
+    def test_staging_timeout_with_no_recorded_nodes_stops_the_owned_init_container(self):
+        with tempfile.TemporaryDirectory() as root:
+            commands = FakeDocker()
+            value = experiment(Path(root) / "case", commands)
+            value.nodes = {}
+            name, identifier = value.project + "-init", "f" * 64
+            commands.objects[("container", name)] = {"Id": identifier, "Name": "/" + name, "State": {"Running": True},
+                "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "init")}}
+            with patch.object(value, "preflight"), patch.object(value, "setup", side_effect=repro.ReproError("staging timeout")), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(value.run(), 2)
+            self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", identifier)])
+            self.assertEqual(value.summary["first_failure"]["reason"], "staging timeout")
+            self.assertTrue(value.summary["retained_nodes_stopped"])
+            snapshot = json.loads((value.out / "containers-retained-stopped.json").read_text())
+            self.assertEqual([(item["kind"], item["state"]["Running"]) for item in snapshot], [("init", False)])
+            commands.mutations.clear()
+            commands.objects[("container", name)]["Config"]["Labels"][repro.LABEL_PREFIX + "owner"] = "foreign"
+            with self.assertRaises(repro.ReproError):
+                value.stop_retained_nodes()
+            self.assertEqual(commands.mutations, [], "a foreign init container must prevent every mutation")
+
+    def test_missing_resource_is_distinguished_from_transport_and_permission_errors(self):
         commands = repro.Commands()
-        for error in ("Error: No such container: gone", "Error response from daemon: No such container: gone"):
-            with self.subTest(error=error), patch.object(commands, "docker", return_value=subprocess.CompletedProcess([], 1, b"[]", error.encode())):
-                self.assertIsNone(commands.inspect("container", "gone", optional=True))
-        for error in ("Cannot connect to the Docker daemon: no such file or directory", "permission denied", "credential helper not found",
-                      "Error: No such container: gone\nCannot connect to Docker daemon"):
-            with self.subTest(error=error), patch.object(commands, "docker", return_value=subprocess.CompletedProcess([], 1, b"[]", error.encode())):
-                with self.assertRaises(repro.ReproError):
-                    commands.inspect("container", "gone", optional=True)
+        missing = {"container": ("Error: No such container: gone", "Error response from daemon: No such container: gone"),
+                   "volume": ("Error response from daemon: get gone: no such volume",),
+                   "network": ("Error response from daemon: network gone not found",)}
+        for resource, errors in missing.items():
+            for error in errors:
+                with self.subTest(resource=resource, error=error), patch.object(commands, "docker", return_value=subprocess.CompletedProcess([], 1, b"[]", error.encode())):
+                    self.assertIsNone(commands.inspect(resource, "gone", optional=True))
+            for error in ("Cannot connect to the Docker daemon: no such file or directory", "permission denied", "credential helper not found",
+                          errors[0] + "\nCannot connect to Docker daemon", errors[0].replace("gone", "other-resource")):
+                with self.subTest(resource=resource, error=error), patch.object(commands, "docker", return_value=subprocess.CompletedProcess([], 1, b"[]", error.encode())):
+                    with self.assertRaises(repro.ReproError):
+                        commands.inspect(resource, "gone", optional=True)
 
     def test_recovery_gate_is_followed_by_object_reads_before_classification(self):
         with tempfile.TemporaryDirectory() as root:

@@ -163,6 +163,10 @@ def validate_image(info: dict[str, Any], source: str, expected_binary: str | Non
     architecture = canonical_architecture(info.get("Architecture"))
     if info.get("Os") != "linux" or architecture != canonical_architecture(expected_arch):
         raise ReproError("the experiment requires a Linux image matching the Docker daemon architecture")
+    inherited = (info.get("Config") or {}).get("Env") or ()
+    if any(entry.partition("=")[0].startswith("RUSTFS_") or entry.partition("=")[0] == "RUST_LOG"
+           for entry in inherited):
+        raise ReproError("the image must not inherit RUSTFS_* or RUST_LOG overrides")
     if labels.get(LABEL_PREFIX + "source_revision") != source:
         raise ReproError("image source revision does not match --expected-source")
     if not SHA_RE.fullmatch(binary):
@@ -194,11 +198,19 @@ def verify_ownership(info: dict[str, Any], resource: str, name: str, kind: str, 
         raise ReproError(f"refusing to mutate unowned {resource} {name}")
 
 
-def is_missing_container(error: str) -> bool:
-    prefixes = ("no such container:", "error: no such container:", "error response from daemon: no such container:")
+def is_missing_resource(resource: str, name: str, error: str) -> bool:
+    subject = re.escape(name.lower())
+    forms = {
+        "container": rf"no such container:\s*{subject}",
+        "volume": rf"(?:no such volume:\s*{subject}|get {subject}:\s*no such volume)",
+        "network": rf"(?:no such network:\s*{subject}|network {subject} not found)",
+        "image": rf"no such image:\s*{subject}(?::latest)?",
+    }
+    if resource not in forms:
+        return False
+    pattern = r"(?:error(?: response from daemon)?:\s*)?" + forms[resource]
     lines = [line.strip().lower() for line in error.splitlines() if line.strip()]
-    return bool(lines) and all(any(line.startswith(prefix) and line[len(prefix):].strip() for prefix in prefixes)
-                               for line in lines)
+    return bool(lines) and all(re.fullmatch(pattern, line) is not None for line in lines)
 
 
 class Commands:
@@ -229,7 +241,7 @@ class Commands:
         result = self.docker(resource, "inspect", name, check=False)
         if result.returncode:
             error = result.stderr.decode(errors="replace").lower()
-            missing = is_missing_container(error) if resource == "container" else ("no such" in error or "not found" in error)
+            missing = is_missing_resource(resource, name, error)
             if optional and missing:
                 return None
             raise ReproError(f"could not inspect {resource} {name}")
@@ -337,7 +349,6 @@ class Experiment:
         self.project = "rustfs-rejoin-repro-" + secrets.token_hex(8)
         self.source = args.expected_source
         self.nodes: dict[int, dict[str, Any]] = {}
-        self.stopped: set[int] = set()
         self.acknowledged: dict[str, bytes] = {}
         self.first_failure: dict[str, Any] | None = None
         self.request_number = 0
@@ -503,9 +514,9 @@ class Experiment:
         self.commands.docker("container", "start", *(node["id"] for node in self.nodes.values()))
         self.snapshot("initial-before-gate")
 
-    def snapshot(self, phase: str, *, nodes: dict[int, dict[str, Any]] | None = None) -> None:
+    def snapshot(self, phase: str) -> None:
         snapshot = []
-        for n, node in (self.nodes if nodes is None else nodes).items():
+        for n, node in self.nodes.items():
             info = self.commands.inspect("container", node["id"])
             assert info is not None
             verify_ownership(info, "container", node["name"], "node", self.project, self.source)
@@ -611,7 +622,6 @@ class Experiment:
         self.require(self.request(3, "GET", "/repro/reference-object", phase="initial-get"), "initial-get", reference)
         generation = 0
         for stopped, peer in ((5, 2), (2, 3)):
-            self.stopped.add(stopped)
             self.commands.docker("container", "stop", "-t", "10", self.nodes[stopped]["id"], timeout=30)
             time.sleep(self.args.outage_wait)
             self.require(self.request(1, "GET", "/repro/reference-object", phase=f"down-{stopped}-reference"), "degraded-reference", reference)
@@ -674,7 +684,6 @@ class Experiment:
         restart = [node["id"] for node in self.nodes.values() if not node["running"]]
         if restart:
             self.commands.docker("container", "start", *restart)
-        self.stopped.clear()
         self.snapshot("restarted-before-gate")
         self.summary["recovery_gate"] = self.wait_gate("recovery")
         self.summary["recovery_gets"] = self.read_object_batch("immediate-recovery", self.summary["recovery_gate"])
@@ -726,24 +735,39 @@ class Experiment:
 
     def stop_retained_nodes(self, *, allow_missing: bool = False) -> None:
         running = []
-        existing = {}
-        # Validate the complete owned set before stopping any node. Immutable
-        # IDs prevent a recreated, same-name container from being selected.
-        for n, node in self.nodes.items():
-            info = self.commands.inspect("container", node["id"], optional=allow_missing)
+        existing = []
+        by_name = {node["name"]: node for node in self.nodes.values()}
+        # Include the staging container and partially created nodes. A Docker
+        # CLI timeout can leave an owned container alive before its ID is saved.
+        # Verify the complete inventory before stopping any immutable ID.
+        for resource, name, kind in expected_resources(self.project):
+            if resource != "container":
+                continue
+            node = by_name.get(name)
+            optional = allow_missing or node is None
+            info = self.commands.inspect("container", node["id"] if node else name, optional=optional)
             if info is None:
-                if allow_missing:
+                if optional:
                     continue
                 raise ReproError("a retained experiment node could not be inspected")
-            verify_ownership(info, "container", node["name"], "node", self.project, self.source)
-            existing[n] = node
+            verify_ownership(info, "container", name, kind, self.project, self.source)
+            existing.append((info["Id"], name, kind))
             if info["State"]["Running"]:
                 running.append(info["Id"])
         if running:
             self.commands.docker("container", "stop", "-t", "10", *running, timeout=80)
-        self.snapshot("retained-stopped", nodes=existing)
-        if any(node["running"] for node in existing.values()):
-            raise ReproError("an owned experiment node is still running after retention stop")
+        snapshot = []
+        for identifier, name, kind in existing:
+            info = self.commands.inspect("container", identifier)
+            if info is None:
+                raise ReproError("could not confirm a retained container stopped")
+            verify_ownership(info, "container", name, kind, self.project, self.source)
+            snapshot.append({"id": identifier, "name": name, "kind": kind, "state": info["State"]})
+            if name in by_name:
+                by_name[name]["running"] = info["State"]["Running"]
+        write_json(self.out / "containers-retained-stopped.json", snapshot)
+        if any(info["state"]["Running"] for info in snapshot):
+            raise ReproError("an owned experiment container is still running after retention stop")
         self.summary["retained_nodes_stopped"] = True
 
     def run(self) -> int:
