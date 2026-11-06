@@ -350,3 +350,43 @@ async fn wide_root_legacy_permission_failure_isolated_to_child() {
     assert_eq!((summary.objects, summary.size), (1, 7));
     assert_eq!(wide.cache.len(), 1);
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_symlink_lookup_failure_isolated_to_child() {
+    use std::os::unix::fs::symlink;
+
+    assert!(!crate::scanner_is_erasure().await, "single-drive Namespace scan");
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(&root, "healthy/object", &[(None, 7)]).await;
+    let bucket = root.join("bucket");
+    let bad = bucket.join("bad");
+    std::fs::create_dir(&bad).expect("create bad root child");
+    let regular_file = root.join("regular-file");
+    std::fs::write(&regular_file, b"not a directory").expect("create regular symlink ancestor");
+    let broken_link = bad.join("broken-link");
+    symlink(regular_file.join("child"), &broken_link).expect("create symlink through non-directory");
+    assert_eq!(
+        std::fs::metadata(broken_link).expect_err("target ancestor is a file").kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+    for idx in 0..DATA_SCANNER_COMPACT_AT_FOLDERS - 2 {
+        std::fs::create_dir(bucket.join(format!("empty-{idx:05}"))).expect("create wide directory");
+    }
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 100).await;
+    let ScannerDiskScanOutcome::Complete(wide) = outcome else {
+        panic!("a failed child must not interrupt the wide root");
+    };
+    let summary = wide.checked_flatten("bucket").expect("aggregate healthy child");
+    assert!(summary.compacted);
+    assert_eq!((summary.objects, summary.size), (1, 7));
+    assert_eq!(wide.cache.len(), 1);
+}

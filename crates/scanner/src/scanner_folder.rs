@@ -433,7 +433,6 @@ enum FolderScanOutcome {
     Namespace,
     ErasureData,
     Vanished,
-    Unreadable,
 }
 
 fn is_erasure_candidate(name: &str) -> bool {
@@ -1876,7 +1875,7 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
         mode: FolderScanMode,
-        skip_unreadable_directory: bool,
+        isolate_compacted_namespace_errors: bool,
     ) -> Result<FolderScanOutcome, ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
         let trace_started_at = trace_start_instant();
@@ -1998,20 +1997,6 @@ impl FolderScanner {
                         return Ok(FolderScanOutcome::Vanished);
                     }
                     None
-                }
-                Err(e) if skip_unreadable_directory && !ctx.is_cancelled() && e.kind() == ErrorKind::PermissionDenied => {
-                    warn!(
-                        target: "rustfs::scanner::folder",
-                        event = EVENT_SCANNER_FOLDER_STATE,
-                        component = LOG_COMPONENT_SCANNER,
-                        subsystem = LOG_SUBSYSTEM_FOLDER,
-                        state = "child_scan_failed",
-                        folder = %folder.name,
-                        error = %e,
-                        "Scanner skipped an unreadable child directory"
-                    );
-                    done_folder();
-                    return Ok(FolderScanOutcome::Unreadable);
                 }
                 Err(e) => return Err(ScannerError::Io(e)),
             };
@@ -2575,8 +2560,8 @@ impl FolderScanner {
                     && (!is_scan_root || into.children.is_empty()));
             // Preserve the ordinary namespace walk's child isolation when the
             // root starts sharing one accumulator across its descendants.
-            let skip_unreadable_children =
-                skip_unreadable_directory || (is_scan_root && !into.compacted && should_compact && !force_compact);
+            let isolate_compacted_children =
+                isolate_compacted_namespace_errors || (is_scan_root && !into.compacted && should_compact && !force_compact);
 
             self.alert_excessive_folders(&folder.name, total_folders);
 
@@ -2725,52 +2710,51 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let outcome = if into.compacted {
-                    Box::pin(self.scan_folder_inner(
-                        ctx.clone(),
-                        folder_item.clone(),
-                        into,
-                        child_mode,
-                        skip_unreadable_children && child_mode == FolderScanMode::Namespace,
-                    ))
-                    .await?
+                let isolate_child = isolate_compacted_children && child_mode == FolderScanMode::Namespace;
+                let compacted = into.compacted;
+                // This accumulator has no retained child tree. Save its totals so a
+                // failed child cannot contribute partial usage to a completed scan.
+                let rollback = (compacted && isolate_child).then(|| clone_cache_value(into));
+                let mut dst = None;
+                let result = if compacted {
+                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode, isolate_child)).await
                 } else {
-                    let mut dst = DataUsageEntry::default();
-                    match self
-                        .scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst, child_mode)
+                    let dst = dst.insert(DataUsageEntry::default());
+                    self.scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, dst, child_mode)
                         .await
-                    {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
-                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
-                                    .await;
-                                return Err(e);
+                };
+                let outcome = match result {
+                    Ok(outcome) => outcome,
+                    Err(e) => {
+                        if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                            if let Some(dst) = &dst {
+                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, dst).await;
                             }
-                            if child_mode != FolderScanMode::Namespace {
-                                return Err(e);
-                            }
-                            warn!(
-                                target: "rustfs::scanner::folder",
-                                event = EVENT_SCANNER_FOLDER_STATE,
-                                component = LOG_COMPONENT_SCANNER,
-                                subsystem = LOG_SUBSYSTEM_FOLDER,
-                                folder = %folder.name,
-                                child_folder = %folder_item.name,
-                                state = "child_scan_failed",
-                                error = %e,
-                                "Scanner child folder scan failed"
-                            );
-                            self.coverage_gap |= forward_sweep;
-                            self.finish_raw_enumeration_parent(&folder_item.name);
-                            continue;
+                            return Err(e);
                         }
+                        if child_mode != FolderScanMode::Namespace || (compacted && !isolate_child) {
+                            return Err(e);
+                        }
+                        if let Some(rollback) = rollback {
+                            *into = rollback;
+                        }
+                        warn!(
+                            target: "rustfs::scanner::folder",
+                            event = EVENT_SCANNER_FOLDER_STATE,
+                            component = LOG_COMPONENT_SCANNER,
+                            subsystem = LOG_SUBSYSTEM_FOLDER,
+                            folder = %folder.name,
+                            child_folder = %folder_item.name,
+                            state = "child_scan_failed",
+                            error = %e,
+                            "Scanner child folder scan failed"
+                        );
+                        self.coverage_gap |= forward_sweep;
+                        self.finish_raw_enumeration_parent(&folder_item.name);
+                        continue;
                     }
                 };
                 self.finish_raw_enumeration_parent(&folder_item.name);
-                if outcome == FolderScanOutcome::Unreadable {
-                    continue;
-                }
                 if outcome == FolderScanOutcome::Vanished {
                     self.new_cache.delete_recursive(&h);
                     if let Some(updates) = &mut self.usage_updates {
