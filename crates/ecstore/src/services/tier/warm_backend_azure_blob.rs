@@ -19,8 +19,9 @@
 //! an interrupted staging operation leaves only Azure's expiring uncommitted
 //! blocks. Lifecycle uploads use the existing transaction journal after a lost
 //! commit acknowledgement; validation probes retain in-process compensation.
-//! GET and DELETE carry an exact version only when the persisted version is
-//! non-empty. Unversioned DELETE uses an ETag condition to refuse replacement.
+//! Versioned GET/DELETE address the persisted version. Current-root cleanup
+//! may demote that matching version under a strong ETag before exact deletion.
+//! Unversioned DELETE also requires a strong ETag to refuse replacement.
 
 use super::tier_config::TierAzure;
 use super::warm_backend::{
@@ -28,6 +29,7 @@ use super::warm_backend::{
     build_transition_put_options, transition_client_timeouts_from_env,
 };
 use super::warm_backend_s3::transition_candidate_metadata_matches;
+use crate::bucket::lifecycle::transition_transaction::canonical_transition_remote_object;
 use bytes::Bytes;
 use futures_util::stream;
 use http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
@@ -232,6 +234,20 @@ impl WarmBackendAzureBlob {
         Err(err)
     }
 
+    async fn delete(&self, object: &str, version: &str, headers: HeaderMap) -> io::Result<()> {
+        let response = self
+            .send(Method::DELETE, self.object_url(object, version)?, headers, None)
+            .await?;
+        if response.status() == StatusCode::ACCEPTED {
+            return Ok(());
+        }
+        let error = service_error(response, "DELETE", self.request_timeout).await;
+        if error.kind() == ErrorKind::NotFound {
+            return Ok(());
+        }
+        Err(error)
+    }
+
     async fn write(
         &self,
         object: &str,
@@ -372,22 +388,27 @@ impl WarmBackend for WarmBackendAzureBlob {
             if !response_version(&current)?.is_empty() {
                 return Err(invalid_data("Azure Blob became versioned; refusing an unversioned delete"));
             }
-            let etag = current
-                .get("etag")
-                .ok_or_else(|| invalid_data("Azure Blob HEAD omitted the delete precondition"))?;
-            headers.insert("if-match", etag.clone());
+            headers = delete_preconditions(&current)?;
         }
-        let response = self
-            .send(Method::DELETE, self.object_url(object, version)?, headers, None)
-            .await?;
-        if response.status() == StatusCode::ACCEPTED {
+        let Err(error) = self.delete(object, version, headers).await else {
             return Ok(());
+        };
+        if version.is_empty()
+            || !AzureBlobError::from_io(&error)
+                .is_some_and(|azure| azure.status == StatusCode::CONFLICT && azure.code == "OperationNotAllowedOnRootBlob")
+        {
+            return Err(error);
         }
-        let err = service_error(response, "DELETE", self.request_timeout).await;
-        if err.kind() == ErrorKind::NotFound {
-            return Ok(());
+
+        // Azure may require the current version to become a previous version
+        // before exact deletion. Only its matching generation can be demoted.
+        if let Some(current) = self.head(object, "").await? {
+            validate_response_version(&current, version)?;
+            self.delete(object, "", delete_preconditions(&current)?).await?;
         }
-        Err(err)
+        // A successful base delete alone does not complete version cleanup.
+        // An error or lost acknowledgement remains retryable by the caller.
+        self.delete(object, version, HeaderMap::new()).await
     }
 
     async fn probe_transition_candidate(&self, object: &str) -> io::Result<TransitionCandidateProbe> {
@@ -484,8 +505,18 @@ fn validate_config(conf: &TierAzure) -> io::Result<()> {
             "Azure Blob tiers currently require an account key and the default storage class",
         ));
     }
-    if !conf.prefix.is_empty() {
-        validate_object_name(&conf.prefix)?;
+    let prefix = conf.prefix.strip_suffix('/').unwrap_or(&conf.prefix);
+    if !prefix.is_empty() {
+        validate_object_name(prefix)?;
+        // Canonical suffix length is independent of the bucket and UUID values.
+        let object = canonical_transition_remote_object(
+            uuid::Uuid::from_u128(1),
+            &conf.bucket,
+            uuid::Uuid::from_u128(2),
+            uuid::Uuid::from_u128(3),
+        )
+        .map_err(io::Error::other)?;
+        validate_object_name(&format!("{prefix}/{object}"))?;
     }
     Ok(())
 }
@@ -536,6 +567,26 @@ fn validate_response_version(headers: &HeaderMap, requested: &str) -> io::Result
         return Err(invalid_data("Azure Blob did not return the requested exact version"));
     }
     Ok(())
+}
+
+fn delete_preconditions(current: &HeaderMap) -> io::Result<HeaderMap> {
+    let etag = current
+        .get("etag")
+        .ok_or_else(|| invalid_data("Azure Blob HEAD omitted the delete precondition"))?;
+    let bytes = etag.as_bytes();
+    // A wildcard, weak tag or list cannot identify a single matching generation.
+    if bytes.len() < 3
+        || bytes.first() != Some(&b'"')
+        || bytes.last() != Some(&b'"')
+        || !bytes[1..bytes.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'!' || (b'#'..=b'~').contains(byte))
+    {
+        return Err(invalid_data("Azure Blob HEAD omitted a single strong ETag"));
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("if-match", etag.clone());
+    Ok(headers)
 }
 
 fn classify_head(headers: &HeaderMap) -> io::Result<TransitionCandidateProbe> {

@@ -451,6 +451,232 @@ async fn range_get_preserves_key_encoding_and_exact_version_for_delete() {
 }
 
 #[tokio::test]
+async fn current_version_delete_demotes_only_the_matching_root_before_exact_cleanup() {
+    let version = "target-version";
+    let (backend, task) = fixture(vec![
+        reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+        present(Some(version)),
+        reply(StatusCode::ACCEPTED, &[], b""),
+        reply(StatusCode::ACCEPTED, &[], b""),
+    ])
+    .await;
+    backend
+        .remove_exact("current", version)
+        .await
+        .expect("current version should be removable");
+    let requests = task.await.expect("fixture should join");
+    assert_eq!(requests.len(), 4);
+    assert_eq!(requests[0].target, "/container/cold/current?versionid=target-version");
+    assert_eq!(requests[1].method, "HEAD");
+    assert_eq!(requests[1].target, "/container/cold/current");
+    assert_eq!(requests[2].method, "DELETE");
+    assert_eq!(requests[2].target, "/container/cold/current");
+    assert_eq!(requests[2].headers["if-match"], "\"original\"");
+    assert_eq!(requests[3].method, "DELETE");
+    assert_eq!(requests[3].target, requests[0].target);
+}
+
+#[tokio::test]
+async fn current_version_delete_refuses_replacements_before_and_after_head() {
+    for replaced_after_head in [false, true] {
+        let mut responses = vec![
+            reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+            present(Some(if replaced_after_head {
+                "target-version"
+            } else {
+                "replacement-version"
+            })),
+        ];
+        if replaced_after_head {
+            responses.push(reply(StatusCode::PRECONDITION_FAILED, &[("x-ms-error-code", "ConditionNotMet")], b""));
+        }
+        let (backend, task) = fixture(responses).await;
+        assert!(backend.remove_exact("current", "target-version").await.is_err());
+        let requests = task.await.expect("fixture should join");
+        if replaced_after_head {
+            assert_eq!(requests.len(), 3, "a failed condition must stop exact cleanup");
+            assert_eq!(requests[2].target, "/container/cold/current");
+            assert_eq!(requests[2].headers["if-match"], "\"original\"");
+        } else {
+            assert_eq!(requests.len(), 2, "a different current version must never authorize a base delete");
+        }
+    }
+}
+
+#[tokio::test]
+async fn current_version_delete_retries_the_exact_version_when_the_root_is_already_absent() {
+    let (backend, task) = fixture(vec![
+        reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+        missing(),
+        reply(StatusCode::ACCEPTED, &[], b""),
+    ])
+    .await;
+    backend
+        .remove_exact("current", "target-version")
+        .await
+        .expect("previous version cleanup");
+    let requests = task.await.expect("fixture should join");
+    assert_eq!(requests.len(), 3);
+    assert_eq!(requests[2].target, "/container/cold/current?versionid=target-version");
+    assert!(
+        requests
+            .iter()
+            .all(|request| request.method != "DELETE" || request.target.contains("versionid="))
+    );
+}
+
+#[tokio::test]
+async fn current_version_delete_keeps_partial_or_uncertain_cleanup_retryable() {
+    for fails_during_exact_cleanup in [false, true] {
+        for lost_response in [false, true] {
+            let mut responses = vec![
+                reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+                present(Some("target-version")),
+            ];
+            if fails_during_exact_cleanup {
+                responses.push(reply(StatusCode::ACCEPTED, &[], b""));
+            }
+            let mut failure = reply(StatusCode::INTERNAL_SERVER_ERROR, &[("x-ms-error-code", "InternalError")], b"");
+            failure.disconnect = lost_response;
+            responses.push(failure);
+            responses.push(reply(StatusCode::ACCEPTED, &[], b""));
+            let (backend, task) = fixture(responses).await;
+            backend
+                .remove_exact("current", "target-version")
+                .await
+                .expect_err("base removal alone or an uncertain response must not complete cleanup");
+            backend
+                .remove_exact("current", "target-version")
+                .await
+                .expect("retry exact cleanup");
+            let requests = task.await.expect("fixture should join");
+            let expected = if fails_during_exact_cleanup { 5 } else { 4 };
+            assert_eq!(requests.len(), expected, "uncertain destructive requests must not be replayed internally");
+            assert_eq!(requests[2].headers["if-match"], "\"original\"");
+            assert_eq!(requests[expected - 1].target, "/container/cold/current?versionid=target-version");
+            assert_eq!(
+                requests
+                    .iter()
+                    .filter(|request| request.method == "DELETE" && !request.target.contains('?'))
+                    .count(),
+                1,
+                "a retry must not delete the root again"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn delete_requires_a_single_strong_etag_and_an_exact_current_version() {
+    for versioned in [false, true] {
+        for etag in [
+            None,
+            Some(""),
+            Some("*"),
+            Some("W/\"weak\""),
+            Some("\"first\", \"second\""),
+            Some("\"\""),
+        ] {
+            let mut head = present(if versioned { Some("target-version") } else { None });
+            head.headers.remove("etag");
+            if let Some(etag) = etag {
+                insert_header(&mut head.headers, "etag", etag).expect("fixture etag should be representable");
+            }
+            let mut responses = Vec::new();
+            if versioned {
+                responses.push(reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""));
+            }
+            responses.push(head);
+            let (backend, task) = fixture(responses).await;
+            assert!(
+                backend
+                    .remove("current", if versioned { "target-version" } else { "" })
+                    .await
+                    .is_err()
+            );
+            let requests = task.await.expect("fixture should join");
+            assert!(
+                requests
+                    .iter()
+                    .all(|request| request.method != "DELETE" || request.target.contains("versionid=")),
+                "a missing, wildcard, weak or multi-value ETag cannot authorize root removal"
+            );
+        }
+    }
+    for current_version in [None, Some("")] {
+        let (backend, task) = fixture(vec![
+            reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+            present(current_version),
+        ])
+        .await;
+        assert!(backend.remove_exact("current", "target-version").await.is_err());
+        assert_eq!(task.await.expect("fixture should join").len(), 2);
+    }
+}
+
+#[tokio::test]
+async fn exact_delete_does_not_demote_roots_for_other_service_errors() {
+    for (status, code) in [
+        (StatusCode::CONFLICT, "BlobImmutableDueToPolicy"),
+        (StatusCode::FORBIDDEN, "OperationNotAllowedOnRootBlob"),
+        (StatusCode::INTERNAL_SERVER_ERROR, "OperationNotAllowedOnRootBlob"),
+    ] {
+        let (backend, task) = fixture(vec![reply(status, &[("x-ms-error-code", code)], b"")]).await;
+        let error = backend
+            .remove_exact("current", "target-version")
+            .await
+            .expect_err("service rejection");
+        assert_eq!(AzureBlobError::from_io(&error).expect("typed service error").code, code);
+        assert_eq!(
+            task.await.expect("fixture should join").len(),
+            1,
+            "unrelated errors cannot trigger root removal"
+        );
+    }
+}
+
+#[test]
+fn prefix_reserves_the_complete_canonical_lifecycle_name_before_backend_creation() {
+    use crate::bucket::lifecycle::transition_transaction::canonical_transition_remote_object;
+    let mut config = TierAzure {
+        access_key: "account".to_string(),
+        secret_key: base64_simd::STANDARD.encode_to_string([7; 32]),
+        bucket: "container".to_string(),
+        prefix: "a".repeat(800),
+        ..Default::default()
+    };
+    assert!(
+        WarmBackendAzureBlob::new(&config).is_err(),
+        "a prefix that fits only the probe is unusable for lifecycle"
+    );
+    let object = canonical_transition_remote_object(
+        uuid::Uuid::from_u128(1),
+        "source-bucket",
+        uuid::Uuid::from_u128(2),
+        uuid::Uuid::from_u128(3),
+    )
+    .expect("canonical lifecycle key");
+    let max_ascii_prefix = 880 - object.chars().count() - 1;
+    config.prefix = "a".repeat(max_ascii_prefix);
+    let backend = WarmBackendAzureBlob::new(&config).expect("complete name at the character limit");
+    assert!(backend.object_url(&object, "").is_ok());
+    config.prefix.push('/');
+    let backend = WarmBackendAzureBlob::new(&config).expect("one trailing slash is normalized");
+    assert!(backend.object_url(&object, "").is_ok());
+    config.prefix = "a".repeat(max_ascii_prefix + 1);
+    assert!(WarmBackendAzureBlob::new(&config).is_err(), "reject one extra character before I/O");
+    let max_unicode_prefix = (1760 - object.len() - 1) / '界'.len_utf8();
+    config.prefix = "界".repeat(max_unicode_prefix);
+    let backend = WarmBackendAzureBlob::new(&config).expect("complete Unicode name within the byte limit");
+    assert!(backend.object_url(&object, "").is_ok());
+    config.prefix.push('界');
+    assert!(
+        WarmBackendAzureBlob::new(&config).is_err(),
+        "the byte limit must include the canonical suffix"
+    );
+}
+
+#[tokio::test]
 async fn version_drift_and_incorrect_ranges_fail_closed() {
     let (backend, task) = fixture(vec![present(Some("new-version"))]).await;
     let err = backend
