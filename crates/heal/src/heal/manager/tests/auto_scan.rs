@@ -881,6 +881,13 @@ async fn auto_format_fixture(
     // Preserve the constructor's explicit open/closed state before any fixture await.
     let node_limit = node.as_ref().map(|node| node.snapshot().limit);
     let fixture = resume_admission_fixture(node.clone()).await;
+    // The endpoint monitor independently probes format.json after five seconds.
+    // Drain it before aging the cache so the path-only pause observes this scanner.
+    for pool in &fixture._store.ecstore.pools {
+        tokio::time::timeout(Duration::from_secs(30), pool.stop_endpoint_monitor_for_test())
+            .await
+            .expect("endpoint reconnection must stop before the scanner owns format probes");
+    }
     let disks = crate::heal::local_disk_map_read()
         .await
         .values()

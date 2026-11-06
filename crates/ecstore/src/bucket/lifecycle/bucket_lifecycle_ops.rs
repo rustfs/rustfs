@@ -5487,6 +5487,14 @@ pub async fn put_restore_opts(
     if !oi.user_tags.is_empty() {
         meta.insert(AMZ_OBJECT_TAGGING.to_string(), (*oi.user_tags).clone());
     }
+    if let Some(expires) = oi.expires {
+        meta.insert(
+            "expires".to_string(),
+            expires
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(std::io::Error::other)?,
+        );
+    }
     let restore_expiry = lifecycle::expected_expiry_time(OffsetDateTime::now_utc(), rreq.days.unwrap_or(1));
     meta.insert(
         metadata_keys::RESTORE.to_string(),
@@ -5506,7 +5514,6 @@ pub async fn put_restore_opts(
         // computed MD5 is not the object's public plaintext ETag.
         preserve_etag: oi.etag.clone(),
         shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
-        //expires:           oi.expires,
         ..Default::default()
     })
 }
@@ -7143,6 +7150,25 @@ mod tests {
             TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
             0,
             "tier generation lease should release after EOF"
+        );
+        let unread = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("open an unread transitioned response");
+        assert_eq!(TierConfigMgr::active_operation_lease_count(&manager, &tier).await, 1);
+        drop(unread);
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "canceling an unread response must release the tier lease"
         );
     }
 

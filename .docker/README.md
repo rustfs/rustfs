@@ -22,9 +22,9 @@ The following files in the project root are essential for Docker operations:
 | File | Description | Usage |
 | :--- | :--- | :--- |
 | **`docker-buildx.sh`** | **Multi-Arch Build Script**<br>Automates building and pushing Docker images for `amd64` and `arm64`. Supports release and dev channels. | `./docker-buildx.sh --push` |
-| **`Dockerfile`** | **Production Image (Alpine)**<br>Lightweight image using musl libc. Downloads pre-built binaries from GitHub Releases. | `docker build -t rustfs:latest .` |
-| **`Dockerfile.glibc`** | **Production Image (Ubuntu)**<br>Standard image using glibc. Useful if you need specific dynamic libraries. | `docker build -f Dockerfile.glibc .` |
-| **`Dockerfile.source`** | **Development Image**<br>Builds RustFS from source code. Includes build tools. Ideal for local development and CI. | `docker build -f Dockerfile.source .` |
+| **`Dockerfile`** | **Production Image (Alpine)**<br>Lightweight image using musl libc. Downloads verified RustFS and `rc` binaries from GitHub Releases and bundles `/etc/rustfs/bootstrap`. | `docker build -t rustfs:latest .` |
+| **`Dockerfile.glibc`** | **Production Image (Ubuntu)**<br>Standard image using glibc. Includes the bundled bootstrap configuration. | `docker build -f Dockerfile.glibc .` |
+| **`Dockerfile.source`** | **Development Image**<br>Builds RustFS from source code and bundles `rc` and the default bootstrap configuration. | `docker build -f Dockerfile.source .` |
 
 ### Docker Compose Configurations
 

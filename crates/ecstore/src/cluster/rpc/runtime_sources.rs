@@ -481,6 +481,14 @@ pub(crate) fn record_remote_disk_grpc_write_all_request() {
         .record_outgoing_request_for_operation_and_backend(INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
 }
 
+pub(crate) fn record_remote_disk_grpc_write_all_duration(duration: Duration) {
+    global_internode_metrics().record_duration_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        duration,
+    );
+}
+
 pub(crate) fn record_remote_disk_grpc_write_all_sent_bytes(bytes: usize) {
     global_internode_metrics().record_sent_bytes_for_operation_and_backend(
         INTERNODE_OPERATION_GRPC_WRITE_ALL,
@@ -519,6 +527,14 @@ pub(crate) fn record_remote_disk_grpc_read_all_error() {
 pub(crate) fn record_remote_disk_grpc_read_all_request() {
     global_internode_metrics()
         .record_outgoing_request_for_operation_and_backend(INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_TRANSPORT_BACKEND_GRPC);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_all_duration(duration: Duration) {
+    global_internode_metrics().record_duration_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_ALL,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        duration,
+    );
 }
 
 #[cfg(feature = "diagnostic-read-version-caller")]
@@ -594,6 +610,17 @@ pub(crate) fn record_remote_disk_grpc_batch_read_version_stage(stage: &'static s
         INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
         INTERNODE_TRANSPORT_BACKEND_GRPC,
         stage,
+        duration,
+    );
+}
+
+pub(crate) fn record_remote_disk_grpc_batch_read_version_duration(duration: Duration) {
+    if !rustfs_io_metrics::get_stage_metrics_enabled() {
+        return;
+    }
+    global_internode_metrics().record_duration_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
         duration,
     );
 }
@@ -688,6 +715,14 @@ pub(crate) fn record_remote_disk_grpc_read_multiple_recv_bytes(bytes: usize) {
         bytes,
     );
     record_grpc_payload_size(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, bytes);
+}
+
+pub(crate) fn record_remote_disk_grpc_read_multiple_duration(duration: Duration) {
+    global_internode_metrics().record_duration_for_operation_and_backend(
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+        duration,
+    );
 }
 
 /// Payload-size threshold (bytes) above which a unary internode gRPC response is counted as a

@@ -5382,6 +5382,7 @@ async fn maintenance_test_object_versions(backend: &TestCatalogObjectBackend) ->
                 key.clone(),
                 TableCatalogObject {
                     data: object.data.clone(),
+                    body_revision: object.body_revision,
                     etag: Some(object.etag.clone()),
                     mod_time: object.mod_time,
                 },
@@ -15734,4 +15735,255 @@ async fn assert_disable_empty_table_bucket<S: TableCatalogStore>(store: &S) {
         .create_namespace(test_namespace_entry(bucket, &namespace))
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn object_maintenance_refuses_roots_shared_after_cross_namespace_rename() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let destination = Namespace::parse("private").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let original_metadata = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    let replacement_metadata = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, original_metadata.clone()).await;
+    backend
+        .seed_object(bucket, &original_metadata, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    store
+        .create_namespace(test_namespace_entry(bucket, &destination))
+        .await
+        .unwrap();
+    store
+        .rename_table(bucket, "sales", "orders", "private", "orders")
+        .await
+        .unwrap();
+    let mut replacement = test_table_entry(bucket, &namespace, &table, replacement_metadata.clone());
+    replacement.table_id = "replacement-id".to_string();
+    replacement.table_uuid = "replacement-uuid".to_string();
+    replacement.warehouse_location = format!("s3://{bucket}/tables/replacement-id");
+    backend
+        .seed_object(bucket, &replacement_metadata, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    store.create_table(replacement).await.unwrap();
+    assert_matches!(store.plan_table_metadata_maintenance(bucket, "sales", "orders", 0).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
+    assert_matches!(store.delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
+    assert!(backend.object_exists(bucket, &original_metadata).await.unwrap());
+    assert_eq!(
+        store
+            .load_table(bucket, "private", "orders")
+            .await
+            .unwrap()
+            .unwrap()
+            .metadata_location,
+        original_metadata
+    );
+    assert!(backend.state.lock().await.delete_attempts.is_empty());
+}
+
+#[tokio::test]
+async fn object_maintenance_rechecks_root_ownership_under_publication_fence() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let other_namespace = Namespace::parse("private").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object(bucket, &orphan, br#"{"metadata-log":[]}"#.to_vec()).await;
+    let report = store
+        .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+        .await
+        .unwrap();
+    assert_eq!(report.deletable_metadata_locations, vec![orphan.clone()]);
+    store
+        .create_namespace(test_namespace_entry(bucket, &other_namespace))
+        .await
+        .unwrap();
+    let mut other = test_table_entry(bucket, &other_namespace, &table, orphan.clone());
+    other.table_id = "other-id".to_string();
+    other.table_uuid = "other-uuid".to_string();
+    other.warehouse_location = format!("s3://{bucket}/tables/other-id");
+    store.create_table(other.clone()).await.unwrap();
+    assert_matches!(store.delete_table_metadata_maintenance_report(bucket, "sales", "orders", report.clone()).await,
+        Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
+    assert!(backend.object_exists(bucket, &orphan).await.unwrap());
+    store.drop_table(bucket, "private", "orders").await.unwrap();
+
+    let pause = backend.pause_next_delete(bucket, &orphan).await;
+    let deleting_store = store.clone();
+    let deleting = tokio::spawn(async move {
+        deleting_store
+            .delete_table_metadata_maintenance_report(bucket, "sales", "orders", report)
+            .await
+    });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, pause.wait_started())
+        .await
+        .unwrap();
+    let publication_lock = default_table_bucket_publication_lock_path();
+    let attempts = backend.write_lock_acquisition_count(bucket, &publication_lock).await;
+    let creating_store = store.clone();
+    let creating = tokio::spawn(async move { creating_store.create_table(other).await });
+    tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, async {
+        while backend.write_lock_acquisition_count(bucket, &publication_lock).await == attempts {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(!creating.is_finished(), "new owner cannot publish between root validation and deletion");
+    creating.abort();
+    let _ = creating.await;
+    pause.release();
+    let deleted = tokio::time::timeout(TABLE_CATALOG_TEST_TIMEOUT, deleting)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(deleted.deletable_metadata_locations, vec![orphan.clone()]);
+    assert!(!backend.object_exists(bucket, &orphan).await.unwrap());
+    assert!(backend.object_exists(bucket, &current).await.unwrap());
+}
+
+#[tokio::test]
+async fn object_maintenance_rejects_a_report_from_a_replaced_table_incarnation() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object(bucket, &orphan, br#"{"metadata-log":[]}"#.to_vec()).await;
+    let report = store
+        .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+        .await
+        .unwrap();
+    store.drop_table(bucket, "sales", "orders").await.unwrap();
+    let mut replacement = test_table_entry(bucket, &namespace, &table, current.clone());
+    replacement.table_id = "new-incarnation".to_string();
+    replacement.table_uuid = "new-uuid".to_string();
+    replacement.warehouse_location = format!("s3://{bucket}/tables/new-incarnation");
+    store.create_table(replacement).await.unwrap();
+    assert_matches!(store.delete_table_metadata_maintenance_report(bucket, "sales", "orders", report).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message.contains("identity does not match"));
+    assert!(backend.object_exists(bucket, &current).await.unwrap());
+    assert!(backend.object_exists(bucket, &orphan).await.unwrap());
+}
+
+#[tokio::test]
+async fn maintenance_orphan_planning_and_deletion_never_read_object_bodies() {
+    let backend = TestCatalogObjectBackend::default();
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
+    backend
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    let root = format!("{}{}/", default_table_root_prefix(&namespace), table.as_str());
+    let old = format!("{root}data/old.parquet");
+    let fresh = format!("{root}delete/fresh.parquet");
+    let unknown = format!("{root}metadata/unknown.avro");
+    backend.seed_object(bucket, &old, b"body must not be read".to_vec()).await;
+    backend
+        .seed_object_with_mod_time(bucket, &fresh, vec![1], Some(OffsetDateTime::now_utc()))
+        .await;
+    backend.seed_object_with_mod_time(bucket, &unknown, vec![2], None).await;
+    for object in [&old, &fresh, &unknown] {
+        backend.fail_next_read(bucket, object).await;
+    }
+    let report = store
+        .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
+        .await
+        .expect("stat-only dry run");
+    assert_eq!(report.deletable_object_locations, vec![old.clone()]);
+    assert_eq!(
+        object_cleanup_report(&report, &fresh).state,
+        TableMetadataMaintenanceObjectState::PendingSafetyWindow
+    );
+    assert_eq!(
+        object_cleanup_report(&report, &unknown).state,
+        TableMetadataMaintenanceObjectState::PendingSafetyWindow
+    );
+    let deleted = store
+        .delete_table_metadata_maintenance_candidates(bucket, "sales", "orders", 0)
+        .await
+        .expect("stat-only deletion recheck");
+    assert_eq!(deleted.deletable_object_locations, vec![old.clone()]);
+    assert!(!backend.object_exists(bucket, &old).await.unwrap());
+    assert!(backend.object_exists(bucket, &fresh).await.unwrap());
+    assert!(backend.object_exists(bucket, &unknown).await.unwrap());
+    let state = backend.state.lock().await;
+    for object in [&old, &fresh, &unknown] {
+        assert_eq!(
+            state.read_attempts.get(&(bucket.to_string(), object.to_string())),
+            None,
+            "orphan body must never be fetched"
+        );
+    }
+}
+
+#[tokio::test]
+async fn compaction_planner_stats_data_files_without_reading_their_bodies() {
+    let backend = TestCatalogObjectBackend::default();
+    let bucket = "analytics";
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let metadata_dir = default_table_metadata_dir_path(&namespace, &table);
+    let current = default_table_metadata_file_path(&namespace, &table, "00004.metadata.json");
+    let entry = test_table_entry(bucket, &namespace, &table, current);
+    let data_dir = default_table_data_dir_path(&namespace, &table);
+    let files = [format!("{data_dir}/left.parquet"), format!("{data_dir}/right.parquet")];
+    let manifest = format!("{metadata_dir}/manifest-20.avro");
+    let manifest_list = format!("{metadata_dir}/snap-20.avro");
+    let manifest_bytes = manifest_avro_bytes(&[(&files[0], 0), (&files[1], 0)]);
+    backend
+        .seed_object(bucket, &manifest_list, manifest_list_avro_bytes(&[(&manifest, manifest_bytes.len())]))
+        .await;
+    backend.seed_object(bucket, &manifest, manifest_bytes).await;
+    for file in &files {
+        backend.seed_object(bucket, file, vec![0; 8192]).await;
+        backend.fail_next_read(bucket, file).await;
+    }
+    let metadata = serde_json::json!({
+        "current-snapshot-id": 20,
+        "snapshots": [{"snapshot-id": 20, "manifest-list": manifest_list}],
+        "refs": {"main": {"snapshot-id": 20, "type": "branch"}}
+    });
+    backend.reset_call_counts().await;
+    let report = table_compaction_planning_report(
+        &backend,
+        bucket,
+        &namespace,
+        &table,
+        &entry,
+        &metadata,
+        TableCompactionPlanningConfig {
+            target_file_size_bytes: 65536,
+            small_file_threshold_bytes: 16384,
+            min_input_files: 2,
+            max_rewrite_bytes_per_job: 65536,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(report.status, TableCompactionPlanningStatus::RewriteCandidates);
+    assert_eq!(report.candidate_file_count, 2);
+    assert_eq!(backend.metadata_call_count().await, 2);
+    assert_eq!(backend.read_call_count().await, 2, "only the manifest list and manifest may be read");
 }

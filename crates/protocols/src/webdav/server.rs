@@ -30,7 +30,6 @@ use hyper_util::rt::{TokioIo, TokioTimer};
 use rustfs_config::{DEFAULT_TLS_RELOAD_ENABLE, DEFAULT_TLS_RELOAD_INTERVAL, ENV_TLS_RELOAD_ENABLE, ENV_TLS_RELOAD_INTERVAL};
 use rustfs_tls_runtime::{ReloadableServerCertResolver, TlsReloadOptions, spawn_server_cert_reload_loop};
 use rustfs_utils::MaskedAccessKey;
-use rustls::ServerConfig;
 use std::convert::Infallible;
 use std::io;
 use std::net::IpAddr;
@@ -159,7 +158,8 @@ where
                     reload_shutdown_rx.clone(),
                 );
 
-                let server_config = ServerConfig::builder().with_no_client_auth().with_cert_resolver(resolver);
+                let server_config = crate::common::tls::server_config(resolver, self.config.ca_file.as_deref())
+                    .map_err(|error| WebDavInitError::Tls(format!("Invalid client CA configuration: {error}")))?;
 
                 Some(TlsAcceptor::from(Arc::new(server_config)))
             } else {

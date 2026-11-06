@@ -168,7 +168,7 @@ http-body-util = "0.1.5"
 memchr = "2.8.3"
 minlz = "1.2.3"
 reqwest = "0.13.5"
-rustfs-kafka-async = { version = "1.4.0" }
+rustfs-kafka-async = { version = "1.4.1" }
 socket2 = { version = "0.6.5" }
 tokio = { version = "1.54.1" }
 tokio-rustls = { default-features = false, version = "0.26.6" }
@@ -191,6 +191,7 @@ quinn = { version = "0.11.12", default-features = false, features = [
 # Serialization and Data Formats
 apache-avro = { version = "0.22.0", features = ["snappy", "zstandard"] }
 bytes = { version = "1.12.1" }
+csv-core = "0.1.13"
 bytesize = "2.7.0"
 byteorder = "1.5.0"
 flatbuffers = "25.12.19"
@@ -212,7 +213,7 @@ serde_urlencoded = "0.7.1"
 # releases.
 aes-gcm = { version = "0.11.1" }
 argon2 = { version = "0.6.0" }
-aws-lc-rs = { version = "1.18.0", default-features = false }
+aws-lc-rs = { version = "1.19.0", default-features = false }
 blake2 = "0.11.0"
 chacha20poly1305 = { version = "0.11.0" }
 crc-fast = "1.10.0"
@@ -378,7 +379,7 @@ libunftp = { version = "0.24.0" }
 unftp-core = "0.1.0"
 suppaftp = { version = "12.2.1" }
 rcgen = { version = "0.14.10", default-features = false, features = ["aws_lc_rs", "crypto", "pem"] }
-russh = { version = "0.65.0" }
+russh = { version = "0.65.1" }
 russh-sftp = "3.0.1"
 
 # WebDAV

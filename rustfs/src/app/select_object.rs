@@ -1781,6 +1781,81 @@ mod tests {
         assert!(error.source().is_none());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn unread_select_response_does_not_block_real_overwrite() {
+        crate::app::gating_test_env::run_large_stack_test("select-unread-writer", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use crate::app::storage_api::test::contract::object::ObjectIO as _;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            crate::app::runtime_sources::install_test_app_context(Arc::clone(&store)).await;
+            let bucket = format!("select-unread-{}", uuid::Uuid::new_v4().simple());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("bucket");
+            let payload = b"original,123456789012345678901234567890\n".repeat(100_000);
+            let mut initial = crate::app::storage_api::object_usecase::StoragePutObjReader::from_vec(payload);
+            store
+                .put_object(&bucket, "input.csv", &mut initial, &Default::default())
+                .await
+                .expect("CSV fixture");
+            let snapshot = store
+                .prepare_select_object_snapshot(&bucket, "input.csv", &HeaderMap::new(), &Default::default())
+                .await
+                .expect("snapshot for terminal consistency fence");
+            let snapshot = Arc::new(snapshot);
+            let mut input = base_input();
+            input.bucket = bucket.clone();
+            input.key = "input.csv".to_owned();
+            let request = S3Request {
+                input,
+                method: http::Method::POST,
+                uri: format!("/{bucket}/input.csv?select&select-type=2").parse().expect("URI"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let response = execute_select_object_content(request)
+                .await
+                .expect("start actual SELECT response");
+            // Keep the response alive without polling its event stream. The
+            // producer may fill its bounded channel, but cannot retain object locks.
+            let mut replacement =
+                crate::app::storage_api::object_usecase::StoragePutObjReader::from_vec(b"replacement,2\n".to_vec());
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                store.put_object(&bucket, "input.csv", &mut replacement, &Default::default()),
+            )
+            .await
+            .expect("unread SELECT must not block writer")
+            .expect("normal overwrite");
+            drop(response);
+            assert!(snapshot.open_reader(None).await.is_err(), "first range must reject the real overwrite");
+            let schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, false)]));
+            let output = Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::empty::<Result<RecordBatch, DataFusionError>>(),
+            ));
+            let (mut events, mut rx) = test_event_channel(4);
+            let outcome = send_select_events(
+                output,
+                &mut events,
+                csv_validation(),
+                Arc::new(SelectInputMetrics::default()),
+                Instant::now() + Duration::from_secs(30),
+                30,
+                &snapshot,
+            )
+            .await;
+            assert!(matches!(outcome, SelectProducerOutcome::Terminal(Err(_))));
+            assert!(rx.try_recv().is_err(), "a real changed-generation fence must never emit Stats or End");
+        });
+    }
+
     fn base_input() -> SelectObjectContentInput {
         SelectObjectContentInput {
             bucket: "bucket".to_string(),

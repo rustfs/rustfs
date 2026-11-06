@@ -12,8 +12,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::Notify;
 
@@ -78,13 +78,21 @@ impl AtomicLockState {
 
     /// Try to acquire shared lock (fast path)
     pub fn try_acquire_shared(&self) -> bool {
+        self.try_acquire_shared_with_mask(NO_WRITER_AND_NO_WAITING_WRITERS)
+    }
+
+    // Publication admission already orders readers against waiting writers.
+    fn try_acquire_admitted_shared(&self) -> bool {
+        self.try_acquire_shared_with_mask(WRITER_FLAG_MASK)
+    }
+
+    fn try_acquire_shared_with_mask(&self, blocked_mask: u64) -> bool {
         self.update_access_time();
 
         loop {
             let current = self.state.load(Ordering::Acquire);
 
-            // Fast path check - cannot acquire if there's a writer or writers waiting
-            if (current & NO_WRITER_AND_NO_WAITING_WRITERS) != 0 {
+            if (current & blocked_mask) != 0 {
                 return false;
             }
 
@@ -334,6 +342,7 @@ pub struct ObjectLockState {
     // First cache line: Most frequently accessed data
     /// Atomic state for fast operations
     pub atomic_state: AtomicLockState,
+    pub(super) publication: OnceLock<Arc<super::publication::PublicationQueue>>,
 
     // Second cache line: Notification mechanisms
     /// Notification for readers (traditional)
@@ -377,6 +386,7 @@ impl ObjectLockState {
     pub fn new() -> Self {
         Self {
             atomic_state: AtomicLockState::new(),
+            publication: OnceLock::new(),
             read_notify: Notify::new(),
             write_notify: Notify::new(),
             optimized_notify: OptimizedNotify::new(),
@@ -392,6 +402,19 @@ impl ObjectLockState {
             return false;
         }
 
+        self.record_shared_owner(owner, lock_timeout);
+        true
+    }
+
+    pub(super) fn try_acquire_admitted_shared(&self, owner: &Arc<str>, lock_timeout: Duration) -> bool {
+        if !self.atomic_state.try_acquire_admitted_shared() {
+            return false;
+        }
+        self.record_shared_owner(owner, lock_timeout);
+        true
+    }
+
+    fn record_shared_owner(&self, owner: &Arc<str>, lock_timeout: Duration) {
         self.atomic_state.update_access_time();
         let mut shared = self.shared_owners.write();
         if let Some(entry) = shared.iter_mut().find(|entry| entry.owner.as_ref() == owner.as_ref()) {
@@ -406,7 +429,6 @@ impl ObjectLockState {
                 lock_timeout,
             });
         }
-        true
     }
 
     /// Try fast path exclusive lock acquisition
@@ -437,6 +459,9 @@ impl ObjectLockState {
                 Some(shared.remove(pos))
             };
             if self.atomic_state.release_shared() {
+                if let Some(queue) = self.publication.get() {
+                    queue.changed.notify_waiters();
+                }
                 if shared.is_empty() {
                     drop(shared);
                     self.optimized_notify.notify_writer();
@@ -480,6 +505,9 @@ impl ObjectLockState {
             if self.atomic_state.release_exclusive() {
                 *current = None;
                 drop(current);
+                if let Some(queue) = self.publication.get() {
+                    queue.changed.notify_waiters();
+                }
                 // Notify waiters using optimized system - prefer writers over readers
                 if self
                     .atomic_state

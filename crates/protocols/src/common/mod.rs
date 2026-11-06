@@ -16,6 +16,9 @@ pub mod client;
 pub mod gateway;
 pub mod session;
 
+#[cfg(any(feature = "webdav", feature = "ftps"))]
+pub(crate) mod tls;
+
 #[cfg(test)]
 pub(crate) mod dummy_storage;
 

@@ -502,10 +502,163 @@ mod tests {
                 assert!(response.contains(if expected == reqwest::StatusCode::FORBIDDEN {
                     "<Code>AccessDenied</Code>"
                 } else {
-                    "<Code>BucketAlreadyExists</Code>"
+                    "<Code>BucketAlreadyOwnedByYou</Code>"
                 }));
             }
         }
+        Ok(())
+    }
+
+    /// A deployment owns a single bucket namespace, so an IAM user that recreates
+    /// an existing bucket is the owner, not another account. In the default region
+    /// every such request returns the legacy idempotent `200 OK` (AWS CreateBucket
+    /// semantics), including buckets created by root and by another IAM user.
+    #[tokio::test]
+    async fn test_create_bucket_duplicate_in_default_region_is_idempotent_for_iam_user()
+    -> Result<(), Box<dyn Error + Send + Sync>> {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec!["--region", "us-east-1"]).await?;
+        let root = env.create_s3_client();
+
+        admin_create_user(&env, "duplicate-iam", "duplicate-iam-secret").await?;
+        admin_attach_user_policy_via(
+            AdminTransport::Signed,
+            &env.url,
+            &env.access_key,
+            &env.secret_key,
+            "readwrite",
+            "duplicate-iam",
+        )
+        .await?;
+        let iam = Client::from_conf(build_test_s3_config(
+            &env.url,
+            "duplicate-iam",
+            "duplicate-iam-secret",
+            None,
+            "duplicate-create",
+        ));
+
+        root.create_bucket()
+            .bucket("duplicate-root-owned")
+            .send()
+            .await
+            .expect("root creates the first bucket");
+        iam.create_bucket()
+            .bucket("duplicate-root-owned")
+            .send()
+            .await
+            .expect("an IAM user recreating a root-owned bucket in us-east-1 gets 200 OK");
+
+        iam.create_bucket()
+            .bucket("duplicate-iam-owned")
+            .send()
+            .await
+            .expect("the IAM user creates its own bucket");
+        iam.create_bucket()
+            .bucket("duplicate-iam-owned")
+            .send()
+            .await
+            .expect("the same IAM user recreating its bucket gets 200 OK");
+        root.create_bucket()
+            .bucket("duplicate-iam-owned")
+            .send()
+            .await
+            .expect("root recreating an IAM-created bucket gets 200 OK");
+
+        Ok(())
+    }
+
+    /// Outside the default region the same ownership answer becomes
+    /// `409 BucketAlreadyOwnedByYou` for every authorized requester. Requests that
+    /// lack `s3:CreateBucket` still fail authorization before the duplicate check.
+    #[tokio::test]
+    async fn test_create_bucket_duplicate_outside_default_region_reports_owned_by_you() -> Result<(), Box<dyn Error + Send + Sync>>
+    {
+        init_logging();
+        let mut env = RustFSTestEnvironment::new().await?;
+        env.start_rustfs_server(vec!["--region", "eu-west-1"]).await?;
+        let region = "eu-west-1";
+        let root = Client::from_conf(
+            env.create_s3_client()
+                .config()
+                .to_builder()
+                .region(Region::new(region))
+                .build(),
+        );
+
+        admin_create_user(&env, "duplicate-eu-iam", "duplicate-eu-iam-secret").await?;
+        admin_attach_user_policy_via(
+            AdminTransport::Signed,
+            &env.url,
+            &env.access_key,
+            &env.secret_key,
+            "readwrite",
+            "duplicate-eu-iam",
+        )
+        .await?;
+        let iam = Client::from_conf(
+            build_test_s3_config(&env.url, "duplicate-eu-iam", "duplicate-eu-iam-secret", None, "duplicate-create")
+                .to_builder()
+                .region(Region::new(region))
+                .build(),
+        );
+
+        admin_create_user(&env, "duplicate-eu-readonly", "duplicate-eu-readonly-secret").await?;
+        admin_attach_user_policy_via(
+            AdminTransport::Signed,
+            &env.url,
+            &env.access_key,
+            &env.secret_key,
+            "readonly",
+            "duplicate-eu-readonly",
+        )
+        .await?;
+        let readonly = Client::from_conf(
+            build_test_s3_config(
+                &env.url,
+                "duplicate-eu-readonly",
+                "duplicate-eu-readonly-secret",
+                None,
+                "duplicate-create",
+            )
+            .to_builder()
+            .region(Region::new(region))
+            .build(),
+        );
+
+        for (client, bucket) in [(&root, "duplicate-eu-root"), (&iam, "duplicate-eu-iam")] {
+            client
+                .create_bucket()
+                .bucket(bucket)
+                .send()
+                .await
+                .unwrap_or_else(|error| panic!("{bucket} must be created: {error:?}"));
+            // Both the creator and the other authenticated identity own the namespace.
+            for creator in [&root, &iam] {
+                let error = creator
+                    .create_bucket()
+                    .bucket(bucket)
+                    .send()
+                    .await
+                    .expect_err("a duplicate create outside us-east-1 must report ownership");
+                assert_eq!(
+                    error.as_service_error().and_then(ProvideErrorMetadata::code),
+                    Some("BucketAlreadyOwnedByYou"),
+                    "{bucket}"
+                );
+                assert_eq!(error.raw_response().map(|response| response.status().as_u16()), Some(409), "{bucket}");
+            }
+        }
+
+        let denied = readonly
+            .create_bucket()
+            .bucket("duplicate-eu-root")
+            .send()
+            .await
+            .expect_err("a requester without s3:CreateBucket must be denied before the duplicate check");
+        assert_eq!(denied.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+
         Ok(())
     }
 }

@@ -18,10 +18,18 @@ use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
 mod backup_types;
 mod cleanup;
+mod directory_index;
 mod manifest;
 mod object;
 mod object_backup;
+mod publication_deadline;
 mod registration_cache;
+pub(crate) use publication_deadline::TablePublicationPreparation;
+#[cfg(test)]
+pub(crate) use publication_deadline::publication_preparation_timeout;
+use publication_deadline::{
+    begin_publication_mutation, publication_preparation, publication_recovery, retain_publication_preparation_fence,
+};
 #[cfg(test)]
 mod registration_cache_tests;
 pub(crate) use registration_cache::TableCatalogRegistrationCache;
@@ -457,6 +465,10 @@ pub(crate) trait TableCatalogStore: Send + Sync {
 
 #[async_trait::async_trait]
 pub(crate) trait TableCommitPublication: Send + Sync {
+    fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
+        Arc::new(TablePublicationPreparation::default())
+    }
+
     async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()>;
 
     async fn prepare(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()>;
@@ -495,6 +507,7 @@ impl Drop for TableCommitPublicationCompletion<'_> {
 
 struct TableCommitLockPublication<'a, B> {
     backend: &'a B,
+    preparation: Arc<TablePublicationPreparation>,
     state: parking_lot::Mutex<TableCommitLockPublicationState>,
 }
 
@@ -510,6 +523,7 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
     fn new(backend: &'a B) -> Self {
         Self {
             backend,
+            preparation: Arc::new(TablePublicationPreparation::default()),
             state: parking_lot::Mutex::new(TableCommitLockPublicationState::default()),
         }
     }
@@ -550,7 +564,13 @@ impl<'a, B> TableCommitPublication for TableCommitLockPublication<'a, B>
 where
     B: TableCatalogObjectBackend,
 {
+    fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
+        self.preparation.clone()
+    }
+
     async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
+        // Includes an earlier acquisition even when a caller prepares before entering the store.
+        let _ = self.preparation.deadline();
         {
             let mut state = self.state.lock();
             if state
@@ -656,12 +676,15 @@ where
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableCatalogObject {
     pub data: Vec<u8>,
+    /// Server-generated identity of the body returned by this read.
+    pub body_revision: Option<Uuid>,
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TableCatalogObjectMetadata {
+    pub body_revision: Option<Uuid>,
     pub etag: Option<String>,
     pub mod_time: Option<OffsetDateTime>,
     pub size: u64,
@@ -767,6 +790,11 @@ pub(crate) struct TableCatalogCleanupObject {
     pub delete_marker: bool,
 }
 
+pub(crate) struct TableCatalogCleanupPage {
+    pub objects: Vec<TableCatalogCleanupObject>,
+    pub is_truncated: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TableCatalogPutPrecondition {
     Any,
@@ -798,6 +826,11 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
         None
     }
+
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
+    }
+
     async fn acquire_catalog_migration_read_guards(
         &self,
         _table_bucket: &str,
@@ -846,6 +879,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .read_object(bucket, object)
             .await?
             .map(|object| TableCatalogObjectMetadata {
+                body_revision: object.body_revision,
                 etag: object.etag,
                 mod_time: object.mod_time,
                 size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
@@ -861,6 +895,7 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
             .read_object_unlocked(bucket, object)
             .await?
             .map(|object| TableCatalogObjectMetadata {
+                body_revision: object.body_revision,
                 etag: object.etag,
                 mod_time: object.mod_time,
                 size: u64::try_from(object.data.len()).unwrap_or(u64::MAX),
@@ -884,6 +919,23 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         data: Vec<u8>,
         precondition: TableCatalogPutPrecondition,
     ) -> TableCatalogStoreResult<()>;
+
+    /// Write an object that precedes the catalog transaction, such as the
+    /// initial metadata file of a create. It is authorized and fenced like
+    /// `put_object`, but a publication-aware backend must not treat it as the
+    /// first durable catalog mutation, so the preparation deadline keeps
+    /// bounding the work that follows. The caller removes the object when the
+    /// transaction fails before any catalog write may have begun; nothing else
+    /// references it, since its root belongs to no table.
+    async fn put_object_before_publication(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: TableCatalogPutPrecondition,
+    ) -> TableCatalogStoreResult<()> {
+        self.put_object(bucket, object, data, precondition).await
+    }
 
     async fn put_object_unlocked(
         &self,
@@ -984,6 +1036,20 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         ))
     }
 
+    /// GET-equivalent, bounded enumeration for publishing authoritative indexes.
+    /// Backends without this contract must not fall back to an ordinary S3 list.
+    async fn list_catalog_objects_page(
+        &self,
+        _bucket: &str,
+        _prefix: &str,
+        _start_after: Option<&str>,
+        _limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogCleanupPage> {
+        Err(TableCatalogStoreError::Unsupported(
+            "authoritative catalog pagination is not supported by this backend".to_string(),
+        ))
+    }
+
     async fn list_objects_page(
         &self,
         bucket: &str,
@@ -1014,6 +1080,10 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
     /// enforce the caller's policy; trusted storage backends have no IAM identity.
     async fn authorize_table_warehouse_location(&self, _table_bucket: &str, _location: &str) -> TableCatalogStoreResult<()> {
         Ok(())
+    }
+
+    fn table_publication_preparation_budget(&self) -> Arc<TablePublicationPreparation> {
+        Arc::new(TablePublicationPreparation::default())
     }
 
     async fn begin_table_bucket_commit_publication(&self, _table_bucket: &str) -> TableCatalogStoreResult<()> {
@@ -1147,6 +1217,10 @@ impl<B> TableCommitPublication for B
 where
     B: TableCatalogObjectBackend,
 {
+    fn preparation_budget(&self) -> Arc<TablePublicationPreparation> {
+        self.table_publication_preparation_budget()
+    }
+
     async fn begin_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<()> {
         self.begin_table_bucket_commit_publication(table_bucket).await
     }
@@ -1446,8 +1520,40 @@ impl TableCatalogObjectPaths {
         )
     }
 
+    /// Object used by the optional table-entry directory (and formerly by backing
+    /// migration). Kept under the historical backing-migration prefix so directory
+    /// state stays compatible with main.
+    pub fn backing_migration_fence_path(&self, table_bucket: &str) -> String {
+        self.legacy_backing_migration_fence_path(table_bucket)
+    }
+
+    pub fn backing_migration_fence_lock_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.table_bucket_root_prefix(table_bucket),
+            "backing-migration",
+            "durable-strong-fence.lock"
+        )
+    }
+
     pub fn legacy_backing_migration_global_fence_path(&self) -> String {
         format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.json")
+    }
+
+    #[allow(
+        dead_code,
+        reason = "path helpers retained for directory/migration-fence compatibility with main"
+    )]
+    pub fn backing_migration_global_fence_path(&self) -> String {
+        self.legacy_backing_migration_global_fence_path()
+    }
+
+    #[allow(
+        dead_code,
+        reason = "path helpers retained for directory/migration-fence compatibility with main"
+    )]
+    pub fn backing_migration_global_fence_lock_path(&self) -> String {
+        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.lock")
     }
 
     pub fn legacy_catalog_restore_intent_path(&self, table_bucket: &str) -> String {
@@ -2255,6 +2361,7 @@ where
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
         match self.store.get_object_info(bucket, object, &ObjectOptions::default()).await {
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
+                body_revision: info.data_dir.filter(|id| !id.is_nil()),
                 etag: info.etag,
                 mod_time: info.mod_time,
                 size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
@@ -2282,6 +2389,7 @@ where
             .await
         {
             Ok(info) => Ok(Some(TableCatalogObjectMetadata {
+                body_revision: info.data_dir.filter(|id| !id.is_nil()),
                 etag: info.etag,
                 mod_time: info.mod_time,
                 size: u64::try_from(info.size.max(0)).unwrap_or(u64::MAX),
@@ -2507,6 +2615,36 @@ where
         })
     }
 
+    async fn list_catalog_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogCleanupPage> {
+        let max_keys = i32::try_from(limit.get())
+            .map_err(|_| TableCatalogStoreError::Invalid("catalog page size exceeds storage API range".to_string()))?;
+        let page = self
+            .store
+            .clone()
+            .list_unversioned_objects_authoritative(bucket, prefix, start_after.map(str::to_string), max_keys)
+            .await
+            .map_err(|err| storage_error_to_catalog("list authoritative catalog page", err))?;
+        Ok(TableCatalogCleanupPage {
+            objects: page
+                .objects
+                .into_iter()
+                .map(|object| TableCatalogCleanupObject {
+                    key: object.name,
+                    version_id: object.version_id.filter(|id| !id.is_nil()).map(|id| id.to_string()),
+                    etag: object.etag,
+                    delete_marker: object.delete_marker,
+                })
+                .collect(),
+            is_truncated: page.is_truncated,
+        })
+    }
+
     async fn list_objects_for_cleanup(
         &self,
         bucket: &str,
@@ -2646,6 +2784,7 @@ where
                 )));
             }
         }
+        let body_revision = reader.object_info.data_dir.filter(|id| !id.is_nil());
         let etag = reader.object_info.etag.clone();
         let mod_time = reader.object_info.mod_time;
         let mut data = Vec::new();
@@ -2664,7 +2803,12 @@ where
                 TableCatalogStoreError::Internal(format!("failed to read catalog object {bucket}/{object}: {err}"))
             })?;
         }
-        Ok(Some(TableCatalogObject { data, etag, mod_time }))
+        Ok(Some(TableCatalogObject {
+            data,
+            body_revision,
+            etag,
+            mod_time,
+        }))
     }
 
     async fn put_object_with_options(

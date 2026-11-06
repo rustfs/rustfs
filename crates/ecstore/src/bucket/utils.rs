@@ -259,6 +259,10 @@ pub fn check_object_name_for_length_and_slash(bucket: &str, object: &str) -> Res
 pub fn check_new_object_args(bucket: &str, object: &str, data_movement: bool) -> Result<()> {
     check_put_object_args(bucket, object)?;
 
+    if !data_movement && !is_meta_bucketname(bucket) && has_xml_invalid_control_characters(object) {
+        return Err(StorageError::ObjectNameInvalid(bucket.to_owned(), object.to_owned()));
+    }
+
     if cfg!(target_os = "windows") && !data_movement && !is_meta_bucketname(bucket) && object.contains('\\') {
         return Err(StorageError::InvalidArgument(
             bucket.to_owned(),
@@ -268,6 +272,14 @@ pub fn check_new_object_args(bucket: &str, object: &str, data_movement: bool) ->
     }
 
     Ok(())
+}
+
+/// New public keys must remain representable in an unencoded XML listing.
+/// Existing keys still use the read/delete validators so they can be removed.
+pub fn has_xml_invalid_control_characters(object: &str) -> bool {
+    object
+        .chars()
+        .any(|character| character < ' ' && !matches!(character, '\t' | '\n' | '\r'))
 }
 
 pub fn check_copy_obj_args(bucket: &str, object: &str) -> Result<()> {

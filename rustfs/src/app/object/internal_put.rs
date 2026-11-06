@@ -129,7 +129,7 @@ fn internal_put_content_input(headers: &HeaderMap, tags: Option<String>) -> PutO
 }
 
 async fn validate_internal_write_target(key: &str, bucket: &str, headers: &HeaderMap) -> Result<(), ApiError> {
-    validate_object_key(key, INTERNAL_PUT_METHOD_NAME).map_err(api_error_from_s3)?;
+    validate_new_object_key(key, INTERNAL_PUT_METHOD_NAME).map_err(api_error_from_s3)?;
     validate_table_catalog_object_mutation(bucket, key)
         .await
         .map_err(api_error_from_s3)?;

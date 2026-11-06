@@ -51,7 +51,6 @@ use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::storage_api::s3::{self, Body, S3Error, S3ErrorCode, S3Request, S3Response, S3Result};
 use crate::admin::utils::read_compatible_admin_body;
 use crate::auth::constant_time_eq;
-use crate::server::RemoteAddr;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -484,7 +483,7 @@ impl Operation for UserMfaStatusHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
@@ -521,7 +520,7 @@ impl Operation for UserMfaResetHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await
         .inspect_err(|_| {

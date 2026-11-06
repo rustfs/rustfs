@@ -105,6 +105,18 @@ pub const AMZ_RUSTFS_SNOWBALL_PREFIX: &str = "X-Amz-Meta-Rustfs-Snowball-Prefix"
 pub const AMZ_RUSTFS_SNOWBALL_IGNORE_DIRS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Dirs";
 pub const AMZ_RUSTFS_SNOWBALL_IGNORE_ERRORS: &str = "X-Amz-Meta-Rustfs-Snowball-Ignore-Errors";
 
+/// Transport controls must not become commands when stored metadata is sent to a tier.
+/// Accepts both persisted metadata names and their HTTP header spellings.
+pub fn is_snowball_transport_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    let name = key.strip_prefix("x-amz-meta-").unwrap_or(&key);
+    name == "snowball-auto-extract"
+        || key == "x-amz-snowball-auto-extract"
+        || ["snowball-prefix", "snowball-ignore-dirs", "snowball-ignore-errors"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix))
+}
+
 // Object lock enabled
 pub const AMZ_OBJECT_LOCK_ENABLED: &str = "x-amz-bucket-object-lock-enabled";
 
@@ -284,8 +296,32 @@ pub fn is_minio_header(header_key: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::is_sse_header;
+    use super::{is_snowball_transport_key, is_sse_header};
     use proptest::prelude::*;
+
+    #[test]
+    fn snowball_transport_keys_cover_header_and_stored_aliases() {
+        for key in [
+            "snowball-auto-extract",
+            "X-Amz-Meta-Snowball-Auto-Extract",
+            "X-Amz-Snowball-Auto-Extract",
+            "snowball-prefix",
+            "minio-snowball-ignore-dirs",
+            "rustfs-snowball-ignore-errors",
+            "x-amz-meta-other-vendor-snowball-prefix",
+            "other-vendor-snowball-ignore-errors",
+        ] {
+            assert!(is_snowball_transport_key(key), "{key}");
+        }
+        for key in [
+            "owner",
+            "snowball-auto-extract-extra",
+            "snowball-prefix-extra",
+            "content-type",
+        ] {
+            assert!(!is_snowball_transport_key(key), "{key}");
+        }
+    }
 
     const STORED_SSE_HEADERS: &[&str] = &[
         "x-amz-server-side-encryption",

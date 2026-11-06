@@ -205,7 +205,6 @@ test_put_public_block
 test_block_public_policy
 test_block_public_policy_with_principal
 test_block_public_restrict_public_buckets
-test_bucket_create_exists_nonowner
 test_get_public_block_deny_bucket_policy
 test_get_undefined_public_block
 

@@ -16,6 +16,7 @@ use super::{FederatedClaims, VerifiedFederatedIdentity};
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::HashAlgorithm;
+use serde_json::Value;
 use std::{collections::HashMap, sync::Arc};
 use tracing::debug;
 
@@ -64,6 +65,15 @@ pub struct FederatedAuthorization {
 impl FederatedAuthorization {
     pub fn provider_id(&self) -> &str {
         &self.provider_id
+    }
+
+    /// Issuer from the verified upstream identity.
+    pub fn issuer(&self) -> Option<&str> {
+        self.claims
+            .raw
+            .get("iss")
+            .and_then(Value::as_str)
+            .filter(|issuer| !issuer.is_empty())
     }
 
     pub fn subject(&self) -> &str {

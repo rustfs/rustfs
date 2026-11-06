@@ -881,7 +881,7 @@ pub fn parse_replicate_decision(_bucket: &str, s: &str) -> std::io::Result<Repli
 /// writers may use different textual representations. `invalid` preserves the
 /// distinction between truly absent legacy metadata and corrupt/conflicting
 /// compatibility aliases.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ReplicationGenerationSnapshot {
     pub timestamp: Option<String>,
     pub mutation_id: Option<String>,

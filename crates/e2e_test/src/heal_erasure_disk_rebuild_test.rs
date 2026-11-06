@@ -33,7 +33,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use std::collections::HashSet;
     use std::error::Error;
-    use std::io::{Read, Write};
+    use std::io::{Read, Seek, SeekFrom, Write};
     use std::net::SocketAddr;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -1654,6 +1654,89 @@ mod tests {
         TargetEndpointBlackhole,
     }
 
+    async fn release_heal_commit_barrier_after_shutdown(
+        log: &Path,
+        log_offset: u64,
+        barrier: &Path,
+    ) -> Result<serde_json::Value, Box<dyn Error + Send + Sync>> {
+        // Observe within the existing graceful process-stop budget.
+        timeout(Duration::from_secs(45), async {
+            loop {
+                let mut file = std::fs::File::open(log)?;
+                file.seek(SeekFrom::Start(log_offset))?;
+                let mut tail = String::new();
+                file.read_to_string(&mut tail)?;
+                if let Some(event) = tail
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                    .find(|event| {
+                        event["event"] == "server_shutdown_state"
+                            && event["component"] == "main"
+                            && event["subsystem"] == "startup"
+                            && event["state"] == "stopping"
+                    })
+                {
+                    // Local heal has stopped and HTTP shutdown has been signalled.
+                    // Let admitted peer RPCs finish; keeping this synthetic barrier
+                    // until process exit would make the fixture block its own drain.
+                    std::fs::remove_file(barrier)?;
+                    return Ok(event);
+                }
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await?
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heal_commit_barrier_waits_for_new_shutdown_event() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let log = directory.path().join("server.log");
+        let barrier = directory.path().join("barrier");
+        let event = serde_json::json!({
+            "event": "server_shutdown_state", "component": "main", "subsystem": "startup", "state": "stopping"
+        });
+        std::fs::write(&log, format!("{event}\n"))?;
+        std::fs::write(&barrier, "bucket/prefix/")?;
+        let log_offset = log.metadata()?.len();
+        let mut writer = std::fs::OpenOptions::new().append(true).open(&log)?;
+        writeln!(writer, "{}", serde_json::json!({"event": "shutdown_signal_received"}))?;
+        writeln!(writer, "{}", serde_json::json!({"event": "server_shutdown_state", "state": "stopping"}))?;
+
+        let release = release_heal_commit_barrier_after_shutdown(&log, log_offset, &barrier);
+        tokio::pin!(release);
+        assert!(
+            futures::poll!(release.as_mut()).is_pending(),
+            "old or unrelated events must not release the barrier"
+        );
+        assert!(barrier.is_file(), "the partial-rebuild barrier must remain armed before shutdown");
+        tokio::time::advance(Duration::from_secs(6)).await;
+        assert!(
+            futures::poll!(release.as_mut()).is_pending(),
+            "background shutdown may take longer than five seconds within the process-stop budget"
+        );
+        writeln!(writer, "{event}")?;
+        tokio::time::advance(Duration::from_millis(10)).await;
+        assert_eq!(release.await?, event, "retain the actual new shutdown witness");
+        assert!(!barrier.exists(), "shutdown must release the synthetic hold");
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn heal_commit_barrier_missing_shutdown_fails_without_releasing() -> Result<(), Box<dyn Error + Send + Sync>> {
+        let directory = tempfile::tempdir()?;
+        let log = directory.path().join("server.log");
+        let barrier = directory.path().join("barrier");
+        std::fs::write(&log, "")?;
+        std::fs::write(&barrier, "bucket/prefix/")?;
+        let error = release_heal_commit_barrier_after_shutdown(&log, 0, &barrier)
+            .await
+            .expect_err("missing shutdown evidence must fail the fixture");
+        assert!(error.is::<tokio::time::error::Elapsed>());
+        assert!(barrier.is_file(), "a missing shutdown witness must not release repairs");
+        Ok(())
+    }
+
     async fn run_cluster_root_heal_interruption(scenario: InterruptionScenario) -> Result<(), Box<dyn Error + Send + Sync>> {
         let server_binary = rustfs_binary_path();
         let evidence_case = match scenario {
@@ -1791,6 +1874,7 @@ mod tests {
         let mut created_online_objects = Vec::with_capacity(online_object_count);
         let mut expected_manifests = Vec::with_capacity(online_object_count);
         let mut unclean_shutdown_marker_observed = None;
+        let mut shutdown_barrier_release = None;
         let mut attempt_count = 0usize;
         let max_online_attempts = online_object_count.saturating_mul(topology.total_drives().max(1));
         while expected_manifests.len() < online_object_count {
@@ -2373,7 +2457,21 @@ mod tests {
                     | InterruptionScenario::BackgroundTargetRestartEc84MultiSet
                     | InterruptionScenario::BackgroundCoordinatorRestart
             ) {
-                cluster.stop_node_gracefully(interruption_node).await?;
+                if interruption_node == 1
+                    && let Some(barrier) = &commit_barrier
+                {
+                    let target_log = PathBuf::from(format!("{log_dir}/node1.log"));
+                    let log_offset = target_log.metadata()?.len();
+                    let (stopped, released) = tokio::join!(
+                        cluster.stop_node_gracefully(interruption_node),
+                        release_heal_commit_barrier_after_shutdown(&target_log, log_offset, barrier),
+                    );
+                    // Await both branches even on error so the child is reaped.
+                    stopped?;
+                    shutdown_barrier_release = Some(released?);
+                } else {
+                    cluster.stop_node_gracefully(interruption_node).await?;
+                }
             } else {
                 cluster.stop_node(interruption_node)?;
             }
@@ -2415,7 +2513,9 @@ mod tests {
                     }
                 }
             }
-            if let Some(barrier) = &commit_barrier {
+            if shutdown_barrier_release.is_none()
+                && let Some(barrier) = &commit_barrier
+            {
                 std::fs::remove_file(barrier)?;
             }
             cluster.start_node_from_binary(interruption_node, &server_binary).await?;
@@ -2746,6 +2846,7 @@ mod tests {
                 "all_peers_bound_to_generation_window": true,
                 "pid_before": target_pid, "pid_after": restarted_pid,
                 "unclean_shutdown_marker": unclean_shutdown_marker_observed.unwrap_or(false),
+                "graceful_barrier_release": shutdown_barrier_release,
                 "objects": evidence_objects, "node_listings": node_listings,
             });
             if let Some(outage_write) = outage_write_diagnostic {

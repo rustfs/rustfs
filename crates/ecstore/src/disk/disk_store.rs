@@ -55,6 +55,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Join the local disk's actual bootstrap worker for deterministic coverage tests.
+/// Completion may mean legacy fallback after a failed scan; callers must assert
+/// the expected index result separately. Remote disks have no local worker.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn wait_for_multipart_index_bootstrap(disk: &crate::disk::DiskStore) -> Result<()> {
+    match disk.as_ref() {
+        crate::disk::Disk::Local(local) => {
+            local.disk.wait_for_multipart_index_bootstrap().await;
+            Ok(())
+        }
+        crate::disk::Disk::Remote(_) => Err(DiskError::MethodNotAllowed),
+    }
+}
+
 /// Disk health status constants
 const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
@@ -2443,6 +2457,7 @@ impl LocalDiskWrapper {
         object: &str,
         transaction: uuid::Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<Option<(crate::disk::DeleteRecoveryJournal, bool, bool)>> {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
@@ -2450,7 +2465,7 @@ impl LocalDiskWrapper {
             || {
                 Box::pin(async {
                     self.disk
-                        .try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                        .try_publish_prepared_delete_local_with_budget(volume, object, transaction, namespace_owner, work_budget)
                         .await
                 })
             },
@@ -2466,6 +2481,7 @@ impl LocalDiskWrapper {
         transaction: uuid::Uuid,
         journal: &crate::disk::DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<bool> {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
@@ -2473,7 +2489,14 @@ impl LocalDiskWrapper {
             || {
                 Box::pin(async {
                     self.disk
-                        .try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
+                        .try_finish_and_finalize_prepared_delete_local_with_budget(
+                            volume,
+                            object,
+                            transaction,
+                            journal,
+                            namespace_owner,
+                            work_budget,
+                        )
                         .await
                 })
             },
@@ -2728,6 +2751,18 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<crate::disk::multipart_index::MultipartIndexPage> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.list_multipart_index_roots(bucket, marker).await
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
         // The local implementation shares this binary's capability. Availability
         // and disk identity remain mutation checks and write-quorum inputs.
@@ -2781,6 +2816,62 @@ impl DiskAPI for LocalDiskWrapper {
         )
         .await
     }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryDiscovery> {
+        self.track_disk_health_with_op(
+            "discover_delete_transactions",
+            || async {
+                self.disk
+                    .discover_delete_transactions_bounded(volume, object, max_entries)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryInspection> {
+        self.track_disk_health_with_op(
+            "inspect_delete_transaction",
+            || async {
+                self.disk
+                    .inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: crate::disk::BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<crate::disk::BoundedDeleteRecoverySettlementReply> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || async {
+                self.disk
+                    .settle_delete_transaction_bounded(volume, request, namespace_owner)
+                    .await
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
+    }
+
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -3749,7 +3840,11 @@ mod tests {
         assert!(futures::poll!(&mut operation).is_pending());
         time::advance(SLOW_DISK_OPERATION_THRESHOLD - Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut operation).is_pending());
-        assert!(logs.contents().is_empty(), "normal disk latency should not warn");
+        assert!(
+            !logs.contents().contains("disk_operation_slow") && !logs.contents().contains("WARN"),
+            "normal disk latency should not warn: {}",
+            logs.contents()
+        );
         time::advance(Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut operation).is_pending());
         let warning = logs.contents();

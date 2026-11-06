@@ -857,9 +857,18 @@ mod tests {
         assert_nothing_left(&store, &bucket, "short.bin").await;
     }
 
-    #[tokio::test]
+    #[test]
     #[serial_test::serial]
-    async fn write_back_multipart_path_matches_the_source_digest() {
+    fn write_back_multipart_path_matches_the_source_digest() {
+        // The multipart commit path's futures exceed the 4 MiB test-thread stack
+        // CI configures; production worker threads are sized by the runtime.
+        crate::app::gating_test_env::run_large_stack_test(
+            "odm-write-back-multipart-digest",
+            write_back_multipart_path_matches_the_source_digest_inner,
+        );
+    }
+
+    async fn write_back_multipart_path_matches_the_source_digest_inner() {
         const PART_SIZE: usize = 5 * 1024 * 1024;
         let (store, bucket) = write_back_test_bucket("odm-wb-mpu", false).await;
         let body: Vec<u8> = (0..PART_SIZE + 4096).map(|i| (i % 253) as u8).collect();

@@ -33,8 +33,8 @@ use crate::{
 };
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
-    Audience, AuthType, AuthorizationCode, ClientId, ClientSecret, CsrfToken, LogoutRequest, Nonce, PkceCodeChallenge,
-    PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
+    Audience, AuthType, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, LogoutRequest, Nonce,
+    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::logging::LogThrottle;
@@ -537,6 +537,9 @@ impl OidcSys {
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         let verified = verify_id_token_claims(id_token, &verifier, &Nonce::new(session.nonce.clone()));
         if let Err(e) = verified {
+            if !matches!(e, ClaimsVerificationError::SignatureVerification(_)) {
+                return Err(format!("ID token verification failed: {e}"));
+            }
             let verification_error = e.to_string();
             warn!(
                 event = EVENT_OIDC_DIAGNOSTICS,
@@ -767,6 +770,9 @@ impl OidcSys {
             .verifier(&config)
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         if let Err(e) = verify_id_token_claims(&id_token, &verifier, |_: Option<&Nonce>| Ok(())) {
+            if !matches!(e, ClaimsVerificationError::SignatureVerification(_)) {
+                return Err(format!("ID token verification failed: {e}"));
+            }
             state = self
                 .provider_runtime
                 .refresh_provider_state(&provider_id, &config)

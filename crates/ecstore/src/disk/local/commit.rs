@@ -486,6 +486,9 @@ impl LocalDisk {
             state.preflight_rejection = Some(LocalRenamePreflightRejection(()));
         })?;
         crate::hp_guard!("LocalDisk::rename_data");
+        if dst_volume == super::super::RUSTFS_META_MULTIPART_BUCKET {
+            self.multipart_index.record_info(dst_path, &fi).await?;
+        }
         #[cfg(feature = "e2e-test-hooks")]
         if fi.is_healing() {
             wait_for_heal_commit_test_barrier(&self.root, dst_volume, dst_path).await?;

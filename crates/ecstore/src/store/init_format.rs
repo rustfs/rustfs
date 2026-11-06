@@ -44,12 +44,32 @@ const LEGACY_FORMAT_READ_CONCURRENCY: usize = 16;
 const LEGACY_FORMAT_BASE_MAX_BYTES: usize = 16 * 1024;
 const LEGACY_FORMAT_MAX_BYTES_PER_DISK: usize = 64;
 
-pub async fn init_disks(eps: &Endpoints, opt: &DiskOption) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
+pub async fn init_disks(
+    instance_ctx: &InstanceContext,
+    eps: &Endpoints,
+    opt: &DiskOption,
+) -> (Vec<Option<DiskStore>>, Vec<Option<DiskError>>) {
     let mut futures = Vec::with_capacity(eps.as_ref().len());
+    let local_disk_map = instance_ctx.local_disk_map();
+    let local_disks = local_disk_map.read().await;
 
     for ep in eps.as_ref().iter() {
-        futures.push(new_disk(ep, opt));
+        // Foundation disks may already serve RPC writes. Opening them again
+        // with startup cleanup can move live staging out from under a writer.
+        let registered = if ep.is_local {
+            local_disks.get(&ep.to_string()).cloned().flatten()
+        } else {
+            None
+        };
+        futures.push(async move {
+            match registered {
+                Some(disk) if disk.endpoint() == *ep => Ok(disk),
+                Some(_) => Err(DiskError::InconsistentDisk),
+                None => new_disk(ep, opt).await,
+            }
+        });
     }
+    drop(local_disks);
 
     let mut res = Vec::with_capacity(eps.as_ref().len());
     let mut errors = Vec::with_capacity(eps.as_ref().len());
@@ -1030,6 +1050,7 @@ mod tests {
         }
 
         let (disks, errors) = init_disks(
+            &InstanceContext::new(),
             &Endpoints::from(endpoints),
             &DiskOption {
                 cleanup: false,
@@ -1047,6 +1068,91 @@ mod tests {
         disks.push(None);
 
         (temp_dir, disks)
+    }
+
+    #[tokio::test]
+    async fn init_disks_preserves_live_staging_on_registered_local_disks() {
+        let (temp_dir, disks) = local_disks(1).await;
+        let registered = disks[0].as_ref().expect("registered disk should exist");
+        let instance_ctx = Arc::new(InstanceContext::new());
+        record_local_disks(&instance_ctx, vec![registered.clone()]).await;
+        let staging = temp_dir.path().join("disk-0/.rustfs.sys/tmp/in-flight/xl.meta");
+        tokio::fs::create_dir_all(staging.parent().expect("staging has a parent"))
+            .await
+            .expect("create staging directory");
+        tokio::fs::write(&staging, b"in-flight pool metadata")
+            .await
+            .expect("stage metadata through the registered disk");
+
+        let (initialized, errors) = init_disks(
+            &instance_ctx,
+            &Endpoints::from(vec![registered.endpoint()]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "disk initialization failed: {errors:?}");
+        assert_eq!(
+            tokio::fs::read(&staging)
+                .await
+                .expect("startup must preserve live RPC staging"),
+            b"in-flight pool metadata"
+        );
+        assert!(Arc::ptr_eq(registered, initialized[0].as_ref().expect("initialized disk should exist")));
+    }
+
+    #[tokio::test]
+    async fn init_disks_cleans_stale_staging_without_a_registered_disk() {
+        let temp_dir = tempfile::tempdir().expect("create disk root");
+        let endpoint =
+            Endpoint::try_from(temp_dir.path().to_str().expect("disk root should be UTF-8")).expect("endpoint should parse");
+        let staging = temp_dir.path().join(".rustfs.sys/tmp/stale/xl.meta");
+        tokio::fs::create_dir_all(staging.parent().expect("staging has a parent"))
+            .await
+            .expect("create stale staging directory");
+        tokio::fs::write(&staging, b"stale pool metadata")
+            .await
+            .expect("write stale staging");
+
+        let (disks, errors) = init_disks(
+            &InstanceContext::new(),
+            &Endpoints::from(vec![endpoint]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(errors.iter().all(Option::is_none), "disk initialization failed: {errors:?}");
+        assert!(disks[0].is_some());
+        assert!(!staging.exists(), "a fresh disk open must still clear stale staging");
+    }
+
+    #[tokio::test]
+    async fn init_disks_rejects_registered_disk_topology_mismatch() {
+        let (_temp_dir, disks) = local_disks(1).await;
+        let registered = disks[0].as_ref().expect("registered disk should exist");
+        let instance_ctx = Arc::new(InstanceContext::new());
+        record_local_disks(&instance_ctx, vec![registered.clone()]).await;
+        let mut endpoint = registered.endpoint();
+        endpoint.set_pool_index(1);
+
+        let (initialized, errors) = init_disks(
+            &instance_ctx,
+            &Endpoints::from(vec![endpoint]),
+            &DiskOption {
+                cleanup: true,
+                health_check: false,
+            },
+        )
+        .await;
+
+        assert!(initialized[0].is_none(), "a registered disk must not be reopened in a different slot");
+        assert_eq!(errors[0], Some(DiskError::InconsistentDisk));
     }
 
     async fn format_bytes(disks: &[Option<DiskStore>]) -> Vec<Option<Vec<u8>>> {
@@ -1758,6 +1864,7 @@ mod tests {
             disk.set_disk_id(None).await.expect("test disk ID should be reset");
         }
         let (prewarm_disks, prewarm_errors) = init_disks(
+            &InstanceContext::new(),
             &prewarm_endpoints,
             &DiskOption {
                 cleanup: false,

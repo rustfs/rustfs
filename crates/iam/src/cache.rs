@@ -15,7 +15,6 @@
 use std::{
     collections::{HashMap, HashSet},
     ops::{Deref, DerefMut},
-    ptr,
     sync::{Arc, Mutex, Weak},
 };
 
@@ -64,21 +63,46 @@ impl Default for CacheState {
 pub struct Cache {
     state: ArcSwap<CacheState>,
     write_lock: Mutex<()>,
+    reload_lock: AsyncMutex<()>,
+    reload_changes: Mutex<Weak<Mutex<ReloadChanges>>>,
     service_account_mutation_lock: AsyncMutex<()>,
-    sts_account_mutation_locks: Arc<StsMutationLockRegistry>,
+    sts_account_mutation_locks: Arc<MutationLockRegistry>,
+    parent_mutation_locks: Arc<MutationLockRegistry>,
 }
 
-struct StsMutationLockRegistry {
-    locks: Mutex<HashMap<String, Weak<AsyncMutex<StsMutationLockState>>>>,
+#[derive(Default)]
+struct MutationLockRegistry {
+    locks: Mutex<HashMap<String, Weak<AsyncMutex<MutationLockState>>>>,
 }
 
-pub(crate) struct StsMutationLockState {
+pub(crate) struct MutationLockState {
     access_key: String,
-    registry: Weak<StsMutationLockRegistry>,
-    lock: Weak<AsyncMutex<StsMutationLockState>>,
+    registry: Weak<MutationLockRegistry>,
+    lock: Weak<AsyncMutex<MutationLockState>>,
 }
 
-impl Drop for StsMutationLockState {
+impl MutationLockRegistry {
+    fn lock_for(self: &Arc<Self>, access_key: &str) -> Arc<AsyncMutex<MutationLockState>> {
+        let mut locks = self.locks.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(lock) = locks.get(access_key).and_then(Weak::upgrade) {
+            return lock;
+        }
+
+        let registry = Arc::downgrade(self);
+        let access_key_owned = access_key.to_string();
+        let lock = Arc::new_cyclic(|lock| {
+            AsyncMutex::new(MutationLockState {
+                access_key: access_key_owned,
+                registry,
+                lock: lock.clone(),
+            })
+        });
+        locks.insert(access_key.to_string(), Arc::downgrade(&lock));
+        lock
+    }
+}
+
+impl Drop for MutationLockState {
     fn drop(&mut self) {
         let Some(registry) = self.registry.upgrade() else {
             return;
@@ -95,10 +119,52 @@ impl Default for Cache {
         Self {
             state: ArcSwap::new(Arc::new(CacheState::default())),
             write_lock: Mutex::new(()),
+            reload_lock: AsyncMutex::new(()),
+            reload_changes: Mutex::new(Weak::new()),
             service_account_mutation_lock: AsyncMutex::new(()),
-            sts_account_mutation_locks: Arc::new(StsMutationLockRegistry {
-                locks: Mutex::new(HashMap::new()),
-            }),
+            sts_account_mutation_locks: Arc::new(MutationLockRegistry::default()),
+            parent_mutation_locks: Arc::new(MutationLockRegistry::default()),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Hash, PartialEq, Eq)]
+pub(crate) enum CachePartition {
+    PolicyDocs,
+    Users,
+    UserPolicies,
+    StsAccounts,
+    StsPolicies,
+    Groups,
+    UserGroupMemberships,
+    GroupPolicies,
+}
+
+type ReloadChanges = HashMap<CachePartition, HashSet<String>>;
+
+/// A reload journals only keys changed during its own lifetime, including
+/// deletions. Unrelated STS traffic cannot suppress a persisted revocation.
+pub(crate) struct CacheReload<'a> {
+    _guard: tokio::sync::MutexGuard<'a, ()>,
+    changes: Arc<Mutex<ReloadChanges>>,
+}
+
+impl CacheReload<'_> {
+    pub(crate) fn merge_partition<T: Clone>(
+        &self,
+        partition: CachePartition,
+        loaded: &mut CacheEntity<T>,
+        current: &CacheEntity<T>,
+    ) {
+        let changes = self.changes.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(keys) = changes.get(&partition) {
+            for key in keys {
+                if let Some(value) = current.get(key) {
+                    loaded.insert(key.clone(), value.clone());
+                } else {
+                    loaded.remove(key);
+                }
+            }
         }
     }
 }
@@ -106,31 +172,27 @@ impl Default for Cache {
 pub(crate) type CacheSnapshot = Guard<Arc<CacheState>>;
 
 impl Cache {
+    pub(crate) async fn begin_reload(&self) -> CacheReload<'_> {
+        // Registration and publication both take write_lock before the journal
+        // lock, so no mutation can fall between the reload and its journal.
+        let guard = self.reload_lock.lock().await;
+        let changes = Arc::new(Mutex::new(HashMap::new()));
+        let _write = self.write_lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        *self.reload_changes.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::downgrade(&changes);
+        CacheReload { _guard: guard, changes }
+    }
+
     pub(crate) fn service_account_mutation_lock(&self) -> &AsyncMutex<()> {
         &self.service_account_mutation_lock
     }
 
-    pub(crate) fn sts_account_mutation_lock(&self, access_key: &str) -> Arc<AsyncMutex<StsMutationLockState>> {
-        let mut locks = self
-            .sts_account_mutation_locks
-            .locks
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(lock) = locks.get(access_key).and_then(Weak::upgrade) {
-            return lock;
-        }
+    pub(crate) fn sts_account_mutation_lock(&self, access_key: &str) -> Arc<AsyncMutex<MutationLockState>> {
+        self.sts_account_mutation_locks.lock_for(access_key)
+    }
 
-        let registry = Arc::downgrade(&self.sts_account_mutation_locks);
-        let access_key_owned = access_key.to_string();
-        let lock = Arc::new_cyclic(|lock| {
-            AsyncMutex::new(StsMutationLockState {
-                access_key: access_key_owned,
-                registry,
-                lock: lock.clone(),
-            })
-        });
-        locks.insert(access_key.to_string(), Arc::downgrade(&lock));
-        lock
+    /// Orders derived-credential publication with changes to its regular parent.
+    pub(crate) fn parent_mutation_lock(&self, access_key: &str) -> Arc<AsyncMutex<MutationLockState>> {
+        self.parent_mutation_locks.lock_for(access_key)
     }
 
     pub(crate) fn snapshot(&self) -> CacheSnapshot {
@@ -142,7 +204,13 @@ impl Cache {
         let current = self.state.load_full();
         let mut locked = LockedCache {
             state: CacheState::clone(&current),
+            #[cfg(test)]
             current_ptr: Arc::as_ptr(&current),
+            reload_changes: self
+                .reload_changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .upgrade(),
             dirty: false,
         };
         let ret = f(&mut locked);
@@ -215,7 +283,9 @@ impl Cache {
 
 pub(crate) struct LockedCache {
     state: CacheState,
+    #[cfg(test)]
     current_ptr: *const CacheState,
+    reload_changes: Option<Arc<Mutex<ReloadChanges>>>,
     dirty: bool,
 }
 
@@ -224,11 +294,19 @@ impl LockedCache {
         &self.state
     }
 
+    #[cfg(test)]
     pub(crate) fn matches_snapshot(&self, snapshot: &CacheSnapshot) -> bool {
-        ptr::eq(self.current_ptr, Arc::as_ptr(snapshot))
+        std::ptr::eq(self.current_ptr, Arc::as_ptr(snapshot))
     }
 
-    fn exec<T: Clone>(target: &mut Arc<CacheEntity<T>>, t: OffsetDateTime, mut op: impl FnMut(&mut CacheEntity<T>)) -> bool {
+    fn exec<T: Clone>(
+        target: &mut Arc<CacheEntity<T>>,
+        t: OffsetDateTime,
+        changes: Option<&Arc<Mutex<ReloadChanges>>>,
+        partition: CachePartition,
+        key: &str,
+        mut op: impl FnMut(&mut CacheEntity<T>),
+    ) -> bool {
         if target.load_time >= t {
             return false;
         }
@@ -236,6 +314,14 @@ impl LockedCache {
         let mut new = CacheEntity::clone(target);
         op(&mut new);
         *target = Arc::new(new);
+        if let Some(changes) = changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(partition)
+                .or_default()
+                .insert(key.to_string());
+        }
         true
     }
 
@@ -244,139 +330,315 @@ impl LockedCache {
     }
 
     pub(crate) fn replace_policy_docs(&mut self, value: CacheEntity<PolicyDoc>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::PolicyDocs)
+                .or_default()
+                .extend(self.state.policy_docs.keys().chain(value.keys()).cloned());
+        }
         self.state.policy_docs = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_users(&mut self, value: CacheEntity<UserIdentity>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::Users)
+                .or_default()
+                .extend(self.state.users.keys().chain(value.keys()).cloned());
+        }
         self.state.users = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_user_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::UserPolicies)
+                .or_default()
+                .extend(self.state.user_policies.keys().chain(value.keys()).cloned());
+        }
         self.state.user_policies = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_sts_accounts(&mut self, value: CacheEntity<UserIdentity>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::StsAccounts)
+                .or_default()
+                .extend(self.state.sts_accounts.keys().chain(value.keys()).cloned());
+        }
         self.state.sts_accounts = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_sts_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::StsPolicies)
+                .or_default()
+                .extend(self.state.sts_policies.keys().chain(value.keys()).cloned());
+        }
         self.state.sts_policies = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_groups(&mut self, value: CacheEntity<GroupInfo>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::Groups)
+                .or_default()
+                .extend(self.state.groups.keys().chain(value.keys()).cloned());
+        }
         self.state.groups = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_group_policies(&mut self, value: CacheEntity<MappedPolicy>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::GroupPolicies)
+                .or_default()
+                .extend(self.state.group_policies.keys().chain(value.keys()).cloned());
+        }
         self.state.group_policies = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn replace_user_group_memberships(&mut self, value: CacheEntity<HashSet<String>>) {
+        if let Some(changes) = &self.reload_changes {
+            changes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .entry(CachePartition::UserGroupMemberships)
+                .or_default()
+                .extend(self.state.user_group_memberships.keys().chain(value.keys()).cloned());
+        }
         self.state.user_group_memberships = Self::replaced(value);
         self.dirty = true;
     }
 
     pub(crate) fn add_or_update_policy_doc(&mut self, key: &str, value: &PolicyDoc, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.policy_docs, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.policy_docs,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::PolicyDocs,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_user(&mut self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.users, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.users,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::Users,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_user_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.user_policies, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.user_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::UserPolicies,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_sts_account(&mut self, key: &str, value: &UserIdentity, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.sts_accounts, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.sts_accounts,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::StsAccounts,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_sts_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.sts_policies, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.sts_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::StsPolicies,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_group(&mut self, key: &str, value: &GroupInfo, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.groups, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.groups,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::Groups,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_user_group_membership(&mut self, key: &str, value: &HashSet<String>, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.user_group_memberships, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.user_group_memberships,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::UserGroupMemberships,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn add_or_update_group_policy(&mut self, key: &str, value: &MappedPolicy, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.group_policies, t, |map| {
-            map.insert(key.to_string(), value.clone());
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.group_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::GroupPolicies,
+            key,
+            |map| {
+                map.insert(key.to_string(), value.clone());
+            },
+        );
     }
 
     pub(crate) fn delete_policy_doc(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.policy_docs, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.policy_docs,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::PolicyDocs,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_user(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.users, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.users,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::Users,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_user_policy(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.user_policies, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.user_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::UserPolicies,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_user_group_membership(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.user_group_memberships, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.user_group_memberships,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::UserGroupMemberships,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_sts_account(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.sts_accounts, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.sts_accounts,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::StsAccounts,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_sts_policy(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.sts_policies, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.sts_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::StsPolicies,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_group(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.groups, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.groups,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::Groups,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn delete_group_policy(&mut self, key: &str, t: OffsetDateTime) {
-        self.dirty |= Self::exec(&mut self.state.group_policies, t, |map| {
-            map.remove(key);
-        });
+        self.dirty |= Self::exec(
+            &mut self.state.group_policies,
+            t,
+            self.reload_changes.as_ref(),
+            CachePartition::GroupPolicies,
+            key,
+            |map| {
+                map.remove(key);
+            },
+        );
     }
 
     pub(crate) fn build_user_group_memberships(&mut self) {
@@ -493,6 +755,50 @@ mod tests {
 
     use crate::cache::Cache;
     use crate::store::MappedPolicy;
+
+    #[tokio::test]
+    async fn reload_journal_preserves_same_key_mutations_and_expires_on_cancellation() {
+        use super::{CacheEntity, CachePartition};
+        let cache = Cache::default();
+        let stale = UserIdentity {
+            version: 1,
+            ..Default::default()
+        };
+        let current = UserIdentity {
+            version: 2,
+            ..Default::default()
+        };
+        let reload = cache.begin_reload().await;
+        cache.add_or_update_user("updated", &current, OffsetDateTime::now_utc());
+        cache.add_or_update_user("removed", &current, OffsetDateTime::now_utc());
+        cache.delete_user("removed", OffsetDateTime::now_utc());
+        // Even an absent key's deletion is recorded: storage may have returned
+        // an entry created and deleted entirely during the reload's reads.
+        cache.delete_user("absent", OffsetDateTime::now_utc());
+        let mut loaded = CacheEntity::new(std::collections::HashMap::from([
+            ("updated".to_string(), stale.clone()),
+            ("removed".to_string(), stale.clone()),
+            ("absent".to_string(), stale.clone()),
+            ("disk-only".to_string(), stale),
+        ]));
+        cache.with_write_lock(|locked| {
+            reload.merge_partition(CachePartition::Users, &mut loaded, &locked.state().users);
+            locked.replace_users(loaded);
+        });
+        let snapshot = cache.snapshot();
+        assert_eq!(snapshot.users["updated"].version, 2);
+        assert!(!snapshot.users.contains_key("removed"));
+        assert!(!snapshot.users.contains_key("absent"));
+        assert!(snapshot.users.contains_key("disk-only"));
+        drop(reload);
+        assert!(cache.reload_changes.lock().expect("journal lock").upgrade().is_none());
+        let cancelled = cache.begin_reload().await;
+        cache.delete_user("disk-only", OffsetDateTime::now_utc());
+        drop(cancelled);
+        assert!(cache.reload_changes.lock().expect("journal lock").upgrade().is_none());
+        let next = cache.begin_reload().await;
+        assert!(next.changes.lock().expect("new journal").is_empty());
+    }
 
     #[test]
     fn sts_mutation_locks_are_keyed_and_prune_unused_entries() {
