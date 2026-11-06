@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tarfile
@@ -158,13 +159,17 @@ class ImageGuards(unittest.TestCase):
                 repro.validate_image({**image_info(), "Architecture": image_arch}, SOURCE, expected_arch=daemon_arch)
 
     def test_inherited_controls_are_rejected_without_exposing_values(self):
-        for environment in (["RUSTFS_RUNTIME_WORKER_THREADS=2"], ["RUST_LOG=trace"], ["RUSTFS_SECRET_KEY=private-base-secret"]):
+        for environment in (["RUSTFS_RUNTIME_WORKER_THREADS=2"], ["RUST_LOG=trace"], ["RUSTFS_SECRET_KEY=private-base-secret"],
+                            ["MINIO_SCANNER_CYCLE=1"], ["MINIO_SCANNER_SPEED=fast"], ["MINIO_ROOT_PASSWORD=private-base-secret"],
+                            ["MINIO_NOTIFY_WEBHOOK_ENDPOINT_test=https://example.invalid/private-base-secret"],
+                            ["MINIO_SCANNER_CYCLE="], ["MINIO_FUTURE_CONTROL=1"]):
             info = image_info()
             info["Config"]["Env"] = environment
-            with self.subTest(environment=environment), self.assertRaises(repro.ReproError) as error:
-                repro.validate_image(info, SOURCE, expected_arch="arm64")
-            self.assertNotIn(environment[0], str(error.exception))
-            self.assertNotIn("private-base-secret", str(error.exception))
+            with self.subTest(environment=environment):
+                with self.assertRaises(repro.ReproError) as error:
+                    repro.validate_image(info, SOURCE, expected_arch="arm64")
+                self.assertNotIn(environment[0], str(error.exception))
+                self.assertNotIn("private-base-secret", str(error.exception))
         neutral = image_info()
         neutral["Config"]["Env"] = ["PATH=/usr/bin", "LANG=C.UTF-8", "PYTHON_VERSION=3.13", "RUST_LOG_STYLE=never"]
         self.assertEqual(repro.validate_image(neutral, SOURCE, expected_arch="arm64")["id"], IMAGE)
@@ -563,6 +568,76 @@ class RequestsAndOracles(unittest.TestCase):
             self.assertEqual(summary["first_failure"]["phase"], "capture")
             self.assertEqual(summary["first_failure"]["reason"], "interrupted")
             self.assertTrue(summary["retained_nodes_stopped"])
+
+    def test_cli_signals_during_docker_logs_finalize_and_preserve_the_first_failure(self):
+        script = r'''
+import os, signal, sys
+from pathlib import Path
+from unittest.mock import patch
+import test_repro_rejoin_readiness_docker as tests
+repro = tests.repro
+
+class SignalingDocker(tests.FakeDocker):
+    def docker(self, *args, **kwargs):
+        if args[:2] == ('container', 'logs'):
+            os.kill(os.getpid(), int(sys.argv[2]))
+            raise AssertionError('the signal must interrupt log capture')
+        return super().docker(*args, **kwargs)
+
+commands = SignalingDocker()
+value = tests.experiment(Path(sys.argv[1]), commands)
+value.args.cleanup_on_success = True
+for node in value.nodes.values():
+    commands.objects[('container', node['id'])] = {
+        'Id': node['id'], 'Name': '/' + node['name'], 'State': {'Running': True},
+        'Config': {'Labels': repro.resource_labels(value.project, tests.SOURCE, 'node')}}
+if sys.argv[3] == 'prior-failure':
+    value.fail('sequence', 'original object failure')
+previous = signal.getsignal(signal.SIGTERM)
+with patch.object(repro, 'Commands', return_value=commands), patch.object(repro, 'Experiment', return_value=value), \
+     patch.object(value, 'preflight'), patch.object(value, 'setup'), patch.object(value, 'sequence'), \
+     patch.object(value, 'recover'), patch.object(repro, 'cleanup_resources') as cleanup:
+    result = repro.main(['run', '--image', tests.IMAGE, '--expected-source', tests.SOURCE, '--out-dir', sys.argv[1]])
+    cleanup.assert_not_called()
+assert signal.getsignal(signal.SIGTERM) == previous, 'the CLI must restore the previous signal handler'
+raise SystemExit(result)
+'''
+        for signum in (signal.SIGINT, signal.SIGTERM):
+            for prior_failure in (False, True):
+                with tempfile.TemporaryDirectory() as root, self.subTest(signal=signum, prior_failure=prior_failure):
+                    directory = Path(root) / "case"
+                    result = subprocess.run([sys.executable, "-c", script, str(directory), str(int(signum)),
+                                             "prior-failure" if prior_failure else "no-failure"],
+                                            cwd=Path(__file__).parent, capture_output=True, timeout=10)
+                    self.assertEqual(result.returncode, 2, result.stderr.decode(errors="replace"))
+                    summary = json.loads((directory / "summary.json").read_text())
+                    self.assertEqual(summary["result"], "failed")
+                    self.assertTrue(summary["resources_retained"])
+                    self.assertTrue(summary["retained_nodes_stopped"])
+                    self.assertEqual(summary["first_failure"]["phase"], "sequence" if prior_failure else "capture")
+                    if prior_failure:
+                        self.assertEqual(summary["first_failure"]["reason"], "original object failure")
+                    failures = [json.loads(line)["failure"] for line in (directory / "events.jsonl").read_text().splitlines()]
+                    capture = next(failure for failure in failures if failure["phase"] == "capture")
+                    self.assertEqual(capture["reason"], "SIGTERM" if signum == signal.SIGTERM else "interrupted")
+                    stopped = json.loads((directory / "containers-retained-stopped.json").read_text())
+                    self.assertEqual(len(stopped), 5)
+                    self.assertTrue(all(not node["state"]["Running"] for node in stopped))
+
+    def test_cli_restores_sigterm_handler_after_success_or_preflight_failure(self):
+        previous = signal.getsignal(signal.SIGTERM)
+        for fails in (False, True):
+            def run():
+                self.assertNotEqual(signal.getsignal(signal.SIGTERM), previous)
+                if fails:
+                    raise repro.ReproError("preflight failed")
+                return 0
+
+            with self.subTest(fails=fails), patch.object(repro.Experiment, "run", side_effect=run), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                result = repro.main(["run", "--image", IMAGE, "--expected-source", SOURCE, "--out-dir", "/unused-test-output"])
+                self.assertEqual(result, 2 if fails else 0)
+                self.assertEqual(signal.getsignal(signal.SIGTERM), previous)
 
     def test_cleanup_interrupt_falls_back_to_stopping_remaining_owned_nodes(self):
         with tempfile.TemporaryDirectory() as root:

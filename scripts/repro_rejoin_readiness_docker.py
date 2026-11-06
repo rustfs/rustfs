@@ -43,6 +43,7 @@ from pathlib import Path
 import platform
 import re
 import secrets
+import signal
 import subprocess
 import sys
 import tarfile
@@ -164,9 +165,9 @@ def validate_image(info: dict[str, Any], source: str, expected_binary: str | Non
     if info.get("Os") != "linux" or architecture != canonical_architecture(expected_arch):
         raise ReproError("the experiment requires a Linux image matching the Docker daemon architecture")
     inherited = (info.get("Config") or {}).get("Env") or ()
-    if any(entry.partition("=")[0].startswith("RUSTFS_") or entry.partition("=")[0] == "RUST_LOG"
+    if any(entry.partition("=")[0].startswith(("RUSTFS_", "MINIO_")) or entry.partition("=")[0] == "RUST_LOG"
            for entry in inherited):
-        raise ReproError("the image must not inherit RUSTFS_* or RUST_LOG overrides")
+        raise ReproError("the image must not inherit RUSTFS_*, MINIO_* or RUST_LOG overrides")
     if labels.get(LABEL_PREFIX + "source_revision") != source:
         raise ReproError("image source revision does not match --expected-source")
     if not SHA_RE.fullmatch(binary):
@@ -973,6 +974,11 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def interrupt_run(signum: int, _frame: Any) -> None:
+    # Use the existing interrupt-aware recovery, retention and summary path.
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     commands = Commands()
@@ -982,9 +988,13 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_resources(commands, manifest)
             print(json.dumps({"cleaned_project": manifest["project"]}))
             return 0
-        return Experiment(args, commands).run()
-    except (ReproError, OSError, ValueError, KeyError) as error:
-        print(commands.redact(f"reproduction failed: {error}"), file=sys.stderr)
+        previous_sigterm = signal.signal(signal.SIGTERM, interrupt_run)
+        try:
+            return Experiment(args, commands).run()
+        finally:
+            signal.signal(signal.SIGTERM, previous_sigterm)
+    except (ReproError, OSError, ValueError, KeyError, KeyboardInterrupt) as error:
+        print(commands.redact(f"reproduction failed: {str(error) or 'interrupted'}"), file=sys.stderr)
         return 2
 
 
