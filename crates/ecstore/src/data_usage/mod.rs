@@ -275,6 +275,16 @@ fn cache_data_usage_snapshot_result<T>(
             mut degraded_baseline,
             observed_unavailable,
         }) => {
+            // A primary read can fall back to an older backup. Refresh the
+            // retry age without replacing a newer snapshot this process has
+            // already read; snapshot size itself is not an ordering signal.
+            if let Some(previous) = cache.as_mut()
+                && let Some(cached_info) = previous.info.as_ref()
+                && snapshot_predates(&info, cached_info)
+            {
+                previous.loaded_at = loaded_at;
+                return Some(Ok(project(cached_info)));
+            }
             // A flaky observed read must not shrink quota coverage for a TTL
             // window: carry the previous refresh's baseline entries forward,
             // letting the fresh (authoritative) values win where they exist.
@@ -2382,11 +2392,30 @@ fn unknown_bucket_reload_due(cache: &Option<CachedDataUsageSnapshot>, bucket: &s
         .is_none_or(|attempted_at| now.duration_since(attempted_at) >= refresh_age)
 }
 
-/// Whether a freshly loaded snapshot is older than the cached one, as when a
-/// primary read fails and the loader falls back to the previous `.bkp` copy.
-fn snapshot_predates(loaded: Option<SystemTime>, cached: Option<SystemTime>) -> bool {
+/// Compare authoritative lineage by the writer's epoch, cycle, then timestamp
+/// order. Only observations of the same lineage use their own timestamp, so a
+/// later observation of an old backup cannot revive a retired namespace.
+fn snapshot_predates(loaded: &DataUsageInfo, cached: &DataUsageInfo) -> bool {
+    let loaded_baseline = loaded
+        .usage_snapshot_authoritative_baseline
+        .unwrap_or_else(|| loaded.snapshot_identity());
+    let cached_baseline = cached
+        .usage_snapshot_authoritative_baseline
+        .unwrap_or_else(|| cached.snapshot_identity());
+    let loaded_position = (loaded_baseline.scanner_epoch, loaded_baseline.scanner_cycle);
+    let cached_position = (cached_baseline.scanner_epoch, cached_baseline.scanner_cycle);
+    if loaded_position != cached_position {
+        return loaded_position < cached_position;
+    }
+    let (loaded, cached) = if loaded_baseline == cached_baseline {
+        (loaded.last_update, cached.last_update)
+    } else {
+        (loaded_baseline.last_update, cached_baseline.last_update)
+    };
     match (loaded, cached) {
-        (Some(loaded), Some(cached)) => loaded < cached,
+        (Some(loaded), Some(cached)) => {
+            loaded < cached && !rustfs_data_usage::usage_last_update_is_untrusted_future(cached, SystemTime::now())
+        }
         (None, Some(_)) => true,
         _ => false,
     }
@@ -2427,22 +2456,15 @@ where
         return false;
     };
     let mut cache = data_usage_snapshot_cache().write().await;
-    let cached_last_update = cache
-        .as_ref()
-        .and_then(|cached| cached.info.as_ref())
-        .and_then(|info| info.last_update);
-    if snapshot_predates(loaded.info.last_update, cached_last_update) {
-        return false;
-    }
     cache_data_usage_snapshot_result(
         &mut cache,
         Ok(loaded),
         tokio::time::Instant::now(),
         refresh_generation,
         data_usage_snapshot_generation(),
-        |_| (),
+        |info| info.buckets_usage.contains_key(bucket),
     )
-    .is_some()
+    .is_some_and(|result| matches!(result, Ok(true)))
 }
 
 // Calls of `reload_unknown_bucket_usage` per bucket. Unit tests do not run in
@@ -4698,6 +4720,216 @@ mod tests {
         .expect("successful load must remain cached within the TTL")
         .expect("cached success must remain successful");
         assert_snapshot_bucket(&cached, "bucket");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn expired_usage_snapshot_refresh_keeps_newer_counts_over_an_older_backup() {
+        use crate::bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
+        use crate::config::com::save_config;
+
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        let mut current = usage_snapshot_with_new_bucket(SystemTime::UNIX_EPOCH + Duration::from_secs(2), 100);
+        current.scanner_epoch = Some(4);
+        current.scanner_cycle = Some(11);
+        current.usage_snapshot_converged = Some(true);
+        let mut backup = data_usage_info_for_test("existing", 1, 5, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        backup.scanner_epoch = Some(4);
+        backup.scanner_cycle = Some(10);
+        backup.usage_snapshot_converged = Some(true);
+        for (path, info) in [
+            (DATA_USAGE_OBJ_NAME_PATH.as_str(), &current),
+            (DATA_USAGE_OBJ_BACKUP_PATH.as_str(), &backup),
+        ] {
+            save_config(store.clone(), path, serde_json::to_vec(info).expect("encode usage snapshot"))
+                .await
+                .expect("persist initial usage snapshot");
+        }
+        invalidate_data_usage_snapshot_cache().await;
+        for loaded in [
+            load_data_usage_from_backend_cached(store.clone()).await,
+            load_admin_data_usage_from_backend_cached(store.clone()).await,
+        ] {
+            assert_eq!(loaded.expect("prime usage cache"), current);
+        }
+
+        // Bucket cleanup can reduce usage without advancing the scanner
+        // position. Only its publication timestamp advances.
+        let mut after_delete = data_usage_info_for_test("existing", 1, 3, SystemTime::UNIX_EPOCH + Duration::from_secs(3));
+        after_delete.scanner_epoch = current.scanner_epoch;
+        after_delete.scanner_cycle = current.scanner_cycle;
+        after_delete.usage_snapshot_converged = Some(true);
+        let mut stale_observation =
+            data_usage_info_for_test("retired-incarnation", 99, 999, SystemTime::UNIX_EPOCH + Duration::from_secs(4));
+        stale_observation.scanner_epoch = Some(4);
+        stale_observation.scanner_cycle = Some(12);
+        stale_observation.usage_snapshot_converged = Some(false);
+        stale_observation.usage_snapshot_authoritative_baseline = Some(backup.snapshot_identity());
+        assert!(observed_data_usage_is_newer(&stale_observation, &backup));
+        assert!(!observed_data_usage_is_newer(&stale_observation, &current));
+        save_config(
+            store.clone(),
+            DATA_USAGE_OBSERVED_OBJ_NAME_PATH.as_str(),
+            serde_json::to_vec(&stale_observation).expect("encode observation of an older namespace"),
+        )
+        .await
+        .expect("persist an observation anchored to the old backup");
+        for (payload, expected) in [
+            (b"not a usage snapshot".to_vec(), &current),
+            (serde_json::to_vec(&after_delete).expect("encode post-delete usage"), &after_delete),
+        ] {
+            save_config(store.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str(), payload)
+                .await
+                .expect("replace primary usage snapshot");
+            for cache in [data_usage_snapshot_cache(), admin_data_usage_snapshot_cache()] {
+                cache
+                    .write()
+                    .await
+                    .as_mut()
+                    .expect("usage cache should be populated")
+                    .loaded_at = tokio::time::Instant::now() - Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+            }
+            for loaded in [
+                load_data_usage_from_backend_cached(store.clone()).await,
+                load_admin_data_usage_from_backend_cached(store.clone()).await,
+            ] {
+                assert_eq!(loaded.expect("refresh an expired usage cache"), *expected);
+            }
+            assert!(
+                !data_usage_snapshot_cache()
+                    .read()
+                    .await
+                    .as_ref()
+                    .expect("quota cache should remain populated")
+                    .degraded_baseline
+                    .contains_key("retired-incarnation"),
+                "a newer observation anchored to an older namespace must not backfill ghost usage"
+            );
+        }
+        invalidate_data_usage_snapshot_cache().await;
+    }
+
+    #[test]
+    fn expired_usage_snapshot_refresh_accepts_new_authority_over_a_later_old_observation() {
+        let loaded_at = tokio::time::Instant::now();
+        let baseline = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(1));
+        let mut observed = data_usage_info_for_test("bucket", 5, 60, SystemTime::UNIX_EPOCH + Duration::from_secs(4));
+        observed.usage_snapshot_converged = Some(false);
+        observed.usage_snapshot_authoritative_baseline = Some(baseline.snapshot_identity());
+        let mut cache = Some(CachedDataUsageSnapshot {
+            info: Some(observed),
+            loaded_at,
+            degraded_baseline: HashMap::new(),
+        });
+        let after_delete = data_usage_info_for_test("bucket", 1, 7, SystemTime::UNIX_EPOCH + Duration::from_secs(3));
+        let refreshed = cache_data_usage_snapshot_result(
+            &mut cache,
+            Ok(loaded_usage_for_test(after_delete.clone())),
+            loaded_at,
+            1,
+            1,
+            DataUsageInfo::clone,
+        )
+        .expect("matching refresh generation")
+        .expect("a newer authority must retire observations of its predecessor");
+        assert_eq!(refreshed, after_delete);
+    }
+
+    #[test]
+    fn expired_usage_snapshot_refresh_orders_lineage_by_epoch_cycle_then_time() {
+        let loaded_at = tokio::time::Instant::now();
+        for (cached_position, loaded_position, loaded_time, accept) in [
+            ((Some(2), Some(10)), (Some(1), Some(99)), 110, false),
+            ((Some(2), Some(10)), (Some(2), Some(9)), 110, false),
+            ((Some(2), Some(10)), (Some(3), Some(1)), 90, true),
+            ((Some(2), Some(10)), (Some(2), Some(11)), 90, true),
+            ((Some(2), Some(10)), (Some(2), Some(10)), 110, true),
+            ((Some(3), None), (Some(2), Some(10)), 110, false),
+            ((Some(2), Some(10)), (Some(3), None), 90, true),
+            ((None, None), (None, None), 110, true),
+            ((None, None), (None, None), 90, false),
+        ] {
+            let mut previous = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(100));
+            (previous.scanner_epoch, previous.scanner_cycle) = cached_position;
+            let mut loaded = data_usage_info_for_test("bucket", 1, 7, SystemTime::UNIX_EPOCH + Duration::from_secs(loaded_time));
+            (loaded.scanner_epoch, loaded.scanner_cycle) = loaded_position;
+            let expected = if accept { &loaded } else { &previous };
+            let mut cache = Some(CachedDataUsageSnapshot {
+                info: Some(previous.clone()),
+                loaded_at,
+                degraded_baseline: HashMap::new(),
+            });
+            let refreshed = cache_data_usage_snapshot_result(
+                &mut cache,
+                Ok(loaded_usage_for_test(loaded.clone())),
+                loaded_at,
+                1,
+                1,
+                DataUsageInfo::clone,
+            )
+            .expect("matching refresh generation")
+            .expect("a valid usage snapshot remains available");
+            assert_eq!(
+                &refreshed, expected,
+                "lineage ordering must match scanner publication: cached={cached_position:?}, loaded={loaded_position:?}, loaded_time={loaded_time}"
+            );
+        }
+    }
+
+    #[test]
+    fn expired_usage_snapshot_refresh_preserves_rejection_backoff_and_baseline() {
+        let loaded_at = tokio::time::Instant::now();
+        let expected = data_usage_info_for_test("bucket", 3, 42, SystemTime::UNIX_EPOCH + Duration::from_secs(2));
+        let mut cache = Some(CachedDataUsageSnapshot {
+            info: Some(expected.clone()),
+            loaded_at,
+            degraded_baseline: HashMap::from([("bucket".to_string(), 42)]),
+        });
+        let refreshed_at = loaded_at + Duration::from_secs(DATA_USAGE_CACHE_TTL_SECS);
+        let refreshed = cache_data_usage_snapshot_result(
+            &mut cache,
+            Ok(loaded_usage_for_test(data_usage_info_for_test("bucket", 1, 7, SystemTime::UNIX_EPOCH))),
+            refreshed_at,
+            1,
+            1,
+            DataUsageInfo::clone,
+        )
+        .expect("matching refresh generation")
+        .expect("the newer cached snapshot remains available");
+        assert_eq!(refreshed, expected);
+        let retained = cache.as_ref().expect("cache should remain populated");
+        assert_eq!(retained.degraded_baseline.get("bucket"), Some(&42));
+        assert_eq!(retained.loaded_at, refreshed_at, "an older fallback must retain the TTL backoff");
+
+        let result =
+            cache_data_usage_snapshot_result(&mut cache, Err(Error::ErasureReadQuorum), refreshed_at, 1, 1, DataUsageInfo::clone)
+                .expect("matching refresh generation");
+        assert!(matches!(result, Err(Error::ErasureReadQuorum)));
+        assert!(cache.as_ref().expect("negative cache should be populated").info.is_none());
+    }
+
+    #[test]
+    fn expired_usage_snapshot_refresh_accepts_clock_recovery() {
+        let loaded_at = tokio::time::Instant::now();
+        let now = SystemTime::now();
+        let future = now + rustfs_data_usage::USAGE_LAST_UPDATE_FUTURE_TOLERANCE + Duration::from_secs(60);
+        let mut cache = Some(CachedDataUsageSnapshot {
+            info: Some(data_usage_info_for_test("bucket", 3, 42, future)),
+            loaded_at,
+            degraded_baseline: HashMap::new(),
+        });
+        let recovered = data_usage_info_for_test("bucket", 1, 7, now);
+        let refreshed = cache_data_usage_snapshot_result(
+            &mut cache,
+            Ok(loaded_usage_for_test(recovered.clone())),
+            loaded_at,
+            1,
+            1,
+            DataUsageInfo::clone,
+        )
+        .expect("matching refresh generation")
+        .expect("a clock recovery snapshot must not be frozen behind an untrusted timestamp");
+        assert_eq!(refreshed, recovered);
     }
 
     #[test]
