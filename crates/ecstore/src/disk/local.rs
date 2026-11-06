@@ -9142,11 +9142,15 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<DiskError>> {
-        let payload = super::GuardedDeleteVersionsPayload { versions, opts };
+        let payload = super::GuardedDeleteVersionsPayload {
+            versions,
+            opts,
+            bounded_recovery_protocol: None,
+        };
         if let Err(error) = payload.validate() {
             return vec![Some(error); payload.versions.len()];
         }
-        let super::GuardedDeleteVersionsPayload { versions, mut opts } = payload;
+        let super::GuardedDeleteVersionsPayload { versions, mut opts, .. } = payload;
         opts.recoverable_delete = true;
         let mut errors = Vec::with_capacity(versions.len());
         for version in &versions {
@@ -30444,6 +30448,7 @@ mod test {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            requires_bounded_delete_recovery: false,
             orphan_data_dir: false,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)

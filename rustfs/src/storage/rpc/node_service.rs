@@ -4847,7 +4847,9 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::PermissionDenied);
         }
         let mut invalid = message.clone();
-        invalid.protocol_version = 2;
+        invalid.protocol_version = crate::storage::storage_api::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION + 1;
+        let mut non_prepare = message.clone();
+        non_prepare.protocol_version = crate::storage::storage_api::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
         let mut malformed = message.clone();
         malformed.operation = vec![0xc1].into();
         let mut trailing = message.clone();
@@ -4856,6 +4858,7 @@ mod tests {
         trailing.operation = payload.into();
         for (message, expected) in [
             (invalid, tonic::Code::Unimplemented),
+            (non_prepare, tonic::Code::InvalidArgument),
             (malformed, tonic::Code::InvalidArgument),
             (trailing, tonic::Code::InvalidArgument),
         ] {
@@ -7953,6 +7956,7 @@ mod tests {
             guarded_group(last.clone()),
         ];
         let payload = crate::storage::storage_api::ecstore_disk::GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: groups.clone(),
             opts: DeleteOptions {
                 old_data_dir: Some(transaction),
