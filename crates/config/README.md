@@ -62,6 +62,23 @@ Current guidance:
 - `RUSTFS_CORS_ALLOWED_ORIGINS` defaults to empty, so the S3 endpoint emits no generic CORS headers unless configured. Set `*` for wildcard origins without credentials, or a comma-separated allow-list for credentialed explicit origins.
 - `RUSTFS_CONSOLE_CORS_ALLOWED_ORIGINS` defaults to `*` for the console service.
 
+## API URL prefix
+
+`RUSTFS_API_PREFIX` serves the S3 and admin API under a URL path prefix, for example
+`RUSTFS_API_PREFIX=/tools/rustfs` behind a reverse proxy that shares one host between
+deployments. It is unset by default and then changes nothing. The syntax and validation
+rules are those of `RUSTFS_CONSOLE_PREFIX` below; an empty value counts as unset. The
+prefix must not equal or be nested under the console prefix. Restart the server after
+changing it.
+
+The reverse proxy must forward the full path unchanged. RustFS strips the prefix itself
+and verifies SigV4 signatures over the path the client signed, so unprefixed requests,
+`/health`, and internode traffic keep working. When `RUSTFS_CONSOLE_PREFIX` is unset, the
+console moves to `<RUSTFS_API_PREFIX>/rustfs/console`; set both variables to choose
+separate paths such as `/tools/rustfs/api` and `/tools/rustfs/console`. The embedded
+console is told the API prefix at runtime, and the OIDC callback and object ZIP download
+URLs include it. See [reverse-proxy-path-prefix.md](../../docs/operations/reverse-proxy-path-prefix.md).
+
 ## Console URL prefix
 
 `RUSTFS_CONSOLE_PREFIX` changes the embedded console URL prefix. The default is
@@ -77,7 +94,8 @@ Choose a prefix that does not collide with S3 bucket paths.
 
 The console routes, embedded frontend asset URLs, browser redirects, and OIDC
 console redirects use this prefix. Admin API paths and the identity provider's
-`/rustfs/admin/v3/oidc/callback/...` URL remain unchanged. `RUSTFS_CONSOLE_ADDRESS`
+`/rustfs/admin/v3/oidc/callback/...` URL do not use it; they move only with
+`RUSTFS_API_PREFIX`. `RUSTFS_CONSOLE_ADDRESS`
 continues to control only the listening address and port. The server adapts bundled
 console asset references from their build-time base path to the runtime prefix.
 

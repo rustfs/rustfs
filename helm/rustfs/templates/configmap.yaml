@@ -21,6 +21,12 @@ data:
   {{- if .region }}
   RUSTFS_REGION: {{ .region | quote }}
   {{- end }}
+  {{- if .api_prefix }}
+  RUSTFS_API_PREFIX: {{ .api_prefix | quote }}
+  {{- end }}
+  {{- if .console_prefix }}
+  RUSTFS_CONSOLE_PREFIX: {{ .console_prefix | quote }}
+  {{- end }}
   {{- if .domains }}
   RUSTFS_SERVER_DOMAINS: {{ include "rustfs.serverDomains" $ | quote }}
   {{- end }}

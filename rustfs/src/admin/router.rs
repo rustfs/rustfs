@@ -85,7 +85,7 @@ use s3s::S3Request;
 use s3s::S3Response;
 use s3s::S3Result;
 use s3s::StdError;
-use s3s::auth::SigV4PathEncoding;
+use s3s::auth::{SigV4PathEncoding, SignedUriPath};
 use s3s::dto::{GetObjectInput, GetObjectOutput, IfMatch, IfNoneMatch, Range, StreamingBlob, Timestamp, TimestampFormat};
 use s3s::header;
 use s3s::route::S3Route;
@@ -913,10 +913,15 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
     })?;
     let scheme = extract_request_scheme(&req.headers, &req.uri);
     let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
-    let path_and_query = filtered_uri
-        .path_and_query()
-        .map(|value| value.as_str().to_string())
-        .unwrap_or_else(|| filtered_uri.path().to_string());
+    // The webhook fetches the URL through the same public endpoint as the client.
+    let source_path = req
+        .extensions
+        .get::<SignedUriPath>()
+        .map_or(filtered_uri.path(), SignedUriPath::as_str);
+    let path_and_query = match filtered_uri.query() {
+        Some(query) => format!("{source_path}?{query}"),
+        None => source_path.to_owned(),
+    };
     let source_uri = format!("{scheme}://{host}{path_and_query}").parse::<Uri>().map_err(|e| {
         S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to construct object lambda source URL: {e}"))
     })?;
@@ -5578,7 +5583,7 @@ mod tests {
 
     #[test]
     fn build_object_lambda_source_url_presigns_request_without_lambda_arn() {
-        let req = S3Request {
+        let mut req = S3Request {
             input: Body::from(String::new()),
             method: Method::GET,
             uri: "/demo-bucket/object.txt?lambdaArn=arn%3Aacme%3As3-object-lambda%3A%3Atransformer%3Awebhook&versionId=v1"
@@ -5609,6 +5614,12 @@ mod tests {
         assert_eq!(expires, Some(3600));
         assert_eq!(query_pairs.get("X-Amz-Algorithm").map(|value| value.as_ref()), Some("AWS4-HMAC-SHA256"));
         assert!(query_pairs.contains_key("X-Amz-Signature"));
+
+        let prefixed_path = "/tools/rustfs/api/demo-bucket/object.txt";
+        req.extensions.insert(SignedUriPath::new(prefixed_path));
+        let prefixed_url = build_object_lambda_source_url(&req).expect("prefixed source url should build");
+        let prefixed_url = Url::parse(&prefixed_url).expect("prefixed source url should parse");
+        assert_eq!(prefixed_url.path(), prefixed_path);
     }
 
     #[test]

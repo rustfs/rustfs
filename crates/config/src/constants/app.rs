@@ -207,6 +207,8 @@ pub const ENV_RUSTFS_CONSOLE_ADDRESS: &str = "RUSTFS_CONSOLE_ADDRESS";
 
 /// URL path prefix for the embedded console, read once at server startup.
 pub const ENV_RUSTFS_CONSOLE_PREFIX: &str = "RUSTFS_CONSOLE_PREFIX";
+/// URL path prefix under which the S3 and admin API are also served, read once at server startup.
+pub const ENV_RUSTFS_API_PREFIX: &str = "RUSTFS_API_PREFIX";
 /// Default embedded console URL path prefix.
 pub const DEFAULT_CONSOLE_PREFIX: &str = "/rustfs/console";
 

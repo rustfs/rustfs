@@ -143,6 +143,14 @@ config:
     console_enable: "true"
     console_address: ":9001"
     region: "us-east-1"
+    # Serve the S3/admin API under a path prefix, e.g. "/tools/rustfs/api". Sets
+    # RUSTFS_API_PREFIX only when non-empty. The proxy must pass the path through
+    # unchanged (no rewrite/strip): SigV4 signs the full path. Unprefixed paths,
+    # including /health probes, keep working.
+    api_prefix: ""
+    # Console path prefix, sets RUSTFS_CONSOLE_PREFIX only when non-empty. When
+    # empty and api_prefix is set, the console defaults to "<api_prefix>/rustfs/console".
+    console_prefix: ""
     # Optionally enable support for virtual-hosted-style requests.
     # See more information: https://docs.rustfs.com/integration/virtual.html
     domains: "" # e.g. "example.com"
@@ -355,6 +363,22 @@ ingress:
         - path: /
           pathType: Prefix
           servicePort: endpoint
+    # Path-prefix example (single host). Also set config.rustfs.api_prefix and
+    # config.rustfs.console_prefix to the same paths. Do NOT use
+    # nginx.ingress.kubernetes.io/rewrite-target or any strip-prefix middleware:
+    # the path must reach RustFS unchanged because SigV4 signs the full path.
+    # Route BOTH paths to "console" (9001): the console requests
+    # <api_prefix><console_prefix>/version, which port 9000 ("endpoint") rejects.
+    # With only api_prefix set, one path (api_prefix) is enough.
+    # Note: gatewayApi and contour routes only route "/".
+    # - host: rustfs.example.com
+    #   paths:
+    #     - path: /tools/rustfs/api
+    #       pathType: Prefix
+    #       servicePort: console   # 9001: serves the console and the full API
+    #     - path: /tools/rustfs/console
+    #       pathType: Prefix
+    #       servicePort: console
   tls:
     enabled: false # Enable tls and access rustfs via https.
 
