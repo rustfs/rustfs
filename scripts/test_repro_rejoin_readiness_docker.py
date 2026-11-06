@@ -239,6 +239,54 @@ class CleanupGuards(unittest.TestCase):
 
 
 class RequestsAndOracles(unittest.TestCase):
+    def test_every_volume_is_verified_before_staging_can_touch_it(self):
+        class StagingDocker(FakeDocker):
+            def __init__(self):
+                super().__init__()
+                self.volume_checks = []
+
+            def inspect(self, resource, name, **kwargs):
+                if resource == "volume":
+                    self.volume_checks.append(name)
+                return super().inspect(resource, name, **kwargs)
+
+            def docker(self, *args, **kwargs):
+                self.mutations.append(args)
+                if args[:2] == ("volume", "create"):
+                    name = args[-1]
+                    labels = dict(args[i + 1].split("=", 1) for i, value in enumerate(args[:-1]) if value == "--label")
+                    # Docker reuses existing names without replacing labels.
+                    self.objects.setdefault(("volume", name), {"Name": name, "Labels": labels})
+                if args[:2] == ("container", "create"):
+                    raise repro.ReproError("stop test at verified staging boundary")
+                return subprocess.CompletedProcess(args, 0, b"", b"")
+
+        for foreign in (False, True):
+            with tempfile.TemporaryDirectory() as root, self.subTest(foreign=foreign):
+                commands = StagingDocker()
+                value = experiment(Path(root) / "case", commands)
+                value.identity = {"id": IMAGE, "architecture": "arm64", "binary_sha256": BINARY}
+                commands.objects[("network", value.project)] = {
+                    "Name": value.project, "Id": "network-id", "Driver": "bridge", "Internal": False,
+                    "Labels": repro.resource_labels(value.project, SOURCE, "network")}
+                collision = value.project + "-config03"
+                if foreign:
+                    commands.objects[("volume", collision)] = {"Name": collision, "Labels": {"owner": "other"}}
+                with patch.object(value, "make_configuration", return_value=b"private-archive"):
+                    expected = "unowned volume" if foreign else "verified staging boundary"
+                    with self.assertRaisesRegex(repro.ReproError, expected):
+                        value.setup()
+                stage = [call for call in commands.mutations if call[:2] == ("container", "create")]
+                if foreign:
+                    self.assertEqual(stage, [], "no init container may mount or chown a foreign volume")
+                    self.assertEqual(commands.objects[("volume", collision)]["Labels"], {"owner": "other"})
+                else:
+                    self.assertEqual(len(commands.volume_checks), 10)
+                    self.assertEqual(len(stage), 1)
+                    mounts = [stage[0][i + 1] for i, value in enumerate(stage[0][:-1]) if value == "--mount"]
+                    self.assertEqual(len(mounts), 10)
+                    self.assertTrue(all("volume-nocopy" in mount for mount in mounts))
+
     def test_setup_declares_and_records_the_owned_non_internal_bridge(self):
         class NetworkDocker(FakeDocker):
             def docker(self, *args, **kwargs):
@@ -392,6 +440,62 @@ class RequestsAndOracles(unittest.TestCase):
             self.assertFalse(summary["retained_nodes_stopped"])
             events = (value.out / "events.jsonl").read_text()
             self.assertIn("stop failed", events)
+
+    def test_final_capture_interrupt_still_stops_owned_nodes_and_writes_failed_summary(self):
+        with tempfile.TemporaryDirectory() as root:
+            commands = FakeDocker()
+            value = experiment(Path(root) / "case", commands)
+            for node in value.nodes.values():
+                commands.objects[("container", node["id"])] = {
+                    "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": True},
+                    "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
+            with patch.object(value, "preflight"), patch.object(value, "setup"), patch.object(value, "sequence"), \
+                 patch.object(value, "recover"), patch.object(value, "capture", side_effect=KeyboardInterrupt), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(value.run(), 2)
+            self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", *(str(n) * 64 for n in range(1, 6)))])
+            summary = json.loads((value.out / "summary.json").read_text())
+            self.assertEqual(summary["first_failure"]["phase"], "capture")
+            self.assertEqual(summary["first_failure"]["reason"], "interrupted")
+            self.assertTrue(summary["retained_nodes_stopped"])
+
+    def test_cleanup_interrupt_falls_back_to_stopping_remaining_owned_nodes(self):
+        with tempfile.TemporaryDirectory() as root:
+            commands = FakeDocker()
+            value = experiment(Path(root) / "case", commands)
+            value.args.cleanup_on_success = True
+            repro.write_json(value.out / "manifest.json", {"project": value.project, "source_revision": SOURCE})
+            for node in value.nodes.values():
+                commands.objects[("container", node["id"])] = {
+                    "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": True},
+                    "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
+
+            def interrupted_cleanup(*args):
+                del commands.objects[("container", value.nodes[1]["id"])]
+                raise KeyboardInterrupt
+
+            with patch.object(value, "preflight"), patch.object(value, "setup"), patch.object(value, "sequence"), \
+                 patch.object(value, "recover"), patch.object(value, "capture"), \
+                 patch.object(repro, "cleanup_resources", side_effect=interrupted_cleanup), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(value.run(), 2)
+            self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", *(str(n) * 64 for n in range(2, 6)))])
+            summary = json.loads((value.out / "summary.json").read_text())
+            self.assertEqual(summary["first_failure"]["phase"], "cleanup")
+            self.assertEqual(summary["first_failure"]["reason"], "interrupted")
+            self.assertTrue(summary["retained_nodes_stopped"])
+
+    def test_retention_interrupt_is_recorded_in_the_failed_summary(self):
+        with tempfile.TemporaryDirectory() as root:
+            value = experiment(Path(root) / "case", FakeDocker())
+            with patch.object(value, "preflight"), patch.object(value, "setup"), patch.object(value, "sequence"), \
+                 patch.object(value, "recover"), patch.object(value, "capture"), \
+                 patch.object(value, "stop_retained_nodes", side_effect=KeyboardInterrupt), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(value.run(), 2)
+            summary = json.loads((value.out / "summary.json").read_text())
+            self.assertEqual(summary["first_failure"]["phase"], "retention-stop")
+            self.assertFalse(summary["retained_nodes_stopped"])
 
     def test_partial_cleanup_failure_stops_remaining_owned_nodes_and_retains_the_error(self):
         with tempfile.TemporaryDirectory() as root:

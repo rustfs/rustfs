@@ -459,9 +459,16 @@ class Experiment:
             raise ReproError("the experiment requires its declared non-internal bridge network")
         for n in range(1, 6):
             for kind in ("data", "config"):
-                self.commands.docker("volume", "create", *self.labels(kind), f"{self.project}-{kind}{n:02}")
+                name = f"{self.project}-{kind}{n:02}"
+                self.commands.docker("volume", "create", *self.labels(kind), name)
+                volume = self.commands.inspect("volume", name)
+                if volume is None:
+                    raise ReproError("could not inspect a created experiment volume")
+                # Docker may reuse an existing name without applying labels.
+                # Validate every volume before staging can mount or chown it.
+                verify_ownership(volume, "volume", name, kind, self.project, self.source)
         mounts = [item for n in range(1, 6) for kind in ("data", "config")
-                  for item in ("--mount", f"type=volume,src={self.project}-{kind}{n:02},dst=/stage/{kind}{n:02}")]
+                  for item in ("--mount", f"type=volume,src={self.project}-{kind}{n:02},dst=/stage/{kind}{n:02},volume-nocopy")]
         init_name = self.project + "-init"
         init_id = self.commands.docker("container", "create", "--pull=never", "--name", init_name, "--network", "none",
             "--user", "0:0", "--interactive", *self.labels("init"), *mounts,
@@ -502,8 +509,8 @@ class Experiment:
                 *self.labels("node"), "--network", self.project, "--network-alias", f"storage{n:02}", "--user", "10001:10001",
                 "--read-only", "--cpus", "1", "--memory", "1g", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
                 "--tmpfs", "/tmp:mode=1777,size=64m", "--tmpfs", "/logs:uid=10001,gid=10001,mode=0700,size=32m",
-                "--publish", f"127.0.0.1::{PORT}", "--mount", f"type=volume,src={self.project}-data{n:02},dst=/data",
-                "--mount", f"type=volume,src={self.project}-config{n:02},dst=/config,readonly"]
+                "--publish", f"127.0.0.1::{PORT}", "--mount", f"type=volume,src={self.project}-data{n:02},dst=/data,volume-nocopy",
+                "--mount", f"type=volume,src={self.project}-config{n:02},dst=/config,readonly,volume-nocopy"]
             args += [item for key, value in environment.items() for item in ("--env", f"{key}={value}")]
             args += ["--entrypoint", "/bin/sh", self.identity["id"], "-c", NODE_ENTRYPOINT]
             identifier = self.commands.docker(*args).stdout.decode().strip()
@@ -679,8 +686,8 @@ class Experiment:
                         time.sleep(1)
             try:
                 self.capture("before-recovery")
-            except (ReproError, OSError, tarfile.TarError) as error:
-                self.fail("pre-recovery-capture", str(error))
+            except (Exception, KeyboardInterrupt) as error:
+                self.fail("pre-recovery-capture", str(error) or "interrupted")
         restart = [node["id"] for node in self.nodes.values() if not node["running"]]
         if restart:
             self.commands.docker("container", "start", *restart)
@@ -784,8 +791,8 @@ class Experiment:
                 self.fail("recovery", str(error) or "interrupted")
             try:
                 self.capture()
-            except (ReproError, OSError, tarfile.TarError) as error:
-                self.fail("capture", str(error))
+            except (Exception, KeyboardInterrupt) as error:
+                self.fail("capture", str(error) or "interrupted")
             self.summary["acknowledged_objects"] = {key: sha256(value) for key, value in self.acknowledged.items()}
             self.summary["resources_retained"] = True
             cleanup_failed = False
@@ -793,15 +800,15 @@ class Experiment:
                 try:
                     cleanup_resources(self.commands, json.loads((self.out / "manifest.json").read_text()))
                     self.summary["resources_retained"] = False
-                except Exception as error:
+                except (Exception, KeyboardInterrupt) as error:
                     cleanup_failed = True
-                    self.fail("cleanup", str(error))
+                    self.fail("cleanup", str(error) or "interrupted")
                     self.summary["cleanup"] = "failed; resources may be partially removed"
             if self.summary["resources_retained"]:
                 try:
                     self.stop_retained_nodes(allow_missing=cleanup_failed)
-                except Exception as error:
-                    self.fail("retention-stop", str(error))
+                except (Exception, KeyboardInterrupt) as error:
+                    self.fail("retention-stop", str(error) or "interrupted")
                     self.summary["retained_nodes_stopped"] = False
             self.summary["first_failure"] = self.first_failure
             self.summary["result"] = "failed" if self.first_failure else "passed"
