@@ -4477,6 +4477,69 @@ fn raw_enumeration_progress_retains_resume_index_until_unordered_entries_reappea
 }
 
 #[test]
+fn reduce_children_of_wide_root_keeps_into_aligned_before_cancel_wait() {
+    // Non-checkpointed scans can reduce a reused wide root (>10k clean children)
+    // into a compacted aggregate. The live `into` accumulator must be refreshed
+    // from that cache entry before any await (flush_pacing): otherwise a cancel
+    // handler that replace_hashed's `into` reintroduces deleted child links.
+    const PREFIXES: usize = DATA_SCANNER_COMPACT_AT_CHILDREN + 1;
+    const {
+        assert!(PREFIXES > DATA_SCANNER_COMPACT_AT_CHILDREN);
+    }
+
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let root = hash_path("bucket");
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:05}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut into = cache.find("bucket").expect("root").clone();
+    assert!(!into.compacted);
+    assert_eq!(into.children.len(), PREFIXES);
+
+    cache.reduce_children_of(&root, DATA_SCANNER_COMPACT_AT_CHILDREN, true);
+    let cached = cache.find("bucket").expect("compacted root").clone();
+    assert!(cached.compacted);
+    assert!(cached.children.is_empty());
+    assert_eq!(cached.objects, PREFIXES);
+
+    // Pre-fix shape: into still holds the deleted child links.
+    assert_eq!(into.children.len(), PREFIXES);
+    assert!(!into.compacted);
+
+    // Production fix: copy the compacted aggregate back into the accumulator
+    // before any cancel-sensitive wait.
+    if cached.compacted {
+        into = cached;
+    }
+
+    // Simulate the interruption handler overwriting the cache from `into`.
+    cache.replace_hashed(&root, &None, &into);
+    let after_cancel = cache.find("bucket").expect("root after cancel overwrite");
+    assert!(after_cancel.compacted, "cancel must not resurrect a non-compacted root");
+    assert!(after_cancel.children.is_empty(), "cancel must not reintroduce dangling child links");
+    assert_eq!(after_cancel.objects, PREFIXES);
+    assert_eq!(cache.cache.len(), 1, "deleted children must stay deleted after cancel overwrite");
+}
+
+#[test]
 fn force_compact_limit_for_interrupted_sweep_keeps_frontier_above_ordinary_limit() {
     const PREFIXES: usize = DATA_SCANNER_COMPACT_AT_CHILDREN + 1;
     const {
