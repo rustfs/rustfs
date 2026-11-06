@@ -23,6 +23,10 @@ pub enum WebDavInitError {
     Bind(#[from] std::io::Error),
     #[error("server error: {0}")]
     Server(String),
+    #[error("WebDAV background task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+    #[error("WebDAV connections did not drain before the shutdown deadline")]
+    ShutdownDeadline,
     #[error("invalid WebDAV configuration: {0}")]
     InvalidConfig(String),
     #[error("TLS error: {0}")]
