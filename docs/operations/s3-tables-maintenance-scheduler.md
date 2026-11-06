@@ -6,7 +6,7 @@ The server can periodically **queue** maintenance jobs for explicitly selected t
 
 ## Direct Metadata Maintenance
 
-The object catalog accepts authenticated planning requests at:
+The object catalog accepts authenticated maintenance requests at:
 
 ```text
 POST /iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata
@@ -36,7 +36,7 @@ Successful planning returns HTTP 200 with a completed `DRY_RUN` job. It leaves t
 
 The same endpoint supports explicit operations with `delete`, `commit-snapshot-expiration`, or `commit-compaction`. Enable at most one of these flags. Metadata deletion requires `delete-enabled`. To commit snapshot expiration or compaction, also supply the corresponding plan configuration.
 
-Before invoking this endpoint, pause competing maintenance workers and resolve outstanding jobs or active quarantine. The direct endpoint can replace the current and latest reports even when a job already exists. Prior named reports remain available for inspection. If a request fails, inspect the scheduler state and named reports before retrying.
+Before invoking this endpoint, including a dry run, pause scheduler admission and competing maintenance workers, then resolve outstanding jobs, active quarantine, or inconsistent current/latest aliases. The direct endpoint can replace the current and latest reports even when a job already exists; it does not guarantee HTTP 409 for these states or preserve an outstanding job's retry budget. Prior named reports remain available for inspection. If a request fails, inspect the scheduler state and named reports before retrying. Resume scheduler admission and workers only after inspecting the direct invocation's result and report state.
 
 ## Enablement
 

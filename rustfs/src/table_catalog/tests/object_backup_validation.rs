@@ -516,6 +516,144 @@ async fn backup_fixture_with_backend(
 }
 
 #[tokio::test]
+async fn backup_and_restore_validate_retained_inline_v1_history_after_upgrade() {
+    let (backend, _, metadata_path) = backup_fixture().await;
+    let store = ObjectTableCatalogStore::new(backend.clone());
+    let entry = store.load_table("analytics", "sales", "orders").await.unwrap().unwrap();
+    let manifest = "tables/table-id/metadata/retained-v1.avro";
+    let data = "tables/table-id/data/retained-v1.parquet";
+    let manifest_bytes = v1_manifest_avro_bytes(&format!("s3://analytics/{data}"));
+    backend.seed_object("analytics", manifest, manifest_bytes.clone()).await;
+    backend.seed_object("analytics", data, vec![1]).await;
+    let v1 = serde_json::json!({
+        "format-version": 1,
+        "table-uuid": entry.table_uuid,
+        "location": entry.warehouse_location,
+        "last-updated-ms": 1,
+        "last-column-id": 1,
+        "schema": {"type": "struct", "schema-id": 0, "fields": []},
+        "partition-spec": [],
+        "current-snapshot-id": 10,
+        "snapshots": [{
+            "snapshot-id": 10, "timestamp-ms": 1,
+            "manifests": [format!("s3://analytics/{manifest}")],
+            "summary": {"operation": "append"}
+        }],
+        "snapshot-log": [{"timestamp-ms": 1, "snapshot-id": 10}],
+        "metadata-log": [],
+        "properties": {}
+    });
+    let mut v2 = v1.clone();
+    v2["format-version"] = serde_json::json!(2);
+    v2["snapshots"][0]["sequence-number"] = serde_json::json!(0);
+    synchronize_table_metadata_version_fields(&mut v2).unwrap();
+    let context = TableSnapshotGraphValidationContext::new(&backend, "analytics", &entry);
+    validate_table_snapshot_changes(&context, None, &v1).await.unwrap();
+    validate_table_snapshot_changes(&context, Some(&v1), &v2)
+        .await
+        .expect("commit validation supports retaining inline v1 history during upgrade");
+    assert!(matches!(
+        validate_table_snapshot_changes(&context, None, &v2).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message == "new Iceberg v2 snapshots require manifest-list"
+    ));
+    let mut appended = v2.clone();
+    let mut new_snapshot = v2["snapshots"][0].clone();
+    new_snapshot["snapshot-id"] = serde_json::json!(11);
+    new_snapshot["sequence-number"] = serde_json::json!(1);
+    appended["last-sequence-number"] = serde_json::json!(1);
+    appended["current-snapshot-id"] = serde_json::json!(11);
+    appended["snapshots"].as_array_mut().unwrap().push(new_snapshot);
+    assert!(matches!(
+        validate_table_snapshot_changes(&context, Some(&v2), &appended).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message == "new Iceberg v2 snapshots require manifest-list"
+    ));
+
+    let namespace = Namespace::parse("sales").unwrap();
+    let table = IdentifierSegment::parse("orders").unwrap();
+    let history_path = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
+    backend
+        .seed_object("analytics", &history_path, serde_json::to_vec(&v1).unwrap())
+        .await;
+    v2["metadata-log"] = serde_json::json!([{
+        "timestamp-ms": 1, "metadata-file": format!("s3://analytics/{history_path}")
+    }]);
+    backend
+        .seed_object("analytics", &metadata_path, serde_json::to_vec(&v2).unwrap())
+        .await;
+    let backup = store
+        .create_object_catalog_backup("analytics", None)
+        .await
+        .expect("backup must accept a supported v1-to-v2 upgrade");
+    let artifact = backend
+        .read_object(RUSTFS_META_BUCKET, &backup.backup_path)
+        .await
+        .unwrap()
+        .unwrap();
+    let artifact: serde_json::Value = serde_json::from_slice(&artifact.data).unwrap();
+    let references = artifact["references"].as_array().unwrap();
+    for object in [manifest, data, history_path.as_str()] {
+        assert_eq!(references.iter().filter(|reference| reference["object"] == object).count(), 1);
+    }
+    store
+        .restore_object_catalog_backup("analytics", &backup.backup_id, None, true)
+        .await
+        .expect("restore must revalidate the same retained inline history");
+    let restored = backend.read_object("analytics", &metadata_path).await.unwrap().unwrap();
+    assert_eq!(serde_json::from_slice::<serde_json::Value>(&restored.data).unwrap(), v2);
+
+    let mut invalid_history = v2.clone();
+    invalid_history["last-sequence-number"] = serde_json::json!(1);
+    invalid_history["snapshots"][0]["sequence-number"] = serde_json::json!(1);
+    backend
+        .seed_object("analytics", &metadata_path, serde_json::to_vec(&invalid_history).unwrap())
+        .await;
+    let before = maintenance_test_object_versions(&backend).await;
+    assert!(matches!(
+        store.create_object_catalog_backup("analytics", None).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message == "new Iceberg v2 snapshots require manifest-list"
+    ));
+    assert_eq!(maintenance_test_object_versions(&backend).await, before);
+    backend
+        .seed_object("analytics", &metadata_path, serde_json::to_vec(&v2).unwrap())
+        .await;
+
+    let v2_manifest =
+        crate::table_catalog::test_support::manifest_avro_bytes(&[(&format!("s3://analytics/{data}"), 0, 1, 10, 0)]);
+    backend.seed_object("analytics", manifest, v2_manifest).await;
+    let before = maintenance_test_object_versions(&backend).await;
+    assert!(matches!(
+        store.create_object_catalog_backup("analytics", None).await,
+        Err(TableCatalogStoreError::Invalid(message)) if message == "manifest format version exceeds the table format version"
+    ));
+    assert_eq!(maintenance_test_object_versions(&backend).await, before);
+    backend.seed_object("analytics", manifest, manifest_bytes).await;
+
+    // Persisted history must still be traversed, even though commit admission checks do not apply.
+    for invalid_object in [data, manifest] {
+        backend
+            .state
+            .lock()
+            .await
+            .objects
+            .remove(&("analytics".to_string(), invalid_object.to_string()));
+        let before = maintenance_test_object_versions(&backend).await;
+        assert!(matches!(
+            store.create_object_catalog_backup("analytics", None).await,
+            Err(TableCatalogStoreError::Invalid(_))
+        ));
+        assert_eq!(maintenance_test_object_versions(&backend).await, before);
+        backend.seed_object("analytics", data, vec![1]).await;
+    }
+    backend.seed_object("analytics", manifest, b"invalid Avro".to_vec()).await;
+    let before = maintenance_test_object_versions(&backend).await;
+    assert!(matches!(
+        store.create_object_catalog_backup("analytics", None).await,
+        Err(TableCatalogStoreError::Invalid(_))
+    ));
+    assert_eq!(maintenance_test_object_versions(&backend).await, before);
+}
+
+#[tokio::test]
 async fn restore_validates_the_entire_artifact_before_any_target_write() {
     let (source, backup, _) = backup_fixture().await;
     let bytes = source
