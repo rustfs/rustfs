@@ -277,7 +277,7 @@ impl ResumeManager {
             }
             return self.ensure_handoff_successor().await;
         }
-        if state.replacement_execution_protocol != 1
+        if !matches!(state.replacement_execution_protocol, 1 | 2)
             || !matches!(
                 state.replacement_phase,
                 ReplacementPhase::Intent
@@ -458,6 +458,13 @@ impl ResumeManager {
             predecessor.replacement_targets.clone(),
             link.targets.clone(),
         );
+        if predecessor.replacement_execution_protocol == 2 {
+            state.replacement_execution_protocol = 2;
+            state.replacement_bucket_incarnations = predecessor.replacement_bucket_incarnations.clone();
+            state.replacement_bucket_pass_order = predecessor.replacement_bucket_pass_order.clone();
+            state.replacement_retired_bucket_incarnations = predecessor.replacement_retired_bucket_incarnations.clone();
+            state.replacement_bucket_pass_reset_pending = true;
+        }
         state.replacement_phase = ReplacementPhase::OwnershipPending;
         // The constructor marks this compatibility grant consumed for every
         // successor, including descendants of a recovered older generation.
@@ -580,7 +587,7 @@ fn preformat_handoff_retry_candidate(state: &ResumeState) -> bool {
         && state.replacement_generation.as_deref() == Some(state.task_id.as_str())
         && !state.replacement_preformat_handoff_retry_done
         && state.replacement_phase == ReplacementPhase::Intent
-        && state.replacement_execution_protocol == 1
+        && matches!(state.replacement_execution_protocol, 1 | 2)
         && state.max_retries >= 2
         && state.replacement_predecessor.is_none()
         && state.replacement_handoff.is_none()

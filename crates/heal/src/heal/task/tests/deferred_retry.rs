@@ -221,6 +221,90 @@ async fn full_window_abort_accounts_inline_once_and_leaves_unstarted_tail_unproc
 }
 
 #[tokio::test(start_paused = true)]
+async fn rate_limited_page_does_not_age_out_behind_successful_repairs() {
+    let names: Vec<String> = (0..64).map(|index| format!("object-{index:04}")).collect();
+    let mut storage = MockStorage {
+        retry_test_pages: Some(vec![names.iter().map(|name| heal_item(name)).collect()]),
+        ..Default::default()
+    };
+    for name in &names {
+        storage.heal_object_outcomes.lock().expect("outcomes").insert(
+            name.clone(),
+            VecDeque::from([
+                MockHealObjectOutcome::RetryableSlowDown,
+                MockHealObjectOutcome::RetryableSlowDown,
+            ]),
+        );
+        storage
+            .retry_test_success_delays
+            .insert(name.clone(), Duration::from_millis(500));
+    }
+    let storage = Arc::new(storage);
+    let task = bucket_task(storage.clone());
+    let started = tokio::time::Instant::now();
+    task.execute()
+        .await
+        .expect("rate pressure must not start the whole page's retry age before serial repair capacity is available");
+    assert!(started.elapsed() > Duration::from_secs(30), "the page exceeds one object's retry age");
+    let outcome = task.get_outcome().await;
+    assert_eq!(
+        (outcome.counters.processed, outcome.counters.failed, outcome.counters.unknown),
+        (64, 0, 64)
+    );
+    assert_eq!(outcome.counters.attempt_failures, 128);
+    assert_eq!(task.get_progress().await.objects_healed, 64);
+    let calls = storage.heal_object_calls.lock().expect("calls");
+    for name in &names {
+        assert_eq!(calls.iter().filter(|called| *called == name).count(), 3);
+    }
+    assert_eq!(storage.healed_objects.lock().expect("healed").len(), 64);
+}
+
+#[tokio::test(start_paused = true)]
+async fn rate_pressure_abort_retains_unstarted_page_tail() {
+    for cancel in [true, false] {
+        let storage = Arc::new(pages_storage(&[&["a", "b", "c", "tail"], &["next-page"]]));
+        for name in ["a", "b", "c"] {
+            storage
+                .heal_object_outcomes
+                .lock()
+                .expect("outcomes")
+                .insert(name.to_string(), VecDeque::from([MockHealObjectOutcome::RetryableSlowDown]));
+        }
+        let mut task = bucket_task(storage.clone());
+        if !cancel {
+            task.options.timeout = Some(Duration::from_secs(1));
+        }
+        let execution = task.execute();
+        tokio::pin!(execution);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(500), &mut execution)
+                .await
+                .is_err()
+        );
+        assert_eq!(storage.heal_object_calls.lock().expect("calls").as_slice(), ["a", "b", "c"]);
+        assert_eq!(storage.listing_tokens.lock().expect("tokens").len(), 1);
+        if cancel {
+            task.cancel().await.expect("cancel");
+        }
+        assert!(matches!(
+            (execution.await, cancel),
+            (Err(Error::TaskCancelled), true) | (Err(Error::TaskTimeout), false)
+        ));
+        let outcome = task.get_outcome().await;
+        assert_eq!((outcome.counters.processed, outcome.counters.skipped, outcome.counters.failed), (3, 3, 0));
+        assert!(
+            !outcome
+                .objects
+                .iter()
+                .any(|item| item.identity.object == "tail" || item.identity.object == "next-page")
+        );
+        tokio::time::advance(Duration::from_secs(60)).await;
+        assert_eq!(storage.heal_object_calls.lock().expect("calls").len(), 3);
+    }
+}
+
+#[tokio::test(start_paused = true)]
 async fn repeated_slowdown_keeps_attempts_and_forward_pages_bounded() {
     let storage = Arc::new(pages_storage(&[&["a"], &["b"], &["c"], &["d"]]));
     for name in ["a", "b", "c", "d"] {

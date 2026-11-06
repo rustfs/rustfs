@@ -457,7 +457,9 @@ where
     }
 
     let pool = get_concurrency_manager().bytes_pool();
-    let mut buffer = pool.acquire_buffer(size).await;
+    let mut buffer = pool
+        .try_acquire_buffer(size)
+        .unwrap_or_else(|| rustfs_io_core::PooledBuffer::unpooled(size));
     super::put::read_small_put_body_into(body, &mut *buffer, size).await?;
     Ok(ExtractStagedBody {
         reader: Some(super::put::PooledBufferReader::new(buffer, size)),
@@ -1282,7 +1284,7 @@ fn is_empty_extract_entry_path(path: &str) -> bool {
 
 fn validate_extract_member_key(path: &str, limits: ArchiveLimits) -> Result<(), ExtractEntryError> {
     validate_put_object_extract_entry_path(path, limits).map_err(ExtractEntryError::Recoverable)?;
-    validate_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
+    validate_new_object_key(path, "PUT").map_err(ExtractEntryError::Recoverable)
 }
 
 fn record_extract_pax_metadata_bytes(
@@ -1585,6 +1587,26 @@ fn extract_member_iam_requirements(
         retention: object_lock_mode.is_some() || object_lock_retain_until_date.is_some(),
         legal_hold: object_lock_legal_hold_status.is_some(),
         replication: explicit_version_id.is_some() || replica,
+    }
+}
+
+// Version and replica controls require authorization even when the archive does not set a time.
+// An mtime-only member can still be uploaded with server time when the caller lacks that permission.
+async fn authorized_extract_member_mod_time(
+    req: &mut S3Request<PutObjectInput>,
+    replication_required: bool,
+    archive_time: Option<OffsetDateTime>,
+) -> S3Result<Option<OffsetDateTime>> {
+    if !replication_required {
+        if archive_time.is_none() {
+            return Ok(None);
+        }
+        req_info_mut(req)?.suppress_denial_log = true;
+    }
+    match authorize_request(req, Action::S3Action(S3Action::ReplicateObjectAction)).await {
+        Ok(()) => Ok(archive_time),
+        Err(err) if !replication_required && err.code() == &S3ErrorCode::AccessDenied => Ok(None),
+        Err(err) => Err(err),
     }
 }
 
@@ -2067,14 +2089,26 @@ impl DefaultObjectUsecase {
             true,
         )?;
         let Some(body) = body else { return Err(s3_error!(IncompleteBody)) };
-        let body = guard_put_object_body_read_timeout(
-            body,
-            &bucket,
-            &key,
-            &request_context.request_id,
-            content_length,
-            put_object_body_read_timeout(),
-        );
+        let (body, progress_control) = if let Some(control) = req.extensions.get::<super::request_body::BodyReadControl>() {
+            control.activate_upload(
+                put_object_body_read_timeout(),
+                &bucket,
+                &key,
+                &request_context.request_id,
+                content_length.unwrap_or_default().max(0) as u64,
+            );
+            (body, control.clone())
+        } else {
+            super::request_body::guard_upload_progress(
+                body,
+                put_object_body_read_timeout(),
+                &bucket,
+                &key,
+                &request_context.request_id,
+                content_length.unwrap_or_default().max(0) as u64,
+            )
+        };
+        let body = super::request_body::demand_upload_body(body, progress_control.clone());
 
         let size = match content_length {
             Some(c) => c,
@@ -2092,7 +2126,7 @@ impl DefaultObjectUsecase {
         if size < 0 {
             return Err(s3_error!(UnexpectedContent));
         }
-        validate_object_key(&key, "PUT")?;
+        validate_new_object_key(&key, "PUT")?;
         validate_table_catalog_object_mutation(&bucket, &key).await?;
         let _ = self
             .check_bucket_quota(
@@ -2156,6 +2190,7 @@ impl DefaultObjectUsecase {
             ExtractArchiveEtagReader::new(archive_reader, expected_archive_length, archive_upload_state.clone());
         let decoder = build_admitted_extract_archive_decoder(get_concurrency_manager(), &key, tracked_archive).await?;
         let decoder = ExtractDecodedLimitReader::new(decoder, extract_limits.max_decoded_size);
+        let decoder = super::request_body::DemandReader::new(decoder, progress_control);
 
         let mut ar = build_put_object_extract_archive(decoder, extract_limits);
         let mut entries = ar.entries().map_err(|e| {
@@ -2357,7 +2392,10 @@ impl DefaultObjectUsecase {
                 put_opts_with_replication_authorization(
                     &bucket,
                     &fpath,
-                    outer_version_id.clone(),
+                    // The DTO version is applied with any PAX override below, then
+                    // authorized against this member before publication. Header
+                    // replication controls still require the outer authorization.
+                    None,
                     &member_request_headers,
                     metadata.clone(),
                     replication_authorized,
@@ -2456,15 +2494,14 @@ impl DefaultObjectUsecase {
             if iam_requirements.legal_hold {
                 extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::PutObjectLegalHoldAction)).await);
             }
-            if iam_requirements.replication {
-                extract_try!(authorize_request(&mut auth_req, Action::S3Action(S3Action::ReplicateObjectAction)).await);
+            if let Some(mod_time) = extract_try!(
+                authorized_extract_member_mod_time(&mut auth_req, iam_requirements.replication, archive_entry_mod_time,).await
+            ) {
+                opts.mod_time = Some(mod_time);
             }
             let table_data_plane_publication_guards = retained_table_data_plane_publication_guards(&auth_req);
             drop(auth_req);
             extract_try!(reject_veeam_sosapi_mutation(|| Some(Arc::clone(&commit_context.store)), &bucket, &fpath).await);
-            if archive_entry_mod_time.is_some() {
-                opts.mod_time = archive_entry_mod_time;
-            }
 
             debug!("Extracting file: {}, size: {} bytes", fpath, size);
 
@@ -2790,6 +2827,49 @@ mod tests {
             user_agent: String::new(),
             wrote_any_entry: AtomicBool::new(false),
         })
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn snowball_stalled_archives_release_actual_decoder_slots() {
+        use futures::poll;
+        use tokio_stream::wrappers::UnboundedReceiverStream;
+        let manager = ConcurrencyManager::new();
+        let mut senders = Vec::new();
+        let mut owners = Vec::new();
+        for _ in 0..4 {
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel::<Result<Bytes, std::io::Error>>();
+            let (body, _control) = super::super::request_body::guard_upload_progress(
+                StreamingBlob::wrap(UnboundedReceiverStream::new(receiver)),
+                Duration::ZERO,
+                "bucket",
+                "archive.tar",
+                "request",
+                1024,
+            );
+            let body = StreamReader::new(body.map(|item| item.map_err(s3s_body_error_to_io)));
+            let mut owner = Box::pin(build_admitted_extract_archive_decoder(&manager, "archive.tar", body));
+            assert!(poll!(owner.as_mut()).is_pending());
+            senders.push(sender);
+            owners.push(owner);
+        }
+        assert!(manager.try_acquire_snowball_archive_decoder().is_none());
+        for _ in 0..5 {
+            tokio::time::advance(Duration::from_secs(10)).await;
+            for (sender, owner) in senders.iter().zip(&mut owners) {
+                sender.send(Ok(Bytes::from_static(b"x"))).unwrap();
+                assert!(poll!(owner.as_mut()).is_pending());
+            }
+        }
+        tokio::time::advance(Duration::from_secs(10)).await;
+        for owner in owners {
+            let error = owner.await.err().expect("stalled archive sniff must expire");
+            assert_eq!(error.code(), &S3ErrorCode::RequestTimeout);
+        }
+        let recovered: Vec<_> = (0..4)
+            .map(|_| manager.try_acquire_snowball_archive_decoder().expect("reusable slot"))
+            .collect();
+        assert!(manager.try_acquire_snowball_archive_decoder().is_none());
+        drop(recovered);
     }
 
     #[tokio::test]
@@ -3582,6 +3662,107 @@ mod tests {
                 .await
                 .expect_err("rejected archive cannot publish a member");
             assert!(is_err_object_not_found(&missing), "{missing}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn snowball_member_mtime_requires_member_replication_authorization() {
+        use crate::app::storage_api::test::ReqInfo;
+        use crate::app::storage_api::test::bucket::metadata::{BUCKET_POLICY_CONFIG, BUCKET_VERSIONING_CONFIG};
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use http::Method;
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("extract-time-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        metadata_sys::update(
+            &bucket,
+            BUCKET_VERSIONING_CONFIG,
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>".to_vec(),
+        )
+        .await
+        .expect("enable versioning");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        for (replicate, explicit_version, mtime) in [
+            (false, false, 2_524_608_000_u64),
+            (false, false, 1_000_000_000),
+            (false, true, 2_524_608_000),
+            (true, false, 1_704_000_123),
+            (true, true, 2_524_608_000),
+        ] {
+            let actions = if replicate {
+                vec!["s3:PutObject", "s3:ReplicateObject"]
+            } else {
+                vec!["s3:PutObject"]
+            };
+            let policy = serde_json::json!({"Version":"2012-10-17", "Statement":[{
+                "Effect":"Allow", "Principal":"*", "Action":actions,
+                "Resource":format!("arn:aws:s3:::{bucket}/*")
+            }]});
+            metadata_sys::update(&bucket, BUCKET_POLICY_CONFIG, serde_json::to_vec(&policy).expect("policy JSON"))
+                .await
+                .expect("install member permissions");
+            let member = match (replicate, explicit_version) {
+                (true, false) => "authorized-time-only.txt",
+                (true, true) => "replicated.txt",
+                (false, true) => "denied-version.txt",
+                (false, false) => "ordinary.txt",
+            };
+            let mut builder = Builder::new(Vec::new());
+            let mut header = Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_mtime(mtime);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, member, &b"x"[..])
+                .await
+                .expect("append member");
+            let archive = builder.into_inner().await.expect("finish archive");
+            let before = OffsetDateTime::now_utc();
+            let input = PutObjectInput::builder()
+                .bucket(bucket.clone())
+                .key("archive.tar".to_string())
+                .version_id(explicit_version.then(|| Uuid::new_v4().to_string()))
+                .content_length(Some(i64::try_from(archive.len()).expect("archive size")))
+                .body(Some(StreamingBlob::from_bytes(Bytes::from(archive))))
+                .build()
+                .expect("extract request");
+            let mut request = build_request(input, Method::PUT);
+            request.extensions.insert(ReqInfo::default());
+            let result = Box::pin(usecase.execute_put_object_extract(request)).await;
+            if explicit_version && !replicate {
+                assert_eq!(
+                    result
+                        .expect_err("version selection requires member replication permission")
+                        .code(),
+                    &S3ErrorCode::AccessDenied
+                );
+                let missing = store
+                    .get_object_info(&bucket, member, &ObjectOptions::default())
+                    .await
+                    .expect_err("unauthorized version cannot publish a member");
+                assert!(is_err_object_not_found(&missing));
+                continue;
+            }
+            result.expect("extract member");
+            let info = store
+                .get_object_info(&bucket, member, &ObjectOptions::default())
+                .await
+                .expect("current member");
+            let actual = info.mod_time.expect("stored timestamp");
+            if replicate {
+                assert_eq!(actual.unix_timestamp(), i64::try_from(mtime).expect("timestamp"));
+            } else {
+                assert!(
+                    actual >= before && actual <= OffsetDateTime::now_utc(),
+                    "ordinary upload used archive time: {actual}"
+                );
+            }
         }
     }
 
@@ -4936,13 +5117,13 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn snowball_extract_body_guard_aborts_stalled_upload() {
         let body = StreamingBlob::wrap(futures::stream::pending::<Result<Bytes, std::io::Error>>());
-        let mut guarded = guard_put_object_body_read_timeout(
+        let (mut guarded, _) = super::request_body::guard_upload_progress(
             body,
+            Duration::from_millis(1),
             "test-bucket",
             "archive.tar",
             "snowball-timeout",
-            Some(512),
-            Duration::from_millis(1),
+            512,
         );
 
         let err = guarded

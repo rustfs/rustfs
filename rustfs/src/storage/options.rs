@@ -360,6 +360,21 @@ pub async fn put_opts(
     put_opts_with_replication_authorization(bucket, object, vid, headers, metadata, false).await
 }
 
+/// Resolve the version addressed by a write before evaluating version-scoped policy.
+/// Query parameters take precedence over compatible replication headers.
+pub(crate) fn destination_version_id(vid: Option<&str>, headers: &HeaderMap<HeaderValue>) -> Option<String> {
+    let header = get_header(headers, SUFFIX_SOURCE_VERSION_ID);
+    let value = vid.or(header.as_deref())?.trim();
+    if value.eq_ignore_ascii_case("null") {
+        return Some("null".to_owned());
+    }
+    Some(match Uuid::parse_str(value) {
+        Ok(id) if id.is_nil() => "null".to_owned(),
+        Ok(id) => id.to_string(),
+        Err(_) => value.to_owned(),
+    })
+}
+
 pub async fn put_opts_with_replication_authorization(
     bucket: &str,
     object: &str,
@@ -379,8 +394,8 @@ pub async fn put_opts_with_replication_authorization(
     let versioned = versioning_cfg.prefix_enabled(object);
     let version_suspended = versioning_cfg.prefix_suspended(object);
 
-    let vid = if vid.is_none() && replication_request_authorized {
-        get_header(headers, SUFFIX_SOURCE_VERSION_ID).map(|s| s.into_owned())
+    let vid = if replication_request_authorized {
+        destination_version_id(vid.as_deref(), headers)
     } else {
         vid
     };
@@ -439,7 +454,7 @@ pub fn get_complete_multipart_upload_opts_with_replication_authorization(
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         replication_request = true;
         mod_time = replication_source_mtime(headers);
-        preserve_etag = replication_source_etag(headers);
+        preserve_etag = replication_source_etag(headers)?;
         if let Some(actual_size_str) = get_header(headers, SUFFIX_REPLICATION_ACTUAL_OBJECT_SIZE) {
             rustfs_utils::http::insert_str(
                 &mut user_defined,
@@ -518,25 +533,47 @@ pub fn put_opts_from_headers_with_replication_authorization(
     if replication_request_authorized && get_header(headers, SUFFIX_SOURCE_REPLICATION_REQUEST).as_deref() == Some("true") {
         opts.replication_request = true;
         opts.mod_time = replication_source_mtime(headers);
-        opts.preserve_etag = replication_source_etag(headers);
+        opts.preserve_etag = replication_source_etag(headers)?;
         // SSE-C ciphertext passthrough: restore the stored encryption metadata
         // from the transport headers and mark the body as already encrypted so
         // the write path stores it verbatim.
         if let Some(restored) = rustfs_utils::http::ssec_transport_to_stored_metadata(headers) {
+            if restored
+                .get(rustfs_utils::http::object_encryption_keys::SSEC_ORIGINAL_SIZE_HEADER)
+                .is_some_and(|value| !value.parse::<i64>().is_ok_and(|size| size >= 0))
+            {
+                return Err(StorageError::InvalidArgument(
+                    String::new(),
+                    String::new(),
+                    "Invalid replicated SSE-C original size".to_string(),
+                ));
+            }
             opts.user_defined.extend(restored);
             opts.preserve_ciphertext = true;
             // A compressed passthrough object restores its compression
             // layout as well, so the replica decompresses after decrypting
-            // (backlog#2363). The value is validated when the object is read.
+            // (backlog#2363). Reject unreadable layouts before persisting them.
             if let Some(scheme) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION) {
+                super::storage_api::options_consumer::validate_compression_scheme(&scheme).map_err(|_| {
+                    StorageError::InvalidArgument(
+                        String::new(),
+                        String::new(),
+                        "Unsupported replicated compression scheme".to_string(),
+                    )
+                })?;
                 rustfs_utils::http::insert_str(
                     &mut opts.user_defined,
                     rustfs_utils::http::SUFFIX_COMPRESSION,
                     scheme.into_owned(),
                 );
-                if let Some(actual_size) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE)
-                    && actual_size.parse::<i64>().is_ok_and(|size| size >= 0)
-                {
+                if let Some(actual_size) = get_header(headers, rustfs_utils::http::SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE) {
+                    if !actual_size.parse::<i64>().is_ok_and(|size| size >= 0) {
+                        return Err(StorageError::InvalidArgument(
+                            String::new(),
+                            String::new(),
+                            "Invalid replicated compression size".to_string(),
+                        ));
+                    }
                     rustfs_utils::http::insert_str(
                         &mut opts.user_defined,
                         rustfs_utils::http::SUFFIX_ACTUAL_SIZE,
@@ -556,17 +593,30 @@ pub fn put_opts_from_headers_with_replication_authorization(
 /// Replicas must keep the source object's ETag: managed-SSE replication
 /// re-encrypts on the target, so a recomputed ETag would differ from the
 /// source and every HEAD comparison would re-schedule the object forever.
-fn replication_source_etag(headers: &HeaderMap<HeaderValue>) -> Option<String> {
-    let value = get_header(headers, SUFFIX_SOURCE_ETAG)?;
-    let value = value.trim().trim_matches('"');
-    (!value.is_empty()).then(|| value.to_string())
+fn replication_source_etag(headers: &HeaderMap<HeaderValue>) -> std::io::Result<Option<String>> {
+    let Some(value) = get_header(headers, SUFFIX_SOURCE_ETAG) else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    let value = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .unwrap_or(value);
+    if value
+        .bytes()
+        .any(|byte| !byte.is_ascii_graphic() || matches!(byte, b'"' | b'<' | b'>' | b'&'))
+    {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid replication source ETag"));
+    }
+    Ok((!value.is_empty()).then(|| value.to_string()))
 }
 
 fn replication_source_mtime(headers: &HeaderMap<HeaderValue>) -> Option<time::OffsetDateTime> {
     let value = get_header(headers, SUFFIX_SOURCE_MTIME)?;
     let value = value.trim();
     match time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc3339) {
-        Ok(mtime) => Some(mtime),
+        Ok(mtime) if mtime.unix_timestamp_nanos() != 0 && i64::try_from(mtime.unix_timestamp_nanos()).is_ok() => Some(mtime),
+        Ok(_) => None,
         Err(err) => {
             tracing::warn!("Invalid source-mtime value '{}' (replication request=true): {}", value, err);
             None
@@ -1209,6 +1259,45 @@ mod tests {
     use std::collections::HashMap;
     use uuid::Uuid;
 
+    #[test]
+    fn replication_etags_reject_xml_and_header_delimiters_before_persistence() {
+        for etag in ["</ETag><Contents><Key>victim</Key></Contents><ETag>", "a&b", "a\"b", "a\tb"] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            insert_header(&mut headers, SUFFIX_SOURCE_ETAG, etag);
+            assert!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err(),
+                "{etag:?}"
+            );
+            assert!(
+                get_complete_multipart_upload_opts_with_replication_authorization(&headers, true).is_err(),
+                "{etag:?}"
+            );
+            assert!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), false)
+                    .expect("untrusted header is inert")
+                    .preserve_etag
+                    .is_none()
+            );
+        }
+        for etag in [
+            "0123456789abcdef0123456789abcdef",
+            "\"0123456789abcdef0123456789abcdef-3\"",
+            "opaque-provider-etag",
+        ] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            insert_header(&mut headers, SUFFIX_SOURCE_ETAG, etag);
+            assert_eq!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+                    .expect("valid replica ETag")
+                    .preserve_etag
+                    .as_deref(),
+                Some(etag.trim_matches('"'))
+            );
+        }
+    }
+
     fn create_test_headers() -> HeaderMap<HeaderValue> {
         let mut headers = HeaderMap::new();
         headers.insert("content-type", HeaderValue::from_static("application/json"));
@@ -1564,6 +1653,25 @@ mod tests {
         }
     }
 
+    #[test]
+    fn destination_version_resolution_preserves_query_precedence_and_normalizes_aliases() {
+        for header in ["x-rustfs-source-version-id", "x-minio-source-version-id"] {
+            let mut headers = HeaderMap::new();
+            headers.insert(header, HeaderValue::from_static(" ABCDEF12-1234-1234-1234-123456789ABC "));
+            assert_eq!(
+                super::destination_version_id(None, &headers).as_deref(),
+                Some("abcdef12-1234-1234-1234-123456789abc")
+            );
+            for query in ["null", "NULL", "  null  ", "00000000-0000-0000-0000-000000000000"] {
+                assert_eq!(super::destination_version_id(Some(query), &headers).as_deref(), Some("null"));
+            }
+            headers.insert(header, HeaderValue::from_static("null"));
+            assert_eq!(super::destination_version_id(None, &headers).as_deref(), Some("null"));
+            assert_eq!(super::destination_version_id(Some("invalid"), &headers).as_deref(), Some("invalid"));
+        }
+        assert_eq!(super::destination_version_id(None, &HeaderMap::new()), None);
+    }
+
     #[tokio::test]
     async fn test_put_opts_normalizes_null_version_id() {
         // MinIO-compatible replication senders (including RustFS itself since
@@ -1686,9 +1794,10 @@ mod tests {
             get_str,
         };
 
+        let scheme = crate::storage::storage_api::compression_metadata_value(rustfs_utils::CompressionAlgorithm::Lz4);
         let mut headers = HeaderMap::new();
         insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
-        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION, "klauspost/compress/s2");
+        insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION, &scheme);
         insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "6295552");
 
         // Without SSE-C transport headers the request is not a passthrough:
@@ -1716,19 +1825,49 @@ mod tests {
         let trusted = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
             .expect("authorized replication request should parse");
         assert!(trusted.preserve_ciphertext);
-        assert_eq!(
-            get_str(&trusted.user_defined, SUFFIX_COMPRESSION).as_deref(),
-            Some("klauspost/compress/s2")
-        );
+        assert_eq!(get_str(&trusted.user_defined, SUFFIX_COMPRESSION).as_deref(), Some(scheme.as_str()));
         assert_eq!(get_str(&trusted.user_defined, SUFFIX_ACTUAL_SIZE).as_deref(), Some("6295552"));
 
-        // A malformed plaintext size is dropped; the scheme alone still lets
-        // the read path derive the size from the parts.
         insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "-5");
-        let malformed = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
-            .expect("authorized replication request should parse");
-        assert!(get_str(&malformed.user_defined, SUFFIX_COMPRESSION).is_some());
-        assert!(get_str(&malformed.user_defined, SUFFIX_ACTUAL_SIZE).is_none());
+        assert!(
+            put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err(),
+            "invalid replicated sizes must not reach persisted metadata"
+        );
+    }
+
+    #[test]
+    fn replicated_encryption_metadata_rejects_invalid_sizes_and_compression() {
+        use rustfs_utils::http::object_encryption_keys::REPLICATION_SSEC_ORIGINAL_SIZE_HEADER;
+        use rustfs_utils::http::{SUFFIX_REPLICATION_COMPRESSION, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE};
+        for (header, value) in [
+            (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "abc"),
+            (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "-1"),
+            (REPLICATION_SSEC_ORIGINAL_SIZE_HEADER, "9223372036854775808"),
+        ] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            headers.insert(
+                http::HeaderName::from_bytes(header.as_bytes()).expect("header name"),
+                HeaderValue::from_static(value),
+            );
+            assert!(put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err());
+            assert!(
+                put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), false).is_ok(),
+                "untrusted transport headers stay inert"
+            );
+        }
+        for size in ["0", "5", "9223372036854775807"] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            headers.insert(
+                http::HeaderName::from_bytes(REPLICATION_SSEC_ORIGINAL_SIZE_HEADER.as_bytes()).expect("size header"),
+                HeaderValue::from_static(size),
+            );
+            assert!(put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_ok());
+            insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION, "not-a-compression-format");
+            insert_header(&mut headers, SUFFIX_REPLICATION_COMPRESSION_ACTUAL_SIZE, "5");
+            assert!(put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true).is_err());
+        }
     }
 
     #[test]
@@ -1808,6 +1947,26 @@ mod tests {
         let opts_invalid = result_invalid.unwrap();
         assert!(opts_invalid.replication_request);
         assert!(opts_invalid.mod_time.is_none());
+    }
+
+    #[test]
+    fn replication_source_time_must_survive_the_metadata_codec() {
+        for timestamp in ["1970-01-01T00:00:00Z", "9999-12-31T23:59:59Z", "0001-01-01T00:00:00Z"] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_REPLICATION_REQUEST, "true");
+            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, timestamp);
+            let opts = put_opts_from_headers_with_replication_authorization(&headers, HashMap::new(), true)
+                .expect("invalid source time falls back to server commit time");
+            assert!(opts.mod_time.is_none(), "{timestamp}");
+        }
+        for timestamp in ["1969-12-31T23:59:59Z", "1970-01-01T00:00:00.000000001Z"] {
+            let mut headers = HeaderMap::new();
+            insert_header(&mut headers, SUFFIX_SOURCE_MTIME, timestamp);
+            assert!(
+                super::replication_source_mtime(&headers).is_some(),
+                "representable time {timestamp} remains readable"
+            );
+        }
     }
 
     /// A client PUT must not materialize the replication transport names as

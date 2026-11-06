@@ -786,7 +786,7 @@ impl WarmBackend for MockWarmBackend {
             bytes.len()
         };
 
-        Ok(tokio::io::BufReader::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
+        Ok(ReadCloser::new(Cursor::new(bytes[start.min(bytes.len())..end].to_vec())))
     }
 
     async fn remove(&self, object: &str, rv: &str) -> Result<(), std::io::Error> {

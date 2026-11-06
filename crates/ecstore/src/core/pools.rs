@@ -8380,8 +8380,9 @@ where
         })
     });
     let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
-    let may_have_mutated = !matches!(&result, Err(Error::PreconditionFailed));
-    if !may_have_mutated {
+    let write_not_started = matches!(&result, Err(Error::Io(inner)) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataWriteNotStarted>()));
+    let may_have_mutated = !write_not_started && !matches!(&result, Err(Error::PreconditionFailed));
+    if matches!(&result, Err(Error::PreconditionFailed)) {
         record_pool_meta_stale_write_rejection(phase);
     }
     let mut source = None;
@@ -8392,6 +8393,8 @@ where
             source = Some(Arc::clone(&original));
             if matches!(original.as_ref(), Error::PreconditionFailed) {
                 Err(Error::PreconditionFailed)
+            } else if write_not_started {
+                Err(Error::other(original))
             } else {
                 Err(Error::other(pool_metadata_error(
                     crate::error::PoolMetadataFailure::TransactionUnknown,
@@ -30823,6 +30826,154 @@ mod pools_tests {
         assert!(
             future_size <= 4 * 1024,
             "pool metadata CAS future must remain stack-bounded; measured {future_size} bytes versus {original_size} without repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_quorum_rejection_allows_retry_after_disks_return() {
+        let (dirs, disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        pool.disks.write().await[2..].fill(None);
+        let state = super::PoolMetaWriteState::default();
+        let data =
+            super::initialized_pool_meta_identity_for_test(uuid::Uuid::new_v4(), 1).expect("encode the deployment identity");
+        let mut transaction = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("two of four disks cannot satisfy the identity write quorum");
+        drop(transaction);
+        for dir in &dirs {
+            assert!(
+                !dir.path()
+                    .join(crate::disk::RUSTFS_META_BUCKET)
+                    .join(POOL_META_IDENTITY_NAME)
+                    .exists(),
+                "the rejected write must not create an identity replica"
+            );
+        }
+        state
+            .ensure_write_safe("retry after disks return")
+            .expect("a rejected inline write must not poison the startup transaction");
+
+        let ordinary_error = crate::config::com::save_config_with_opts(
+            pool.clone(),
+            "ordinary-config",
+            data.clone(),
+            &ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("ordinary writes must still fail without quorum");
+        assert!(
+            matches!(ordinary_error, Error::InsufficientWriteQuorum(_, _)),
+            "ordinary callers must retain their existing quorum error"
+        );
+
+        *pool.disks.write().await = disks.into_iter().map(Some).collect();
+        let mut retry = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut retry,
+        )
+        .await
+        .expect("the same transaction must succeed when the disks return");
+        retry.disarm();
+        drop(retry);
+        assert_eq!(
+            crate::config::com::read_config(pool, POOL_META_IDENTITY_NAME)
+                .await
+                .expect("read back the committed identity"),
+            data
+        );
+        state
+            .ensure_write_safe("after successful retry")
+            .expect("retry must leave writes enabled");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_quorum_rejection_keeps_an_earlier_write_armed() {
+        let (_dirs, disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        let state = super::PoolMetaWriteState::default();
+        let data =
+            super::initialized_pool_meta_identity_for_test(uuid::Uuid::new_v4(), 1).expect("encode the deployment identity");
+        let mut transaction = state.arm_transaction();
+        let written = save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "prepare_cas",
+            &mut transaction,
+        )
+        .await
+        .expect("the earlier phase must really commit");
+        pool.disks.write().await[2..].fill(None);
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Existing(written.etag.expect("committed identity has an ETag")),
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("the next phase must fail without a write quorum");
+        drop(transaction);
+        *pool.disks.write().await = disks.into_iter().map(Some).collect();
+        assert_eq!(
+            crate::config::com::read_config(pool, POOL_META_IDENTITY_NAME)
+                .await
+                .expect("the earlier commit must survive the rejected write"),
+            data
+        );
+        let error = state
+            .ensure_write_safe("after a committed phase")
+            .expect_err("a later rejection cannot discharge the earlier write");
+        assert_eq!(
+            error.pool_metadata_failure().expect("retain typed uncertainty").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        assert_eq!(error.pool_metadata_failure().expect("retain the earlier mutation").phase, "prepare_cas");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_noninline_failure_keeps_transaction_armed() {
+        let (_dirs, _disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        pool.disks.write().await[2..].fill(None);
+        let state = super::PoolMetaWriteState::default();
+        let mut transaction = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool,
+            POOL_META_IDENTITY_NAME,
+            vec![0x51; 2 * 1024 * 1024],
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("the noninline write must fail without quorum");
+        drop(transaction);
+        assert!(
+            state.ensure_write_safe("after writer setup").is_err(),
+            "a failure after disk writers were created must remain fail-closed"
         );
     }
 

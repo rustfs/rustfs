@@ -79,6 +79,14 @@ pub fn compression_scheme_to_read_plan(scheme: &str) -> std::io::Result<(Compres
     Ok((CompressionAlgorithm::from_str(scheme)?, ReadCompressionBackend::Legacy))
 }
 
+/// Validate that replicated compression metadata can be read by this build.
+///
+/// # Errors
+/// Returns an error for an unsupported compression scheme.
+pub fn validate_compression_scheme(scheme: &str) -> std::io::Result<()> {
+    compression_scheme_to_read_plan(scheme).map(|_| ())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadEncryptionBackend {
     Legacy,
@@ -444,10 +452,12 @@ impl WritePlan {
 
         if let Some(encryption) = self.encryption {
             let etag_nonce = match encryption.mode {
-                WriteEncryptionMode::Singlepart { base_nonce } | WriteEncryptionMode::MultipartLegacy { base_nonce, .. } => {
-                    base_nonce
-                }
-                WriteEncryptionMode::SinglepartObjectKey | WriteEncryptionMode::MultipartObjectKey { .. } => [0u8; 12],
+                WriteEncryptionMode::Singlepart { base_nonce } => base_nonce,
+                WriteEncryptionMode::SinglepartObjectKey => [0u8; 12],
+                // Each part write needs an independent fingerprint, including a
+                // retry at the same part number. This salt affects only the ETag
+                // MAC; encryption framing and its data nonce stay unchanged.
+                WriteEncryptionMode::MultipartLegacy { .. } | WriteEncryptionMode::MultipartObjectKey { .. } => rand::random(),
             };
             let protected_reader = rustfs_rio::EtagReader::new_encrypted(reader, encryption.key_bytes, etag_nonce)?
                 .with_inner_etag_delegation(delegate_inner_etag);
@@ -555,6 +565,54 @@ mod tests {
             assert_ne!(tag, md5, "stored ETag must not reveal the plaintext MD5");
             assert_eq!(tag.len(), 32, "multipart ETags require a 16-byte hexadecimal part tag");
             assert_eq!(reader.try_resolve_etag().as_ref(), Some(&tag));
+        }
+    }
+
+    #[tokio::test]
+    async fn multipart_etags_are_unique_per_write_without_changing_data_encryption() {
+        let plaintext = b"same confidential part";
+        let size = i64::try_from(plaintext.len()).expect("test length");
+        for object_key_mode in [false, true] {
+            let mut tags = std::collections::HashSet::new();
+            for part_number in [1, 2, 1] {
+                let encryption = if object_key_mode {
+                    WriteEncryption::multipart_object_key([7; 32], part_number)
+                } else {
+                    WriteEncryption::multipart([7; 32], [9; 12], part_number as usize)
+                };
+                let source = HashReader::from_stream(Cursor::new(plaintext), size, size, None, None, false).expect("plaintext");
+                let mut reader = WritePlan::new()
+                    .with_encryption(encryption)
+                    .apply(source, size)
+                    .expect("part plan");
+                let mut ciphertext = Vec::new();
+                reader.read_to_end(&mut ciphertext).await.expect("encrypt part");
+                let tag = reader.try_resolve_etag().expect("part fingerprint");
+                assert_eq!(reader.try_resolve_etag().as_ref(), Some(&tag), "reading a stored result stays stable");
+                assert!(
+                    tags.insert(tag),
+                    "different part numbers and retries must not identify matching plaintext"
+                );
+                #[cfg(feature = "rio-v2")]
+                let mut decrypt = if object_key_mode {
+                    DecryptReader::new_multipart_with_object_key(Cursor::new(ciphertext), [7; 32], vec![part_number as usize])
+                } else {
+                    DecryptReader::new_multipart(Cursor::new(ciphertext), [7; 32], [9; 12], vec![part_number as usize])
+                };
+                #[cfg(not(feature = "rio-v2"))]
+                let mut decrypt = DecryptReader::new_multipart(
+                    Cursor::new(ciphertext),
+                    [7; 32],
+                    if object_key_mode { [0; 12] } else { [9; 12] },
+                    vec![part_number as usize],
+                );
+                let mut decoded = Vec::new();
+                decrypt
+                    .read_to_end(&mut decoded)
+                    .await
+                    .expect("existing data nonce still decrypts");
+                assert_eq!(decoded, plaintext);
+            }
         }
     }
 

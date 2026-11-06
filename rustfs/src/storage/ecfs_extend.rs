@@ -322,11 +322,36 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     buffer_size
 }
 
-/// Validate object key for control characters and log special characters
+/// Reject XML-incompatible and storage-sidecar keys at new object boundaries.
+pub(crate) fn validate_new_object_key(key: &str, operation: &str) -> S3Result<()> {
+    validate_object_key(key, operation)?;
+    // These persistent sidecar filenames share directories with client objects.
+    // Case-insensitive checks also protect case-insensitive disk deployments.
+    if key.split('/').any(|segment| {
+        ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"]
+            .iter()
+            .any(|reserved| segment.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved storage filename",
+        ));
+    }
+    if crate::storage::storage_api::ecstore_bucket::utils::has_xml_invalid_control_characters(key) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains characters unsupported by XML listings",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate client object keys and log special characters
 ///
 /// This function:
 /// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
-/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+/// 2. Rejects reserved directory markers and invalid path segments
+/// 3. Logs debug information for keys containing spaces, plus signs, or percent signs
 ///
 /// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
 /// This validation ensures that invalid characters that could cause issues are rejected early.
@@ -1155,7 +1180,39 @@ pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'sta
 
 #[cfg(test)]
 mod object_key_admission_tests {
-    use super::validate_object_key;
+    use super::{validate_new_object_key, validate_object_key};
+
+    #[test]
+    fn storage_sidecar_keys_are_rejected_only_for_new_writes() {
+        for reserved in ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"] {
+            for key in [
+                reserved.to_string(),
+                format!("parent/uuid/{reserved}"),
+                format!("parent/{reserved}/child"),
+                reserved.to_uppercase(),
+            ] {
+                for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                    assert!(validate_new_object_key(&key, operation).is_err(), "{operation}: {key}");
+                }
+                assert!(validate_object_key(&key, "GetObject").is_ok(), "legacy read: {key}");
+                assert!(validate_object_key(&key, "DeleteObject").is_ok(), "legacy cleanup: {key}");
+            }
+            assert!(validate_new_object_key(&format!("ordinary/{reserved}-report"), "PutObject").is_ok());
+        }
+    }
+
+    #[test]
+    fn xml_invalid_keys_are_rejected_only_for_new_writes() {
+        for byte in (1u8..32).filter(|byte| !matches!(byte, 9 | 10 | 13)) {
+            let key = format!("legacy-{}", char::from(byte));
+            assert!(validate_new_object_key(&key, "PutObject").is_err());
+            assert!(validate_object_key(&key, "GetObject").is_ok());
+            assert!(validate_object_key(&key, "DeleteObject").is_ok());
+        }
+        for key in ["ordinary/key", "tab\tkey", "unicode-中文", "directory/"] {
+            assert!(validate_new_object_key(key, "PutObject").is_ok());
+        }
+    }
 
     #[test]
     fn reserved_directory_marker_keys_are_rejected() {

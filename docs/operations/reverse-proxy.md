@@ -2,7 +2,7 @@
 
 **Use this when:** a request succeeds against `http://<host>:9000` directly but fails, hangs, or resets through Caddy, Nginx, HAProxy, or Cloudflare.
 
-**Source of truth:** `crates/config/src/constants/tls.rs` (`DEFAULT_HTTP1_HEADER_READ_TIMEOUT`, `DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT`); the `put_object_body_read_stalled` log event.
+**Source of truth:** `crates/config/src/constants/tls.rs` (`DEFAULT_HTTP1_HEADER_READ_TIMEOUT`, `DEFAULT_HTTP_REQUEST_BODY_READ_TIMEOUT`); the `upload_body_progress_stalled` log event.
 
 RustFS speaks plain S3 over HTTP/1.1 and HTTP/2. Most proxy problems are not RustFS storage bugs: if the same request works directly against `:9000`, the fault is in proxy/CDN request forwarding. Use the checklist below to find which forwarding behavior broke.
 
@@ -108,7 +108,7 @@ Cloudflare's proxy may buffer the entire request body before forwarding and can 
 1. Bypass the proxy. Send the failing request to `http://<host>:9000` directly. Success confirms the fault is in the proxy/CDN path.
 2. Bypass the CDN, keep the proxy. Point the proxy straight at the origin (Cloudflare grey cloud / direct DNS). If it now works, the CDN was buffering or re-chunking the body.
 3. Check idle reuse. Intermittent failures that correlate with upload size are almost always the keep-alive mismatch. Lower the proxy keepalive (or disable it) and retry.
-4. Check for a stalled body. A client or intermediary can stop forwarding data without closing the connection. `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT` defaults to 300 seconds. `PutObject` logs `put_object_body_read_stalled` when its body-read guard expires. `UploadPart` logs `upload_part_body_read_stalled` and returns `RequestTimeout` (HTTP 400); its log records `raw_bytes_received`, `expected_decoded_bytes`, `timeout_secs`, bucket, key, and request ID. The event identifies missing input progress, without attributing the cause to a particular proxy.
+4. Check for a stalled body. A client or intermediary can stop forwarding data without closing the connection. `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT` defaults to 300 seconds. `PutObject` and `UploadPart` log `upload_body_progress_stalled` and return `RequestTimeout` (HTTP 400) when a body makes no progress for the timeout, or less than 64 KiB of progress in 60 seconds of server wait (the minimum-progress floor, which applies even when the timeout is set to 0); the log records `raw_bytes_received`, `expected_decoded_bytes`, `timeout_secs`, bucket, key, and request ID. The event identifies missing input progress, without attributing the cause to a particular proxy.
 5. Compare bytes. Confirm the proxy forwards exactly `Content-Length` body bytes with no compression or transformation.
 6. Confirm signed headers survive. `Host` and `x-amz-*` must reach RustFS unchanged; a `SignatureDoesNotMatch` (rather than a hang) points here.
 

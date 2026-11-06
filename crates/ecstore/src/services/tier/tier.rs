@@ -37,7 +37,6 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 use tokio::{
     select,
     sync::{Notify, RwLock},
@@ -8183,7 +8182,7 @@ mod tests {
         }
 
         async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> io::Result<ReadCloser> {
-            Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+            Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
         }
 
         async fn remove(&self, _object: &str, _rv: &str) -> io::Result<()> {
@@ -8248,7 +8247,7 @@ mod tests {
             _opts: WarmBackendGetOpts,
         ) -> std::result::Result<ReadCloser, std::io::Error> {
             if self.healthy {
-                Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+                Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
             } else {
                 Err(std::io::Error::other("mock get failed"))
             }
@@ -9895,7 +9894,7 @@ mod tests {
         }
 
         async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> io::Result<ReadCloser> {
-            Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+            Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
         }
 
         async fn remove(&self, _object: &str, _rv: &str) -> io::Result<()> {

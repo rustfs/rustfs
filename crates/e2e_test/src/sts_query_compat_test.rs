@@ -360,12 +360,26 @@ impl OpaMock {
 
     pub(crate) async fn expect_bucket_tags(&mut self, action: &str, bucket: &str, department: Option<&str>) -> TestResult {
         let payload = self.next_request().await?;
+        Self::assert_bucket_tags(&payload, action, bucket, department);
+        Ok(())
+    }
+
+    async fn expect_versioned_tag_permission(&mut self, bucket: &str, object: &str, version: &str) -> TestResult {
+        let payload = self.next_request().await?;
+        Self::assert_bucket_tags(&payload, "s3:GetObjectVersionTagging", bucket, Some("finance"));
+        assert_eq!(payload["input"]["resource"]["object"], object);
+        assert_eq!(payload["input"]["context"]["conditions"]["versionid"], serde_json::json!([version]));
+        Ok(())
+    }
+
+    fn assert_bucket_tags(payload: &Value, action: &str, bucket: &str, department: Option<&str>) {
         let input = &payload["input"];
+        assert_eq!(input["identity"]["account"], "opabuckettags");
+        assert_eq!(input["identity"]["is_owner"], false);
         assert_eq!(input["action"], action);
         assert_eq!(input["resource"]["bucket"], bucket);
         let expected = department.map(|value| serde_json::json!([value]));
         assert_eq!(input["context"]["conditions"].get("ExistingBucketTag/department"), expected.as_ref());
-        Ok(())
     }
 
     async fn wait_for_validation(&mut self) -> TestResult {
@@ -678,22 +692,61 @@ async fn test_list_buckets_opa_contract() -> TestResult {
     Ok(())
 }
 
+/// Stop and reap the directory's owning server before opening the fixture store.
+async fn seed_legacy_duplicate_bucket_tags(env: &mut RustFSTestEnvironment, bucket: &str) -> TestResult {
+    use crate::storage_api::bucket_tag_fixture::{
+        DisksLayout, ECStore, EndpointServerPools, InstanceContext, init_local_disks_with_instance_ctx, load_bucket_metadata,
+    };
+
+    let server = env
+        .process
+        .as_mut()
+        .ok_or("missing server process before offline fixture write")?;
+    server.kill()?;
+    server.wait()?;
+    env.process = None;
+    let layout = DisksLayout::from_volumes(std::slice::from_ref(&env.temp_dir))?;
+    let (pools, _) = EndpointServerPools::create_server_endpoints(&env.address, &layout).await?;
+    let context = std::sync::Arc::new(InstanceContext::new());
+    init_local_disks_with_instance_ctx(&context, pools.clone()).await?;
+    let store = ECStore::new_with_instance_ctx(env.address.parse()?, pools, Default::default(), context.clone()).await?;
+    let _cancel = context
+        .background_cancel_token()
+        .expect("store binds its shutdown token")
+        .drop_guard();
+    let mut metadata = load_bucket_metadata(store.clone(), bucket).await?;
+    let incarnation = metadata.bucket_incarnation_id;
+    let policy = metadata.policy_config_json.clone();
+    assert!(!incarnation.is_nil());
+    assert!(!policy.is_empty(), "the bucket-policy Allow must survive legacy seeding");
+    // Encode the duplicate tag set with the same bucket record and erasure writer used by the store.
+    let xml = b"<Tagging><TagSet><Tag><Key>department</Key><Value>finance</Value></Tag><Tag><Key>department</Key><Value>engineering</Value></Tag></TagSet></Tagging>";
+    metadata.tagging_config_xml = xml.to_vec();
+    metadata.save_with_store(store.clone()).await?;
+    let persisted = load_bucket_metadata(store, bucket).await?;
+    assert_eq!(persisted.bucket_incarnation_id, incarnation);
+    assert_eq!(persisted.policy_config_json, policy);
+    assert_eq!(persisted.tagging_config_xml.as_slice(), xml);
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_bucket_tags_opa_contract() -> TestResult {
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{
-        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, VersioningConfiguration,
+        BucketVersioningStatus, CompletedMultipartUpload, CompletedPart, Tag, Tagging, TaggingDirective, VersioningConfiguration,
     };
 
     init_logging();
     let mut opa = OpaMock::start().await?;
     let mut env = RustFSTestEnvironment::new().await?;
-    env.start_rustfs_server_without_cleanup_with_env(&[
-        ("RUSTFS_POLICY_PLUGIN_URL", opa.url.as_str()),
+    let opa_url = opa.url.clone();
+    let server_env = [
+        ("RUSTFS_POLICY_PLUGIN_URL", opa_url.as_str()),
         ("RUSTFS_POLICY_PLUGIN_AUTH_TOKEN", OPA_AUTH_TOKEN),
         ("NO_PROXY", "127.0.0.1,localhost"),
-    ])
-    .await?;
+    ];
+    env.start_rustfs_server_without_cleanup_with_env(&server_env).await?;
     let secret = uuid::Uuid::new_v4().to_string();
     create_user(&env, "opabuckettags", &secret).await?;
     let client = aws_sdk_s3::Client::from_conf(build_test_s3_config(&env.url, "opabuckettags", &secret, None, "e2e-bucket-tags"));
@@ -733,7 +786,7 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
         .await?;
     assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
     opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
-    client
+    let head = client
         .head_object()
         .bucket(source)
         .key("report")
@@ -741,6 +794,8 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
         .send()
         .await?;
     opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+    assert_eq!(head.tag_count(), Some(1));
+    opa.expect_versioned_tag_permission(source, "report", version).await?;
     client.list_objects_v2().bucket(source).send().await?;
     opa.expect_bucket_tags("s3:ListBucket", source, Some("finance")).await?;
     client.list_object_versions().bucket(source).send().await?;
@@ -750,28 +805,65 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
     admin.create_bucket().bucket(destination).send().await?;
     set_department(&admin, destination, "engineering").await?;
     let copy_source = format!("{source}/report?versionId={version}");
-    let error = client
-        .copy_object()
-        .bucket(destination)
-        .key("copied")
-        .copy_source(&copy_source)
-        .send()
-        .await
-        .expect_err("source tags must not authorize a different destination");
-    assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
-    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
-    opa.expect_bucket_tags("s3:PutObject", destination, Some("engineering"))
-        .await?;
+    for directive in [TaggingDirective::Copy, TaggingDirective::Replace] {
+        let error = client
+            .copy_object()
+            .bucket(destination)
+            .key("copied")
+            .copy_source(&copy_source)
+            .set_tagging_directive((directive == TaggingDirective::Replace).then_some(TaggingDirective::Replace))
+            .set_tagging((directive == TaggingDirective::Replace).then(|| "department=legal".to_owned()))
+            .send()
+            .await
+            .expect_err("source tags must not authorize a different destination");
+        assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
+        opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+        if directive == TaggingDirective::Copy {
+            opa.expect_versioned_tag_permission(source, "report", version).await?;
+        }
+        opa.expect_bucket_tags("s3:PutObject", destination, Some("engineering"))
+            .await?;
+        let missing = admin
+            .head_object()
+            .bucket(destination)
+            .key("copied")
+            .send()
+            .await
+            .expect_err("denied COPY and REPLACE must leave no destination object");
+        assert_eq!(missing.raw_response().map(|response| response.status().as_u16()), Some(404));
+    }
     set_department(&admin, destination, "finance").await?;
-    client
-        .copy_object()
-        .bucket(destination)
-        .key("copied")
-        .copy_source(&copy_source)
-        .send()
-        .await?;
-    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
-    opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+    for directive in [TaggingDirective::Copy, TaggingDirective::Replace] {
+        client
+            .copy_object()
+            .bucket(destination)
+            .key("copied")
+            .copy_source(&copy_source)
+            .set_tagging_directive((directive == TaggingDirective::Replace).then_some(TaggingDirective::Replace))
+            .set_tagging((directive == TaggingDirective::Replace).then(|| "department=legal".to_owned()))
+            .send()
+            .await?;
+        opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+        // The access hook checks preliminary tags, then the copy use case checks
+        // the exact source reader's tags before publishing the destination.
+        for _ in 0..2 {
+            if directive == TaggingDirective::Copy {
+                opa.expect_versioned_tag_permission(source, "report", version).await?;
+            }
+            opa.expect_bucket_tags("s3:PutObject", destination, Some("finance")).await?;
+        }
+        let tags = admin.get_object_tagging().bucket(destination).key("copied").send().await?;
+        assert_eq!(tags.tag_set().len(), 1);
+        assert_eq!(tags.tag_set()[0].key(), "department");
+        assert_eq!(
+            tags.tag_set()[0].value(),
+            if directive == TaggingDirective::Copy {
+                "engineering"
+            } else {
+                "legal"
+            }
+        );
+    }
 
     let upload = client
         .create_multipart_upload()
@@ -847,6 +939,14 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
     assert_eq!(error.as_service_error().and_then(ProvideErrorMetadata::code), Some("AccessDenied"));
     opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("engineering"))
         .await?;
+    let missing = admin
+        .head_object()
+        .bucket(destination)
+        .key("denied-source")
+        .send()
+        .await
+        .expect_err("a denied source must leave no destination object");
+    assert_eq!(missing.raw_response().map(|response| response.status().as_u16()), Some(404));
     set_department(&client, source, "finance")
         .await
         .expect_err("requested tags must not authorize their own mutation");
@@ -885,7 +985,7 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
     assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
     opa.expect_bucket_tags("s3:GetObject", destination, Some("engineering"))
         .await?;
-    admin
+    let invalid_write = admin
         .put_bucket_tagging()
         .bucket(destination)
         .tagging(
@@ -895,7 +995,25 @@ async fn test_bucket_tags_opa_contract() -> TestResult {
                 .build()?,
         )
         .send()
+        .await
+        .expect_err("new duplicate tags must be rejected before publication");
+    assert_eq!(invalid_write.as_service_error().and_then(ProvideErrorMetadata::code), Some("InvalidTag"));
+    assert_eq!(invalid_write.raw_response().map(|response| response.status().as_u16()), Some(400));
+
+    set_department(&admin, source, "finance").await?;
+    seed_legacy_duplicate_bucket_tags(&mut env, destination).await?;
+    env.start_rustfs_server_without_cleanup_with_env(&server_env).await?;
+    // Prove this process can authorize the same caller and read a healthy bucket's persisted tags.
+    let read = client
+        .get_object()
+        .bucket(source)
+        .key("report")
+        .version_id(version)
+        .send()
         .await?;
+    assert_eq!(read.body.collect().await?.into_bytes().as_ref(), b"report");
+    opa.expect_bucket_tags("s3:GetObjectVersion", source, Some("finance")).await?;
+
     let error = client
         .get_object()
         .bucket(destination)

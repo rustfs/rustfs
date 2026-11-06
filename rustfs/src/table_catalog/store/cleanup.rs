@@ -131,6 +131,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         let bucket_path = self.paths.table_bucket_entry_path(bucket);
         let index_state_path = self.paths.warehouse_index_state_path(bucket);
         let index_prefix = self.paths.warehouse_index_entries_prefix(bucket);
+        let directory_prefix = self.paths.table_directory_prefix(bucket);
         let mut indexes = Vec::new();
         for object in catalog_objects {
             if object.delete_marker
@@ -171,6 +172,14 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 let expected = format!("tables/{}/", index.table_id);
                 if index.warehouse_object_prefix != expected {
                     return Err(cleanup_conflict("cleanup requires the default table warehouse location"));
+                }
+                etag
+            } else if object.key.starts_with(&directory_prefix) {
+                // Registration/rename share the held bucket publication fence.
+                // Remove only the exact immutable candidate of a vanished entry.
+                let (target, etag) = self.directory_candidate_target(bucket, &object.key).await?;
+                if self.backend.object_exists(self.catalog_bucket(), &target).await? {
+                    return Err(cleanup_conflict("table directory candidate references a retained table entry"));
                 }
                 etag
             } else {

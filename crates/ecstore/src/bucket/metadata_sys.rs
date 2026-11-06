@@ -3428,7 +3428,7 @@ mod tests {
         ),
         (
             BUCKET_TAGGING_CONFIG,
-            r#"<Tagging><TagSet><Tag><Key>environment</Key><Value>测试-🦀</Value></Tag></TagSet></Tagging>"#.as_bytes(),
+            r#"<Tagging><TagSet><Tag><Key>environment</Key><Value>测试-rust</Value></Tag></TagSet></Tagging>"#.as_bytes(),
         ),
         (BUCKET_REPLICATION_CONFIG, NEW_WRITER_REPLICATION_XML),
         (
@@ -4556,8 +4556,13 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should be created");
         }
         let mut bm = BucketMetadata::new(bucket);
-        bm.update_config(config_file, raw.to_vec())
-            .expect("raw config should be stored");
+        if config_file == crate::bucket::metadata::BUCKET_TAGGING_CONFIG {
+            // Model legacy persisted corruption without passing the write-time validator.
+            bm.tagging_config_xml = raw.to_vec();
+        } else {
+            bm.update_config(config_file, raw.to_vec())
+                .expect("raw config should be stored");
+        }
         sys.persist_new_and_set(bm).await.expect("initial metadata should persist");
     }
 
@@ -5738,7 +5743,8 @@ mod tests {
         // update only needs one interleaving to show up.
         const ROUNDS: usize = 8;
         for round in 0..ROUNDS {
-            let tagging = format!("<Tagging><Round>{round}</Round></Tagging>").into_bytes();
+            let tagging =
+                format!("<Tagging><TagSet><Tag><Key>round</Key><Value>{round}</Value></Tag></TagSet></Tagging>").into_bytes();
             let policy = format!(r#"{{"Version":"2012-10-17","Round":{round}}}"#).into_bytes();
 
             let start = Arc::new(tokio::sync::Barrier::new(2));
@@ -5811,7 +5817,7 @@ mod tests {
 
         let blocked = tokio::spawn({
             let node_b = node_b.clone();
-            async move { update_with_sys(node_b, bucket, BUCKET_TAGGING_CONFIG, b"<Tagging/>".to_vec()).await }
+            async move { update_with_sys(node_b, bucket, BUCKET_TAGGING_CONFIG, b"<Tagging><TagSet/></Tagging>".to_vec()).await }
         });
 
         // Long enough for the write to have finished had it not waited: the

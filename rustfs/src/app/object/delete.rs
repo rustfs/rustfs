@@ -54,12 +54,10 @@ async fn authorize_recursive_delete<T>(
                 let info = req_info_mut(req)?;
                 info.object = Some(object.name.clone());
                 info.version_id = version_id.clone();
-                let action = if replica {
-                    Action::S3Action(S3Action::ReplicateDeleteAction)
-                } else {
-                    delete_object_authorize_action(version_id.as_deref())
-                };
-                authorize_request(req, action).await?;
+                authorize_request(req, delete_object_authorize_action(version_id.as_deref())).await?;
+                if replica {
+                    authorize_request(req, Action::S3Action(S3Action::ReplicateDeleteAction)).await?;
+                }
                 if has_bypass_governance_header(&req.headers) {
                     authorize_request(req, Action::S3Action(S3Action::BypassGovernanceRetentionAction)).await?;
                 }
@@ -524,7 +522,12 @@ fn reduce_delete_objects_result<'a>(
 
 impl DefaultObjectUsecase {
     #[instrument(level = "debug", skip(self, req))]
-    pub async fn execute_delete_objects(
+    pub async fn execute_delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        let owner = self.clone();
+        run_owned_mutation(async move { Box::pin(owner.execute_delete_objects_owned(req)).await }).await
+    }
+
+    async fn execute_delete_objects_owned(
         &self,
         mut req: S3Request<DeleteObjectsInput>,
     ) -> S3Result<S3Response<DeleteObjectsOutput>> {
@@ -851,6 +854,8 @@ impl DefaultObjectUsecase {
             .delete_objects_with_tier_delete_journal_and_accounting(&bucket, object_to_delete.clone(), storage_delete_opts)
             .await;
 
+        #[cfg(test)]
+        super::super::storage_api::object_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
         let _manager = get_concurrency_manager();
         if !errs.is_empty() && errs.iter().all(|err| err.as_ref().is_some_and(is_err_bucket_not_found)) {
             let result = Err(S3Error::with_message(S3ErrorCode::NoSuchBucket, "Bucket not found".to_string()));
@@ -1031,6 +1036,8 @@ impl DefaultObjectUsecase {
                     .user_agent(get_request_user_agent(&req_headers))
                     .build();
 
+                    #[cfg(test)]
+                    super::super::storage_api::object_usecase::helper::capture_mutation_event_for_test(&event_args);
                     notify.notify(event_args).await;
                 }
             }
@@ -1050,7 +1057,15 @@ impl DefaultObjectUsecase {
     }
 
     #[instrument(level = "info", skip(self, req))]
-    pub async fn execute_delete_object(&self, mut req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+    pub async fn execute_delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+        let owner = self.clone();
+        run_owned_mutation(async move { Box::pin(owner.execute_delete_object_owned(req)).await }).await
+    }
+
+    async fn execute_delete_object_owned(
+        &self,
+        mut req: S3Request<DeleteObjectInput>,
+    ) -> S3Result<S3Response<DeleteObjectOutput>> {
         if let Some(context) = &self.context {
             let _ = context.object_store();
         }
@@ -1261,6 +1276,8 @@ impl DefaultObjectUsecase {
             }
         };
 
+        #[cfg(test)]
+        super::super::storage_api::object_usecase::helper::pause_committed_mutation_for_test(&bucket).await;
         if force_delete {
             let _ = invalidate_object_data_cache_prefix_after_delete(&cache_adapter, &bucket, &key).await;
         } else {
@@ -1454,6 +1471,105 @@ impl DefaultObjectUsecase {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn recursive_replica_delete_checks_each_descendant_delete_permission() {
+        crate::app::gating_test_env::run_large_stack_test("recursive-replica-permissions", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let slot = crate::app::runtime_sources::ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()))));
+            for versioned in [false, true] {
+                let bucket = format!("recursive-replica-{}", Uuid::new_v4());
+                store
+                    .make_bucket(
+                        &bucket,
+                        &MakeBucketOptions {
+                            versioning_enabled: versioned,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("create bucket");
+                for key in ["team/public", "team/secret"] {
+                    for _ in 0..2 {
+                        store
+                            .put_object(
+                                &bucket,
+                                key,
+                                &mut PutObjReader::from_vec(b"protected payload".to_vec()),
+                                &ObjectOptions {
+                                    versioned,
+                                    ..Default::default()
+                                },
+                            )
+                            .await
+                            .expect("seed descendant");
+                    }
+                }
+                let before = store
+                    .clone()
+                    .list_object_versions(&bucket, "team/", None, None, None, 1000)
+                    .await
+                    .expect("list fixture")
+                    .objects
+                    .len();
+                for (grant_delete, deny_delete) in [(false, false), (true, true), (true, false)] {
+                    let mut statements = vec![
+                        serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:ReplicateDelete","Resource":format!("arn:aws:s3:::{bucket}/*")}),
+                    ];
+                    if grant_delete {
+                        statements.push(serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/*")}));
+                    }
+                    if deny_delete {
+                        statements.push(serde_json::json!({"Effect":"Deny","Principal":{"AWS":"*"},"Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":format!("arn:aws:s3:::{bucket}/team/secret")}));
+                    }
+                    store
+                        .update_bucket_metadata_config(
+                            &bucket,
+                            crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                            serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                        )
+                        .await
+                        .expect("publish policy");
+                    for replica in [false, true] {
+                        let mut req = build_request((), Method::DELETE);
+                        req.extensions.insert(slot.clone());
+                        req.extensions.insert(crate::storage::access::ReqInfo {
+                            bucket: Some(bucket.clone()),
+                            object: Some("team/".to_owned()),
+                            ..Default::default()
+                        });
+                        let result = authorize_recursive_delete(&mut req, &store, &bucket, "team/", versioned, replica).await;
+                        if grant_delete && !deny_delete {
+                            result.expect("ordinary and replication deletes allowed");
+                        } else {
+                            assert_eq!(
+                                result.expect_err("descendant delete permission must be enforced").code(),
+                                &S3ErrorCode::AccessDenied
+                            );
+                        }
+                        assert_eq!(
+                            req_info_ref(&req).unwrap().object.as_deref(),
+                            Some("team/"),
+                            "restore original authorization context"
+                        );
+                        assert_eq!(
+                            store
+                                .clone()
+                                .list_object_versions(&bucket, "team/", None, None, None, 1000)
+                                .await
+                                .expect("versions survive preflight")
+                                .objects
+                                .len(),
+                            before
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     use super::*;
     use http::{HeaderMap, HeaderValue, Method};
     use s3s::dto::{
@@ -3106,6 +3222,92 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
+    fn cancelled_delete_requests_complete_audit_and_notifications() {
+        crate::app::gating_test_env::run_large_stack_test("owned-delete-events", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            let (store, context) = real_store_test_context().await;
+            for batch in [false, true] {
+                let bucket = format!("delete-owned-event-{}", Uuid::new_v4());
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket");
+                for key in ["first", "second"] {
+                    let mut reader = PutObjReader::from_vec(b"object".to_vec());
+                    store
+                        .put_object(&bucket, key, &mut reader, &ObjectOptions::default())
+                        .await
+                        .expect("object");
+                }
+                let policy_json = format!(
+                    r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"*"}},"Action":["s3:DeleteObject","s3:DeleteObjectVersion"],"Resource":["arn:aws:s3:::{bucket}/*"]}}]}}"#
+                );
+                let mut metadata = (*crate::storage::get_bucket_metadata(&bucket).await.expect("metadata")).clone();
+                metadata.policy_config = Some(serde_json::from_str(&policy_json).expect("policy"));
+                metadata.policy_config_json = policy_json.into_bytes();
+                crate::storage::storage_api::set_bucket_metadata(bucket.clone(), metadata)
+                    .await
+                    .expect("policy metadata");
+                let probe = crate::app::storage_api::object_usecase::helper::MutationCompletionProbe::install(&bucket);
+                let (entered, resume) = probe.pause_after_commit();
+                let usecase = DefaultObjectUsecase::with_context(Some(context.clone()));
+                let request_bucket = bucket.clone();
+                let deletion = tokio::spawn(async move {
+                    if batch {
+                        let input = DeleteObjectsInput::builder()
+                            .bucket(request_bucket.clone())
+                            .delete(Delete {
+                                objects: ["first", "second"]
+                                    .into_iter()
+                                    .map(|key| ObjectIdentifier {
+                                        key: key.to_owned(),
+                                        ..Default::default()
+                                    })
+                                    .collect(),
+                                quiet: Some(false),
+                            })
+                            .build()
+                            .expect("batch input");
+                        let mut request = build_request(input, Method::POST);
+                        request.uri = format!("/{request_bucket}").parse().expect("URI");
+                        request.extensions.insert(crate::storage::access::ReqInfo::default());
+                        usecase.execute_delete_objects(request).await.map(|_| ())
+                    } else {
+                        let input = DeleteObjectInput::builder()
+                            .bucket(request_bucket.clone())
+                            .key("first".to_owned())
+                            .build()
+                            .expect("delete input");
+                        let mut request = build_request(input, Method::DELETE);
+                        request.uri = format!("/{request_bucket}/first").parse().expect("URI");
+                        usecase.execute_delete_object(request).await.map(|_| ())
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(10), entered.wait())
+                    .await
+                    .expect("committed delete");
+                deletion.abort();
+                assert!(deletion.await.expect_err("cancel waiter").is_cancelled());
+                resume.wait().await;
+                probe.wait_for(1, if batch { 2 } else { 1 }).await;
+                assert!(
+                    store
+                        .get_object_info(&bucket, "first", &ObjectOptions::default())
+                        .await
+                        .is_err()
+                );
+                let audits = probe.audits.lock().expect("audits");
+                assert_eq!(audits.len(), 1);
+                assert_eq!(audits[0].api.status.as_deref(), Some("success"));
+                let events = probe.events.lock().expect("events");
+                assert_eq!(events.len(), if batch { 2 } else { 1 });
+                assert!(events.iter().all(|event| event.event_name == EventName::ObjectRemovedDelete));
+            }
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
     fn recursive_delete_holds_writer_exclusion_after_authorization() {
         crate::app::gating_test_env::run_large_stack_test("recursive-delete-writer-exclusion", || async {
             use crate::app::storage_api::test::contract::bucket::{
@@ -3791,11 +3993,16 @@ mod tests {
             .delete_object(&bucket, "object", ObjectOptions::default())
             .await
             .expect("delete quota-tracked object");
+        // Deleted bytes are reclaimed by the owned reconciliation job; requests
+        // no longer scan the bucket synchronously under the ledger lock.
+        crate::app::storage_api::test::set_disk::retry_quota_reconciliation_for_test(Arc::clone(&store), &bucket)
+            .await
+            .expect("reconcile the deleted object's usage through the production worker");
         let mut replacement = PutObjReader::from_vec(vec![0x43; 4096]);
         store
             .put_object(&bucket, "replacement", &mut replacement, &ObjectOptions::default())
             .await
-            .expect("deleted bytes must be reclaimed before rejecting a replacement");
+            .expect("reconciled deleted bytes must admit a full-size replacement");
 
         let mut excess = PutObjReader::from_vec(vec![0x44]);
         let err = store

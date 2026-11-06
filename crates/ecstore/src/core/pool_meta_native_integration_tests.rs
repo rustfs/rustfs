@@ -217,6 +217,264 @@ async fn pool_meta_native_physical_split_without_ordinary_commit_performs_no_mut
         "all current heads, identities and complete backups must remain unchanged"
     );
     assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+    state
+        .ensure_write_safe("ordinary authority temporarily unavailable")
+        .expect("missing ordinary authority alone must not install a permanent corruption latch");
+}
+
+async fn interrupted_first_commit_fixture() -> (PhysicalFixture, PoolMetaCommittedCandidate) {
+    let fixture = fixture(3).await;
+    let PoolMetaReplica::Valid {
+        previous: Some(previous),
+        committed: false,
+        ..
+    } = decode_pool_meta_replica(fixture.pending.clone())
+    else {
+        panic!("fixture must retain its acknowledged predecessor");
+    };
+    let physical = disks(&fixture.store).await;
+    let prepared = replicas(&fixture.pending, OffsetDateTime::now_utc()).await;
+    for (index, disk) in physical[0].iter().enumerate() {
+        fs::write(object_path(disk).join("xl.meta"), &prepared[index])
+            .await
+            .expect("one pool must retain an ordinary-readable PREPARE");
+    }
+    (fixture, *previous)
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_interrupted_first_commit_restores_proven_predecessor() {
+    let (mut fixture, previous) = interrupted_first_commit_fixture().await;
+    let before = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+    assert!(
+        before[1..]
+            .iter()
+            .all(|read| matches!(read.replica, PoolMetaReplica::Unreadable(_)))
+    );
+    assert!(matches!(before[0].replica, PoolMetaReplica::Valid { committed: false, .. }));
+    let mut state = clean_state(&fixture);
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    assert!(
+        repair(&fixture.store, &mut state, &fence)
+            .await
+            .expect("ordinary PREPARE must authorize restoring only its acknowledged predecessor")
+    );
+    state
+        .ensure_write_safe("first commit rollback")
+        .expect("rollback must finish its transaction");
+    assert_ne!(
+        previous.canonical, fixture.canonical,
+        "the interrupted COMMIT must not become authoritative"
+    );
+    fixture.canonical = previous.canonical;
+    fixture.revision = previous.revision;
+    assert_committed(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_interrupted_rollback_retains_authority_and_resumes() {
+    let (mut fixture, previous) = interrupted_first_commit_fixture().await;
+    let pause = Arc::new(NativeApplyPause::default());
+    let reached = pause.reached.notified();
+    tokio::pin!(reached);
+    reached.as_mut().enable();
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    let mut state = clean_state(&fixture);
+    let recovery = tokio::spawn({
+        let store = Arc::clone(&fixture.store);
+        let pause = Arc::clone(&pause);
+        async move {
+            AFTER_NATIVE_POOL_APPLY
+                .scope(pause, async move { repair(&store, &mut state, &fence).await })
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(10), reached)
+        .await
+        .expect("real rollback should pause after one pool is durably restored");
+    let partial = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+    assert!(matches!(partial[0].replica, PoolMetaReplica::Valid { committed: false, .. }));
+    assert!(matches!(&partial[1].replica, PoolMetaReplica::Valid { canonical, committed: true, .. }
+        if canonical == &previous.canonical));
+    assert!(matches!(partial[2].replica, PoolMetaReplica::Unreadable(_)));
+    recovery.abort();
+    assert!(
+        recovery
+            .await
+            .expect_err("the paused repair must be cancelled")
+            .is_cancelled()
+    );
+    let mut state = clean_state(&fixture);
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    assert!(
+        repair(&fixture.store, &mut state, &fence)
+            .await
+            .expect("restart must resume from the retained ordinary PREPARE")
+    );
+    fixture.canonical = previous.canonical;
+    fixture.revision = previous.revision;
+    assert_committed(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_rollback_resumes_after_last_prepare_loses_read_quorum() {
+    let (mut fixture, previous) = interrupted_first_commit_fixture().await;
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    let inspected = inspect(&fixture.store.pools, &fence)
+        .await
+        .expect("physical rollback inventory");
+    let replacements = plan(
+        &inspected,
+        &fixture.canonical,
+        fixture.revision,
+        &fixture.identity,
+        Some(&previous.canonical),
+    )
+    .await
+    .expect("the ordinary PREPARE must authorize its predecessor");
+    for (pool, count) in [(1, 4), (2, 4), (0, 2)] {
+        for (index, replacement) in replacements[pool].iter().enumerate().take(count) {
+            let snapshot = &inspected[pool].snapshots[index];
+            assert_eq!(
+                inspected[pool].disks[index]
+                    .pool_meta_native_recovery(Request::Apply {
+                        object: PoolMetaNativeObject::PoolBin,
+                        expected_disk_id: snapshot.disk_id,
+                        expected_current_sha256: snapshot.current.as_ref().map(|raw| Sha256::digest(raw).into()),
+                        expected_backup_inventory_sha256: snapshot.inventory_sha256().expect("original inventory hash"),
+                        replacement: replacement.clone(),
+                    })
+                    .await
+                    .expect("partial rollback must use the real conditional publication and sync path"),
+                Response::Applied
+            );
+        }
+    }
+    let partial = read_pool_meta_replicas(fixture.store.pools.clone(), true).await;
+    assert!(matches!(partial[0].replica, PoolMetaReplica::Unreadable(_)));
+    assert!(partial[1..].iter().all(|read| matches!(&read.replica,
+        PoolMetaReplica::Valid { canonical, committed: true, .. } if canonical == &previous.canonical)));
+    let mut state = clean_state(&fixture);
+    assert!(
+        repair(&fixture.store, &mut state, &fence)
+            .await
+            .expect("restored ordinary COMMIT must finish rollback after the last PREPARE becomes split")
+    );
+    fixture.canonical = previous.canonical;
+    fixture.revision = previous.revision;
+    assert_committed(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_rollback_backup_does_not_poison_reused_generation() {
+    let (mut fixture, previous) = interrupted_first_commit_fixture().await;
+    let mut state = clean_state(&fixture);
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    assert!(repair(&fixture.store, &mut state, &fence).await.expect("initial rollback"));
+    let revision = PoolMetaRevision {
+        transaction_id: Some(Uuid::new_v4()),
+        ..fixture.revision
+    };
+    let mut meta = previous.meta.clone();
+    meta.pools[0].last_update += Duration::seconds(1);
+    let canonical = encode_pool_meta_v3_envelope(&meta, revision, true, None).expect("later COMMIT");
+    let pending = encode_pool_meta_v3_envelope(&meta, revision, false, Some(&previous)).expect("later PREPARE");
+    let modified = OffsetDateTime::now_utc() + Duration::seconds(1);
+    let split = split(&pending, &canonical, modified).await;
+    let commit = replicas(&canonical, modified).await;
+    let prepared = replicas(&pending, modified).await;
+    let directory = Uuid::new_v4();
+    let retained = snapshots(&fixture.store).await;
+    for (pool_index, pool) in disks(&fixture.store).await.into_iter().enumerate() {
+        for (disk_index, disk) in pool.iter().enumerate() {
+            assert!(
+                !retained[pool_index][disk_index].backups.is_empty(),
+                "the abandoned PREPARE must remain as real on-disk evidence"
+            );
+            let object = object_path(disk);
+            fs::write(object.join("xl.meta"), &if pool_index < 2 { &split } else { &commit }[disk_index])
+                .await
+                .expect("install later partial COMMIT without clearing old backups");
+            fs::create_dir(object.join(directory.to_string()))
+                .await
+                .expect("later backup directory");
+            fs::write(object.join(directory.to_string()).join("xl.meta.bkp"), &prepared[disk_index])
+                .await
+                .expect("later PREPARE backup");
+        }
+    }
+    assert!(
+        repair(&fixture.store, &mut state, &fence)
+            .await
+            .expect("an ordinary later COMMIT must survive the abandoned sibling PREPARE")
+    );
+    fixture.canonical = canonical;
+    fixture.revision = revision;
+    assert_committed(&fixture).await;
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_rollback_rejects_retained_commit_without_mutation() {
+    let (fixture, _) = interrupted_first_commit_fixture().await;
+    let physical = disks(&fixture.store).await;
+    let commit = replicas(&fixture.canonical, OffsetDateTime::now_utc()).await;
+    let directory = Uuid::new_v4();
+    let object = object_path(&physical[0][0]);
+    fs::create_dir(object.join(directory.to_string()))
+        .await
+        .expect("retained COMMIT directory");
+    fs::write(object.join(directory.to_string()).join("xl.meta.bkp"), &commit[0])
+        .await
+        .expect("retain evidence that the interrupted transaction may already have committed");
+    let before = snapshots(&fixture.store).await;
+    let mut state = clean_state(&fixture);
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    assert!(repair(&fixture.store, &mut state, &fence).await.is_err());
+    assert_eq!(snapshots(&fixture.store).await, before, "ambiguous COMMIT evidence must remain untouched");
+    assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+#[serial_test::serial(pool_meta_version_env)]
+async fn pool_meta_native_physical_rollback_rejects_competing_prepares_without_mutation() {
+    let (fixture, previous) = interrupted_first_commit_fixture().await;
+    let pending = encode_pool_meta_v3_envelope(
+        &previous.meta,
+        PoolMetaRevision {
+            transaction_id: Some(Uuid::new_v4()),
+            ..fixture.revision
+        },
+        false,
+        Some(&previous),
+    )
+    .expect("competing PREPARE must remain structurally valid");
+    let physical = disks(&fixture.store).await;
+    let prepared = replicas(&pending, OffsetDateTime::now_utc()).await;
+    for (index, disk) in physical[1].iter().enumerate() {
+        fs::write(object_path(disk).join("xl.meta"), &prepared[index])
+            .await
+            .expect("second pool must expose the competing transaction through ordinary reads");
+    }
+    let before = snapshots(&fixture.store).await;
+    let mut state = clean_state(&fixture);
+    let fence = PoolMetaPersistenceFence::Owned(owner(&fixture.store).await);
+    let error = repair(&fixture.store, &mut state, &fence)
+        .await
+        .expect_err("two distinct prepared transactions must not authorize a guessed rollback");
+    assert_eq!(
+        error
+            .pool_metadata_failure()
+            .expect("transaction conflict must be typed")
+            .kind,
+        crate::error::PoolMetadataFailure::RecoveryRequired
+    );
+    assert_eq!(snapshots(&fixture.store).await, before, "competing transactions must remain untouched");
+    assert_eq!(state.active_transactions.load(Ordering::SeqCst), 0);
 }
 
 struct IdentityEpochFork {
@@ -468,7 +726,7 @@ async fn pool_meta_native_physical_partial_apply_resumes_after_conditional_rejec
     let inspected = inspect(&fixture.store.pools, &fence)
         .await
         .expect("real native snapshots should be obtained");
-    let replacements = plan(&inspected, &fixture.canonical, fixture.revision, &fixture.identity)
+    let replacements = plan(&inspected, &fixture.canonical, fixture.revision, &fixture.identity, None)
         .await
         .expect("physical recovery plan should validate");
     let snapshot = &inspected[0].snapshots[0];

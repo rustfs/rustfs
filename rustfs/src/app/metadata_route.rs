@@ -18,13 +18,13 @@ use super::bucket_usecase::DefaultBucketUsecase;
 use super::object_usecase::DefaultObjectUsecase;
 use crate::app::runtime_sources::ServerContextSlot;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::storage::access::{ReqInfo, authorize_request, req_info_mut};
+use crate::storage::access::{ReqInfo, authorize_bucket_listing, req_info_mut};
 use crate::storage::{get_bucket_website_config_for_store, validate_website_configuration};
 use async_trait::async_trait;
 use http::header::CONTENT_TYPE;
 use http::header::HOST;
 use http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, Uri};
-use rustfs_policy::policy::action::{Action, S3Action};
+use rustfs_policy::policy::action::S3Action;
 use s3s::access::S3Access;
 use s3s::dto::{
     ETagCondition, EncodingType, GetObjectInput, GetObjectOutput, HeadObjectInput, ListObjectVersionsInput, ListObjectsV2Input,
@@ -674,14 +674,14 @@ async fn check_metadata_access(req: &mut S3Request<Body>, target: BucketTarget) 
         let req_info = req_info_mut(req)?;
         req_info.cred = cred;
         req_info.is_owner = is_owner;
-        req_info.bucket = Some(target.bucket);
+        req_info.bucket = Some(target.bucket.clone());
     }
 
     let action = match target.operation {
-        MetadataOperation::ListObjectVersions => Action::S3Action(S3Action::ListBucketVersionsAction),
-        MetadataOperation::ListObjectsV2 => Action::S3Action(S3Action::ListBucketAction),
+        MetadataOperation::ListObjectVersions => S3Action::ListBucketVersionsAction,
+        MetadataOperation::ListObjectsV2 => S3Action::ListBucketAction,
     };
-    authorize_request(req, action).await
+    authorize_bucket_listing(req, &target.bucket, action).await
 }
 
 async fn call_list_object_versions(req: S3Request<Body>, bucket: String) -> S3Result<S3Response<Body>> {
@@ -838,6 +838,197 @@ fn header_value(headers: &HeaderMap, name: &str) -> S3Result<Option<String>> {
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn metadata_route_prepares_and_applies_table_listing_isolation() {
+        use crate::app::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
+        use crate::app::storage_api::bucket_usecase::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use crate::app::storage_api::object_usecase::access::TableDataPlaneListAccess;
+        use crate::app::storage_api::object_usecase::contract::object::ObjectIO as _;
+        use crate::app::storage_api::object_usecase::{StorageObjectOptions, StoragePutObjReader};
+        use crate::app::table_list_isolation;
+        use crate::table_catalog::{
+            ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, NamespaceEntry, TABLE_BUCKET_CATALOG_TYPE,
+            TABLE_BUCKET_MARKER_CONFIG, TABLE_CATALOG_ENTRY_VERSION, TableBucketEntry, TableCatalogBackingMode,
+            TableCatalogEntryState, TableCatalogStore, TableEntry,
+        };
+        use std::{collections::BTreeMap, sync::Arc};
+
+        struct UnreadyIam;
+        impl IamInterface for UnreadyIam {
+            fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>> {
+                panic!("anonymous listing must not resolve IAM credentials")
+            }
+            fn is_ready(&self) -> bool {
+                false
+            }
+        }
+        struct TestKms;
+        impl KmsInterface for TestKms {
+            fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                Arc::new(rustfs_kms::KmsServiceManager::new())
+            }
+        }
+
+        let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+        let bucket = format!("metadata-isolation-{}", uuid::Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create table bucket");
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                TABLE_BUCKET_MARKER_CONFIG,
+                crate::table_catalog::table_bucket_marker_json().expect("table bucket marker"),
+            )
+            .await
+            .expect("enable table bucket");
+        let policy = serde_json::json!({"Version": "2012-10-17", "Statement": [{
+            "Effect": "Allow", "Principal": {"AWS": "*"},
+            "Action": ["s3:ListBucket", "s3:ListBucketVersions"], "Resource": format!("arn:aws:s3:::{bucket}")
+        }]});
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                serde_json::to_vec(&policy).expect("listing policy"),
+            )
+            .await
+            .expect("allow anonymous object listings");
+        let context = Arc::new(AppContext::new(Arc::clone(&store), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+            access_key: "table-list-root".to_owned(),
+            secret_key: "table-list-root-secret".to_owned(),
+            status: "on".to_owned(),
+            ..Default::default()
+        }));
+        let backend =
+            EcStoreTableCatalogObjectBackend::new_with_strong_runtime(Arc::clone(&store), context.table_catalog_strong_runtime());
+        let catalog =
+            ConfiguredTableCatalogStore::new_for_test(backend, TableCatalogBackingMode::from_env().expect("catalog mode"));
+        catalog
+            .put_table_bucket(TableBucketEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.clone(),
+                catalog_type: TABLE_BUCKET_CATALOG_TYPE.to_owned(),
+                warehouse_root: format!("s3://{bucket}/"),
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                active_rename_id: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("seed catalog bucket");
+        catalog
+            .create_namespace(NamespaceEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.clone(),
+                namespace: "sales".to_owned(),
+                namespace_id: "sales".to_owned(),
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("seed catalog namespace");
+        catalog
+            .create_table(TableEntry {
+                version: TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.clone(),
+                namespace: "sales".to_owned(),
+                table: "orders".to_owned(),
+                table_id: "table-id".to_owned(),
+                table_uuid: uuid::Uuid::new_v4().to_string(),
+                format: "ICEBERG".to_owned(),
+                format_version: 2,
+                warehouse_location: format!("s3://{bucket}/tables/table-id"),
+                metadata_location: format!("s3://{bucket}/tables/table-id/metadata.json"),
+                version_token: "v1".to_owned(),
+                generation: 1,
+                state: TableCatalogEntryState::Active,
+                properties: BTreeMap::new(),
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("seed catalog table");
+        for key in ["ordinary.txt", "tables/table-id/data.parquet", ".rustfs-table/private.json"] {
+            store
+                .put_object(
+                    &bucket,
+                    key,
+                    &mut StoragePutObjReader::from_vec(b"private metadata".to_vec()),
+                    &StorageObjectOptions::default(),
+                )
+                .await
+                .expect("seed objects for listing");
+        }
+        let slot = ServerContextSlot::new();
+        assert!(slot.install(context));
+        for operation in [MetadataOperation::ListObjectsV2, MetadataOperation::ListObjectVersions] {
+            let mut req = website_request(&format!("/{bucket}?list-type=2&metadata=true"));
+            req.extensions.insert(Arc::clone(&slot));
+            super::check_metadata_access(
+                &mut req,
+                super::BucketTarget {
+                    operation,
+                    bucket: bucket.clone(),
+                },
+            )
+            .await
+            .expect("bucket listing is authorized");
+            let access = req
+                .extensions
+                .get::<TableDataPlaneListAccess>()
+                .expect("metadata-route authorization must attach table isolation");
+            assert!(access.allows_object("ordinary.txt"));
+            assert!(!access.allows_object("tables/table-id/data.parquet"));
+            assert!(!access.allows_object(".rustfs-table/private.json"));
+            let objects = match operation {
+                MetadataOperation::ListObjectsV2 => {
+                    table_list_isolation::list_objects_v2(
+                        Arc::clone(&store),
+                        access,
+                        table_list_isolation::ListObjectsV2Request {
+                            bucket: &bucket,
+                            prefix: "",
+                            continuation_token: None,
+                            delimiter: None,
+                            max_keys: 1000,
+                            start_after: None,
+                            incl_deleted: false,
+                            opaque_cursor_supported: true,
+                        },
+                    )
+                    .await
+                    .expect("protected object listing succeeds")
+                    .objects
+                }
+                MetadataOperation::ListObjectVersions => {
+                    table_list_isolation::list_object_versions(
+                        Arc::clone(&store),
+                        access,
+                        table_list_isolation::ListObjectVersionsRequest {
+                            bucket: &bucket,
+                            prefix: "",
+                            key_marker: None,
+                            version_id_marker: None,
+                            delimiter: None,
+                            max_keys: 1000,
+                        },
+                    )
+                    .await
+                    .expect("protected version listing succeeds")
+                    .objects
+                }
+            };
+            let keys: Vec<_> = objects.into_iter().map(|object| object.name).collect();
+            assert_eq!(keys, vec!["ordinary.txt"], "catalog and unauthorized warehouse objects must be hidden");
+        }
+    }
+
     #[tokio::test]
     async fn website_304_preserves_cache_headers_without_content() {
         use http_body_util::BodyExt;

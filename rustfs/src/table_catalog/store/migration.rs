@@ -23,6 +23,20 @@ use super::strong::{
 };
 use super::*;
 
+async fn run_owned_backing_migration<T: Send + 'static>(
+    operation: impl std::future::Future<Output = TableCatalogStoreResult<T>> + Send + 'static,
+) -> TableCatalogStoreResult<T> {
+    let credentials = rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten();
+    let operation = rustfs_keystone::KEYSTONE_CREDENTIALS.scope(credentials, operation);
+    let operation = rustfs_io_metrics::s3_http_metrics::with_s3_http_operation_context(
+        rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_context(),
+        operation,
+    );
+    crate::storage_api::table::spawn_traced_join(operation)
+        .await
+        .map_err(|_| TableCatalogStoreError::Internal("catalog migration worker failed".to_owned()))?
+}
+
 pub(super) fn table_catalog_backing_manifest(
     paths: &TableCatalogObjectPaths,
     namespace: &Namespace,
@@ -267,12 +281,34 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<Option<(TableCatalogBackingMigrationFence, Option<String>)>> {
-        let fence = self
-            .read_entry(self.catalog_bucket(), &self.paths.backing_migration_fence_path(table_bucket))
-            .await?;
-        if let Some((fence, _)) = fence.as_ref() {
-            Self::validate_backing_migration_fence(table_bucket, fence)?;
+        let path = self.paths.backing_migration_fence_path(table_bucket);
+        let Some(object) = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), &path, super::directory_index::DIRECTORY_STATE_MAX_SIZE)
+            .await?
+        else {
+            return Ok(None);
+        };
+        // The table-entry directory keeps its state on this path; its presence
+        // excludes a backing migration rather than being a malformed fence.
+        if self.table_directory_state_from_object(table_bucket, &object)?.is_some() {
+            return Err(TableCatalogStoreError::Conflict(
+                "table bucket has an active table-entry directory; roll it back before a backing migration".to_string(),
+            ));
         }
+        let fence = Self::backing_migration_fence_from_object(table_bucket, &path, &object)?;
+        Ok(Some((fence, object.etag)))
+    }
+
+    /// Decode and validate a migration fence already read from its path.
+    fn backing_migration_fence_from_object(
+        table_bucket: &str,
+        path: &str,
+        object: &TableCatalogObject,
+    ) -> TableCatalogStoreResult<TableCatalogBackingMigrationFence> {
+        let fence: TableCatalogBackingMigrationFence = serde_json::from_slice(&object.data)
+            .map_err(|err| TableCatalogStoreError::Invalid(format!("failed to parse catalog entry {path}: {err}")))?;
+        Self::validate_backing_migration_fence(table_bucket, &fence)?;
         Ok(fence)
     }
 
@@ -307,17 +343,31 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<()> {
-        if self.read_backing_migration_fence(table_bucket).await?.is_some() {
-            return Err(TableCatalogStoreError::Conflict(format!(
-                "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
-            )));
+        // The directory state and the migration fence share one object: read
+        // it once and dispatch on its kind.
+        let path = self.paths.backing_migration_fence_path(table_bucket);
+        let Some(object) = self
+            .backend
+            .read_object_limited(self.catalog_bucket(), &path, super::directory_index::DIRECTORY_STATE_MAX_SIZE)
+            .await?
+        else {
+            return Ok(());
+        };
+        // The directory upgrade keeps legacy entries authoritative and requires
+        // every compatible writer to publish its candidate before the entry.
+        if self.table_directory_state_from_object(table_bucket, &object)?.is_some() {
+            return Ok(());
         }
-        Ok(())
+        Self::backing_migration_fence_from_object(table_bucket, &path, &object)?;
+        Err(TableCatalogStoreError::Conflict(format!(
+            "object-backed catalog writes are fenced while table bucket {table_bucket} is prepared for durable strong cutover"
+        )))
     }
 
     async fn ensure_global_backing_migration_fence(
         &self,
         fence_path: &str,
+        mutation_fence: &TableCatalogObjectMutationFence,
     ) -> TableCatalogStoreResult<TableCatalogBackingMigrationGlobalFence> {
         if let Some((fence, _)) = self
             .read_entry::<TableCatalogBackingMigrationGlobalFence>(self.catalog_bucket(), fence_path)
@@ -330,13 +380,17 @@ where
             version: TABLE_CATALOG_MIGRATION_VERSION,
             migration_id: Uuid::new_v4().to_string(),
         };
-        self.write_entry(self.catalog_bucket(), fence_path, &fence, TableCatalogPutPrecondition::IfAbsent)
+        self.write_migration_entry(fence_path, &fence, TableCatalogPutPrecondition::IfAbsent, mutation_fence)
             .await?;
         Ok(fence)
     }
 
-    async fn clear_global_backing_migration_fence_if_unused(&self, fence_path: &str) -> TableCatalogStoreResult<()> {
-        let Some((fence, _)) = self
+    async fn clear_global_backing_migration_fence_if_unused(
+        &self,
+        fence_path: &str,
+        mutation_fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        let Some((fence, etag)) = self
             .read_entry::<TableCatalogBackingMigrationGlobalFence>(self.catalog_bucket(), fence_path)
             .await?
         else {
@@ -353,7 +407,24 @@ where
         {
             return Ok(());
         }
-        self.backend.delete_object(self.catalog_bucket(), fence_path).await
+        let etag = etag.ok_or_else(|| TableCatalogStoreError::Conflict("migration fence has no ETag".to_owned()))?;
+        self.backend
+            .delete_object_if_match_fenced(self.catalog_bucket(), fence_path, &etag, mutation_fence)
+            .await
+    }
+
+    async fn write_migration_entry<T: Serialize>(
+        &self,
+        path: &str,
+        entry: &T,
+        precondition: TableCatalogPutPrecondition,
+        fence: &TableCatalogObjectMutationFence,
+    ) -> TableCatalogStoreResult<()> {
+        let data = serde_json::to_vec(entry)
+            .map_err(|err| TableCatalogStoreError::Internal(format!("cannot serialize migration entry: {err}")))?;
+        self.backend
+            .put_object_fenced(self.catalog_bucket(), path, data, precondition, fence)
+            .await
     }
 
     async fn collect_bucket_snapshot_with_locks(
@@ -908,6 +979,16 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<TableCatalogBackingMigrationExecutionReport> {
+        let store = self.clone();
+        let table_bucket = table_bucket.to_owned();
+        run_owned_backing_migration(async move { store.materialize_durable_strong_backing_migration_owned(&table_bucket).await })
+            .await
+    }
+
+    async fn materialize_durable_strong_backing_migration_owned(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogBackingMigrationExecutionReport> {
         let fence_path = self.paths.backing_migration_fence_path(table_bucket);
         let fence_lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let global_fence_path = self.paths.backing_migration_global_fence_path();
@@ -929,6 +1010,10 @@ where
             .backend
             .acquire_write_lock(self.catalog_bucket(), &fence_lock_path)
             .await?;
+        let mut mutation_fence = TableCatalogObjectMutationFence::from_signals([
+            _global_fence_guard.lock_lost_signal(),
+            _fence_guard.lock_lost_signal(),
+        ]);
         let existing_fence = self.read_backing_migration_fence(table_bucket).await?;
         let strong_store = StrongTableCatalogStore::new(self.backend.clone());
         if let Some((fence, _)) = existing_fence.as_ref()
@@ -955,6 +1040,10 @@ where
         let source = self
             .collect_bucket_snapshot_with_locks(table_bucket, &mut source_guards)
             .await?;
+        mutation_fence
+            .signals
+            .extend(source_guards.iter().filter_map(TableCatalogLockGuard::lock_lost_signal));
+        mutation_fence.ensure_held()?;
         let source_fingerprint = table_catalog_bucket_snapshot_fingerprint(&source)?;
         if let Some((fence, _)) = existing_fence.as_ref()
             && fence.status == TableCatalogBackingMigrationFenceStatus::Materialized
@@ -965,7 +1054,8 @@ where
             )));
         }
 
-        self.ensure_global_backing_migration_fence(&global_fence_path).await?;
+        self.ensure_global_backing_migration_fence(&global_fence_path, &mutation_fence)
+            .await?;
         let (target_fingerprint, target_snapshot_etag) = Self::observe_durable_strong_migration_target(
             &strong_store,
             table_bucket,
@@ -985,12 +1075,14 @@ where
                 source_fingerprint: None,
                 target_snapshot_etag,
             };
-            self.write_entry(self.catalog_bucket(), &fence_path, &fence, TableCatalogPutPrecondition::IfAbsent)
+            self.write_migration_entry(&fence_path, &fence, TableCatalogPutPrecondition::IfAbsent, &mutation_fence)
                 .await?;
             (fence.migration_id, target_bucket_existed)
         };
 
-        let (target_snapshot_etag, created) = strong_store.materialize_bucket_snapshot(source.clone()).await?;
+        let (target_snapshot_etag, created) = strong_store
+            .materialize_bucket_snapshot_with_fence(source.clone(), &mutation_fence)
+            .await?;
         let completed_fence = TableCatalogBackingMigrationFence {
             version: TABLE_CATALOG_MIGRATION_VERSION,
             table_bucket: table_bucket.to_string(),
@@ -1000,7 +1092,7 @@ where
             source_fingerprint: Some(source_fingerprint.clone()),
             target_snapshot_etag: Some(target_snapshot_etag.clone()),
         };
-        self.write_entry(self.catalog_bucket(), &fence_path, &completed_fence, TableCatalogPutPrecondition::Any)
+        self.write_migration_entry(&fence_path, &completed_fence, TableCatalogPutPrecondition::Any, &mutation_fence)
             .await?;
 
         drop(source_guards);
@@ -1031,6 +1123,15 @@ where
         &self,
         table_bucket: &str,
     ) -> TableCatalogStoreResult<TableCatalogBackingMigrationCancelReport> {
+        let store = self.clone();
+        let table_bucket = table_bucket.to_owned();
+        run_owned_backing_migration(async move { store.cancel_durable_strong_backing_migration_owned(&table_bucket).await }).await
+    }
+
+    async fn cancel_durable_strong_backing_migration_owned(
+        &self,
+        table_bucket: &str,
+    ) -> TableCatalogStoreResult<TableCatalogBackingMigrationCancelReport> {
         let fence_path = self.paths.backing_migration_fence_path(table_bucket);
         let fence_lock_path = self.paths.backing_migration_fence_lock_path(table_bucket);
         let global_fence_path = self.paths.backing_migration_global_fence_path();
@@ -1043,8 +1144,12 @@ where
             .backend
             .acquire_write_lock(self.catalog_bucket(), &fence_lock_path)
             .await?;
-        let Some((fence, _)) = self.read_backing_migration_fence(table_bucket).await? else {
-            self.clear_global_backing_migration_fence_if_unused(&global_fence_path)
+        let mut mutation_fence = TableCatalogObjectMutationFence::from_signals([
+            _global_fence_guard.lock_lost_signal(),
+            _fence_guard.lock_lost_signal(),
+        ]);
+        let Some((fence, fence_etag)) = self.read_backing_migration_fence(table_bucket).await? else {
+            self.clear_global_backing_migration_fence_if_unused(&global_fence_path, &mutation_fence)
                 .await?;
             return Ok(TableCatalogBackingMigrationCancelReport {
                 table_bucket: table_bucket.to_string(),
@@ -1052,12 +1157,17 @@ where
                 object_backed_writes_fenced: false,
             });
         };
-        self.ensure_global_backing_migration_fence(&global_fence_path).await?;
+        self.ensure_global_backing_migration_fence(&global_fence_path, &mutation_fence)
+            .await?;
 
         let mut source_guards = Vec::new();
         let source = self
             .collect_bucket_snapshot_with_locks(table_bucket, &mut source_guards)
             .await?;
+        mutation_fence
+            .signals
+            .extend(source_guards.iter().filter_map(TableCatalogLockGuard::lock_lost_signal));
+        mutation_fence.ensure_held()?;
         let source_fingerprint = table_catalog_bucket_snapshot_fingerprint(&source)?;
         if fence.status == TableCatalogBackingMigrationFenceStatus::Materialized
             && fence.source_fingerprint.as_deref() != Some(source_fingerprint.as_str())
@@ -1086,11 +1196,14 @@ where
         }
         if !fence.target_bucket_existed {
             strong_store
-                .remove_bucket_snapshot_if_unchanged(table_bucket, &source_fingerprint)
+                .remove_bucket_snapshot_if_unchanged_with_fence(table_bucket, &source_fingerprint, &mutation_fence)
                 .await?;
         }
-        self.backend.delete_object(self.catalog_bucket(), &fence_path).await?;
-        self.clear_global_backing_migration_fence_if_unused(&global_fence_path)
+        let fence_etag = fence_etag.ok_or_else(|| TableCatalogStoreError::Conflict("migration fence has no ETag".to_owned()))?;
+        self.backend
+            .delete_object_if_match_fenced(self.catalog_bucket(), &fence_path, &fence_etag, &mutation_fence)
+            .await?;
+        self.clear_global_backing_migration_fence_if_unused(&global_fence_path, &mutation_fence)
             .await?;
         Ok(TableCatalogBackingMigrationCancelReport {
             table_bucket: table_bucket.to_string(),

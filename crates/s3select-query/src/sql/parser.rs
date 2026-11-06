@@ -27,6 +27,8 @@ use rustfs_s3select_api::{
 
 use super::dialect::RustFsDialect;
 
+pub(crate) const MAX_SQL_EXPRESSION_BYTES: usize = 256 * 1024;
+
 pub type Result<T, E = ParserError> = std::result::Result<T, E>;
 
 // Use `Parser::expected` instead, if possible
@@ -54,7 +56,12 @@ impl<'a> ExtParser<'a> {
     /// Parse the specified tokens with dialect
     fn new_with_dialect(sql: &str, dialect: &'a dyn Dialect) -> Result<Self> {
         let mut tokenizer = Tokenizer::new(dialect, sql);
+        // Bound token allocation before the full recursive SQL parser runs.
+        if sql.len() > MAX_SQL_EXPRESSION_BYTES {
+            return parser_err!("S3 Select expression exceeds 256 KiB");
+        }
         let mut tokens = tokenizer.tokenize()?;
+        validate_projection_width(&tokens)?;
         rewrite_source_object_wildcards(&mut tokens);
         Ok(ExtParser {
             parser: Parser::new(dialect).with_tokens(tokens),
@@ -104,6 +111,41 @@ impl<'a> ExtParser<'a> {
     fn expected<T>(&self, expected: &str, found: impl Display) -> Result<T> {
         parser_err!(format!("Expected {}, found: {}", expected, found))
     }
+}
+
+fn validate_projection_width(tokens: &[Token]) -> Result<()> {
+    let mut depth = 0usize;
+    let mut projections: Vec<(usize, usize)> = Vec::new();
+    for token in tokens {
+        match token {
+            Token::Word(word) if word.keyword == Keyword::SELECT => projections.push((depth, 1)),
+            Token::Word(word)
+                if word.keyword == Keyword::FROM && projections.last().is_some_and(|(level, _)| *level == depth) =>
+            {
+                projections.pop();
+            }
+            Token::LParen | Token::LBracket => depth += 1,
+            Token::RParen | Token::RBracket => {
+                depth = depth.saturating_sub(1);
+                while projections.last().is_some_and(|(level, _)| *level > depth) {
+                    projections.pop();
+                }
+            }
+            Token::Comma => {
+                if let Some((level, columns)) = projections.last_mut()
+                    && *level == depth
+                {
+                    *columns += 1;
+                    if *columns > rustfs_s3select_api::query::session::MAX_SELECT_COLUMNS {
+                        return parser_err!("S3 Select projection exceeds 1024 columns");
+                    }
+                }
+            }
+            Token::SemiColon => projections.clear(),
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 fn rewrite_source_object_wildcards(tokens: &mut [Token]) {
@@ -442,6 +484,31 @@ mod tests {
         let statements = result.unwrap();
         let memory_size = std::mem::size_of_val(&statements);
         assert!(memory_size < 10000, "Parsed statements should not use excessive memory");
+    }
+
+    #[test]
+    fn bounded_projection_preflight_respects_quoted_commas_and_nested_expressions() {
+        let projection = (0..1024)
+            .map(|index| format!("COALESCE('a,b', 'c') AS c{index}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        assert!(ExtParser::parse_sql(&format!("SELECT {projection} FROM S3Object")).is_ok());
+        let error = ExtParser::parse_sql(&format!("SELECT {projection}, 1 FROM S3Object")).expect_err("column limit");
+        assert!(error.to_string().contains("1024 columns"));
+        let nested = format!("SELECT (SELECT 1), {projection} FROM S3Object");
+        assert!(
+            ExtParser::parse_sql(&nested)
+                .expect_err("nested SELECT cannot reset outer width")
+                .to_string()
+                .contains("1024 columns")
+        );
+        let long_literal = "x".repeat(256 * 1024);
+        assert!(
+            ExtParser::parse_sql(&format!("SELECT '{long_literal}' FROM S3Object"))
+                .expect_err("byte limit")
+                .to_string()
+                .contains("256 KiB")
+        );
     }
 
     #[test]

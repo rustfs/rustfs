@@ -514,6 +514,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        table_route_sample(Method::GET, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
+        table_route_sample(Method::POST, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
+        table_route_sample(Method::DELETE, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
         table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         table_route_sample(
@@ -719,6 +722,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         compat_table_route_sample(Method::GET, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
         compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/migration", "/analytics/catalog/migration"),
+        compat_table_route_sample(Method::GET, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
+        compat_table_route_sample(Method::POST, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
+        compat_table_route_sample(Method::DELETE, "/{warehouse}/catalog/directory", "/analytics/catalog/directory"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/backup", "/analytics/catalog/backup"),
         compat_table_route_sample(Method::POST, "/{warehouse}/catalog/restore", "/analytics/catalog/restore"),
         compat_table_route_sample(

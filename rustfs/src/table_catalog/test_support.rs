@@ -524,8 +524,16 @@ impl TableCommitPublication for BlockingObjectPublication {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct TestCatalogWorkerContext {
+    pub(crate) access_key: Option<String>,
+    pub(crate) operation: Option<&'static str>,
+    pub(crate) span_name: Option<&'static str>,
+}
+
 #[derive(Default)]
 pub(crate) struct TestCatalogObjectState {
+    pub(crate) observed_worker_contexts: Option<Vec<TestCatalogWorkerContext>>,
     pub(crate) objects: BTreeMap<(String, String), TestCatalogObjectRecord>,
     pub(crate) etagless_objects: BTreeSet<(String, String)>,
     pub(crate) fail_read_attempts: BTreeMap<(String, String), BTreeSet<usize>>,
@@ -546,6 +554,7 @@ pub(crate) struct TestCatalogObjectState {
     pub(crate) read_calls: usize,
     pub(crate) read_bytes: usize,
     pub(crate) metadata_calls: usize,
+    pub(crate) pause_metadata: BTreeMap<(String, String), TestCatalogObjectPause>,
     pub(crate) list_calls: usize,
     pub(crate) failed_inventory_prefixes: BTreeSet<String>,
     pub(crate) inventory_overrides: BTreeMap<String, Vec<TableCatalogCleanupObject>>,
@@ -554,6 +563,7 @@ pub(crate) struct TestCatalogObjectState {
 
 #[derive(Clone)]
 pub(crate) struct TestCatalogObjectRecord {
+    pub(crate) body_revision: Option<Uuid>,
     pub(crate) data: Vec<u8>,
     pub(crate) etag: String,
     pub(crate) mod_time: Option<OffsetDateTime>,
@@ -574,9 +584,15 @@ impl TestCatalogObjectBackend {
     ) {
         let mut state = self.state.lock().await;
         let etag = state.next_etag();
-        state
-            .objects
-            .insert((bucket.to_string(), object.to_string()), TestCatalogObjectRecord { data, etag, mod_time });
+        state.objects.insert(
+            (bucket.to_string(), object.to_string()),
+            TestCatalogObjectRecord {
+                body_revision: Some(Uuid::new_v4()),
+                data,
+                etag,
+                mod_time,
+            },
+        );
     }
 
     pub(crate) async fn fail_put_attempt(&self, bucket: &str, object: &str, attempt: usize) {
@@ -854,6 +870,7 @@ impl TestCatalogObjectBackend {
                 state.objects.insert(
                     key.clone(),
                     TestCatalogObjectRecord {
+                        body_revision: Some(Uuid::new_v4()),
                         data,
                         etag,
                         mod_time: Some(OffsetDateTime::now_utc()),
@@ -995,6 +1012,16 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
         let (attempt, pause_before) = {
             let mut state = self.state.lock().await;
             state.read_calls += 1;
+            if let Some(observations) = state.observed_worker_contexts.as_mut() {
+                observations.push(TestCatalogWorkerContext {
+                    access_key: rustfs_keystone::KEYSTONE_CREDENTIALS
+                        .try_with(|credentials| credentials.as_ref().map(|credentials| credentials.access_key.clone()))
+                        .ok()
+                        .flatten(),
+                    operation: rustfs_io_metrics::s3_http_metrics::current_s3_http_operation_name(),
+                    span_name: tracing::Span::current().metadata().map(|metadata| metadata.name()),
+                });
+            }
             let attempt = {
                 let attempts = state.read_attempts.entry(key.clone()).or_default();
                 *attempts += 1;
@@ -1023,6 +1050,7 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             let mut state = self.state.lock().await;
             let etagless = state.etagless_objects.contains(&key);
             let result = state.objects.get(&key).map(|record| TableCatalogObject {
+                body_revision: record.body_revision,
                 data: record.data.clone(),
                 etag: (!etagless).then(|| record.etag.clone()),
                 mod_time: record.mod_time,
@@ -1068,15 +1096,37 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
     }
 
     async fn object_metadata(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        let pause = self
+            .state
+            .lock()
+            .await
+            .pause_metadata
+            .remove(&(bucket.to_string(), object.to_string()));
+        if let Some(pause) = pause {
+            pause.started.notify_one();
+            pause.release.notified().await;
+        }
         let mut state = self.state.lock().await;
         state.metadata_calls += 1;
         let key = (bucket.to_string(), object.to_string());
         let etagless = state.etagless_objects.contains(&key);
-        Ok(state.objects.get(&key).map(|record| TableCatalogObjectMetadata {
+        let metadata = state.objects.get(&key).map(|record| TableCatalogObjectMetadata {
+            body_revision: record.body_revision,
             etag: (!etagless).then(|| record.etag.clone()),
             mod_time: record.mod_time,
             size: record.data.len() as u64,
-        }))
+        });
+        drop(state);
+        Ok(metadata)
+    }
+
+    async fn object_metadata_unlocked(
+        &self,
+        bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableCatalogObjectMetadata>> {
+        // Match the ECStore stat path while publication already holds the object lock.
+        self.object_metadata(bucket, object).await
     }
 
     async fn object_exists(&self, bucket: &str, object: &str) -> TableCatalogStoreResult<bool> {
@@ -1202,6 +1252,25 @@ impl TableCatalogObjectBackend for TestCatalogObjectBackend {
             .collect())
     }
 
+    async fn list_catalog_objects_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        start_after: Option<&str>,
+        limit: NonZeroUsize,
+    ) -> TableCatalogStoreResult<TableCatalogCleanupPage> {
+        // Only this in-memory fixture materializes the complete inventory.
+        // The production adapter uses a bounded authoritative storage page.
+        let mut objects = self.list_objects_for_cleanup(bucket, prefix).await?;
+        objects.sort_by(|left, right| left.key.cmp(&right.key));
+        objects.retain(|object| start_after.is_none_or(|after| object.key.as_str() > after));
+        // Production stops on a full page without consuming lookahead. Only
+        // a subsequent shorter (possibly empty) page proves EOF.
+        let is_truncated = objects.len() >= limit.get();
+        objects.truncate(limit.get());
+        Ok(TableCatalogCleanupPage { objects, is_truncated })
+    }
+
     async fn ensure_no_multipart_uploads(&self, _bucket: &str) -> TableCatalogStoreResult<()> {
         Ok(())
     }
@@ -1281,6 +1350,7 @@ impl TestCatalogObjectBackend {
         self.state.lock().await.objects.insert(
             (bucket.to_string(), object.to_string()),
             TestCatalogObjectRecord {
+                body_revision: Some(Uuid::new_v4()),
                 data,
                 etag,
                 mod_time: None,
@@ -1311,11 +1381,15 @@ impl TestCatalogObjectBackend {
     ) {
         let data = serde_json::to_vec(&value).expect("metadata JSON should serialize");
         let etag = content_etag(&data);
-        self.state
-            .lock()
-            .await
-            .objects
-            .insert((bucket.to_string(), object.to_string()), TestCatalogObjectRecord { data, etag, mod_time });
+        self.state.lock().await.objects.insert(
+            (bucket.to_string(), object.to_string()),
+            TestCatalogObjectRecord {
+                body_revision: Some(Uuid::new_v4()),
+                data,
+                etag,
+                mod_time,
+            },
+        );
     }
 
     pub(crate) async fn write_lock_is_held(&self, bucket: &str, object: &str) -> bool {

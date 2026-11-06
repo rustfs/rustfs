@@ -1588,7 +1588,13 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     if boot_epoch != tonic_rpc_boot_epoch() {
         return Err(std::io::Error::other("RPC boot epoch is stale"));
     }
-    check_and_record_tonic_nonce(nonce, signed_at, path)
+    check_and_record_tonic_nonce(nonce, signed_at, path)?;
+    // A body-bound request also carries a usable v2 signature. Consume both
+    // nonces so stripping the replay-scope headers cannot authorize it again.
+    if content_sha256 != UNSIGNED_PAYLOAD {
+        verify_tonic_rpc_signature_with_strictness(audience, path, headers, true)?;
+    }
+    Ok(())
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
@@ -2577,6 +2583,43 @@ mod tests {
         let path_error = verify_tonic_replay_scope_signature("node-a:9000", "/node_service.NodeService/SignalService", &headers)
             .expect_err("a replay-scoped signature must not move to another method");
         assert_eq!(path_error.to_string(), "Invalid RPC replay scope signature");
+    }
+
+    #[test]
+    fn replay_scope_consumes_the_body_bound_v2_nonce() {
+        ensure_test_rpc_secret();
+        let audience = "node-a:9000";
+        let path = "/node_service.NodeService/RecoverDeleteTransaction";
+        let digest = "a".repeat(64);
+        for v3_first in [true, false] {
+            let mut headers =
+                gen_tonic_signature_headers(audience, "node_service.NodeService", "RecoverDeleteTransaction", Some(&digest))
+                    .expect("body-bound v2 headers should build");
+            let timestamp = headers[TIMESTAMP_HEADER].to_str().expect("timestamp").to_string();
+            headers.extend(
+                gen_tonic_replay_scope_headers(audience, path, &timestamp, &digest, tonic_rpc_boot_epoch())
+                    .expect("replay-scope headers should build"),
+            );
+            let mut downgraded = headers.clone();
+            for header in [
+                RPC_REPLAY_SCOPE_VERSION_HEADER,
+                RPC_REPLAY_SCOPE_SIGNATURE_HEADER,
+                RPC_REPLAY_SCOPE_NONCE_HEADER,
+                RPC_BOOT_EPOCH_HEADER,
+            ] {
+                downgraded.remove(header);
+            }
+            let (first, replay) = if v3_first {
+                (&headers, &downgraded)
+            } else {
+                (&downgraded, &headers)
+            };
+            verify_tonic_rpc_signature_with_policy(audience, path, first, true, false, false)
+                .expect("the first delivery must be accepted");
+            let error = verify_tonic_rpc_signature_with_policy(audience, path, replay, true, false, false)
+                .expect_err("a mutation cannot replay through the other signature generation");
+            assert_eq!(error.to_string(), "RPC request replay detected");
+        }
     }
 
     #[test]
