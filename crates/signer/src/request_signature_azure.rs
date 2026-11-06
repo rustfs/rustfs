@@ -36,6 +36,8 @@ pub enum AzureSignError {
 /// as reads. This implements the Shared Key format for service versions
 /// 2015-02-21 and newer, where a zero Content-Length is signed as an empty
 /// field. The returned base64 signature does not include the account name.
+/// Service-header whitespace is folded only outside quoted strings; quoted
+/// whitespace and escaped characters retain their original bytes.
 ///
 /// # Errors
 ///
@@ -94,7 +96,7 @@ pub fn azure_shared_key_signature(
             service_headers
                 .entry(name.as_str())
                 .or_default()
-                .push(value.split_ascii_whitespace().collect::<Vec<_>>().join(" "));
+                .push(normalize_service_header(value));
         }
     }
     for (name, values) in service_headers {
@@ -118,6 +120,33 @@ pub fn azure_shared_key_signature(
         canonical.push_str(&values.join(","));
     }
     Ok(base64_simd::STANDARD.encode_to_string(hmac_sha256(key, canonical.as_bytes())))
+}
+
+fn normalize_service_header(value: &str) -> String {
+    // HeaderValue::to_str already excludes non-ASCII bytes and CR/LF.
+    let mut normalized = String::with_capacity(value.len());
+    let mut quoted = false;
+    let mut escaped = false;
+    let mut pending_space = false;
+    for byte in value.bytes() {
+        if !quoted && matches!(byte, b' ' | b'\t') {
+            pending_space = !normalized.is_empty();
+            continue;
+        }
+        if pending_space {
+            normalized.push(' ');
+            pending_space = false;
+        }
+        normalized.push(char::from(byte));
+        if escaped {
+            escaped = false;
+        } else if quoted && byte == b'\\' {
+            escaped = true;
+        } else if byte == b'"' {
+            quoted = !quoted;
+        }
+    }
+    normalized
 }
 
 #[cfg(test)]
@@ -150,6 +179,60 @@ mod tests {
             let signature = azure_shared_key_signature(b"0123456789abcdef0123456789abcdef", "account", "PUT", &url, &headers)
                 .expect("valid write should sign");
             assert_eq!(signature, expected);
+        }
+    }
+
+    #[test]
+    fn signs_quoted_content_disposition_without_collapsing_filename_whitespace() {
+        let mut headers = HeaderMap::new();
+        for (name, value) in [
+            ("content-length", "3"),
+            ("content-md5", "YWJj"),
+            ("content-type", "application/octet-stream"),
+            ("if-none-match", "*"),
+            ("x-ms-date", "Fri, 06 Nov 2026 01:00:00 GMT"),
+            ("x-ms-version", "2020-10-02"),
+        ] {
+            headers.insert(name, HeaderValue::from_static(value));
+        }
+        // Independent Python hmac/hashlib vectors use the documented canonical
+        // strings: only whitespace outside quoted strings is folded.
+        for (value, signatures) in [
+            (
+                "attachment; filename=\"a  b.txt\"",
+                [
+                    "QO88BLMyaCEREeo/zP7esZKpkx9N/bwRQDwAkrjotB8=",
+                    "jZKYLpdUVYulDaVaNmpjy46IBxuuHyDmZ26ecnEs8wo=",
+                ],
+            ),
+            (
+                "\tattachment; \tfilename=\"a\\\"  b.txt\" \t",
+                [
+                    "dJI4cH77ju0YzM37HT66vck9p9obz9jdp5k04nhLkA0=",
+                    "13VDC1M4IIl11zPnxjBQhOd/CnzrxRj59DJ+wgDNQrQ=",
+                ],
+            ),
+            (
+                "attachment; filename=\"a\t\tb.txt\"",
+                [
+                    "ONDPQmh7ulrnziZyCiHOm241GhEJ4iTZa/ZWmgdE4sY=",
+                    "pHkeDR6QaUwuQTJsP/RFTlfPqzOA86DG6HSpdm4Fh2U=",
+                ],
+            ),
+        ] {
+            headers.insert("x-ms-blob-content-disposition", HeaderValue::from_static(value));
+            for (address, expected) in [
+                "https://account.blob.core.windows.net/container/blob",
+                "https://account.blob.core.windows.net/container/blob?comp=blocklist",
+            ]
+            .into_iter()
+            .zip(signatures)
+            {
+                let url = Url::parse(address).expect("fixture URL should parse");
+                let signature = azure_shared_key_signature(b"0123456789abcdef0123456789abcdef", "account", "PUT", &url, &headers)
+                    .expect("quoted content disposition should sign");
+                assert_eq!(signature, expected);
+            }
         }
     }
 
