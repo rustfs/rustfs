@@ -2231,6 +2231,14 @@ pub(crate) async fn acquire_scanner_bucket_incarnation_fence(
     ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence(bucket, incarnation, owner_id).await
 }
 
+pub(crate) async fn acquire_scanner_bucket_incarnation_read_fence(
+    bucket: &str,
+    incarnation: uuid::Uuid,
+    owner_id: uuid::Uuid,
+) -> Result<ecstore_bucket::metadata_sys::ScannerBucketIncarnationReadGuard> {
+    ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_read_fence(bucket, incarnation, owner_id).await
+}
+
 pub(crate) async fn update_bucket_targets_under_transaction_lock(
     guard: &ecstore_bucket::metadata_sys::BucketMetadataMutationGuard,
     bucket: &str,

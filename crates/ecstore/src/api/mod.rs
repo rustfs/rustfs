@@ -210,11 +210,11 @@ pub mod bucket {
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
             BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
-            ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            ObjectLockConfigState, ScannerBucketIncarnationReadGuard, acquire_bucket_metadata_transaction_lock,
             acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
-            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, delete_if_incarnation_at,
-            delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
-            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            acquire_scanner_bucket_incarnation_read_fence, capture_bucket_metadata_incarnation, delete, delete_if_incarnation,
+            delete_if_incarnation_at, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
+            get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,

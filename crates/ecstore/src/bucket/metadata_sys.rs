@@ -869,6 +869,30 @@ impl BucketMetadataMutationGuard {
     }
 }
 
+/// Read-only scanner authority for one bucket incarnation.
+///
+/// Lock order is bucket lifecycle (read), then metadata transaction (read).
+/// This guard cannot authorize a configuration mutation or scanner ACK write.
+pub struct ScannerBucketIncarnationReadGuard {
+    bucket: String,
+    incarnation_id: Uuid,
+    lifecycle_guard: rustfs_lock::NamespaceLockGuard,
+    transaction_guard: rustfs_lock::NamespaceLockGuard,
+}
+
+impl ScannerBucketIncarnationReadGuard {
+    /// Returns the verified identity while both read fences remain valid.
+    ///
+    /// # Errors
+    /// Returns an error if either lock has lost its lease.
+    pub fn checked_bucket_incarnation(&self) -> Result<(&str, Uuid)> {
+        if self.lifecycle_guard.is_lock_lost() || self.transaction_guard.is_lock_lost() {
+            return Err(Error::other(format!("scanner bucket incarnation read lock was lost: {}", self.bucket)));
+        }
+        Ok((&self.bucket, self.incarnation_id))
+    }
+}
+
 async fn acquire_config_write_guard(sys: Arc<RwLock<BucketMetadataSys>>, bucket: &str) -> Result<BucketMetadataMutationGuard> {
     acquire_config_write_guard_for_incarnation(sys, bucket, None).await
 }
@@ -893,6 +917,68 @@ pub async fn acquire_scanner_bucket_incarnation_fence(
         return Err(Error::other("scanner bucket incarnation owner does not match"));
     }
     acquire_config_write_guard_with_migration(sys, bucket, Some(expected_incarnation_id), false).await
+}
+
+/// Validate scanner read authority without serializing compatible metadata readers.
+///
+/// The returned guard retains both read locks. It never migrates metadata or
+/// creates an incarnation; mutation callers must use the exclusive scanner fence.
+///
+/// # Errors
+/// Returns an error for invalid bucket/owner identities, unavailable locks or
+/// storage, absent incarnation metadata, or a deleted/recreated bucket.
+pub async fn acquire_scanner_bucket_incarnation_read_fence(
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+    expected_owner_id: Uuid,
+) -> Result<ScannerBucketIncarnationReadGuard> {
+    acquire_scanner_bucket_incarnation_read_fence_with_sys(
+        get_bucket_metadata_sys()?,
+        bucket,
+        expected_incarnation_id,
+        expected_owner_id,
+    )
+    .await
+}
+
+async fn acquire_scanner_bucket_incarnation_read_fence_with_sys(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+    expected_owner_id: Uuid,
+) -> Result<ScannerBucketIncarnationReadGuard> {
+    super::utils::check_valid_bucket_name(bucket)?;
+    let metadata_sys = sys.read().await.clone();
+    if expected_owner_id.is_nil() || metadata_sys.object_store().id != expected_owner_id || expected_incarnation_id.is_nil() {
+        return Err(Error::other("scanner bucket incarnation owner does not match"));
+    }
+    let lifecycle_guard = metadata_sys.object_store().acquire_bucket_lifecycle_read_lock(bucket).await?;
+    let transaction_guard = await_bucket_namespace_operation(
+        Some(&lifecycle_guard),
+        bucket,
+        "scanner incarnation read transaction lock acquisition",
+        acquire_metadata_transaction_guard(
+            metadata_sys.object_store(),
+            bucket,
+            "scanner_incarnation_probe",
+            rustfs_lock::LockType::Shared,
+        ),
+    )
+    .await?;
+    let incarnation_id = validate_bucket_metadata_guard_incarnation(
+        &metadata_sys,
+        bucket,
+        Some(expected_incarnation_id),
+        &lifecycle_guard,
+        &transaction_guard,
+    )
+    .await?;
+    Ok(ScannerBucketIncarnationReadGuard {
+        bucket: bucket.to_owned(),
+        incarnation_id,
+        lifecycle_guard,
+        transaction_guard,
+    })
 }
 
 async fn acquire_config_write_guard_with_migration(
@@ -931,12 +1017,36 @@ async fn acquire_config_write_guard_with_migration(
         ),
     )
     .await?;
+    let current_incarnation_id = validate_bucket_metadata_guard_incarnation(
+        &metadata_sys,
+        bucket,
+        expected_incarnation_id,
+        &lifecycle_guard,
+        &transaction_guard,
+    )
+    .await?;
+
+    Ok(BucketMetadataMutationGuard {
+        bucket: bucket.to_string(),
+        incarnation_id: current_incarnation_id,
+        lifecycle_guard,
+        transaction_guard,
+    })
+}
+
+async fn validate_bucket_metadata_guard_incarnation(
+    metadata_sys: &BucketMetadataSys,
+    bucket: &str,
+    expected_incarnation_id: Option<Uuid>,
+    lifecycle_guard: &rustfs_lock::NamespaceLockGuard,
+    transaction_guard: &rustfs_lock::NamespaceLockGuard,
+) -> Result<Uuid> {
     await_bucket_namespace_operation(
-        Some(&lifecycle_guard),
+        Some(lifecycle_guard),
         bucket,
         "bucket config existence validation",
         await_bucket_namespace_operation(
-            Some(&transaction_guard),
+            Some(transaction_guard),
             bucket,
             "bucket config existence transaction validation",
             async {
@@ -954,11 +1064,11 @@ async fn acquire_config_write_guard_with_migration(
     )
     .await?;
     let current_incarnation_id = await_bucket_namespace_operation(
-        Some(&lifecycle_guard),
+        Some(lifecycle_guard),
         bucket,
         "bucket config incarnation validation",
         await_bucket_namespace_operation(
-            Some(&transaction_guard),
+            Some(transaction_guard),
             bucket,
             "bucket config incarnation transaction validation",
             load_bucket_incarnation(metadata_sys.object_store(), bucket),
@@ -971,12 +1081,7 @@ async fn acquire_config_write_guard_with_migration(
         return Err(Error::BucketNotFound(bucket.to_string()));
     }
 
-    Ok(BucketMetadataMutationGuard {
-        bucket: bucket.to_string(),
-        incarnation_id: current_incarnation_id,
-        lifecycle_guard,
-        transaction_guard,
-    })
+    Ok(current_incarnation_id)
 }
 
 /// Rewrite one config file while the caller already holds this bucket's
@@ -4041,6 +4146,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, Uuid::new_v4(), store.id)
+                .await
+                .is_err(),
+            "read-only scanner validation must not migrate an absent incarnation"
+        );
         assert!(load_bucket_incarnation(store, bucket).await.expect("read sidecar").is_none());
         assert!(
             sys.read()
@@ -4094,6 +4205,128 @@ mod tests {
             acquire_config_write_guard_with_migration(sys, bucket, Some(new), false)
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn scanner_incarnation_read_fence_shares_reads_and_blocks_mutations() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "scanner-read-fence";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("bucket incarnation");
+        let guard = acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+            .await
+            .expect("read-only scanner fence");
+        assert_eq!(guard.checked_bucket_incarnation().expect("valid read fences"), (bucket, incarnation));
+
+        let transaction_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
+            .await
+            .expect("metadata transaction namespace");
+        assert!(
+            transaction_lock.get_write_lock(Duration::from_millis(20)).await.is_err(),
+            "scanner read authority must exclude metadata writers"
+        );
+        let lifecycle_lock = store
+            .new_ns_lock(bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("bucket lifecycle namespace");
+        assert!(
+            lifecycle_lock.get_write_lock(Duration::from_millis(20)).await.is_err(),
+            "scanner read authority must exclude delete and recreation"
+        );
+        let another = timeout(
+            Duration::from_secs(1),
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id),
+        )
+        .await
+        .expect("scanner readers must not serialize")
+        .expect("second read-only scanner fence");
+        let compatible = timeout(
+            Duration::from_secs(1),
+            acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, bucket),
+        )
+        .await
+        .expect("metadata readers must remain compatible")
+        .expect("metadata transaction reader");
+        drop(compatible);
+        drop(another);
+
+        let mut mutation = Box::pin(acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(incarnation), false));
+        assert!(matches!(futures::poll!(&mut mutation), std::task::Poll::Pending));
+        let mut deletion = Box::pin(store.acquire_bucket_lifecycle_write_lock(bucket));
+        assert!(matches!(futures::poll!(&mut deletion), std::task::Poll::Pending));
+        drop(deletion);
+        drop(guard);
+        let mutation = timeout(Duration::from_secs(1), mutation)
+            .await
+            .expect("metadata mutation must progress after scanner read release")
+            .expect("exclusive mutation fence");
+        drop(mutation);
+        let lifecycle = timeout(Duration::from_secs(1), store.acquire_bucket_lifecycle_write_lock(bucket))
+            .await
+            .expect("bucket delete fence must progress after readers release")
+            .expect("exclusive lifecycle fence");
+        drop(lifecycle);
+
+        for (owner, expected) in [
+            (Uuid::new_v4(), incarnation),
+            (Uuid::nil(), incarnation),
+            (store.id, Uuid::nil()),
+        ] {
+            assert!(
+                acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, expected, owner)
+                    .await
+                    .is_err(),
+                "invalid owner or nil incarnation must not receive authority"
+            );
+        }
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, Uuid::new_v4(), store.id)
+                .await
+                .is_err(),
+            "a stale incarnation must not receive authority"
+        );
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket");
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+                .await
+                .is_err(),
+            "deleted bucket must not receive authority"
+        );
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let replacement = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("replacement incarnation");
+        assert_ne!(replacement, incarnation);
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+                .await
+                .is_err(),
+            "recreation must reject the previous scanner identity"
+        );
+        let guard = acquire_scanner_bucket_incarnation_read_fence_with_sys(sys, bucket, replacement, store.id)
+            .await
+            .expect("replacement read-only scanner fence");
+        assert_eq!(
+            guard.checked_bucket_incarnation().expect("replacement remains fenced"),
+            (bucket, replacement)
         );
     }
 
