@@ -2224,6 +2224,10 @@ mod tests {
                 .expect("check successor")
                 .is_some()
         );
+        // FastLock acquisition deadlines use the real clock. Resume Tokio time
+        // so virtual-time retries cannot expire the successor's lease while
+        // waiting for the contender's real-time deadline.
+        tokio::time::resume();
         let contender =
             LockRequest::new(request.resource, LockType::Exclusive, "contender").with_acquire_timeout(Duration::from_millis(50));
         assert!(
