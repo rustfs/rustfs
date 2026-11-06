@@ -22440,9 +22440,29 @@ mod test {
 
     #[cfg(target_os = "linux")]
     #[tokio::test]
-    #[serial_test::serial(dst_dir_fsync_group_commit, file_fdatasync_group_commit, file_sync_probe)]
     #[allow(clippy::await_holding_lock)]
     async fn test_rename_data_fused_overwrite_and_rollback_double_failure() {
+        const CHILD: &str = "RUSTFS_TEST_FUSED_OVERWRITE_CHILD";
+        const TEST: &str = "disk::local::test::test_rename_data_fused_overwrite_and_rollback_double_failure";
+
+        // Other tests install process-wide hooks that deliberately force rename_data off the fused path.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("fused overwrite subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("FUSED_OVERWRITE_OK"), "fused overwrite test did not run: {stdout}");
+            return;
+        }
+
+        assert!(!os::dst_dir_fsync_group_commit_enabled());
+        assert!(!os::file_fdatasync_group_commit_enabled());
         let _mode = durability_mode_override::set(DurabilityMode::Strict);
         let dir = tempfile::tempdir().expect("temp dir");
         let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8")).expect("endpoint");
@@ -22474,7 +22494,7 @@ mod test {
 
         let mut fi_v2 = test_file_info(object, version_id, Some(data_dir_v2), None);
         (fi_v2.size, fi_v2.parts[0].size, fi_v2.parts[0].actual_size) = (4, 4, 4);
-        assert!(!has_rename_data_test_failpoints(&format!("{object}/{STORAGE_FORMAT_FILE}")));
+        assert!(!has_rename_data_test_failpoints(object));
         let resp2 = disk
             .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v2", fi_v2, bucket, object)
             .await
@@ -22550,6 +22570,7 @@ mod test {
         );
         assert!(!replacement_dir.exists());
         assert_eq!(fs::read(&dst_meta_path).await.expect("restored"), v1_meta_bytes);
+        println!("FUSED_OVERWRITE_OK");
     }
 
     /// rustfs/backlog#1009: `observe_old_current_size` must mirror the pre-PUT
