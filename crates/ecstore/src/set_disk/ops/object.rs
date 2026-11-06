@@ -4562,7 +4562,14 @@ impl SetDisks {
                 SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
             let (reader, w_size, inline_shards, integrity) = Arc::clone(&erasure)
-                .encode_with_shard_integrity(stream, &mut writers, write_quorum, 1, mode, protect_write)
+                .encode_with_shard_integrity(
+                    stream,
+                    &mut writers,
+                    coding::encode::ShardWritePolicy::object(write_quorum),
+                    1,
+                    mode,
+                    protect_write,
+                )
                 .await?;
             let encode_elapsed = encode_stage_start.map(|stage_start| stage_start.elapsed());
             let encode_ms = encode_elapsed.map(|elapsed| elapsed.as_millis() as u64).unwrap_or_default();

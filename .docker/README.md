@@ -110,6 +110,36 @@ docker compose up -d
 
 ---
 
+## Docker Compose environment values
+
+Use map syntax when quoting environment values in YAML:
+
+```yaml
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data:/data
+      - ./logs:/var/log/rustfs
+    environment:
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:?Set RUSTFS_ACCESS_KEY}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:?Set RUSTFS_SECRET_KEY}"
+```
+
+Create the host directories and grant the container user write access before starting this example; official images run as UID/GID `10001:10001`. Set both credential variables to your own values, then run `docker compose config` to inspect the resolved configuration locally before `docker compose up -d`. The resolved output includes credentials, so do not share it publicly.
+
+With list syntax, use `- RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/` or quote the whole item as `- "RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/"`. Writing `- RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"` passes the inner quotes literally, making this a relative path beginning with `"`, which can fail with `mkdir: cannot create directory '"': Permission denied`. This also applies to addresses and credentials: fix every affected list item, rather than only the log directory. The entrypoint preserves configured values, including literal quotes in valid paths and secrets.
+
+---
+
 ## 🔧 Common Operations
 
 ### Cleaning Up

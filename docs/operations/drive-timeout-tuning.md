@@ -24,6 +24,12 @@ may therefore remain undetected until real I/O reaches it. Missing slots,
 invalidated identities, unhealthy drives, and remote endpoints still get probed
 for recovery. Scanner, heal, and other background services have separate controls.
 
+## Multipart shard completion
+
+UploadPart waits for every still-pending shard operation to finish or reach its existing `RUSTFS_OBJECT_DISK_WRITE_STALL_TIMEOUT` budget (default 30 seconds), bounded further by the remaining `RUSTFS_OBJECT_DISK_WRITE_ABSOLUTE_CAP` when configured. Reaching write quorum does not start the one-second straggler cutoff used by ordinary PUT. This keeps finite slow shards from being discarded on different disks for different parts, which could leave too few disks carrying the entire object at CompleteMultipartUpload.
+
+This does not require every disk to succeed, count an unfinished writer as committed, or reduce the final object's write quorum. Failed and expired writers remain excluded. The tradeoff is that a black-hole peer can delay each part up to the existing operation budget rather than one second after quorum. The stall budget resets per shard-write operation; the optional absolute cap belongs to one part's encoding instance, not the entire multipart upload. Setting both budgets to zero retains the existing unbounded-wait behavior. Actual failures can still leave different parts missing on different disks, in which case completion must fail if a common complete write quorum is unavailable.
+
 ## Background: what these timeouts bound
 
 Every foreground drive operation carries a liveness budget so a hung disk fails

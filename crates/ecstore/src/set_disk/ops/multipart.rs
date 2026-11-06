@@ -112,6 +112,10 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::task::JoinSet;
 
+#[cfg(test)]
+#[path = "multipart_quorum_tests.rs"]
+mod multipart_writer_test_hook;
+
 // The erasure-set width bounds fan-out. Await every opener so errors retain
 // their disk slots and every successful writer remains owned until quorum is checked.
 async fn create_part_writers(
@@ -124,6 +128,13 @@ async fn create_part_writers(
         let Some(disk) = disk else {
             return (None, Some(DiskError::DiskNotFound));
         };
+        #[cfg(test)]
+        if let Some(result) = multipart_writer_test_hook::create_writer(disk, path, length, shard_size).await {
+            return match result {
+                Ok(writer) => (Some(writer), None),
+                Err(error) => (None, Some(error)),
+            };
+        }
         match create_bitrot_writer_with_orig_volume(
             false,
             Some(disk),
@@ -2644,8 +2655,19 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 SmallWritePath::PipelineBatchedLarge => IntegrityEncodeMode::Batched,
                 SmallWritePath::Inline | SmallWritePath::Pipeline => IntegrityEncodeMode::Streaming,
             };
+            let shard_write_policy = crate::erasure::coding::encode::ShardWritePolicy::multipart(write_quorum);
+            #[cfg(test)]
+            let shard_write_policy = multipart_writer_test_hook::write_policy(&shuffle_disks, write_quorum)
+                .unwrap_or(shard_write_policy);
             let (reader, w_size, _, integrity) = Arc::clone(&erasure)
-                .encode_with_shard_integrity(stream, &mut writers, write_quorum, part_id, mode, protected_upload)
+                .encode_with_shard_integrity(
+                    stream,
+                    &mut writers,
+                    shard_write_policy,
+                    part_id,
+                    mode,
+                    protected_upload,
+                )
                 .await?;
 
             if let Some(stage_start) = encode_stage_start {
