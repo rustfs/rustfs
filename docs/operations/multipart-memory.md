@@ -31,6 +31,10 @@ A previously published gauge can remain visible after a statistic becomes unavai
 
 When live requested bytes are unavailable, capture a supported heap profile or allocation/free trace. Preserve attribution to allocation stacks and lifetime; committed bytes and RSS alone cannot establish a leak. Other raw allocator statistics, including page accounting, depend on the allocator build and are not interchangeable with live application bytes.
 
+### Linux transparent huge pages
+
+Linux RustFS binaries disable transparent huge pages for mimalloc by default. This reduces resident memory when reclaimable allocations occupy only part of a huge page. Check `THP_enabled` in `/proc/<pid>/status` and `AnonHugePages` in `/proc/<pid>/smaps_rollup` to verify the running process. Both values should be zero with the default. The Linux binary also defaults to immediately purging free arena ranges. Set `MIMALLOC_PURGE_DELAY` before startup to override the delay in milliseconds.
+
 ### Idle reclaim
 
 The reclaim loop waits for request, delete-tail, scanner, heal, EC and GET-buffer activity to become idle. Continuous traffic can skip reclaim. Check the activity gauges, skipped reasons and idle streak rather than assuming that waiting a fixed period guarantees collection.
