@@ -9862,6 +9862,7 @@ dependencies = [
  "path-absolutize",
  "pin-project-lite",
  "proptest",
+ "quick-xml",
  "rand 0.10.3",
  "ratelimit",
  "rcgen",
@@ -9894,7 +9895,9 @@ dependencies = [
  "rustfs-s3-ops",
  "rustfs-s3-types",
  "rustfs-scanner-metrics",
+ "rustfs-signer",
  "rustfs-storage-api",
+ "rustfs-tls-runtime",
  "rustfs-uring",
  "rustfs-utils",
  "rustix",
@@ -10896,6 +10899,7 @@ dependencies = [
  "time",
  "tracing",
  "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -139,6 +139,7 @@ impl TierType {
 }
 
 pub(crate) const TIER_CREDENTIAL_REDACTED: &str = "REDACTED";
+pub(crate) const AZURE_BLOB_TIER_VERSION: &str = "rustfs-azure-blob-v1";
 
 #[derive(Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -178,6 +179,10 @@ impl Clone for TierConfig {
 }
 
 impl TierConfig {
+    pub(crate) fn is_native_azure(&self) -> bool {
+        self.tier_type == TierType::Azure && self.version == AZURE_BLOB_TIER_VERSION
+    }
+
     pub(crate) fn redacted(&self) -> Self {
         let mut redacted = Self {
             version: self.version.clone(),

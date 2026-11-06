@@ -24035,6 +24035,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-record", &[4])).await;
         let mutation_id = uuid::Uuid::new_v4();
         let intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -24220,6 +24221,7 @@ mod tests {
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan", &[4])).await;
         let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -24281,6 +24283,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-advance", &[4])).await;
         let mutation_id = uuid::Uuid::new_v4();
         let intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -24355,6 +24358,7 @@ mod tests {
 
         let abort_id = uuid::Uuid::new_v4();
         let abort_intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id: abort_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -24397,6 +24401,7 @@ mod tests {
         candidate_digest: [u8; 32],
     ) -> TierMutationIntent {
         TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -25473,6 +25478,7 @@ mod tests {
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan-page", &[4])).await;
         let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
