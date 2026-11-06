@@ -3573,6 +3573,10 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         return Err(Status::resource_exhausted("background resource admission is not enabled"));
     }
 
+    let span = tracing::Span::current();
+    if span.is_disabled() {
+        return Ok(req);
+    }
     let parent_context =
         global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
     if parent_context.has_active_span() {
@@ -3583,7 +3587,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             sampled = span_ref.span_context().is_sampled(),
             "Extracted trace context from incoming gRPC metadata"
         );
-        if let Err(e) = tracing::Span::current().set_parent(parent_context) {
+        if let Err(e) = span.set_parent(parent_context) {
             warn!(
                 event = EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED,
                 component = LOG_COMPONENT_SERVER,
@@ -6184,6 +6188,70 @@ mod tests {
         assert_eq!(event.operation, TelemetryTraceOperation::InternalRpc);
         assert_eq!(event.status, TelemetryTraceStatus::Ok);
         assert!(event.duration > Duration::ZERO);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rpc_auth_disabled_span_does_not_warn_for_valid_trace_context() {
+        global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+        let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
+        let previous_node_name = rustfs_common::get_global_local_node_name().await;
+        rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
+        let make_request = || {
+            let mut headers = storage::gen_tonic_signature_headers("127.0.0.1:9000", "node_service.NodeService", "Ping", None)
+                .expect("test RPC signature should build");
+            headers.insert(
+                "traceparent",
+                HeaderValue::from_static("00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"),
+            );
+            let mut request = Request::new(());
+            request.metadata_mut().as_mut().extend(headers);
+            request.extensions_mut().insert(RpcRequestTarget {
+                uri: "http://127.0.0.1:9000/node_service.NodeService/Ping"
+                    .parse()
+                    .expect("test RPC URI"),
+                method: Method::POST,
+            });
+            request
+        };
+        let request = make_request();
+        let context =
+            global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(request.metadata())));
+        assert!(context.has_active_span(), "the request must exercise valid remote trace context");
+        let log_file = tempfile::NamedTempFile::new().expect("create trace propagation log capture");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(Level::WARN)
+            .with_writer(Arc::new(log_file.reopen().expect("open trace propagation log writer")))
+            .finish();
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::Span::current().is_disabled());
+            assert!(check_auth(request).is_ok(), "disabled tracing must preserve RPC authentication");
+        });
+        let logs = std::fs::read_to_string(log_file.path()).expect("read trace propagation logs");
+        assert!(logs.is_empty(), "disabled tracing is normal and must not emit a warning per RPC: {logs}");
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::layer::SubscriberExt;
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::Registry::default()
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("rpc-trace-test")));
+        let enabled_request = make_request();
+        tracing::subscriber::with_default(subscriber, || {
+            let http_request = HttpRequest::builder()
+                .uri("http://127.0.0.1:9000/node_service.NodeService/Ping")
+                .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .body(())
+                .expect("test RPC HTTP request");
+            let span = make_http_trace_span(&http_request);
+            let _entered = span.enter();
+            assert!(check_auth(enabled_request).is_ok(), "enabled tracing must preserve RPC authentication");
+            assert_eq!(
+                span.context().span().span_context().trace_id().to_string(),
+                "4bf92f3577b34da6a3ce929d0e0e4736",
+                "enabled tracing must retain the remote trace parent"
+            );
+        });
+        rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
     #[tokio::test]
