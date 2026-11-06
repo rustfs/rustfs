@@ -61,7 +61,6 @@ use hyper_util::{
 };
 use metrics::{counter, gauge, histogram};
 use opentelemetry::global;
-use opentelemetry::trace::TraceContextExt;
 use rustfs_common::{
     GlobalReadiness,
     trace_bus::{TelemetryTraceEvent, TelemetryTraceOperation, TelemetryTraceStatus, telemetry_trace_emit},
@@ -123,7 +122,7 @@ type Http3ExternalService = tower::util::BoxCloneService<
     >,
     Box<dyn std::error::Error + Send + Sync>,
 >;
-use tracing::{Level, Span, debug, error, info, instrument, trace, warn};
+use tracing::{Span, debug, error, info, instrument, trace, warn};
 use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 const LABEL_HTTP_METHOD: &str = "method";
@@ -267,7 +266,6 @@ const EVENT_HTTP_CONNECTION_DRAIN: &str = "http_connection_drain";
 const EVENT_HTTP_EARLY_RESPONSE_BODY_DRAIN: &str = "http_early_response_body_drain";
 const EVENT_PEER_ADDR_UNAVAILABLE: &str = "peer_addr_unavailable";
 const EVENT_RPC_SIGNATURE_VERIFICATION_FAILED: &str = "rpc_signature_verification_failed";
-const EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED: &str = "grpc_trace_context_propagation_failed";
 const HEAL_CONTROL_TONIC_RPC_PATH: &str = "/node_service.HealControlService/HealControl";
 const SCANNER_SCOPED_DIRTY_USAGE_ACK_TONIC_RPC_PATH: &str = "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck";
 const TIER_MUTATION_PREPARE_TONIC_RPC_PATH: &str = "/node_service.TierMutationControlService/PrepareTierMutation";
@@ -1791,10 +1789,6 @@ fn trace_on_response<ResBody>(response: &Response<ResBody>, latency: Duration, s
 }
 
 fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
-    if !tracing::enabled!(Level::INFO) {
-        return Span::none();
-    }
-
     let request_context = request
         .extensions()
         .get::<crate::storage_api::server::http::request_context::RequestContext>();
@@ -1802,30 +1796,13 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
     let trace_id = request_context.and_then(|ctx| ctx.trace_id.as_deref()).unwrap_or("unknown");
     let span_id = request_context.and_then(|ctx| ctx.span_id.as_deref()).unwrap_or("unknown");
 
-    let parent_context =
-        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier::new(request.headers())));
-
-    if parent_context.has_active_span() {
-        let span_ref = parent_context.span();
-        trace!(
-            otel_trace_id = %span_ref.span_context().trace_id(),
-            otel_parent_span_id = %span_ref.span_context().span_id(),
-            sampled = span_ref.span_context().is_sampled(),
-            "Extracted trace context from incoming request headers"
-        );
-    } else {
-        trace!("No trace context found in request headers, will create root span");
-    }
-
-    let peer_addr = request_peer_addr(request);
-
     let span = tracing::info_span!("http-request",
         request_id = %request_id,
         trace_id = %trace_id,
         span_id = %span_id,
         status_code = tracing::field::Empty,
         method = %request.method(),
-        peer_addr = %peer_addr,
+        peer_addr = %request_peer_addr(request),
         uri = %redact_sensitive_uri_query(request.uri()),
         version = ?request.version(),
         user_agent = tracing::field::Empty,
@@ -1835,6 +1812,8 @@ fn make_http_trace_span<ReqBody>(request: &HttpRequest<ReqBody>) -> Span {
     if span.is_disabled() {
         return span;
     }
+    let parent_context =
+        global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier::new(request.headers())));
     if let Err(e) = span.set_parent(parent_context) {
         debug!(component = LOG_COMPONENT_SERVER, subsystem = LOG_SUBSYSTEM_HTTP, error = ?e, "Failed to propagate tracing context");
     }
@@ -3019,45 +2998,6 @@ impl<'a> opentelemetry::propagation::Extractor for HeaderMapCarrier<'a> {
     }
 }
 
-/// Adapter that implements the OpenTelemetry [`Extractor`] trait for gRPC
-/// metadata maps so internode gRPC requests can continue distributed traces.
-struct MetadataMapCarrier<'a> {
-    metadata: &'a tonic::metadata::MetadataMap,
-}
-
-impl<'a> MetadataMapCarrier<'a> {
-    fn new(metadata: &'a tonic::metadata::MetadataMap) -> Self {
-        Self { metadata }
-    }
-}
-
-impl<'a> opentelemetry::propagation::Extractor for MetadataMapCarrier<'a> {
-    fn get(&self, key: &str) -> Option<&str> {
-        self.metadata.get(key).and_then(|v| v.to_str().ok())
-    }
-
-    fn keys(&self) -> Vec<&str> {
-        self.metadata
-            .keys()
-            .filter_map(|key| match key {
-                tonic::metadata::KeyRef::Ascii(v) => Some(v.as_str()),
-                tonic::metadata::KeyRef::Binary(_) => None,
-            })
-            .collect()
-    }
-
-    fn get_all(&self, key: &str) -> Option<Vec<&str>> {
-        let values = self
-            .metadata
-            .get_all(key)
-            .iter()
-            .filter_map(|value| value.to_str().ok())
-            .collect::<Vec<_>>();
-
-        if values.is_empty() { None } else { Some(values) }
-    }
-}
-
 /// Process a single incoming TCP connection.
 ///
 /// This function is executed in a new Tokio task, and it will:
@@ -3573,30 +3513,6 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
         return Err(Status::resource_exhausted("background resource admission is not enabled"));
     }
 
-    let span = tracing::Span::current();
-    if span.is_disabled() {
-        return Ok(req);
-    }
-    let parent_context =
-        global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(req.metadata())));
-    if parent_context.has_active_span() {
-        let span_ref = parent_context.span();
-        debug!(
-            otel_trace_id = %span_ref.span_context().trace_id(),
-            otel_parent_span_id = %span_ref.span_context().span_id(),
-            sampled = span_ref.span_context().is_sampled(),
-            "Extracted trace context from incoming gRPC metadata"
-        );
-        if let Err(e) = span.set_parent(parent_context) {
-            warn!(
-                event = EVENT_GRPC_TRACE_CONTEXT_PROPAGATION_FAILED,
-                component = LOG_COMPONENT_SERVER,
-                subsystem = LOG_SUBSYSTEM_HTTP,
-                error = ?e,
-                "Failed to propagate tracing context from gRPC metadata"
-            );
-        }
-    }
     Ok(req)
 }
 
@@ -3687,7 +3603,7 @@ mod tests {
     use http_body_util::{BodyExt, Empty, Full};
     use metrics::with_local_recorder;
     use metrics_util::debugging::{DebugValue, DebuggingRecorder};
-    use opentelemetry::propagation::Extractor;
+    use opentelemetry::{propagation::Extractor, trace::TraceContextExt};
     use std::collections::HashMap;
     use std::convert::Infallible;
     use std::future::{Future, Ready};
@@ -3699,6 +3615,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::sync::{Notify, mpsc};
     use tower::{Layer, Service, ServiceBuilder};
+    use tracing::Level;
 
     const DIGEST_DELETE_XML: &str = "<Delete><Object><Key>safe-object</Key></Object></Delete>";
 
@@ -6190,10 +6107,92 @@ mod tests {
         assert!(event.duration > Duration::ZERO);
     }
 
+    #[derive(Debug)]
+    struct CountingTracePropagator {
+        inner: opentelemetry_sdk::propagation::TraceContextPropagator,
+        extractions: Arc<AtomicUsize>,
+    }
+
+    impl opentelemetry::propagation::TextMapPropagator for CountingTracePropagator {
+        fn inject_context(&self, cx: &opentelemetry::Context, injector: &mut dyn opentelemetry::propagation::Injector) {
+            self.inner.inject_context(cx, injector);
+        }
+
+        fn extract_with_context(&self, cx: &opentelemetry::Context, extractor: &dyn Extractor) -> opentelemetry::Context {
+            self.extractions.fetch_add(1, Ordering::Relaxed);
+            self.inner.extract_with_context(cx, extractor)
+        }
+
+        fn fields(&self) -> opentelemetry::propagation::text_map_propagator::FieldIter<'_> {
+            self.inner.fields()
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn http_trace_disabled_span_skips_parent_extraction() {
+        let extractions = Arc::new(AtomicUsize::new(0));
+        global::set_text_map_propagator(CountingTracePropagator {
+            inner: opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            extractions: Arc::clone(&extractions),
+        });
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt};
+        let subscriber = tracing_subscriber::Registry::default().with(
+            tracing_subscriber::fmt::layer().with_filter(tracing_subscriber::filter::filter_fn(|metadata| !metadata.is_span())),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(tracing::enabled!(Level::INFO), "the generic hint must not decide span filtering");
+            let request = HttpRequest::builder()
+                .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .body(())
+                .expect("test HTTP request");
+            assert!(make_http_trace_span(&request).is_disabled());
+            assert_eq!(extractions.load(Ordering::Relaxed), 0, "disabled spans must not parse a remote parent");
+        });
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn http_trace_span_only_subscriber_keeps_remote_parent() {
+        use opentelemetry::trace::TracerProvider as _;
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt};
+
+        let extractions = Arc::new(AtomicUsize::new(0));
+        global::set_text_map_propagator(CountingTracePropagator {
+            inner: opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            extractions: Arc::clone(&extractions),
+        });
+        let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
+        let subscriber = tracing_subscriber::Registry::default().with(
+            tracing_opentelemetry::layer()
+                .with_tracer(provider.tracer("span-only-test"))
+                .with_filter(tracing_subscriber::filter::filter_fn(|metadata| metadata.is_span())),
+        );
+        tracing::subscriber::with_default(subscriber, || {
+            assert!(!tracing::enabled!(Level::INFO), "a span-only subscriber rejects generic hints");
+            let request = HttpRequest::builder()
+                .header("traceparent", "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01")
+                .body(())
+                .expect("test HTTP request");
+            let span = make_http_trace_span(&request);
+            assert!(!span.is_disabled(), "the span's own filter must determine whether it is enabled");
+            let _entered = span.enter();
+            assert_eq!(
+                span.context().span().span_context().trace_id().to_string(),
+                "4bf92f3577b34da6a3ce929d0e0e4736"
+            );
+            assert_eq!(extractions.load(Ordering::Relaxed), 1);
+        });
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn rpc_auth_disabled_span_does_not_warn_for_valid_trace_context() {
-        global::set_text_map_propagator(opentelemetry_sdk::propagation::TraceContextPropagator::new());
+        let extractions = Arc::new(AtomicUsize::new(0));
+        global::set_text_map_propagator(CountingTracePropagator {
+            inner: opentelemetry_sdk::propagation::TraceContextPropagator::new(),
+            extractions: Arc::clone(&extractions),
+        });
         let _ = rustfs_credentials::set_global_rpc_secret("rpc-http-test-secret".to_string());
         let previous_node_name = rustfs_common::get_global_local_node_name().await;
         rustfs_common::set_global_local_node_name("127.0.0.1:9000").await;
@@ -6215,8 +6214,8 @@ mod tests {
             request
         };
         let request = make_request();
-        let context =
-            global::get_text_map_propagator(|propagator| propagator.extract(&MetadataMapCarrier::new(request.metadata())));
+        let incoming_headers = request.metadata().clone().into_headers();
+        let context = global::get_text_map_propagator(|propagator| propagator.extract(&HeaderMapCarrier::new(&incoming_headers)));
         assert!(context.has_active_span(), "the request must exercise valid remote trace context");
         let log_file = tempfile::NamedTempFile::new().expect("create trace propagation log capture");
         let subscriber = tracing_subscriber::fmt()
@@ -6224,6 +6223,7 @@ mod tests {
             .with_max_level(Level::WARN)
             .with_writer(Arc::new(log_file.reopen().expect("open trace propagation log writer")))
             .finish();
+        extractions.store(0, Ordering::Relaxed);
         tracing::subscriber::with_default(subscriber, || {
             assert!(tracing::Span::current().is_disabled());
             assert!(check_auth(request).is_ok(), "disabled tracing must preserve RPC authentication");
@@ -6231,11 +6231,18 @@ mod tests {
         let logs = std::fs::read_to_string(log_file.path()).expect("read trace propagation logs");
         assert!(logs.is_empty(), "disabled tracing is normal and must not emit a warning per RPC: {logs}");
         use opentelemetry::trace::TracerProvider as _;
-        use tracing_subscriber::layer::SubscriberExt;
+        use tracing_subscriber::{Layer as _, layer::SubscriberExt};
         let provider = opentelemetry_sdk::trace::SdkTracerProvider::builder().build();
         let subscriber = tracing_subscriber::Registry::default()
-            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("rpc-trace-test")));
+            .with(tracing_opentelemetry::layer().with_tracer(provider.tracer("rpc-trace-test")))
+            .with(
+                tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Arc::new(log_file.reopen().expect("open enabled trace log writer")))
+                    .with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            );
         let enabled_request = make_request();
+        extractions.store(0, Ordering::Relaxed);
         tracing::subscriber::with_default(subscriber, || {
             let http_request = HttpRequest::builder()
                 .uri("http://127.0.0.1:9000/node_service.NodeService/Ping")
@@ -6246,11 +6253,18 @@ mod tests {
             let _entered = span.enter();
             assert!(check_auth(enabled_request).is_ok(), "enabled tracing must preserve RPC authentication");
             assert_eq!(
+                extractions.load(Ordering::Relaxed),
+                1,
+                "the HTTP span factory must be the only parent extractor"
+            );
+            assert_eq!(
                 span.context().span().span_context().trace_id().to_string(),
                 "4bf92f3577b34da6a3ce929d0e0e4736",
                 "enabled tracing must retain the remote trace parent"
             );
         });
+        let logs = std::fs::read_to_string(log_file.path()).expect("read enabled trace logs");
+        assert!(logs.is_empty(), "authentication must not reparent an already active HTTP span: {logs}");
         rustfs_common::set_global_local_node_name(&previous_node_name).await;
     }
 
