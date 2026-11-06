@@ -4965,15 +4965,19 @@ fn resolve_complete_etag(
     uploaded_parts: &[CompletePart],
     stored_parts: &[ObjectPartInfo],
 ) -> (String, bool) {
-    let computed = get_complete_multipart_md5(uploaded_parts);
     let preserved = opts
         .preserve_etag
         .as_ref()
         .filter(|etag| !etag.is_empty())
         .or_else(|| opts.user_defined.get("etag"));
-    let encrypted_etag = !stored_parts.is_empty()
-        && stored_parts.iter().all(|part| part.encrypted_etag)
-        && preserved.is_none_or(|etag| etag == &computed);
+    let protected_parts = !stored_parts.is_empty() && stored_parts.iter().all(|part| part.encrypted_etag);
+    if let Some(etag) = preserved
+        && !protected_parts
+    {
+        return (etag.clone(), false);
+    }
+    let computed = get_complete_multipart_md5(uploaded_parts);
+    let encrypted_etag = protected_parts && preserved.is_none_or(|etag| etag == &computed);
     (preserved.cloned().unwrap_or(computed), encrypted_etag)
 }
 
@@ -16294,40 +16298,56 @@ mod tests {
 
     #[test]
     fn complete_etag_proof_requires_all_selected_parts_and_matching_overrides() {
-        let uploaded = vec![CompletePart {
-            part_num: 1,
-            etag: Some("0123456789abcdef0123456789abcdef".to_owned()),
-            ..Default::default()
-        }];
-        let protected = ObjectPartInfo {
-            encrypted_etag: true,
-            ..Default::default()
-        };
-        let legacy = ObjectPartInfo::default();
-        let computed = get_complete_multipart_md5(&uploaded);
-        for (stored, expected) in [
-            (vec![protected.clone()], true),
-            (vec![protected.clone(), protected.clone()], true),
-            (vec![protected.clone(), legacy.clone()], false),
-            (vec![legacy], false),
-            (vec![], false),
-        ] {
-            let result = resolve_complete_etag(&ObjectOptions::default(), &uploaded, &stored);
-            assert_eq!(result, (computed.clone(), expected));
-        }
-        for preserved in ["foreign-etag", computed.as_str()] {
-            for opts in [
-                ObjectOptions {
-                    preserve_etag: Some(preserved.to_owned()),
+        for proofs in [&[][..], &[true], &[true, true], &[true, false], &[false]] {
+            let stored: Vec<_> = proofs
+                .iter()
+                .enumerate()
+                .map(|(index, &encrypted_etag)| ObjectPartInfo {
+                    number: index + 1,
+                    etag: "0123456789abcdef0123456789abcdef".to_owned(),
+                    encrypted_etag,
                     ..Default::default()
-                },
-                ObjectOptions {
-                    user_defined: HashMap::from([("etag".to_owned(), preserved.to_owned())]),
+                })
+                .collect();
+            let uploaded: Vec<_> = stored
+                .iter()
+                .map(|part| CompletePart {
+                    part_num: part.number,
+                    etag: Some(part.etag.clone()),
                     ..Default::default()
-                },
-            ] {
-                let result = resolve_complete_etag(&opts, &uploaded, std::slice::from_ref(&protected));
-                assert_eq!(result, (preserved.to_owned(), preserved == computed));
+                })
+                .collect();
+            let computed = get_complete_multipart_md5(&uploaded);
+            let protected = !proofs.is_empty() && proofs.iter().all(|&proof| proof);
+            assert_eq!(
+                resolve_complete_etag(&ObjectOptions::default(), &uploaded, &stored),
+                (computed.clone(), protected)
+            );
+
+            for preserved in ["foreign-etag", computed.as_str(), ""] {
+                for opts in [
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        user_defined: HashMap::from([("etag".to_owned(), preserved.to_owned())]),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        user_defined: HashMap::from([("etag".to_owned(), "metadata-etag".to_owned())]),
+                        ..Default::default()
+                    },
+                ] {
+                    let expected_etag = if !preserved.is_empty() || opts.preserve_etag.is_none() {
+                        preserved
+                    } else {
+                        opts.user_defined.get("etag").map_or(computed.as_str(), String::as_str)
+                    };
+                    let result = resolve_complete_etag(&opts, &uploaded, &stored);
+                    assert_eq!(result, (expected_etag.to_owned(), protected && expected_etag == computed));
+                }
             }
         }
     }
