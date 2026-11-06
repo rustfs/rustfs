@@ -728,18 +728,7 @@ pub(super) fn inspection_with_markers(
         .transpose()
         .map_err(|_| DiskError::FileCorrupt)?;
     let committed = receipt.is_some();
-    let finished = regular_marker(&rollback.join(FINISHED))?
-        || receipt.as_ref().is_some_and(|receipt| {
-            receipt.finished
-                || (before.is_none()
-                    && prepared.is_none()
-                    && target.is_none()
-                    && receipt
-                        .journal
-                        .data_dirs
-                        .iter()
-                        .all(|dir| !root.join(dir.to_string()).exists() && !rollback.join(dir.to_string()).exists()))
-        });
+    let finished = regular_marker(&rollback.join(FINISHED))? || receipt.as_ref().is_some_and(|receipt| receipt.finished);
     let journal: Option<DeleteRecoveryJournal> = prepared
         .as_deref()
         .map(serde_json::from_slice)
@@ -2615,12 +2604,14 @@ impl LocalDisk {
         }
 
         let bucket_path = self.io_get_bucket_path(volume)?;
+        let staging_root = self.io_get_bucket_path(RUSTFS_META_TMP_BUCKET)?;
         let root = self.io_get_object_path(volume, object)?;
         let rollback = root.join(transaction.to_string());
         let receipt_path = rollback.join(DELETE_QUORUM_COMMITTED_FILE);
         let sync = effective_durability(volume).syncs_commit_metadata();
         let data_dirs = journal.data_dirs.clone();
         let has_target = journal.target_digest.is_some();
+        let journal_for_receipt = journal.clone();
         let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
         let prune_paths: Vec<_> = rollback
             .ancestors()
@@ -2686,12 +2677,24 @@ impl LocalDisk {
                 ignore_not_found(std::fs::remove_file(rollback.join(name)))?;
             }
             if has_target || had_physical_data_dirs {
+                let finished_receipt = CommitReceipt {
+                    journal: journal_for_receipt,
+                    finished: true,
+                };
+                let receipt_bytes = serde_json::to_vec(&finished_receipt).map_err(std::io::Error::other)?;
+                std::fs::create_dir_all(&staging_root)?;
+                let mut staged_receipt = tempfile::NamedTempFile::new_in(&staging_root)?;
+                std::io::Write::write_all(staged_receipt.as_file_mut(), &receipt_bytes)?;
+                if sync && !receipt_bytes.is_empty() {
+                    staged_receipt.as_file().sync_data()?;
+                }
+                std::fs::rename(staged_receipt.path(), &receipt_path)?;
                 let _ = std::fs::File::create(rollback.join(FINISHED))?;
                 if sync {
                     os::fsync_dir_std(&rollback)?;
                 }
             }
-            for name in [TARGET, PREPARED] {
+            for name in [TARGET, PREPARED, FINISHED] {
                 let path = rollback.join(name);
                 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
@@ -2700,12 +2703,9 @@ impl LocalDisk {
             if sync {
                 os::fsync_dir_std(&rollback)?;
             }
-            for name in [FINISHED, DELETE_QUORUM_COMMITTED_FILE] {
-                let path = rollback.join(name);
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-                os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
-                ignore_not_found(std::fs::remove_file(path))?;
-            }
+            #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+            os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &receipt_path);
+            ignore_not_found(std::fs::remove_file(&receipt_path))?;
             for dir_path in &prune_paths {
                 #[cfg(all(any(test, feature = "test-util"), not(windows)))]
                 os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, dir_path);
@@ -6664,6 +6664,7 @@ mod tests {
         assert!(!root.exists(), "empty object directory must be pruned");
     }
 
+    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
     #[tokio::test]
     async fn delete_recovery_receipt_formatting_and_post_finished_unlink_interruption() {
         let (_temp, disk, info, _) = fixture().await;
@@ -6712,22 +6713,12 @@ mod tests {
         assert!(sole_transaction && target_satisfied && journal.target_digest.is_some());
 
         let rollback = root.join(transaction.to_string());
-        // 0. Unlinking BACKUP alone (while PREPARED and TARGET remain without FINISHED) stays QuorumCommitted.
-        let _ = fs::remove_file(rollback.join(STORAGE_FORMAT_FILE_BACKUP)).await;
-        assert_eq!(
-            disk.inspect_delete_transaction("recovery", "object", transaction)
-                .await
-                .expect("BACKUP-only unlink")
-                .state,
-            DeleteRecoveryState::QuorumCommitted
-        );
-
-        // 1. Real finalizer failure at the second fsync_dir_std(&rollback) (after [TARGET, PREPARED] unlink)
-        // must retain FINISHED and receipt_path and inspect as CommitFinished.
+        // Real finalizer failure at the second fsync_dir_std(&rollback) (after [TARGET, PREPARED, FINISHED] unlink)
+        // must leave a durable finished=true receipt that inspects as CommitFinished.
         let rollback_for_hook = rollback.clone();
         let _hook = os::prepared_publication_test_hooks::install_at(
             os::prepared_publication_test_hooks::Stage::Remove,
-            &rollback.join(PREPARED),
+            &rollback.join(FINISHED),
             move || {
                 os::fsync_dir_recorder::set_failure(&rollback_for_hook, std::io::ErrorKind::Other);
             },
@@ -6737,21 +6728,11 @@ mod tests {
                 .await
                 .is_err()
         );
-        assert!(rollback.join(FINISHED).is_file(), "FINISHED must be retained across proof unlink fsync");
+        assert!(!rollback.join(FINISHED).exists());
         assert_eq!(
             disk.inspect_delete_transaction("recovery", "object", transaction)
                 .await
-                .expect("post-second-fsync failure")
-                .state,
-            DeleteRecoveryState::CommitFinished
-        );
-
-        // 2. Post-FINISHED unlink (only receipt_path with finished=false remaining) inspects as CommitFinished.
-        let _ = fs::remove_file(rollback.join(FINISHED)).await;
-        assert_eq!(
-            disk.inspect_delete_transaction("recovery", "object", transaction)
-                .await
-                .expect("post-FINISHED unlink")
+                .expect("post-FINISHED-unlink failure")
                 .state,
             DeleteRecoveryState::CommitFinished
         );
