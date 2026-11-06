@@ -24,7 +24,7 @@ use http::header::{
     ACCESS_CONTROL_EXPOSE_HEADERS, ACCESS_CONTROL_REQUEST_HEADERS, ACCESS_CONTROL_REQUEST_METHOD, AUTHORIZATION, ORIGIN, REFERER,
     USER_AGENT, VARY,
 };
-use http::{HeaderMap, HeaderName, HeaderValue, Method};
+use http::{HeaderMap, HeaderValue, Method};
 use http_body_util::{BodyExt, Full, LengthLimitError, Limited};
 use hyper::body::Body as HttpBody;
 use hyper::server::conn::http1;
@@ -66,38 +66,44 @@ const EVENT_WEBDAV_CONNECTION_CAP_STATE: &str = "webdav_connection_cap_state";
 type WebDavBody = Pin<Box<dyn HttpBody<Data = Bytes, Error = io::Error> + Send>>;
 
 /// Listener-wide browser policy, parsed once and shared across connections.
-struct WebDavCors {
-    origins: Vec<HeaderValue>,
-    wildcard: bool,
+enum WebDavCors {
+    Disabled,
+    Wildcard,
+    Origins(Vec<HeaderValue>),
 }
 
 impl WebDavCors {
     const METHODS: &str = "OPTIONS, GET, HEAD, PUT, DELETE, PATCH, PROPFIND, PROPPATCH, MKCOL, COPY, MOVE, LOCK, UNLOCK";
 
     fn new(origins: &str) -> Self {
-        let origins = origins.trim();
-        Self {
-            wildcard: origins == "*",
-            origins: origins
-                .split(',')
-                .map(str::trim)
-                .filter(|origin| !origin.is_empty() && *origin != "*")
-                .filter_map(|origin| HeaderValue::from_str(origin).ok())
-                .collect(),
+        match origins.trim() {
+            "" => Self::Disabled,
+            "*" => Self::Wildcard,
+            origins => Self::Origins(
+                origins
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|origin| !origin.is_empty() && *origin != "*")
+                    .filter_map(|origin| HeaderValue::from_str(origin).ok())
+                    .collect(),
+            ),
         }
     }
 
     fn allowed_origin(&self, headers: &HeaderMap) -> Option<HeaderValue> {
+        if matches!(self, Self::Disabled) {
+            return None;
+        }
         let mut origins = headers.get_all(ORIGIN).iter();
         let origin = origins.next()?;
         let value = origin.to_str().ok()?;
         if origins.next().is_some() || value.is_empty() || value.bytes().any(|byte| byte.is_ascii_whitespace() || byte == b',') {
             return None;
         }
-        if self.wildcard {
-            Some(HeaderValue::from_static("*"))
-        } else {
-            self.origins.iter().find(|allowed| *allowed == origin).cloned()
+        match self {
+            Self::Origins(allowed) => allowed.iter().find(|allowed| *allowed == origin).cloned(),
+            Self::Wildcard => Some(HeaderValue::from_static("*")),
+            Self::Disabled => None,
         }
     }
 
@@ -130,7 +136,7 @@ impl WebDavCors {
         }
         if let Some(origin) = allow_origin {
             response.headers_mut().insert(ACCESS_CONTROL_ALLOW_ORIGIN, origin);
-            if !self.wildcard {
+            if matches!(self, Self::Origins(_)) {
                 response
                     .headers_mut()
                     .insert(ACCESS_CONTROL_ALLOW_CREDENTIALS, HeaderValue::from_static("true"));
@@ -149,16 +155,12 @@ impl WebDavCors {
         let mut methods = headers.get_all(ACCESS_CONTROL_REQUEST_METHOD).iter();
         let method = methods.next().and_then(|value| value.to_str().ok());
         let method_allowed = method.is_some_and(|method| Self::METHODS.split(", ").any(|allowed| allowed == method));
-        let headers_allowed = headers.get_all(ACCESS_CONTROL_REQUEST_HEADERS).iter().all(|value| {
-            value.to_str().is_ok_and(|value| {
-                value
-                    .split(',')
-                    .all(|name| HeaderName::from_bytes(name.trim().as_bytes()).is_ok())
-            })
-        });
-        if !origin_allowed || !method_allowed || methods.next().is_some() || !headers_allowed {
+        if !origin_allowed || !method_allowed || methods.next().is_some() {
             return error_response(StatusCode::FORBIDDEN, "CORS preflight denied");
         }
+        let Ok(allowed_headers) = cors_requested_headers(headers) else {
+            return error_response(StatusCode::FORBIDDEN, "CORS preflight denied");
+        };
 
         let mut response = Response::new(fixed_body(Bytes::new()));
         *response.status_mut() = StatusCode::NO_CONTENT;
@@ -167,11 +169,71 @@ impl WebDavCors {
             .insert(ACCESS_CONTROL_ALLOW_METHODS, HeaderValue::from_static(Self::METHODS));
         // A wildcard does not cover Authorization, and is not a wildcard for
         // credentialed requests. Echo the validated names explicitly instead.
-        for value in headers.get_all(ACCESS_CONTROL_REQUEST_HEADERS) {
-            response.headers_mut().append(ACCESS_CONTROL_ALLOW_HEADERS, value.clone());
+        if let Some(value) = allowed_headers {
+            response.headers_mut().insert(ACCESS_CONTROL_ALLOW_HEADERS, value);
         }
         response
     }
+}
+
+/// Validate borrowed field names, reusing an ordinary single header value.
+/// RFC 9110 section 5.6.1.2 requires recipients to ignore empty list elements;
+/// normalize those and repeated fields into one nonempty response list.
+fn cors_requested_headers(headers: &HeaderMap) -> Result<Option<HeaderValue>, ()> {
+    let values = headers.get_all(ACCESS_CONTROL_REQUEST_HEADERS);
+    let mut fields = values.iter();
+    let Some(first) = fields.next() else {
+        return Ok(None);
+    };
+    let mut normalize = fields.next().is_some();
+    let mut has_name = false;
+    for value in values.iter() {
+        for name in value.to_str().map_err(|_| ())?.split(',') {
+            let name = name.trim_matches([' ', '\t']);
+            if name.is_empty() {
+                normalize = true;
+                continue;
+            }
+            if !is_cors_header_name(name) {
+                return Err(());
+            }
+            has_name = true;
+        }
+    }
+    if !has_name {
+        return Err(());
+    }
+    if !normalize {
+        return Ok(Some(first.clone()));
+    }
+
+    let capacity = values.iter().map(|value| value.as_bytes().len() + 1).sum();
+    let mut normalized = String::with_capacity(capacity);
+    for value in values {
+        for name in value.to_str().map_err(|_| ())?.split(',') {
+            let name = name.trim_matches([' ', '\t']);
+            if name.is_empty() {
+                continue;
+            }
+            if !normalized.is_empty() {
+                normalized.push(',');
+            }
+            normalized.push_str(name);
+        }
+    }
+    HeaderValue::try_from(normalized).map(Some).map_err(|_| ())
+}
+
+/// RFC 9110 field-name is a nonempty sequence of ASCII tchar bytes.
+fn is_cors_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' | b'^' | b'_' | b'`' | b'|' | b'~'
+                )
+        })
 }
 
 fn policy_request_headers(headers: &HeaderMap) -> HeaderMap {
@@ -461,15 +523,14 @@ where
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        // These borrows live for the connection. Preflights complete before
+        // invoking the closure that clones the backend for an actual request.
+        let cors = cors.as_ref();
+        let storage = &storage;
         let service = service_fn(move |req: Request<hyper::body::Incoming>| {
-            let storage = storage.clone();
-            let cors = cors.clone();
-            async move {
-                cors.handle(req, |req| {
-                    Self::handle_request(req, storage, source_ip, secure_transport, max_body_size, request_timeout)
-                })
-                .await
-            }
+            cors.handle(req, move |req| {
+                Self::handle_request(req, storage.clone(), source_ip, secure_transport, max_body_size, request_timeout)
+            })
         });
 
         // A peer that opens a connection and dribbles (or never finishes)
@@ -822,6 +883,7 @@ mod tests {
     use s3s::dto::*;
     use std::fmt::{Debug, Formatter};
     use std::net::{Ipv4Addr, SocketAddr};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::task::{Context, Poll};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
@@ -830,8 +892,19 @@ mod tests {
 
     /// Storage double for the connection-level tests. Those requests are
     /// rejected before authentication succeeds, so storage is never reached.
-    #[derive(Clone)]
-    struct StubStorage;
+    #[derive(Default)]
+    struct StubStorage {
+        clone_count: Arc<AtomicUsize>,
+    }
+
+    impl Clone for StubStorage {
+        fn clone(&self) -> Self {
+            self.clone_count.fetch_add(1, Ordering::Relaxed);
+            Self {
+                clone_count: self.clone_count.clone(),
+            }
+        }
+    }
 
     impl Debug for StubStorage {
         fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
@@ -1005,10 +1078,16 @@ mod tests {
     const BROWSER_ORIGIN: &str = "https://dav-console.example";
 
     async fn cors_http_request(origins: &str, method: &str, headers: &str) -> String {
+        cors_http_exchange(origins, method, headers).await.0
+    }
+
+    async fn cors_http_exchange(origins: &str, method: &str, headers: &str) -> (String, usize) {
+        let storage = StubStorage::default();
+        let clone_count = storage.clone_count.clone();
         let (mut client, server) = tokio::io::duplex(8192);
         let connection = tokio::spawn(WebDavServer::<StubStorage>::handle_connection_impl(
             TokioIo::new(server),
-            StubStorage,
+            storage,
             TEST_IP,
             false,
             16,
@@ -1027,7 +1106,10 @@ mod tests {
             .expect("connection shutdown timeout")
             .expect("connection task")
             .expect("serve browser request");
-        String::from_utf8(response).expect("ASCII HTTP response")
+        (
+            String::from_utf8(response).expect("ASCII HTTP response"),
+            clone_count.load(Ordering::Relaxed),
+        )
     }
 
     fn browser_request(method: &str, path: &str) -> Request<Full<Bytes>> {
@@ -1152,12 +1234,58 @@ mod tests {
                 "Origin: {BROWSER_ORIGIN}\r\nAccess-Control-Request-Method: PROPFIND\r\nAccess-Control-Request-Headers: invalid header\r\n"
             ),
             format!(
-                "Origin: {BROWSER_ORIGIN}\r\nAccess-Control-Request-Method: PROPFIND\r\nAccess-Control-Request-Headers: authorization,\r\n"
+                "Origin: {BROWSER_ORIGIN}\r\nAccess-Control-Request-Method: PROPFIND\r\nAccess-Control-Request-Headers: , \t,\r\n"
             ),
         ] {
             let response = cors_http_request(BROWSER_ORIGIN, "OPTIONS", &headers).await;
             assert!(response.starts_with("HTTP/1.1 403"), "{headers}: {response}");
             assert!(!response.contains("access-control-allow-methods:"));
+        }
+    }
+
+    #[tokio::test]
+    async fn webdav_cors_normalizes_header_lists() {
+        for requested in [
+            "authorization, ,depth,",
+            " , authorization,\tdepth , ",
+            "authorization,\r\nAccess-Control-Request-Headers: , depth,",
+        ] {
+            let headers = format!(
+                "Origin: {BROWSER_ORIGIN}\r\nAccess-Control-Request-Method: PROPFIND\r\nAccess-Control-Request-Headers: {requested}\r\n"
+            );
+            let response = cors_http_request(BROWSER_ORIGIN, "OPTIONS", &headers).await;
+            assert!(response.starts_with("HTTP/1.1 204"), "{response}");
+            assert!(response.contains("access-control-allow-headers: authorization,depth\r\n"));
+        }
+    }
+
+    #[test]
+    fn webdav_cors_header_name_validation_matches_http_tokens() {
+        for byte in u8::MIN..=u8::MAX {
+            let bytes = [b'x', byte, b'y'];
+            let actual = std::str::from_utf8(&bytes).is_ok_and(is_cors_header_name);
+            assert_eq!(actual, http::HeaderName::from_bytes(&bytes).is_ok(), "byte {byte}");
+        }
+        assert!(!is_cors_header_name(""));
+        assert!(is_cors_header_name("Authorization"));
+        assert!(is_cors_header_name("!#$%&'*+-.^_`|~"));
+    }
+
+    #[tokio::test]
+    async fn webdav_cors_only_clones_backend_for_actual_requests() {
+        for (method, requested_method, expected_clones, expected_status) in [
+            ("OPTIONS", Some("PROPFIND"), 0, "204"),
+            ("OPTIONS", Some("TRACE"), 0, "403"),
+            ("OPTIONS", None, 1, "401"),
+            ("PUT", Some("PUT"), 1, "401"),
+        ] {
+            let mut headers = format!("Origin: {BROWSER_ORIGIN}\r\n");
+            if let Some(requested_method) = requested_method {
+                headers.push_str(&format!("Access-Control-Request-Method: {requested_method}\r\n"));
+            }
+            let (response, clones) = cors_http_exchange(BROWSER_ORIGIN, method, &headers).await;
+            assert!(response.starts_with(&format!("HTTP/1.1 {expected_status}")), "{response}");
+            assert_eq!(clones, expected_clones, "{method} with {requested_method:?}");
         }
     }
 
@@ -1397,7 +1525,7 @@ mod tests {
 
         let conn = tokio::spawn(WebDavServer::<StubStorage>::handle_connection_impl(
             TokioIo::new(server),
-            StubStorage,
+            StubStorage::default(),
             TEST_IP,
             false,
             1024,
@@ -1427,7 +1555,7 @@ mod tests {
             request_timeout_secs: 30,
             max_connections: 1,
         };
-        let server = WebDavServer::new(config, StubStorage).await.expect("build server");
+        let server = WebDavServer::new(config, StubStorage::default()).await.expect("build server");
 
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await.expect("bind listener");
         let addr = listener.local_addr().expect("listener addr");
