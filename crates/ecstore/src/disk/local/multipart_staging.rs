@@ -398,7 +398,9 @@ impl LocalDisk {
         let source_path = source_path.to_owned();
         let incoming = incoming.clone();
         let sync_directory = effective_durability(destination_volume).syncs_data_shards();
-        let fresh_head = os::run_cancellable_blocking_namespace_operation(Arc::clone(&staging.lease), move |cancelled| {
+        let sync_lane = sync_directory && incoming.data.is_none() && !incoming.is_remote();
+        let lease = Arc::clone(&staging.lease);
+        let fresh_head = os::run_cancellable_blocking_namespace_operation_with_sync(lease, sync_lane, move |cancelled| {
             if cancelled() {
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "multipart staging cancelled"));
             }
