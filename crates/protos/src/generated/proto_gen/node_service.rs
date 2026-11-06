@@ -924,6 +924,9 @@ pub struct GenerallyLockResponse {
     /// JSON serialized LockInfo
     #[prost(string, optional, tag = "3")]
     pub lock_info: ::core::option::Option<::prost::alloc::string::String>,
+    /// Only populated by unlock RPCs.
+    #[prost(enumeration = "LockReleaseStatus", tag = "4")]
+    pub release_status: i32,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct BatchGenerallyLockRequest {
@@ -939,6 +942,9 @@ pub struct GenerallyLockResult {
     /// JSON serialized LockInfo
     #[prost(string, optional, tag = "3")]
     pub lock_info: ::core::option::Option<::prost::alloc::string::String>,
+    /// Per-ID result for unlock batches.
+    #[prost(enumeration = "LockReleaseStatus", tag = "4")]
+    pub release_status: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct BatchGenerallyLockResponse {
@@ -1871,6 +1877,37 @@ impl CompareAndUpdateFileOutcome {
             "COMPARE_AND_UPDATE_FILE_UPDATED" => Some(Self::CompareAndUpdateFileUpdated),
             "COMPARE_AND_UPDATE_FILE_MISSING" => Some(Self::CompareAndUpdateFileMissing),
             "COMPARE_AND_UPDATE_FILE_MISMATCH" => Some(Self::CompareAndUpdateFileMismatch),
+            _ => None,
+        }
+    }
+}
+/// Authoritative unlock result for cleanup of a previously confirmed grant.
+/// Older peers omit this field. Unspecified does not confirm absence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum LockReleaseStatus {
+    Unspecified = 0,
+    Released = 1,
+    AlreadyAbsent = 2,
+}
+impl LockReleaseStatus {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "LOCK_RELEASE_STATUS_UNSPECIFIED",
+            Self::Released => "LOCK_RELEASE_STATUS_RELEASED",
+            Self::AlreadyAbsent => "LOCK_RELEASE_STATUS_ALREADY_ABSENT",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "LOCK_RELEASE_STATUS_UNSPECIFIED" => Some(Self::Unspecified),
+            "LOCK_RELEASE_STATUS_RELEASED" => Some(Self::Released),
+            "LOCK_RELEASE_STATUS_ALREADY_ABSENT" => Some(Self::AlreadyAbsent),
             _ => None,
         }
     }
