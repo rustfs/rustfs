@@ -26,6 +26,7 @@ use crate::{
 
 /// Default shard count for guard storage (must be power of 2)
 const DEFAULT_GUARD_SHARD_COUNT: usize = 64;
+const EVENT_NAMESPACE_LOCK_ACQUIRE: &str = "namespace_lock_acquire";
 const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
 const LOG_COMPONENT_LOCK: &str = "lock";
 const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
@@ -232,6 +233,7 @@ impl Default for LocalClient {
 #[async_trait::async_trait]
 impl LockClient for LocalClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
+        let started = Instant::now();
         self.ensure_reaper();
         if request.lock_id.resource != request.resource {
             return Ok(LockResponse::failure(
@@ -251,6 +253,7 @@ impl LockClient for LocalClient {
                 .await
                 .unwrap_or(0)
         };
+        let reclaim_elapsed = started.elapsed();
 
         let build_lock_request = |acquire_timeout| match request.lock_type {
             LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
@@ -265,8 +268,12 @@ impl LockClient for LocalClient {
             if remaining.is_zero() {
                 return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
             }
+            let manager_started = Instant::now();
             match lock_manager.acquire_lock(build_lock_request(remaining)).await {
                 Ok(guard) => {
+                    let manager_elapsed = manager_started.elapsed();
+                    let registration_started = Instant::now();
+                    let physical_guard_id = guard.guard_id();
                     let lock_id = request.lock_id.clone();
                     let entry = LocalGuardEntry::new(guard, request.ttl);
                     let acquired_at = entry.acquired_at;
@@ -276,6 +283,26 @@ impl LockClient for LocalClient {
                         let shard = self.get_shard(&lock_id);
                         let mut guards = shard.write().await;
                         guards.insert(lock_id.clone(), entry);
+                    }
+
+                    let registration_elapsed = registration_started.elapsed();
+                    if started.elapsed() >= Duration::from_millis(100) {
+                        tracing::trace!(
+                            target: "rustfs_lock::namespace_owner",
+                            event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "local_completed",
+                            resource = %request.resource,
+                            lock_id = %lock_id,
+                            mode = ?request.lock_type,
+                            physical_guard_id,
+                            reclaim_ms = reclaim_elapsed.as_millis(),
+                            manager_ms = manager_elapsed.as_millis(),
+                            registration_ms = registration_elapsed.as_millis(),
+                            acquire_ms = started.elapsed().as_millis(),
+                            "Namespace local lock acquisition completed slowly"
+                        );
                     }
 
                     let lock_info = LockInfo {

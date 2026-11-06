@@ -868,7 +868,28 @@ impl DistributedLock {
             let idx = *next_client_index;
             *next_client_index = (*next_client_index).saturating_add(1);
             let request = request.clone();
-            pending.spawn(async move { (idx, client.acquire_lock(&request).await) });
+            let scheduled = Instant::now();
+            pending.spawn(async move {
+                let entered = Instant::now();
+                let response = client.acquire_lock(&request).await;
+                if scheduled.elapsed() >= Duration::from_millis(100) {
+                    tracing::trace!(
+                        target: "rustfs_lock::namespace_owner",
+                        event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                        component = LOG_COMPONENT_LOCK,
+                        subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                        state = "peer_completed",
+                        resource = %request.resource,
+                        lock_id = %request.lock_id,
+                        peer_index = idx,
+                        result = response.as_ref().is_ok_and(|response| response.success),
+                        queue_ms = entered.duration_since(scheduled).as_millis(),
+                        acquire_ms = entered.elapsed().as_millis(),
+                        "Namespace peer lock acquisition completed slowly"
+                    );
+                }
+                (idx, response)
+            });
         }
     }
 
@@ -1208,30 +1229,13 @@ impl DistributedLock {
         }
     }
 
-    fn lock_acquire_timeout_result(timeout: Duration) -> LockAcquireQuorumResult {
-        LockAcquireQuorumResult {
-            response: LockResponse::failure("Lock acquisition timeout", timeout),
-            individual_locks: Vec::new(),
-            failure_kind: Some(LockAcquireFailureKind::RetryableContention),
-            quorum_impossible: false,
-            attempt_timed_out: true,
-        }
-    }
-
     fn lock_acquire_attempt_timeout_result(
         timeout: Duration,
         individual_locks: Vec<HeldLockEntry>,
         last_failure: Option<String>,
         last_failure_kind: Option<LockAcquireFailureKind>,
     ) -> LockAcquireQuorumResult {
-        let failure_kind =
-            if let Some(kind @ (LockAcquireFailureKind::NonRetryable | LockAcquireFailureKind::UnrecoverableQuorum)) =
-                last_failure_kind
-            {
-                kind
-            } else {
-                return Self::lock_acquire_timeout_result(timeout);
-            };
+        let failure_kind = last_failure_kind.unwrap_or(LockAcquireFailureKind::RetryableContention);
 
         let mut error = "Lock acquisition timeout".to_string();
         if let Some(last_failure) = last_failure {
@@ -3079,6 +3083,37 @@ mod tests {
 
         assert_eq!(guard.entries.len(), 3);
         drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquire_quorum_timeout_preserves_partial_grants() {
+        let clients = (0..4)
+            .map(|index| {
+                Arc::new(SequencedClient::new(
+                    vec![AcquirePlan::Success {
+                        delay: if index == 0 { Duration::ZERO } else { Duration::from_secs(2) },
+                    }],
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let lock = DistributedLock::new(
+            "partial-grants".to_string(),
+            clients.iter().map(|client| client.clone() as Arc<dyn LockClient>).collect(),
+            3,
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket", "partial-grants"), LockType::Shared, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+        let result = lock
+            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .await
+            .expect("partial quorum should return a timeout response");
+        assert!(!result.response.success);
+        assert!(result.attempt_timed_out);
+        assert_matches!(result.failure_kind, Some(LockAcquireFailureKind::RetryableContention));
+        assert_eq!(result.individual_locks.len(), 1, "retain received grants for timeout diagnostics");
+        assert_eq!(result.individual_locks[0].lock_id, request.lock_id);
+        wait_for_acquisition_cleanup(&clients).await;
     }
 
     #[tokio::test]
