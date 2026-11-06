@@ -197,11 +197,16 @@ pub(crate) fn init_console_prefix() -> std::io::Result<()> {
         Err(err) => return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, err)),
     };
     let prefix = validate_path_prefix(&raw, rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX)?;
-    if api_prefix.as_deref().is_some_and(|api| has_path_prefix(api, &prefix)) {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "RUSTFS_API_PREFIX must not equal or be nested under RUSTFS_CONSOLE_PREFIX",
-        ));
+    if let Some(api) = api_prefix.as_deref() {
+        if has_path_prefix(api, &prefix) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "RUSTFS_API_PREFIX must not equal or be nested under RUSTFS_CONSOLE_PREFIX",
+            ));
+        }
+        if let Some(relative) = prefix.strip_prefix(api).filter(|suffix| suffix.starts_with('/')) {
+            validate_path_prefix(relative, rustfs_config::ENV_RUSTFS_CONSOLE_PREFIX)?;
+        }
     }
     if CONFIGURED_API_PREFIX.get_or_init(|| api_prefix.clone()) != &api_prefix {
         return Err(std::io::Error::new(
@@ -575,6 +580,9 @@ mod api_prefix_tests {
             ("", None, Some(CONSOLE_PREFIX)),
             ("/console", Some("/console"), None),
             ("/console/api", Some("/console"), None),
+            ("/api", Some("/api/rustfs/admin"), None),
+            ("/api", Some("/api/rustfs/admin/v3/oidc/callback"), None),
+            ("/api", Some("/api/rustfs"), None),
             ("/rustfs/admin", None, None),
             ("api", None, None),
         ] {

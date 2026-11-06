@@ -28,7 +28,7 @@ Both variables are read once at startup. An invalid value stops the server with 
 | Variable | Default | Rule |
 | --- | --- | --- |
 | `RUSTFS_API_PREFIX` | unset: no prefix, behavior unchanged | Absolute path, not `/`, at most 256 bytes, one trailing `/` is trimmed. Segments are non-empty and use only `A-Za-z0-9._~-`; `.` and `..` are rejected. Must not overlap a reserved RustFS route (see below), must not equal the console prefix, and must not be nested under it. An empty string counts as unset. |
-| `RUSTFS_CONSOLE_PREFIX` | `/rustfs/console`, or `<RUSTFS_API_PREFIX>/rustfs/console` when `RUSTFS_API_PREFIX` is set | Same syntax and reserved-route check. May be nested under the API prefix. An empty string is rejected (it does not mean "default"); unset the variable instead. |
+| `RUSTFS_CONSOLE_PREFIX` | `/rustfs/console`, or `<RUSTFS_API_PREFIX>/rustfs/console` when `RUSTFS_API_PREFIX` is set | Same syntax and reserved-route check. May be nested under the API prefix if the path below it does not overlap a reserved route. An empty string is rejected (it does not mean "default"); unset the variable instead. |
 
 Reserved routes (a prefix is rejected if it equals, is nested under, or is a parent of any of these): `/rustfs/admin`, `/minio/admin`, `/iceberg/v1`, `/_iceberg/v1`, `/rustfs/rpc`, `/rustfs/peer`, `/node_service.NodeService`, `/node_service.HealControlService`, `/node_service.ScannerControlService`, `/node_service.TierMutationControlService`, `/health`, `/minio/health`, `/profile`, `/index.html`, `/favicon.ico`, and the two `apple-touch-icon` files. For example `/rustfs` and `/minio` are rejected; `/tools/rustfs` is fine.
 
