@@ -688,6 +688,37 @@ static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> 
     LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
 
 #[cfg(not(test))]
+static GRPC_READ_MULTIPLE_DURATION: LazyLock<metrics::Histogram> =
+    LazyLock::new(|| operation_duration_histogram(INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_TRANSPORT_BACKEND_GRPC));
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_DURATION: LazyLock<metrics::Histogram> =
+    LazyLock::new(|| operation_duration_histogram(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_TRANSPORT_BACKEND_GRPC));
+
+#[cfg(not(test))]
+fn grpc_operation_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_VERSION => Some(&GRPC_READ_VERSION_METRIC_HANDLES.duration),
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_DURATION),
+        _ => None,
+    }
+}
+
+fn operation_duration_histogram(operation: &'static str, backend: &'static str) -> metrics::Histogram {
+    metrics::histogram!(
+        INTERNODE_OPERATION_DURATION_MS,
+        SERVER_LABEL => current_server_label(),
+        OPERATION_LABEL => operation,
+        BACKEND_LABEL => backend
+    )
+}
+
+#[cfg(not(test))]
 fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
     STABLE_SERVER_LABEL.get()?;
     Some(&INTERNODE_SERVER_METRIC_HANDLES)
@@ -944,17 +975,11 @@ impl InternodeMetrics {
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
         #[cfg(not(test))]
-        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
-            handles.duration.record(duration_ms);
+        if let Some(histogram) = grpc_operation_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
             return;
         }
-        metrics::histogram!(
-            INTERNODE_OPERATION_DURATION_MS,
-            SERVER_LABEL => current_server_label(),
-            OPERATION_LABEL => operation,
-            BACKEND_LABEL => backend
-        )
-        .record(duration_ms);
+        operation_duration_histogram(operation, backend).record(duration_ms);
     }
 
     pub fn record_stage_duration_for_operation_and_backend(
