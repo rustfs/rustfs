@@ -167,6 +167,16 @@ impl ObjectLockAttempt {
             }
         }
     }
+
+    /// Correlate a raw guard's acquisition with its peer identities without
+    /// claiming ownership of the guard's lifetime. Peer release events retain
+    /// the identities needed to reconstruct when the actual owner releases it.
+    pub(crate) fn observe_acquisition(&mut self, result: &Result<NamespaceLockGuard, LockError>) {
+        self.observe(result);
+        if let Some(context) = self.0.as_mut() {
+            context.finished = true;
+        }
+    }
 }
 
 fn duration_ms(duration: Duration) -> u64 {
@@ -498,6 +508,45 @@ pub(crate) mod tests {
             rustfs_lock::ObjectKey::new("bucket", "object"),
             "shared-set-owner".to_owned(),
         )
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn raw_guard_acquisition_diagnostic_does_not_claim_guard_lifetime() {
+        temp_env::with_vars([(rustfs_config::ENV_OBJECT_LOCK_DIAG_ENABLE, Some("true"))], || {
+            let capture = CapturedLockEvents::default();
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("raw guard diagnostic runtime");
+            tracing::subscriber::with_default(capture.subscriber(), || {
+                runtime.block_on(async {
+                    let lock = namespace();
+                    let mut attempt = ObjectLockAttempt::start(
+                        "bucket_incarnation_disk_read",
+                        "bucket",
+                        "transaction.lock",
+                        None,
+                        &lock,
+                        "read",
+                        Duration::from_secs(1),
+                    );
+                    let result = lock.get_read_lock(Duration::from_secs(1)).await;
+                    attempt.observe_acquisition(&result);
+                    drop(attempt);
+                    let guard = result.expect("retain the raw guard after diagnostic completion");
+                    assert!(!guard.is_lock_lost());
+                    let states = capture
+                        .rows()
+                        .iter()
+                        .map(|row| row["fields"]["state"].as_str().expect("diagnostic state string").to_owned())
+                        .collect::<Vec<_>>();
+                    assert_eq!(states, ["acquiring", "acquired"]);
+                    drop(guard);
+                    assert_eq!(capture.rows().len(), 2, "the acquisition observer must not invent a guard release");
+                });
+            });
+        });
     }
 
     #[test]

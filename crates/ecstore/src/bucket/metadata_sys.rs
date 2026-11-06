@@ -22,6 +22,7 @@ use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_parse_with_presence};
 use crate::bucket::utils::is_meta_bucketname;
+use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
 use crate::object_api::ObjectOptions;
@@ -599,7 +600,9 @@ pub(crate) async fn get_bucket_incarnation_id_for_options_in(
     }
     let sys = bucket_metadata_sys_of(ctx)?;
     let sys = sys.read().await.clone();
-    let guard = acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    let guard =
+        acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts, "bucket_incarnation_options_read")
+            .await?;
     sys.get_bucket_incarnation_id_under_transaction_lock(bucket, &guard).await
 }
 
@@ -917,7 +920,15 @@ async fn acquire_config_write_guard_with_migration(
         Some(&lifecycle_guard),
         bucket,
         "bucket config transaction lock acquisition",
-        acquire_transaction_lock_with_sys(&sys, bucket),
+        acquire_transaction_lock_with_sys_for_purpose(
+            &sys,
+            bucket,
+            if migrate {
+                "bucket_config_update"
+            } else {
+                "scanner_incarnation_validation"
+            },
+        ),
     )
     .await?;
     await_bucket_namespace_operation(
@@ -1236,12 +1247,17 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
 ) -> Result<rustfs_lock::NamespaceLockGuard> {
+    acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, "bucket_metadata_read").await
+}
+
+pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    op: &'static str,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
     let sys = bucket_metadata_sys_of(ctx)?;
     let api = sys.read().await.object_store();
-    let lock = api
-        .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-        .await?;
-    Ok(lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
+    acquire_metadata_transaction_guard(api, bucket, op, rustfs_lock::LockType::Shared).await
 }
 
 /// Readers already holding an Object Lock snapshot must share its guard:
@@ -1250,6 +1266,7 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     opts: &ObjectOptions,
+    op: &'static str,
 ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
     if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
         let store = object_store_in(ctx).await?;
@@ -1259,12 +1276,22 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in
                 Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
             });
     }
-    Ok(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(ctx, bucket).await?))
+    Ok(Arc::new(
+        acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, op).await?,
+    ))
 }
 
 async fn acquire_transaction_lock_with_sys(
     sys: &Arc<RwLock<BucketMetadataSys>>,
     bucket: &str,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
+    acquire_transaction_lock_with_sys_for_purpose(sys, bucket, "bucket_metadata_transaction_write").await
+}
+
+async fn acquire_transaction_lock_with_sys_for_purpose(
+    sys: &Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    op: &'static str,
 ) -> Result<rustfs_lock::NamespaceLockGuard> {
     // Resolve the store under a short-lived read guard: this runs before the
     // write guard in `acquire_config_write_guards`, and must not still hold a
@@ -1273,12 +1300,22 @@ async fn acquire_transaction_lock_with_sys(
     let lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
         .await?;
-    let acquire = lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout());
+    let timeout = crate::set_disk::get_lock_acquire_timeout();
+    let mut attempt = ObjectLockAttempt::start(
+        op,
+        RUSTFS_META_BUCKET,
+        &bucket_metadata_transaction_lock_key(bucket),
+        None,
+        &lock,
+        "write",
+        timeout,
+    );
+    let acquire = lock.get_write_lock(timeout);
     #[cfg(any(test, feature = "test-util"))]
     {
         tokio::pin!(acquire);
         let mut notified = false;
-        let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+        let result = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
             std::task::Poll::Pending => {
                 if !notified {
                     notify_config_write_lock_attempt(bucket);
@@ -1288,11 +1325,38 @@ async fn acquire_transaction_lock_with_sys(
             }
             std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
         })
-        .await?;
-        Ok(guard)
+        .await;
+        attempt.observe_acquisition(&result);
+        Ok(result?)
     }
     #[cfg(not(any(test, feature = "test-util")))]
-    Ok(acquire.await?)
+    {
+        let result = acquire.await;
+        attempt.observe_acquisition(&result);
+        Ok(result?)
+    }
+}
+
+pub(crate) async fn acquire_metadata_transaction_guard(
+    api: Arc<ECStore>,
+    bucket: &str,
+    op: &'static str,
+    lock_type: rustfs_lock::LockType,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
+    let object = bucket_metadata_transaction_lock_key(bucket);
+    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+    let timeout = crate::set_disk::get_lock_acquire_timeout();
+    let mode = match lock_type {
+        rustfs_lock::LockType::Shared => "read",
+        rustfs_lock::LockType::Exclusive => "write",
+    };
+    let mut attempt = ObjectLockAttempt::start(op, RUSTFS_META_BUCKET, &object, None, &lock, mode, timeout);
+    let result = match lock_type {
+        rustfs_lock::LockType::Shared => lock.get_read_lock(timeout).await,
+        rustfs_lock::LockType::Exclusive => lock.get_write_lock(timeout).await,
+    };
+    attempt.observe_acquisition(&result);
+    Ok(result?)
 }
 
 /// The lock resource name is deliberately still the `bucket-targets` one it
@@ -2794,13 +2858,13 @@ impl BucketMetadataSys {
     }
 
     async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let _transaction_guard = transaction_lock
-            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let _transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_incarnation_disk_read",
+            rustfs_lock::LockType::Shared,
+        )
+        .await?;
         self.find_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
             .await
     }
@@ -2876,13 +2940,13 @@ impl BucketMetadataSys {
     /// revalidated at write quorum, so a stale snapshot can neither revert an
     /// acknowledged configuration update nor outlive a delete/recreate.
     async fn migrate_bucket_creation_commit(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let transaction_guard = transaction_lock
-            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_creation_commit_migration",
+            rustfs_lock::LockType::Exclusive,
+        )
+        .await?;
         let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
         let namespace_guard = namespace_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
@@ -2932,13 +2996,13 @@ impl BucketMetadataSys {
     }
 
     async fn migrate_legacy_metadata(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let _transaction_guard = transaction_lock
-            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let _transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_metadata_legacy_migration",
+            rustfs_lock::LockType::Exclusive,
+        )
+        .await?;
 
         let authority = self
             .load_authoritative_metadata_from_disk_under_transaction_lock(bucket)
