@@ -433,6 +433,7 @@ enum FolderScanOutcome {
     Namespace,
     ErasureData,
     Vanished,
+    Unreadable,
 }
 
 fn is_erasure_candidate(name: &str) -> bool {
@@ -1427,7 +1428,7 @@ impl FolderScanner {
         mode: FolderScanMode,
     ) -> Result<FolderScanOutcome, ScannerError> {
         if self.checkpoint_tx.is_none() || self.old_cache.info.scan_progress.is_none() {
-            return Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+            return Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode, false)).await;
         }
         let depth = self.checkpoint_depth;
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
@@ -1441,7 +1442,7 @@ impl FolderScanner {
         std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
         std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
         self.checkpoint_depth += 1;
-        let result = Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+        let result = Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode, false)).await;
         self.checkpoint_depth -= 1;
         // Restore the parent before cancellation/error handling stitches partial work.
         std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
@@ -1862,7 +1863,7 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
-        self.scan_folder_inner(ctx, folder, into, FolderScanMode::Namespace)
+        self.scan_folder_inner(ctx, folder, into, FolderScanMode::Namespace, false)
             .await
             .map(|_| ())
     }
@@ -1875,6 +1876,7 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
         mode: FolderScanMode,
+        skip_unreadable_directory: bool,
     ) -> Result<FolderScanOutcome, ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
         let trace_started_at = trace_start_instant();
@@ -1996,6 +1998,20 @@ impl FolderScanner {
                         return Ok(FolderScanOutcome::Vanished);
                     }
                     None
+                }
+                Err(e) if skip_unreadable_directory && !ctx.is_cancelled() && e.kind() == ErrorKind::PermissionDenied => {
+                    warn!(
+                        target: "rustfs::scanner::folder",
+                        event = EVENT_SCANNER_FOLDER_STATE,
+                        component = LOG_COMPONENT_SCANNER,
+                        subsystem = LOG_SUBSYSTEM_FOLDER,
+                        state = "child_scan_failed",
+                        folder = %folder.name,
+                        error = %e,
+                        "Scanner skipped an unreadable child directory"
+                    );
+                    done_folder();
+                    return Ok(FolderScanOutcome::Unreadable);
                 }
                 Err(e) => return Err(ScannerError::Io(e)),
             };
@@ -2548,11 +2564,20 @@ impl FolderScanner {
             // frontier (#8292). Outside that, also compact a wide bucket root:
             // excluding it left #8961's ~170k top-level prefixes unbounded until
             // the emergency 250k ceiling. Keep FORCE as the absolute backstop.
-            let should_compact = (self.old_cache.info.scan_progress.is_none()
-                && queued_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
-                || queued_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
-
+            let is_scan_root = folder.name == self.old_cache.info.name;
+            let forward_sweep = self.old_cache.info.scan_progress.is_some();
             let total_folders = queued_folders.len();
+            let force_compact = total_folders >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
+            // Reused root children still have links in the new cache.
+            let should_compact = force_compact
+                || (!forward_sweep
+                    && total_folders >= DATA_SCANNER_COMPACT_AT_FOLDERS
+                    && (!is_scan_root || into.children.is_empty()));
+            // Preserve the ordinary namespace walk's child isolation when the
+            // root starts sharing one accumulator across its descendants.
+            let skip_unreadable_children =
+                skip_unreadable_directory || (is_scan_root && !into.compacted && should_compact && !force_compact);
+
             self.alert_excessive_folders(&folder.name, total_folders);
 
             if !into.compacted && should_compact {
@@ -2575,7 +2600,6 @@ impl FolderScanner {
                 }
             }
 
-            let is_scan_root = folder.name == self.old_cache.info.name;
             let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
             let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
                 if is_scan_root {
@@ -2599,7 +2623,6 @@ impl FolderScanner {
                 .is_some_and(|resume_match| matches!(resume_match, FolderResumeMatch::Descendant));
             let scan_resume_after = checkpoint_resume_after.or(self.old_cache.info.scan_resume_after.as_deref());
             let has_queued_folders = !queued_folders.is_empty();
-            let forward_sweep = self.old_cache.info.scan_progress.is_some();
             let resume_order = if forward_sweep {
                 order_queued_folders_for_resume(&mut queued_folders, None)
             } else {
@@ -2703,7 +2726,14 @@ impl FolderScanner {
                 (self.update_current_path)(&folder_item.name).await;
 
                 let outcome = if into.compacted {
-                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode)).await?
+                    Box::pin(self.scan_folder_inner(
+                        ctx.clone(),
+                        folder_item.clone(),
+                        into,
+                        child_mode,
+                        skip_unreadable_children && child_mode == FolderScanMode::Namespace,
+                    ))
+                    .await?
                 } else {
                     let mut dst = DataUsageEntry::default();
                     match self
@@ -2738,6 +2768,9 @@ impl FolderScanner {
                     }
                 };
                 self.finish_raw_enumeration_parent(&folder_item.name);
+                if outcome == FolderScanOutcome::Unreadable {
+                    continue;
+                }
                 if outcome == FolderScanOutcome::Vanished {
                     self.new_cache.delete_recursive(&h);
                     if let Some(updates) = &mut self.usage_updates {

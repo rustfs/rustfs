@@ -293,3 +293,60 @@ async fn check_large_prefix_resumption(mode: HealScanMode) {
     }
     panic!("large prefix must finish within repeated bounded scans");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_permission_failure_isolated_to_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(!crate::scanner_is_erasure().await, "single-drive Namespace scan");
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(&root, "healthy/object", &[(None, 7)]).await;
+    let bucket = root.join("bucket");
+    let denied = bucket.join("denied");
+    std::fs::create_dir(&denied).expect("create denied root child");
+    for idx in 0..DATA_SCANNER_COMPACT_AT_FOLDERS - 2 {
+        std::fs::create_dir(bucket.join(format!("empty-{idx:05}"))).expect("create wide directory");
+    }
+    assert_eq!(std::fs::read_dir(&bucket).expect("list root").count(), DATA_SCANNER_COMPACT_AT_FOLDERS);
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).expect("remove child read access");
+
+    match std::fs::read_dir(&denied) {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        Ok(_) => {
+            std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o700)).expect("restore child access");
+            eprintln!("skipping permission-denied fixture because this process can read mode-000 directories");
+            return;
+        }
+    }
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    assert!(cache.info.scan_progress.is_none());
+    cache.info.skip_healing = true;
+    let budget = ScannerCycleBudget::new(&CancellationToken::new(), Default::default());
+    let wide = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            super::scan_options(HealScanMode::Normal),
+        )
+        .await;
+    std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o700)).expect("restore child access");
+    let ScannerDiskScanOutcome::Complete(wide) = wide.expect("wide legacy scanner must keep the same child-error isolation")
+    else {
+        panic!("wide root should complete despite one unreadable prefix");
+    };
+    let summary = wide.checked_flatten("bucket").expect("aggregate healthy child");
+    assert!(summary.compacted);
+    assert_eq!((summary.objects, summary.size), (1, 7));
+    assert_eq!(wide.cache.len(), 1);
+}
