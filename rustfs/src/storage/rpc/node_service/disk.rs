@@ -3012,6 +3012,66 @@ mod tests {
     }
 
     #[test]
+    #[serial]
+    fn handlers_record_duration_on_missing_disk_errors() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::{BatchReadVersionRequest, ReadMultipleRequest};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler-level metrics test runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let read_multiple = server
+                    .handle_read_multiple(Request::new(ReadMultipleRequest {
+                        disk: "missing-disk".to_owned(),
+                        read_multiple_req: String::new(),
+                        read_multiple_req_bin: Vec::new().into(),
+                    }))
+                    .await
+                    .expect("ReadMultiple handler should return a response")
+                    .into_inner();
+                assert!(!read_multiple.success);
+
+                let batch_read_version = server
+                    .handle_batch_read_version(Request::new(BatchReadVersionRequest {
+                        disk: "missing-disk".to_owned(),
+                        batch_read_version_req: String::new(),
+                        batch_read_version_req_bin: Vec::new().into(),
+                    }))
+                    .await
+                    .expect("BatchReadVersion handler should return a response")
+                    .into_inner();
+                assert!(!batch_read_version.success);
+            });
+        });
+
+        let entries = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_system_network_internode_operation_duration_ms")
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        for (composite, _, _, value) in entries {
+            let operation = composite
+                .key()
+                .labels()
+                .find(|label| label.key() == "operation")
+                .map(|label| label.value().to_string())
+                .expect("handler duration metric should carry an operation label");
+            assert!(
+                operation == INTERNODE_OPERATION_GRPC_READ_MULTIPLE || operation == INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+            );
+            assert!(matches!(value, DebugValue::Histogram(samples) if !samples.is_empty()));
+        }
+    }
+
+    #[test]
     fn decode_msgpack_or_json_prefers_binary_payload() {
         let payload = SamplePayload {
             name: "rustfs".to_string(),
