@@ -3651,6 +3651,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         }
         let source_condition = capture_source_condition(bucket, object, &upload_id_path, &fi, Uuid::new_v4())?;
+        let preserved_encrypted_etag = preserves_data_movement_etag_proof(&fi, opts);
         let upload_data_dir = source_condition.lineage.original_data_dir.to_string();
         // The source generation remains in the captured precondition. Its
         // ACTIVE/recovery controls are not final user-object metadata.
@@ -4122,9 +4123,12 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
         // etag
         let (etag, encrypted_etag) = resolve_complete_etag(opts, &uploaded_parts, &fi.parts);
+        let encrypted_etag = encrypted_etag
+            || preserved_encrypted_etag
+                && fi.version_id.filter(|version| !version.is_nil()) == source_condition.lineage.original_version_id;
 
-        // Only selected parts whose protected ETags reached read quorum can
-        // attest the completed fingerprint. Discard any upload-level claim.
+        // New writes attest their selected parts. Same-version internal moves
+        // can retain the source proof captured from quorum-validated metadata.
         rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
         if encrypted_etag {
             insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
@@ -4953,6 +4957,25 @@ fn completed_multipart_upload_matches(
         }
     }
     Ok(true)
+}
+
+// Capture only the original staged proof, before completion applies metadata
+// updates. Publication must also retain the source lineage's version.
+fn preserves_data_movement_etag_proof(fi: &FileInfo, opts: &ObjectOptions) -> bool {
+    if !opts.data_movement || opts.replication_request {
+        return false;
+    }
+    let Some(version) = opts.version_id.as_deref().and_then(|version| Uuid::parse_str(version).ok()) else {
+        return false;
+    };
+    let Some(etag) = opts.preserve_etag.as_deref().filter(|etag| !etag.is_empty()) else {
+        return false;
+    };
+    Some(version).filter(|version| !version.is_nil()) == fi.version_id.filter(|version| !version.is_nil())
+        && fi.metadata.get("etag").map(String::as_str) == Some(etag)
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD)
+            .is_some_and(|identity| !identity.is_empty())
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
 }
 
 /// Final ETag for a completed multipart object. An authorized replication
@@ -9204,6 +9227,168 @@ mod tests {
         for info in [completed, reread] {
             assert!(!rustfs_utils::http::etag_can_be_listed(&info.user_defined));
             assert!(!contains_key_str(&info.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG));
+        }
+    }
+
+    #[test]
+    fn data_movement_etag_proof_requires_verified_source_identity() {
+        let version = Uuid::new_v4();
+        let mut source = FileInfo {
+            version_id: Some(version),
+            metadata: HashMap::from([("etag".to_owned(), "protected-source-etag".to_owned())]),
+            ..Default::default()
+        };
+        insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "source-generation".to_owned(),
+        );
+        insert_str(&mut source.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        let opts = ObjectOptions {
+            data_movement: true,
+            version_id: Some(version.to_string()),
+            preserve_etag: source.metadata.get("etag").cloned(),
+            ..Default::default()
+        };
+        assert!(preserves_data_movement_etag_proof(&source, &opts));
+        for version_id in [None, Some(Uuid::nil())] {
+            let null_source = FileInfo {
+                version_id,
+                ..source.clone()
+            };
+            let null_opts = ObjectOptions {
+                version_id: Some(Uuid::nil().to_string()),
+                ..opts.clone()
+            };
+            assert!(preserves_data_movement_etag_proof(&null_source, &null_opts));
+        }
+        for rejected in [
+            ObjectOptions {
+                data_movement: false,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                replication_request: true,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some("invalid".to_owned()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some(String::new()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some("replacement-etag".to_owned()),
+                ..opts.clone()
+            },
+        ] {
+            assert!(!preserves_data_movement_etag_proof(&source, &rejected));
+        }
+        for suffix in [
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+        ] {
+            let mut missing = source.clone();
+            rustfs_utils::http::remove_str(&mut missing.metadata, suffix);
+            assert!(!preserves_data_movement_etag_proof(&missing, &opts));
+            insert_str(&mut missing.metadata, suffix, String::new());
+            assert!(!preserves_data_movement_etag_proof(&missing, &opts));
+            let mut conflicting = source.clone();
+            conflicting
+                .metadata
+                .insert(format!("x-minio-internal-{suffix}"), "conflict".to_owned());
+            assert!(!preserves_data_movement_etag_proof(&conflicting, &opts));
+        }
+        for value in [None, Some("unknown")] {
+            let mut unproven = source.clone();
+            rustfs_utils::http::remove_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+            if let Some(value) = value {
+                insert_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, value.to_owned());
+            }
+            let request_claim = ObjectOptions {
+                user_defined: source.metadata.clone(),
+                ..opts.clone()
+            };
+            assert!(!preserves_data_movement_etag_proof(&unproven, &request_claim));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_data_movement_etag_proof_rejects_version_rewrites_and_late_claims() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "movement-etag-proof";
+        make_bucket_on_all(&disks, bucket).await;
+        for (object, staged_proof, publish_versioned, late_claim, expected_proof) in [
+            ("same-version", true, true, false, true),
+            ("rewritten-version", true, false, false, false),
+            ("late-claim", false, true, true, false),
+        ] {
+            let version = Uuid::new_v4();
+            let mut opts = ObjectOptions {
+                data_movement: true,
+                versioned: true,
+                version_id: Some(version.to_string()),
+                preserve_etag: Some("protected-source-etag".to_owned()),
+                user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+                ..Default::default()
+            };
+            insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+                "source-generation".to_owned(),
+            );
+            if staged_proof {
+                insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            }
+            let (upload_id, parts) = stage_upload_with_create_opts(&set, bucket, object, b"raw source bytes", &opts).await;
+            opts.versioned = publish_versioned;
+            if late_claim {
+                let mut metadata = HashMap::new();
+                insert_str(&mut metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+                opts.eval_metadata = Some(metadata);
+            }
+            let completed = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &opts)
+                .await
+                .expect("complete raw internal movement");
+            assert_eq!(completed.version_id, publish_versioned.then_some(version), "{object}");
+            assert_eq!(completed.etag, opts.preserve_etag, "{object}");
+            let persisted = set
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(crate::data_movement::data_movement_exact_version_id(completed.version_id)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read completed proof from disk");
+            assert_eq!(
+                rustfs_utils::http::etag_can_be_listed(&persisted.user_defined),
+                expected_proof,
+                "{object}"
+            );
+            assert_eq!(
+                get_consistent_str(&persisted.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+                expected_proof.then_some("v1"),
+                "{object}"
+            );
         }
     }
 
