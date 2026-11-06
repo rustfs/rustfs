@@ -142,6 +142,7 @@ async fn test_api_prefix_data_plane_body() {
         // Wait for readiness (unprefixed probe path, additive semantics).
         wait_ready(&http, &base).await;
 
+        internode_grpc_routes_are_not_mounted_under_api_prefix(&base).await;
         ac1_header_sigv4_operations_under_prefix(&prefixed_client).await;
         ac2_presigned_get_and_put_under_prefix(&prefixed_client, &http, &base).await;
         ac3_signature_binds_the_wire_path(&prefixed_client, &plain_client, &http, &base).await;
@@ -166,6 +167,36 @@ async fn wait_ready(http: &reqwest::Client, base: &str) {
     })
     .await;
     assert!(ok.is_ok(), "server did not become ready at {url}");
+}
+
+async fn internode_grpc_routes_are_not_mounted_under_api_prefix(base: &str) {
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .http2_prior_knowledge()
+        .build()
+        .expect("build gRPC transport");
+    for path in [
+        "/node_service.HealControlService/HealControl",
+        "/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+        "/node_service.TierMutationControlService/PrepareTierMutation",
+    ] {
+        for (prefix, expected_status) in [("", "16"), (API_PREFIX, "12")] {
+            let response = client
+                .post(format!("{base}{prefix}{path}"))
+                .header("content-type", "application/grpc")
+                .header("te", "trailers")
+                .body(vec![0; 5])
+                .send()
+                .await
+                .expect("send gRPC request");
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get("grpc-status").and_then(|value| value.to_str().ok()),
+                Some(expected_status),
+                "{prefix}{path}: bare routes must require authentication and prefixed routes must be unimplemented"
+            );
+        }
+    }
 }
 
 /// AC-1: every data-plane call works with header SigV4 through the prefix.

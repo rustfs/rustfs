@@ -30,7 +30,7 @@ Both variables are read once at startup. An invalid value stops the server with 
 | `RUSTFS_API_PREFIX` | unset: no prefix, behavior unchanged | Absolute path, not `/`, at most 256 bytes, one trailing `/` is trimmed. Segments are non-empty and use only `A-Za-z0-9._~-`; `.` and `..` are rejected. Must not overlap a reserved RustFS route (see below), must not equal the console prefix, and must not be nested under it. An empty string counts as unset. |
 | `RUSTFS_CONSOLE_PREFIX` | `/rustfs/console`, or `<RUSTFS_API_PREFIX>/rustfs/console` when `RUSTFS_API_PREFIX` is set | Same syntax and reserved-route check. May be nested under the API prefix. An empty string is rejected (it does not mean "default"); unset the variable instead. |
 
-Reserved routes (a prefix is rejected if it equals, is nested under, or is a parent of any of these): `/rustfs/admin`, `/minio/admin`, `/iceberg/v1`, `/_iceberg/v1`, `/rustfs/rpc`, `/rustfs/peer`, `/node_service.NodeService`, `/health`, `/minio/health`, `/profile`, `/index.html`, `/favicon.ico`, and the two `apple-touch-icon` files. For example `/rustfs` and `/minio` are rejected; `/tools/rustfs` is fine.
+Reserved routes (a prefix is rejected if it equals, is nested under, or is a parent of any of these): `/rustfs/admin`, `/minio/admin`, `/iceberg/v1`, `/_iceberg/v1`, `/rustfs/rpc`, `/rustfs/peer`, `/node_service.NodeService`, `/node_service.HealControlService`, `/node_service.ScannerControlService`, `/node_service.TierMutationControlService`, `/health`, `/minio/health`, `/profile`, `/index.html`, `/favicon.ico`, and the two `apple-touch-icon` files. For example `/rustfs` and `/minio` are rejected; `/tools/rustfs` is fine.
 
 | Mode | Settings | API URL | Console URL |
 | --- | --- | --- | --- |
@@ -47,7 +47,7 @@ Behavior to know:
 - With `RUSTFS_API_PREFIX` set, the OIDC callback URL sent to the identity provider (`<prefix>/rustfs/admin/v3/oidc/callback/<provider>`) and the object ZIP download URLs (`<prefix>/rustfs/admin/v3/object-zip-downloads/...`) include the prefix. Register the prefixed callback URL with your identity provider.
 - Bucket shadowing: with prefix `/tools/rustfs/api`, keys under `rustfs/api/` in a bucket named `tools` cannot be reached path-style without the prefix, by any encoding, because that path belongs to the prefix. They remain reachable through the prefix itself (`/tools/rustfs/api/tools/rustfs/api/...`). This is the same class as the existing `/rustfs/console` shadow. Choose a first segment that is not, and will not become, a bucket name.
 - Send the prefix literally. A request whose path matches the prefix only after percent-decoding (for example `/tools/rustf%73/...`) is rejected with an empty HTTP 400 response, not passed through. Every SigV4 client sends the prefix literally, so this affects only hand-built requests.
-- Internode paths (`/rustfs/rpc`, `/node_service.NodeService`, `/rustfs/peer`) are never served through the API prefix. Expose only the prefix at the proxy and keep internode traffic on the cluster network.
+- Internode paths (`/rustfs/rpc`, `/rustfs/peer`, and the Node, Heal, Scanner, and Tier Mutation gRPC services) are never served through the API prefix. Expose only the prefix at the proxy and keep internode traffic on the cluster network.
 
 ## Supported proxy mode: pass the path through unchanged
 

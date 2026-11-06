@@ -147,8 +147,18 @@ fn strip_prefix_except<'a>(path: &'a str, api_prefix: &str, console_prefix: &str
     Some(remainder)
 }
 
+// Include every internode service registered by the HTTP and gRPC routers.
+const INTERNODE_PATH_PREFIXES: [&str; 6] = [
+    RPC_PREFIX,
+    TONIC_PREFIX,
+    "/rustfs/peer",
+    "/node_service.HealControlService",
+    "/node_service.ScannerControlService",
+    "/node_service.TierMutationControlService",
+];
+
 fn is_internode_path(path: &str) -> bool {
-    [RPC_PREFIX, TONIC_PREFIX, "/rustfs/peer"]
+    INTERNODE_PATH_PREFIXES
         .iter()
         .any(|internode| has_path_prefix(path, internode))
 }
@@ -231,9 +241,6 @@ fn validate_path_prefix(raw: &str, env_name: &str) -> std::io::Result<String> {
         MINIO_ADMIN_PREFIX,
         TABLE_CATALOG_PREFIX,
         TABLE_CATALOG_COMPAT_PREFIX,
-        RPC_PREFIX,
-        TONIC_PREFIX,
-        "/rustfs/peer",
         HEALTH_PREFIX,
         "/minio/health",
         "/profile",
@@ -243,7 +250,8 @@ fn validate_path_prefix(raw: &str, env_name: &str) -> std::io::Result<String> {
         APPLE_TOUCH_ICON_PRECOMPOSED_PATH,
     ];
     if reserved
-        .iter()
+        .into_iter()
+        .chain(INTERNODE_PATH_PREFIXES)
         .any(|path| has_path_prefix(prefix, path) || has_path_prefix(path, prefix))
     {
         return Err(std::io::Error::new(
@@ -462,6 +470,9 @@ mod api_prefix_tests {
             "/minio",
             "/profile",
             "/rustfs/rpc",
+            "/node_service.HealControlService",
+            "/node_service.ScannerControlService",
+            "/node_service.TierMutationControlService",
         ] {
             let error = validate_path_prefix(raw, env).expect_err(raw);
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{raw}");
@@ -495,6 +506,9 @@ mod api_prefix_tests {
             "/tools/rustfs/rustfs/rpc/read_file",
             "/tools/rustfs/node_service.NodeService",
             "/tools/rustfs/node_service.NodeService/Ping",
+            "/tools/rustfs/node_service.HealControlService/HealControl",
+            "/tools/rustfs/node_service.ScannerControlService/ScannerScopedDirtyUsageAck",
+            "/tools/rustfs/node_service.TierMutationControlService/PrepareTierMutation",
             "/tools/rustfs/rustfs/peer",
             "/tools/rustfs/rustfs/peer/health",
         ] {
@@ -519,6 +533,9 @@ mod api_prefix_tests {
             "/tools/rustfs/%72ustfs/rpc/x",
             "/tools/rustfs/rustfs%2Frpc/x",
             "/tools/rustfs/node_s%65rvice.NodeService/Ping",
+            "/tools/rustfs/node_service.%48ealControlService/HealControl",
+            "/tools/rustfs/node_service.ScannerControlService%2FScannerScopedDirtyUsageAck",
+            "/tools/rustfs/node_service.TierMutationControl%53ervice/PrepareTierMutation",
             "/tools/rustfs/rustfs/%70eer/health",
         ] {
             assert_eq!(classify(path), ApiPathMatch::Reject, "{path}");
