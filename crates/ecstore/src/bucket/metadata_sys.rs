@@ -887,7 +887,7 @@ impl ScannerBucketIncarnationReadGuard {
     /// Returns an error if either lock has lost its lease.
     pub fn checked_bucket_incarnation(&self) -> Result<(&str, Uuid)> {
         if self.lifecycle_guard.is_lock_lost() || self.transaction_guard.is_lock_lost() {
-            return Err(Error::other(format!("scanner bucket incarnation read lock was lost: {}", self.bucket)));
+            return Err(Error::other("scanner bucket incarnation read lock was lost"));
         }
         Ok((&self.bucket, self.incarnation_id))
     }

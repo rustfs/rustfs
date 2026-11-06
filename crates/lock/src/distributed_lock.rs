@@ -85,6 +85,12 @@ fn is_remote_lock_rpc_timeout(error: &str) -> bool {
     has_case_insensitive_prefix(error, REMOTE_LOCK_RPC_TIMED_OUT_PREFIX)
 }
 
+/// Only the local backend's explicit no-grant responses permit reusing a round's ID.
+/// RPC timeouts and unknown failures can still own a late grant and its cleanup.
+fn is_definitive_lock_contention(error: &str) -> bool {
+    error == "Lock acquisition timeout" || error.starts_with("Lock conflict: resource held by ")
+}
+
 fn has_case_insensitive_prefix(error: &str, expected_prefix: &str) -> bool {
     error
         .get(0..expected_prefix.len())
@@ -378,7 +384,12 @@ impl DistributedLockGuard {
         };
 
         let now = Instant::now();
-        let first_refresh = now.checked_add(interval).unwrap_or(now);
+        // Acquisition can consume most of the original lease. Anchor the first tick
+        // to that lease instead of waiting another full interval after admission.
+        let first_refresh = Self::quorum_valid_until(&entries, config.refresh_quorum)
+            .and_then(|deadline| deadline.checked_sub(config.ttl.saturating_sub(interval)))
+            .unwrap_or(now)
+            .min(now.checked_add(interval).unwrap_or(now));
         let mut ticker = tokio::time::interval_at(first_refresh, interval);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
@@ -862,35 +873,42 @@ impl DistributedLock {
         target_pending: usize,
     ) {
         while pending.len() < target_pending {
-            let Some(client) = self.clients.get(*next_client_index).cloned() else {
+            if *next_client_index >= self.clients.len() {
                 break;
-            };
+            }
             let idx = *next_client_index;
             *next_client_index = (*next_client_index).saturating_add(1);
-            let request = request.clone();
-            let scheduled = Instant::now();
-            pending.spawn(async move {
-                let entered = Instant::now();
-                let response = client.acquire_lock(&request).await;
-                if scheduled.elapsed() >= Duration::from_millis(100) {
-                    tracing::trace!(
-                        target: "rustfs_lock::namespace_owner",
-                        event = EVENT_NAMESPACE_LOCK_ACQUIRE,
-                        component = LOG_COMPONENT_LOCK,
-                        subsystem = LOG_SUBSYSTEM_NAMESPACE,
-                        state = "peer_completed",
-                        result = response.as_ref().is_ok_and(|response| response.success),
-                        resource = %request.resource,
-                        lock_id = %request.lock_id,
-                        peer_index = idx,
-                        queue_ms = entered.duration_since(scheduled).as_millis(),
-                        acquire_ms = entered.elapsed().as_millis(),
-                        "Namespace peer lock acquisition completed slowly"
-                    );
-                }
-                (idx, response)
-            });
+            self.spawn_lock_request(pending, request, idx);
         }
+    }
+
+    fn spawn_lock_request(&self, pending: &mut JoinSet<LockAcquireTaskResult>, request: &LockRequest, idx: usize) {
+        let Some(client) = self.clients.get(idx).cloned() else {
+            return;
+        };
+        let request = request.clone();
+        let scheduled = Instant::now();
+        pending.spawn(async move {
+            let entered = Instant::now();
+            let response = client.acquire_lock(&request).await;
+            if scheduled.elapsed() >= Duration::from_millis(100) {
+                tracing::trace!(
+                    target: "rustfs_lock::namespace_owner",
+                    event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "peer_completed",
+                    result = response.as_ref().is_ok_and(|response| response.success),
+                    resource = %request.resource,
+                    lock_id = %request.lock_id,
+                    peer_index = idx,
+                    queue_ms = entered.duration_since(scheduled).as_millis(),
+                    acquire_ms = entered.elapsed().as_millis(),
+                    "Namespace peer lock acquisition completed slowly"
+                );
+            }
+            (idx, response)
+        });
     }
 
     fn lock_acquire_retry_backoff(attempt: usize, rng: &mut impl rand::Rng) -> Duration {
@@ -1281,6 +1299,8 @@ impl DistributedLock {
         let mut last_failure_kind = None;
         let mut last_hard_failure_kind = None;
         let mut hard_failures = 0usize;
+        let mut retry_at = vec![None; self.clients.len()];
+        let mut contention_retries = vec![0usize; self.clients.len()];
         let start = attempt_started;
         // A silent prefix must not hide healthy voters later in the list.
         // Spread additional hedges across the existing attempt budget; fast
@@ -1310,8 +1330,25 @@ impl DistributedLock {
                 ));
             }
 
+            let next_retry = retry_at.iter().flatten().copied().min();
             let next_result = tokio::select! {
-                result = tokio::time::timeout(remaining, round.pending.join_next()) => result,
+                biased;
+                _ = tokio::time::sleep_until(quorum_deadline) => None,
+                result = round.pending.join_next(), if !round.pending.is_empty() => result,
+                _ = tokio::time::sleep_until(next_retry.unwrap_or(quorum_deadline)), if next_retry.is_some() => {
+                    let now = Instant::now();
+                    if now < quorum_deadline {
+                        for (idx, retry) in retry_at.iter_mut().enumerate() {
+                            if retry.is_some_and(|deadline| deadline <= now) {
+                                *retry = None;
+                                let mut retry_request = request.clone();
+                                retry_request.acquire_timeout = request.acquire_timeout.min(quorum_deadline - now);
+                                self.spawn_lock_request(&mut round.pending, &retry_request, idx);
+                            }
+                        }
+                    }
+                    continue;
+                }
                 _ = &mut hedge_timer, if next_client_index < self.clients.len() => {
                     if start.elapsed() < quorum_timeout {
                         let target_in_flight = round.pending.len().saturating_add(1);
@@ -1324,9 +1361,8 @@ impl DistributedLock {
                 }
             };
             let join_result = match next_result {
-                Ok(Some(join_result)) => join_result,
-                Ok(None) => break,
-                Err(_) => {
+                Some(join_result) => join_result,
+                None => {
                     Self::spawn_release_cleanup(
                         round.grants.iter().map(HeldLockEntry::release_entry).collect(),
                         "distributed_lock_attempt_timeout",
@@ -1366,6 +1402,16 @@ impl DistributedLock {
                         }
                     } else {
                         let error = resp.error.unwrap_or_else(|| "unknown error".to_string());
+                        // Only an authoritative no-grant response is safe to retry under
+                        // the same ID. A successful or still-pending voter is never retried.
+                        if is_definitive_lock_contention(&error) {
+                            contention_retries[idx] = contention_retries[idx].saturating_add(1);
+                            let backoff = LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF
+                                .saturating_mul(contention_retries[idx].try_into().unwrap_or(u32::MAX));
+                            retry_at[idx] = Instant::now()
+                                .checked_add(backoff)
+                                .filter(|deadline| *deadline < quorum_deadline);
+                        }
                         let failure_kind = classify_lock_failure(&error);
                         if is_remote_lock_rpc_failure(&error) && !is_remote_lock_rpc_timeout(&error) {
                             hard_failures += 1;
@@ -1523,6 +1569,8 @@ impl DistributedLock {
                 needed.saturating_add(LOCK_ACQUIRE_SPARE_HEDGES),
             );
             let unstarted_clients = self.clients.len().saturating_sub(next_client_index);
+            // Scheduled retries cannot rescue an otherwise impossible round. Roll back
+            // its partial cohort so competing exclusive callers can make progress.
             if round.grants.len() + round.pending.len() + unstarted_clients < required_quorum {
                 let rollback_count = round.grants.len();
                 Self::spawn_release_cleanup(
@@ -1608,7 +1656,7 @@ mod tests {
     use super::{
         DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LOCK_ACQUIRE_SPARE_HEDGES,
         LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF,
-        is_remote_lock_rpc_failure, should_warn_lock_failure,
+        is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{
         GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
@@ -1623,6 +1671,7 @@ mod tests {
         sync::{Arc, Mutex},
         time::Duration,
     };
+    use tokio::time::Instant;
 
     #[derive(Clone, Copy, Debug)]
     enum RefreshOutcome {
@@ -1679,6 +1728,7 @@ mod tests {
     #[derive(Debug)]
     struct RefreshCountingClient {
         acquire_calls: AtomicUsize,
+        acquire_delay: Duration,
         refresh_calls: Arc<AtomicUsize>,
         outcome: RefreshOutcome,
         active: tokio::sync::Mutex<std::collections::HashSet<LockId>>,
@@ -1686,8 +1736,13 @@ mod tests {
 
     impl RefreshCountingClient {
         fn new(outcome: RefreshOutcome, counter: Arc<AtomicUsize>) -> Arc<Self> {
+            Self::with_acquire_delay(outcome, counter, Duration::ZERO)
+        }
+
+        fn with_acquire_delay(outcome: RefreshOutcome, counter: Arc<AtomicUsize>, acquire_delay: Duration) -> Arc<Self> {
             Arc::new(Self {
                 acquire_calls: AtomicUsize::new(0),
+                acquire_delay,
                 refresh_calls: counter,
                 outcome,
                 active: tokio::sync::Mutex::new(std::collections::HashSet::new()),
@@ -1699,6 +1754,9 @@ mod tests {
     impl LockClient for RefreshCountingClient {
         async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
             self.acquire_calls.fetch_add(1, Ordering::SeqCst);
+            if !self.acquire_delay.is_zero() {
+                tokio::time::sleep(self.acquire_delay).await;
+            }
             self.active.lock().await.insert(request.lock_id.clone());
             let info = LockInfo {
                 id: request.lock_id.clone(),
@@ -1759,6 +1817,90 @@ mod tests {
             counters.push(counter);
         }
         (clients, counters)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_quorum_refreshes_before_its_original_lease_expires() {
+        let counter = Arc::new(AtomicUsize::new(0));
+        let clients = (0..4)
+            .map(|_| {
+                RefreshCountingClient::with_acquire_delay(RefreshOutcome::Alive, counter.clone(), Duration::from_millis(250))
+                    as Arc<dyn LockClient>
+            })
+            .collect();
+        let lock = DistributedLock::new("delayed-quorum-refresh".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(300))
+            .with_acquire_timeout(Duration::from_secs(1));
+        let started = Instant::now();
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("acquisition result")
+            .expect("live quorum");
+        assert_eq!(started.elapsed(), Duration::from_millis(250));
+        tokio::task::yield_now().await;
+        assert!(counter.load(Ordering::SeqCst) >= 3, "renew before the remaining 50ms lease expires");
+        for _ in 0..4 {
+            tokio::time::advance(Duration::from_millis(100)).await;
+            tokio::task::yield_now().await;
+            assert!(!guard.is_lock_lost(), "renewed quorum must survive the original acquisition lease");
+        }
+        assert!(started.elapsed() > request.ttl);
+        drop(guard);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_quorum_failed_refresh_still_expires_at_original_deadline() {
+        for outcome in [
+            RefreshOutcome::RpcError,
+            RefreshOutcome::SlowAlive(Duration::from_millis(100)),
+        ] {
+            let counter = Arc::new(AtomicUsize::new(0));
+            let clients = (0..4)
+                .map(|_| {
+                    RefreshCountingClient::with_acquire_delay(outcome, counter.clone(), Duration::from_millis(250))
+                        as Arc<dyn LockClient>
+                })
+                .collect();
+            let lock = DistributedLock::new("delayed-quorum-failed-refresh".to_string(), clients, 3);
+            let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+                .with_ttl(Duration::from_millis(300))
+                .with_acquire_timeout(Duration::from_secs(1));
+            let started = Instant::now();
+            let guard = lock
+                .acquire_guard(&request)
+                .await
+                .expect("acquisition result")
+                .expect("live quorum");
+            tokio::task::yield_now().await;
+            assert!(counter.load(Ordering::SeqCst) >= 3, "remaining lease must allow a renewal attempt");
+            guard.lock_lost().notified().await;
+            assert_eq!(started.elapsed(), request.ttl, "unconfirmed renewal must not extend the lease");
+            assert!(guard.is_lock_lost());
+            drop(guard);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fresh_quorum_keeps_normal_first_refresh_interval() {
+        let (clients, counters) = counting_clients(&[RefreshOutcome::Alive; 4]);
+        let lock = DistributedLock::new("fresh-quorum-refresh".to_string(), clients, 3);
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_ttl(Duration::from_millis(300));
+        let guard = lock
+            .acquire_guard(&request)
+            .await
+            .expect("acquisition result")
+            .expect("live quorum");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert!(counters.iter().all(|counter| counter.load(Ordering::SeqCst) == 0));
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert!(counters.iter().filter(|counter| counter.load(Ordering::SeqCst) > 0).count() >= 3);
+        drop(guard);
     }
 
     #[tokio::test(start_paused = true)]
@@ -2673,6 +2815,24 @@ mod tests {
     }
 
     #[test]
+    fn only_backend_no_grant_responses_allow_same_round_retry() {
+        assert!(is_definitive_lock_contention("Lock acquisition timeout"));
+        assert!(is_definitive_lock_contention("Lock conflict: resource held by owner in Exclusive mode"));
+        for error in [
+            "Remote lock RPC timed out: Lock acquisition timeout",
+            "Remote lock RPC failed: Lock conflict: resource held by owner in Exclusive mode",
+            "Timeout { resource: bucket/object, timeout: 1s }",
+            "permission denied",
+            "unknown error",
+        ] {
+            assert!(
+                !is_definitive_lock_contention(error),
+                "ambiguous failure must not reuse a lock ID: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn test_should_warn_lock_failure() {
         assert!(should_warn_lock_failure("Remote lock RPC failed: backend unreachable"));
         assert!(should_warn_lock_failure("permission denied"));
@@ -3244,6 +3404,172 @@ mod tests {
         })
         .await
         .expect("every completed and late grant must be cleaned up");
+    }
+
+    fn contention_retry_clients(error: &'static str, failures: usize, retry_delay: Duration) -> Vec<Arc<SequencedClient>> {
+        (0..4)
+            .map(|idx| {
+                let plans = match idx {
+                    2 => {
+                        let mut plans = vec![
+                            AcquirePlan::Failure {
+                                error,
+                                delay: Duration::ZERO
+                            };
+                            failures
+                        ];
+                        plans.push(AcquirePlan::Success { delay: retry_delay });
+                        plans
+                    }
+                    3 => vec![AcquirePlan::Success {
+                        delay: Duration::from_secs(3),
+                    }],
+                    _ => vec![AcquirePlan::Success { delay: Duration::ZERO }],
+                };
+                Arc::new(SequencedClient::new(plans, Arc::new(Mutex::new(Vec::new()))))
+            })
+            .collect()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn contended_voter_retries_without_discarding_grants_or_pending_peer() {
+        for error in [
+            "Lock acquisition timeout",
+            "Lock conflict: resource held by owner in Exclusive mode",
+        ] {
+            let clients = contention_retry_clients(error, 1, Duration::ZERO);
+            let lock = DistributedLock::new(
+                "contention-with-silent-peer".to_string(),
+                clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+                3,
+            );
+            let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+                .with_acquire_timeout(Duration::from_secs(2))
+                .with_refresh_interval(Duration::ZERO);
+            let started = Instant::now();
+            let guard = lock
+                .acquire_guard(&request)
+                .await
+                .expect("acquisition result")
+                .expect("healthy voter retries");
+            assert_eq!(started.elapsed(), LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF);
+            assert_eq!(guard.entries.len(), 3, "each voter can contribute at most one grant");
+            let round_id = &guard.entries[0].lock_id;
+            for (idx, client) in clients.iter().enumerate() {
+                assert_eq!(client.requested_acquires.load(Ordering::SeqCst), if idx == 2 { 2 } else { 1 });
+                assert!(client.seen_ids.lock().expect("observed IDs").iter().all(|id| id == round_id));
+            }
+            drop(guard);
+            wait_for_acquisition_cleanup(&clients).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn ambiguous_voter_failure_never_retries_with_the_same_id() {
+        for error in ["Remote lock RPC timed out: RPC timed out after 1s", "unknown error"] {
+            let clients = contention_retry_clients(error, 1, Duration::ZERO);
+            let lock = DistributedLock::new(
+                "ambiguous-voter-failure".to_string(),
+                clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+                3,
+            );
+            let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+                .with_acquire_timeout(Duration::from_secs(2));
+            let result = lock
+                .acquire_lock_quorum_once(&request, request.acquire_timeout)
+                .await
+                .expect("round result");
+            assert!(!result.response.success);
+            assert!(result.attempt_timed_out);
+            assert_eq!(clients[2].requested_acquires.load(Ordering::SeqCst), 1);
+            wait_for_acquisition_cleanup(&clients).await;
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn permanent_contention_retries_are_bounded_by_backoff_and_deadline() {
+        let clients = contention_retry_clients("Lock acquisition timeout", 16, Duration::ZERO);
+        let lock = DistributedLock::new(
+            "bounded-voter-retries".to_string(),
+            clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+            3,
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+        let started = Instant::now();
+        let result = lock
+            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .await
+            .expect("round result");
+        assert!(!result.response.success);
+        assert!(result.attempt_timed_out);
+        assert_eq!(started.elapsed(), request.acquire_timeout);
+        assert_eq!(result.individual_locks.len(), 2, "retries must not duplicate existing votes");
+        assert_eq!(clients[2].requested_acquires.load(Ordering::SeqCst), 4, "250ms, 500ms, 750ms backoffs");
+        wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn impossible_round_releases_partial_cohort_without_waiting_for_retries() {
+        let clients = (0..4)
+            .map(|idx| {
+                Arc::new(SequencedClient::new(
+                    vec![if idx < 2 {
+                        AcquirePlan::Success { delay: Duration::ZERO }
+                    } else {
+                        AcquirePlan::Failure {
+                            error: "Lock acquisition timeout",
+                            delay: Duration::ZERO,
+                        }
+                    }],
+                    Arc::new(Mutex::new(Vec::new())),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let lock = DistributedLock::new(
+            "split-exclusive-cohort".to_string(),
+            clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+            3,
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(2));
+        let started = Instant::now();
+        let result = lock
+            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .await
+            .expect("round result");
+        assert!(!result.response.success);
+        assert!(
+            !result.attempt_timed_out,
+            "a split minority must yield instead of retaining grants until the deadline"
+        );
+        assert_eq!(started.elapsed(), Duration::ZERO);
+        assert!(
+            clients
+                .iter()
+                .all(|client| client.requested_acquires.load(Ordering::SeqCst) == 1)
+        );
+        wait_for_acquisition_cleanup(&clients).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn timed_out_contention_retry_releases_its_late_grant() {
+        let clients = contention_retry_clients("Lock acquisition timeout", 1, Duration::from_secs(2));
+        let lock = DistributedLock::new(
+            "late-retry-cleanup".to_string(),
+            clients.iter().cloned().map(|client| client as Arc<dyn LockClient>).collect(),
+            3,
+        );
+        let request = LockRequest::new(ObjectKey::new("bucket", "object"), LockType::Exclusive, "owner")
+            .with_acquire_timeout(Duration::from_secs(1));
+        let result = lock
+            .acquire_lock_quorum_once(&request, request.acquire_timeout)
+            .await
+            .expect("round result");
+        assert!(!result.response.success);
+        assert!(result.attempt_timed_out);
+        assert_eq!(clients[2].requested_acquires.load(Ordering::SeqCst), 2);
+        wait_for_acquisition_cleanup(&clients).await;
     }
 
     #[tokio::test(start_paused = true)]
