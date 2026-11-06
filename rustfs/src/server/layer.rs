@@ -33,7 +33,7 @@ use crate::storage_api::server::layer::apply_cors_headers;
 use crate::storage_api::server::layer::batch_diagnostic;
 use crate::storage_api::server::layer::request_context::{RequestContext, extract_request_id_from_headers, spawn_traced};
 use bytes::{Bytes, BytesMut};
-use futures::future::Either;
+use futures::future::{BoxFuture, Either};
 use http::{HeaderMap, HeaderValue, Method, Request as HttpRequest, Response, StatusCode, Uri};
 use http_body::Body;
 use http_body_util::{BodyExt, Full};
@@ -2279,8 +2279,8 @@ fn is_object_attributes_request<B>(req: &HttpRequest<B>) -> bool {
     has_object_attributes_query || has_object_attributes_header
 }
 
-/// Conditional CORS layer that only applies to S3 API requests
-/// (not Admin, not Console, not RPC)
+/// Applies bucket/global CORS grants and origin cache variation to external responses.
+/// Cache variation also protects grants supplied by inner website and console handlers.
 #[derive(Clone)]
 pub struct ConditionalCorsLayer {
     cors_origins: Option<String>,
@@ -2452,9 +2452,40 @@ fn apply_bucket_cors_result(response_headers: &mut HeaderMap, bucket_cors_header
     }
 }
 
+pin_project! {
+    /// Adds cache selectors after policy evaluation without boxing the direct inner future.
+    pub struct CorsResponseFuture<F> {
+        #[pin]
+        inner: F,
+        vary_fields: &'static str,
+    }
+}
+
+impl<F, ResBody, E> Future for CorsResponseFuture<F>
+where
+    F: Future<Output = Result<Response<ResBody>, E>>,
+    E: Into<Box<dyn std::error::Error + Send + Sync>>,
+{
+    type Output = Result<Response<ResBody>, Box<dyn std::error::Error + Send + Sync>>;
+
+    fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        let this = self.project();
+        match this.inner.poll(cx) {
+            Poll::Ready(Ok(mut response)) => {
+                // Grants can come from inner handlers even on non-S3 paths.
+                // Cache variation is independent of routing and policy matching.
+                append_vary_headers(response.headers_mut(), this.vary_fields);
+                Poll::Ready(Ok(response))
+            }
+            Poll::Ready(Err(error)) => Poll::Ready(Err(error.into())),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+}
+
 impl<S, ReqBody, ResBody> Service<HttpRequest<ReqBody>> for ConditionalCorsService<S>
 where
-    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Clone + Send + 'static,
+    S: Service<HttpRequest<ReqBody>, Response = Response<ResBody>> + Send + 'static,
     S::Future: Send + 'static,
     S::Error: Into<Box<dyn std::error::Error + Send + Sync>> + Send + 'static,
     ReqBody: Send + 'static,
@@ -2462,7 +2493,7 @@ where
 {
     type Response = Response<ResBody>;
     type Error = Box<dyn std::error::Error + Send + Sync>;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+    type Future = CorsResponseFuture<Either<S::Future, BoxFuture<'static, Result<Self::Response, S::Error>>>>;
 
     fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner.poll_ready(cx).map_err(Into::into)
@@ -2471,73 +2502,74 @@ where
     fn call(&mut self, req: HttpRequest<ReqBody>) -> Self::Future {
         let is_options = req.method() == Method::OPTIONS;
         let has_origin = req.headers().contains_key(cors::standard::ORIGIN);
+        if !is_options && !has_origin {
+            return CorsResponseFuture {
+                inner: Either::Left(self.inner.call(req)),
+                vary_fields: "Origin",
+            };
+        }
+
         let global_policy = self.global_policy.clone();
-        let vh_domain_hosts = self.vh_domain_hosts.clone();
-        let mut inner = self.inner.clone();
+        let uri = req.uri().clone();
+        let method = req.method().clone();
+        let cors_request = cors::CorsRequest::from_headers(req.headers());
+        let is_s3 = ConditionalCorsLayer::is_s3_path(uri.path());
+        // A virtual-hosted-style request carries its bucket in the host, so its
+        // path is the object key (or `/` for a bucket-level request).
+        let vh_bucket = virtual_host_bucket(&req, &self.vh_domain_hosts).map(str::to_owned);
+        let is_root = uri.path() == "/" && vh_bucket.is_none();
 
-        Box::pin(async move {
-            let result: Result<Self::Response, Self::Error> = async {
-                if !is_options && !has_origin {
-                    return inner.call(req).await.map_err(Into::into);
-                }
-                let uri = req.uri().clone();
-                let path = uri.path();
-                let method = req.method().clone();
-                let cors_request = cors::CorsRequest::from_headers(req.headers());
-                let is_s3 = ConditionalCorsLayer::is_s3_path(path);
-                // A virtual-hosted-style request carries its bucket in the host, so its
-                // path is the object key (or `/` for a bucket-level request).
-                let vh_bucket = virtual_host_bucket(&req, &vh_domain_hosts).map(str::to_owned);
-                let is_root = path == "/" && vh_bucket.is_none();
-
-                if is_options {
-                    let has_acrm = cors_request.requested_method.is_some();
-                    if is_s3 && (!has_acrm || !has_origin) {
-                        return Ok(Response::builder()
-                            .status(StatusCode::BAD_REQUEST)
-                            .body(ResBody::default())
-                            .expect("valid response body"));
-                    }
-
-                    if is_s3 && !is_root {
-                        let bucket = vh_bucket
-                            .as_deref()
-                            .unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or(""));
-                        if let Some(cors_headers) = resolve_s3_options_cors_headers(bucket, &cors_request).await {
-                            let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
-                            let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
-                            let mut response = Response::builder()
-                                .status(status)
-                                .body(ResBody::default())
-                                .expect("valid response body");
-                            apply_bucket_cors_result(response.headers_mut(), &cors_headers);
-                            return Ok(response);
-                        }
-                    }
-
-                    // No bucket policy applies: retain the existing global/default policy.
-                    let mut response = Response::builder()
-                        .status(StatusCode::OK)
+        let future: BoxFuture<'static, Result<Self::Response, S::Error>> = if is_options {
+            Box::pin(async move {
+                let has_acrm = cors_request.requested_method.is_some();
+                if is_s3 && (!has_acrm || !has_origin) {
+                    return Ok(Response::builder()
+                        .status(StatusCode::BAD_REQUEST)
                         .body(ResBody::default())
-                        .expect("valid response body");
-                    global_policy.apply(cors_request.origin.as_ref(), response.headers_mut());
-                    return Ok(response);
+                        .expect("valid response body"));
                 }
 
-                let mut response = inner.call(req).await.map_err(Into::into)?;
+                if is_s3 && !is_root {
+                    let bucket = vh_bucket
+                        .as_deref()
+                        .unwrap_or_else(|| uri.path().trim_start_matches('/').split('/').next().unwrap_or(""));
+                    if let Some(cors_headers) = resolve_s3_options_cors_headers(bucket, &cors_request).await {
+                        let cors_allowed = cors_headers.contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN);
+                        let status = if cors_allowed { StatusCode::OK } else { StatusCode::FORBIDDEN };
+                        let mut response = Response::builder()
+                            .status(status)
+                            .body(ResBody::default())
+                            .expect("valid response body");
+                        apply_bucket_cors_result(response.headers_mut(), &cors_headers);
+                        return Ok(response);
+                    }
+                }
 
-                if has_origin && !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN) {
+                // No bucket policy applies: retain the existing global/default policy.
+                let mut response = Response::builder()
+                    .status(StatusCode::OK)
+                    .body(ResBody::default())
+                    .expect("valid response body");
+                global_policy.apply(cors_request.origin.as_ref(), response.headers_mut());
+                Ok(response)
+            })
+        } else {
+            // Forward through the instance whose readiness was polled. A clone
+            // may not hold the resources reserved by poll_ready.
+            let future = self.inner.call(req);
+            Box::pin(async move {
+                let mut response = future.await?;
+                if !response.headers().contains_key(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN) {
                     if is_s3 {
                         let bucket = vh_bucket
                             .as_deref()
-                            .unwrap_or_else(|| path.trim_start_matches('/').split('/').next().unwrap_or(""));
+                            .unwrap_or_else(|| uri.path().trim_start_matches('/').split('/').next().unwrap_or(""));
                         if is_root {
                             global_policy.apply(cors_request.origin.as_ref(), response.headers_mut());
                         } else if !bucket.is_empty() {
                             match apply_cors_headers(bucket, &method, &cors_request).await {
                                 Some(bucket_cors_headers) => {
-                                    // Bucket-level CORS is authoritative when configured, even if it
-                                    // intentionally resolves to an empty header set (no rule match).
+                                    // Bucket-level CORS is authoritative even when no rule matched.
                                     apply_bucket_cors_result(response.headers_mut(), &bucket_cors_headers);
                                 }
                                 None => {
@@ -2552,24 +2584,21 @@ where
                         global_policy.apply(cors_request.origin.as_ref(), response.headers_mut());
                     }
                 }
-
                 Ok(response)
-            }
-            .await;
-            let mut response = result?;
+            })
+        };
 
-            // Grants may come from an inner handler even on paths excluded by
-            // is_s3_path (for example website objects named /favicon.ico). Keep
-            // cache variation independent of routing and avoid metadata lookups
-            // or request cloning solely to classify originless responses.
-            let fields = if is_options {
-                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
+        CorsResponseFuture {
+            inner: Either::Right(future),
+            // Actual requests retain method overrides and credential-sensitive
+            // wildcard grants. Nominate their inputs even when absent so cached
+            // responses cannot hide later changes to those inputs.
+            vary_fields: if is_options {
+                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers, Authorization, Cookie, X-Amz-Security-Token, X-Amz-Content-Sha256"
             } else {
-                "Origin"
-            };
-            append_vary_headers(response.headers_mut(), fields);
-            Ok(response)
-        })
+                "Origin, Access-Control-Request-Method, Authorization, Cookie, X-Amz-Security-Token, X-Amz-Content-Sha256"
+            },
+        }
     }
 }
 
@@ -6328,6 +6357,219 @@ mod tests {
         }
     }
 
+    struct CorsReadyService {
+        ready: bool,
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl Service<Request<()>> for CorsReadyService {
+        type Response = Response<Full<Bytes>>;
+        type Error = Infallible;
+        type Future = Ready<Result<Self::Response, Self::Error>>;
+
+        fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+            self.ready = true;
+            Poll::Ready(Ok(()))
+        }
+
+        fn call(&mut self, _request: Request<()>) -> Self::Future {
+            assert!(std::mem::take(&mut self.ready), "call must consume this instance's readiness");
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            ready(Ok(Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header(http::header::VARY, "Accept-Encoding")
+                .header(http::header::ETAG, "original-etag")
+                .body(Full::new(Bytes::from_static(b"original body")))
+                .expect("inner response")))
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_calls_the_ready_non_clone_service() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = ConditionalCorsLayer {
+            cors_origins: Some("https://allowed.example".to_owned()),
+            vh_domain_hosts: Arc::default(),
+        }
+        .layer(CorsReadyService {
+            ready: false,
+            calls: calls.clone(),
+        });
+        for (index, origin) in [None, Some("https://allowed.example"), None].into_iter().enumerate() {
+            std::future::poll_fn(|cx| service.poll_ready(cx))
+                .await
+                .expect("inner readiness");
+            let mut request = Request::builder().uri("/");
+            if let Some(origin) = origin {
+                request = request.header(cors::standard::ORIGIN, origin);
+            }
+            let future = service.call(request.body(()).expect("request"));
+            assert_eq!(calls.load(Ordering::SeqCst), index + 1, "call forwards through the ready instance");
+            let response = future.await.expect("response");
+            assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+            assert_eq!(response.headers()[http::header::ETAG], "original-etag");
+            let mut expected_vary = vec!["Accept-Encoding"];
+            expected_vary.extend(expected_cors_vary(false, origin.is_some()));
+            assert_eq!(cors_vary_tokens(response.headers()), expected_vary);
+            assert_eq!(
+                response
+                    .headers()
+                    .get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+                    .and_then(|v| v.to_str().ok()),
+                origin
+            );
+            assert_eq!(response.into_body().collect().await.expect("body").to_bytes(), "original body");
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_options_preserves_inner_readiness_without_calling_it() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let mut service = ConditionalCorsLayer {
+            cors_origins: Some("https://allowed.example".to_owned()),
+            vh_domain_hosts: Arc::default(),
+        }
+        .layer(CorsReadyService {
+            ready: false,
+            calls: calls.clone(),
+        });
+        std::future::poll_fn(|cx| service.poll_ready(cx))
+            .await
+            .expect("inner readiness");
+        let request = Request::builder()
+            .method(Method::OPTIONS)
+            .uri("/")
+            .header(cors::standard::ORIGIN, "https://allowed.example")
+            .header(cors::request::ACCESS_CONTROL_REQUEST_METHOD, "GET")
+            .body(())
+            .expect("preflight request");
+        let future = service.call(request);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        let response = future.await.expect("preflight response");
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(service.inner.ready, "synthesized preflight does not consume inner readiness");
+        assert_eq!(cors_vary_tokens(response.headers()), expected_cors_vary(true, true));
+        assert!(response.into_body().collect().await.expect("body").to_bytes().is_empty());
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_preserves_pending_response_and_transport_error() {
+        for origin in [None, Some("https://allowed.example")] {
+            for fail in [false, true] {
+                let (sender, receiver) = tokio::sync::oneshot::channel::<Result<Response<Full<Bytes>>, io::Error>>();
+                let mut receiver = Some(receiver);
+                let inner = tower::service_fn(move |_: Request<()>| {
+                    let receiver = receiver.take().expect("one inner call");
+                    async move { receiver.await.expect("controlled response") }
+                });
+                let mut service = ConditionalCorsLayer {
+                    cors_origins: Some("https://allowed.example".to_owned()),
+                    vh_domain_hosts: Arc::default(),
+                }
+                .layer(inner);
+                std::future::poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .expect("inner readiness");
+                let mut request = Request::builder().uri("/");
+                if let Some(origin) = origin {
+                    request = request.header(cors::standard::ORIGIN, origin);
+                }
+                let mut future = Box::pin(service.call(request.body(()).expect("request")));
+                assert!(futures::poll!(future.as_mut()).is_pending());
+                let result = if fail {
+                    Err(io::Error::new(io::ErrorKind::BrokenPipe, "controlled transport failure"))
+                } else {
+                    Ok(Response::builder()
+                        .status(StatusCode::PARTIAL_CONTENT)
+                        .header(http::header::ETAG, "pending-etag")
+                        .header(http::header::VARY, "Accept-Encoding")
+                        .body(Full::new(Bytes::from_static(b"pending body")))
+                        .expect("inner response"))
+                };
+                sender.send(result).expect("response receiver alive");
+                if fail {
+                    let error = future.await.expect_err("transport error");
+                    let error = error.downcast_ref::<io::Error>().expect("original error type");
+                    assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+                    assert_eq!(error.to_string(), "controlled transport failure");
+                } else {
+                    let response = future.await.expect("completed response");
+                    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+                    assert_eq!(response.headers()[http::header::ETAG], "pending-etag");
+                    let mut expected_vary = vec!["Accept-Encoding"];
+                    expected_vary.extend(expected_cors_vary(false, origin.is_some()));
+                    assert_eq!(cors_vary_tokens(response.headers()), expected_vary);
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .and_then(|v| v.to_str().ok()),
+                        origin
+                    );
+                    assert_eq!(response.into_body().collect().await.expect("body").to_bytes(), "pending body");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn conditional_cors_cancellation_drops_the_inner_future() {
+        for origin in [None, Some("https://allowed.example")] {
+            for poll_request in [false, true] {
+                let (sender, receiver) = tokio::sync::oneshot::channel::<Response<()>>();
+                let mut receiver = Some(receiver);
+                let inner = tower::service_fn(move |_: Request<()>| {
+                    let receiver = receiver.take().expect("one inner call");
+                    async move { Ok::<_, Infallible>(receiver.await.expect("controlled response")) }
+                });
+                let mut service = ConditionalCorsLayer {
+                    cors_origins: Some("https://allowed.example".to_owned()),
+                    vh_domain_hosts: Arc::default(),
+                }
+                .layer(inner);
+                std::future::poll_fn(|cx| service.poll_ready(cx))
+                    .await
+                    .expect("inner readiness");
+                let mut request = Request::builder().uri("/");
+                if let Some(origin) = origin {
+                    request = request.header(cors::standard::ORIGIN, origin);
+                }
+                let mut future = Box::pin(service.call(request.body(()).expect("request")));
+                if poll_request {
+                    assert!(futures::poll!(future.as_mut()).is_pending());
+                }
+                drop(future);
+                assert!(sender.is_closed(), "cancellation must release the inner receiver");
+            }
+        }
+    }
+
+    fn expected_cors_vary(preflight: bool, has_origin: bool) -> Vec<&'static str> {
+        if preflight {
+            vec![
+                "Origin",
+                "Access-Control-Request-Method",
+                "Access-Control-Request-Headers",
+                "Authorization",
+                "Cookie",
+                "X-Amz-Security-Token",
+                "X-Amz-Content-Sha256",
+            ]
+        } else if has_origin {
+            vec![
+                "Origin",
+                "Access-Control-Request-Method",
+                "Authorization",
+                "Cookie",
+                "X-Amz-Security-Token",
+                "X-Amz-Content-Sha256",
+            ]
+        } else {
+            vec!["Origin"]
+        }
+    }
+
     fn cors_vary_tokens(headers: &HeaderMap) -> Vec<&str> {
         headers
             .get_all(cors::standard::VARY)
@@ -6375,7 +6617,9 @@ mod tests {
                         let response = service.call(request.body(()).expect("request")).await.expect("response");
                         assert_eq!(response.status(), status);
                         assert_eq!(response.headers()[http::header::CACHE_CONTROL], "public, max-age=3600");
-                        assert_eq!(cors_vary_tokens(response.headers()), ["Accept-Encoding", "Origin"]);
+                        let mut expected_vary = vec!["Accept-Encoding"];
+                        expected_vary.extend(expected_cors_vary(false, origin.is_some()));
+                        assert_eq!(cors_vary_tokens(response.headers()), expected_vary);
                         let valid_origin = origin.as_ref().and_then(|value| value.to_str().ok());
                         let expected_origin = match (config, valid_origin) {
                             (Some("*"), Some(_)) => Some("*"),
@@ -6438,10 +6682,23 @@ mod tests {
                 }
                 let response = service.call(request.body(()).expect("request")).await.expect("response");
                 assert_eq!(response.headers()[cors::response::ACCESS_CONTROL_ALLOW_ORIGIN], "https://inner.example");
-                let mut expected_vary = initial_vary;
-                if needs_origin {
-                    expected_vary.push(HeaderValue::from_static("Origin"));
-                }
+                let expected_vary = if initial_vary.is_empty() {
+                    vec![HeaderValue::from_str(&expected_cors_vary(false, origin.is_some()).join(", ")).expect("Vary fields")]
+                } else {
+                    let mut values = initial_vary;
+                    if needs_origin {
+                        values.push(HeaderValue::from_static("Origin"));
+                    }
+                    if origin.is_some() && !existing_vary.contains(&"*") {
+                        values.extend(
+                            expected_cors_vary(false, true)
+                                .into_iter()
+                                .skip(1)
+                                .map(HeaderValue::from_static),
+                        );
+                    }
+                    values
+                };
                 assert_eq!(
                     response
                         .headers()
@@ -6488,10 +6745,7 @@ mod tests {
                                 StatusCode::OK
                             }
                         );
-                        assert_eq!(
-                            cors_vary_tokens(response.headers()),
-                            ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"]
-                        );
+                        assert_eq!(cors_vary_tokens(response.headers()), expected_cors_vary(true, true));
                     }
                 }
             }
@@ -6538,7 +6792,7 @@ mod tests {
                     request = request.header(cors::standard::ORIGIN, origin);
                 }
                 let response = service.call(request.body(()).expect("request")).await.expect("response");
-                assert_eq!(cors_vary_tokens(response.headers()), ["Origin"]);
+                assert_eq!(cors_vary_tokens(response.headers()), expected_cors_vary(false, origin.is_some()));
             }
         }
     }
@@ -6581,11 +6835,202 @@ mod tests {
                             origin,
                             "{host}{path} must preserve the website handler's grant"
                         );
-                        assert_eq!(cors_vary_tokens(response.headers()), ["Origin"], "{host}{path}, origin={origin:?}");
+                        assert_eq!(
+                            cors_vary_tokens(response.headers()),
+                            expected_cors_vary(false, origin.is_some()),
+                            "{host}{path}, origin={origin:?}"
+                        );
                     }
                 }
             }
         }
+    }
+
+    // These fixtures use canonical single-value fields. This checks Vary's
+    // nominated-field matching, not freshness or a complete HTTP cache engine.
+    fn cors_vary_allows_reuse(stored_request: &HeaderMap, stored_response: &HeaderMap, next_request: &HeaderMap) -> bool {
+        cors_vary_tokens(stored_response)
+            .into_iter()
+            .all(|field| field != "*" && stored_request.get_all(field).iter().eq(next_request.get_all(field).iter()))
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn conditional_cors_cache_keys_separate_policy_input_variants() {
+        crate::app::gating_test_env::run_large_stack_test("cors-cache-keys", || async {
+            use crate::app::storage_api::bucket::{metadata::BUCKET_CORS_CONFIG, metadata_sys};
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+            async fn assert_pair(
+                service: &mut ConditionalCorsService<CorsOkService>,
+                bucket: &str,
+                method: Method,
+                requests: [HeaderMap; 2],
+                grants: [(Option<&str>, bool); 2],
+                can_reuse: bool,
+            ) {
+                let mut responses = Vec::new();
+                for (headers, (allow_origin, allow_credentials)) in requests.iter().zip(grants) {
+                    let mut request = Request::builder()
+                        .method(method.clone())
+                        .uri(format!("/{bucket}/object"))
+                        .body(())
+                        .expect("cache variant request");
+                    *request.headers_mut() = headers.clone();
+                    let response = service.call(request).await.expect("cache variant response");
+                    assert_eq!(
+                        response
+                            .headers()
+                            .get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN)
+                            .and_then(|value| value.to_str().ok()),
+                        allow_origin,
+                        "{method}, request={headers:?}"
+                    );
+                    assert_eq!(
+                        response
+                            .headers()
+                            .contains_key(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS),
+                        allow_credentials
+                    );
+                    assert!(cors_vary_allows_reuse(headers, response.headers(), headers));
+                    responses.push(response.into_parts().0.headers);
+                }
+                for (stored, next) in [(0, 1), (1, 0)] {
+                    assert_eq!(
+                        cors_vary_allows_reuse(&requests[stored], &responses[stored], &requests[next]),
+                        can_reuse,
+                        "{method}, stored={:?}, next={:?}",
+                        requests[stored],
+                        requests[next]
+                    );
+                }
+            }
+
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let suffix = uuid::Uuid::new_v4().simple().to_string();
+            let owner = format!("cors-cache-owner-{suffix}");
+            let wildcard = format!("cors-cache-wildcard-{suffix}");
+            for (bucket, origin, allowed_header) in [(&owner, "https://app.example", "x-allowed"), (&wildcard, "*", "*")] {
+                store
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("cache variant bucket");
+                let xml = format!(
+                    "<CORSConfiguration><CORSRule><AllowedOrigin>{origin}</AllowedOrigin><AllowedMethod>GET</AllowedMethod><AllowedMethod>HEAD</AllowedMethod><AllowedHeader>{allowed_header}</AllowedHeader></CORSRule></CORSConfiguration>"
+                );
+                metadata_sys::update(bucket, BUCKET_CORS_CONFIG, xml.into_bytes())
+                    .await
+                    .expect("persist cache variant CORS rule");
+            }
+            let mut service = ConditionalCorsLayer {
+                cors_origins: Some("*".to_owned()),
+                vh_domain_hosts: Arc::default(),
+            }
+            .layer(CorsOkService);
+            let mut origin = HeaderMap::new();
+            origin.insert(cors::standard::ORIGIN, HeaderValue::from_static("https://app.example"));
+            let granted = (Some("https://app.example"), false);
+            let denied = (None, false);
+
+            for method in [Method::GET, Method::HEAD] {
+                assert_pair(&mut service, &owner, method, [HeaderMap::new(), origin.clone()], [denied, granted], false).await;
+            }
+            for name in ["authorization", "cookie", "x-amz-security-token", "x-amz-content-sha256"] {
+                for value in ["", "present"] {
+                    let mut credentialed = origin.clone();
+                    credentialed.insert(name, HeaderValue::from_static(value));
+                    assert_pair(
+                        &mut service,
+                        &wildcard,
+                        Method::GET,
+                        [origin.clone(), credentialed],
+                        [(Some("*"), false), (Some("https://app.example"), true)],
+                        false,
+                    )
+                    .await;
+                }
+            }
+            let mut get_override = origin.clone();
+            get_override.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, HeaderValue::from_static("GET"));
+            let mut put_override = origin.clone();
+            put_override.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, HeaderValue::from_static("PUT"));
+            for allowed in [origin.clone(), get_override.clone()] {
+                assert_pair(
+                    &mut service,
+                    &owner,
+                    Method::GET,
+                    [allowed, put_override.clone()],
+                    [granted, denied],
+                    false,
+                )
+                .await;
+            }
+            let opaque = HeaderValue::from_bytes(&[0x80]).expect("opaque CORS selector");
+            let mut invalid_method = origin.clone();
+            invalid_method.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, opaque.clone());
+            for denied_preflight in [origin.clone(), put_override, invalid_method] {
+                assert_pair(
+                    &mut service,
+                    &owner,
+                    Method::OPTIONS,
+                    [get_override.clone(), denied_preflight],
+                    [granted, denied],
+                    false,
+                )
+                .await;
+            }
+            let mut allowed_headers = get_override.clone();
+            allowed_headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, HeaderValue::from_static("x-allowed"));
+            let mut denied_headers = get_override.clone();
+            denied_headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, HeaderValue::from_static("x-denied"));
+            let mut opaque_headers = get_override.clone();
+            opaque_headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, opaque);
+            for (left, right, right_grant) in [
+                (get_override.clone(), allowed_headers.clone(), granted),
+                (get_override.clone(), denied_headers.clone(), denied),
+                (allowed_headers, denied_headers, denied),
+                (get_override.clone(), opaque_headers, granted),
+            ] {
+                assert_pair(&mut service, &owner, Method::OPTIONS, [left, right], [granted, right_grant], false).await;
+            }
+            let mut no_origin_preflight = HeaderMap::new();
+            no_origin_preflight.insert(cors::request::ACCESS_CONTROL_REQUEST_METHOD, HeaderValue::from_static("GET"));
+            assert_pair(
+                &mut service,
+                &owner,
+                Method::OPTIONS,
+                [no_origin_preflight, get_override],
+                [denied, granted],
+                false,
+            )
+            .await;
+
+            let mut originless_credentials = HeaderMap::new();
+            originless_credentials.insert(http::header::COOKIE, HeaderValue::from_static("present"));
+            assert_pair(
+                &mut service,
+                &wildcard,
+                Method::GET,
+                [HeaderMap::new(), originless_credentials],
+                [denied, denied],
+                true,
+            )
+            .await;
+            let mut ignored_actual_headers = origin.clone();
+            ignored_actual_headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, HeaderValue::from_static("x-denied"));
+            assert_pair(
+                &mut service,
+                &owner,
+                Method::GET,
+                [origin, ignored_actual_headers],
+                [granted, granted],
+                true,
+            )
+            .await;
+            let mut never_reusable = HeaderMap::new();
+            never_reusable.insert(http::header::VARY, HeaderValue::from_static("*"));
+            assert!(!cors_vary_allows_reuse(&HeaderMap::new(), &never_reusable, &HeaderMap::new()));
+        });
     }
 
     #[test]
@@ -6671,11 +7116,7 @@ mod tests {
                         );
                         assert_eq!(
                             cors_vary_tokens(response.headers()),
-                            if method == Method::OPTIONS {
-                                vec!["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"]
-                            } else {
-                                vec!["Origin"]
-                            },
+                            expected_cors_vary(method == Method::OPTIONS, origin.is_some()),
                             "{method} {uri}, origin={origin:?}"
                         );
                     }
@@ -6751,10 +7192,7 @@ mod tests {
             );
             assert_eq!(response.headers()[cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS], "true");
             assert_eq!(response.headers()[cors::response::ACCESS_CONTROL_ALLOW_HEADERS], "x-amz-content-sha256");
-            assert_eq!(
-                cors_vary_tokens(response.headers()),
-                ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"]
-            );
+            assert_eq!(cors_vary_tokens(response.headers()), expected_cors_vary(true, true));
         });
     }
 
@@ -6796,7 +7234,7 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(response.headers().get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(), "*");
-        assert_eq!(cors_vary_tokens(response.headers()), ["Origin"]);
+        assert_eq!(cors_vary_tokens(response.headers()), expected_cors_vary(false, true));
     }
 
     #[test]
