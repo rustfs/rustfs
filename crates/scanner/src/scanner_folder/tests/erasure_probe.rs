@@ -15,7 +15,7 @@ enum DirectoryOrder {
 pub(in crate::scanner_folder) type OrderedEntries = VecDeque<std::io::Result<native_io::DirEntry>>;
 static ORDERED_DIRECTORIES: LazyLock<Mutex<HashMap<String, DirectoryOrder>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-struct OrderedDirectory(String);
+pub(in crate::scanner_folder) struct OrderedDirectory(String);
 
 impl OrderedDirectory {
     fn new(path: &std::path::Path) -> Self {
@@ -26,7 +26,7 @@ impl OrderedDirectory {
             .insert(path.clone(), DirectoryOrder::PartLast);
         Self(path)
     }
-    fn failing(path: &std::path::Path, entries: usize, kind: std::io::ErrorKind) -> Self {
+    pub(in crate::scanner_folder) fn failing(path: &std::path::Path, entries: usize, kind: std::io::ErrorKind) -> Self {
         let guard = Self::new(path);
         ORDERED_DIRECTORIES
             .lock()

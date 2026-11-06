@@ -2710,48 +2710,74 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let isolate_child = isolate_compacted_children && child_mode == FolderScanMode::Namespace;
-                let compacted = into.compacted;
-                // This accumulator has no retained child tree. Save its totals so a
-                // failed child cannot contribute partial usage to a completed scan.
-                let rollback = (compacted && isolate_child).then(|| clone_cache_value(into));
-                let mut dst = None;
-                let result = if compacted {
-                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode, isolate_child)).await
+                // Keep a compacted namespace child's accounting local until it
+                // succeeds. Ordinary child errors can then discard it without
+                // rolling back totals already committed by healthy siblings.
+                let isolate_compacted_child =
+                    into.compacted && isolate_compacted_children && child_mode == FolderScanMode::Namespace;
+                let outcome = if into.compacted && !isolate_compacted_child {
+                    // Keep the shared-accumulator path free of child summaries.
+                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode, false)).await?
                 } else {
-                    let dst = dst.insert(DataUsageEntry::default());
-                    self.scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, dst, child_mode)
-                        .await
-                };
-                let outcome = match result {
-                    Ok(outcome) => outcome,
-                    Err(e) => {
-                        if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
-                            if let Some(dst) = &dst {
-                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, dst).await;
+                    let mut dst = DataUsageEntry {
+                        compacted: isolate_compacted_child,
+                        ..Default::default()
+                    };
+                    // Provisional child usage must not escape through progress
+                    // updates before this accumulator is committed to its parent.
+                    let suspended_updates = if isolate_compacted_child {
+                        self.usage_updates.take()
+                    } else {
+                        None
+                    };
+                    let result = if isolate_compacted_child {
+                        Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), &mut dst, child_mode, true)).await
+                    } else {
+                        self.scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst, child_mode)
+                            .await
+                    };
+                    if isolate_compacted_child {
+                        self.usage_updates = suspended_updates;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            if isolate_compacted_child {
+                                into.merge(&dst);
                             }
-                            return Err(e);
+                            outcome
                         }
-                        if child_mode != FolderScanMode::Namespace || (compacted && !isolate_child) {
-                            return Err(e);
+                        Err(e) => {
+                            if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
+                                if isolate_compacted_child {
+                                    // Cancellation and resource deferral keep completed
+                                    // work even though the child has not finished.
+                                    into.merge(&dst);
+                                } else {
+                                    self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
+                                        .await;
+                                }
+                                return Err(e);
+                            }
+                            if child_mode != FolderScanMode::Namespace {
+                                return Err(e);
+                            }
+                            warn!(
+                                target: "rustfs::scanner::folder",
+                                event = EVENT_SCANNER_FOLDER_STATE,
+                                component = LOG_COMPONENT_SCANNER,
+                                subsystem = LOG_SUBSYSTEM_FOLDER,
+                                state = "child_scan_failed",
+                                folder = %folder.name,
+                                child_folder = %folder_item.name,
+                                error = %e,
+                                "Scanner child folder scan failed"
+                            );
+                            // A skipped namespace is a coverage gap even when no
+                            // checkpointed forward sweep is active.
+                            self.coverage_gap = true;
+                            self.finish_raw_enumeration_parent(&folder_item.name);
+                            continue;
                         }
-                        if let Some(rollback) = rollback {
-                            *into = rollback;
-                        }
-                        warn!(
-                            target: "rustfs::scanner::folder",
-                            event = EVENT_SCANNER_FOLDER_STATE,
-                            component = LOG_COMPONENT_SCANNER,
-                            subsystem = LOG_SUBSYSTEM_FOLDER,
-                            folder = %folder.name,
-                            child_folder = %folder_item.name,
-                            state = "child_scan_failed",
-                            error = %e,
-                            "Scanner child folder scan failed"
-                        );
-                        self.coverage_gap |= forward_sweep;
-                        self.finish_raw_enumeration_parent(&folder_item.name);
-                        continue;
                     }
                 };
                 self.finish_raw_enumeration_parent(&folder_item.name);
@@ -3243,6 +3269,15 @@ impl FolderScanner {
             let compact_self = self.new_cache.info.name != folder.name || self.old_cache.info.scan_progress.is_none();
             self.new_cache
                 .reduce_children_of(&this_hash, DATA_SCANNER_COMPACT_AT_CHILDREN, compact_self);
+            // The root accumulator is also used by interruption handling.
+            // Reduction may have removed all its old child links, so publish
+            // the aggregate there before any cancellation-prone flush wait.
+            if folder.parent.is_none()
+                && let Some(root) = self.new_cache.cache.get(&this_hash.0)
+                && root.compacted
+            {
+                into.clone_from(root);
+            }
             done_compact();
         }
 
@@ -3256,6 +3291,8 @@ impl FolderScanner {
         }
 
         if folder.parent.is_none() {
+            #[cfg(test)]
+            tests::checkpoint_fixture::deep_compacted::cancel_at_root_flush(&self.root, &self.new_cache, &ctx);
             wait_for_scanner_io(&ctx, self.sleeper.flush_pacing(&mut self.pacing_debt)).await?;
         }
         self.finish_size_reconciliation_batch();
@@ -3467,8 +3504,13 @@ pub(crate) async fn scan_data_folder_scoped(
                     // Retain observations, then verify from the beginning under
                     // the latest plan. A clean tail cannot certify an old prefix.
                     progress.started_plan = progress.requested_plan;
-                    new_cache.info.scan_plan_digest = None;
                 }
+            }
+            if !new_cache.info.snapshot_complete {
+                // Legacy sweeps also reuse compacted children by sampling.
+                // Invalidate that baseline after gaps so the next preparation
+                // cannot certify an unvisited subtree from cached totals.
+                new_cache.info.scan_plan_digest = None;
             }
             let had_scan_checkpoint = had_scan_checkpoint || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
