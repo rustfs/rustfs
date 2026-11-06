@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import re
+import signal
 import subprocess
 import sys
 import tarfile
@@ -167,6 +168,18 @@ class ImageGuards(unittest.TestCase):
             self.assertNotIn("private-base-secret", str(error.exception))
         neutral = image_info()
         neutral["Config"]["Env"] = ["PATH=/usr/bin", "LANG=C.UTF-8", "PYTHON_VERSION=3.13", "RUST_LOG_STYLE=never"]
+        self.assertEqual(repro.validate_image(neutral, SOURCE, expected_arch="arm64")["id"], IMAGE)
+
+    def test_inherited_legacy_minio_alias_is_not_a_neutral_base(self):
+        for setting in ("MINIO_SCANNER_CYCLE=1", "MINIO_ROOT_PASSWORD=private-legacy-secret"):
+            info = image_info()
+            info["Config"]["Env"] = [setting]
+            with self.subTest(setting=setting), self.assertRaises(repro.ReproError) as error:
+                repro.validate_image(info, SOURCE, expected_arch="arm64")
+            self.assertNotIn(setting, str(error.exception))
+            self.assertNotIn("private-legacy-secret", str(error.exception))
+        neutral = image_info()
+        neutral["Config"]["Env"] = ["PATH=/usr/bin", "MINIOLOGY=unrelated"]
         self.assertEqual(repro.validate_image(neutral, SOURCE, expected_arch="arm64")["id"], IMAGE)
 
     def test_preflight_uses_daemon_architecture_and_records_the_actual_host(self):
@@ -563,6 +576,49 @@ class RequestsAndOracles(unittest.TestCase):
             self.assertEqual(summary["first_failure"]["phase"], "capture")
             self.assertEqual(summary["first_failure"]["reason"], "interrupted")
             self.assertTrue(summary["retained_nodes_stopped"])
+
+    def test_main_routes_sigterm_during_capture_through_owned_stop_and_restores_the_handler(self):
+        with tempfile.TemporaryDirectory() as root:
+            commands = FakeDocker()
+            value = experiment(Path(root) / "case", commands)
+            for node in value.nodes.values():
+                commands.objects[("container", node["id"])] = {
+                    "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": True},
+                    "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
+
+            def previous_handler(_signum, _frame):
+                self.fail("the run's SIGTERM bridge must handle termination")
+
+            original_handler = signal.signal(signal.SIGTERM, previous_handler)
+            try:
+                with patch.object(repro, "Experiment", return_value=value), patch.object(value, "preflight"), \
+                     patch.object(value, "setup"), patch.object(value, "sequence"), patch.object(value, "recover"), \
+                     patch.object(value, "capture", side_effect=lambda: signal.raise_signal(signal.SIGTERM)), \
+                     contextlib.redirect_stdout(io.StringIO()):
+                    self.assertEqual(repro.main(["run", "--image", IMAGE, "--expected-source", SOURCE,
+                                                 "--out-dir", str(value.out)]), 2)
+                self.assertIs(signal.getsignal(signal.SIGTERM), previous_handler)
+            finally:
+                signal.signal(signal.SIGTERM, original_handler)
+            self.assertEqual(commands.mutations, [("container", "stop", "-t", "10", *(str(n) * 64 for n in range(1, 6)))])
+            summary = json.loads((value.out / "summary.json").read_text())
+            self.assertEqual(summary["first_failure"]["phase"], "capture")
+            self.assertEqual(summary["first_failure"]["reason"], "terminated by SIGTERM")
+            self.assertTrue(summary["retained_nodes_stopped"])
+
+    def test_main_restores_sigterm_handler_on_normal_return_and_unexpected_failure(self):
+        original_handler = signal.getsignal(signal.SIGTERM)
+        for failure in (None, RuntimeError("unexpected run failure")):
+            with self.subTest(failure=failure), patch.object(repro, "Experiment") as experiment_type:
+                experiment_type.return_value.run.return_value = 0
+                experiment_type.return_value.run.side_effect = failure
+                arguments = ["run", "--image", IMAGE, "--expected-source", SOURCE, "--out-dir", "/unused"]
+                if failure:
+                    with self.assertRaisesRegex(RuntimeError, "unexpected run failure"):
+                        repro.main(arguments)
+                else:
+                    self.assertEqual(repro.main(arguments), 0)
+                self.assertIs(signal.getsignal(signal.SIGTERM), original_handler)
 
     def test_cleanup_interrupt_falls_back_to_stopping_remaining_owned_nodes(self):
         with tempfile.TemporaryDirectory() as root:
