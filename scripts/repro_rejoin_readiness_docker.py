@@ -974,6 +974,11 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def interrupt_run(signum: int, _frame: Any) -> None:
+    # Use the existing interrupt-aware recovery, retention and summary path.
+    raise KeyboardInterrupt(signal.Signals(signum).name)
+
+
 def main(argv: list[str] | None = None) -> int:
     args = parser().parse_args(argv)
     commands = Commands()
@@ -983,18 +988,11 @@ def main(argv: list[str] | None = None) -> int:
             cleanup_resources(commands, manifest)
             print(json.dumps({"cleaned_project": manifest["project"]}))
             return 0
-
-        def terminate_run(_signum: int, _frame: Any) -> None:
-            raise KeyboardInterrupt("terminated by SIGTERM")
-
-        # CLI entry runs on the main thread. Reuse the same interruption path
-        # that preserves the first failure, captures evidence and stops owners.
-        previous_handler = signal.getsignal(signal.SIGTERM)
+        previous_sigterm = signal.signal(signal.SIGTERM, interrupt_run)
         try:
-            signal.signal(signal.SIGTERM, terminate_run)
             return Experiment(args, commands).run()
         finally:
-            signal.signal(signal.SIGTERM, previous_handler)
+            signal.signal(signal.SIGTERM, previous_sigterm)
     except (ReproError, OSError, ValueError, KeyError, KeyboardInterrupt) as error:
         print(commands.redact(f"reproduction failed: {str(error) or 'interrupted'}"), file=sys.stderr)
         return 2
