@@ -3044,6 +3044,23 @@ mod tests {
         crate::app::gating_test_env::run_large_stack_test("ssec-completion-checksums", || async {
             let (_store, bucket) =
                 crate::app::gating_test_env::durable_quota_test_bucket("ssec-completion-checksums", 16_384).await;
+            let fs = crate::storage::ecfs::FS::new();
+            s3s::S3::put_bucket_versioning(
+                &fs,
+                build_request(
+                    s3s::dto::PutBucketVersioningInput::builder()
+                        .bucket(bucket.clone())
+                        .versioning_configuration(s3s::dto::VersioningConfiguration {
+                            status: Some(s3s::dto::BucketVersioningStatus::from_static("Enabled")),
+                            ..Default::default()
+                        })
+                        .build()
+                        .expect("bucket versioning input"),
+                    Method::PUT,
+                ),
+            )
+            .await
+            .expect("enable versioning for encrypted multipart listing");
             let usecase = DefaultMultipartUsecase::from_global();
             let key = "customer-encrypted";
             let customer_key = "KioqKioqKioqKioqKioqKioqKioqKioqKioqKioqKio=";
@@ -3137,6 +3154,29 @@ mod tests {
                             .expect("key MD5"),
                         customer_md5
                     );
+                    let etag = response.output.e_tag.expect("completed encrypted object ETag");
+                    let version_id = response.output.version_id.expect("completed object version");
+                    assert_ne!(version_id, "null");
+                    assert_multipart_etag_listings(&fs, &bucket, key, &etag, &version_id).await;
+                    let head = s3s::S3::head_object(
+                        &fs,
+                        build_request(
+                            s3s::dto::HeadObjectInput {
+                                bucket: bucket.clone(),
+                                key: key.to_string(),
+                                version_id: Some(version_id.clone()),
+                                sse_customer_algorithm: Some("AES256".to_string()),
+                                sse_customer_key: Some(customer_key.to_string()),
+                                sse_customer_key_md5: Some(customer_md5.to_string()),
+                                ..Default::default()
+                            },
+                            Method::HEAD,
+                        ),
+                    )
+                    .await
+                    .expect("authorized HEAD of completed encrypted version");
+                    assert_eq!(head.output.e_tag, Some(etag));
+                    assert_eq!(head.output.version_id, Some(version_id));
                 } else {
                     assert_eq!(
                         result
@@ -3146,6 +3186,232 @@ mod tests {
                     );
                 }
             }
+        });
+    }
+
+    async fn assert_multipart_etag_listings(
+        fs: &crate::storage::ecfs::FS,
+        bucket: &str,
+        key: &str,
+        etag: &ETag,
+        version_id: &str,
+    ) {
+        use s3s::dto::{ListObjectVersionsInput, ListObjectsInput, ListObjectsV2Input};
+        use s3s::xml::{Serialize, Serializer};
+
+        fn assert_xml_etag<T: Serialize>(output: &T, etag: &ETag) {
+            let mut bytes = Vec::new();
+            output
+                .serialize(&mut Serializer::new(&mut bytes))
+                .expect("serialize listing XML");
+            let xml = String::from_utf8(bytes).expect("listing XML is UTF-8");
+            assert!(
+                xml.contains(&format!("<ETag>\"{}\"</ETag>", etag.value())),
+                "listing must include the completed ETag: {xml}"
+            );
+        }
+
+        // Listings carry neither the SSE-C key nor a per-object decryption request.
+        let versions = s3s::S3::list_object_versions(
+            fs,
+            build_request(
+                ListObjectVersionsInput {
+                    bucket: bucket.to_string(),
+                    prefix: Some(key.to_string()),
+                    ..Default::default()
+                },
+                Method::GET,
+            ),
+        )
+        .await
+        .expect("keyless version listing")
+        .output;
+        let entries = versions.versions.as_ref().expect("completed version must be listed");
+        assert_eq!(entries.len(), 1, "completion replay must preserve a single version");
+        assert_eq!(entries[0].key.as_deref(), Some(key));
+        assert_eq!(entries[0].version_id.as_deref(), Some(version_id));
+        assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
+        assert_xml_etag(&versions, etag);
+
+        let v1 = s3s::S3::list_objects(
+            fs,
+            build_request(
+                ListObjectsInput {
+                    bucket: bucket.to_string(),
+                    prefix: Some(key.to_string()),
+                    ..Default::default()
+                },
+                Method::GET,
+            ),
+        )
+        .await
+        .expect("keyless V1 listing")
+        .output;
+        let v2 = s3s::S3::list_objects_v2(
+            fs,
+            build_request(
+                ListObjectsV2Input {
+                    bucket: bucket.to_string(),
+                    prefix: Some(key.to_string()),
+                    ..Default::default()
+                },
+                Method::GET,
+            ),
+        )
+        .await
+        .expect("keyless V2 listing")
+        .output;
+        for contents in [&v1.contents, &v2.contents] {
+            let entries = contents.as_ref().expect("completed object must be listed");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].key.as_deref(), Some(key));
+            assert_eq!(entries[0].e_tag.as_ref(), Some(etag));
+        }
+        assert_xml_etag(&v1, etag);
+        assert_xml_etag(&v2, etag);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn kms_multipart_completion_and_replay_preserve_etag_in_versioned_listings() {
+        crate::app::gating_test_env::run_large_stack_test("kms-multipart-listing-etag", || async {
+            use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+            use rustfs_kms::types::{CreateKeyRequest, KeyUsage};
+
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = ambient.object_store();
+            let key_dir = tempfile::TempDir::new().expect("local KMS key directory");
+            let manager = ambient.kms().handle();
+            manager
+                .reconfigure(rustfs_kms::KmsConfig::local(key_dir.path().to_path_buf()).with_insecure_development_defaults())
+                .await
+                .expect("configure local KMS");
+            let kms_key = manager
+                .get_encryption_service()
+                .await
+                .expect("local KMS encryption service")
+                .create_key(CreateKeyRequest {
+                    key_name: Some("multipart-listing-key".to_string()),
+                    key_usage: KeyUsage::EncryptDecrypt,
+                    description: None,
+                    policy: None,
+                    tags: HashMap::new(),
+                    origin: None,
+                })
+                .await
+                .expect("create multipart KMS key");
+            let bucket = format!("kms-mpu-etag-{}", Uuid::new_v4().simple());
+            store
+                .make_bucket(
+                    &bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: true,
+                        lock_enabled: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create versioned Object Lock bucket");
+            let fs = crate::storage::ecfs::FS::new();
+            let key = "kms-encrypted";
+            s3s::S3::put_bucket_encryption(
+                &fs,
+                build_request(
+                    s3s::dto::PutBucketEncryptionInput::builder()
+                        .bucket(bucket.clone())
+                        .server_side_encryption_configuration(s3s::dto::ServerSideEncryptionConfiguration {
+                            rules: vec![s3s::dto::ServerSideEncryptionRule {
+                                apply_server_side_encryption_by_default: Some(s3s::dto::ServerSideEncryptionByDefault {
+                                    sse_algorithm: ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS),
+                                    kms_master_key_id: Some(kms_key.key_id.clone()),
+                                }),
+                                ..Default::default()
+                            }],
+                        })
+                        .build()
+                        .expect("bucket encryption input"),
+                    Method::PUT,
+                ),
+            )
+            .await
+            .expect("configure bucket-default SSE-KMS");
+            let upload_id = s3s::S3::create_multipart_upload(
+                &fs,
+                build_request(
+                    CreateMultipartUploadInput {
+                        bucket: bucket.clone(),
+                        key: key.to_string(),
+                        ..Default::default()
+                    },
+                    Method::POST,
+                ),
+            )
+            .await
+            .expect("create KMS multipart upload")
+            .output
+            .upload_id
+            .expect("KMS upload id");
+            let part = s3s::S3::upload_part(
+                &fs,
+                build_request(
+                    UploadPartInput {
+                        bucket: bucket.clone(),
+                        key: key.to_string(),
+                        upload_id: upload_id.clone(),
+                        part_number: 1,
+                        content_length: Some(3),
+                        body: Some(StreamingBlob::from(Bytes::from_static(b"abc"))),
+                        ..Default::default()
+                    },
+                    Method::PUT,
+                ),
+            )
+            .await
+            .expect("upload encrypted KMS part")
+            .output;
+            let complete = CompleteMultipartUploadInput {
+                bucket: bucket.clone(),
+                key: key.to_string(),
+                upload_id,
+                multipart_upload: Some(CompletedMultipartUpload {
+                    parts: Some(vec![CompletedPart {
+                        part_number: Some(1),
+                        e_tag: part.e_tag,
+                        ..Default::default()
+                    }]),
+                }),
+                ..Default::default()
+            };
+            for _ in 0..2 {
+                let response = s3s::S3::complete_multipart_upload(&fs, build_request(complete.clone(), Method::POST))
+                    .await
+                    .expect("complete and replay KMS multipart upload")
+                    .output;
+                let etag = response.e_tag.expect("KMS completed ETag");
+                let version_id = response.version_id.expect("KMS completed version");
+                assert_ne!(version_id, "null");
+                assert_multipart_etag_listings(&fs, &bucket, key, &etag, &version_id).await;
+                let head = s3s::S3::head_object(
+                    &fs,
+                    build_request(
+                        s3s::dto::HeadObjectInput {
+                            bucket: bucket.clone(),
+                            key: key.to_string(),
+                            version_id: Some(version_id.clone()),
+                            ..Default::default()
+                        },
+                        Method::HEAD,
+                    ),
+                )
+                .await
+                .expect("HEAD of completed KMS version")
+                .output;
+                assert_eq!(head.e_tag, Some(etag));
+                assert_eq!(head.version_id, Some(version_id));
+                assert_eq!(head.server_side_encryption.as_ref().map(|value| value.as_str()), Some("aws:kms"));
+                assert_eq!(head.ssekms_key_id.as_deref(), Some(kms_key.key_id.as_str()));
+            }
+            manager.stop().await.expect("stop local KMS");
         });
     }
 
