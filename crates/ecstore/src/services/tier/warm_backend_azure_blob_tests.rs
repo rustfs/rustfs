@@ -202,6 +202,53 @@ async fn mutation_probe_uses_blob_shared_key_and_cleans_up_with_an_etag() {
 }
 
 #[tokio::test]
+async fn versioned_mutation_probe_cleans_up_after_forbidden_current_version_delete() {
+    let version = "2026-11-06T01:02:03.0000000Z";
+    let (backend, task) = fixture(vec![
+        reply(StatusCode::CREATED, &[("x-ms-version-id", version)], b""),
+        present(Some(version)),
+        reply(
+            StatusCode::PARTIAL_CONTENT,
+            &[("content-range", "bytes 0-5/6"), ("x-ms-version-id", version)],
+            b"RustFS",
+        ),
+        reply(StatusCode::FORBIDDEN, &[], b"<Error><Code>OperationNotAllowedOnRootBlob</Code></Error>"),
+        present(Some(version)),
+        reply(StatusCode::ACCEPTED, &[], b""),
+        reply(StatusCode::ACCEPTED, &[], b""),
+        missing(),
+    ])
+    .await;
+    let backend: WarmBackendImpl = Box::new(backend);
+    check_warm_backend(Some(&backend))
+        .await
+        .expect("a versioned Add/Verify probe must finish cleanup after the specific 403");
+    let requests = task.await.expect("fixture should join");
+    assert_eq!(
+        requests.iter().map(|request| request.method.as_str()).collect::<Vec<_>>(),
+        ["PUT", "HEAD", "GET", "DELETE", "HEAD", "DELETE", "DELETE", "HEAD"]
+    );
+    let base = &requests[0].target;
+    assert!(base.starts_with("/container/cold/rustfs-tier-probe-"));
+    for index in [1, 4, 5, 7] {
+        assert_eq!(&requests[index].target, base, "base operations must retain the probe identity");
+    }
+    for index in [2, 3, 6] {
+        let url = Url::parse(&format!("http://fixture{}", requests[index].target)).expect("captured URL");
+        assert_eq!(url.path(), base);
+        assert_eq!(
+            url.query_pairs().collect::<Vec<_>>(),
+            [("versionid".into(), version.into())],
+            "exact reads and deletes must retain the timestamp version"
+        );
+    }
+    assert_eq!(requests[5].headers["if-match"], "\"original\"");
+    for request in &requests {
+        assert_eq!(request.headers["x-ms-version"], "2020-10-02");
+    }
+}
+
+#[tokio::test]
 async fn rejected_put_preserves_azure_error_and_never_deletes_an_existing_blob() {
     for (status, code) in [
         (StatusCode::BAD_REQUEST, "InvalidHeaderValue"),
@@ -452,35 +499,37 @@ async fn range_get_preserves_key_encoding_and_exact_version_for_delete() {
 
 #[tokio::test]
 async fn current_version_delete_demotes_only_the_matching_root_before_exact_cleanup() {
-    let version = "target-version";
-    let (backend, task) = fixture(vec![
-        reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
-        present(Some(version)),
-        reply(StatusCode::ACCEPTED, &[], b""),
-        reply(StatusCode::ACCEPTED, &[], b""),
-    ])
-    .await;
-    backend
-        .remove_exact("current", version)
-        .await
-        .expect("current version should be removable");
-    let requests = task.await.expect("fixture should join");
-    assert_eq!(requests.len(), 4);
-    assert_eq!(requests[0].target, "/container/cold/current?versionid=target-version");
-    assert_eq!(requests[1].method, "HEAD");
-    assert_eq!(requests[1].target, "/container/cold/current");
-    assert_eq!(requests[2].method, "DELETE");
-    assert_eq!(requests[2].target, "/container/cold/current");
-    assert_eq!(requests[2].headers["if-match"], "\"original\"");
-    assert_eq!(requests[3].method, "DELETE");
-    assert_eq!(requests[3].target, requests[0].target);
+    for status in [StatusCode::FORBIDDEN, StatusCode::CONFLICT] {
+        let version = "target-version";
+        let (backend, task) = fixture(vec![
+            reply(status, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+            present(Some(version)),
+            reply(StatusCode::ACCEPTED, &[], b""),
+            reply(StatusCode::ACCEPTED, &[], b""),
+        ])
+        .await;
+        backend
+            .remove_exact("current", version)
+            .await
+            .expect("current version should be removable");
+        let requests = task.await.expect("fixture should join");
+        assert_eq!(requests.len(), 4);
+        assert_eq!(requests[0].target, "/container/cold/current?versionid=target-version");
+        assert_eq!(requests[1].method, "HEAD");
+        assert_eq!(requests[1].target, "/container/cold/current");
+        assert_eq!(requests[2].method, "DELETE");
+        assert_eq!(requests[2].target, "/container/cold/current");
+        assert_eq!(requests[2].headers["if-match"], "\"original\"");
+        assert_eq!(requests[3].method, "DELETE");
+        assert_eq!(requests[3].target, requests[0].target);
+    }
 }
 
 #[tokio::test]
 async fn current_version_delete_refuses_replacements_before_and_after_head() {
     for replaced_after_head in [false, true] {
         let mut responses = vec![
-            reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+            reply(StatusCode::FORBIDDEN, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
             present(Some(if replaced_after_head {
                 "target-version"
             } else {
@@ -506,7 +555,7 @@ async fn current_version_delete_refuses_replacements_before_and_after_head() {
 #[tokio::test]
 async fn current_version_delete_retries_the_exact_version_when_the_root_is_already_absent() {
     let (backend, task) = fixture(vec![
-        reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+        reply(StatusCode::FORBIDDEN, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
         missing(),
         reply(StatusCode::ACCEPTED, &[], b""),
     ])
@@ -530,7 +579,7 @@ async fn current_version_delete_keeps_partial_or_uncertain_cleanup_retryable() {
     for fails_during_exact_cleanup in [false, true] {
         for lost_response in [false, true] {
             let mut responses = vec![
-                reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+                reply(StatusCode::FORBIDDEN, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
                 present(Some("target-version")),
             ];
             if fails_during_exact_cleanup {
@@ -584,7 +633,7 @@ async fn delete_requires_a_single_strong_etag_and_an_exact_current_version() {
             }
             let mut responses = Vec::new();
             if versioned {
-                responses.push(reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""));
+                responses.push(reply(StatusCode::FORBIDDEN, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""));
             }
             responses.push(head);
             let (backend, task) = fixture(responses).await;
@@ -605,7 +654,7 @@ async fn delete_requires_a_single_strong_etag_and_an_exact_current_version() {
     }
     for current_version in [None, Some("")] {
         let (backend, task) = fixture(vec![
-            reply(StatusCode::CONFLICT, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
+            reply(StatusCode::FORBIDDEN, &[("x-ms-error-code", "OperationNotAllowedOnRootBlob")], b""),
             present(current_version),
         ])
         .await;
@@ -618,7 +667,12 @@ async fn delete_requires_a_single_strong_etag_and_an_exact_current_version() {
 async fn exact_delete_does_not_demote_roots_for_other_service_errors() {
     for (status, code) in [
         (StatusCode::CONFLICT, "BlobImmutableDueToPolicy"),
-        (StatusCode::FORBIDDEN, "OperationNotAllowedOnRootBlob"),
+        (StatusCode::FORBIDDEN, "BlobImmutableDueToPolicy"),
+        (StatusCode::FORBIDDEN, "AuthenticationFailed"),
+        (StatusCode::FORBIDDEN, "AuthorizationFailure"),
+        (StatusCode::FORBIDDEN, "AuthorizationPermissionMismatch"),
+        (StatusCode::FORBIDDEN, "OperationNotAllowedOnRootBlobOther"),
+        (StatusCode::UNAUTHORIZED, "OperationNotAllowedOnRootBlob"),
         (StatusCode::INTERNAL_SERVER_ERROR, "OperationNotAllowedOnRootBlob"),
     ] {
         let (backend, task) = fixture(vec![reply(status, &[("x-ms-error-code", code)], b"")]).await;

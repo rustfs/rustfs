@@ -394,8 +394,10 @@ impl WarmBackend for WarmBackendAzureBlob {
             return Ok(());
         };
         if version.is_empty()
-            || !AzureBlobError::from_io(&error)
-                .is_some_and(|azure| azure.status == StatusCode::CONFLICT && azure.code == "OperationNotAllowedOnRootBlob")
+            || !AzureBlobError::from_io(&error).is_some_and(|azure| {
+                matches!(azure.status, StatusCode::FORBIDDEN | StatusCode::CONFLICT)
+                    && azure.code == "OperationNotAllowedOnRootBlob"
+            })
         {
             return Err(error);
         }
