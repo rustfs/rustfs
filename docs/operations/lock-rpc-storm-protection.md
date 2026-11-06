@@ -17,7 +17,11 @@ A timed-out request is no longer cancelled. Cancelling sends `RST_STREAM`, and e
 
 Three consecutive lock-acquisition timeouts open a request-level per-peer breaker. While open, new `lock` and `lock_batch` calls fail fast as retryable contention; after the backoff window one half-open probe is admitted. The breaker does not block release or refresh traffic, and it is separate from channel eviction. A per-peer in-flight admission limit also bounds requests that were already admitted before the breaker opened.
 
-Unlocks that fail three quick retries no longer stop there. The background task continues with a deferred schedule (1s, 2s, 4s, 8s, 16s) before it gives up and leaves the entry to the server-side lease.
+Unlock cleanup that remains unconfirmed after three quick retries continues in the background with a deferred schedule (1s, 2s, 4s, 8s, 16s). Exhausting that schedule means cleanup was not confirmed; it does not prove that the peer still holds the lock. A server-side lease bounds any grant that remains.
+
+Cleanup of a previously confirmed grant is idempotent for its exact `LockId`: `Released` and authoritative `AlreadyAbsent` both complete cleanup. The unlock RPCs append a structured `release_status` to each response or batch entry while preserving the existing `success` and `error_info` fields. Ordinary release and force-release still report a missing lock as failure. A new client keeps retrying unknown transport/backend results and absence responses from older peers that omit the structured status; it never infers absence from diagnostic text. Older clients ignore the added field and retain their existing behavior during upgrades or rollback.
+
+An absence response cannot settle an acquisition that may still grant the same ID later. Pending acquisition completion retains its own cleanup owner, and uncertain remote acquisition failures keep their conservative late-release retries. Only a completed, confirmed grant can use authoritative absence to stop retrying.
 
 ## Configuration
 

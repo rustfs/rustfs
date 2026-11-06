@@ -165,7 +165,7 @@ fn every_rule_has_a_positive_sample() {
         ("lock-acquire-timeout", msg("Lock acquisition timeout for resource 'b/o' after 30s")),
         ("lock-quorum-nodes", msg("Quorum not reached: required 3, achieved 1")),
         ("lock-owner-mismatch", msg("Not the lock owner: lock_id abc, owner node1")),
-        ("dist-unlock-failed", msg("distributed unlock failed on client: node2")),
+        ("dist-unlock-failed", msg("Distributed unlock cleanup failed on client")),
         (
             "lock-state-inconsistent",
             msg("Atomic state inconsistency during exclusive lock release: owner=x, atomic_state=101"),
@@ -302,6 +302,32 @@ fn every_rule_has_a_positive_sample() {
         let hits = engine.matches(&event(sample));
         let hit_ids: Vec<&str> = hits.iter().map(|&i| engine.rules()[i].id.as_str()).collect();
         assert!(hit_ids.contains(id), "rule '{id}' did not match its sample; hits: {hit_ids:?}");
+    }
+}
+
+#[test]
+fn distributed_unlock_rule_matches_current_and_legacy_failures_only() {
+    let engine = engine();
+    for (message, expected) in [
+        ("Distributed unlock cleanup failed on client", true),
+        ("distributed unlock failed on client: node2", true),
+        ("Failed to acquire lock on client node2", true),
+        ("Distributed unlock cleanup completed", false),
+        ("Deferred distributed unlock cleanup converged", false),
+        ("Distributed unlock cleanup was not confirmed by client", false),
+        ("Distributed unlock cleanup remains unconfirmed after deferred retries", false),
+    ] {
+        let sample = Sample {
+            message,
+            level: Some(LogLevel::Warn),
+            target: "rustfs_lock::distributed_lock",
+            ..Default::default()
+        };
+        let matched = engine
+            .matches(&event(&sample))
+            .iter()
+            .any(|&index| engine.rules()[index].id == "dist-unlock-failed");
+        assert_eq!(matched, expected, "unexpected match for {message}");
     }
 }
 
