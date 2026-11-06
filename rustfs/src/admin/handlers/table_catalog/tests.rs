@@ -11829,6 +11829,21 @@ async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
     )
     .await
     .expect("the table should upgrade while retaining v1 history");
+    let backup = store
+        .create_object_catalog_backup("warehouse", None)
+        .await
+        .expect("backup should capture the upgraded table and its inline v1 manifests");
+    let backup_object = backend
+        .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+        .await
+        .expect("read captured backup")
+        .expect("backup artifact exists");
+    let backup_json: serde_json::Value = serde_json::from_slice(&backup_object.data).expect("decode backup artifact");
+    let references = backup_json["references"].as_array().expect("physical object inventory");
+    for location in [&manifest, &file] {
+        let key = test_snapshot_object_key("warehouse", location);
+        assert!(references.iter().any(|reference| reference["object"] == key), "missing {key}");
+    }
     let inherited_list = format!("{location}/metadata/snap-11.avro");
     for sequence in [1, 0] {
         backend

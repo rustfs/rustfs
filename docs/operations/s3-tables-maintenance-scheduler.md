@@ -4,7 +4,7 @@
 
 The server can periodically **queue** maintenance jobs for explicitly selected table buckets. It does not run workers, delete objects, expire snapshots, or compact data automatically. Workers remain an explicit operator action. The object catalog uses the maintenance configuration and job format described below.
 
-## Read-only Metadata Maintenance Planning
+## Direct Metadata Maintenance
 
 The object catalog accepts authenticated planning requests at:
 
@@ -30,11 +30,13 @@ For example:
 }
 ```
 
-`max-rewrite-bytes-per-job` is accepted up to any value at or above `target-file-size-bytes`, but each rewrite group is packed to at most the smaller of that value and the 512 MiB per-group stored-input ceiling that the commit path holds in memory; the 1 GiB example therefore produces groups of at most 512 MiB. The optional snapshot-expiration and compaction fields request plans, not commits. An empty JSON object requests ordinary metadata planning. A nonzero retention value overrides the effective maintenance configuration for this request; omission or zero uses the effective configured retention.
+`max-rewrite-bytes-per-job` is accepted up to any value at or above `target-file-size-bytes`, but each rewrite group is packed to at most the smaller of that value and the 512 MiB per-group stored-input ceiling that the commit path holds in memory; the 1 GiB example therefore produces groups of at most 512 MiB. The optional snapshot-expiration and compaction fields request plans, not commits. An empty JSON object requests ordinary metadata planning. The request's retention value overrides the configured retention for this invocation. Omission or zero adds no recent-file retention. Existing protections for referenced metadata still apply.
 
-Successful planning returns HTTP 200 with a completed `DRY_RUN` job and persists its named, current, and latest reports with audit events. Read-only means that table data, metadata pointers, and catalog generations are unchanged; the request still writes maintenance report sidecars and requires the table-scoped `admin:RunTableMaintenance` permission. Inspect the returned plan and any manual-review state before taking further action. Mutating cleanup, snapshot expiration, and compaction remain explicit worker operations with their existing safety checks.
+Successful planning returns HTTP 200 with a completed `DRY_RUN` job. It leaves table data, metadata pointers, and catalog generations unchanged. The endpoint writes named, current, and latest maintenance reports and requires the table-scoped `admin:RunTableMaintenance` permission.
 
-A queued, running, or failed job, active quarantine, or inconsistent current/latest aliases or their named report returns HTTP 409 instead of replacing the existing job or discarding its retry budget. Inspect that state before retrying or taking explicit worker/recovery action. A failed publication that saved only a completed named dry-run report leaves harmless history: no alias advertises a running claim, and replanning is safe because there were no table-object effects. Planning revalidates table identity, metadata pointer, configuration, and the prior report before publication; concurrent changes also conflict. It does not introduce automatic workers, snapshot-expiration commits, or compaction commits.
+The same endpoint supports explicit operations with `delete`, `commit-snapshot-expiration`, or `commit-compaction`. Enable at most one of these flags. Metadata deletion requires `delete-enabled`. To commit snapshot expiration or compaction, also supply the corresponding plan configuration.
+
+Before invoking this endpoint, pause competing maintenance workers and resolve outstanding jobs or active quarantine. The direct endpoint can replace the current and latest reports even when a job already exists. Prior named reports remain available for inspection. If a request fails, inspect the scheduler state and named reports before retrying.
 
 ## Enablement
 

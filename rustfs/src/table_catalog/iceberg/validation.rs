@@ -2756,6 +2756,11 @@ struct SnapshotGraphManifestLocation {
     from_manifest_list: bool,
 }
 
+enum SnapshotGraphValidation<'a> {
+    Commit(Option<&'a serde_json::Value>),
+    BackupInventory,
+}
+
 pub(crate) async fn validate_table_snapshot_changes<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
     current_metadata: Option<&serde_json::Value>,
@@ -2764,13 +2769,13 @@ pub(crate) async fn validate_table_snapshot_changes<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    validate_table_snapshot_changes_with_budget(context, current_metadata, metadata).await?;
+    validate_table_snapshot_changes_with_budget(context, SnapshotGraphValidation::Commit(current_metadata), metadata).await?;
     Ok(())
 }
 
 async fn validate_table_snapshot_changes_with_budget<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
-    current_metadata: Option<&serde_json::Value>,
+    validation: SnapshotGraphValidation<'_>,
     metadata: &serde_json::Value,
 ) -> TableCatalogStoreResult<SnapshotGraphReadBudget>
 where
@@ -2782,29 +2787,44 @@ where
     let mut budget = SnapshotGraphReadBudget::default();
     validate_table_statistics_objects(context, metadata).await?;
     let format_version = table_metadata_format_version(metadata)?;
+    let current_metadata = match validation {
+        SnapshotGraphValidation::Commit(current_metadata) => current_metadata,
+        SnapshotGraphValidation::BackupInventory => None,
+    };
     let snapshots = snapshots_requiring_graph_validation(current_metadata, metadata)?;
     for snapshot in snapshots {
         snapshot
             .get("snapshot-id")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot-id must be an integer".to_string()))?;
-        if format_version == 2
-            && snapshot.get("manifests").is_some()
-            && !snapshot_is_retained_v1_history(current_metadata, snapshot)
-        {
-            return Err(TableCatalogStoreError::Invalid(
-                "new Iceberg v2 snapshots require manifest-list".to_string(),
-            ));
-        }
         let snapshot_sequence_number = snapshot
             .get("sequence-number")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        let graph_format_version = if format_version == 2 && snapshot.get("manifests").is_some() {
+            match validation {
+                // A persisted upgrade can retain an inline v1 snapshot. Walk
+                // its full graph using v1 manifest and file constraints.
+                SnapshotGraphValidation::BackupInventory if snapshot_sequence_number == 0 => 1,
+                SnapshotGraphValidation::Commit(current_metadata)
+                    if snapshot_is_retained_v1_history(current_metadata, snapshot) =>
+                {
+                    format_version
+                }
+                _ => {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "new Iceberg v2 snapshots require manifest-list".to_string(),
+                    ));
+                }
+            }
+        } else {
+            format_version
+        };
         let manifests = snapshot_graph_manifest_references(
             context,
             metadata,
             snapshot,
-            format_version,
+            graph_format_version,
             snapshot_sequence_number,
             &mut budget,
         )
@@ -2836,7 +2856,7 @@ pub(crate) async fn validated_table_snapshot_graph_inventory<B>(
 where
     B: TableCatalogObjectBackend,
 {
-    let budget = validate_table_snapshot_changes_with_budget(context, None, metadata).await?;
+    let budget = validate_table_snapshot_changes_with_budget(context, SnapshotGraphValidation::BackupInventory, metadata).await?;
     let mut inventory = BTreeMap::new();
     for object in budget.manifest_lists.keys() {
         insert_validated_snapshot_graph_inventory_object(
