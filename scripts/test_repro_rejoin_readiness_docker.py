@@ -7,9 +7,12 @@ import contextlib
 import io
 import inspect
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
+import sys
+import tarfile
 import tempfile
 import time
 import unittest
@@ -65,6 +68,20 @@ class FakeCurl(repro.Commands):
             value = re.search(r"^" + key + r" = (.+)$", config, re.MULTILINE).group(1)
             Path(json.loads(value)).write_bytes(content)
         return subprocess.CompletedProcess(args, 0, str(self.status).encode(), b"")
+
+
+class CaptureDocker(FakeDocker):
+    def __init__(self, history=None, archive=b""):
+        super().__init__()
+        self.history, self.archive = history or {}, archive
+
+    def docker(self, *args, **kwargs):
+        self.mutations.append(args)
+        if args[:2] == ("container", "logs"):
+            return subprocess.CompletedProcess(args, 0, self.history.get(args[-1], b""), b"")
+        if args[:2] == ("container", "exec"):
+            return subprocess.CompletedProcess(args, 0, self.archive, b"")
+        raise AssertionError("unexpected capture command")
 
 
 def experiment(directory, commands):
@@ -239,6 +256,94 @@ class CleanupGuards(unittest.TestCase):
 
 
 class RequestsAndOracles(unittest.TestCase):
+    def test_lock_json_events_are_counted_without_confusing_release_ack_with_physical_release(self):
+        rows = [
+            {"fields": {"event": "object_namespace_lock", "state": "acquired", "lock_attempt_id": "a"}},
+            {"fields": {"event": "object_namespace_lock", "state": "guard_dropped", "lock_attempt_id": "a"}},
+            {"fields": {"event": "namespace_lock_release", "state": "acknowledged", "result": "released"}},
+            {"fields": {"event": "namespace_lock_release", "state": "mapped", "physical_guard_id": 17}},
+            {"fields": {"event": "namespace_lock_release", "state": "released", "physical_guard_id": 17}},
+            {"fields": {"message": "object_namespace_lock acquired guard_dropped released"}},
+            {"fields": {"event": {}, "state": "acquired"}},
+        ]
+        history = b"plain loader output\n" + b"\n".join(
+            b"2026-11-07T00:00:00.000000000Z " + json.dumps(row).encode() for row in rows)
+        counts = repro.diagnostic_event_counts(history)
+        self.assertEqual([counts[event] for event in repro.REQUIRED_DIAGNOSTIC_EVENTS], [1, 1, 1])
+        self.assertEqual(counts["namespace_lock_release/acknowledged"], 1)
+        self.assertEqual(counts["namespace_lock_release/mapped"], 1)
+
+    @unittest.skipUnless(hasattr(os, "fwalk"), "the archive helper executes in a Linux container")
+    def test_runtime_archive_helper_reads_live_files_and_enforces_the_byte_budget(self):
+        with tempfile.TemporaryDirectory() as root:
+            directory = Path(root) / "logs"
+            directory.mkdir()
+            data = b'{"fields":{"event":"namespace_lock_release","state":"released"}}\n' * 100
+            (directory / "rustfs.log").write_bytes(data)
+            command = [sys.executable, "-c", repro.LOG_ARCHIVE_SCRIPT, str(directory), str(len(data)), "2"]
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10, check=True)
+            with tarfile.open(fileobj=io.BytesIO(result.stdout)) as archive:
+                self.assertEqual(archive.getnames(), ["rustfs.log"])
+                self.assertEqual(archive.extractfile("rustfs.log").read(), data)
+            command[-2] = str(len(data) - 1)
+            limited = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+            self.assertNotEqual(limited.returncode, 0)
+            self.assertIn(b"capture budget exceeded", limited.stderr)
+
+    def test_live_runtime_logs_use_exec_and_stopped_tmpfs_is_explicitly_unavailable(self):
+        data = b'{"fields":{"event":"namespace_lock_release","state":"released"}}\n'
+        output = io.BytesIO()
+        with tarfile.open(fileobj=output, mode="w") as archive:
+            member = tarfile.TarInfo("rustfs.log")
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+        with tempfile.TemporaryDirectory() as root:
+            commands = CaptureDocker(archive=output.getvalue())
+            value = experiment(Path(root) / "case", commands)
+            value.nodes = {n: value.nodes[n] for n in (1, 2)}
+            for n, node in value.nodes.items():
+                commands.objects[("container", node["id"])] = {
+                    "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": n == 1},
+                    "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
+            value.capture()
+            executed = [call for call in commands.mutations if call[:2] == ("container", "exec")]
+            self.assertEqual(len(executed), 1)
+            self.assertEqual(executed[0][2:5], ("1" * 64, "python3", "-c"))
+            self.assertNotIn("cp", [item for call in commands.mutations for item in call])
+            records = value.summary["log_captures"]
+            self.assertEqual(records[0]["runtime_files"]["status"], "captured")
+            self.assertEqual(records[0]["runtime_files"]["bytes"], len(data))
+            self.assertEqual(records[0]["runtime_files"]["event_counts"]["namespace_lock_release/released"], 1)
+            self.assertEqual(records[1]["runtime_files"]["status"], "unavailable")
+            self.assertIn("stopped_container_tmpfs", records[1]["runtime_files"]["reason"])
+
+    def test_diagnostic_coverage_requires_all_principal_categories_in_the_final_pool(self):
+        for categories, expected in (((), "missing"), ((0,), "partial"), ((0, 1, 2), "complete")):
+            with tempfile.TemporaryDirectory() as root, self.subTest(status=expected):
+                history = {}
+                for index in categories:
+                    event, state = repro.REQUIRED_DIAGNOSTIC_EVENTS[index].split("/")
+                    history[str(index + 1) * 64] = b"2026-11-07T00:00:00Z " + json.dumps({"fields": {"event": event, "state": state}}).encode() + b"\n"
+                commands = CaptureDocker(history)
+                value = experiment(Path(root) / "case", commands)
+                value.args.diagnostics = True
+                value.summary["sequence_passed"] = True
+                value.nodes = {n: value.nodes[n] for n in (1, 2, 3)}
+                for node in value.nodes.values():
+                    commands.objects[("container", node["id"])] = {
+                        "Id": node["id"], "Name": "/" + node["name"], "State": {"Running": True},
+                        "Config": {"Labels": repro.resource_labels(value.project, SOURCE, "node")}}
+                value.capture()
+                self.assertEqual(value.summary["diagnostic_coverage"]["status"], expected)
+                self.assertTrue(value.summary["sequence_passed"], "observer coverage must not rewrite functional HTTP results")
+                self.assertTrue(all(record["runtime_files"]["status"] == "not_configured" for record in value.summary["log_captures"]))
+                self.assertFalse(any(call[:2] == ("container", "exec") for call in commands.mutations))
+                if expected == "complete":
+                    self.assertIsNone(value.first_failure)
+                    self.assertEqual([value.summary["diagnostic_coverage"]["event_counts"][key] for key in repro.REQUIRED_DIAGNOSTIC_EVENTS], [1, 1, 1])
+                else:
+                    self.assertEqual(value.first_failure["phase"], "diagnostic-coverage")
+
     def test_every_volume_is_verified_before_staging_can_touch_it(self):
         class StagingDocker(FakeDocker):
             def __init__(self):

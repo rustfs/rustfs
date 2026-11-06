@@ -341,6 +341,63 @@ done
 exec /usr/bin/rustfs
 '''
 
+MAX_RUNTIME_LOG_BYTES = 32 * 1024 * 1024
+MAX_RUNTIME_LOG_FILES = 256
+REQUIRED_DIAGNOSTIC_EVENTS = (
+    "object_namespace_lock/acquired", "object_namespace_lock/guard_dropped", "namespace_lock_release/released",
+)
+
+LOG_ARCHIVE_SCRIPT = r'''
+import os, pathlib, stat, sys, tarfile
+root = pathlib.Path(sys.argv[1])
+remaining, max_files = int(sys.argv[2]), int(sys.argv[3])
+if not root.is_dir():
+    raise RuntimeError('runtime log directory is unavailable')
+files = entries = 0
+with tarfile.open(fileobj=sys.stdout.buffer, mode='w|') as archive:
+    for directory, dirs, names, descriptor in os.fwalk(root, follow_symlinks=False):
+        entries += len(dirs) + len(names)
+        if entries > max_files * 2:
+            raise RuntimeError('runtime log entry limit exceeded')
+        dirs.sort()
+        for name in sorted(names):
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=descriptor)
+            with os.fdopen(fd, 'rb') as source:
+                info = os.fstat(source.fileno())
+                if not stat.S_ISREG(info.st_mode):
+                    continue
+                files += 1
+                if files > max_files or info.st_size > remaining:
+                    raise RuntimeError('runtime log capture budget exceeded')
+                remaining -= info.st_size
+                member = tarfile.TarInfo(str(pathlib.Path(directory).relative_to(root) / name))
+                member.size, member.mode = info.st_size, 0o600
+                archive.addfile(member, source)
+'''
+
+
+def diagnostic_event_counts(data: bytes) -> dict[str, int]:
+    counts = dict.fromkeys(REQUIRED_DIAGNOSTIC_EVENTS, 0)
+    events = {"object_namespace_lock", "object_namespace_lock_peer", "namespace_lock_release", "distributed_lock_cleanup"}
+    for line in io.BytesIO(data):
+        line = line.lstrip()
+        if not line.startswith(b"{"):
+            _, separator, line = line.partition(b" ")  # docker logs --timestamps
+            if not separator:
+                continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(row, dict):
+            continue
+        fields = row.get("fields") if isinstance(row.get("fields"), dict) else row
+        event, state = fields.get("event"), fields.get("state")
+        if isinstance(event, str) and event in events and isinstance(state, str) and len(state) <= 128:
+            key = event + "/" + state
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
 
 class Experiment:
     def __init__(self, args: argparse.Namespace, commands: Commands) -> None:
@@ -500,14 +557,19 @@ class Experiment:
         if self.args.diagnostics:
             environment.update({"RUSTFS_OBJECT_LOCK_DIAG_ENABLE": "true", "RUSTFS_OBJECT_LOCK_DIAG_SLOW_ACQUIRE_MS": "100",
                 "RUSTFS_OBJECT_LOCK_DIAG_SLOW_HOLD_MS": "100",
+                "RUSTFS_OBS_LOG_DIRECTORY": "", "RUSTFS_OBS_LOG_STDOUT_ENABLED": "true",
                 "RUST_LOG": "warn,rustfs_ecstore::object_lock_diag=trace,rustfs_lock::namespace_owner=trace,"
                             "rustfs_ecstore::cluster::rpc::remote_locker=debug,rustfs_lock::distributed_lock=debug"})
         self.summary["environment"] = environment
+        self.summary["logging"] = {"application_sink": "stdout" if self.args.diagnostics else "/logs",
+            "docker_driver": "json-file", "docker_max_size": "20m", "docker_max_files": 5,
+            "runtime_max_bytes": MAX_RUNTIME_LOG_BYTES, "runtime_max_files": MAX_RUNTIME_LOG_FILES}
         for n in range(1, 6):
             name = f"{self.project}-storage{n:02}"
             args = ["container", "create", "--pull=never", "--name", name, "--hostname", f"storage{n:02}",
                 *self.labels("node"), "--network", self.project, "--network-alias", f"storage{n:02}", "--user", "10001:10001",
                 "--read-only", "--cpus", "1", "--memory", "1g", "--cap-drop", "ALL", "--security-opt", "no-new-privileges:true",
+                "--log-driver", "json-file", "--log-opt", "max-size=20m", "--log-opt", "max-file=5",
                 "--tmpfs", "/tmp:mode=1777,size=64m", "--tmpfs", "/logs:uid=10001,gid=10001,mode=0700,size=32m",
                 "--publish", f"127.0.0.1::{PORT}", "--mount", f"type=volume,src={self.project}-data{n:02},dst=/data,volume-nocopy",
                 "--mount", f"type=volume,src={self.project}-config{n:02},dst=/config,readonly,volume-nocopy"]
@@ -537,7 +599,7 @@ class Experiment:
                                   "restart_count": info.get("RestartCount")}
             limits = info["HostConfig"]
             snapshot.append({"node": n, "image": info["Image"], "generation": node["generation"], "state": info["State"],
-                "limits": {key: limits.get(key) for key in ("NanoCpus", "Memory", "ReadonlyRootfs", "CapDrop", "SecurityOpt", "Tmpfs")},
+                "limits": {key: limits.get(key) for key in ("NanoCpus", "Memory", "ReadonlyRootfs", "CapDrop", "SecurityOpt", "Tmpfs", "LogConfig")},
                 "mounts": [{key: mount.get(key) for key in ("Type", "Name", "Destination", "RW", "Driver")} for mount in info["Mounts"]]})
         write_json(self.out / f"containers-{phase}.json", snapshot)
 
@@ -711,34 +773,89 @@ class Experiment:
             convergence.update(result=convergence["gets"]["result"], finished_at=utc_now())
 
     def capture(self, phase: str = "final") -> None:
+        captures = self.summary.setdefault("log_captures", [])
+        totals = dict.fromkeys(REQUIRED_DIAGNOSTIC_EVENTS, 0)
         for node in self.nodes.values():
-            result = self.commands.docker("container", "logs", "--timestamps", "--tail", "2000", node["id"], check=False)
+            info = self.commands.inspect("container", node["id"])
+            if info is None:
+                raise ReproError("could not inspect a log capture source")
+            verify_ownership(info, "container", node["name"], "node", self.project, self.source)
+            record = {"phase": phase, "container_id": info["Id"], "node": node["name"], "running": info["State"]["Running"],
+                      "started_at": info["State"].get("StartedAt"), "captured_at": utc_now()}
+            captures.append(record)
+            # The server's explicit json-file retention (20m * 5) bounds this
+            # history and preserves it across restarts; no tail hides early events.
+            result = self.commands.docker("container", "logs", "--timestamps", node["id"], check=False)
             if result.returncode:
                 self.fail("capture", f"Docker stdout capture failed for {node['name']}: "
                           + self.commands.redact(result.stderr.decode(errors="replace"))[-500:])
-            (self.out / (node["name"].rsplit("-", 1)[-1] + f"-{phase}.log")).write_text(
-                self.commands.redact((result.stdout + result.stderr).decode(errors="replace")))
-            archive = self.commands.docker("container", "cp", node["id"] + ":/logs/.", "-", check=False)
-            if archive.returncode:
-                self.fail("capture", f"runtime log capture unavailable for {node['name']} during {phase}: "
-                          + self.commands.redact(archive.stderr.decode(errors="replace"))[-500:])
-                continue
-            log_dir = self.out / f"runtime-logs-{phase}" / node["name"].rsplit("-", 1)[-1]
-            log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-            with tarfile.open(fileobj=io.BytesIO(archive.stdout)) as logs:
-                for member in logs:
-                    if member.isfile() and member.size <= 32 * 1024 * 1024:
-                        relative = Path(member.name)
-                        if relative.is_absolute() or ".." in relative.parts:
-                            raise ReproError("unexpected runtime log archive path")
-                        target = log_dir / relative
-                        target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-                        data = logs.extractfile(member).read()
-                        for secret in self.commands.redactions:
-                            data = data.replace(secret.encode(), b"[REDACTED]")
-                        target.write_bytes(data)
+            history = result.stdout + result.stderr
+            for secret in self.commands.redactions:
+                history = history.replace(secret.encode(), b"[REDACTED]")
+            destination = node["name"].rsplit("-", 1)[-1] + f"-{phase}.log"
+            (self.out / destination).write_bytes(history)
+            counts = diagnostic_event_counts(history)
+            record["docker_history"] = {"method": "docker container logs --timestamps", "path": destination,
+                "bytes": len(history), "exit_code": result.returncode, "event_counts": counts}
+            runtime = {"method": "docker container exec python3 tar", "bytes": 0, "files": [], "event_counts": {}}
+            record["runtime_files"] = runtime
+            if self.args.diagnostics:
+                runtime.update(status="not_configured", reason="diagnostics_use_stdout_only")
+            elif not info["State"]["Running"]:
+                runtime.update(status="unavailable", reason="stopped_container_tmpfs_cannot_be_read")
+                self.fail("capture", f"stopped container runtime tmpfs is unavailable for {node['name']} during {phase}")
+            else:
+                # docker cp can omit live tmpfs mounts. Read /logs from inside
+                # the running container, without changing its logging state.
+                archive = self.commands.docker("container", "exec", node["id"], "python3", "-c", LOG_ARCHIVE_SCRIPT,
+                    "/logs", str(MAX_RUNTIME_LOG_BYTES), str(MAX_RUNTIME_LOG_FILES), check=False)
+                runtime["archive_bytes"] = len(archive.stdout)
+                if archive.returncode:
+                    runtime.update(status="error", exit_code=archive.returncode)
+                    self.fail("capture", f"live runtime log capture failed for {node['name']}: "
+                              + self.commands.redact(archive.stderr.decode(errors="replace"))[-500:])
+                else:
+                    log_dir = self.out / f"runtime-logs-{phase}" / node["name"].rsplit("-", 1)[-1]
+                    log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                    try:
+                        logs = tarfile.open(fileobj=io.BytesIO(archive.stdout))
+                        with logs:
+                            for member in logs:
+                                if member.isdir():
+                                    continue
+                                if not member.isfile() or len(runtime["files"]) >= MAX_RUNTIME_LOG_FILES or member.size > MAX_RUNTIME_LOG_BYTES - runtime["bytes"]:
+                                    raise ReproError("runtime log archive exceeds its regular-file capture budget")
+                                relative = Path(member.name)
+                                if relative.is_absolute() or ".." in relative.parts:
+                                    raise ReproError("unexpected runtime log archive path")
+                                target = log_dir / relative
+                                target.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+                                data = logs.extractfile(member).read()
+                                for secret in self.commands.redactions:
+                                    data = data.replace(secret.encode(), b"[REDACTED]")
+                                target.write_bytes(data)
+                                runtime["bytes"] += len(data)
+                                events = diagnostic_event_counts(data)
+                                runtime["files"].append({"path": str(target.relative_to(self.out)), "bytes": len(data)})
+                                for event, count in events.items():
+                                    runtime["event_counts"][event] = runtime["event_counts"].get(event, 0) + count
+                        runtime["status"] = "captured" if runtime["files"] else "empty"
+                    except (ReproError, OSError, tarfile.TarError) as error:
+                        runtime.update(status="error", reason=self.commands.redact(str(error)))
+                        self.fail("capture", str(error))
+            for event, count in counts.items():
+                totals[event] = totals.get(event, 0) + count
+            self.event({"log_capture": record})
         if self.started:
             self.snapshot("final")
+        if phase == "final":
+            missing = [event for event in REQUIRED_DIAGNOSTIC_EVENTS if not totals[event]]
+            status = "missing" if len(missing) == len(REQUIRED_DIAGNOSTIC_EVENTS) else "partial" if missing else "complete"
+            self.summary["diagnostic_coverage"] = {"requested": self.args.diagnostics,
+                "status": status if self.args.diagnostics else "not_requested", "event_counts": totals, "missing_events": missing,
+                "scope": "final pool aggregate of captured retained Docker history; counts do not prove per-owner release"}
+            if self.args.diagnostics and missing:
+                self.fail("diagnostic-coverage", "required lock trace categories were not captured: " + ", ".join(missing))
 
     def stop_retained_nodes(self, *, allow_missing: bool = False) -> None:
         running = []
