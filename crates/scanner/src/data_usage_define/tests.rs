@@ -3230,6 +3230,9 @@ fn test_force_compact_flattens_wide_root_above_limit() {
     // Before the fix, force_compact kept one entry per prefix forever.
     const PREFIXES: usize = 64;
     const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES > LIMIT);
+    }
 
     let root = hash_path("bucket");
     let mut cache = DataUsageCache {
@@ -3269,6 +3272,9 @@ fn test_force_compact_flattens_wide_root_above_limit() {
 fn test_force_compact_keeps_narrow_root_children() {
     const PREFIXES: usize = 4;
     const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES < LIMIT);
+    }
 
     let root = hash_path("bucket");
     let mut cache = DataUsageCache {
@@ -3314,6 +3320,10 @@ fn test_force_compact_interrupted_ceiling_retains_wide_root_children() {
     const PREFIXES: usize = 64;
     const ORDINARY_LIMIT: usize = 16;
     const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
 
     let root = hash_path("bucket");
     let mut cache = DataUsageCache {
@@ -3350,6 +3360,60 @@ fn test_force_compact_interrupted_ceiling_retains_wide_root_children() {
     assert!(
         completed.find("bucket").is_some_and(|entry| entry.compacted),
         "ordinary limit still flattens the same wide root after completion"
+    );
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_seals_reloaded_frontier() {
+    // The interrupted call runs before seal_scan_frontier. Flattening at the
+    // ordinary limit deletes the child that frontier names, so a saved cache
+    // reloads with no resume position and the next cycle replays finished prefixes.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
+    let frontier = format!("bucket/prefix-{:04}", PREFIXES / 2);
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    let root = hash_path("bucket");
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut interrupted = cache.clone();
+    interrupted.force_compact(INTERRUPTED_CEILING);
+    assert!(interrupted.find(&frontier).is_some(), "interrupted ceiling must keep the frontier child");
+    interrupted
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal frontier after interrupted compaction");
+    let encoded = rmp_serde::to_vec(&interrupted).expect("partial cache should encode");
+    let reloaded: DataUsageCache = rmp_serde::from_slice(&encoded).expect("partial cache should reload");
+    assert_eq!(reloaded.validated_scan_frontier(), Some(frontier.as_str()));
+    assert!(reloaded.find(&frontier).is_some(), "reloaded frontier child must stay addressable");
+
+    cache.force_compact(ORDINARY_LIMIT);
+    assert!(cache.find(&frontier).is_none(), "ordinary limit removes the frontier child");
+    cache
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal after a completed flatten");
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "a flattened root cannot seal the removed frontier child"
     );
 }
 

@@ -4475,3 +4475,47 @@ fn raw_enumeration_progress_retains_resume_index_until_unordered_entries_reappea
         "same source identity should keep the resume index even when read_dir order changes"
     );
 }
+
+#[test]
+fn force_compact_limit_for_interrupted_sweep_keeps_frontier_above_ordinary_limit() {
+    const PREFIXES: usize = DATA_SCANNER_COMPACT_AT_CHILDREN + 1;
+    const {
+        assert!(PREFIXES > DATA_SCANNER_COMPACT_AT_CHILDREN);
+        assert!(PREFIXES < DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS);
+    }
+
+    let frontier = format!("bucket/prefix-{:05}", PREFIXES / 2);
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    let root = hash_path("bucket");
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:05}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut completed = cache.clone();
+    completed.force_compact(force_compact_limit_for_sweep(false));
+    assert!(completed.find("bucket").is_some_and(|entry| entry.compacted));
+    assert!(completed.find(&frontier).is_none());
+
+    cache.force_compact(force_compact_limit_for_sweep(true));
+    assert!(cache.find(&frontier).is_some(), "interrupted ceiling must keep the frontier child");
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted);
+    assert_eq!(root_entry.children.len(), PREFIXES);
+}

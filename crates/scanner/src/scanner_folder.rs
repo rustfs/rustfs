@@ -523,6 +523,18 @@ fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
     data_usage_root_has_progress(entry)
 }
 
+/// Root-fanout limit for `DataUsageCache::force_compact` at the end of a sweep.
+///
+/// An interrupted sweep still has to seal its resume frontier, so it keeps the
+/// emergency ceiling. A finished walk applies the ordinary child limit.
+fn force_compact_limit_for_sweep(interrupted: bool) -> usize {
+    if interrupted {
+        DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS
+    } else {
+        DATA_SCANNER_COMPACT_AT_CHILDREN
+    }
+}
+
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
     let resume_after = clone_cache_value(&cache.info.scan_resume_after).or_else(|| {
         cache
@@ -3418,7 +3430,7 @@ pub(crate) async fn scan_data_folder_scoped(
             let coverage_gap = scanner.coverage_gap;
             scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
-            new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
+            new_cache.force_compact(force_compact_limit_for_sweep(false));
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap
@@ -3525,7 +3537,7 @@ pub(crate) async fn scan_data_folder_scoped(
                         // to replay completed prefixes (#8292 / review on #9193).
                         // Keep only the emergency FORCE ceiling here; successful
                         // completions above apply DATA_SCANNER_COMPACT_AT_CHILDREN.
-                        new_cache.force_compact(DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS);
+                        new_cache.force_compact(force_compact_limit_for_sweep(true));
                     }
                     new_cache.info.last_update = Some(SystemTime::now());
                     new_cache.info.next_cycle = next_cycle;
