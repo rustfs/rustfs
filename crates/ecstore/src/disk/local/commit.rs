@@ -15,6 +15,8 @@
 //! Single-disk object rename publication and rollback. The shared execution core
 //! retains instrumentation, mutation leases, and commit guards through the syscall.
 
+#[cfg(target_os = "linux")]
+use super::has_rename_data_test_failpoints;
 #[cfg(all(test, windows))]
 use super::run_destination_commit_directory_preparation;
 #[cfg(any(not(windows), test))]
@@ -22,8 +24,8 @@ use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, has_inline_commit_test_failpoints,
-    has_rename_data_test_failpoints, inline_metadata_rollback_dir, observe_old_current, remove_dir_all_if_exists,
-    remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature, run_inline_preparation_before_backup,
+    inline_metadata_rollback_dir, observe_old_current, remove_dir_all_if_exists, remove_dst_base_before_commit,
+    remove_file_if_exists, rename_data_versions_signature, run_inline_preparation_before_backup,
     should_fail_after_metadata_commit, should_fail_before_old_metadata_backup, should_fail_commit_rename,
     should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
