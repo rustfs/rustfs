@@ -26,8 +26,9 @@ use crate::storage::storage_api::rpc_consumer::node_service::{
 };
 use crate::storage::storage_api::runtime_sources_consumer::runtime_sources;
 use crate::storage::storage_api::{
-    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, PartTransactionAction, RenameDataResp,
-    SnapshotLeaseToken, verify_tonic_canonical_body_digest, verify_tonic_mutation_body_digest,
+    BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION, DELETE_RECOVERY_PROTOCOL_VERSION, DeleteRecoveryRpcOperation,
+    DeleteRecoveryRpcReply, PartTransactionAction, RenameDataResp, SnapshotLeaseToken, verify_tonic_canonical_body_digest,
+    verify_tonic_mutation_body_digest,
 };
 use bytes::Bytes;
 use rustfs_filemeta::FileInfo;
@@ -2269,11 +2270,23 @@ impl NodeService {
         verify_tonic_canonical_body_digest(&request, &body)
             .map_err(|_| Status::permission_denied("delete recovery requires body-bound v2 authentication"))?;
         let request = request.into_inner();
-        if request.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+        let protocol_version = request.protocol_version;
+        if !matches!(
+            protocol_version,
+            DELETE_RECOVERY_PROTOCOL_VERSION | BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION
+        ) {
             return Err(Status::unimplemented("incompatible delete recovery protocol"));
         }
         let operation: DeleteRecoveryRpcOperation = rustfs_protos::decode_delete_recovery_payload(&request.operation)
             .map_err(|_| Status::invalid_argument("invalid delete recovery operation"))?;
+        if protocol_version == BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION
+            && !matches!(
+                operation,
+                DeleteRecoveryRpcOperation::ApplyVersion { .. } | DeleteRecoveryRpcOperation::ApplyVersions { .. }
+            )
+        {
+            return Err(Status::invalid_argument("bounded prepare protocol requires a delete prepare operation"));
+        }
         if request.operation.len() > operation.max_wire_payload_bytes() {
             return Err(Status::resource_exhausted("delete recovery operation exceeds payload limit"));
         }
@@ -2411,14 +2424,14 @@ impl NodeService {
                 }
                 Ok(Response::new(RecoverDeleteTransactionResponse {
                     success: true,
-                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    protocol_version,
                     result: result.into(),
                     error: None,
                 }))
             }
             Err(error) => Ok(Response::new(RecoverDeleteTransactionResponse {
                 success: false,
-                protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                protocol_version,
                 result: Bytes::new(),
                 error: Some(error.into()),
             })),

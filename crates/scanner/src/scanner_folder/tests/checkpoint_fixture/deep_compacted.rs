@@ -293,3 +293,507 @@ async fn check_large_prefix_resumption(mode: HealScanMode) {
     }
     panic!("large prefix must finish within repeated bounded scans");
 }
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_permission_failure_isolated_to_child() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(!crate::scanner_is_erasure().await, "single-drive Namespace scan");
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(&root, "healthy/object", &[(None, 7)]).await;
+    let bucket = root.join("bucket");
+    let denied = bucket.join("denied");
+    std::fs::create_dir(&denied).expect("create denied root child");
+    for idx in 0..DATA_SCANNER_COMPACT_AT_FOLDERS - 2 {
+        std::fs::create_dir(bucket.join(format!("empty-{idx:05}"))).expect("create wide directory");
+    }
+    assert_eq!(std::fs::read_dir(&bucket).expect("list root").count(), DATA_SCANNER_COMPACT_AT_FOLDERS);
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).expect("remove child read access");
+
+    match std::fs::read_dir(&denied) {
+        Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied),
+        Ok(_) => {
+            std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o700)).expect("restore child access");
+            eprintln!("skipping permission-denied fixture because this process can read mode-000 directories");
+            return;
+        }
+    }
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    assert!(cache.info.scan_progress.is_none());
+    cache.info.skip_healing = true;
+    let budget = ScannerCycleBudget::new(&CancellationToken::new(), Default::default());
+    let wide = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(
+            budget.token(),
+            budget,
+            vec![scanner.local_disk.clone()],
+            cache,
+            None,
+            super::scan_options(HealScanMode::Normal),
+        )
+        .await;
+    std::fs::set_permissions(denied, std::fs::Permissions::from_mode(0o700)).expect("restore child access");
+    let ScannerDiskScanOutcome::Partial(wide) = wide.expect("wide legacy scanner must keep the same child-error isolation")
+    else {
+        panic!("an unreadable prefix must prevent complete snapshot publication");
+    };
+    assert!(!wide.info.snapshot_complete);
+    let summary = wide.checked_flatten("bucket").expect("aggregate healthy child");
+    assert!(summary.compacted);
+    assert_eq!((summary.objects, summary.size), (1, 7));
+    assert_eq!(wide.cache.len(), 1);
+}
+
+// Select one fixture disk so unrelated concurrent scans cannot trigger this
+// cancellation. The hook runs at the root flush boundary, after compaction.
+static CANCEL_ROOT_FLUSH: Mutex<Option<std::path::PathBuf>> = Mutex::new(None);
+
+pub(in crate::scanner_folder) fn cancel_at_root_flush(root: &str, cache: &DataUsageCache, ctx: &CancellationToken) {
+    let mut selected = CANCEL_ROOT_FLUSH.lock().expect("root flush cancellation lock");
+    if selected.as_deref() == Some(std::path::Path::new(root)) {
+        let cached = cache.root().expect("root cached before flush");
+        assert!(cached.compacted, "fixture must reach post-reduction compaction");
+        assert!(cached.children.is_empty());
+        *selected = None;
+        ctx.cancel();
+    }
+}
+
+struct RootFlushCancellationGuard;
+
+impl Drop for RootFlushCancellationGuard {
+    fn drop(&mut self) {
+        *CANCEL_ROOT_FLUSH.lock().expect("clear root flush cancellation") = None;
+    }
+}
+
+async fn wide_legacy_root() -> (FolderScanner, std::path::PathBuf, TestGuard, DataUsageCache) {
+    let (scanner, root) = build_test_scanner().await;
+    let cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(&root, "a-healthy/object", &[(Some(Uuid::from_u128(101)), 7)]).await;
+    write_checkpoint_object(&root, "z-healthy/object", &[(Some(Uuid::from_u128(102)), 11)]).await;
+    for index in 0..DATA_SCANNER_COMPACT_AT_FOLDERS - 2 {
+        std::fs::create_dir(root.join("bucket").join(format!("empty-{index:05}"))).expect("create wide root child");
+    }
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    assert!(cache.info.scan_progress.is_none());
+    (scanner, root, cleanup, cache)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_namespace_error_isolated_to_child() {
+    assert!(!crate::scanner_is_erasure().await, "single-drive Namespace scan");
+    let (scanner, root, _cleanup, cache) = wide_legacy_root().await;
+    // The error occurs while resolving a symlink inside the child, after its
+    // directory opened successfully. An open-only permission check misses it.
+    let regular = root.join("regular-file");
+    std::fs::write(&regular, b"payload").expect("write non-directory symlink target");
+    for broken in ["m-broken", "nested/broken"] {
+        let directory = root.join("bucket").join(broken);
+        std::fs::create_dir_all(&directory).expect("create failing namespace child");
+        let link = directory.join("bad-link");
+        symlink(regular.join("child"), &link).expect("create NotADirectory symlink");
+        assert_eq!(
+            std::fs::metadata(link).expect_err("invalid symlink target").kind(),
+            ErrorKind::NotADirectory
+        );
+    }
+    write_checkpoint_object(&root, "nested/healthy/object", &[(Some(Uuid::from_u128(103)), 13)]).await;
+    write_checkpoint_object(&root, "m-partial", &[(Some(Uuid::from_u128(104)), 101)]).await;
+    // Fail enumeration after this child's metadata contributed usage. Simply
+    // catching the error with a shared accumulator would retain its 101 bytes.
+    let _partial =
+        erasure_probe::OrderedDirectory::failing(&scanner.local_disk.path().join("bucket/m-partial"), 1, ErrorKind::Other);
+    let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 5).await;
+    let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+        panic!("namespace errors must prevent complete snapshot publication without aborting healthy siblings")
+    };
+    assert!(!cache.info.snapshot_complete);
+    assert_eq!(budget.progress().0, 4, "healthy siblings and the failing child must read metadata");
+    let total = cache.checked_flatten("bucket").expect("valid compacted root");
+    assert!(total.compacted);
+    assert_eq!((total.objects, total.versions, total.size), (3, 3, 31));
+    assert_eq!(cache.cache.len(), 1, "child isolation must retain aggregate-only storage");
+    let mut reloaded = save_reload(&FixtureStore::new(), &cache).await;
+    assert_eq!(reloaded.checked_flatten("bucket").expect("persisted aggregate").objects, 3);
+    drop(_partial);
+    for broken in ["m-broken", "nested/broken"] {
+        std::fs::remove_dir_all(root.join("bucket").join(broken)).expect("remove failed namespace fixture");
+    }
+    assert_eq!(
+        reloaded.prepare_for_scan("bucket", 12, 7, SOURCE, PLAN, false),
+        crate::DataUsageCachePrepareOutcome::Reset
+    );
+    reloaded.info.skip_healing = true;
+    let (outcome, budget) = scan(&scanner.local_disk, reloaded, HealScanMode::Normal, 5).await;
+    let ScannerDiskScanOutcome::Complete(verified) = outcome else {
+        panic!("a clean retry must rebuild complete coverage")
+    };
+    assert!(verified.info.snapshot_complete);
+    assert_eq!(
+        budget.progress().0,
+        4,
+        "retry must revisit every object including the previously failed child"
+    );
+    let total = verified.checked_flatten("bucket").expect("verified complete aggregate");
+    assert_eq!((total.objects, total.versions, total.size), (4, 4, 132));
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_child_cancellation_preserves_partial_accounting() {
+    let (scanner, _root, _cleanup, cache) = wide_legacy_root().await;
+    let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 1).await;
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+    assert_eq!(budget.progress().0, 1);
+    let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+        panic!("cancellation inside a compacted namespace child must propagate")
+    };
+    let total = cache.checked_flatten("bucket").expect("partial compacted accounting");
+    assert!(total.compacted);
+    assert_eq!((total.objects, total.versions), (1, 1));
+    assert!([7, 11].contains(&total.size), "completed child-local bytes must survive cancellation");
+    let reloaded = save_reload(&FixtureStore::new(), &cache).await;
+    assert_eq!(reloaded.checked_flatten("bucket").expect("persisted partial accounting").size, total.size);
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_root_reused_children_cancellation_preserves_compacted_accounting() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    cache.replace("bucket", "", DataUsageEntry::default());
+    let children = DATA_SCANNER_COMPACT_AT_CHILDREN + 1;
+    for index in 0..children {
+        let name = format!("bucket/clean-{index:05}");
+        std::fs::create_dir_all(root.join(&name)).expect("create reusable root child");
+        cache.replace(
+            &name,
+            "bucket",
+            DataUsageEntry {
+                compacted: true,
+                objects: 1,
+                versions: 2,
+                size: 7,
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(cache.root().expect("wide baseline root").children.len(), children);
+    *CANCEL_ROOT_FLUSH.lock().expect("install root flush cancellation") = Some(scanner.local_disk.path());
+    let _cancel_guard = RootFlushCancellationGuard;
+    let budget = ScannerCycleBudget::new(&CancellationToken::new(), Default::default());
+    let mut options = super::scan_options(HealScanMode::Normal);
+    options.prefix_scan_scope = ScannerBucketPrefixScanScope::from_dirty_top_level_entries(HashSet::from(["dirty".into()]));
+    let outcome = scanner
+        .local_disk
+        .clone()
+        .nsscanner_disk(budget.token(), budget.clone(), vec![scanner.local_disk.clone()], cache, None, options)
+        .await
+        .expect("cancelled root flush must return a partial cache");
+    assert!(CANCEL_ROOT_FLUSH.lock().expect("flush hook observed").is_none());
+    assert_eq!(budget.progress().0, 0, "clean children must be reused without metadata reads");
+    let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+        panic!("flush cancellation must propagate")
+    };
+    assert!(!cache.info.snapshot_complete);
+    let total = cache
+        .checked_flatten("bucket")
+        .expect("cancellation must not leave dangling root links");
+    assert!(total.compacted);
+    assert!(total.children.is_empty());
+    assert_eq!((total.objects, total.versions, total.size), (children, children * 2, children * 7));
+    assert_eq!(cache.cache.len(), 1);
+    let reloaded = save_reload(&FixtureStore::new(), &cache).await;
+    assert_eq!(reloaded.checked_flatten("bucket").expect("persisted root accounting").objects, children);
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_child_resource_deferral_preserves_partial_accounting() {
+    use rustfs_concurrency::adaptive::{FeedbackController, FeedbackObservation, NodeAdmission, ResourcePressure};
+    use std::num::NonZeroU16;
+
+    let (mut scanner, _root, _cleanup, cache) = wide_legacy_root().await;
+    scanner.old_cache = cache.clone();
+    scanner.new_cache.info = cache.info;
+    scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+    let admission = NodeAdmission::new(NonZeroU16::MIN);
+    admission.update(
+        &mut FeedbackController::new(),
+        Some(FeedbackObservation {
+            generation: 1,
+            max_concurrency: 1,
+            pressure: ResourcePressure::Unknown,
+            completed_units: None,
+        }),
+    );
+    scanner.node_admission = Some(admission.clone());
+    let (sender, mut receiver) = mpsc::channel(16);
+    scanner.usage_updates = Some(ScannerUsageUpdates::new(sender, "bucket".into()));
+    let deferred = Arc::new(AtomicBool::new(false));
+    let observed = deferred.clone();
+    scanner.update_current_path = Arc::new(move |path| {
+        if path == "bucket/a-healthy/object" {
+            // Defer the next directory after this object's metadata completed.
+            observed.store(true, Ordering::SeqCst);
+        } else if observed.load(Ordering::SeqCst) {
+            admission.update(&mut FeedbackController::new(), None);
+        }
+        Box::pin(async {})
+    });
+    let mut total = DataUsageEntry::default();
+    let result = scanner
+        .scan_folder(
+            CancellationToken::new(),
+            CachedFolder {
+                name: "bucket".into(),
+                parent: None,
+                object_heal_prob_div: 1,
+            },
+            &mut total,
+        )
+        .await;
+    assert!(deferred.load(Ordering::SeqCst), "first metadata object must be reached");
+    assert!(
+        matches!(result, Err(ScannerError::ResourceDeferred)),
+        "resource pressure must propagate: {result:?}"
+    );
+    assert!(total.compacted);
+    assert_eq!((total.objects, total.versions, total.size), (1, 1, 7));
+    assert!(scanner.usage_updates.is_some(), "resource deferral must restore the progress owner");
+    let committed = receiver.try_recv().expect("completed sibling progress");
+    assert_eq!((committed.objects, committed.versions, committed.size), (1, 1, 7));
+}
+
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_usage_updates_exclude_uncommitted_child_accounting() {
+    temp_env::async_with_vars([(rustfs_config::ENV_SCANNER_YIELD_EVERY_N_OBJECTS, Some("1"))], async {
+        let (mut scanner, root, _cleanup, cache) = wide_legacy_root().await;
+        write_checkpoint_object(&root, "000-partial", &[(Some(Uuid::from_u128(105)), 101)]).await;
+        let _partial = erasure_probe::OrderedDirectory::failing(&root.join("bucket/000-partial"), 1, ErrorKind::Other);
+        scanner.old_cache = cache.clone();
+        scanner.new_cache.info = cache.info;
+        scanner.sleeper = DynamicSleeper::new(rustfs_config::ScannerSpeed::Fastest);
+        let (sender, mut receiver) = mpsc::channel(16);
+        scanner.usage_updates = Some(ScannerUsageUpdates::new(sender, "bucket".into()));
+        scanner
+            .scan_folder(
+                CancellationToken::new(),
+                CachedFolder {
+                    name: "bucket".into(),
+                    parent: None,
+                    object_heal_prob_div: 1,
+                },
+                &mut DataUsageEntry::default(),
+            )
+            .await
+            .expect("failed namespace must not abort healthy siblings");
+        let committed = scanner
+            .new_cache
+            .checked_flatten("bucket")
+            .expect("canonical committed aggregate");
+        assert_eq!((committed.objects, committed.versions, committed.size), (2, 2, 18));
+        let first = receiver.try_recv().expect("committed usage progress");
+        assert_eq!(
+            (first.objects, first.versions, first.size),
+            (1, 1, 7),
+            "provisional 101-byte child must never be published"
+        );
+        assert!(receiver.try_recv().is_err(), "minute interval still bounds updates");
+        let updates = scanner
+            .usage_updates
+            .as_mut()
+            .expect("requested usage owner must be restored");
+        let total = updates.cache.checked_flatten("bucket").expect("connected committed progress");
+        assert_eq!((total.objects, total.versions, total.size), (2, 2, 18));
+        assert_eq!(
+            updates.cache.cache.len(),
+            1,
+            "compacted progress must not retain provisional child entries"
+        );
+        updates.last_update = SystemTime::UNIX_EPOCH;
+        scanner.send_update().await;
+        let last = receiver.try_recv().expect("final committed aggregate");
+        assert_eq!((last.objects, last.versions, last.size), (2, 2, 18));
+    })
+    .await;
+}
+
+#[tokio::test]
+#[serial]
+async fn legacy_namespace_gap_requires_fresh_verification_before_sampling() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for (object, version, size) in [("prefix/000-partial", 111, 101), ("prefix/healthy", 112, 7)] {
+        write_checkpoint_object(&root, object, &[(Some(Uuid::from_u128(version)), size)]).await;
+    }
+    let partial = erasure_probe::OrderedDirectory::failing(
+        &scanner.local_disk.path().join("bucket/prefix/000-partial"),
+        1,
+        ErrorKind::Other,
+    );
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 3).await;
+    let ScannerDiskScanOutcome::Partial(cache) = outcome else {
+        panic!("a narrow root must also refuse to certify skipped namespace coverage")
+    };
+    assert_eq!(budget.progress().0, 2, "failed child must reach provisional metadata accounting");
+    assert!(!cache.info.snapshot_complete);
+    assert!(cache.find(PREFIX).expect("incomplete aggregate").compacted);
+    assert_eq!(
+        cache.info.scan_plan_digest, None,
+        "incomplete coverage must invalidate sampled baseline reuse"
+    );
+    let mut reloaded = save_reload(&FixtureStore::new(), &cache).await;
+    drop(partial);
+    assert_eq!(
+        reloaded.prepare_for_scan("bucket", 12, 7, SOURCE, PLAN, false),
+        crate::DataUsageCachePrepareOutcome::Reset,
+        "a legacy retry must not sample an incomplete compacted subtree"
+    );
+    reloaded.info.skip_healing = true;
+    let (outcome, budget) = scan(&scanner.local_disk, reloaded, HealScanMode::Normal, 3).await;
+    let ScannerDiskScanOutcome::Complete(cache) = outcome else {
+        panic!("clean retry must restore complete coverage")
+    };
+    assert!(cache.info.snapshot_complete);
+    assert_eq!(budget.progress().0, 2, "both metadata objects must be rechecked");
+    let total = cache.checked_flatten("bucket").expect("verified retry accounting");
+    assert_eq!((total.objects, total.versions, total.size), (2, 2, 108));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn wide_root_legacy_symlink_lookup_failure_isolated_to_child() {
+    use std::os::unix::fs::symlink;
+
+    assert!(!crate::scanner_is_erasure().await, "single-drive Namespace scan");
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_checkpoint_object(&root, "healthy/object", &[(None, 7)]).await;
+    let bucket = root.join("bucket");
+    let bad = bucket.join("bad");
+    std::fs::create_dir(&bad).expect("create bad root child");
+    let regular_file = root.join("regular-file");
+    std::fs::write(&regular_file, b"not a directory").expect("create regular symlink ancestor");
+    let broken_link = bad.join("broken-link");
+    symlink(regular_file.join("child"), &broken_link).expect("create symlink through non-directory");
+    assert_eq!(
+        std::fs::metadata(broken_link).expect_err("target ancestor is a file").kind(),
+        std::io::ErrorKind::NotADirectory
+    );
+    for idx in 0..DATA_SCANNER_COMPACT_AT_FOLDERS - 2 {
+        std::fs::create_dir(bucket.join(format!("empty-{idx:05}"))).expect("create wide directory");
+    }
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 100).await;
+    let ScannerDiskScanOutcome::Partial(wide) = outcome else {
+        panic!("a failed child must preserve sibling progress without certifying complete coverage");
+    };
+    assert!(!wide.info.snapshot_complete);
+    let summary = wide.checked_flatten("bucket").expect("aggregate healthy child");
+    assert!(summary.compacted);
+    assert_eq!((summary.objects, summary.size), (1, 7));
+    assert_eq!(wide.cache.len(), 1);
+}
+
+#[tokio::test]
+#[serial]
+async fn legacy_failed_object_keeps_retry_history_after_partial_scan() {
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    write_test_object_metadata_bytes(&root, "bucket", "broken/object", &[]).await;
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 100).await;
+    let ScannerDiskScanOutcome::Partial(partial) = outcome else {
+        panic!("a failed metadata read must keep the sweep partial");
+    };
+    assert_eq!(partial.info.failed_objects.len(), 1, "failed metadata should enter the retry cache");
+    let mut reloaded = save_reload(&FixtureStore::new(), &partial).await;
+    reloaded.prepare_for_scan("bucket", 12, 7, SOURCE, PLAN, false);
+    assert_eq!(
+        reloaded.info.failed_objects, partial.info.failed_objects,
+        "same-plan retry must retain the timestamp that suppresses repeated repair attempts"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn interrupted_legacy_gap_requires_fresh_verification_before_sampling() {
+    use std::os::unix::fs::symlink;
+
+    let (scanner, root) = build_test_scanner().await;
+    let _cleanup = TestGuard {
+        temp_dir: Some(root.clone()),
+    };
+    for (object, size) in [("prefix/a-bad/object", 101), ("prefix/z-good", 7), ("z-tail/object", 11)] {
+        write_checkpoint_object(&root, object, &[(None, size)]).await;
+    }
+    let regular_file = root.join("regular-file");
+    std::fs::write(&regular_file, b"not a directory").expect("create regular symlink ancestor");
+    let broken_link = root.join("bucket/prefix/a-bad/bad-link");
+    symlink(regular_file.join("child"), &broken_link).expect("create symlink through non-directory");
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_for_scan("bucket", 11, 7, SOURCE, PLAN, false);
+    cache.info.skip_healing = true;
+    let (outcome, budget) = scan(&scanner.local_disk, cache, HealScanMode::Normal, 2).await;
+    assert_eq!(budget.reason(), Some(ScannerCycleBudgetReason::Objects));
+    let ScannerDiskScanOutcome::Partial(partial) = outcome else {
+        panic!("the tail must interrupt the scan after the prefix was compacted");
+    };
+    let prefix = partial.find(PREFIX).expect("incomplete compacted prefix");
+    assert!(prefix.compacted);
+    assert_eq!((prefix.objects, prefix.size), (1, 7));
+
+    let mut reloaded = save_reload(&FixtureStore::new(), &partial).await;
+    std::fs::remove_file(broken_link).expect("restore namespace traversal");
+    let next_cycle = (12_u32..28)
+        .find(|cycle| !hash_path(PREFIX).mod_(*cycle, data_usage_update_dir_cycles()))
+        .expect("choose a cycle that would otherwise sample the incomplete prefix");
+    reloaded.prepare_for_scan("bucket", u64::from(next_cycle), 7, SOURCE, PLAN, false);
+    reloaded.info.skip_healing = true;
+    let (outcome, _) = scan(&scanner.local_disk, reloaded, HealScanMode::Normal, 4).await;
+    let ScannerDiskScanOutcome::Complete(verified) = outcome else {
+        panic!("retry must complete after the namespace is repaired");
+    };
+    let total = verified.checked_flatten("bucket").expect("verified retry accounting");
+    assert_eq!((total.objects, total.size), (3, 119));
+}

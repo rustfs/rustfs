@@ -15,7 +15,7 @@ enum DirectoryOrder {
 pub(in crate::scanner_folder) type OrderedEntries = VecDeque<std::io::Result<native_io::DirEntry>>;
 static ORDERED_DIRECTORIES: LazyLock<Mutex<HashMap<String, DirectoryOrder>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
 
-struct OrderedDirectory(String);
+pub(in crate::scanner_folder) struct OrderedDirectory(String);
 
 impl OrderedDirectory {
     fn new(path: &std::path::Path) -> Self {
@@ -26,7 +26,7 @@ impl OrderedDirectory {
             .insert(path.clone(), DirectoryOrder::PartLast);
         Self(path)
     }
-    fn failing(path: &std::path::Path, entries: usize, kind: std::io::ErrorKind) -> Self {
+    pub(in crate::scanner_folder) fn failing(path: &std::path::Path, entries: usize, kind: std::io::ErrorKind) -> Self {
         let guard = Self::new(path);
         ORDERED_DIRECTORIES
             .lock()
@@ -205,6 +205,7 @@ async fn erasure_directory_probe_reaches_eof_across_budgeted_batches() {
                 folder,
                 &mut DataUsageEntry::default(),
                 FolderScanMode::ErasureCandidate { reuse_namespace: false },
+                false,
             )
             .await
             .expect("classify full UUID namespace");
@@ -271,6 +272,7 @@ async fn scanner_directory_probe_budget_wait_cancels_without_rate_delay() {
             folder,
             &mut DataUsageEntry::default(),
             FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            false,
         )
         .await;
     task.await.expect("open-wait cancellation");
@@ -310,6 +312,7 @@ async fn scanner_directory_probe_cancels_during_entry_budget_wait() {
             folder,
             &mut DataUsageEntry::default(),
             FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            false,
         )
         .await;
     assert!(ctx.is_cancelled());
@@ -379,7 +382,7 @@ async fn erasure_candidate_defers_metadata_until_part_classification_finishes() 
     scanner.budget = ScannerCycleBudget::new_with_progress_tracking(&ctx, Default::default());
     let mut into = DataUsageEntry::default();
     let outcome = scanner
-        .scan_folder_inner(ctx, folder, &mut into, FolderScanMode::ErasureCandidate { reuse_namespace: false })
+        .scan_folder_inner(ctx, folder, &mut into, FolderScanMode::ErasureCandidate { reuse_namespace: false }, false)
         .await
         .expect("classify candidate");
     assert_eq!(outcome, FolderScanOutcome::ErasureData);
@@ -592,6 +595,7 @@ async fn erasure_candidate_part_symlink_is_not_data_evidence() {
             folder,
             &mut DataUsageEntry::default(),
             FolderScanMode::ErasureCandidate { reuse_namespace: false },
+            false,
         )
         .await
         .expect("classify symlink namespace");

@@ -478,6 +478,7 @@ struct ScannerPublicationCommitScopeInner {
 #[derive(Clone)]
 pub struct ScannerPublicationCommitScope {
     inner: Arc<ScannerPublicationCommitScopeInner>,
+    owns_completion: bool,
 }
 
 /// RAII fallback for storage paths that return before their commit closure
@@ -569,6 +570,16 @@ impl ScannerPublicationCommitScope {
                 movement_permit: Mutex::new(Some(movement_permit)),
                 lease_release_safe,
             }),
+            owns_completion: true,
+        }
+    }
+
+    /// A pool may use the shared fence, but only the enclosing operation may
+    /// report completion and authorize release of its leases.
+    pub(crate) fn pool_delete_participant(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            owns_completion: false,
         }
     }
 
@@ -607,7 +618,9 @@ impl ScannerPublicationCommitScope {
     /// storage mutation owner. Once set, dropping a scanner waiter leaves the
     /// scope in-flight until that owner reports committed or indeterminate.
     pub fn attach_mutation_owner(&self) {
-        self.inner.owner_attached.store(true, Ordering::Release);
+        if self.owns_completion {
+            self.inner.owner_attached.store(true, Ordering::Release);
+        }
     }
 
     fn owner_attached(&self) -> bool {
@@ -654,16 +667,17 @@ impl ScannerPublicationCommitScope {
     }
 
     pub fn mark_aborted_before_commit(&self) -> bool {
-        if self
-            .inner
-            .state
-            .compare_exchange(
-                SCANNER_PUBLICATION_SCOPE_ADMITTED,
-                SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        if self.owns_completion
+            && self
+                .inner
+                .state
+                .compare_exchange(
+                    SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                    SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
         {
             self.inner.lease_release_safe.store(true, Ordering::Release);
             self.inner.completed.notify_waiters();
@@ -677,6 +691,9 @@ impl ScannerPublicationCommitScope {
     }
 
     fn mark_terminal(&self, terminal: ScannerPublicationCommitState) -> bool {
+        if !self.owns_completion {
+            return false;
+        }
         self.inner
             .state
             .compare_exchange(SCANNER_PUBLICATION_SCOPE_IN_FLIGHT, terminal.as_u8(), Ordering::AcqRel, Ordering::Acquire)
@@ -709,7 +726,7 @@ impl ScannerPublicationCommitScope {
     /// Release the storage-owned movement permit only after a known-safe
     /// terminal result. Returns `false` for in-flight or indeterminate work.
     pub async fn release_movement_permit(&self) -> bool {
-        if !self.state().permits_lease_release() {
+        if !self.owns_completion || !self.state().permits_lease_release() {
             return false;
         }
         self.inner.movement_permit.lock().await.take().is_some()

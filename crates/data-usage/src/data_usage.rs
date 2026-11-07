@@ -675,6 +675,10 @@ impl DataUsageInfo {
 /// cycle. The timestamp fallback preserves ordering for legacy snapshots that
 /// predate those fields.
 pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUsageInfo) -> bool {
+    data_usage_identity_is_newer(candidate.snapshot_identity(), baseline.snapshot_identity())
+}
+
+fn data_usage_identity_is_newer(candidate: DataUsageSnapshotIdentity, baseline: DataUsageSnapshotIdentity) -> bool {
     match (
         candidate.scanner_epoch.zip(candidate.scanner_cycle),
         baseline.scanner_epoch.zip(baseline.scanner_cycle),
@@ -697,10 +701,18 @@ pub fn data_usage_snapshot_is_newer(candidate: &DataUsageInfo, baseline: &DataUs
 /// already advance the authoritative timestamp when deleting a bucket, so a
 /// rollback delete/recreate fences the previous bucket incarnation too.
 pub fn observed_data_usage_is_newer(observed: &DataUsageInfo, authoritative: &DataUsageInfo) -> bool {
+    observed_data_usage_is_newer_than_identity(observed, authoritative.snapshot_identity())
+}
+
+/// Return whether a nonconverged observation may supersede `authoritative`.
+///
+/// This applies the structural, exact-baseline, and generation checks of
+/// [`observed_data_usage_is_newer`] without retaining the baseline's bucket maps.
+pub fn observed_data_usage_is_newer_than_identity(observed: &DataUsageInfo, authoritative: DataUsageSnapshotIdentity) -> bool {
     observed.usage_snapshot_converged == Some(false)
         && (observed.is_complete_bucket_usage_snapshot() || observed.is_valid_partial_snapshot())
-        && observed.usage_snapshot_authoritative_baseline.as_ref() == Some(&authoritative.snapshot_identity())
-        && data_usage_snapshot_is_newer(observed, authoritative)
+        && observed.usage_snapshot_authoritative_baseline == Some(authoritative)
+        && data_usage_identity_is_newer(observed.snapshot_identity(), authoritative)
 }
 
 /// Metadata describing the status of a disk-level data usage snapshot.
@@ -3140,11 +3152,16 @@ mod tests {
         };
 
         assert!(observed_data_usage_is_newer(&observed, &authoritative));
+        assert!(observed_data_usage_is_newer_than_identity(&observed, authoritative.snapshot_identity()));
 
         authoritative.last_update = Some(SystemTime::UNIX_EPOCH + Duration::from_secs(601));
         assert!(
             !observed_data_usage_is_newer(&observed, &authoritative),
             "an old-binary namespace mutation must fence the prior bucket incarnation regardless of clock skew"
+        );
+        assert!(
+            !observed_data_usage_is_newer_than_identity(&observed, authoritative.snapshot_identity()),
+            "a captured identity must preserve the exact namespace fence"
         );
     }
 
@@ -3172,6 +3189,18 @@ mod tests {
         assert!(!observed_data_usage_is_newer(&candidate(2, 9, Some(false), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(true), true), &authoritative));
         assert!(!observed_data_usage_is_newer(&candidate(2, 11, Some(false), false), &authoritative));
+        for (observed, expected) in [
+            (candidate(2, 11, Some(false), true), true),
+            (candidate(2, 9, Some(false), true), false),
+            (candidate(2, 11, Some(true), true), false),
+            (candidate(2, 11, Some(false), false), false),
+        ] {
+            assert_eq!(
+                observed_data_usage_is_newer_than_identity(&observed, authoritative.snapshot_identity()),
+                expected,
+                "observation identity selection must preserve convergence, completeness, and generation gates"
+            );
+        }
 
         let mut partial = candidate(2, 11, Some(false), false);
         partial.usage_snapshot_partial = true;
@@ -3186,6 +3215,30 @@ mod tests {
             segment_invalidation_proof: None,
         }];
         assert!(observed_data_usage_is_newer(&partial, &authoritative));
+        assert!(observed_data_usage_is_newer_than_identity(&partial, authoritative.snapshot_identity()));
+    }
+
+    #[test]
+    fn observation_identity_selection_keeps_legacy_timestamp_ordering() {
+        let baseline = DataUsageSnapshotIdentity {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(10)),
+            // An epoch without a cycle is not a coordinated position.
+            scanner_epoch: Some(2),
+            scanner_cycle: None,
+        };
+        let mut observed = DataUsageInfo {
+            last_update: Some(SystemTime::UNIX_EPOCH + Duration::from_secs(11)),
+            scanner_epoch: Some(1),
+            usage_snapshot_complete: true,
+            usage_snapshot_converged: Some(false),
+            usage_snapshot_authoritative_baseline: Some(baseline),
+            ..Default::default()
+        };
+        assert!(observed_data_usage_is_newer_than_identity(&observed, baseline));
+        observed.last_update = baseline.last_update;
+        assert!(!observed_data_usage_is_newer_than_identity(&observed, baseline));
+        observed.last_update = None;
+        assert!(!observed_data_usage_is_newer_than_identity(&observed, baseline));
     }
 
     #[test]

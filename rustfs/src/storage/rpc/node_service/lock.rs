@@ -22,6 +22,7 @@ fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLo
         success: response.success,
         error_info: response.error,
         lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+        ..Default::default()
     }
 }
 
@@ -30,6 +31,7 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
         success: false,
         error_info: Some(error.into()),
         lock_info: None,
+        ..Default::default()
     }
 }
 
@@ -54,29 +56,59 @@ async fn refresh_lock(
             success: true,
             error_info: None,
             lock_info: None,
+            ..Default::default()
         },
         Ok(false) => GenerallyLockResponse {
             success: false,
             error_info: None,
             lock_info: None,
+            ..Default::default()
         },
         Err(err) => GenerallyLockResponse {
             success: false,
             error_info: Some(format!("can not refresh, resource: {0}, err: {1}", args.resource, err)),
             lock_info: None,
+            ..Default::default()
         },
     }
 }
 
 fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> GenerallyLockResult {
-    if success {
-        GenerallyLockResult {
-            success: true,
-            error_info: None,
-            lock_info: None,
+    GenerallyLockResult {
+        success,
+        error_info: (!success).then(|| format!("lock not found for release: {lock_id}")),
+        lock_info: None,
+        release_status: if success {
+            LockReleaseStatus::Released.into()
+        } else {
+            LockReleaseStatus::AlreadyAbsent.into()
+        },
+    }
+}
+
+async fn release_lock(
+    lock_client: &std::sync::Arc<dyn rustfs_lock::client::LockClient>,
+    args: &LockRequest,
+) -> GenerallyLockResponse {
+    match lock_client.release(&args.lock_id).await {
+        Ok(success) => {
+            let result = lock_result_from_release(&args.lock_id, success);
+            GenerallyLockResponse {
+                success: result.success,
+                error_info: result.error_info,
+                lock_info: None,
+                release_status: result.release_status,
+            }
         }
-    } else {
-        lock_result_from_error(format!("lock not found for release: {lock_id}"))
+        Err(err) => GenerallyLockResponse {
+            success: false,
+            error_info: Some(format!(
+                "can not unlock, resource: {0}, owner: {1}, err: {2}",
+                args.resource, args.owner, err
+            )),
+            lock_info: None,
+            ..Default::default()
+        },
     }
 }
 
@@ -93,6 +125,7 @@ impl NodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -113,6 +146,7 @@ impl NodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -125,6 +159,7 @@ impl NodeService {
                     success: result.success,
                     error_info: result.error_info,
                     lock_info: None,
+                    release_status: result.release_status,
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -134,6 +169,7 @@ impl NodeService {
                     args.resource, args.owner, err
                 )),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }
@@ -150,29 +186,13 @@ impl NodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
 
         let lock_client = self.get_lock_client()?;
-        match lock_client.release(&args.lock_id).await {
-            Ok(success) => {
-                let result = lock_result_from_release(&args.lock_id, success);
-                Ok(Response::new(GenerallyLockResponse {
-                    success: result.success,
-                    error_info: result.error_info,
-                    lock_info: None,
-                }))
-            }
-            Err(err) => Ok(Response::new(GenerallyLockResponse {
-                success: false,
-                error_info: Some(format!(
-                    "can not unlock, resource: {0}, owner: {1}, err: {2}",
-                    args.resource, args.owner, err
-                )),
-                lock_info: None,
-            })),
-        }
+        Ok(Response::new(release_lock(&lock_client, &args).await))
     }
 
     pub(super) async fn handle_lock(
@@ -190,6 +210,7 @@ impl NodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -205,6 +226,7 @@ impl NodeService {
                     success: result.success,
                     error_info: result.error,
                     lock_info: lock_info_json,
+                    ..Default::default()
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -214,6 +236,7 @@ impl NodeService {
                     args.resource, args.owner, err
                 )),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }
@@ -328,6 +351,7 @@ mod tests {
         let result = lock_result_from_release(&lock_id, false);
 
         assert!(!result.success);
+        assert_eq!(result.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
         assert!(result.lock_info.is_none());
         assert!(
             result
@@ -345,6 +369,40 @@ mod tests {
         assert!(!result.success);
         assert_eq!(result.error_info.as_deref(), Some("lock conflict"));
         assert!(result.lock_info.is_none());
+        assert_eq!(result.release_status, super::LockReleaseStatus::Unspecified as i32);
+    }
+
+    #[tokio::test]
+    async fn release_lock_preserves_strict_failure_and_reports_authoritative_absence() {
+        use rustfs_lock::{GlobalLockManager, LocalClient, LockClient, LockRequest, LockType, ObjectKey};
+        use std::sync::Arc;
+
+        let client: Arc<dyn LockClient> = Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new())));
+        let request = LockRequest::new(ObjectKey::new("bucket", "release-result"), LockType::Exclusive, "owner");
+        assert!(client.acquire_lock(&request).await.expect("acquire grant").success);
+
+        let released = super::release_lock(&client, &request).await;
+        assert!(released.success);
+        assert!(released.error_info.is_none());
+        assert_eq!(released.release_status, super::LockReleaseStatus::Released as i32);
+        let absent = super::release_lock(&client, &request).await;
+        assert!(!absent.success, "ordinary release remains strict");
+        assert!(absent.error_info.is_some());
+        assert_eq!(absent.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
+
+        let successor = LockRequest::new(request.resource.clone(), LockType::Exclusive, "successor");
+        assert!(client.acquire_lock(&successor).await.expect("acquire successor").success);
+        let absent = super::release_lock(&client, &request).await;
+        assert!(!absent.success);
+        assert_eq!(absent.release_status, super::LockReleaseStatus::AlreadyAbsent as i32);
+        assert!(
+            client
+                .check_status(&successor.lock_id)
+                .await
+                .expect("check successor")
+                .is_some()
+        );
+        assert!(client.release(&successor.lock_id).await.expect("release successor"));
     }
 
     // B1 -- refresh_lock delegates to LocalClient::refresh for a held lock, returns

@@ -412,6 +412,38 @@ mod integration_tests {
         );
     }
 
+    async fn upload_after_quota_reconciliation(
+        env: &QuotaTestEnv,
+        key: &str,
+        size_bytes: usize,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let upload = async {
+            loop {
+                let result = env
+                    .client
+                    .put_object()
+                    .bucket(&env.bucket_name)
+                    .key(key)
+                    .body(aws_sdk_s3::primitives::ByteStream::from(vec![0u8; size_bytes]))
+                    .send()
+                    .await;
+                match result {
+                    Ok(_) => break,
+                    Err(error) => assert_quota_rejection(
+                        error.raw_response().map(|response| response.status().as_u16()),
+                        error.as_service_error(),
+                        &error,
+                    ),
+                }
+                sleep(Duration::from_secs(1)).await;
+            }
+        };
+        // The durable V1 ledger can retain the old charge for its 30-second reconciliation cooldown.
+        timeout(Duration::from_secs(45), upload)
+            .await
+            .map_err(|_| format!("PUT {key} did not succeed after quota reconciliation within 45 seconds").into())
+    }
+
     async fn assert_put_rejected_by_quota(env: &QuotaTestEnv, key: &str, size_bytes: usize) {
         let error = env
             .client
@@ -573,8 +605,7 @@ mod integration_tests {
 
         assert!(!env.object_exists("file1.txt").await?);
 
-        // Now we should be able to upload again (quota freed up)
-        env.upload_object("file3.txt", 256 * 1024).await?;
+        upload_after_quota_reconciliation(&env, "file3.txt", 256 * 1024).await?;
         assert!(env.object_exists("file3.txt").await?);
 
         env.cleanup_bucket().await?;
@@ -981,8 +1012,7 @@ mod integration_tests {
         );
         assert_eq!(delete_result.deleted().len(), 2);
 
-        // Now should be able to upload again (quota freed up)
-        env.upload_object("file3.txt", 256 * 1024).await?;
+        upload_after_quota_reconciliation(&env, "file3.txt", 256 * 1024).await?;
         assert!(env.object_exists("file3.txt").await?);
 
         env.cleanup_bucket().await?;

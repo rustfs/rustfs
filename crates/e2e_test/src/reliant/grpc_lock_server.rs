@@ -42,6 +42,7 @@ fn lock_result_from_response(response: rustfs_lock::LockResponse) -> GenerallyLo
         success: response.success,
         error_info: response.error,
         lock_info: response.lock_info.and_then(|info| serde_json::to_string(&info).ok()),
+        ..Default::default()
     }
 }
 
@@ -50,6 +51,7 @@ fn lock_result_from_error(error: impl Into<String>) -> GenerallyLockResult {
         success: false,
         error_info: Some(error.into()),
         lock_info: None,
+        ..Default::default()
     }
 }
 
@@ -59,6 +61,7 @@ fn lock_result_from_release(lock_id: &rustfs_lock::LockId, success: bool) -> Gen
             success: true,
             error_info: None,
             lock_info: None,
+            ..Default::default()
         }
     } else {
         lock_result_from_error(format!("lock not found for release: {lock_id}"))
@@ -164,6 +167,7 @@ impl NodeService for MinimalLockNodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -175,6 +179,7 @@ impl NodeService for MinimalLockNodeService {
                     success: result.success,
                     error_info: result.error,
                     lock_info: lock_info_json,
+                    ..Default::default()
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -184,6 +189,7 @@ impl NodeService for MinimalLockNodeService {
                     args.resource, args.owner, err
                 )),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }
@@ -197,6 +203,7 @@ impl NodeService for MinimalLockNodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -208,6 +215,7 @@ impl NodeService for MinimalLockNodeService {
                     success: result.success,
                     error_info: result.error_info,
                     lock_info: None,
+                    ..Default::default()
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -217,6 +225,7 @@ impl NodeService for MinimalLockNodeService {
                     args.resource, args.owner, err
                 )),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }
@@ -230,6 +239,7 @@ impl NodeService for MinimalLockNodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -241,6 +251,7 @@ impl NodeService for MinimalLockNodeService {
                     success: result.success,
                     error_info: result.error_info,
                     lock_info: None,
+                    ..Default::default()
                 }))
             }
             Err(err) => Ok(Response::new(GenerallyLockResponse {
@@ -250,6 +261,7 @@ impl NodeService for MinimalLockNodeService {
                     args.resource, args.owner, err
                 )),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }
@@ -263,6 +275,7 @@ impl NodeService for MinimalLockNodeService {
                     success: false,
                     error_info: Some(format!("can not decode args, err: {err}")),
                     lock_info: None,
+                    ..Default::default()
                 }));
             }
         };
@@ -272,11 +285,13 @@ impl NodeService for MinimalLockNodeService {
                 success,
                 error_info: None,
                 lock_info: None,
+                ..Default::default()
             })),
             Err(err) => Ok(Response::new(GenerallyLockResponse {
                 success: false,
                 error_info: Some(format!("can not refresh, err: {err}")),
                 lock_info: None,
+                ..Default::default()
             })),
         }
     }

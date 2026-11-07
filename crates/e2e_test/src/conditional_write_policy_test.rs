@@ -260,7 +260,7 @@ async fn iam_policy_requires_if_match(env: &RustFSTestEnvironment, admin: &Clien
     let key = "guarded.txt";
 
     admin_create_user(env, &user, user_secret).await?;
-    let policy = serde_json::json!({
+    let mut policy = serde_json::json!({
         "Version": "2012-10-17",
         "Statement": [{
             "Effect": "Allow",
@@ -268,9 +268,8 @@ async fn iam_policy_requires_if_match(env: &RustFSTestEnvironment, admin: &Clien
             "Resource": [format!("arn:aws:s3:::{bucket}/*")],
             "Condition": { "Null": { "s3:if-match": "false" } }
         }]
-    })
-    .to_string();
-    admin_add_and_attach_policy(env, &policy_name, &policy, &user).await?;
+    });
+    admin_add_and_attach_policy(env, &policy_name, &policy.to_string(), &user).await?;
 
     admin.create_bucket().bucket(&bucket).send().await?;
     let original = admin
@@ -293,6 +292,46 @@ async fn iam_policy_requires_if_match(env: &RustFSTestEnvironment, admin: &Clien
         .expect_err("PutObject without If-Match must be denied");
     assert_error(&denied, "AccessDenied", 403, "unconditional PutObject");
 
+    let denied = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .if_match(&etag)
+        .body(ByteStream::from_static(b"missing-read-permission"))
+        .send()
+        .await
+        .expect_err("If-Match without GetObject must be denied");
+    assert_error(&denied, "AccessDenied", 403, "conditional PutObject without GetObject");
+
+    // S3 requires GetObject as well as PutObject for an ETag-based write.
+    policy["Statement"]
+        .as_array_mut()
+        .expect("policy statements")
+        .push(serde_json::json!({
+            "Effect": "Allow",
+            "Action": ["s3:GetObject"],
+            "Resource": [format!("arn:aws:s3:::{bucket}/{key}")]
+        }));
+    admin_add_canned_policy_via(
+        AdminTransport::Signed,
+        &env.url,
+        &env.access_key,
+        &env.secret_key,
+        &policy_name,
+        &policy.to_string(),
+    )
+    .await?;
+
+    let denied = client
+        .put_object()
+        .bucket(&bucket)
+        .key(key)
+        .body(ByteStream::from_static(b"blind-overwrite"))
+        .send()
+        .await
+        .expect_err("GetObject permission must not allow an unconditional PutObject");
+    assert_error(&denied, "AccessDenied", 403, "unconditional PutObject with GetObject");
+
     client
         .put_object()
         .bucket(&bucket)
@@ -301,6 +340,8 @@ async fn iam_policy_requires_if_match(env: &RustFSTestEnvironment, admin: &Clien
         .body(ByteStream::from_static(b"v2"))
         .send()
         .await?;
+    let written = client.get_object().bucket(&bucket).key(key).send().await?;
+    assert_eq!(written.body.collect().await?.into_bytes().as_ref(), b"v2");
 
     let _ = admin.delete_object().bucket(&bucket).key(key).send().await;
     let _ = admin.delete_bucket().bucket(&bucket).send().await;

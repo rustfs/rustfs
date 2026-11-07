@@ -59,13 +59,14 @@ pub(super) fn rules() -> Vec<Rule> {
             )
         },
         Rule {
-            anchors: strings(["distributed unlock failed on client"]),
+            anchors: strings(["Distributed unlock cleanup failed on client"]),
             ..base(
                 "dist-unlock-failed",
                 P2Degraded,
                 "lock",
                 "分布式加/解锁在部分节点失败",
                 any([
+                    contains("Distributed unlock cleanup failed on client"),
                     contains("distributed unlock failed on client"),
                     contains("Failed to acquire lock on client"),
                 ]),

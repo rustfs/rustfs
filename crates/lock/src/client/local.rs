@@ -12,12 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::collections::HashMap;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
-use tokio::sync::RwLock;
-use tokio::time::{Instant, timeout};
+use tokio::sync::Notify;
+use tokio::time::{Instant, timeout, timeout_at};
 
 use crate::{
     FastLockGuard, GlobalLockManager, LockClient, LockId, LockInfo, LockManager, LockMetadata, LockPriority, LockRequest,
@@ -26,12 +28,97 @@ use crate::{
 
 /// Default shard count for guard storage (must be power of 2)
 const DEFAULT_GUARD_SHARD_COUNT: usize = 64;
+const EVENT_NAMESPACE_LOCK_ACQUIRE: &str = "namespace_lock_acquire";
 const EVENT_NAMESPACE_LOCK_RELEASE: &str = "namespace_lock_release";
 const LOG_COMPONENT_LOCK: &str = "lock";
 const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
 
-type GuardShard = Arc<RwLock<HashMap<LockId, LocalGuardEntry>>>;
+type GuardMap = HashMap<LockId, LocalGuardEntry>;
+type GuardShard = Arc<GuardRegistry>;
 type GuardStorage = Arc<Vec<GuardShard>>;
+
+/// Registry access never reserves the table for a task that has not resumed.
+/// Only short synchronous map operations hold the native lock; contention
+/// waits on a notification without blocking an executor thread.
+#[derive(Debug, Default)]
+struct GuardRegistry {
+    entries: RwLock<GuardMap>,
+    changed: Notify,
+}
+
+struct GuardRegistryWake<'a>(&'a Notify);
+
+impl Drop for GuardRegistryWake<'_> {
+    fn drop(&mut self) {
+        self.0.notify_waiters();
+    }
+}
+
+struct GuardRegistryAccess<'a, G> {
+    // Field drop order unlocks the table before waking its waiters, including
+    // when a map operation unwinds. Physical guards are removed before Drop.
+    guard: G,
+    _wake: GuardRegistryWake<'a>,
+}
+
+impl<G: Deref> Deref for GuardRegistryAccess<'_, G> {
+    type Target = G::Target;
+
+    fn deref(&self) -> &Self::Target {
+        &self.guard
+    }
+}
+
+impl<G: DerefMut> DerefMut for GuardRegistryAccess<'_, G> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.guard
+    }
+}
+
+impl GuardRegistry {
+    fn access<G>(&self, guard: G) -> GuardRegistryAccess<'_, G> {
+        GuardRegistryAccess {
+            guard,
+            _wake: GuardRegistryWake(&self.changed),
+        }
+    }
+
+    async fn read(&self) -> GuardRegistryAccess<'_, RwLockReadGuard<'_, GuardMap>> {
+        tokio::task::consume_budget().await;
+        if let Some(guard) = self.entries.try_read() {
+            return self.access(guard);
+        }
+        loop {
+            tokio::task::consume_budget().await;
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(guard) = self.entries.try_read() {
+                return self.access(guard);
+            }
+            notified.await;
+        }
+    }
+
+    async fn write(&self) -> GuardRegistryAccess<'_, RwLockWriteGuard<'_, GuardMap>> {
+        tokio::task::consume_budget().await;
+        if let Some(guard) = self.entries.try_write() {
+            return self.access(guard);
+        }
+        loop {
+            tokio::task::consume_budget().await;
+            // Register before rechecking so an unlock between the first
+            // failed try and this wait cannot leave the task asleep.
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if let Some(guard) = self.entries.try_write() {
+                return self.access(guard);
+            }
+            notified.await;
+        }
+    }
+}
 
 /// Local lock client using FastLock with sharded guard storage for better concurrency
 #[derive(Debug)]
@@ -94,7 +181,7 @@ impl LocalClient {
     pub fn with_shard_count(shard_count: usize) -> Self {
         assert!(shard_count.is_power_of_two(), "Shard count must be power of 2");
 
-        let guard_storage: Vec<GuardShard> = (0..shard_count).map(|_| Arc::new(RwLock::new(HashMap::new()))).collect();
+        let guard_storage: Vec<GuardShard> = (0..shard_count).map(|_| Arc::new(GuardRegistry::default())).collect();
 
         Self::with_storage(Arc::new(guard_storage), None, crate::fast_lock::CLEANUP_INTERVAL)
     }
@@ -115,7 +202,7 @@ impl LocalClient {
     /// This allows simulating multi-node environments where each node has its own lock backend
     pub fn with_manager(manager: Arc<GlobalLockManager>) -> Self {
         let guard_storage = (0..DEFAULT_GUARD_SHARD_COUNT)
-            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .map(|_| Arc::new(GuardRegistry::default()))
             .collect();
         Self::with_storage(Arc::new(guard_storage), Some(manager), crate::fast_lock::CLEANUP_INTERVAL)
     }
@@ -123,7 +210,7 @@ impl LocalClient {
     #[cfg(test)]
     pub(crate) fn with_manager_and_reaper_interval(manager: Arc<GlobalLockManager>, reaper_interval: Duration) -> Self {
         let guard_storage = (0..DEFAULT_GUARD_SHARD_COUNT)
-            .map(|_| Arc::new(RwLock::new(HashMap::new())))
+            .map(|_| Arc::new(GuardRegistry::default()))
             .collect();
         Self::with_storage(Arc::new(guard_storage), Some(manager), reaper_interval)
     }
@@ -140,7 +227,7 @@ impl LocalClient {
     }
 
     /// Get the shard for a given lock ID
-    fn get_shard(&self, lock_id: &LockId) -> &Arc<RwLock<HashMap<LockId, LocalGuardEntry>>> {
+    fn get_shard(&self, lock_id: &LockId) -> &GuardShard {
         let index = self.get_resource_shard_index(&lock_id.resource);
         &self.guard_storage[index]
     }
@@ -232,6 +319,7 @@ impl Default for LocalClient {
 #[async_trait::async_trait]
 impl LockClient for LocalClient {
     async fn acquire_lock(&self, request: &LockRequest) -> Result<LockResponse> {
+        let started = Instant::now();
         self.ensure_reaper();
         if request.lock_id.resource != request.resource {
             return Ok(LockResponse::failure(
@@ -251,6 +339,7 @@ impl LockClient for LocalClient {
                 .await
                 .unwrap_or(0)
         };
+        let reclaim_elapsed = started.elapsed();
 
         let build_lock_request = |acquire_timeout| match request.lock_type {
             LockType::Exclusive => crate::ObjectLockRequest::new_write(request.resource.clone(), request.owner.clone())
@@ -265,17 +354,65 @@ impl LockClient for LocalClient {
             if remaining.is_zero() {
                 return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
             }
+            let manager_started = Instant::now();
             match lock_manager.acquire_lock(build_lock_request(remaining)).await {
                 Ok(guard) => {
+                    let manager_elapsed = manager_started.elapsed();
+                    let registration_started = Instant::now();
+                    let physical_guard_id = guard.guard_id();
                     let lock_id = request.lock_id.clone();
                     let entry = LocalGuardEntry::new(guard, request.ttl);
                     let acquired_at = entry.acquired_at;
                     let expires_at = entry.expires_at;
 
-                    {
+                    let (replaced_entry, registration_wait, registration_mutation, registry_entries, registry_capacity) = {
                         let shard = self.get_shard(&lock_id);
-                        let mut guards = shard.write().await;
-                        guards.insert(lock_id.clone(), entry);
+                        let Ok(mut guards) = timeout_at(acquire_deadline, shard.write()).await else {
+                            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
+                        };
+                        // A ready table cannot publish a grant after the peer
+                        // budget expired while its acquisition task was idle.
+                        if Instant::now() >= acquire_deadline {
+                            drop(guards);
+                            return Ok(LockResponse::failure("Lock acquisition timeout", request.acquire_timeout));
+                        }
+                        let registration_wait = registration_started.elapsed();
+                        let mutation_started = Instant::now();
+                        let replaced_entry = guards.insert(lock_id.clone(), entry);
+                        (
+                            replaced_entry,
+                            registration_wait,
+                            mutation_started.elapsed(),
+                            guards.len(),
+                            guards.capacity(),
+                        )
+                    };
+                    // Repeated shared requests can replace an entry. Releasing
+                    // its physical guard must not reenter locks under the table.
+                    drop(replaced_entry);
+
+                    let registration_elapsed = registration_started.elapsed();
+                    if started.elapsed() >= Duration::from_millis(100) {
+                        tracing::trace!(
+                            target: "rustfs_lock::namespace_owner",
+                            event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "local_completed",
+                            resource = %request.resource,
+                            lock_id = %lock_id,
+                            mode = ?request.lock_type,
+                            physical_guard_id,
+                            reclaim_ms = reclaim_elapsed.as_millis(),
+                            manager_ms = manager_elapsed.as_millis(),
+                            registration_ms = registration_elapsed.as_millis(),
+                            registration_wait_ms = registration_wait.as_millis(),
+                            registration_mutation_ms = registration_mutation.as_millis(),
+                            registry_entries,
+                            registry_capacity,
+                            acquire_ms = started.elapsed().as_millis(),
+                            "Namespace local lock acquisition completed slowly"
+                        );
                     }
 
                     let lock_info = LockInfo {
@@ -357,6 +494,16 @@ impl LockClient for LocalClient {
             // Lock not found or already released
             Ok(false)
         }
+    }
+
+    async fn cleanup_grant(&self, lock_id: &LockId) -> Result<super::LockCleanupOutcome> {
+        self.release(lock_id).await.map(|released| {
+            if released {
+                super::LockCleanupOutcome::Released
+            } else {
+                super::LockCleanupOutcome::AlreadyAbsent
+            }
+        })
     }
 
     async fn refresh(&self, lock_id: &LockId) -> Result<bool> {
@@ -459,11 +606,302 @@ impl LockClient for LocalClient {
 mod tests {
     use super::*;
     use crate::{GlobalLockManager, LockClient, LockRequest, LockType};
+    use futures::FutureExt;
+    use std::task::Poll;
 
     fn request(resource: crate::ObjectKey, owner: &str, ttl: Duration) -> LockRequest {
         LockRequest::new(resource, LockType::Exclusive, owner)
             .with_ttl(ttl)
             .with_acquire_timeout(Duration::from_millis(80))
+    }
+
+    fn hold_guard_shard(shard: GuardShard) -> (std::sync::mpsc::Sender<()>, std::thread::JoinHandle<()>) {
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build the independent guard-table owner runtime");
+            let guard = runtime.block_on(shard.write());
+            entered_tx.send(()).expect("signal that the guard table is occupied");
+            // A dropped controller also releases the table on test failure.
+            let _ = release_rx.recv_timeout(Duration::from_secs(3));
+            drop(guard);
+        });
+        entered_rx
+            .recv_timeout(Duration::from_secs(3))
+            .expect("guard-table owner must enter before the tested operation");
+        (release_tx, thread)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn unpolled_registry_writer_does_not_block_compatible_acquisition() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        client.reaper_started.store(true, Ordering::Release);
+        let first = LockRequest::new(crate::ObjectKey::new("bucket", ""), LockType::Shared, "first");
+        assert!(client.acquire_lock(&first).await.expect("first shared lock").success);
+        let (release_table, table_owner) = hold_guard_shard(client.get_shard(&first.lock_id).clone());
+        let mut pending_release = Box::pin(client.release(&first.lock_id));
+        assert!(matches!(futures::poll!(&mut pending_release), Poll::Pending));
+        release_table.send(()).expect("release the occupied table");
+        table_owner.join().expect("guard-table owner must finish");
+
+        // The earlier writer is deliberately not polled: an unoccupied
+        // bookkeeping table must remain usable by a currently running peer.
+        let second = LockRequest::new(first.resource.clone(), LockType::Shared, "second");
+        let response = client
+            .acquire_lock(&second)
+            .now_or_never()
+            .expect("a sleeping registry writer must not reserve the available table")
+            .expect("compatible shared acquisition should return a response");
+        assert!(response.success);
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled physical lock backend")
+                .get_shard(&first.resource)
+                .active_guard_count(),
+            2
+        );
+        assert!(
+            pending_release
+                .await
+                .expect("the earlier writer still releases its exact grant")
+        );
+        assert!(client.release(&second.lock_id).await.expect("release the second grant"));
+        assert_eq!(
+            manager
+                .as_fast_lock_manager()
+                .expect("enabled physical lock backend")
+                .get_shard(&first.resource)
+                .active_guard_count(),
+            0
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn acquisition_deadline_rejects_registration_after_physical_grant() {
+        for unlock_before_poll in [false, true] {
+            let manager = Arc::new(GlobalLockManager::new());
+            let client = LocalClient::with_manager(manager.clone());
+            client.reaper_started.store(true, Ordering::Release);
+            let resource = crate::ObjectKey::new("bucket", "registration-deadline");
+            let blocker = manager
+                .acquire_lock(crate::ObjectLockRequest::new_write(resource.clone(), "blocker"))
+                .await
+                .expect("hold the physical lock until guard-table preflight finishes");
+            let request =
+                request(resource.clone(), "owner", Duration::from_secs(30)).with_acquire_timeout(Duration::from_millis(20));
+            let mut acquire = Box::pin(tokio::task::unconstrained(client.acquire_lock(&request)));
+            assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+            let (release_table, table_owner) = hold_guard_shard(client.get_shard(&request.lock_id).clone());
+            drop(blocker);
+            assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+            assert_eq!(
+                manager
+                    .as_fast_lock_manager()
+                    .expect("enabled physical lock backend")
+                    .get_shard(&resource)
+                    .active_guard_count(),
+                1,
+                "the tested future owns a physical grant"
+            );
+            tokio::time::advance(Duration::from_millis(21)).await;
+            if unlock_before_poll {
+                release_table.send(()).expect("make registration ready after its deadline");
+                table_owner.join().expect("guard-table owner must finish");
+                assert!(!acquire.await.expect("expired registration response").success);
+            } else {
+                let response = timeout(Duration::from_millis(100), &mut acquire)
+                    .await
+                    .expect("registration must honor its deadline while the table remains occupied")
+                    .expect("expired registration response");
+                assert!(!response.success);
+                release_table.send(()).expect("release the occupied table");
+                table_owner.join().expect("guard-table owner must finish");
+            }
+            assert!(
+                client
+                    .check_status(&request.lock_id)
+                    .await
+                    .expect("check the expired identity")
+                    .is_none()
+            );
+            assert_eq!(
+                manager
+                    .as_fast_lock_manager()
+                    .expect("enabled physical lock backend")
+                    .get_shard(&resource)
+                    .active_guard_count(),
+                0,
+                "expired registration must release its grant"
+            );
+            assert!(
+                manager
+                    .acquire_lock(crate::ObjectLockRequest::new_write(resource, "next-owner"))
+                    .await
+                    .is_ok(),
+                "the next owner must not inherit an abandoned physical grant"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelling_registration_releases_the_unpublished_physical_grant() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        client.reaper_started.store(true, Ordering::Release);
+        let resource = crate::ObjectKey::new("bucket", "cancel-registration");
+        let blocker = manager
+            .acquire_lock(crate::ObjectLockRequest::new_write(resource.clone(), "blocker"))
+            .await
+            .expect("hold the physical lock through registry preflight");
+        let request = request(resource.clone(), "cancelled", Duration::from_secs(30));
+        let mut acquire = Box::pin(tokio::task::unconstrained(client.acquire_lock(&request)));
+        assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+        let (release_table, table_owner) = hold_guard_shard(client.get_shard(&request.lock_id).clone());
+        drop(blocker);
+        assert!(matches!(futures::poll!(&mut acquire), Poll::Pending));
+        let backend = manager.as_fast_lock_manager().expect("enabled physical lock backend");
+        assert_eq!(backend.get_shard(&resource).active_guard_count(), 1);
+        drop(acquire);
+        assert_eq!(backend.get_shard(&resource).active_guard_count(), 0);
+        assert!(
+            manager
+                .acquire_lock(crate::ObjectLockRequest::new_write(resource, "next-owner"))
+                .await
+                .is_ok(),
+            "cancellation must release the physical lock without waiting for the table"
+        );
+        release_table.send(()).expect("release the occupied table");
+        table_owner.join().expect("guard-table owner must finish");
+        assert!(
+            client
+                .check_status(&request.lock_id)
+                .await
+                .expect("check cancelled identity")
+                .is_none()
+        );
+        assert!(client.list_lock_leases().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_registry_waiter_keeps_other_waiters_live() {
+        let shard = Arc::new(GuardRegistry::default());
+        let (release_table, table_owner) = hold_guard_shard(shard.clone());
+        let mut cancelled = Box::pin(shard.write());
+        let mut survivor = Box::pin(shard.read());
+        assert!(matches!(futures::poll!(&mut cancelled), Poll::Pending));
+        assert!(matches!(futures::poll!(&mut survivor), Poll::Pending));
+        drop(cancelled);
+        release_table.send(()).expect("wake registry waiters");
+        table_owner.join().expect("guard-table owner must finish");
+        let access = timeout(Duration::from_millis(100), survivor)
+            .await
+            .expect("a cancelled waiter must not consume another waiter's unlock notification");
+        assert!(access.is_empty());
+    }
+
+    #[tokio::test]
+    async fn uncontended_registry_access_retains_cooperative_scheduling() {
+        let shard = GuardRegistry::default();
+        let mut yielded = false;
+        for _ in 0..1024 {
+            match shard.read().now_or_never() {
+                Some(access) => drop(access),
+                None => {
+                    yielded = true;
+                    break;
+                }
+            }
+        }
+        assert!(yielded, "a loop of ready registry operations must still yield to other executor tasks");
+    }
+
+    #[tokio::test]
+    async fn repeated_shared_identity_replaces_only_its_previous_physical_guard() {
+        let manager = Arc::new(GlobalLockManager::new());
+        let client = LocalClient::with_manager(manager.clone());
+        let request = LockRequest::new(crate::ObjectKey::new("bucket", ""), LockType::Shared, "owner");
+        assert!(client.acquire_lock(&request).await.expect("first shared grant").success);
+        assert!(client.acquire_lock(&request).await.expect("repeated shared identity").success);
+        let backend = manager.as_fast_lock_manager().expect("enabled physical lock backend");
+        assert_eq!(backend.get_shard(&request.resource).active_guard_count(), 1);
+        assert_eq!(client.list_lock_leases().await.len(), 1);
+        assert!(client.release(&request.lock_id).await.expect("release the replacement grant"));
+        assert_eq!(backend.get_shard(&request.resource).active_guard_count(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn hot_shared_registry_keeps_refresh_reaper_and_snapshots_live() {
+        for width in [64, 128] {
+            let manager = Arc::new(GlobalLockManager::new());
+            let client = Arc::new(LocalClient::with_manager_and_reaper_interval(manager.clone(), Duration::from_millis(1)));
+            let resource = crate::ObjectKey::new("bucket", "");
+            let expired = LockRequest::new(resource.clone(), LockType::Shared, "expired").with_ttl(Duration::ZERO);
+            assert!(client.acquire_lock(&expired).await.expect("expired seed grant").success);
+            let acquired = Arc::new(tokio::sync::Barrier::new(width + 1));
+            let observed = Arc::new(Notify::new());
+            let mut tasks = tokio::task::JoinSet::new();
+            for index in 0..width {
+                let client = client.clone();
+                let resource = resource.clone();
+                let acquired = acquired.clone();
+                let observed = observed.clone();
+                tasks.spawn(async move {
+                    for iteration in 0..8 {
+                        let request = LockRequest::new(resource.clone(), LockType::Shared, format!("load-{index}"));
+                        assert!(client.acquire_lock(&request).await.expect("concurrent shared grant").success);
+                        if iteration == 0 {
+                            let notification = observed.notified();
+                            tokio::pin!(notification);
+                            notification.as_mut().enable();
+                            acquired.wait().await;
+                            notification.await;
+                        } else {
+                            tokio::task::yield_now().await;
+                        }
+                        assert!(client.refresh(&request.lock_id).await.expect("refresh concurrent grant"));
+                        assert!(
+                            client
+                                .check_status(&request.lock_id)
+                                .await
+                                .expect("read concurrent grant")
+                                .is_some()
+                        );
+                        assert!(client.release(&request.lock_id).await.expect("release concurrent grant"));
+                    }
+                });
+            }
+            timeout(Duration::from_secs(5), acquired.wait())
+                .await
+                .expect("all shared grants must reach the snapshot gate");
+            let snapshot = client.list_lock_leases().await;
+            assert_eq!(snapshot.iter().filter(|lease| lease.owner.starts_with("load-")).count(), width);
+            observed.notify_waiters();
+            let mut completed = 0;
+            timeout(Duration::from_secs(5), async {
+                while let Some(result) = tasks.join_next().await {
+                    result.expect("all shared grant workers must finish");
+                    completed += 1;
+                    let _ = client.list_lock_leases().await;
+                }
+            })
+            .await
+            .expect("refresh, cleanup, and concurrent snapshots must make progress");
+            assert_eq!(completed, width);
+            wait_until_reaped(&client, &expired.lock_id).await;
+            assert!(client.list_lock_leases().await.is_empty());
+            assert!(
+                manager
+                    .as_fast_lock_manager()
+                    .expect("enabled physical lock backend")
+                    .list_locks()
+                    .is_empty()
+            );
+        }
     }
 
     async fn wait_until_reaped(client: &LocalClient, lock_id: &LockId) {
@@ -492,8 +930,9 @@ mod tests {
         }
 
         let lock_request = request(resource, "owner", Duration::from_secs(30));
-        let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&lock_request))
-            .await
+        let response = client
+            .acquire_lock(&lock_request)
+            .now_or_never()
             .expect("an acquire must not sweep unrelated guard shards")
             .expect("local acquire should return a response");
         assert!(response.success);
@@ -520,8 +959,9 @@ mod tests {
         }
 
         let replacement = request(resource, "replacement-owner", Duration::from_secs(30));
-        let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&replacement))
-            .await
+        let response = client
+            .acquire_lock(&replacement)
+            .now_or_never()
             .expect("expired guard reclaim must only write the resource shard")
             .expect("local acquire should return a response");
         assert!(response.success);
@@ -537,7 +977,7 @@ mod tests {
         client.reaper_started.store(true, Ordering::Release);
         let resource = crate::ObjectKey::new("bucket", "resource-shard-deadline");
         let target_shard = client.get_resource_shard_index(&resource);
-        let _target_write = client.guard_storage[target_shard].write().await;
+        let (release_table, table_owner) = hold_guard_shard(client.guard_storage[target_shard].clone());
         let lock_request = request(resource, "owner", Duration::from_secs(30)).with_acquire_timeout(Duration::from_millis(10));
 
         let response = tokio::time::timeout(Duration::from_millis(100), client.acquire_lock(&lock_request))
@@ -545,6 +985,8 @@ mod tests {
             .expect("acquire should return after its reclaim budget expires")
             .expect("local acquire should return a response");
         assert!(!response.success);
+        release_table.send(()).expect("release the occupied resource table");
+        table_owner.join().expect("guard-table owner must finish");
     }
 
     #[tokio::test]
