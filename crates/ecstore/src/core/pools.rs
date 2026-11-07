@@ -2344,19 +2344,8 @@ fn grow_decommission_target_reservation(
         if required_peak <= existing_remaining {
             return Ok(false);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            return Err(decommission_target_no_longer_fits_error(
-                target_pool_index,
-                format!("source pool {source_pool_index} reservation estimate is exhausted"),
-            ));
-        }
-        if let Some(target) = existing_target
-            && target_capacity.physical_free <= target.physical_free_at_reservation
-        {
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
-            )));
-        }
+        // Scanner estimates can predate source writes. Grow against current
+        // target capacity, then validate the aggregate reservation below.
         let current_peak = reservation.remaining_peak_physical_bytes();
         let additional_peak = required_peak.saturating_sub(existing_remaining);
         let additional_predicted = additional_peak.div_ceil(1usize.saturating_add(reservation.temporary_copies));
@@ -15864,14 +15853,8 @@ impl ECStore {
             log_decommission_adopted_target_choice(reservation, owner, pool_index, &over_budget);
             return Ok(pool_index);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            let mut skipped = over_budget.iter().copied().collect::<Vec<_>>();
-            skipped.sort_unstable();
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {} has no target allocation for {expected_data_bytes} data bytes; target pools over their temporary-copy budget: {skipped:?}",
-                owner.source_pool_index
-            )));
-        }
+        // A stale nonzero estimate can exhaust its allocation too. Selection
+        // is provisional until fenced growth persists the new reservation.
         let capacities = self.get_decommission_all_pool_capacity_infos().await?;
         let active_sources = active_decommission_source_indices(&pool_meta);
         capacities
@@ -25884,6 +25867,67 @@ mod tests {
             .await
             .expect("the rejected activation must leave baseline metadata readable");
         assert!(persisted.pools[0].decommission.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_copies_native_object_after_nonzero_usage_estimate_is_exhausted() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let bucket = format!("stale-owned-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create source bucket");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacities = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1 << 30, 1),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities]);
+        let expected = vec![0x57; 16 * 1024];
+        let mut body = crate::object_api::PutObjReader::from_vec(expected.clone());
+        store.pools[0]
+            .put_object(&bucket, object, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write an object larger than the earlier scanner estimate");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate the stale nonzero reservation");
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run the real native-disk mover");
+
+        let mut reader = store.pools[1]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer object must reach the target despite the stale estimate");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read migrated payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "source cleanup follows the verified target copy"
+        );
+        let meta = store.pool_meta.read().await;
+        let state = meta.pools[0].decommission.as_ref().expect("retirement state is retained");
+        assert!(state.complete && !state.failed);
+        assert_eq!(state.items_decommission_failed, 0);
     }
 
     #[tokio::test]
@@ -37697,6 +37741,43 @@ mod pools_tests {
         assert_eq!(reservation.predicted_physical_bytes, 3);
         assert_eq!(reservation.targets.len(), 1);
         assert_eq!(reservation.targets[0].reserved_physical_bytes, 6);
+    }
+
+    #[test]
+    fn decommission_capacity_grows_a_stale_nonzero_estimate_and_rolls_back_if_space_is_short() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        let layout = DecommissionErasureLayout { data: 3, parity: 1 };
+        let initial = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64, 2),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 64, 64, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, initial[0].space).expect("activate source");
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[0],
+            &initial,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("reserve the stale estimate");
+        assert!(
+            grow_decommission_target_reservation(&mut meta, &initial, 0, 1, 16, uuid::Uuid::new_v4(), now)
+                .expect("a nonzero stale estimate may grow against real free space")
+        );
+        let before = serde_json::to_value(&meta).expect("snapshot reservation before rejected growth");
+        let shortage = vec![initial[0], DecommissionPoolCapacityInfo::for_test(1, layout, 43, 64, 21)];
+        assert!(
+            grow_decommission_target_reservation(&mut meta, &shortage, 0, 1, 32, uuid::Uuid::new_v4(), now).is_err(),
+            "real free-space shortage still rejects growth"
+        );
+        assert_eq!(serde_json::to_value(&meta).expect("snapshot after rejected growth"), before);
     }
 
     #[test]
