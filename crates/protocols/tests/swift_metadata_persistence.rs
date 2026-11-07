@@ -111,16 +111,17 @@ async fn swift_metadata_writes_are_durable() {
 
 async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
     use ecstore_test_compat::{get_s3_tagging_config, update_s3_tagging_config};
-    use s3s::dto::{Tag, Tagging};
 
     let s3_only = "s3-only-swift-like-keys";
     env.make_bucket(s3_only, false).await;
-    let ordinary_tags = Tagging {
-        tag_set: vec![Tag {
-            key: Some("swift-meta-owner".to_owned()),
-            value: Some("blue".to_owned()),
-        }],
-    };
+    let mut ordinary_tags = get_bucket_metadata(s3_only)
+        .await
+        .expect("S3-only bucket metadata")
+        .tagging_config
+        .clone()
+        .unwrap_or_default();
+    ordinary_tags.tag_set =
+        serde_json::from_value(json!([{"key": "swift-meta-owner", "value": "blue"}])).expect("ordinary tag fixture");
     update_s3_tagging_config(s3_only, Some(ordinary_tags.clone()), None)
         .await
         .expect("S3-only buckets accept Swift-like names");
@@ -146,14 +147,11 @@ async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
     container::set_container_acl(&account, container, Some(".r:*"), None, &credentials)
         .await
         .expect("public ACL should persist");
-    let s3_tags = Tagging {
-        tag_set: (0..50)
-            .map(|index| Tag {
-                key: Some(format!("team-{index}")),
-                value: Some("blue".to_owned()),
-            })
-            .collect(),
-    };
+    let mut s3_tags = get_s3_tagging_config(&bucket).await.expect("initial S3 view").0;
+    assert!(s3_tags.tag_set.is_empty(), "Swift fields must be absent from the initial S3 view");
+    s3_tags.tag_set = (0..50)
+        .map(|index| serde_json::from_value(json!({"key": format!("team-{index}"), "value": "blue"})).expect("S3 tag fixture"))
+        .collect();
     update_s3_tagging_config(&bucket, Some(s3_tags.clone()), None)
         .await
         .expect("S3 tags must coexist with Swift metadata");
@@ -161,12 +159,10 @@ async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
     let (read_back, _) = get_s3_tagging_config(&bucket).await.expect("S3 view should read");
     assert_eq!(read_back.tag_set, s3_tags.tag_set, "the S3 view must contain only the 50 S3 tags");
     for forbidden_key in ["swift-meta-item-0", "!rustfs-swift-metadata"] {
-        let forbidden = Tagging {
-            tag_set: vec![Tag {
-                key: Some(forbidden_key.to_owned()),
-                value: Some("1".to_owned()),
-            }],
-        };
+        let mut forbidden = s3_tags.clone();
+        forbidden.tag_set.truncate(1);
+        forbidden.tag_set[0].key = Some(forbidden_key.to_owned());
+        forbidden.tag_set[0].value = Some("1".to_owned());
         assert!(
             update_s3_tagging_config(&bucket, Some(forbidden), None).await.is_err(),
             "S3 must reject overwriting Swift metadata or forging its marker"
