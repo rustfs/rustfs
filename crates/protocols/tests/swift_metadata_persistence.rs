@@ -103,9 +103,112 @@ async fn swift_metadata_writes_are_durable() {
 
     posts_survive_disk_truth_reload(&env).await;
     tag_writers_preserve_each_others_state(&env).await;
+    s3_tag_writes_preserve_swift_metadata(&env).await;
     unrelated_account_posts_preserve_the_tempurl_key().await;
     acl_only_posts_leave_container_metadata_alone(&env).await;
     versioning_writes_reject_missing_containers().await;
+}
+
+async fn s3_tag_writes_preserve_swift_metadata(env: &TestECStoreEnv) {
+    use ecstore_test_compat::{get_s3_tagging_config, update_s3_tagging_config};
+    use s3s::dto::{Tag, Tagging};
+
+    let s3_only = "s3-only-swift-like-keys";
+    env.make_bucket(s3_only, false).await;
+    let ordinary_tags = Tagging {
+        tag_set: vec![Tag {
+            key: Some("swift-meta-owner".to_owned()),
+            value: Some("blue".to_owned()),
+        }],
+    };
+    update_s3_tagging_config(s3_only, Some(ordinary_tags.clone()), None)
+        .await
+        .expect("S3-only buckets accept Swift-like names");
+    reload_bucket_metadata_from_disk(s3_only).await;
+    assert_eq!(
+        get_s3_tagging_config(s3_only).await.expect("S3-only tag read").0.tag_set,
+        ordinary_tags.tag_set
+    );
+
+    let project_id = "swifts3tagproj";
+    let account = format!("AUTH_{project_id}");
+    let container = "shared-s3-view";
+    let bucket = ContainerMapper::default().swift_to_s3_bucket(container, project_id);
+    let credentials = keystone_credentials(project_id);
+    env.make_bucket(&bucket, false).await;
+    let mut metadata = MetadataUpdate::default();
+    for index in 0..51 {
+        metadata = metadata.set(&format!("item-{index}"), "a,b");
+    }
+    update_container_metadata(&account, container, &credentials, metadata)
+        .await
+        .expect("51 Swift metadata values should persist");
+    container::set_container_acl(&account, container, Some(".r:*"), None, &credentials)
+        .await
+        .expect("public ACL should persist");
+    let s3_tags = Tagging {
+        tag_set: (0..50)
+            .map(|index| Tag {
+                key: Some(format!("team-{index}")),
+                value: Some("blue".to_owned()),
+            })
+            .collect(),
+    };
+    update_s3_tagging_config(&bucket, Some(s3_tags.clone()), None)
+        .await
+        .expect("S3 tags must coexist with Swift metadata");
+    reload_bucket_metadata_from_disk(&bucket).await;
+    let (read_back, _) = get_s3_tagging_config(&bucket).await.expect("S3 view should read");
+    assert_eq!(read_back.tag_set, s3_tags.tag_set, "the S3 view must contain only the 50 S3 tags");
+    for forbidden_key in ["swift-meta-item-0", "!rustfs-swift-metadata"] {
+        let forbidden = Tagging {
+            tag_set: vec![Tag {
+                key: Some(forbidden_key.to_owned()),
+                value: Some("1".to_owned()),
+            }],
+        };
+        assert!(
+            update_s3_tagging_config(&bucket, Some(forbidden), None).await.is_err(),
+            "S3 must reject overwriting Swift metadata or forging its marker"
+        );
+        assert_eq!(
+            get_s3_tagging_config(&bucket)
+                .await
+                .expect("rejected writes preserve S3 tags")
+                .0
+                .tag_set,
+            read_back.tag_set
+        );
+    }
+    update_s3_tagging_config(&bucket, Some(read_back), None)
+        .await
+        .expect("S3 read-back must be writable");
+    assert!(
+        update_s3_tagging_config(&bucket, Some(s3_tags), Some(uuid::Uuid::new_v4()))
+            .await
+            .is_err(),
+        "a stale bucket incarnation must reject the mutation"
+    );
+    update_s3_tagging_config(&bucket, None, None)
+        .await
+        .expect("S3 delete should preserve Swift metadata");
+    reload_bucket_metadata_from_disk(&bucket).await;
+    assert!(
+        get_s3_tagging_config(&bucket)
+            .await
+            .expect("Swift-only config has an empty S3 view")
+            .0
+            .tag_set
+            .is_empty()
+    );
+    assert_eq!(persisted_container_metadata(&bucket).await.len(), 51);
+    assert!(
+        container::get_container_acl(&account, container, &credentials)
+            .await
+            .expect("Swift ACL should load")
+            .check_read_access(None, None, None),
+        "S3 tag mutations must preserve the public Swift ACL"
+    );
 }
 
 async fn posts_survive_disk_truth_reload(env: &TestECStoreEnv) {

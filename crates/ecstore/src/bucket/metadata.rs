@@ -310,10 +310,23 @@ pub const SWIFT_ACCOUNT_META_TAG_PREFIX: &str = "swift-account-meta-";
 /// Prefix for Swift container metadata persisted in tagging.xml.
 pub const SWIFT_CONTAINER_META_TAG_PREFIX: &str = "swift-meta-";
 
+/// Marks a bucket whose shared tag config contains Swift-owned metadata.
+/// The key cannot be supplied through S3's tag alphabet.
+pub const SWIFT_TAGGING_MARKER: &str = "!rustfs-swift-metadata";
+
+/// Whether a persisted tag belongs to Swift's internal metadata namespace.
+pub fn is_swift_bucket_metadata_tag_key(key: &str) -> bool {
+    matches!(
+        key,
+        "swift-acl-read" | "swift-acl-write" | "swift-versions-location" | SWIFT_TAGGING_MARKER
+    ) || key.starts_with(SWIFT_ACCOUNT_META_TAG_PREFIX)
+        || key.starts_with(SWIFT_CONTAINER_META_TAG_PREFIX)
+}
+
 fn validate_persisted_bucket_tags(tags: &[s3s::dto::Tag]) -> std::result::Result<(), &'static str> {
     const SWIFT_ACL_MAX_BYTES: usize = 8192;
     const SWIFT_META_NAME_MAX_BYTES: usize = 128;
-    const MAX_PERSISTED_TAGS: usize = MAX_BUCKET_TAGS + 2 * MAX_SWIFT_METADATA_COUNT + 3;
+    const MAX_PERSISTED_TAGS: usize = MAX_BUCKET_TAGS + 2 * MAX_SWIFT_METADATA_COUNT + 4;
     if tags.len() > MAX_PERSISTED_TAGS {
         return Err("Too many persisted bucket tags");
     }
@@ -341,6 +354,10 @@ fn validate_persisted_bucket_tags(tags: &[s3s::dto::Tag]) -> std::result::Result
             if *count > MAX_SWIFT_METADATA_COUNT {
                 return Err("Too many Swift metadata tags");
             }
+            return Ok(());
+        }
+
+        if key == SWIFT_TAGGING_MARKER && value == "1" {
             return Ok(());
         }
 

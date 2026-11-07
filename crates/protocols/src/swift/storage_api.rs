@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
+use rustfs_ecstore::api::bucket::metadata::SWIFT_TAGGING_MARKER;
 use rustfs_ecstore::api::bucket::metadata::{BUCKET_TAGGING_CONFIG, is_unreadable_config_error};
 use rustfs_ecstore::api::bucket::metadata_sys::{get as get_swift_bucket_metadata_from_backend, update_config_with};
 use rustfs_ecstore::api::bucket::utils::serialize as serialize_bucket_config;
@@ -25,7 +26,7 @@ use rustfs_ecstore::api::notification::get_global_notification_sys;
 pub(crate) use rustfs_ecstore::api::runtime::object_store_handle as resolve_swift_object_store_handle;
 use rustfs_ecstore::api::storage::ECStore as SwiftStore;
 use rustfs_storage_api as storage_contracts;
-use s3s::dto::Tagging;
+use s3s::dto::{Tag, Tagging};
 
 use super::{SwiftError, SwiftResult};
 
@@ -111,7 +112,7 @@ where
     // including the container ACL and versioning tags — because the rewrite
     // closures treat "no parsed tags" as "no tags".
     let result = update_config_with(&bucket, BUCKET_TAGGING_CONFIG, |bm| {
-        let tagging = match rewrite(bm.tagging_config.as_ref()) {
+        let mut tagging = match rewrite(bm.tagging_config.as_ref()) {
             Ok(tagging) => tagging,
             Err(err) => {
                 rejected = Some(err);
@@ -122,6 +123,16 @@ where
         if tagging.tag_set.is_empty() {
             Ok(Vec::new())
         } else {
+            if !tagging
+                .tag_set
+                .iter()
+                .any(|tag| tag.key.as_deref() == Some(SWIFT_TAGGING_MARKER))
+            {
+                tagging.tag_set.push(Tag {
+                    key: Some(SWIFT_TAGGING_MARKER.to_owned()),
+                    value: Some("1".to_owned()),
+                });
+            }
             // The S3 XML serializer, not quick_xml: the metadata loader's
             // parse step must be able to round-trip what we persist.
             serialize_bucket_config(&tagging)

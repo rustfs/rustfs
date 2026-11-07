@@ -486,8 +486,6 @@ pub(crate) mod bucket {
         pub(crate) const BUCKET_REPLICATION_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG;
         pub(crate) const BUCKET_SSECONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_SSECONFIG;
-        pub(crate) const BUCKET_TAGGING_CONFIG: &str =
-            crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TAGGING_CONFIG;
         pub(crate) const BUCKET_TARGETS_FILE: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
         pub(crate) const BUCKET_VERSIONING_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
@@ -603,7 +601,20 @@ pub(crate) mod bucket {
         pub(crate) async fn get_tagging_config(
             bucket: &str,
         ) -> Result<(Tagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::get_tagging_config(bucket).await
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::get_s3_tagging_config(bucket).await
+        }
+
+        pub(crate) async fn update_s3_tagging_config(
+            bucket: &str,
+            tagging: Option<Tagging>,
+            expected_incarnation_id: Option<uuid::Uuid>,
+        ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::update_s3_tagging_config(
+                bucket,
+                tagging,
+                expected_incarnation_id,
+            )
+            .await
         }
 
         pub(crate) async fn update(

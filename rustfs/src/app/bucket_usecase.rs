@@ -32,8 +32,8 @@ use super::storage_api::bucket_usecase::bucket::{
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
-        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
-        BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
+        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TARGETS_FILE,
+        BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
     policy_sys::PolicySys,
@@ -1989,7 +1989,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id)
+        metadata_sys::update_s3_tagging_config(&bucket, None, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2899,9 +2899,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let data = serialize_config(&tagging)?;
-
-        update_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, data, expected_incarnation_id)
+        metadata_sys::update_s3_tagging_config(&bucket, Some(tagging.clone()), expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
