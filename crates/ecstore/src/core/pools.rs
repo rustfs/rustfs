@@ -25941,6 +25941,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[cfg(feature = "test-util")]
     #[serial_test::serial]
     async fn decommission_native_ec_growth_keeps_all_metadata_replicas_readable() {
         use rustfs_data_usage::{DataUsageCache, DataUsageEntry};
