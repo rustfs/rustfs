@@ -65,3 +65,7 @@ Typed pool metadata failures additionally carry `pool_metadata_reason`, `pool_me
 Storage inventory emits a WARN event on the first failed probe and an INFO event on recovery, using `event="storage_info_probe"`. A recovery event confirms the RPC succeeded, not that every reported disk is healthy. Bucket metadata load/retry errors include the bucket and a bounded error code, so one failing bucket can be identified without dumping its metadata.
 
 No new environment variable, admin authorization action, or recovery command is required.
+
+## Delete recovery during rolling upgrades
+
+S3 deletes that require bounded recovery need peers that support the bounded prepare protocol. An older peer rejects that prepare before staging a mutation. If too few upgraded drives can satisfy the write quorum, the delete can fail with a retryable error until more peers are upgraded. Ordinary recovery inspection and settlement continue to use the original protocol.

@@ -1117,18 +1117,13 @@ pub(crate) async fn wrap_response_with_cors<T>(
     headers: &HeaderMap,
     output: T,
 ) -> S3Response<T> {
-    let mut response = S3Response::new(output);
-
-    // Quick check: only process CORS if Origin header is present
     if needs_cors_processing(headers)
         && let Some(cors_headers) = apply_cors_headers(bucket, method, &cors::CorsRequest::from_headers(headers)).await
     {
-        for (key, value) in cors_headers.iter() {
-            response.headers.insert(key, value.clone());
-        }
+        S3Response::with_headers(output, cors_headers)
+    } else {
+        S3Response::new(output)
     }
-
-    response
 }
 
 /// Parse part number from Option<i32> to Option<usize> with validation

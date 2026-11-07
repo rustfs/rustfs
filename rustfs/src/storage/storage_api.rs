@@ -813,6 +813,7 @@ pub(crate) type DeleteRecoveryDigest = ecstore_disk::DeleteRecoveryDigest;
 pub(crate) type DeleteRecoveryAction = ecstore_disk::DeleteRecoveryAction;
 pub(crate) type DeleteRecoveryRpcOperation = ecstore_disk::DeleteRecoveryRpcOperation;
 pub(crate) type DeleteRecoveryRpcReply = ecstore_disk::DeleteRecoveryRpcReply;
+pub(crate) use rustfs_ecstore::api::disk::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
 pub(crate) const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = ecstore_disk::DELETE_RECOVERY_PROTOCOL_VERSION;
 pub(crate) type PartTransactionAction = ecstore_disk::PartTransactionAction;
 pub(crate) type RenameDataResp = ecstore_disk::RenameDataResp;
@@ -2229,6 +2230,14 @@ pub(crate) async fn acquire_scanner_bucket_incarnation_fence(
     owner_id: uuid::Uuid,
 ) -> Result<ecstore_bucket::metadata_sys::BucketMetadataMutationGuard> {
     ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_fence(bucket, incarnation, owner_id).await
+}
+
+pub(crate) async fn acquire_scanner_bucket_incarnation_read_fence(
+    bucket: &str,
+    incarnation: uuid::Uuid,
+    owner_id: uuid::Uuid,
+) -> Result<ecstore_bucket::metadata_sys::ScannerBucketIncarnationReadGuard> {
+    ecstore_bucket::metadata_sys::acquire_scanner_bucket_incarnation_read_fence(bucket, incarnation, owner_id).await
 }
 
 pub(crate) async fn update_bucket_targets_under_transaction_lock(

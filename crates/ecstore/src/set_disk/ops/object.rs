@@ -9103,6 +9103,9 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
 
+        let requires_bounded_delete_recovery = commit_context
+            .options
+            .is_some_and(|options| options.delete_recovery_work_budget.is_some());
         for disk in disks.iter() {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             let transaction_guard = commit_context.transaction_guard.as_ref();
@@ -9114,6 +9117,7 @@ impl SetDisks {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: source_bucket_incarnation_id,
+                        requires_bounded_delete_recovery,
                         ..Default::default()
                     };
                     let result = if is_meta_bucketname(bucket) {
@@ -10557,6 +10561,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .collect();
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requires_bounded_delete_recovery = opts.delete_recovery_work_budget.is_some();
 
         // let mut errors = Vec::with_capacity(disks.len());
 
@@ -10574,6 +10579,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
+                        requires_bounded_delete_recovery,
                         ..Default::default()
                     };
                     if current_generations
@@ -17173,6 +17179,9 @@ mod transition_commit_failure_tests {
     #[tokio::test]
     #[serial_test::serial]
     async fn multipart_restore_copies_the_stored_representation_back_verbatim() {
+        use crate::io_support::rio::{WriteEncryption, WritePlan};
+        use rustfs_utils::http::{SUFFIX_OPAQUE_ENCRYPTED_ETAG, etag_can_be_listed};
+
         let (_temp_dirs, disk_stores, set_disks) = hermetic_set_disks(4).await;
         let bucket = "restore-multipart-stored-coordinates-bucket";
         let object = "object.bin";
@@ -17180,9 +17189,8 @@ mod transition_commit_failure_tests {
             disk.make_volume(bucket).await.expect("bucket volume should be created");
         }
 
-        // The minimum-part-size gate reads the PLAINTEXT length, so part one
-        // clears 5 MiB there while its stored form carries encoding overhead.
-        let part_shapes = [(6 * 1024 * 1024_usize, 9_216_usize), (256 * 1024_usize, 512_usize)];
+        // The first plaintext part clears the non-final 5 MiB threshold.
+        let part_sizes = [6 * 1024 * 1024_usize, 256 * 1024_usize];
         let mut user_defined = HashMap::new();
         user_defined.insert(rustfs_utils::http::INTERNAL_ENCRYPTION_ALGORITHM_HEADER.to_string(), "AES256".to_string());
         user_defined.insert(
@@ -17203,20 +17211,22 @@ mod transition_commit_failure_tests {
             .expect("multipart upload should be created");
 
         let mut uploaded_parts = Vec::new();
-        let mut expected_stored = Vec::new();
-        for (index, (plaintext_len, overhead)) in part_shapes.iter().enumerate() {
-            let stored = stored_representation_bytes(index as u32 * 7 + 1, plaintext_len + overhead);
-            expected_stored.extend_from_slice(&stored);
-            let stored_len = stored.len() as i64;
-            let hash_reader =
-                HashReader::from_stream(std::io::Cursor::new(stored), stored_len, *plaintext_len as i64, None, None, false)
-                    .expect("hash reader over the stored representation");
-            let mut reader = PutObjReader::new(hash_reader);
+        for (index, &part_size) in part_sizes.iter().enumerate() {
+            let plaintext = stored_representation_bytes(index as u32 * 7 + 1, part_size);
+            let actual_size = part_size as i64;
+            let plaintext_reader =
+                HashReader::from_stream(std::io::Cursor::new(plaintext), actual_size, actual_size, None, None, false)
+                    .expect("plaintext part reader");
+            let encrypted_reader = WritePlan::new()
+                .with_encryption(WriteEncryption::multipart([7; 32], [9; 12], index + 1))
+                .apply(plaintext_reader, actual_size)
+                .expect("native protected encrypted writer");
+            let mut reader = PutObjReader::new(encrypted_reader);
             let info = set_disks
                 .put_object_part(bucket, object, &upload.upload_id, index + 1, &mut reader, &ObjectOptions::default())
                 .await
                 .expect("stored part should be staged");
-            assert_eq!(info.size as i64, stored_len, "a part is stored in its encoded length");
+            assert!(info.size as i64 > actual_size, "part contains actual encryption overhead");
             uploaded_parts.push(CompletePart {
                 part_num: info.part_num,
                 etag: info.etag,
@@ -17240,8 +17250,12 @@ mod transition_commit_failure_tests {
                 "the fixture must keep the two coordinate systems apart: stored {size} vs plaintext {actual_size}"
             );
         }
-        let stored_before = read_stored_representation(&set_disks, bucket, object).await;
-        assert_stored_representation_eq(&stored_before, &expected_stored, "the fixture must store its encoded bytes verbatim");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&original.user_defined, SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+            Some("v1")
+        );
+        assert!(etag_can_be_listed(&original.user_defined), "the source has a real producer-attested ETag");
+        let expected_stored = read_stored_representation(&set_disks, bucket, object).await;
 
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
@@ -17264,6 +17278,16 @@ mod transition_commit_failure_tests {
             )
             .await
             .expect("multipart source should transition before restore");
+
+        let transitioned = set_disks
+            .get_object_info(bucket, object, &ObjectOptions::default())
+            .await
+            .expect("read metadata after actual tier transition");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&transitioned.user_defined, SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+            Some("v1")
+        );
+        assert!(etag_can_be_listed(&transitioned.user_defined), "transition retains the source proof");
 
         let operation_id = Uuid::new_v4();
         set_disks
@@ -17310,6 +17334,11 @@ mod transition_commit_failure_tests {
         // backlog#2369 P7.1: the copy-back digests stored bytes, so the object's
         // public ETag has to be carried over rather than recomputed.
         assert_eq!(restored.etag, original.etag, "restore must preserve the object ETag");
+        assert_eq!(restored.version_id, original.version_id, "restore keeps the same version");
+        assert!(
+            etag_can_be_listed(&restored.user_defined),
+            "the restored version retains its protected ETag proof"
+        );
     }
 
     #[tokio::test]

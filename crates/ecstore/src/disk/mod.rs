@@ -2125,10 +2125,19 @@ pub struct GuardedFileInfoVersions {
 pub struct GuardedDeleteVersionsPayload {
     pub versions: Vec<GuardedFileInfoVersions>,
     pub opts: DeleteOptions,
+    // The strict legacy decoder rejects this field before applying any change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_recovery_protocol: Option<u32>,
 }
 
 impl GuardedDeleteVersionsPayload {
     pub fn validate(&self) -> Result<()> {
+        if self
+            .bounded_recovery_protocol
+            .is_some_and(|version| version != BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
         validate_delete_recovery_options(&self.opts)?;
         if self.versions.is_empty()
             || self.versions.len() > 1000
@@ -2306,6 +2315,9 @@ pub struct DeleteOptions {
     pub delete_recovery_bucket_incarnation: Option<Uuid>,
     #[serde(default)]
     pub recoverable_delete: bool,
+    /// Transport requirement for preparing a delete that will use bounded settlement.
+    #[serde(skip)]
+    pub requires_bounded_delete_recovery: bool,
     /// Reclaim only plain erasure-part leaves, preserving every other entry.
     /// Keep `recursive` false so an older peer cannot widen this operation.
     #[serde(default)]
@@ -2313,6 +2325,8 @@ pub struct DeleteOptions {
 }
 
 pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
+/// Accepted only for prepare RPCs. Legacy peers must refuse before staging a delete.
+pub const BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION: u32 = 2;
 pub(crate) fn get_delete_recovery_timeout() -> Result<std::time::Duration> {
     let value = std::env::var("RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS");
     match value {
@@ -2909,6 +2923,7 @@ mod tests {
         insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
         let generation = CurrentDeleteGeneration::from_file_info(&fi).expect("capture complete remote identity");
         let payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: vec![GuardedFileInfoVersions {
                 group: FileInfoVersions {
                     name: "object".into(),
@@ -2963,6 +2978,7 @@ mod tests {
             expected_current: CurrentDeleteGeneration::Absent,
         };
         let mut payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: vec![group],
             opts: DeleteOptions {
                 old_data_dir: Some(Uuid::new_v4()),
@@ -2974,6 +2990,25 @@ mod tests {
         let decoded: GuardedDeleteVersionsPayload =
             rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded batch");
         decoded.validate().expect("round-trip guarded batch remains valid");
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyGuardedDeletePayload {
+            #[serde(rename = "versions")]
+            _versions: Vec<GuardedFileInfoVersions>,
+            #[serde(rename = "opts")]
+            _opts: DeleteOptions,
+        }
+        rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&encoded)
+            .expect("legacy reader accepts legacy prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION);
+        let bounded = rmp_serde::to_vec_named(&payload).expect("serialize bounded guarded prepare");
+        assert!(rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&bounded).is_err());
+        let bounded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&bounded).expect("current reader accepts bounded prepare");
+        bounded.validate().expect("valid bounded guarded prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION + 1);
+        assert_eq!(payload.validate(), Err(DiskError::UnsupportedDisk));
+        payload.bounded_recovery_protocol = None;
         let mut trailing = encoded;
         trailing.push(0xc0);
         assert!(rustfs_protos::decode_delete_recovery_payload::<GuardedDeleteVersionsPayload>(&trailing).is_err());
@@ -3168,8 +3203,14 @@ mod tests {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            requires_bounded_delete_recovery: true,
             orphan_data_dir: false,
         };
+
+        let wire = serde_json::to_value(&opts).expect("encode legacy wire options");
+        assert!(wire.get("requires_bounded_delete_recovery").is_none());
+        let decoded: DeleteOptions = serde_json::from_value(wire).expect("decode legacy wire options");
+        assert!(!decoded.requires_bounded_delete_recovery);
 
         assert!(opts.recursive);
         assert!(!opts.immediate);

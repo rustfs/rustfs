@@ -1384,6 +1384,30 @@ impl scanner_control_service_server::ScannerControlService for NodeService {
             return Err(Status::failed_precondition("scoped dirty usage peer or process changed"));
         }
         let cleared = timeout(Duration::from_secs(30), async {
+            if request.probe_only {
+                // Capability probes validate the same persistent identities
+                // without reserving metadata writers behind active uploads.
+                let mut guards = Vec::with_capacity(request.entries.len());
+                for entry in &request.entries {
+                    let incarnation = Uuid::from_slice(entry.bucket_incarnation.as_ref())
+                        .map_err(|_| Status::invalid_argument("invalid bucket incarnation"))?;
+                    let guard = crate::storage::storage_api::acquire_scanner_bucket_incarnation_read_fence(
+                        &entry.bucket,
+                        incarnation,
+                        store.id,
+                    )
+                    .await
+                    .map_err(|_| Status::failed_precondition("trusted bucket incarnation is unavailable"))?;
+                    guards.push(guard);
+                }
+                let entries = guards
+                    .iter()
+                    .zip(&request.entries)
+                    .map(|(guard, entry)| (guard, entry.generation))
+                    .collect::<Vec<_>>();
+                return rustfs_scanner::probe_scoped_dirty_usage(&request.instance_id, &entries)
+                    .map_err(|err| Status::failed_precondition(err.to_string()));
+            }
             // Strict bucket order is validated before admission. Acquire every
             // lifecycle/metadata fence before clearing any dirty record.
             let mut guards = Vec::with_capacity(request.entries.len());
@@ -4847,7 +4871,9 @@ mod tests {
             assert_eq!(error.code(), tonic::Code::PermissionDenied);
         }
         let mut invalid = message.clone();
-        invalid.protocol_version = 2;
+        invalid.protocol_version = crate::storage::storage_api::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION + 1;
+        let mut non_prepare = message.clone();
+        non_prepare.protocol_version = crate::storage::storage_api::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
         let mut malformed = message.clone();
         malformed.operation = vec![0xc1].into();
         let mut trailing = message.clone();
@@ -4856,6 +4882,7 @@ mod tests {
         trailing.operation = payload.into();
         for (message, expected) in [
             (invalid, tonic::Code::Unimplemented),
+            (non_prepare, tonic::Code::InvalidArgument),
             (malformed, tonic::Code::InvalidArgument),
             (trailing, tonic::Code::InvalidArgument),
         ] {
@@ -7953,6 +7980,7 @@ mod tests {
             guarded_group(last.clone()),
         ];
         let payload = crate::storage::storage_api::ecstore_disk::GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: groups.clone(),
             opts: DeleteOptions {
                 old_data_dir: Some(transaction),
@@ -11112,6 +11140,100 @@ mod tests {
                 .code(),
             tonic::Code::Unavailable
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn scoped_dirty_usage_probe_shares_upload_fence_and_keeps_ack_exclusive() {
+        use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+        use rustfs_protos::scoped_dirty_usage::{canonical_scoped_dirty_usage_request, canonical_scoped_dirty_usage_response};
+
+        let _ = rustfs_credentials::set_global_rpc_secret("scoped-usage-probe-test-secret".to_string());
+        let fixture = target_rpc_fixture().await;
+        let store = &fixture.env.ecstore;
+        crate::storage::storage_api::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "scoped-probe-upload";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create real probe bucket");
+        super::timeout(Duration::from_secs(10), async {
+            while store.namespace_commits_pending_for_test() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("bucket creation commits drain before observing dirty state");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("persisted incarnation");
+        let upload_fence = store
+            .object_lock_config_snapshot(bucket)
+            .await
+            .expect("retain upload metadata read fence");
+        rustfs_scanner::record_dirty_usage_bucket(bucket);
+        let generation = rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket).expect("dirty bucket generation");
+        let before = rustfs_scanner::scanner_dirty_usage_snapshot(1024);
+        let service = make_server_for_context(Some(fixture.context.clone()));
+        let mut payload = scoped_dirty_usage_request();
+        payload.owner_id = store.id.to_string();
+        payload.instance_id = rustfs_scanner::scanner_activity_epoch().to_owned();
+        payload.probe_only = true;
+        payload.entries[0].bucket = bucket.to_owned();
+        payload.entries[0].bucket_incarnation = incarnation.as_bytes().to_vec().into();
+        payload.entries[0].generation = generation;
+        let signed = |payload: rustfs_protos::proto_gen::node_service::ScannerScopedDirtyUsageAckRequest| {
+            let canonical = canonical_scoped_dirty_usage_request(&payload).expect("canonical scoped usage request");
+            let mut request = Request::new(payload);
+            set_tonic_canonical_body_digest(&mut request, &canonical).expect("scoped usage digest");
+            mark_v2_authenticated(&mut request);
+            request
+        };
+        let probes = (0..3).map(|_| service.scanner_scoped_dirty_usage_ack(signed(payload.clone())));
+        let responses = super::timeout(Duration::from_secs(2), futures::future::join_all(probes))
+            .await
+            .expect("concurrent probes must share the active upload's metadata read fence");
+        let canonical_request = canonical_scoped_dirty_usage_request(&payload).expect("probe canonical body");
+        for response in responses {
+            let response = response
+                .expect("authenticated probe succeeds with an active upload")
+                .into_inner();
+            assert!(response.supported);
+            assert_eq!(response.cleared, 0);
+            let body = canonical_scoped_dirty_usage_response(&canonical_request, &response).expect("probe response body");
+            crate::storage::storage_api::verify_tonic_rpc_response_proof(&body, &response.response_proof)
+                .expect("probe response remains bound to the exact request");
+        }
+        assert_eq!(rustfs_scanner::scanner_dirty_usage_snapshot(1024), before);
+        for field in 0..3 {
+            let mut stale = payload.clone();
+            match field {
+                0 => stale.owner_id = Uuid::new_v4().to_string(),
+                1 => stale.instance_id = "b".repeat(32),
+                _ => stale.entries[0].bucket_incarnation = Uuid::new_v4().as_bytes().to_vec().into(),
+            }
+            let error = service
+                .scanner_scoped_dirty_usage_ack(signed(stale))
+                .await
+                .expect_err("probe must reject changed owner, process, or persisted incarnation");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
+
+        let mut ack_payload = payload;
+        ack_payload.probe_only = false;
+        let ack = service.scanner_scoped_dirty_usage_ack(signed(ack_payload));
+        tokio::pin!(ack);
+        assert!(super::timeout(Duration::from_millis(250), ack.as_mut()).await.is_err());
+        assert_eq!(rustfs_scanner::scanner_dirty_usage_snapshot(1024), before);
+        drop(upload_fence);
+        let response = super::timeout(Duration::from_secs(10), ack)
+            .await
+            .expect("actual ACK proceeds after the upload releases its read fence")
+            .expect("actual ACK retains trusted incarnation validation")
+            .into_inner();
+        assert_eq!(response.cleared, 1);
+        assert_eq!(rustfs_scanner::scanner_dirty_usage_bucket_generation(bucket), None);
     }
 
     #[tokio::test]

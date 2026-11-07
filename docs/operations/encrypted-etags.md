@@ -11,18 +11,11 @@ to the original plaintext. Encryption and decryption formats do not change.
 
 ## Listings and older objects
 
-ListObjects, ListObjectsV2, and ListObjectVersions omit the optional ETag field
-for encrypted objects whose metadata does not attest to the protected format.
-This includes encrypted objects written before the upgrade, preserved source
-ETags without that proof, and completed encrypted multipart uploads. New
-single-part encrypted writes carry the internal format marker and expose their
-protected ETag in listings. Unencrypted listings retain their existing ETags.
-Existing persistent listing snapshots are invalidated; the provider falls
-back to verified storage until a new snapshot is built.
+ListObjects, ListObjectsV2, and ListObjectVersions omit the optional ETag field for encrypted objects whose metadata does not attest to the protected format. This includes older encrypted objects and preserved source ETags without that proof. New single-part encrypted writes carry the internal format marker and expose their protected ETag in listings. Completed encrypted multipart uploads also carry that marker when every selected part has quorum-backed proof that its stored ETag came from the encryption reader and the final ETag is the aggregate of those parts. Unencrypted listings retain their existing ETags.
 
-Clients that require an ETag for these older or multipart objects must issue an
-authorized HeadObject request, including the SSE-C key when required. GET,
-HEAD, and conditional requests continue to use the object's stored ETag.
+Each new encrypted part records its producer proof in optional part metadata. Older part metadata defaults to unproven. Mixing proven and unproven selected parts, or preserving a different source ETag, keeps the completed object unproven. The proof is checked during completion using the existing part metadata reads, so listings need no additional object reads or KMS requests. Internal same-version data movement, including rebalance and decommission, retains an existing source proof when quorum-validated staging metadata and the completed object agree on the version and preserved ETag. Tier restore also retains the proof for the same version and ETag when it commits under the matching restore operation. Sources without proof continue to require authorized HEAD access or a credentialed rewrite.
+
+Clients that require an ETag for unproven objects must issue an authorized HeadObject request, including the SSE-C key when required. GET, HEAD, and conditional requests use the object's stored ETag. Already-completed encrypted multipart versions keep their original metadata and can still have no listing ETag after upgrading. Clients that enumerate historical versions, including backup software, may therefore require migration or an application change even after new uploads work. See the existing-data guidance below.
 
 ## Replication
 

@@ -40,13 +40,17 @@ use std::io;
 use std::net::IpAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use subtle::ConstantTimeEq;
 use tokio::net::TcpListener;
 use tokio::sync::{Semaphore, broadcast, watch};
+use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_rustls::TlsAcceptor;
 use tracing::{Instrument, debug, error, info, info_span, warn};
+
+const CONNECTION_DRAIN_TIMEOUT: Duration = Duration::from_secs(10);
 
 const LOG_COMPONENT_PROTOCOLS: &str = "protocols";
 const LOG_SUBSYSTEM_WEBDAV_SERVER: &str = "webdav_server";
@@ -250,6 +254,11 @@ fn policy_request_headers(headers: &HeaderMap) -> HeaderMap {
     policy_headers
 }
 
+struct ConnectionLimits {
+    max_body_size: u64,
+    request_timeout: Duration,
+}
+
 /// WebDAV server implementation
 pub struct WebDavServer<S>
 where
@@ -318,7 +327,8 @@ where
             bind_addr = %self.config.bind_addr,
             "WebDAV server listening"
         );
-        let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let mut reload_task = None;
 
         // Setup TLS if enabled
         let tls_acceptor = if self.config.tls_enabled {
@@ -334,15 +344,9 @@ where
 
                 let resolver = ReloadableServerCertResolver::load_from_directory(cert_dir)
                     .map_err(|e| WebDavInitError::Tls(format!("Failed to create certificate resolver: {}", e)))?;
-                let _reload_task = spawn_server_cert_reload_loop(
-                    "webdav",
-                    resolver.clone(),
-                    Self::tls_reload_options(),
-                    reload_shutdown_rx.clone(),
-                );
-
-                let server_config = crate::common::tls::server_config(resolver, self.config.ca_file.as_deref())
+                let server_config = crate::common::tls::server_config(resolver.clone(), self.config.ca_file.as_deref())
                     .map_err(|error| WebDavInitError::Tls(format!("Invalid client CA configuration: {error}")))?;
+                reload_task = spawn_server_cert_reload_loop("webdav", resolver, Self::tls_reload_options(), shutdown.clone());
 
                 Some(TlsAcceptor::from(Arc::new(server_config)))
             } else {
@@ -356,7 +360,15 @@ where
         let request_timeout = Duration::from_secs(self.config.request_timeout_secs);
         let connection_limiter = Arc::new(Semaphore::new(self.config.max_connections.min(Semaphore::MAX_PERMITS)));
 
-        loop {
+        let mut connections = JoinSet::new();
+        let mut failure = None;
+        'accept: loop {
+            while let Some(result) = connections.try_join_next() {
+                if let Err(error) = result {
+                    failure = Some(WebDavInitError::TaskJoin(error));
+                    break 'accept;
+                }
+            }
             // Admission control: hold a permit before accepting, so at
             // saturation the kernel backlog absorbs the burst instead of the
             // process spawning an unbounded number of connection tasks. The
@@ -387,7 +399,6 @@ where
                                 state = "shutdown_requested",
                                 "WebDAV shutdown requested"
                             );
-                            let _ = reload_shutdown_tx.send(true);
                             break;
                         }
                     }
@@ -402,23 +413,32 @@ where
                             let cors = self.cors.clone();
                             let tls_acceptor = tls_acceptor.clone();
 
-                            let max_body_size = self.config.max_body_size;
+                            let limits = ConnectionLimits {
+                                max_body_size: self.config.max_body_size,
+                                request_timeout,
+                            };
                             let source_ip: IpAddr = addr.ip();
                             let span = info_span!(
                                 "webdav-connection",
                                 peer = %source_ip,
                                 transport = if tls_acceptor.is_some() { "tls" } else { "tcp" },
                             );
-                            tokio::spawn(
+                            let mut shutdown = shutdown.clone();
+                            connections.spawn(
                                 async move {
                                     let _permit = permit;
                                     if let Some(acceptor) = tls_acceptor {
                                         // A handshake that never completes would otherwise
                                         // hold its connection permit forever.
-                                        match timeout(request_timeout, acceptor.accept(stream)).await {
+                                        let handshake = tokio::select! {
+                                            biased;
+                                            _ = shutdown.changed() => return,
+                                            result = timeout(request_timeout, acceptor.accept(stream)) => result,
+                                        };
+                                        match handshake {
                                             Ok(Ok(tls_stream)) => {
                                                 let io = TokioIo::new(tls_stream);
-                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, true, max_body_size, request_timeout, cors).await {
+                                                if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, true, limits, cors, shutdown).await {
                                                     debug!(
                                                         event = EVENT_WEBDAV_CONNECTION_STATE,
                                                         component = LOG_COMPONENT_PROTOCOLS,
@@ -456,7 +476,7 @@ where
                                         }
                                     } else {
                                         let io = TokioIo::new(stream);
-                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, false, max_body_size, request_timeout, cors).await {
+                                        if let Err(e) = Self::handle_connection_impl(io, storage, source_ip, false, limits, cors, shutdown).await {
                                             debug!(
                                                 event = EVENT_WEBDAV_CONNECTION_STATE,
                                                 component = LOG_COMPONENT_PROTOCOLS,
@@ -493,13 +513,29 @@ where
                         state = "shutdown_requested",
                         "WebDAV shutdown requested"
                     );
-                    let _ = reload_shutdown_tx.send(true);
                     break;
                 }
             }
         }
 
-        let _ = reload_shutdown_tx.send(true);
+        drop(listener);
+        shutdown_tx.send_replace(true);
+        let drain = async {
+            while let Some(result) = connections.join_next().await {
+                if let Err(error) = result {
+                    failure.get_or_insert(WebDavInitError::TaskJoin(error));
+                }
+            }
+        };
+        if timeout(CONNECTION_DRAIN_TIMEOUT, drain).await.is_err() {
+            connections.shutdown().await;
+            failure.get_or_insert(WebDavInitError::ShutdownDeadline);
+        }
+        if let Some(task) = reload_task
+            && let Err(error) = task.await
+        {
+            failure.get_or_insert(WebDavInitError::TaskJoin(error));
+        }
         info!(
             event = EVENT_WEBDAV_SERVER_STATE,
             component = LOG_COMPONENT_PROTOCOLS,
@@ -507,7 +543,7 @@ where
             state = "stopped",
             "WebDAV server stopped"
         );
-        Ok(())
+        failure.map_or(Ok(()), Err)
     }
 
     /// Handle a single connection with hyper-util TokioIo wrapper
@@ -516,18 +552,24 @@ where
         storage: S,
         source_ip: IpAddr,
         secure_transport: bool,
-        max_body_size: u64,
-        request_timeout: Duration,
+        limits: ConnectionLimits,
         cors: Arc<WebDavCors>,
+        mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>>
     where
         I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
     {
+        let ConnectionLimits {
+            max_body_size,
+            request_timeout,
+        } = limits;
         // These borrows live for the connection. Preflights complete before
         // invoking the closure that clones the backend for an actual request.
         let cors = cors.as_ref();
         let storage = &storage;
-        let service = service_fn(move |req: Request<hyper::body::Incoming>| {
+        let received_request = AtomicBool::new(false);
+        let service = service_fn(|req: Request<hyper::body::Incoming>| {
+            received_request.store(true, Ordering::Relaxed);
             cors.handle(req, move |req| {
                 Self::handle_request(req, storage.clone(), source_ip, secure_transport, max_body_size, request_timeout)
             })
@@ -536,11 +578,23 @@ where
         // A peer that opens a connection and dribbles (or never finishes)
         // request headers is disconnected once the configured request
         // timeout elapses. The timer is required for the deadline to apply.
-        http1::Builder::new()
+        let connection = http1::Builder::new()
             .timer(TokioTimer::new())
             .header_read_timeout(request_timeout)
-            .serve_connection(io, service)
-            .await?;
+            .serve_connection(io, service);
+        tokio::pin!(connection);
+        tokio::select! {
+            biased;
+            _ = shutdown.changed() => {
+                // Hyper starts in a busy state even before parsing the first
+                // request. An incomplete header has no application work to drain.
+                if received_request.load(Ordering::Relaxed) {
+                    connection.as_mut().graceful_shutdown();
+                    connection.await?;
+                }
+            }
+            result = &mut connection => result?,
+        }
 
         Ok(())
     }
@@ -1085,14 +1139,18 @@ mod tests {
         let storage = StubStorage::default();
         let clone_count = storage.clone_count.clone();
         let (mut client, server) = tokio::io::duplex(8192);
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         let connection = tokio::spawn(WebDavServer::<StubStorage>::handle_connection_impl(
             TokioIo::new(server),
             storage,
             TEST_IP,
             false,
-            16,
-            Duration::from_secs(30),
+            ConnectionLimits {
+                max_body_size: 16,
+                request_timeout: Duration::from_secs(30),
+            },
             Arc::new(WebDavCors::new(origins)),
+            shutdown,
         ));
         let request = format!("{method} / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n{headers}\r\n");
         client.write_all(request.as_bytes()).await.expect("write browser request");
@@ -1523,14 +1581,18 @@ mod tests {
     async fn slow_request_headers_hit_request_timeout() {
         let (mut client, server) = tokio::io::duplex(1024);
 
+        let (_shutdown_tx, shutdown) = tokio::sync::watch::channel(false);
         let conn = tokio::spawn(WebDavServer::<StubStorage>::handle_connection_impl(
             TokioIo::new(server),
             StubStorage::default(),
             TEST_IP,
             false,
-            1024,
-            Duration::from_secs(30),
+            ConnectionLimits {
+                max_body_size: 1024,
+                request_timeout: Duration::from_secs(30),
+            },
             Arc::new(WebDavCors::new("")),
+            shutdown,
         ));
 
         client
@@ -1540,6 +1602,40 @@ mod tests {
 
         let outcome = timeout(Duration::from_secs(600), conn).await;
         assert!(outcome.is_ok(), "connection outlived the configured request timeout");
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_connection_with_incomplete_first_headers() {
+        use std::future::{Future, poll_fn};
+        use std::task::Poll;
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let (shutdown_tx, shutdown) = watch::channel(false);
+        let connection = WebDavServer::<StubStorage>::handle_connection_impl(
+            TokioIo::new(server),
+            StubStorage::default(),
+            TEST_IP,
+            false,
+            ConnectionLimits {
+                max_body_size: 1024,
+                request_timeout: Duration::from_secs(30),
+            },
+            Arc::new(WebDavCors::new("")),
+            shutdown,
+        );
+        tokio::pin!(connection);
+        client
+            .write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\n")
+            .await
+            .expect("write partial headers");
+        let pending = poll_fn(|cx| Poll::Ready(connection.as_mut().poll(cx).is_pending())).await;
+        assert!(pending, "connection should be waiting for the rest of the first header");
+        shutdown_tx.send_replace(true);
+
+        timeout(Duration::from_secs(1), connection.as_mut())
+            .await
+            .expect("shutdown should not wait for an incomplete header")
+            .expect("no request reached the service");
     }
 
     /// R05-CAN-097: the accept loop must not serve more connections at once
@@ -1590,8 +1686,16 @@ mod tests {
             .expect("read second");
         assert!(served > 0, "second connection returned no data");
 
-        let _ = shutdown_tx.send(());
-        let _ = timeout(Duration::from_secs(10), serving).await;
+        shutdown_tx.send(()).expect("signal server");
+        timeout(Duration::from_secs(5), serving)
+            .await
+            .expect("server did not retire the keep-alive connection")
+            .expect("server task panicked")
+            .expect("server did not shut down cleanly");
+        let remaining = timeout(Duration::from_secs(5), second.read_to_end(&mut Vec::new()))
+            .await
+            .expect("connection remained open after server exit");
+        remaining.expect("read remaining response and EOF");
     }
 
     #[tokio::test]
