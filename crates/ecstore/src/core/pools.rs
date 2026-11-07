@@ -12145,8 +12145,13 @@ async fn pause_decommission_start_for_test(store_id: uuid::Uuid, point: Decommis
 }
 
 #[cfg(any(test, feature = "test-util"))]
-type DecommissionCapacityInfoOverrides =
-    std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
+struct DecommissionCapacityInfoOverride {
+    snapshots: std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>,
+    owned_snapshots: Option<std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+type DecommissionCapacityInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, DecommissionCapacityInfoOverride>>;
 
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
@@ -12163,16 +12168,30 @@ pub(crate) fn set_decommission_capacity_info_overrides_for_test(
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned")
-        .insert(store_id, snapshots.into());
+        .insert(
+            store_id,
+            DecommissionCapacityInfoOverride {
+                snapshots: snapshots.into(),
+                owned_snapshots: None,
+            },
+        );
 }
 
 #[cfg(any(test, feature = "test-util"))]
-fn take_decommission_capacity_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<DecommissionPoolCapacityInfo>> {
+fn take_decommission_capacity_info_override_for_test(
+    store_id: uuid::Uuid,
+    use_owned_usage: bool,
+) -> Option<Vec<DecommissionPoolCapacityInfo>> {
     let mut overrides = DECOMMISSION_CAPACITY_INFO_OVERRIDES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned");
-    let queue = overrides.get_mut(&store_id)?;
+    let entry = overrides.get_mut(&store_id)?;
+    let queue = if use_owned_usage {
+        entry.owned_snapshots.as_mut().unwrap_or(&mut entry.snapshots)
+    } else {
+        &mut entry.snapshots
+    };
     if queue.len() > 1 {
         queue.pop_front()
     } else {
@@ -15242,7 +15261,7 @@ impl ECStore {
         ensure_decommission_start_pool_states(&latest_pool_meta, indices)?;
         ensure_decommission_ledger_persistence_supported(&latest_pool_meta)?;
         ensure_decommission_capacity_writer_supported(&latest_pool_meta)?;
-        let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+        let capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
         activation_fence.ensure_held()?;
         let target_fence_proof = crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof();
 
@@ -15604,7 +15623,7 @@ impl ECStore {
 
     async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, false) {
             return capacity_infos
                 .iter()
                 .find(|capacity| capacity.pool_index == target_pool_index)
@@ -15627,7 +15646,7 @@ impl ECStore {
 
     async fn get_decommission_pool_capacity_infos(&self, use_owned_usage: bool) -> Result<Vec<DecommissionPoolCapacityInfo>> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, use_owned_usage) {
             return Ok(capacity_infos);
         }
 
@@ -25782,6 +25801,55 @@ mod tests {
                 .is_err(),
             "the stale PUT must not create a target object"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_activation_reserves_owned_usage_on_a_shared_filesystem() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let target = DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0);
+        let filesystem_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 400);
+        let owned_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 30);
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![vec![filesystem_source, target]]);
+        {
+            let mut overrides = super::DECOMMISSION_CAPACITY_INFO_OVERRIDES
+                .get()
+                .expect("capacity overrides initialized")
+                .lock()
+                .expect("capacity overrides lock");
+            overrides
+                .get_mut(&store.id)
+                .expect("this store has an override")
+                .owned_snapshots = Some(vec![vec![owned_source, target]].into());
+        }
+
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activation should reserve the owned bytes rather than unrelated mount usage");
+
+        let local = store.pool_meta.read().await;
+        let reservation = local.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
+        drop(local);
+        let mut persisted = PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("activation should be durable");
+        let reservation = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("persisted activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
     }
 
     #[tokio::test]
