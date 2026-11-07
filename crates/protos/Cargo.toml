@@ -86,4 +86,5 @@ doctest = false
 
 [dev-dependencies]
 serde_json = { workspace = true }
-temp-env = { workspace = true }
+temp-env = { workspace = true, features = ["async_closure"] }
+tokio = { workspace = true, features = ["macros"] }
