@@ -61,7 +61,7 @@ pub use errors::{SwiftError, SwiftResult};
 pub use metadata_update::MetadataUpdate;
 pub use router::{SwiftRoute, SwiftRouter};
 
-pub(crate) use storage_api::{
+pub(crate) use storage_api::tagging::{
     MAX_SWIFT_METADATA_COUNT as MAX_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE as MAX_METADATA_VALUE_SIZE,
 };
 

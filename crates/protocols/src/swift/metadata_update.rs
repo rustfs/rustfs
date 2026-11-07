@@ -43,7 +43,7 @@ const CONTAINER_META_HEADER_PREFIX: &str = "x-container-meta-";
 /// Request header prefix removing a container metadata item.
 const CONTAINER_META_REMOVE_HEADER_PREFIX: &str = "x-remove-container-meta-";
 
-pub(crate) use super::storage_api::{
+pub(crate) use super::storage_api::tagging::{
     SWIFT_ACCOUNT_META_TAG_PREFIX as ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX as CONTAINER_META_TAG_PREFIX,
 };
 
