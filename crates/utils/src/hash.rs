@@ -12,10 +12,9 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use blake2::Blake2b512;
+use blake2::{Blake2b512, Digest};
 use highway::{HighwayHash, HighwayHasher, Key};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use std::hint::black_box;
 
 const MD5_INITIAL_STATE: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
@@ -410,7 +409,7 @@ impl HashAlgorithm {
                 hasher.append(data);
                 HashEncoded::HighwayHash256(u8x32_from_u64x4(hasher.finalize256()))
             }
-            HashAlgorithm::SHA256 => HashEncoded::Sha256(Sha256::digest(data).into()),
+            HashAlgorithm::SHA256 => HashEncoded::Sha256(crate::sha256::hash(data)),
             HashAlgorithm::HighwayHash256S => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
@@ -452,13 +451,7 @@ impl HashAlgorithm {
                 }
                 HashEncoded::HighwayHash256(u8x32_from_u64x4(hasher.finalize256()))
             }
-            HashAlgorithm::SHA256 => {
-                let mut hasher = Sha256::new();
-                for slice in slices {
-                    hasher.update(slice);
-                }
-                HashEncoded::Sha256(hasher.finalize().into())
-            }
+            HashAlgorithm::SHA256 => HashEncoded::Sha256(crate::sha256::hash_slices(slices)),
             HashAlgorithm::HighwayHash256S => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 for slice in slices {
