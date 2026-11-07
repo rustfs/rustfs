@@ -32,8 +32,9 @@ pub const ENV_OBJECT_MEDIUM_CONCURRENCY_THRESHOLD: &str = "RUSTFS_OBJECT_MEDIUM_
 
 /// Environment variable name for maximum concurrent disk reads for object operations.
 /// - Purpose: Limit the number of concurrent disk read operations for object reads to prevent I/O saturation.
-/// - Unit: request count (usize).
-/// - Semantics: Throttling disk reads helps maintain overall system responsiveness under load.
+/// - Unit: request count (usize) for GET; estimated drive fanout for native LIST.
+/// - Semantics: GET bodies and native LIST walks use separate per-instance budgets of this size.
+///   A LIST consumes up to one budget, including its disk-producer cleanup. `0` disables both caps.
 /// - Example: `export RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS=16`
 /// - Note: This setting may interact with OS-level I/O scheduling and should be tuned based on hardware capabilities.
 pub const ENV_OBJECT_MAX_CONCURRENT_DISK_READS: &str = "RUSTFS_OBJECT_MAX_CONCURRENT_DISK_READS";
