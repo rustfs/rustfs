@@ -72,13 +72,9 @@ async fn publication_deadline_registration_inventory_releases_fence_without_writ
         .unwrap();
 }
 
-async fn commit_fixture(strong: bool) -> (TestCatalogObjectBackend, Arc<dyn TableCatalogStore>, TableCommitRequest) {
+async fn commit_fixture() -> (TestCatalogObjectBackend, Arc<dyn TableCatalogStore>, TableCommitRequest) {
     let backend = TestCatalogObjectBackend::default();
-    let store: Arc<dyn TableCatalogStore> = if strong {
-        Arc::new(StrongTableCatalogStore::new(backend.clone()))
-    } else {
-        Arc::new(ObjectTableCatalogStore::new(backend.clone()))
-    };
+    let store: Arc<dyn TableCatalogStore> = Arc::new(ObjectTableCatalogStore::new(backend.clone()));
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
@@ -116,7 +112,7 @@ async fn commit_fixture(strong: bool) -> (TestCatalogObjectBackend, Arc<dyn Tabl
 // so only the object backing is exercised here.
 #[tokio::test(start_paused = true)]
 async fn publication_deadline_commit_metadata_read_does_not_publish_object_backing() {
-    let (backend, store, request) = commit_fixture(false).await;
+    let (backend, store, request) = commit_fixture().await;
     let pause = backend
         .pause_before_next_read("analytics", &request.new_metadata_location)
         .await;
@@ -159,30 +155,24 @@ async fn publication_deadline_commit_metadata_read_does_not_publish_object_backi
 }
 
 #[tokio::test(start_paused = true)]
-async fn publication_deadline_create_finishes_after_first_write_on_either_backing() {
-    for strong in [false, true] {
-        let (backend, store, _) = commit_fixture(strong).await;
-        let namespace = Namespace::parse("sales").unwrap();
-        let candidate = registration_entry(&namespace, "candidate");
-        let paths = TableCatalogObjectPaths::default();
-        let first_write = if strong {
-            StrongTableCatalogStore::<TestCatalogObjectBackend>::snapshot_object_path()
-        } else {
-            paths.warehouse_index_entry_path("analytics", "tables/id-candidate/")
-        };
-        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &first_write).await;
-        let creating = {
-            let store = store.clone();
-            tokio::spawn(async move { store.create_table(candidate).await })
-        };
-        pause.wait_started().await;
-        tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
-        tokio::task::yield_now().await;
-        assert!(!creating.is_finished(), "deadline must not cancel a possible durable write");
-        pause.release();
-        creating.await.unwrap().unwrap();
-        assert!(store.load_table("analytics", "sales", "candidate").await.unwrap().is_some());
-    }
+async fn publication_deadline_create_finishes_after_first_write_on_object_backing() {
+    let (backend, store, _) = commit_fixture().await;
+    let namespace = Namespace::parse("sales").unwrap();
+    let candidate = registration_entry(&namespace, "candidate");
+    let paths = TableCatalogObjectPaths::default();
+    let first_write = paths.warehouse_index_entry_path("analytics", "tables/id-candidate/");
+    let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &first_write).await;
+    let creating = {
+        let store = store.clone();
+        tokio::spawn(async move { store.create_table(candidate).await })
+    };
+    pause.wait_started().await;
+    tokio::time::advance(publication_preparation_timeout() + StdDuration::from_millis(1)).await;
+    tokio::task::yield_now().await;
+    assert!(!creating.is_finished(), "deadline must not cancel a possible durable write");
+    pause.release();
+    creating.await.unwrap().unwrap();
+    assert!(store.load_table("analytics", "sales", "candidate").await.unwrap().is_some());
 }
 
 #[tokio::test(start_paused = true)]
@@ -241,7 +231,7 @@ async fn publication_deadline_completed_recovery_cannot_exempt_a_new_transaction
 // so only the object backing is exercised here.
 #[tokio::test(start_paused = true)]
 async fn publication_deadline_create_queue_wait_cannot_restart_after_admission() {
-    let (backend, store, _) = commit_fixture(false).await;
+    let (backend, store, _) = commit_fixture().await;
     let key = default_table_bucket_publication_lock_path();
     let blocker = backend.acquire_read_lock("analytics", &key).await.unwrap();
     let attempts = backend.write_lock_acquisition_count("analytics", &key).await;

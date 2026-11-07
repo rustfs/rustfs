@@ -2060,10 +2060,7 @@ fn table_catalog_backend_for_data_plane<T>(
         None => runtime_sources::current_app_context(),
     }
     .ok_or_else(object_store_not_initialized_error)?;
-    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        context.object_store(),
-        context.table_catalog_strong_runtime(),
-    ))
+    Ok(crate::table_catalog::EcStoreTableCatalogObjectBackend::new(context.object_store()))
 }
 
 fn table_catalog_store_for_data_plane<T>(
@@ -2328,7 +2325,7 @@ async fn table_data_plane_resource_for_request<T>(
         .get::<TableDataPlanePublicationGuards>()
         .cloned()
         .unwrap_or_default();
-    {
+    let publication_held = {
         let state = retained.state.lock();
         if state.missing_resources.contains(&key) {
             return Ok(None);
@@ -2342,11 +2339,16 @@ async fn table_data_plane_resource_for_request<T>(
         {
             return Ok(Some(resource));
         }
-    }
+        !state.keys.is_empty()
+    };
 
     let store = table_catalog_store_for_data_plane(req)?;
     let resource = if catalog_metadata {
         crate::table_catalog::table_metadata_data_plane_resource_for_object(&store, bucket, object).await
+    } else if publication_held {
+        store
+            .resolve_table_data_plane_resource_for_authorization(bucket, object)
+            .await
     } else {
         crate::table_catalog::table_data_plane_resource_for_object(&store, bucket, object).await
     }
@@ -4726,6 +4728,87 @@ mod tests {
         lock.get_write_lock(Duration::from_secs(1))
             .await
             .expect("dropping the request must release its publication guard");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn table_data_plane_cold_lookup_does_not_wait_for_backup_while_holding_publication() {
+        use crate::table_catalog::{TableCatalogObjectBackend as _, TableCatalogStore as _};
+        let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        let bucket = "cold-authorization";
+        object_store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create table bucket");
+        let context = Arc::new(AppContext::new(object_store.clone(), Arc::new(UnreadyIam), Arc::new(TestKms)));
+        let server_ctx = ServerContextSlot::new();
+        assert!(server_ctx.install(context));
+        let mut request = build_request((), Method::PUT);
+        request.extensions.insert(server_ctx.clone());
+        let backend = super::table_catalog_backend_for_data_plane(&request).expect("request backend");
+        let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+            backend.clone(),
+            crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        );
+        catalog
+            .put_table_bucket(crate::table_catalog::TableBucketEntry {
+                version: crate::table_catalog::TABLE_CATALOG_ENTRY_VERSION,
+                table_bucket: bucket.to_string(),
+                catalog_type: crate::table_catalog::TABLE_BUCKET_CATALOG_TYPE.to_string(),
+                warehouse_root: format!("s3://{bucket}/"),
+                state: crate::table_catalog::TableCatalogEntryState::Active,
+                properties: Default::default(),
+                active_rename_id: None,
+                created_at: None,
+                updated_at: None,
+            })
+            .await
+            .expect("newly enabled catalog entry");
+        super::retain_table_bucket_publication_guard(&mut request, bucket)
+            .await
+            .expect("S3 owns publication first");
+        let backup_guard = backend
+            .acquire_write_lock(
+                crate::admin::storage_api::RUSTFS_META_BUCKET,
+                &crate::table_catalog::TableCatalogObjectPaths::default().catalog_backup_fence_lock_path(bucket),
+            )
+            .await
+            .expect("backup owns its catalog fence");
+        let resource = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            table_data_plane_resource_for_request(&mut request, bucket, "ordinary-object", true),
+        )
+        .await
+        .expect("cold S3 lookup must not wait for the backup catalog fence")
+        .expect("resolve newly enabled table bucket");
+        assert!(resource.is_none());
+        assert!(
+            request
+                .extensions
+                .get::<TableDataPlanePublicationGuards>()
+                .expect("retained publication")
+                .state
+                .lock()
+                .missing_resources
+                .contains(&(bucket.to_string(), "ordinary-object".to_string()))
+        );
+        drop(backup_guard);
+        drop(request);
+        let mut read_request = build_request((), Method::GET);
+        read_request.extensions.insert(server_ctx);
+        table_data_plane_resource_for_request(&mut read_request, bucket, "ordinary-object", true)
+            .await
+            .expect("unfenced reads retain normal index initialization");
+        assert!(
+            backend
+                .read_object(
+                    crate::admin::storage_api::RUSTFS_META_BUCKET,
+                    &crate::table_catalog::TableCatalogObjectPaths::default().warehouse_index_state_path(bucket),
+                )
+                .await
+                .expect("read initialized index marker")
+                .is_some()
+        );
     }
 
     #[test]

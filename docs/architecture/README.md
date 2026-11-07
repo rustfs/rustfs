@@ -62,7 +62,7 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | Document | Use this when |
 |---|---|
 | [s3-compatibility-matrix.md](s3-compatibility-matrix.md) | writing or checking a user-facing S3 compatibility claim, or moving a Ceph s3tests case between lists |
-| [s3-tables-support-matrix.md](s3-tables-support-matrix.md) | writing a release note or client-compatibility statement about S3 Tables / Iceberg REST Catalog (cutover procedure: [../operations/s3-tables-cutover-runbook.md](../operations/s3-tables-cutover-runbook.md)) |
+| [s3-tables-support-matrix.md](s3-tables-support-matrix.md) | writing a release note or client-compatibility statement about S3 Tables / Iceberg REST Catalog |
 | [minio-rustfs-router-compatibility.md](minio-rustfs-router-compatibility.md) | a client or `mc` call that works against MinIO fails against RustFS and you need to know whether the endpoint is missing, stubbed, or deliberately different |
 | [minio-file-format-compat.md](minio-file-format-compat.md) | deciding whether a MinIO drive set, bucket-metadata blob, or SSE object can be read or imported by a given RustFS build, or before touching a listed version anchor |
 
