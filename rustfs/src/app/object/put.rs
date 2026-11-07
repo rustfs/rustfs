@@ -1879,9 +1879,16 @@ impl DefaultObjectUsecase {
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
         if let Some(control) = progress_control {
-            use rustfs_rio::HashReaderMut;
-            let inner = reader.take_inner();
-            reader.inner = rustfs_rio::boxed_reader(super::request_body::DemandReader::new(inner, control));
+            if !should_compress
+                && (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path)
+                && trailing_headers.is_none()
+            {
+                control.finish();
+            } else {
+                use rustfs_rio::HashReaderMut;
+                let inner = reader.take_inner();
+                reader.inner = rustfs_rio::boxed_reader(super::request_body::DemandReader::new(inner, control));
+            }
         }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
