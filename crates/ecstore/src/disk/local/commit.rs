@@ -200,7 +200,7 @@ pub(super) fn create_local_inline_rollback_backup(
             return Err(err);
         }
     } else if sync && !old_metadata.is_empty() {
-        std::fs::File::open(&backup_path)?.sync_data()?;
+        os::open_file_for_sync_std(&backup_path)?.sync_data()?;
     }
     Ok(backup_path)
 }
@@ -1658,12 +1658,13 @@ impl LocalDisk {
                 );
             }
             if let Some((src_data_path, dst_data_path)) = has_data_dir_path.as_ref() {
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 let payload_guard = if multipart_publication.is_some() {
                     Some(
                         os::multipart_payload_commit_guard(
                             &commit.directory_guard,
                             src_data_path.parent().ok_or(DiskError::InvalidPath)?,
+                            commit.publication_root,
                             commit.mutation_lease.clone(),
                         )
                         .await
@@ -1672,9 +1673,9 @@ impl LocalDisk {
                 } else {
                     None
                 };
-                #[cfg(target_os = "linux")]
+                #[cfg(any(target_os = "linux", windows))]
                 let directory_guard = payload_guard.as_ref().unwrap_or(&commit.directory_guard);
-                #[cfg(not(target_os = "linux"))]
+                #[cfg(not(any(target_os = "linux", windows)))]
                 let directory_guard = &commit.directory_guard;
                 if let Err(err) = os::rename_all_with_commit_guard(
                     src_data_path,

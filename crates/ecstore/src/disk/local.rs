@@ -9993,7 +9993,7 @@ impl LocalDisk {
                         if !std::fs::symlink_metadata(&receipt_path)?.is_file() {
                             return Err(std::io::Error::new(ErrorKind::InvalidData, "delete receipt is not a regular file"));
                         }
-                        std::fs::File::open(receipt_path)?
+                        os::open_file_for_sync_std(&receipt_path)?
                     }
                     Err(err) => return Err(err),
                 };
@@ -14514,7 +14514,7 @@ impl DiskAPI for LocalDisk {
                     return Ok(Err(DiskError::FileCorrupt));
                 }
                 let verify_and_sync = (|| -> std::io::Result<bool> {
-                    let mut file = std::fs::File::open(&source)?;
+                    let mut file = os::open_file_for_sync_std(&source)?;
                     let mut header = [0u8; rustfs_filemeta::shard_integrity::INDEX_HEADER_SIZE];
                     std::io::Read::read_exact(&mut file, &mut header)?;
                     if header != integrity.index_header() {
@@ -19755,6 +19755,9 @@ mod test {
         );
     }
 
+    // Only the Unix grouped dst dir fsync worker consults the injected
+    // failure; the non-Unix worker syncs by path without the hook.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn rename_data_non_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
@@ -19843,6 +19846,9 @@ mod test {
         );
     }
 
+    // Only the Unix grouped dst dir fsync worker consults the injected
+    // failure; the non-Unix worker syncs by path without the hook.
+    #[cfg(unix)]
     #[tokio::test]
     #[serial_test::serial(dst_dir_fsync_group_commit)]
     async fn rename_data_inline_dst_dir_fsync_group_commit_failure_rolls_back_fresh_put() {
