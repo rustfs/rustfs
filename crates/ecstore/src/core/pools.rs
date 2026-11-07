@@ -2208,9 +2208,14 @@ fn ensure_decommission_capacity_reservations_available(
             continue;
         }
         metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
-        return Err(decommission_capacity_blocked_error(format!(
+        let detail = format!(
             "target pool {target_pool_index} reservation requires {required} physical bytes, but only {available} bytes remain during {phase}"
-        )));
+        );
+        return Err(if growth_pool.is_some() {
+            decommission_target_no_longer_fits_error(target_pool_index, detail)
+        } else {
+            decommission_capacity_blocked_error(detail)
+        });
     }
     Ok(())
 }
@@ -2341,6 +2346,13 @@ fn grow_decommission_target_reservation(
         let existing_remaining = existing_target
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
             .unwrap_or_default();
+        let existing_reserved = existing_target
+            .map(|target| target.reserved_physical_bytes)
+            .unwrap_or_default();
+        let allocation_limit = existing_target
+            .map(|target| target.physical_free_at_reservation)
+            .unwrap_or_default()
+            .max(target_capacity.physical_free);
         if required_peak <= existing_remaining {
             return Ok(false);
         }
@@ -2376,6 +2388,15 @@ fn grow_decommission_target_reservation(
             .predicted_physical_bytes
             .saturating_add(reservation.temporary_physical_bytes);
         let allocation_growth = reservation.remaining_peak_physical_bytes().saturating_sub(current_peak);
+        let required_allocation = existing_reserved.saturating_add(allocation_growth);
+        if required_allocation > allocation_limit {
+            return Err(decommission_target_no_longer_fits_error(
+                target_pool_index,
+                format!(
+                    "target pool {target_pool_index} reservation requires {required_allocation} physical bytes, but its observed allocation limit is {allocation_limit} bytes"
+                ),
+            ));
+        }
         if let Some(target) = reservation
             .targets
             .iter_mut()
@@ -37890,10 +37911,9 @@ mod pools_tests {
         );
         let before = serde_json::to_value(&meta).expect("snapshot reservation before rejected growth");
         let shortage = vec![initial[0], DecommissionPoolCapacityInfo::for_test(1, layout, 43, 64, 21)];
-        assert!(
-            grow_decommission_target_reservation(&mut meta, &shortage, 0, 1, 32, uuid::Uuid::new_v4(), now).is_err(),
-            "real free-space shortage still rejects growth"
-        );
+        let error = grow_decommission_target_reservation(&mut meta, &shortage, 0, 1, 32, uuid::Uuid::new_v4(), now)
+            .expect_err("real free-space shortage still rejects growth");
+        assert_eq!(super::decommission_capacity_stale_target_index(&error), Some(1));
         assert_eq!(serde_json::to_value(&meta).expect("snapshot after rejected growth"), before);
     }
 
