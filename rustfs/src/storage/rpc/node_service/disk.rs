@@ -407,7 +407,7 @@ impl InternodeOperationDurationGuard {
 
 impl Drop for InternodeOperationDurationGuard {
     fn drop(&mut self) {
-        global_internode_metrics().record_duration_for_operation_and_backend(
+        global_internode_metrics().record_server_duration_for_operation_and_backend(
             self.operation,
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             self.started_at.elapsed(),
@@ -2999,17 +2999,36 @@ mod tests {
         let recorder = DebuggingRecorder::new();
         let snapshotter = recorder.snapshotter();
         metrics::with_local_recorder(&recorder, || {
-            drop(InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_READ_MULTIPLE));
-            drop(InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION));
+            for operation in [
+                INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+            ] {
+                rustfs_io_metrics::internode_metrics::global_internode_metrics().record_duration_for_operation_and_backend(
+                    operation,
+                    super::INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    std::time::Duration::from_secs(1),
+                );
+                drop(InternodeOperationDurationGuard::new(operation));
+            }
         });
 
         let entries = snapshotter
             .snapshot()
             .into_vec()
             .into_iter()
-            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_system_network_internode_operation_duration_ms")
+            .filter(|(composite, _, _, _)| {
+                matches!(
+                    composite.key().name(),
+                    "rustfs_system_network_internode_operation_duration_ms"
+                        | "rustfs_system_network_internode_operation_server_duration_ms"
+                )
+            })
             .collect::<Vec<_>>();
-        assert_eq!(entries.len(), 2);
+        assert_eq!(
+            entries.len(),
+            4,
+            "client RTT and server latency must have distinct series for each operation"
+        );
         for (composite, _, _, value) in entries {
             let operation = composite
                 .key()
@@ -3020,7 +3039,15 @@ mod tests {
             assert!(
                 operation == INTERNODE_OPERATION_GRPC_READ_MULTIPLE || operation == INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
             );
-            assert!(matches!(value, DebugValue::Histogram(samples) if !samples.is_empty()));
+            match value {
+                DebugValue::Histogram(samples) => {
+                    assert_eq!(samples.len(), 1, "client RTT and server latency must not share a histogram");
+                    if composite.key().name() == "rustfs_system_network_internode_operation_duration_ms" {
+                        assert_eq!(samples[0].0, 1000.0);
+                    }
+                }
+                other => panic!("duration metric must be a histogram, got {other:?}"),
+            }
         }
     }
 
@@ -3067,7 +3094,9 @@ mod tests {
             .snapshot()
             .into_vec()
             .into_iter()
-            .filter(|(composite, _, _, _)| composite.key().name() == "rustfs_system_network_internode_operation_duration_ms")
+            .filter(|(composite, _, _, _)| {
+                composite.key().name() == "rustfs_system_network_internode_operation_server_duration_ms"
+            })
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 2);
         for (composite, _, _, value) in entries {
