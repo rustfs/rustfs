@@ -3159,6 +3159,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
             == Some(dst_path)
         || os::has_dir_fsync_test_failures()
         || os::file_sync_probe::is_active()
+        || os::prepared_publication_test_hooks::has_any_hooks()
 }
 
 #[cfg(all(not(test), feature = "test-util", target_os = "linux"))]
@@ -3169,6 +3170,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         .iter()
         .any(|target| target == dst_path)
         || os::has_dir_fsync_test_failures()
+        || os::prepared_publication_test_hooks::has_any_hooks()
 }
 
 #[cfg(any(not(any(test, feature = "test-util")), not(target_os = "linux")))]
@@ -4198,48 +4200,43 @@ fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_s
 #[cfg(not(target_os = "linux"))]
 fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
 
-static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+const PRESYNCED_TMP_DATA_DIRS_PER_SHARD: usize = 64;
+const PRESYNCED_TMP_FILES_PER_SHARD: usize = 128;
 
-static PRESYNCED_TMP_FILES: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<os::ShardedPathCache<()>> =
+    std::sync::LazyLock::new(|| os::ShardedPathCache::new(PRESYNCED_TMP_DATA_DIRS_PER_SHARD));
 
-fn mark_presynced_tmp_data_dir(dir: PathBuf) {
-    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
-    if set.len() >= 4096 {
-        set.clear();
-    }
-    set.insert(dir);
+static PRESYNCED_TMP_FILES: std::sync::LazyLock<os::ShardedPathCache<()>> =
+    std::sync::LazyLock::new(|| os::ShardedPathCache::new(PRESYNCED_TMP_FILES_PER_SHARD));
+
+fn mark_presynced_tmp_data_dir(dir: impl AsRef<Path>) {
+    PRESYNCED_TMP_DATA_DIRS.insert(dir.as_ref(), ());
 }
 
 fn unmark_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+    PRESYNCED_TMP_DATA_DIRS.remove(dir).is_some()
 }
 
 #[cfg(target_os = "linux")]
 pub(in crate::disk) fn is_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().contains(dir)
+    PRESYNCED_TMP_DATA_DIRS.with_get(dir, |()| ()).is_some()
 }
 
 #[cfg(target_os = "linux")]
 pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+    PRESYNCED_TMP_DATA_DIRS.remove(dir).is_some()
 }
 
-fn mark_presynced_tmp_file(file: PathBuf) {
-    let mut set = PRESYNCED_TMP_FILES.lock();
-    if set.len() >= 8192 {
-        set.clear();
-    }
-    set.insert(file);
+fn mark_presynced_tmp_file(file: impl AsRef<Path>) {
+    PRESYNCED_TMP_FILES.insert(file.as_ref(), ());
 }
 
 fn unmark_presynced_tmp_file(file: &Path) {
-    PRESYNCED_TMP_FILES.lock().remove(file);
+    let _ = PRESYNCED_TMP_FILES.remove(file);
 }
 
 fn take_presynced_tmp_file(file: &Path) -> bool {
-    PRESYNCED_TMP_FILES.lock().remove(file)
+    PRESYNCED_TMP_FILES.remove(file).is_some()
 }
 
 fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
@@ -4325,7 +4322,7 @@ impl LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -4347,7 +4344,7 @@ impl LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -4475,7 +4472,7 @@ impl AsyncWrite for LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -9145,11 +9142,15 @@ impl LocalDisk {
         opts: DeleteOptions,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
     ) -> Vec<Option<DiskError>> {
-        let payload = super::GuardedDeleteVersionsPayload { versions, opts };
+        let payload = super::GuardedDeleteVersionsPayload {
+            versions,
+            opts,
+            bounded_recovery_protocol: None,
+        };
         if let Err(error) = payload.validate() {
             return vec![Some(error); payload.versions.len()];
         }
-        let super::GuardedDeleteVersionsPayload { versions, mut opts } = payload;
+        let super::GuardedDeleteVersionsPayload { versions, mut opts, .. } = payload;
         opts.recoverable_delete = true;
         let mut errors = Vec::with_capacity(versions.len());
         for version in &versions {
@@ -22183,7 +22184,7 @@ mod test {
                 .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
                 .expect("staged shard directory should resolve");
             assert!(
-                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_none(),
                 "an unknown destination must defer payload sync until commit"
             );
 
@@ -22236,7 +22237,10 @@ mod test {
             let staged_dir = disk
                 .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
                 .expect("staged shard directory should resolve");
-            assert!(PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir), "the writer must pre-sync the shard");
+            assert!(
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_some(),
+                "the writer must pre-sync the shard"
+            );
             assert!(!os::fsync_dir_recorder::was_fsynced(&staged_dir));
 
             let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
@@ -22247,7 +22251,7 @@ mod test {
                 .await
                 .expect("rename_data should commit");
             assert!(
-                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_none(),
                 "the fused commit must consume the pre-sync marker"
             );
             assert!(
@@ -22436,6 +22440,141 @@ mod test {
         // rustfs/backlog#1009: the overwritten live current version (size 1
         // from `test_file_info`) must be surfaced through the backfill.
         assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(1)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_fused_overwrite_and_rollback_double_failure() {
+        const CHILD: &str = "RUSTFS_TEST_FUSED_OVERWRITE_CHILD";
+        const TEST: &str = "disk::local::test::test_rename_data_fused_overwrite_and_rollback_double_failure";
+
+        // Other tests install process-wide hooks that deliberately force rename_data off the fused path.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("fused overwrite subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("FUSED_OVERWRITE_OK"), "fused overwrite test did not run: {stdout}");
+            return;
+        }
+
+        assert!(!os::dst_dir_fsync_group_commit_enabled());
+        assert!(!os::file_fdatasync_group_commit_enabled());
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let (bucket, object, version_id) = ("fused-overwrite-bucket", "fused-object", Uuid::nil());
+        let (data_dir_v1, data_dir_v2) = (Uuid::new_v4(), Uuid::new_v4());
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        for (tmp, data_dir, payload) in [("tmp-v1", data_dir_v1, b"v1-d"), ("tmp-v2", data_dir_v2, b"v2-d")] {
+            let mut w = disk
+                .create_file(bucket, RUSTFS_META_TMP_BUCKET, &format!("{tmp}/{data_dir}/part.1"), 4)
+                .await
+                .expect("create shard");
+            w.write_all(payload).await.expect("write");
+            w.shutdown().await.expect("close");
+        }
+        let mut fi_v1 = test_file_info(object, version_id, Some(data_dir_v1), None);
+        (fi_v1.size, fi_v1.parts[0].size, fi_v1.parts[0].actual_size) = (4, 4, 4);
+        let resp1 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v1", fi_v1, bucket, object)
+            .await
+            .expect("commit v1");
+        assert_eq!((resp1.old_data_dir, resp1.rollback_data_dir), (None, None));
+        let dst_object_dir = disk.io_get_object_path(bucket, object).expect("dst object path");
+        let v1_meta_bytes = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read v1 xl.meta");
+
+        let mut fi_v2 = test_file_info(object, version_id, Some(data_dir_v2), None);
+        (fi_v2.size, fi_v2.parts[0].size, fi_v2.parts[0].actual_size) = (4, 4, 4);
+        assert!(!has_rename_data_test_failpoints(object));
+        let resp2 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v2", fi_v2, bucket, object)
+            .await
+            .expect("fused overwrite v2");
+        assert_eq!(
+            (resp2.old_data_dir, resp2.rollback_data_dir, resp2.cleanup_data_dir),
+            (Some(data_dir_v1), Some(data_dir_v1), Some(data_dir_v1))
+        );
+        assert_eq!(
+            fs::read(dst_object_dir.join(data_dir_v1.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                .await
+                .expect("v1 backup"),
+            v1_meta_bytes
+        );
+
+        fs::create_dir_all(dir.path().join(RUSTFS_META_TMP_BUCKET).join("tmp-v3"))
+            .await
+            .expect("create tmp-v3");
+        let fi_v3 = test_file_info(object, version_id, None, Some(Bytes::from_static(b"v3-inline")));
+        let resp3 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v3", fi_v3, bucket, object)
+            .await
+            .expect("fused inline overwrite v3");
+        assert_eq!(
+            (resp3.old_data_dir, resp3.rollback_data_dir, resp3.cleanup_data_dir),
+            (Some(data_dir_v2), Some(data_dir_v2), Some(data_dir_v2))
+        );
+        assert!(
+            dst_object_dir
+                .join(data_dir_v2.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .is_file()
+        );
+
+        let dst_meta_path = dst_object_dir.join(STORAGE_FORMAT_FILE);
+        let dst_vol_dir = disk.io_get_bucket_path(bucket).expect("bucket path");
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_meta_path, None).await;
+        let guard =
+            commit::lock_rename_commit_directories(&dst_object_dir, &dst_object_dir, &dst_vol_dir, &disk.publication_root, lease)
+                .await
+                .expect("lock commit guard");
+        let replacement_dir = dst_object_dir.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&replacement_dir).await.expect("create replacement_dir");
+        fs::write(replacement_dir.join("part.1"), b"live").await.expect("write part");
+
+        os::fsync_dir_recorder::set_failure(&dst_object_dir, std::io::ErrorKind::Other);
+        assert!(
+            commit::fsync_inline_commit_std(
+                &dst_meta_path,
+                &dst_vol_dir,
+                false,
+                Some(Uuid::new_v4()),
+                None,
+                Some(&replacement_dir),
+                &guard,
+            )
+            .is_err()
+        );
+        assert!(replacement_dir.join("part.1").is_file());
+
+        os::fsync_dir_recorder::set_failure(&dst_object_dir, std::io::ErrorKind::Other);
+        assert!(
+            commit::fsync_inline_commit_std(
+                &dst_meta_path,
+                &dst_vol_dir,
+                false,
+                Some(data_dir_v1),
+                None,
+                Some(&replacement_dir),
+                &guard,
+            )
+            .is_err()
+        );
+        assert!(!replacement_dir.exists());
+        assert_eq!(fs::read(&dst_meta_path).await.expect("restored"), v1_meta_bytes);
+        println!("FUSED_OVERWRITE_OK");
     }
 
     /// rustfs/backlog#1009: `observe_old_current_size` must mirror the pre-PUT
@@ -30309,6 +30448,7 @@ mod test {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            requires_bounded_delete_recovery: false,
             orphan_data_dir: false,
         };
         disk.delete("test-volume", "test-file.txt", delete_opts)

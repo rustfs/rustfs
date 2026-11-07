@@ -485,19 +485,24 @@ pub(crate) struct FrontShutdownReport {
     optional: Vec<ShutdownWaitError>,
     optional_expected: Option<usize>,
     optional_joined: bool,
+    optional_retired: usize,
 }
 
 impl FrontShutdownReport {
     fn producers_retired(&self) -> bool {
         self.s3.retired()
             && self.console.retired()
-            && self.optional_expected.is_none_or(|count| count == 0 && self.optional_joined)
+            && self
+                .optional_expected
+                .is_none_or(|count| count == self.optional_retired && self.optional_joined)
     }
 
     fn allows_marker_clear(&self) -> bool {
         self.s3.allows_marker_clear()
             && self.console.allows_marker_clear()
-            && self.optional_expected.is_none_or(|count| count == 0 && self.optional_joined)
+            && self
+                .optional_expected
+                .is_none_or(|count| count == self.optional_retired && self.optional_joined)
             && self.optional.is_empty()
     }
 
@@ -588,7 +593,7 @@ pub(crate) async fn join_startup_fronts(
         report.console = FrontObservation::Observed(handle.wait_checked().await);
         let _ = console.take();
     }
-    shutdown_optional_runtime_services(optional, &mut report.optional).await;
+    shutdown_optional_runtime_services(optional, &mut report.optional, &mut report.optional_retired).await;
     report.optional_joined = true;
 }
 
@@ -1757,6 +1762,27 @@ mod tests {
                 .is::<tokio::task::JoinError>()
         );
     }
+    #[cfg(feature = "webdav")]
+    #[tokio::test]
+    async fn webdav_shutdown_proof_requires_a_successful_managed_join() {
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let mut optional = vec![ShutdownHandle::new_webdav(tx, tokio::spawn(async { Ok(()) }))];
+        let mut report = super::FrontShutdownReport::default();
+        super::join_startup_fronts(&mut None, &mut None, &mut optional, &mut report).await;
+        assert!(report.into_result().is_ok());
+
+        let (tx, _rx) = tokio::sync::broadcast::channel(1);
+        let mut optional = vec![ShutdownHandle::new_webdav(
+            tx,
+            tokio::spawn(async { Err(rustfs_protocols::webdav::config::WebDavInitError::ShutdownDeadline) }),
+        )];
+        let mut report = super::FrontShutdownReport::default();
+        super::join_startup_fronts(&mut None, &mut None, &mut optional, &mut report).await;
+        let error = report.into_result().expect_err("failed drain must preserve the marker");
+        assert!(error.incomplete_leaf_proof);
+        assert!(matches!(error.optional.as_slice(), [crate::server::ShutdownWaitError::WebDav(_)]));
+    }
+
     #[tokio::test]
     async fn configured_optional_outer_join_does_not_fabricate_leaf_proof() {
         let (tx, _rx) = broadcast::channel(1);

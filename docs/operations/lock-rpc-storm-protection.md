@@ -17,7 +17,19 @@ A timed-out request is no longer cancelled. Cancelling sends `RST_STREAM`, and e
 
 Three consecutive lock-acquisition timeouts open a request-level per-peer breaker. While open, new `lock` and `lock_batch` calls fail fast as retryable contention; after the backoff window one half-open probe is admitted. The breaker does not block release or refresh traffic, and it is separate from channel eviction. A per-peer in-flight admission limit also bounds requests that were already admitted before the breaker opened.
 
-Unlocks that fail three quick retries no longer stop there. The background task continues with a deferred schedule (1s, 2s, 4s, 8s, 16s) before it gives up and leaves the entry to the server-side lease.
+Single-resource distributed acquisition bounds each peer's contention wait to one second, but keeps pending responses and partial grants in the same quorum round until a response proves that round cannot reach quorum or the caller's remaining acquisition budget expires. A delayed response can still complete a healthy quorum; it does not restart acquisition with a fresh lock ID merely because delivery took longer than the peer's contention wait. Explicit contention failures retain rollback and retry behavior. Grants whose conservative lease deadline has expired before quorum are rolled back. Cancelling acquisition transfers both confirmed grants and pending replies to background cleanup. The caller's total deadline, read/write quorums, and fast quorum return remain unchanged.
+
+Unlock cleanup that remains unconfirmed after three quick retries continues in the background with a deferred schedule (1s, 2s, 4s, 8s, 16s). Exhausting that schedule means cleanup was not confirmed; it does not prove that the peer still holds the lock. A server-side lease bounds any grant that remains.
+
+Cleanup of a previously confirmed grant is idempotent for its exact `LockId`: `Released` and authoritative `AlreadyAbsent` both complete cleanup. The unlock RPCs append a structured `release_status` to each response or batch entry while preserving the existing `success` and `error_info` fields. Ordinary release and force-release still report a missing lock as failure. A new client keeps retrying unknown transport/backend results and absence responses from older peers that omit the structured status; it never infers absence from diagnostic text. Older clients ignore the added field and retain their existing behavior during upgrades or rollback.
+
+An absence response cannot settle an acquisition that may still grant the same ID later. Pending acquisition completion retains its own cleanup owner, and uncertain remote acquisition failures keep their conservative late-release retries. Only a completed, confirmed grant can use authoritative absence to stop retrying.
+
+## Local grant registration
+
+The local guard registry uses nonblocking native-lock attempts for short map operations and async notifications when the table is occupied. An unpolled metadata waiter does not reserve the table, so currently running peers can register compatible grants without inheriting that waiter's scheduling delay. Notification registration precedes the retry, and unlocking precedes waking waiters. Every registry access and contention retry retains cooperative scheduling points; no executor thread waits on a blocking table-lock acquisition.
+
+Physical acquisition and registry contention share the peer's existing acquisition deadline. An expired registration releases its unpublished physical guard and returns retryable contention, including when the table becomes available after the deadline. Replaced, removed, and reclaimed physical guards are dropped outside the registry lock. This does not change object-lock fairness, quorum, lease duration, or caller cancellation handling.
 
 ## Configuration
 

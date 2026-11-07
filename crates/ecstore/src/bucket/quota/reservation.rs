@@ -886,7 +886,13 @@ pub(crate) async fn begin(
     }
 
     let metadata_lock_started = rustfs_io_metrics::put_stage_timer();
-    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(
+        ctx,
+        bucket,
+        opts,
+        "quota_context_metadata_read",
+    )
+    .await?;
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
         metadata_lock_started,
