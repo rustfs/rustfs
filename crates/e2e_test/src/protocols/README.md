@@ -77,9 +77,7 @@ core protocol surface plus cross-protocol consistency:
   existing path returns an error, bad-password authentication is rejected
 - Cross-protocol via aws-sdk-s3: SFTP write then S3 read with SHA256 match,
   S3 write then SFTP read with SHA256 match
-- Cross-API directory visibility: SFTP-created sub-directory visible via S3
-  ListObjectsV2, S3-created `__XLDIR__` marker visible via SFTP readdir as a
-  directory entry
+- Cross-API directory visibility: SFTP-created sub-directory visible via S3 ListObjectsV2, and an S3 trailing-slash directory object visible via SFTP readdir as a directory entry
 
 #### sftp_compliance (`test_sftp_compliance_suite`)
 

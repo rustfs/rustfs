@@ -47,6 +47,8 @@ their issue closes.
 
 | Entry | Status | Purpose | Wiring / docs |
 |---|---|---|---|
+| `repro_rejoin_readiness_docker.py` | dev-tool | Fixed-source Docker HTTPS rejoin and acknowledged-overwrite diagnostic; retains first failure | [Guide](../docs/testing/docker-rejoin-readiness.md) |
+| `test_repro_rejoin_readiness_docker.py` | ci-gate | Provenance, native architecture, ownership and failure-preservation guards | `make script-tests`; same guide |
 | `diagnose_scanner_enumeration_restart.py` | dev-tool | Strict fixed raw-entry-budget scanner-worker restart diagnostic | [Checkpoint fixture](../docs/testing/scanner-checkpoint-fixture.md) |
 | `prepare_replacement_migration.py` | dev-tool | Prepares digest-bound schema 5/6 replacement maintenance approvals | [Replacement recovery](../docs/operations/replacement-generation-recovery.md) |
 | `test_prepare_replacement_migration.py` | dev-tool | Verifies maintenance approval scope, publication, and stopped-writer assertion | Python unittest; same runbook |

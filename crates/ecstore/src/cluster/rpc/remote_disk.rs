@@ -27,13 +27,13 @@ use crate::disk::multipart_source::{
     MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest, MultipartSourceResponse,
 };
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION,
-    DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection,
-    DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload, GuardedFileInfoVersions,
-    PartTransactionAction, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, ReadMultipleReq, ReadMultipleResp,
-    ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    batch_read_version_one_by_one,
+    BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
+    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
+    DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
+    GuardedFileInfoVersions, PartTransactionAction, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -996,21 +996,32 @@ fn internode_idempotent_read_retries() -> usize {
 static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+fn claim_control_channel_prewarm(addr: &str) -> bool {
+    let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+        return false;
+    };
+    prewarmed.insert(addr.to_owned())
+}
+
+fn release_control_channel_prewarm(addr: &str) {
+    if let Ok(mut prewarmed) = PREWARMED_PEERS.lock() {
+        prewarmed.remove(addr);
+    }
+}
+
 /// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
-/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+/// peer; a dial failure releases the marker so a later disk construction can retry the prewarm.
 fn spawn_control_channel_prewarm(addr: String) {
-    {
-        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
-            return;
-        };
-        if !prewarmed.insert(addr.clone()) {
-            return;
-        }
+    if !claim_control_channel_prewarm(&addr) {
+        return;
     }
     tokio::spawn(async move {
         match node_service_time_out_client_no_auth(&addr).await {
             Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
-            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+            Err(err) => {
+                release_control_channel_prewarm(&addr);
+                debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)");
+            }
         }
     });
 }
@@ -1021,6 +1032,7 @@ impl RemoteDisk {
         volume: &str,
         payload: Vec<u8>,
         probe_only: bool,
+        bounded_prepare: bool,
     ) -> Result<DeleteVersionsResponse> {
         if payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
             return Err(DiskError::FileCorrupt);
@@ -1045,6 +1057,8 @@ impl RemoteDisk {
                     .map_err(|status| {
                         if status.code() == Code::Unimplemented {
                             DiskError::GuardedDeleteUnsupported
+                        } else if bounded_prepare && status.code() == Code::InvalidArgument {
+                            DiskError::UnsupportedDisk
                         } else {
                             status.into()
                         }
@@ -1078,6 +1092,14 @@ impl RemoteDisk {
         volume: &str,
         operation: DeleteRecoveryRpcOperation,
     ) -> Result<DeleteRecoveryRpcReply> {
+        let protocol_version = match &operation {
+            DeleteRecoveryRpcOperation::ApplyVersion { opts, .. } | DeleteRecoveryRpcOperation::ApplyVersions { opts, .. }
+                if opts.requires_bounded_delete_recovery =>
+            {
+                BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION
+            }
+            _ => DELETE_RECOVERY_PROTOCOL_VERSION,
+        };
         let payload = rmp_serde::to_vec_named(&operation)?;
         if payload.len() > operation.max_wire_payload_bytes() {
             return Err(Error::other("delete recovery operation exceeds payload limit"));
@@ -1108,7 +1130,7 @@ impl RemoteDisk {
                 let mut request = Request::new(RecoverDeleteTransactionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_owned(),
-                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    protocol_version,
                     operation: payload.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
@@ -1126,7 +1148,7 @@ impl RemoteDisk {
                         }
                     })?
                     .into_inner();
-                if response.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+                if response.protocol_version != protocol_version {
                     return Err(DiskError::UnsupportedDisk);
                 }
                 if !response.success {
@@ -2768,7 +2790,7 @@ impl DiskAPI for RemoteDisk {
     }
 
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
-        let response = self.guarded_delete_versions_rpc("", Vec::new(), true).await?;
+        let response = self.guarded_delete_versions_rpc("", Vec::new(), true, false).await?;
         if !response.errors.is_empty() || !response.item_errors.is_empty() {
             return Err(DiskError::FileCorrupt);
         }
@@ -2781,7 +2803,12 @@ impl DiskAPI for RemoteDisk {
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         let count = versions.len();
-        let payload = GuardedDeleteVersionsPayload { versions, opts };
+        let bounded_prepare = opts.requires_bounded_delete_recovery;
+        let payload = GuardedDeleteVersionsPayload {
+            versions,
+            opts,
+            bounded_recovery_protocol: bounded_prepare.then_some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION),
+        };
         if let Err(error) = payload.validate() {
             return vec![Some(error); count];
         }
@@ -2789,7 +2816,10 @@ impl DiskAPI for RemoteDisk {
             Ok(encoded) => encoded,
             Err(error) => return vec![Some(error.into()); count],
         };
-        match self.guarded_delete_versions_rpc(volume, encoded, false).await {
+        match self
+            .guarded_delete_versions_rpc(volume, encoded, false, bounded_prepare)
+            .await
+        {
             Ok(response) => {
                 // New guarded peers must return typed errors, never lossy strings.
                 if response.item_errors.len() != count {
@@ -3680,7 +3710,13 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response = match client.batch_read_version(request).await {
+                    let response_result = client.batch_read_version(request).await;
+                    if let Some(rpc_started) = rpc_started {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
+                            rpc_started.elapsed(),
+                        );
+                    }
+                    let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
                             response.into_inner()
@@ -4695,7 +4731,10 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let response = client.read_multiple(request).await?.into_inner();
+                let rpc_started = Instant::now();
+                let response = client.read_multiple(request).await;
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = response?.into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -4746,6 +4785,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4754,6 +4794,7 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -4851,6 +4892,7 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4858,6 +4900,8 @@ impl DiskAPI for RemoteDisk {
                         return Err(err.into());
                     }
                 };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
@@ -11974,5 +12018,16 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[test]
+    fn prewarm_claim_is_deduplicated_and_released_after_failure() {
+        let addr = "http://prewarm-retry-test.invalid:9000";
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        assert!(!claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
     }
 }

@@ -3218,7 +3218,12 @@ impl ECStore {
     pub async fn object_lock_config_snapshot(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
         let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_admission_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision) =
             get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
@@ -3238,7 +3243,12 @@ impl ECStore {
     pub(crate) async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
         let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_snapshot_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision, quota_res) =
             get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
@@ -3267,7 +3277,12 @@ impl ECStore {
         if lifecycle_fence.is_lock_lost() {
             return Err(Error::other("bucket lifecycle lock was lost before loading the Object Lock snapshot"));
         }
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_completion_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision) =
             get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&metadata_guard)).await?;
         if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {

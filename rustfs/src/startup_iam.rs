@@ -85,32 +85,35 @@ where
     publish_ready().await
 }
 
-async fn finalize_iam_recovery(
+async fn prepare_iam_startup(
     iam: Arc<rustfs_iam::sys::IamSys<rustfs_iam::store::object::ObjectStore>>,
     store: Arc<ECStore>,
     kms_interface: Arc<KmsServiceManager>,
     readiness: Arc<GlobalReadiness>,
-    state_manager: Option<Arc<ServiceStateManager>>,
     server_ctx: Arc<ServerContextSlot>,
-) -> Result<()> {
+) -> Result<HealTopologyReady> {
     let endpoint_pools = heal_control_endpoint_pools(store.as_ref())?;
-    AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)?;
-    let topology_ready =
-        publish_iam_ready_after_heal_topology(readiness.as_ref(), server_ctx.heal_topology_fingerprint(), endpoint_pools).await?;
-    publish_runtime_ready_after_heal_topology(topology_ready, || async {
-        publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
+    publish_iam_ready_after_heal_topology(readiness.as_ref(), server_ctx.heal_topology_fingerprint(), endpoint_pools, || {
+        AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)
     })
     .await
 }
 
-async fn publish_iam_ready_after_heal_topology(
+async fn publish_iam_ready_after_heal_topology<InstallFn>(
     readiness: &GlobalReadiness,
     cache: Arc<tokio::sync::OnceCell<String>>,
     endpoint_pools: crate::storage_api::cluster::EndpointServerPools,
-) -> Result<HealTopologyReady> {
+    install_context: InstallFn,
+) -> Result<HealTopologyReady>
+where
+    InstallFn: FnOnce() -> Result<()>,
+{
     crate::storage_api::startup::heal_control::initialize_heal_topology_fingerprint(cache, endpoint_pools)
         .await
         .map_err(std::io::Error::other)?;
+    // Finish fallible preparation before claiming the one-time context slot.
+    // No fallible/async step may follow a successful claim before this token.
+    install_context()?;
     readiness.mark_stage(SystemStage::IamReady);
     Ok(HealTopologyReady(()))
 }
@@ -145,8 +148,7 @@ fn spawn_iam_recovery_task(
     let finalize_readiness = readiness;
     let finalize_state_manager = state_manager;
     let finalize_server_ctx = server_ctx;
-    let recovered_iam = Arc::new(std::sync::Mutex::new(None));
-    let init_recovered_iam = recovered_iam.clone();
+    let prepare_readiness = finalize_readiness.clone();
     tokio::spawn(async move {
         run_iam_recovery_loop(
             initial_interval,
@@ -154,25 +156,23 @@ fn spawn_iam_recovery_task(
             shutdown_token,
             move || {
                 let store = init_store.clone();
-                let recovered_iam = init_recovered_iam.clone();
-                Box::pin(async move {
-                    let iam = attempt_init_iam_sys(store).await?;
-                    *recovered_iam
-                        .lock()
-                        .map_err(|_| std::io::Error::other("IAM recovery state poisoned"))? = Some(iam);
-                    Ok(())
-                })
+                Box::pin(async move { attempt_init_iam_sys(store).await })
             },
-            move || {
+            move |iam| {
                 let store = finalize_store.clone();
                 let kms_interface = finalize_kms_interface.clone();
+                let readiness = prepare_readiness.clone();
+                let server_ctx = finalize_server_ctx.clone();
+                Box::pin(prepare_iam_startup(iam, store, kms_interface, readiness, server_ctx))
+            },
+            move |topology_ready| {
                 let readiness = finalize_readiness.clone();
                 let state_manager = finalize_state_manager.clone();
-                let server_ctx = finalize_server_ctx.clone();
-                let iam = recovered_iam.lock().ok().and_then(|mut recovered| recovered.take());
                 Box::pin(async move {
-                    let iam = iam.ok_or_else(|| std::io::Error::other("IAM recovered but unavailable"))?;
-                    finalize_iam_recovery(iam, store, kms_interface, readiness, state_manager, server_ctx).await
+                    publish_runtime_ready_after_heal_topology(topology_ready, || async {
+                        publish_ready_when_runtime_ready(readiness.as_ref(), state_manager.as_deref()).await
+                    })
+                    .await
                 })
             },
         )
@@ -180,23 +180,27 @@ fn spawn_iam_recovery_task(
     });
 }
 
-type RecoveryFuture = Pin<Box<dyn Future<Output = Result<()>> + Send>>;
+type RecoveryFuture<T = ()> = Pin<Box<dyn Future<Output = Result<T>> + Send>>;
 
-async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
+async fn run_iam_recovery_loop<T, Prepared, InitFn, PrepareFn, FinalizeFn>(
     initial_interval: Duration,
     max_interval: Duration,
     shutdown_token: Option<tokio_util::sync::CancellationToken>,
     mut init_fn: InitFn,
+    mut prepare_fn: PrepareFn,
     mut finalize_fn: FinalizeFn,
 ) where
-    InitFn: FnMut() -> RecoveryFuture,
-    FinalizeFn: FnMut() -> RecoveryFuture,
+    T: Clone,
+    Prepared: Clone,
+    InitFn: FnMut() -> RecoveryFuture<T>,
+    PrepareFn: FnMut(T) -> RecoveryFuture<Prepared>,
+    FinalizeFn: FnMut(Prepared) -> RecoveryFuture,
 {
     let mut attempts: u64 = 0;
     let degraded_since = std::time::Instant::now();
 
-    // Phase 1: retry init until it succeeds
-    loop {
+    // Keep the initialized IAM owner across preparation/publication retries.
+    let recovered = loop {
         attempts += 1;
         let sleep_duration = compute_backoff_interval(attempts, initial_interval, max_interval);
         if let Some(token) = shutdown_token.as_ref() {
@@ -209,7 +213,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
         }
 
         match init_fn().await {
-            Ok(()) => {
+            Ok(recovered) => {
                 let degraded_secs = degraded_since.elapsed().as_secs();
                 info!(
                     event = EVENT_IAM_BOOTSTRAP_RECOVERED,
@@ -219,7 +223,7 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                     degraded_duration_secs = degraded_secs,
                     "IAM bootstrap recovered after startup; publishing IAM readiness"
                 );
-                break;
+                break recovered;
             }
             Err(err) => {
                 let next_interval = compute_backoff_interval(attempts + 1, initial_interval, max_interval);
@@ -250,13 +254,24 @@ async fn run_iam_recovery_loop<InitFn, FinalizeFn>(
                 }
             }
         }
-    }
+    };
 
-    // Phase 2: retry finalize until readiness is published
+    // Preparation claims the context once. Only publication retries after it.
+    let mut prepared: Option<Prepared> = None;
     let mut finalize_attempts: u64 = 0;
     loop {
+        let result = match prepared.as_ref() {
+            Some(prepared) => finalize_fn(prepared.clone()).await,
+            None => match prepare_fn(recovered.clone()).await {
+                Ok(value) => {
+                    prepared = Some(value);
+                    continue;
+                }
+                Err(error) => Err(error),
+            },
+        };
         finalize_attempts += 1;
-        match finalize_fn().await {
+        match result {
             Ok(()) => {
                 info!(
                     event = EVENT_IAM_READINESS_PUBLISHED,
@@ -384,11 +399,7 @@ pub(crate) async fn bootstrap_or_defer_iam_init(
 ) -> Result<IamBootstrapDisposition> {
     match attempt_init_iam_sys(store.clone()).await {
         Ok(iam) => {
-            let endpoint_pools = heal_control_endpoint_pools(store.as_ref())?;
-            AppContext::ensure_startup_after_iam(store, kms_interface, &server_ctx, iam)?;
-            let topology_ready =
-                publish_iam_ready_after_heal_topology(readiness.as_ref(), server_ctx.heal_topology_fingerprint(), endpoint_pools)
-                    .await?;
+            let topology_ready = prepare_iam_startup(iam, store, kms_interface, readiness, server_ctx).await?;
             return Ok(IamBootstrapDisposition::ReadyInline(topology_ready));
         }
         Err(err) => {
@@ -586,7 +597,7 @@ mod tests {
         let expected = crate::storage_api::startup::heal_control::heal_topology_fingerprint(&endpoint_pools)
             .expect("valid topology should hash");
 
-        publish_iam_ready_after_heal_topology(&readiness, Arc::clone(&cache), endpoint_pools)
+        publish_iam_ready_after_heal_topology(&readiness, Arc::clone(&cache), endpoint_pools, || Ok(()))
             .await
             .expect("topology initialization should publish IAM readiness");
 
@@ -599,6 +610,7 @@ mod tests {
             &failed_readiness,
             Arc::clone(&invalid_cache),
             EndpointServerPools::from(Vec::<PoolEndpoints>::new()),
+            || panic!("invalid topology must not claim the context"),
         )
         .await
         .expect_err("invalid topology must block IAM readiness");
@@ -628,7 +640,8 @@ mod tests {
                     Ok(())
                 })
             },
-            move || {
+            |()| Box::pin(async { Ok(()) }),
+            move |_| {
                 let finalize_calls = finalize_calls.clone();
                 Box::pin(async move {
                     let call = finalize_calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -671,7 +684,8 @@ mod tests {
                     }
                 })
             },
-            move || {
+            |()| Box::pin(async { Ok(()) }),
+            move |_| {
                 let readiness = readiness_for_finalize.clone();
                 let observed_iam_ready = observed_iam_ready_for_finalize.clone();
                 Box::pin(async move {
@@ -689,6 +703,197 @@ mod tests {
         assert_eq!(init_calls_for_assert.load(Ordering::SeqCst), 2);
         assert!(observed_iam_ready.load(Ordering::SeqCst));
         assert!(readiness.is_ready());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recovery_publication_timeout_reuses_the_installed_context() {
+        let context = crate::app::gating_test_env::shared_gating_ambient().await;
+        let server_ctx = ServerContextSlot::new();
+        // The legacy fixture exposes its real disks without instance endpoints.
+        let (paths, store) = crate::app::gating_test_env::shared_gating_ecstore_and_disk_paths().await;
+        assert!(Arc::ptr_eq(&store, &context.object_store()));
+        let endpoints = EndpointServerPools::from(vec![PoolEndpoints {
+            legacy: false,
+            set_count: 1,
+            drives_per_set: paths.len(),
+            endpoints: Endpoints::from(
+                paths
+                    .iter()
+                    .enumerate()
+                    .map(|(index, path)| {
+                        let mut endpoint =
+                            Endpoint::try_from(path.to_str().expect("fixture disk path")).expect("fixture endpoint");
+                        endpoint.set_pool_index(0);
+                        endpoint.set_set_index(0);
+                        endpoint.set_disk_index(index);
+                        endpoint
+                    })
+                    .collect::<Vec<_>>(),
+            ),
+            cmd_line: "recovery-publication-test".to_string(),
+            platform: String::new(),
+        }]);
+        crate::storage_api::startup::heal_control::initialize_heal_topology_fingerprint(
+            server_ctx.heal_topology_fingerprint(),
+            endpoints.clone(),
+        )
+        .await
+        .expect("prepare fixture fingerprint before pausing time");
+        // A fresh paused runtime keeps real fixture I/O and its timer-wheel
+        // rounding out of the exact retry/deadline observations below.
+        tokio::task::spawn_blocking(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .start_paused(true)
+                .build()
+                .expect("paused recovery runtime");
+            runtime.block_on(async move {
+                let readiness = Arc::new(GlobalReadiness::new());
+                let init_calls = Arc::new(AtomicUsize::new(0));
+                let prepare_calls = Arc::new(AtomicUsize::new(0));
+                let publish_calls = Arc::new(AtomicUsize::new(0));
+                let started = tokio::time::Instant::now();
+                let recovery = run_iam_recovery_loop(
+                    Duration::from_secs(5),
+                    Duration::from_secs(30),
+                    None,
+                    {
+                        let context = Arc::clone(&context);
+                        let calls = Arc::clone(&init_calls);
+                        move || {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let context = Arc::clone(&context);
+                            Box::pin(async move { Ok(context) })
+                        }
+                    },
+                    {
+                        let server_ctx = Arc::clone(&server_ctx);
+                        let readiness = Arc::clone(&readiness);
+                        let calls = Arc::clone(&prepare_calls);
+                        move |context| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            let server_ctx = Arc::clone(&server_ctx);
+                            let readiness = Arc::clone(&readiness);
+                            let endpoints = endpoints.clone();
+                            Box::pin(async move {
+                                publish_iam_ready_after_heal_topology(
+                                    readiness.as_ref(),
+                                    server_ctx.heal_topology_fingerprint(),
+                                    endpoints,
+                                    || server_ctx.try_install(context),
+                                )
+                                .await
+                            })
+                        }
+                    },
+                    {
+                        let readiness = Arc::clone(&readiness);
+                        let calls = Arc::clone(&publish_calls);
+                        move |prepared| {
+                            let attempt = calls.fetch_add(1, Ordering::SeqCst);
+                            let readiness = Arc::clone(&readiness);
+                            Box::pin(async move {
+                                let result = publish_runtime_ready_after_heal_topology(prepared, || async {
+                                    crate::server::wait_for_runtime_readiness_with(
+                                        Duration::from_secs(2),
+                                        Duration::from_secs(1),
+                                        || async move {
+                                            if attempt == 0 {
+                                                std::future::pending::<crate::shared_types::DependencyReadiness>().await
+                                            } else {
+                                                crate::shared_types::DependencyReadiness {
+                                                    storage_ready: true,
+                                                    iam_ready: true,
+                                                    lock_quorum_ready: true,
+                                                    peer_health_ready: true,
+                                                }
+                                            }
+                                        },
+                                        |_| readiness.mark_stage(SystemStage::FullReady),
+                                    )
+                                    .await
+                                })
+                                .await;
+                                if attempt == 0 {
+                                    assert!(result.is_err(), "the first publication must time out");
+                                    assert!(!readiness.is_ready(), "timeout cannot publish FullReady");
+                                }
+                                result
+                            })
+                        }
+                    },
+                );
+                tokio::time::timeout(Duration::from_secs(20), recovery)
+                    .await
+                    .expect("publication retry must succeed without attempting another context installation");
+                assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(prepare_calls.load(Ordering::SeqCst), 1);
+                assert_eq!(publish_calls.load(Ordering::SeqCst), 2);
+                assert_eq!(started.elapsed(), Duration::from_secs(12));
+                assert!(readiness.is_ready());
+                assert!(Arc::ptr_eq(&server_ctx.installed_app_context().expect("installed context"), &context));
+                assert_eq!(
+                    server_ctx
+                        .try_install(context)
+                        .expect_err("duplicate installs remain conflicts")
+                        .kind(),
+                    std::io::ErrorKind::AlreadyExists
+                );
+            });
+        })
+        .await
+        .expect("recovery model completes without panic");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn recovery_preparation_retries_reuse_the_initialized_owner() {
+        let owner = Arc::new(AtomicUsize::new(0));
+        let init_calls = Arc::new(AtomicUsize::new(0));
+        let publish_calls = Arc::new(AtomicUsize::new(0));
+        run_iam_recovery_loop(
+            Duration::from_secs(1),
+            Duration::from_secs(2),
+            None,
+            {
+                let owner = Arc::clone(&owner);
+                let calls = Arc::clone(&init_calls);
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let owner = Arc::clone(&owner);
+                    Box::pin(async move { Ok(owner) })
+                }
+            },
+            {
+                let expected = Arc::clone(&owner);
+                move |owner| {
+                    assert!(Arc::ptr_eq(&expected, &owner), "preparation must keep the same initialized IAM owner");
+                    Box::pin(async move {
+                        if owner.fetch_add(1, Ordering::SeqCst) == 0 {
+                            Err(Error::other("topology not ready"))
+                        } else {
+                            Ok(owner)
+                        }
+                    })
+                }
+            },
+            {
+                let calls = Arc::clone(&publish_calls);
+                move |owner| {
+                    let calls = Arc::clone(&calls);
+                    Box::pin(async move {
+                        assert_eq!(owner.load(Ordering::SeqCst), 2, "publication follows successful preparation");
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                }
+            },
+        )
+        .await;
+        assert_eq!(init_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(owner.load(Ordering::SeqCst), 2);
+        assert_eq!(publish_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(Arc::strong_count(&owner), 1, "loop releases its initialized and prepared owners");
     }
 
     #[tokio::test(start_paused = true)]
@@ -711,7 +916,8 @@ mod tests {
                             Err(Error::other("keep retrying"))
                         })
                     },
-                    move || Box::pin(async { Ok(()) }),
+                    |()| Box::pin(async { Ok(()) }),
+                    |()| Box::pin(async { Ok(()) }),
                 )
                 .await;
             }

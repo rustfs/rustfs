@@ -24,6 +24,8 @@
 
 ## Lifecycle rule limits and evaluation
 
+For native Azure configuration, protocol compatibility and the supported Stack Hub baseline, see [Azure Blob remote tiers](azure-blob-tiering.md).
+
 Each lifecycle rule supports at most one `Transition` and one `NoncurrentVersionTransition`. A version can make one initial transition; chaining additional tiers after it reaches `complete` is not supported. Splitting stages across overlapping rules does not enable a transition chain. `PutBucketLifecycleConfiguration` rejects multiple entries in either transition array with `InvalidArgument`, including in disabled rules. Existing stored multi-entry arrays are not executed; replace each with a single intended destination. Independent expiration actions in the rule remain eligible.
 
 `Expiration.Days` and `Expiration.Date` are mutually exclusive. A request containing both is rejected instead of silently selecting the date. When expiration and transition are both eligible, expiration takes precedence; a failed earlier transition does not keep an expired object indefinitely. Deadlines select the earliest action within the same action class.

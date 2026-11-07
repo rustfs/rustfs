@@ -446,6 +446,38 @@ fn validate_durable_dirty_usage_replay_scope(
     }
 }
 
+/// Validate scoped ACK capability without clearing dirty work or taking a
+/// metadata mutation fence. Storage owns the read-only incarnation guards.
+/// A successful probe returns zero cleared records and retains no guards.
+///
+/// # Errors
+/// Rejects lost incarnation fences, a changed process epoch, or zero,
+/// saturated, or future generations.
+pub fn probe_scoped_dirty_usage(
+    instance_id: &str,
+    entries: &[(&crate::storage_api::EcstoreScannerBucketIncarnationReadGuard, u64)],
+) -> std::result::Result<u64, ScannerDirtyUsageAckError> {
+    // Keep the generation observation ordered with dirty mutations. The probe
+    // neither changes this map nor acquires its scope/producer companion maps.
+    let _dirty = dirty_usage_buckets();
+    let checked = entries
+        .iter()
+        .map(|(guard, generation)| {
+            guard
+                .checked_bucket_incarnation()
+                .map(|(bucket, _)| (bucket, *generation))
+                .map_err(|_| ScannerDirtyUsageAckError::IncarnationUnavailable)
+        })
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    validate_scoped_dirty_usage_generation(
+        instance_id,
+        scanner_activity_epoch(),
+        DIRTY_USAGE_BUCKET_GENERATION.load(Ordering::Acquire),
+        &checked,
+    )?;
+    Ok(0)
+}
+
 /// A scoped ACK requires storage-owned lifecycle and incarnation fences.
 /// Callers must only send ACKs backed by durable per-bucket publication.
 pub fn acknowledge_scoped_dirty_usage(
@@ -512,16 +544,7 @@ fn apply_scoped_dirty_usage_ack(
     entries: &[(&str, u64)],
     probe_only: bool,
 ) -> std::result::Result<usize, ScannerDirtyUsageAckError> {
-    if instance_id != current_instance {
-        return Err(ScannerDirtyUsageAckError::ProcessChanged);
-    }
-    if current_generation == u64::MAX
-        || entries
-            .iter()
-            .any(|(_, generation)| *generation == 0 || *generation == u64::MAX || *generation > current_generation)
-    {
-        return Err(ScannerDirtyUsageAckError::InvalidGeneration);
-    }
+    validate_scoped_dirty_usage_generation(instance_id, current_instance, current_generation, entries)?;
     let mut cleared = 0;
     if !probe_only {
         for (bucket, generation) in entries {
@@ -533,6 +556,25 @@ fn apply_scoped_dirty_usage_ack(
         }
     }
     Ok(cleared)
+}
+
+fn validate_scoped_dirty_usage_generation(
+    instance_id: &str,
+    current_instance: &str,
+    current_generation: u64,
+    entries: &[(&str, u64)],
+) -> std::result::Result<(), ScannerDirtyUsageAckError> {
+    if instance_id != current_instance {
+        return Err(ScannerDirtyUsageAckError::ProcessChanged);
+    }
+    if current_generation == u64::MAX
+        || entries
+            .iter()
+            .any(|(_, generation)| *generation == 0 || *generation == u64::MAX || *generation > current_generation)
+    {
+        return Err(ScannerDirtyUsageAckError::InvalidGeneration);
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -622,6 +664,25 @@ mod scoped_dirty_usage_tests {
     use super::*;
     use crate::segment_invalidation::SegmentInvalidationProducerIdentity;
     use serial_test::serial;
+
+    #[test]
+    fn scoped_dirty_usage_probe_rejects_invalid_epoch_and_generation() {
+        assert_eq!(validate_scoped_dirty_usage_generation("p", "p", 8, &[("cold", 8)]), Ok(()));
+        assert_eq!(
+            validate_scoped_dirty_usage_generation("old", "new", 8, &[("cold", 8)]),
+            Err(ScannerDirtyUsageAckError::ProcessChanged)
+        );
+        for generation in [0, 9, u64::MAX] {
+            assert_eq!(
+                validate_scoped_dirty_usage_generation("p", "p", 8, &[("cold", 8), ("hot", generation)]),
+                Err(ScannerDirtyUsageAckError::InvalidGeneration)
+            );
+        }
+        assert_eq!(
+            validate_scoped_dirty_usage_generation("p", "p", u64::MAX, &[("cold", 8)]),
+            Err(ScannerDirtyUsageAckError::InvalidGeneration)
+        );
+    }
 
     #[test]
     fn scoped_dirty_usage_preserves_uncovered_newer_and_replayed_generations() {

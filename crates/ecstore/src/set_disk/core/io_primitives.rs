@@ -284,8 +284,9 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
             present_count += 1;
             let part = &parts[part_idx];
             let key = (part.etag.as_str(), part.number, part.size, part.actual_size, part.integrity.as_ref());
-            let (count, _) = part_quorum.entry(key).or_insert((0, part));
+            let (count, protected_count, _) = part_quorum.entry(key).or_insert((0, 0, part));
             *count += 1;
+            *protected_count += usize::from(part.encrypted_etag);
             continue;
         }
 
@@ -296,12 +297,16 @@ pub(in crate::set_disk) fn resolve_read_part_from_responses(
         }
     }
 
-    let max_part = part_quorum.values().max_by_key(|(count, _)| count);
-    let max_quorum = max_part.map_or(0, |(count, _)| *count).max(missing_count);
-    if let Some((count, part)) = max_part
+    let max_part = part_quorum.values().max_by_key(|(count, _, _)| count);
+    let max_quorum = max_part.map_or(0, |(count, _, _)| *count).max(missing_count);
+    if let Some((count, protected_count, part)) = max_part
         && *count >= read_quorum
     {
-        return Ok((*part).clone());
+        let mut part = (*part).clone();
+        // Older peers may omit the extension while agreeing on the part itself.
+        // Require independent proof quorum without reducing part availability.
+        part.encrypted_etag = *protected_count >= read_quorum;
+        return Ok(part);
     }
 
     if missing_count >= read_quorum {
@@ -13387,6 +13392,53 @@ mod tests {
             assert_eq!(part.number, 1, "{field}");
             assert_eq!(part.size, 100, "{field}");
             assert_eq!(part.actual_size, 90, "{field}");
+        }
+    }
+
+    #[test]
+    fn resolve_read_part_requires_matching_quorum_for_encrypted_etag_proof() {
+        let protected = ObjectPartInfo {
+            encrypted_etag: true,
+            ..read_part_test_part(1, "protected-etag")
+        };
+        let legacy = ObjectPartInfo {
+            encrypted_etag: false,
+            ..protected.clone()
+        };
+        for (parts, quorum, expected) in [
+            (vec![protected.clone(), legacy.clone(), legacy.clone()], 2, false),
+            (vec![legacy.clone(), protected.clone(), protected.clone()], 2, true),
+            (vec![protected.clone(), protected.clone(), legacy.clone(), legacy.clone()], 3, false),
+            (
+                vec![
+                    protected.clone(),
+                    ObjectPartInfo {
+                        etag: "other-generation".to_owned(),
+                        ..protected.clone()
+                    },
+                    legacy.clone(),
+                ],
+                2,
+                false,
+            ),
+            (
+                vec![
+                    protected.clone(),
+                    ObjectPartInfo {
+                        error: Some("read failed".to_owned()),
+                        ..protected.clone()
+                    },
+                    legacy,
+                ],
+                2,
+                false,
+            ),
+        ] {
+            let responses = parts.into_iter().map(|part| Some(vec![part])).collect::<Vec<_>>();
+            let part = resolve_read_part_from_responses("bucket", "upload/part.1.meta", 1, 0, 1, &responses, quorum)
+                .expect("matching metadata remains readable across producer versions");
+            assert_eq!(part.etag, protected.etag);
+            assert_eq!(part.encrypted_etag, expected);
         }
     }
 

@@ -1823,7 +1823,12 @@ impl DataUsageCache {
             return;
         };
 
-        if top_e.children.len() > 250_000 {
+        // Wide bucket roots previously only flattened above a hardcoded 250k
+        // fanout, so caches with 10k–250k direct children (common with many
+        // top-level prefixes) never shrank and retained one entry per prefix
+        // after #8971's non-root compaction. Honor `limit` here so completed
+        // sweeps and emergency compaction actually bound root fanout (#8961).
+        if top_e.children.len() > limit {
             self.reduce_children_of(&hash_path(&self.info.name), limit, true);
         }
         if self.cache.len() <= limit {

@@ -1149,6 +1149,8 @@ fn normalized_info(fi: &FileInfo, completion: bool) -> FileInfo {
             part.checksums = None;
             part.index = None;
             part.integrity = None;
+            // The completed object carries the aggregate proof in metadata.
+            part.encrypted_etag = false;
         }
     }
     fi
@@ -1739,6 +1741,12 @@ mod multipart_proof_authority_tests {
         completed.mod_time = Some(original.mod_time.unwrap() + time::Duration::seconds(1));
         completed.size = 15;
         completed.add_object_part(1, "etag".into(), 15, completed.mod_time, 15, None, None);
+        completed.parts[0].encrypted_etag = true;
+        rustfs_utils::http::metadata_compat::insert_str(
+            &mut completed.metadata,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+            "v1".to_owned(),
+        );
         let publication = condition.attach(&mut completed).unwrap();
         assert_eq!(publication.version_id, None);
         assert_eq!(
@@ -1748,6 +1756,11 @@ mod multipart_proof_authority_tests {
         );
         let mut read_completed = persist_null_fixture(&completed);
         assert_eq!(read_completed.version_id, None);
+        assert!(!read_completed.parts[0].encrypted_etag, "xl.meta stores the aggregate proof");
+        assert_eq!(
+            rustfs_utils::http::get_consistent_str(&read_completed.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+            Some("v1")
+        );
         let reread_publication = reread_condition.attach(&mut read_completed).unwrap();
         assert_eq!(
             publication, reread_publication,

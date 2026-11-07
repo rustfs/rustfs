@@ -523,6 +523,18 @@ fn data_usage_entry_has_progress(entry: &DataUsageEntry) -> bool {
     data_usage_root_has_progress(entry)
 }
 
+/// Root-fanout limit for `DataUsageCache::force_compact` at the end of a sweep.
+///
+/// An interrupted sweep still has to seal its resume frontier, so it keeps the
+/// emergency ceiling. A finished walk applies the ordinary child limit.
+fn force_compact_limit_for_sweep(interrupted: bool) -> usize {
+    if interrupted {
+        DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS
+    } else {
+        DATA_SCANNER_COMPACT_AT_CHILDREN
+    }
+}
+
 fn set_scan_checkpoint(cache: &mut DataUsageCache, reason: DataUsageScanCheckpointReason) {
     let resume_after = clone_cache_value(&cache.info.scan_resume_after).or_else(|| {
         cache
@@ -1415,7 +1427,7 @@ impl FolderScanner {
         mode: FolderScanMode,
     ) -> Result<FolderScanOutcome, ScannerError> {
         if self.checkpoint_tx.is_none() || self.old_cache.info.scan_progress.is_none() {
-            return Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+            return Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode, false)).await;
         }
         let depth = self.checkpoint_depth;
         if depth >= MAX_DATA_USAGE_CACHE_DEPTH {
@@ -1429,7 +1441,7 @@ impl FolderScanner {
         std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
         std::mem::swap(parent_entry, &mut self.checkpoint_ancestors[depth].entry);
         self.checkpoint_depth += 1;
-        let result = Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode)).await;
+        let result = Box::pin(self.scan_folder_inner(ctx, folder, child_entry, mode, false)).await;
         self.checkpoint_depth -= 1;
         // Restore the parent before cancellation/error handling stitches partial work.
         std::mem::swap(parent_hash, &mut self.checkpoint_ancestors[depth].hash);
@@ -1850,7 +1862,7 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
     ) -> Result<(), ScannerError> {
-        self.scan_folder_inner(ctx, folder, into, FolderScanMode::Namespace)
+        self.scan_folder_inner(ctx, folder, into, FolderScanMode::Namespace, false)
             .await
             .map(|_| ())
     }
@@ -1863,6 +1875,7 @@ impl FolderScanner {
         folder: CachedFolder,
         into: &mut DataUsageEntry,
         mode: FolderScanMode,
+        isolate_compacted_namespace_errors: bool,
     ) -> Result<FolderScanOutcome, ScannerError> {
         let done_folder = Metrics::time(Metric::ScanFolder);
         let trace_started_at = trace_start_instant();
@@ -2533,13 +2546,23 @@ impl FolderScanner {
             }
 
             // Checkpointed sweeps need child entries to validate their resume
-            // frontier. Keep the emergency compaction limit for large trees.
-            let should_compact = (self.new_cache.info.name != folder.name
-                && self.old_cache.info.scan_progress.is_none()
-                && queued_folders.len() >= DATA_SCANNER_COMPACT_AT_FOLDERS)
-                || queued_folders.len() >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
-
+            // frontier (#8292). Outside that, also compact a wide bucket root:
+            // excluding it left #8961's ~170k top-level prefixes unbounded until
+            // the emergency 250k ceiling. Keep FORCE as the absolute backstop.
+            let is_scan_root = folder.name == self.old_cache.info.name;
+            let forward_sweep = self.old_cache.info.scan_progress.is_some();
             let total_folders = queued_folders.len();
+            let force_compact = total_folders >= DATA_SCANNER_FORCE_COMPACT_AT_FOLDERS;
+            // Reused root children still have links in the new cache.
+            let should_compact = force_compact
+                || (!forward_sweep
+                    && total_folders >= DATA_SCANNER_COMPACT_AT_FOLDERS
+                    && (!is_scan_root || into.children.is_empty()));
+            // Preserve the ordinary namespace walk's child isolation when the
+            // root starts sharing one accumulator across its descendants.
+            let isolate_compacted_children =
+                isolate_compacted_namespace_errors || (is_scan_root && !into.compacted && should_compact && !force_compact);
+
             self.alert_excessive_folders(&folder.name, total_folders);
 
             if !into.compacted && should_compact {
@@ -2562,7 +2585,6 @@ impl FolderScanner {
                 }
             }
 
-            let is_scan_root = folder.name == self.old_cache.info.name;
             let scan_checkpoint = self.old_cache.info.scan_checkpoint.as_ref();
             let checkpoint_resume_after = scan_checkpoint.and_then(|checkpoint| {
                 if is_scan_root {
@@ -2586,7 +2608,6 @@ impl FolderScanner {
                 .is_some_and(|resume_match| matches!(resume_match, FolderResumeMatch::Descendant));
             let scan_resume_after = checkpoint_resume_after.or(self.old_cache.info.scan_resume_after.as_deref());
             let has_queued_folders = !queued_folders.is_empty();
-            let forward_sweep = self.old_cache.info.scan_progress.is_some();
             let resume_order = if forward_sweep {
                 order_queued_folders_for_resume(&mut queued_folders, None)
             } else {
@@ -2689,19 +2710,52 @@ impl FolderScanner {
 
                 (self.update_current_path)(&folder_item.name).await;
 
-                let outcome = if into.compacted {
-                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode)).await?
+                // Keep a compacted namespace child's accounting local until it
+                // succeeds. Ordinary child errors can then discard it without
+                // rolling back totals already committed by healthy siblings.
+                let isolate_compacted_child =
+                    into.compacted && isolate_compacted_children && child_mode == FolderScanMode::Namespace;
+                let outcome = if into.compacted && !isolate_compacted_child {
+                    // Keep the shared-accumulator path free of child summaries.
+                    Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), into, child_mode, false)).await?
                 } else {
-                    let mut dst = DataUsageEntry::default();
-                    match self
-                        .scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst, child_mode)
-                        .await
-                    {
-                        Ok(outcome) => outcome,
+                    let mut dst = DataUsageEntry {
+                        compacted: isolate_compacted_child,
+                        ..Default::default()
+                    };
+                    // Provisional child usage must not escape through progress
+                    // updates before this accumulator is committed to its parent.
+                    let suspended_updates = if isolate_compacted_child {
+                        self.usage_updates.take()
+                    } else {
+                        None
+                    };
+                    let result = if isolate_compacted_child {
+                        Box::pin(self.scan_folder_inner(ctx.clone(), folder_item.clone(), &mut dst, child_mode, true)).await
+                    } else {
+                        self.scan_child_folder(ctx.clone(), folder_item.clone(), &mut this_hash, into, &mut dst, child_mode)
+                            .await
+                    };
+                    if isolate_compacted_child {
+                        self.usage_updates = suspended_updates;
+                    }
+                    match result {
+                        Ok(outcome) => {
+                            if isolate_compacted_child {
+                                into.merge(&dst);
+                            }
+                            outcome
+                        }
                         Err(e) => {
                             if ctx.is_cancelled() || matches!(&e, ScannerError::ResourceDeferred) {
-                                self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
-                                    .await;
+                                if isolate_compacted_child {
+                                    // Cancellation and resource deferral keep completed
+                                    // work even though the child has not finished.
+                                    into.merge(&dst);
+                                } else {
+                                    self.preserve_partial_child_progress(&folder_item.parent, &h, into, &dst)
+                                        .await;
+                                }
                                 return Err(e);
                             }
                             if child_mode != FolderScanMode::Namespace {
@@ -2712,13 +2766,15 @@ impl FolderScanner {
                                 event = EVENT_SCANNER_FOLDER_STATE,
                                 component = LOG_COMPONENT_SCANNER,
                                 subsystem = LOG_SUBSYSTEM_FOLDER,
+                                state = "child_scan_failed",
                                 folder = %folder.name,
                                 child_folder = %folder_item.name,
-                                state = "child_scan_failed",
                                 error = %e,
                                 "Scanner child folder scan failed"
                             );
-                            self.coverage_gap |= forward_sweep;
+                            // A skipped namespace is a coverage gap even when no
+                            // checkpointed forward sweep is active.
+                            self.coverage_gap = true;
                             self.finish_raw_enumeration_parent(&folder_item.name);
                             continue;
                         }
@@ -3204,13 +3260,24 @@ impl FolderScanner {
         self.compact_completed_folder(&folder, &this_hash, into);
 
         // Compact if too many children...
+        // Allow compact_self on the bucket root when this is not a checkpointed
+        // forward sweep so wide roots can flatten instead of retaining one
+        // entry per top-level prefix (#8961). Checkpointed sweeps keep the
+        // previous root exclusion so resume frontiers stay addressable (#8292).
         if !into.compacted {
             let done_compact = Metrics::time(Metric::CompactFolder);
-            self.new_cache.reduce_children_of(
-                &this_hash,
-                DATA_SCANNER_COMPACT_AT_CHILDREN,
-                self.new_cache.info.name != folder.name,
-            );
+            let compact_self = self.new_cache.info.name != folder.name || self.old_cache.info.scan_progress.is_none();
+            self.new_cache
+                .reduce_children_of(&this_hash, DATA_SCANNER_COMPACT_AT_CHILDREN, compact_self);
+            // The root accumulator is also used by interruption handling.
+            // Reduction may have removed all its old child links, so publish
+            // the aggregate there before any cancellation-prone flush wait.
+            if folder.parent.is_none()
+                && let Some(root) = self.new_cache.cache.get(&this_hash.0)
+                && root.compacted
+            {
+                into.clone_from(root);
+            }
             done_compact();
         }
 
@@ -3224,6 +3291,8 @@ impl FolderScanner {
         }
 
         if folder.parent.is_none() {
+            #[cfg(test)]
+            tests::checkpoint_fixture::deep_compacted::cancel_at_root_flush(&self.root, &self.new_cache, &ctx);
             wait_for_scanner_io(&ctx, self.sleeper.flush_pacing(&mut self.pacing_debt)).await?;
         }
         self.finish_size_reconciliation_batch();
@@ -3415,7 +3484,7 @@ pub(crate) async fn scan_data_folder_scoped(
             let coverage_gap = scanner.coverage_gap;
             scanner.reconcile_failed_objects_after_full_scan();
             let new_cache = scanner.as_mut_new_cache();
-            new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
+            new_cache.force_compact(force_compact_limit_for_sweep(false));
             new_cache.info.last_update = Some(SystemTime::now());
             new_cache.info.next_cycle = next_cycle;
             let unresolved_objects = coverage_gap
@@ -3437,6 +3506,9 @@ pub(crate) async fn scan_data_folder_scoped(
                     progress.started_plan = progress.requested_plan;
                     new_cache.info.scan_plan_digest = None;
                 }
+            } else if coverage_gap {
+                // Legacy sampling must not certify an incomplete namespace.
+                new_cache.info.scan_plan_digest = None;
             }
             let had_scan_checkpoint = had_scan_checkpoint || new_cache.info.scan_checkpoint.is_some();
             new_cache.info.scan_resume_after = None;
@@ -3482,6 +3554,7 @@ pub(crate) async fn scan_data_folder_scoped(
                 let root_hash = hash_path(&bucket_name);
                 let root_has_progress = data_usage_root_has_progress(&root);
                 let pending_heals_changed = scanner.pending_heals_changed;
+                let legacy_coverage_gap = scanner.coverage_gap && scanner.old_cache.info.scan_progress.is_none();
                 let raw_enumeration_path_page_indexes = scanner.raw_enumeration_path_page_indexes();
                 let (raw_enumeration_cursor, raw_enumeration_page_index) = scanner.take_raw_enumeration_resume_state();
                 let carry_forward_cache = ((raw_enumeration_cursor.is_some() || raw_enumeration_page_index.is_some())
@@ -3516,11 +3589,20 @@ pub(crate) async fn scan_data_folder_scoped(
                     || !new_cache.info.size_reconciliation.is_empty()
                 {
                     if new_cache.root().is_some() {
-                        new_cache.force_compact(DATA_SCANNER_COMPACT_AT_CHILDREN);
+                        // Interrupted sweeps seal a resume frontier after this.
+                        // Flattening the root at the ordinary 10k limit would
+                        // drop frontier-named children and force the next cycle
+                        // to replay completed prefixes (#8292 / review on #9193).
+                        // Keep only the emergency FORCE ceiling here; successful
+                        // completions above apply DATA_SCANNER_COMPACT_AT_CHILDREN.
+                        new_cache.force_compact(force_compact_limit_for_sweep(true));
                     }
                     new_cache.info.last_update = Some(SystemTime::now());
                     new_cache.info.next_cycle = next_cycle;
                     new_cache.info.snapshot_complete = false;
+                    if legacy_coverage_gap {
+                        new_cache.info.scan_plan_digest = None;
+                    }
                     if root_has_progress {
                         set_scan_checkpoint(new_cache, checkpoint_reason_from_budget(budget.reason()));
                     }

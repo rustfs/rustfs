@@ -1346,6 +1346,7 @@ impl<'a> BorrowedMetaObject<'a> {
                             checksums: None,
                             error: None,
                             integrity: None,
+                            encrypted_etag: false,
                         });
                     }
                 }
@@ -2625,6 +2626,7 @@ impl From<MetaObjectV1Part> for ObjectPartInfo {
             checksums: value.checksums,
             error: value.error,
             integrity: None,
+            encrypted_etag: false,
         }
     }
 }
