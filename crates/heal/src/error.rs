@@ -58,7 +58,7 @@ pub enum Error {
     TaskExecutionFailed { message: String },
 
     /// Only the qualified MRF Deep check may produce this terminal result.
-    #[error("Heal task execution failed: Missing exact storage proof for durable MRF repair {target}")]
+    #[error("Independent verification unavailable for legacy object {target}; durable MRF responsibility retained")]
     LegacyMrfUnverified { target: String },
 
     #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]

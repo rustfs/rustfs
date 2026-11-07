@@ -2348,6 +2348,10 @@ impl FolderScanner {
                     continue;
                 }
 
+                // Budget and admission waits already pace this walker. Charge
+                // only work performed after admission, never those waits again.
+                let mut work_elapsed = work_started.elapsed();
+
                 // Reuse a resolved symlink's size; otherwise admit the size
                 // stat only when the byte budget needs it.
                 let budgeted_bytes = if self.sleeper.budgets_disk_io_bytes() {
@@ -2357,7 +2361,12 @@ impl FolderScanner {
                         wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, 0)).await?;
                         wait_for_scanner_io(
                             &ctx,
-                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, native_io::metadata(&item.path)),
+                            run_scanner_node_operation(self.node_admission.as_ref(), &ctx, async {
+                                let started = tokio::time::Instant::now();
+                                let result = native_io::metadata(&item.path).await;
+                                work_elapsed = work_elapsed.saturating_add(started.elapsed());
+                                result
+                            }),
                         )
                         .await??
                         .map(|metadata| metadata.len())
@@ -2369,6 +2378,7 @@ impl FolderScanner {
                 wait_for_scanner_io(&ctx, self.sleeper.admit_disk_io(1, budgeted_bytes)).await?;
 
                 let size_result = run_scanner_metadata_operation(self.node_admission.as_ref(), &ctx, async {
+                    let started = tokio::time::Instant::now();
                     self.object_metadata_visits.increment(1);
                     #[cfg(feature = "diagnostic-prefix-attribution")]
                     if let Some(attribution) = &self.prefix_attribution {
@@ -2384,9 +2394,11 @@ impl FolderScanner {
                     {
                         attribution.record_success(&item.bucket, &item.prefix);
                     }
+                    work_elapsed = work_elapsed.saturating_add(started.elapsed());
                     result
                 })
                 .await?;
+                let work_started = tokio::time::Instant::now();
                 if self.node_admission.is_some() && ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
                 }
@@ -2483,8 +2495,12 @@ impl FolderScanner {
                             }
                         }
 
-                        wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed()))
-                            .await?;
+                        wait_for_scanner_io(
+                            &ctx,
+                            self.sleeper
+                                .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
+                        )
+                        .await?;
                         continue;
                     }
                 };
@@ -2507,7 +2523,12 @@ impl FolderScanner {
                 self.checkpoint_objects = self.checkpoint_objects.saturating_add(1);
                 self.maybe_send_checkpoint(&folder, &this_hash, into);
 
-                wait_for_scanner_io(&ctx, self.sleeper.pace_object(&mut self.pacing_debt, work_started.elapsed())).await?;
+                wait_for_scanner_io(
+                    &ctx,
+                    self.sleeper
+                        .pace_object(&mut self.pacing_debt, work_elapsed.saturating_add(work_started.elapsed())),
+                )
+                .await?;
 
                 if ctx.is_cancelled() {
                     return Err(ScannerError::Other("Operation cancelled".to_string()));
