@@ -25,6 +25,7 @@ use crate::services::tier::{
     tier_handlers::{ERR_TIER_BUCKET_NOT_FOUND, ERR_TIER_INVALID_CREDENTIALS, ERR_TIER_NOT_FOUND, ERR_TIER_PERM_ERR},
     warm_backend_aliyun::WarmBackendAliyun,
     warm_backend_azure::WarmBackendAzure,
+    warm_backend_azure_blob::{AzureBlobError, WarmBackendAzureBlob},
     warm_backend_huaweicloud::WarmBackendHuaweicloud,
     warm_backend_minio::WarmBackendMinIO,
     warm_backend_r2::WarmBackendR2,
@@ -309,10 +310,10 @@ pub fn build_transition_put_options(storage_class: String, mut metadata: HashMap
 
 /// Connection parameters every S3-compatible warm backend provider supplies.
 ///
-/// The Aliyun, Azure, Huaweicloud, Tencent, MinIO, R2, and RustFS backends all
+/// The Aliyun, legacy Azure, Huaweicloud, Tencent, MinIO, R2, and RustFS backends all
 /// wrap [`WarmBackendS3`] around a statically-credentialed [`TransitionClient`]
 /// built from exactly these values. `bucket_lookup` is a parameter rather than a
-/// constant because the providers split into two families: Aliyun, Azure,
+/// constant because the providers split into two families: Aliyun, legacy Azure,
 /// Huaweicloud, and Tencent pin [`BucketLookupType::BucketLookupDNS`], while
 /// MinIO, R2, and RustFS leave it at [`BucketLookupType::BucketLookupAuto`].
 pub(crate) struct S3CompatibleWarmBackendParams<'a> {
@@ -673,6 +674,9 @@ fn probe_cleanup_incomplete_error() -> AdminError {
 }
 
 fn is_remote_tier_auth_rejection(err: &std::io::Error) -> bool {
+    if AzureBlobError::from_io(err).is_some() && err.kind() == std::io::ErrorKind::PermissionDenied {
+        return true;
+    }
     let Some(response) = err.get_ref().and_then(|err| err.downcast_ref::<ErrorResponse>()) else {
         return false;
     };
@@ -706,10 +710,27 @@ async fn check_warm_backend_with_deadlines(
         Ok(Err(err)) if is_remote_tier_auth_rejection(&err) => {
             return Err(ERR_TIER_INVALID_CREDENTIALS.clone());
         }
-        Ok(Err(_)) => {
+        Ok(Err(err)) => {
+            if let Some(rejection) = AzureBlobError::from_io(&err).filter(|error| error.rejects_write()) {
+                let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                admin_err.message = rejection.to_string();
+                return Err(admin_err);
+            }
             return Err(match compensate_uncertain_probe_put(w, &probe_object, cleanup_deadline).await {
-                Ok(()) => ERR_TIER_PERM_ERR.clone(),
-                Err(_) => probe_cleanup_incomplete_error(),
+                Ok(()) => {
+                    let mut admin_err = ERR_TIER_PERM_ERR.clone();
+                    if let Some(original) = AzureBlobError::from_io(&err) {
+                        admin_err.message = original.to_string();
+                    }
+                    admin_err
+                }
+                Err(_) => {
+                    let mut admin_err = probe_cleanup_incomplete_error();
+                    if let Some(original) = AzureBlobError::from_io(&err) {
+                        admin_err.message.push_str(&format!(": {original}"));
+                    }
+                    admin_err
+                }
             });
         }
         Err(_) => {
@@ -951,24 +972,23 @@ pub async fn new_warm_backend(tier: &TierConfig, probe: bool) -> Result<WarmBack
             }
         }
         TierType::Azure => {
-            if let Some(azure_config) = tier.azure.as_ref() {
-                let dd = WarmBackendAzure::new(azure_config, &tier.name).await;
-                if let Err(err) = dd {
-                    warn!("{}", err);
-                    return Err(AdminError {
-                        code: "XRustFSAdminTierInvalidConfig".to_string(),
-                        message: format!("Unable to setup remote tier, check tier configuration: {err}"),
-                        status_code: StatusCode::BAD_REQUEST,
-                    });
-                }
-                d = Some(Box::new(dd.expect("Failed to create Azure backend")));
+            let azure = tier.azure.as_ref().ok_or_else(|| AdminError {
+                code: "XRustFSAdminTierInvalidConfig".to_string(),
+                message: "Azure tier configuration not found".to_string(),
+                status_code: StatusCode::BAD_REQUEST,
+            })?;
+            let driver = if tier.is_native_azure() {
+                WarmBackendAzureBlob::new(azure).map(|driver| -> WarmBackendImpl { Box::new(driver) })
             } else {
-                return Err(AdminError {
-                    code: "XRustFSAdminTierInvalidConfig".to_string(),
-                    message: "Azure tier configuration not found".to_string(),
-                    status_code: StatusCode::BAD_REQUEST,
-                });
-            }
+                WarmBackendAzure::new(azure, &tier.name)
+                    .await
+                    .map(|driver| -> WarmBackendImpl { Box::new(driver) })
+            };
+            d = Some(driver.map_err(|err| AdminError {
+                code: "XRustFSAdminTierInvalidConfig".to_string(),
+                message: format!("Unable to setup remote tier, check tier configuration: {err}"),
+                status_code: StatusCode::BAD_REQUEST,
+            })?);
         }
         #[cfg(not(feature = "gcs"))]
         TierType::GCS => {
@@ -1042,6 +1062,13 @@ pub(crate) async fn new_transition_candidate_reconciler(
     tier: &TierConfig,
 ) -> Result<Option<Box<dyn TransitionCandidateReconciler + Send + Sync + 'static>>, AdminError> {
     let reconciler: Box<dyn TransitionCandidateReconciler + Send + Sync + 'static> = match tier.tier_type {
+        TierType::Azure if tier.is_native_azure() => Box::new(
+            WarmBackendAzureBlob::new(tier.azure.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?).map_err(|err| {
+                let mut admin_err = ERR_TIER_INVALID_CONFIG.clone();
+                admin_err.message = err.to_string();
+                admin_err
+            })?,
+        ),
         TierType::S3 => Box::new(
             WarmBackendS3::new(tier.s3.as_ref().ok_or_else(|| ERR_TIER_INVALID_CONFIG.clone())?, &tier.name)
                 .await

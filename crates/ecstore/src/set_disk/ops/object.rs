@@ -20461,7 +20461,7 @@ mod transition_upload_integrity_tests {
         assert_local_source_intact(&set_disks, bucket, object, &payload).await;
     }
 
-    #[tokio::test(flavor = "multi_thread")]
+    #[tokio::test(flavor = "current_thread")]
     #[serial_test::serial]
     async fn commit_lock_acquire_failure_cleans_remote_candidate_and_preserves_source() {
         let manager = Arc::new(rustfs_lock::GlobalLockManager::new());
@@ -20470,7 +20470,16 @@ mod transition_upload_integrity_tests {
         let bucket = "transition-lock-acquire-failure-bucket";
         let object = "object.bin";
         let payload = b"transition commit lock failure must clean the remote candidate".repeat(1024);
-        let original = write_source(&set_disks, &disk_stores, bucket, object, &payload).await;
+        let original = temp_env::async_with_vars(
+            [(
+                crate::set_disk::core::io_primitives::ENV_RUSTFS_PUT_RENAME_EARLY_ACK_ENABLE,
+                Some("false"),
+            )],
+            async { write_source(&set_disks, &disk_stores, bucket, object, &payload).await },
+        )
+        .await;
+        // Complete source I/O before controlling the quorum retry deadline.
+        tokio::time::pause();
         let tier_name = format!("COLDTIER{}", &Uuid::new_v4().simple().to_string()[..8]).to_uppercase();
         let backend = register_mock_tier(&runtime_sources::global_tier_config_mgr(), &tier_name).await;
         let _setup_type_guard = SetupTypeGuard::switch_to(SetupType::DistErasure).await;
@@ -20482,13 +20491,8 @@ mod transition_upload_integrity_tests {
             .await
             .expect_err("transition must fail when the commit namespace write lock cannot reach quorum");
         assert!(
-            matches!(
-                error,
-                StorageError::NamespaceLockQuorumUnavailable { .. }
-                    | StorageError::Lock(LockError::QuorumNotReached { .. })
-                    | StorageError::Lock(LockError::Internal { .. })
-            ),
-            "unexpected transition lock-acquire error: {error:?}"
+            matches!(error, StorageError::NamespaceLockQuorumUnavailable { required: 2, .. }),
+            "the injected permanent quorum failure must reach the transition commit boundary: {error:?}"
         );
         assert_eq!(
             backend.put_count().await,

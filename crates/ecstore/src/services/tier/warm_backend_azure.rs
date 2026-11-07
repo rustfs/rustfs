@@ -88,7 +88,7 @@ impl WarmBackend for WarmBackendAzure {
     }
 
     async fn probe_transition_candidate(&self, object: &str) -> Result<TransitionCandidateProbe, std::io::Error> {
-        // Azure currently uses the shared S3/SigV4 transport, but its normal
+        // Legacy Azure uses the shared S3/SigV4 transport, but its normal
         // object path cannot persist exact remote versions across mixed
         // RustFS releases. The mutation probe may still detect and precisely
         // remove a versioned test object before rejecting that configuration.
