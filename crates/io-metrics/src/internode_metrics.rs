@@ -430,6 +430,8 @@ const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
 const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
 const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_internode_operation_server_duration_ms";
+const INTERNODE_RPC_ACTIVE: &str = "rustfs_system_network_internode_rpc_active";
+const INTERNODE_RPC_COMPLETIONS_TOTAL: &str = "rustfs_system_network_internode_rpc_completions_total";
 const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
@@ -463,6 +465,8 @@ pub struct InternodeOperationMetricDescriptor {
 }
 
 const SERVER_OPERATION_BACKEND_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL];
+const SERVER_OPERATION_BACKEND_SIDE_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "side"];
+const SERVER_OPERATION_BACKEND_OUTCOME_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, "outcome"];
 const SERVER_OPERATION_BACKEND_CLASSIFICATION_LABELS: &[&str] =
     &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, CLASSIFICATION_LABEL];
 const SERVER_OPERATION_BACKEND_HTTP_VERSION_LABELS: &[&str] = &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL, HTTP_VERSION_LABEL];
@@ -567,6 +571,14 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         name: INTERNODE_OPERATION_SERVER_DURATION_MS,
         labels: SERVER_OPERATION_BACKEND_LABELS,
     },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_RPC_ACTIVE,
+        labels: SERVER_OPERATION_BACKEND_SIDE_LABELS,
+    },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_RPC_COMPLETIONS_TOTAL,
+        labels: SERVER_OPERATION_BACKEND_OUTCOME_LABELS,
+    },
 ];
 
 static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
@@ -596,6 +608,148 @@ impl InternodeServerMetricHandles {
 #[cfg(not(test))]
 static INTERNODE_SERVER_METRIC_HANDLES: LazyLock<InternodeServerMetricHandles> =
     LazyLock::new(|| InternodeServerMetricHandles::new(current_server_label()));
+
+/// Measures a unary handler from entry through its returned response or cancellation. The
+/// handler metric is separate from client round trips, which include transport and body decode.
+pub struct InternodeRpcDurationGuard {
+    started_at: Instant,
+    handles: UnaryRpcMetricHandles,
+    outcome: RpcOutcome,
+}
+
+#[derive(Clone)]
+struct UnaryRpcMetricHandles {
+    duration: metrics::Histogram,
+    active: metrics::Gauge,
+    completion: Option<(metrics::Counter, metrics::Counter, metrics::Counter)>,
+}
+
+#[derive(Clone, Copy)]
+enum RpcOutcome {
+    Success,
+    Error,
+    Cancelled,
+}
+
+impl UnaryRpcMetricHandles {
+    fn new(operation: &'static str, client: bool, detailed: bool) -> Self {
+        let server = current_server_label();
+        let duration_name = if client {
+            INTERNODE_OPERATION_DURATION_MS
+        } else {
+            INTERNODE_OPERATION_SERVER_DURATION_MS
+        };
+        let duration = metrics::histogram!(
+            duration_name,
+            SERVER_LABEL => server, OPERATION_LABEL => operation, BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC
+        );
+        let active = if detailed {
+            metrics::gauge!(
+                INTERNODE_RPC_ACTIVE,
+                SERVER_LABEL => server, OPERATION_LABEL => operation, BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC,
+                "side" => if client { "client" } else { "server" }
+            )
+        } else {
+            metrics::Gauge::noop()
+        };
+        let completion = (client && detailed).then(|| {
+            let counter = |outcome| {
+                metrics::counter!(
+                    INTERNODE_RPC_COMPLETIONS_TOTAL,
+                    SERVER_LABEL => server, OPERATION_LABEL => operation,
+                    BACKEND_LABEL => INTERNODE_TRANSPORT_BACKEND_GRPC, "outcome" => outcome
+                )
+            };
+            (counter("success"), counter("error"), counter("cancelled"))
+        });
+        Self {
+            duration,
+            active,
+            completion,
+        }
+    }
+}
+
+// Register once after recorder installation and node identity publication. Before that point,
+// use uncached handles so startup no-op instruments cannot poison the process-lifetime cache.
+#[cfg(not(test))]
+fn cached_unary_rpc_handles(operation: &'static str, client: bool) -> Option<UnaryRpcMetricHandles> {
+    const OPERATIONS: [&str; 4] = [
+        INTERNODE_OPERATION_GRPC_READ_ALL,
+        INTERNODE_OPERATION_GRPC_WRITE_ALL,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+    ];
+    static CLIENT: LazyLock<[UnaryRpcMetricHandles; 4]> =
+        LazyLock::new(|| OPERATIONS.map(|op| UnaryRpcMetricHandles::new(op, true, true)));
+    static SERVER: LazyLock<[UnaryRpcMetricHandles; 4]> =
+        LazyLock::new(|| OPERATIONS.map(|op| UnaryRpcMetricHandles::new(op, false, true)));
+    if !crate::metrics_enabled() {
+        return None;
+    }
+    STABLE_SERVER_LABEL.get()?;
+    let index = OPERATIONS.iter().position(|candidate| *candidate == operation)?;
+    Some(if client {
+        CLIENT[index].clone()
+    } else {
+        SERVER[index].clone()
+    })
+}
+
+impl InternodeRpcDurationGuard {
+    /// Start timing a server handler. `operation` must be a bounded RPC operation constant.
+    pub fn handler(operation: &'static str) -> Self {
+        Self::new(operation, false)
+    }
+
+    fn new(operation: &'static str, client: bool) -> Self {
+        #[cfg(not(test))]
+        let handles = cached_unary_rpc_handles(operation, client)
+            .unwrap_or_else(|| UnaryRpcMetricHandles::new(operation, client, crate::metrics_enabled()));
+        #[cfg(test)]
+        let handles = UnaryRpcMetricHandles::new(operation, client, crate::metrics_enabled());
+        handles.active.increment(1.0);
+        Self {
+            started_at: Instant::now(),
+            handles,
+            outcome: RpcOutcome::Cancelled,
+        }
+    }
+}
+
+impl Drop for InternodeRpcDurationGuard {
+    fn drop(&mut self) {
+        self.handles.duration.record(self.started_at.elapsed().as_secs_f64() * 1000.0);
+        self.handles.active.decrement(1.0);
+        if let Some((success, error, cancelled)) = &self.handles.completion {
+            match self.outcome {
+                RpcOutcome::Success => success,
+                RpcOutcome::Error => error,
+                RpcOutcome::Cancelled => cancelled,
+            }
+            .increment(1);
+        }
+    }
+}
+
+/// Measure one complete client unary attempt, including body consumption by the supplied
+/// future. Dropping a pending attempt records its elapsed time. General metrics enable the
+/// active gauge and success/error/cancelled completion counters alongside the duration.
+/// Transport deadlines returned by the future are errors; outer deadlines cancel the attempt.
+/// Retries should call this once per attempt. `operation` must be a bounded RPC constant.
+pub async fn measure_client_rpc<T, E>(
+    operation: &'static str,
+    future: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let mut guard = InternodeRpcDurationGuard::new(operation, true);
+    let result = future.await;
+    guard.outcome = if result.is_ok() {
+        RpcOutcome::Success
+    } else {
+        RpcOutcome::Error
+    };
+    result
+}
 
 #[cfg(not(test))]
 struct GrpcReadVersionMetricHandles {
@@ -1618,6 +1772,83 @@ mod tests {
     use std::collections::{HashMap, HashSet};
 
     #[test]
+    fn unary_rpc_metrics_separate_handler_and_client_and_cover_cancellation() {
+        use std::future::{Future, pending};
+        use std::task::{Context, Poll, Waker};
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        let previously_enabled = crate::metrics_enabled();
+        crate::set_metrics_enabled(true);
+        with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            runtime.block_on(async {
+                let operation = INTERNODE_OPERATION_GRPC_READ_MULTIPLE;
+                assert_eq!(measure_client_rpc(operation, async { Ok::<_, ()>(7) }).await, Ok(7));
+                assert_eq!(measure_client_rpc(operation, async { Err::<(), _>("transport") }).await, Err("transport"));
+                let mut cancelled = Box::pin(measure_client_rpc(operation, pending::<Result<(), ()>>()));
+                assert!(matches!(cancelled.as_mut().poll(&mut Context::from_waker(Waker::noop())), Poll::Pending));
+                drop(cancelled);
+                drop(InternodeRpcDurationGuard::handler(operation));
+            });
+        });
+        crate::set_metrics_enabled(previously_enabled);
+        let entries = snapshotter.snapshot().into_vec();
+        let histogram_samples = |name| {
+            entries
+                .iter()
+                .find_map(|(key, _, _, value)| {
+                    if key.key().name() != name {
+                        return None;
+                    }
+                    match value {
+                        DebugValue::Histogram(values) => Some(values.len()),
+                        _ => None,
+                    }
+                })
+                .expect("duration histogram")
+        };
+        assert_eq!(histogram_samples(INTERNODE_OPERATION_DURATION_MS), 3);
+        assert_eq!(histogram_samples(INTERNODE_OPERATION_SERVER_DURATION_MS), 1);
+        let mut outcomes = HashSet::new();
+        let mut active_sides = HashSet::new();
+        for (key, _, _, value) in entries {
+            match key.key().name() {
+                INTERNODE_RPC_COMPLETIONS_TOTAL => {
+                    assert!(matches!(value, DebugValue::Counter(1)));
+                    outcomes.insert(
+                        key.key()
+                            .labels()
+                            .find(|label| label.key() == "outcome")
+                            .expect("outcome")
+                            .value()
+                            .to_owned(),
+                    );
+                }
+                INTERNODE_RPC_ACTIVE => {
+                    assert!(matches!(value, DebugValue::Gauge(value) if value.into_inner() == 0.0));
+                    active_sides.insert(
+                        key.key()
+                            .labels()
+                            .find(|label| label.key() == "side")
+                            .expect("side")
+                            .value()
+                            .to_owned(),
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(
+            outcomes,
+            HashSet::from(["success".to_owned(), "error".to_owned(), "cancelled".to_owned()])
+        );
+        assert_eq!(active_sides, HashSet::from(["client".to_owned(), "server".to_owned()]));
+    }
+
+    #[test]
     fn snapshot_reports_recorded_values() {
         let metrics = global_internode_metrics();
         metrics.reset_for_test();
@@ -1787,7 +2018,11 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 23);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 25);
+        assert_eq!(INTERNODE_OPERATION_METRICS[23].name, INTERNODE_RPC_ACTIVE);
+        assert_eq!(INTERNODE_OPERATION_METRICS[23].labels, SERVER_OPERATION_BACKEND_SIDE_LABELS);
+        assert_eq!(INTERNODE_OPERATION_METRICS[24].name, INTERNODE_RPC_COMPLETIONS_TOTAL);
+        assert_eq!(INTERNODE_OPERATION_METRICS[24].labels, SERVER_OPERATION_BACKEND_OUTCOME_LABELS);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }

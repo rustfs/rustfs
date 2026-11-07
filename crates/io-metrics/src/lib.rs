@@ -179,8 +179,9 @@ fn record_get_stage_local_summary(
 /// Enable or disable general (non GET/PUT-stage) metric emission.
 ///
 /// Called once during startup, typically gated by `rustfs_obs::observability_metric_enabled()`.
+/// Enable after installing the recorder; the release/acquire pair publishes it to handle caches.
 pub fn set_metrics_enabled(enabled: bool) {
-    METRICS_ENABLED.store(enabled, Ordering::Relaxed);
+    METRICS_ENABLED.store(enabled, Ordering::Release);
 }
 
 /// Returns `true` if detailed per-stage PUT metrics are enabled.
@@ -447,7 +448,7 @@ pub fn get_stage_metrics_enabled() -> bool {
 /// Returns `true` if general (non GET/PUT-stage) metric emission is enabled.
 #[inline(always)]
 pub fn metrics_enabled() -> bool {
-    METRICS_ENABLED.load(Ordering::Relaxed)
+    METRICS_ENABLED.load(Ordering::Acquire)
 }
 
 // Handle-cached emission for hot, LABEL-LESS metrics. The `metrics` macros
