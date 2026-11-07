@@ -43,6 +43,8 @@ pub(crate) struct PacingDebt {
     pub(crate) charged_objects: u64,
     #[cfg(test)]
     pub(crate) batches: u64,
+    #[cfg(test)]
+    pub(crate) charged_delay: Duration,
 }
 
 impl PacingDebt {
@@ -73,6 +75,7 @@ impl PacingDebt {
         #[cfg(test)]
         {
             self.charged_objects += 1;
+            self.charged_delay = self.charged_delay.saturating_add(delay);
         }
     }
 

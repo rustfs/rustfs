@@ -292,6 +292,20 @@ impl HealManager {
                                 "Heal scheduler task completed"
                             );
                         }
+                        Err(e @ Error::LegacyMrfUnverified { .. }) => {
+                            warn!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                state = "verification_unavailable",
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                detail = %e,
+                                "Heal attempt completed without independent verification"
+                            );
+                        }
                         Err(e) => {
                             let will_retry = retry_request.is_some();
                             if will_retry {
@@ -483,6 +497,9 @@ impl HealManager {
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
+                            HealTaskStatus::Completed if matches!(&result, Err(Error::LegacyMrfUnverified { .. })) => {
+                                stats.update_unverified_task_completion();
+                            }
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
                                 stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);

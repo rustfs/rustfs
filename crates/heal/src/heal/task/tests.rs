@@ -3286,6 +3286,29 @@ async fn durable_mrf_unverified_object_names_cannot_change_retry_classification(
 }
 
 #[tokio::test]
+async fn mrf_legacy_verification_pending_is_a_completed_unverified_attempt() {
+    let (task, _) = mrf_task_for_item("legacy-pending", healthy_legacy_heal_item());
+    let error = task.execute().await.expect_err("unverified result must retain MRF ownership");
+    assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
+    assert!(!error.is_recoverable_heal());
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(matches!(outcome.objects[0].disposition, HealObjectDisposition::Unknown));
+    let (status, detail) = outcome.legacy_status("finished", None);
+    assert_eq!(status, "finished");
+    assert!(
+        detail
+            .expect("visible unverified result")
+            .contains("authoritative storage proof is unavailable")
+    );
+}
+
+#[tokio::test]
 async fn mrf_legacy_object_names_cannot_change_retry_classification() {
     for object in [
         "ordinary",
@@ -3304,7 +3327,9 @@ async fn mrf_legacy_object_names_cannot_change_retry_classification() {
         assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
         assert_eq!(
             error.to_string(),
-            format!("Heal task execution failed: Missing exact storage proof for durable MRF repair bucket-a/{object}")
+            format!(
+                "Independent verification unavailable for legacy object bucket-a/{object}; durable MRF responsibility retained"
+            )
         );
     }
 }
@@ -3362,11 +3387,14 @@ async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.counters.healed, 0);
         if case == "qualified" {
+            assert_eq!(task.get_status().await, HealTaskStatus::Completed);
             assert_eq!(outcome.counters.unknown, 1);
             assert_eq!(outcome.objects[0].detail.as_deref(), Some("updated diagnostic wording"));
             let opts = storage.object_heal_opts.lock().expect("storage options");
             assert_eq!(opts.len(), 1);
             assert_eq!(opts[0].scan_mode, HealScanMode::Deep);
+        } else {
+            assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }), "case={case}");
         }
     }
 }
