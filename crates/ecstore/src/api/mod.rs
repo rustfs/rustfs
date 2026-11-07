@@ -191,7 +191,10 @@ pub mod bucket {
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
-        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+        pub use crate::bucket::metadata::{
+            BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE,
+            SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX,
+        };
         pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
     }
 

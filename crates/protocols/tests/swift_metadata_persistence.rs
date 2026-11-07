@@ -234,13 +234,18 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
     env.make_bucket(&ContainerMapper::default().swift_to_s3_bucket(archive, project_id), false)
         .await;
 
-    update_container_metadata(&swift_account, container, &credentials, MetadataUpdate::default().set("color", "blue"))
-        .await
-        .expect("container metadata POST should succeed");
+    update_container_metadata(
+        &swift_account,
+        container,
+        &credentials,
+        MetadataUpdate::default().set("color", "blue,green"),
+    )
+    .await
+    .expect("container metadata POST should succeed");
     container::enable_versioning(&swift_account, container, archive, &credentials)
         .await
         .expect("enable versioning should succeed");
-    container::set_container_acl(&swift_account, container, Some(".r:*"), Some("AUTH_other"), &credentials)
+    container::set_container_acl(&swift_account, container, Some(".r:*,AUTH_other"), Some("AUTH_other"), &credentials)
         .await
         .expect("set container ACL should succeed");
 
@@ -248,7 +253,7 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
 
     // All three writers' state coexists after a disk-truth reload.
     let meta = persisted_container_metadata(&bucket).await;
-    assert_eq!(meta.get("color").map(String::as_str), Some("blue"));
+    assert_eq!(meta.get("color").map(String::as_str), Some("blue,green"));
     assert_eq!(
         container::get_versions_location(&swift_account, container, &credentials)
             .await
@@ -259,7 +264,7 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
     let acl = container::get_container_acl(&swift_account, container, &credentials)
         .await
         .expect("container ACL should load");
-    assert!(!acl.read.is_empty(), "read ACL must survive the reload");
+    assert!(acl.check_read_access(None, None, None), "public read ACL must survive the reload");
     assert!(!acl.write.is_empty(), "write ACL must survive the reload");
 
     // Disabling versioning drops only the versioning tag.
@@ -279,7 +284,7 @@ async fn tag_writers_preserve_each_others_state(env: &TestECStoreEnv) {
     let meta = persisted_container_metadata(&bucket).await;
     assert_eq!(
         meta.get("color").map(String::as_str),
-        Some("blue"),
+        Some("blue,green"),
         "disable_versioning must not disturb container metadata"
     );
     let acl = container::get_container_acl(&swift_account, container, &credentials)

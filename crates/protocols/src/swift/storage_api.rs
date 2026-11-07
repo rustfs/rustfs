@@ -17,6 +17,9 @@ use std::sync::Arc;
 
 pub(crate) use rustfs_ecstore::api::bucket::metadata::BucketMetadata as SwiftBucketMetadata;
 use rustfs_ecstore::api::bucket::metadata::{BUCKET_TAGGING_CONFIG, is_unreadable_config_error};
+pub(crate) use rustfs_ecstore::api::bucket::metadata::{
+    MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE, SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX,
+};
 use rustfs_ecstore::api::bucket::metadata_sys::{get as get_swift_bucket_metadata_from_backend, update_config_with};
 use rustfs_ecstore::api::bucket::utils::serialize as serialize_bucket_config;
 use rustfs_ecstore::api::error::Error as SwiftStorageError;
