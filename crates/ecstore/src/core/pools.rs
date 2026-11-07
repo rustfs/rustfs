@@ -2350,16 +2350,25 @@ fn grow_decommission_target_reservation(
         let additional_peak = required_peak.saturating_sub(existing_remaining);
         let additional_predicted = additional_peak.div_ceil(1usize.saturating_add(reservation.temporary_copies));
         let additional_source_data = capacity_source_data_equivalent(additional_predicted, target_layout)?;
-        reservation.source_data_equivalent_bytes = reservation
-            .source_data_equivalent_bytes
-            .saturating_add(additional_source_data);
         reservation.source_physical_bytes = reservation
             .source_physical_bytes
             .saturating_add(capacity_target_physical_bytes(additional_source_data, reservation.source_layout)?);
+        // Recompute from the physical total so EC rounding matches the
+        // persisted reader after every growth, including repeated growth.
+        reservation.source_data_equivalent_bytes =
+            capacity_source_data_equivalent(reservation.source_physical_bytes, reservation.source_layout)?;
         reservation.predicted_physical_bytes = reservation
-            .predicted_physical_bytes
-            .saturating_add(additional_predicted)
-            .max(capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, target_layout)?);
+            .targets
+            .iter()
+            .map(|target| target.layout)
+            .chain(std::iter::once(target_layout))
+            .try_fold(
+                reservation.predicted_physical_bytes.saturating_add(additional_predicted),
+                |predicted, layout| {
+                    capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, layout)
+                        .map(|required| predicted.max(required))
+                },
+            )?;
         reservation.temporary_physical_bytes = reservation
             .predicted_physical_bytes
             .saturating_mul(reservation.temporary_copies);
@@ -2391,6 +2400,7 @@ fn grow_decommission_target_reservation(
             });
         }
         renew_decommission_capacity_reservation(reservation, now, true);
+        validate_decommission_capacity_reservation(Some(reservation))?;
         pool.last_update = pool.last_update.max(now);
         Ok(true)
     })();
@@ -25932,6 +25942,111 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_native_ec_growth_keeps_all_metadata_replicas_readable() {
+        use rustfs_data_usage::{DataUsageCache, DataUsageEntry};
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+        let bucket = format!("stale-ec-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for set in &store.pools[0].disk_set {
+            let encoded = rmp_serde::to_vec_named(&serde_json::json!({
+                "info": {
+                    "name": DATA_USAGE_ROOT,
+                    "next_cycle": 1,
+                    "last_update": std::time::SystemTime::now(),
+                    "skip_healing": false,
+                    "snapshot_complete": true
+                },
+                "cache": {
+                    DATA_USAGE_ROOT: DataUsageEntry { size: 3, objects: 1, ..Default::default() }
+                }
+            }))
+            .expect("encode completed scanner fixture");
+            let cache = DataUsageCache::unmarshal(&encoded).expect("read scanner fixture");
+            assert!(cache.dui(DATA_USAGE_ROOT, &[]).is_complete_bucket_usage_snapshot());
+            set.put_object(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", crate::disk::BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME),
+                &mut crate::object_api::PutObjReader::from_vec(encoded),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("persist the earlier complete cache");
+        }
+        let expected = vec![0x37; 16 * 1024];
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut crate::object_api::PutObjReader::from_vec(expected.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write after the scan");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate from the earlier owned estimate");
+        {
+            let meta = store.pool_meta.read().await;
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            assert_eq!(reservation.source_layout, DecommissionErasureLayout { data: 3, parity: 1 });
+            assert_eq!(reservation.source_physical_bytes, 8);
+        }
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run native EC migration");
+        for pool in &store.pools {
+            let mut reloaded = PoolMeta::default();
+            reloaded
+                .load_no_lock_from_replicas(vec![pool.clone()])
+                .await
+                .expect("each saved metadata replica must reload");
+            let state = reloaded.pools[0].decommission.as_ref().expect("saved retirement state");
+            assert!(state.complete && !state.failed);
+        }
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("target object must remain readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read migrated EC payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_worker_pauses_on_runtime_capacity_shortage_without_source_side_effect() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let bucket = format!("capacity-blocked-{}", uuid::Uuid::new_v4());
@@ -37737,10 +37852,11 @@ mod pools_tests {
             .as_ref()
             .and_then(|info| info.capacity_reservation.as_ref())
             .unwrap();
-        assert_eq!(reservation.source_data_equivalent_bytes, 2);
-        assert_eq!(reservation.predicted_physical_bytes, 3);
+        assert_eq!(reservation.source_data_equivalent_bytes, 3);
+        assert_eq!(reservation.predicted_physical_bytes, 4);
         assert_eq!(reservation.targets.len(), 1);
-        assert_eq!(reservation.targets[0].reserved_physical_bytes, 6);
+        assert_eq!(reservation.targets[0].reserved_physical_bytes, 8);
+        validate_decommission_capacity_reservation(Some(reservation)).expect("empty-snapshot growth must remain readable");
     }
 
     #[test]
@@ -37778,6 +37894,47 @@ mod pools_tests {
             "real free-space shortage still rejects growth"
         );
         assert_eq!(serde_json::to_value(&meta).expect("snapshot after rejected growth"), before);
+    }
+
+    #[test]
+    fn decommission_capacity_growth_keeps_rounded_and_mixed_layout_estimates_loadable() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        for source_layout in [
+            DecommissionErasureLayout { data: 3, parity: 1 },
+            DecommissionErasureLayout { data: 2, parity: 2 },
+        ] {
+            let capacities = vec![
+                DecommissionPoolCapacityInfo::for_test(0, source_layout, 0, 8, 8),
+                DecommissionPoolCapacityInfo::for_test(1, DecommissionErasureLayout { data: 2, parity: 2 }, 16, 16, 0),
+                DecommissionPoolCapacityInfo::for_test(2, DecommissionErasureLayout { data: 3, parity: 1 }, 1024, 1024, 0),
+            ];
+            let mut meta = PoolMeta {
+                version: POOL_META_VERSION,
+                pools: (0..3).map(|index| decommission_test_pool_status(index, None)).collect(),
+                ..Default::default()
+            };
+            meta.decommission(0, capacities[0].space).unwrap();
+            reserve_decommission_start_target_capacity(
+                &mut meta,
+                &[0],
+                &capacities,
+                uuid::Uuid::new_v4(),
+                1,
+                now,
+                DECOMMISSION_CAPACITY_MODEL_VERSION,
+            )
+            .expect("initial reservation");
+            grow_decommission_target_reservation(&mut meta, &capacities, 0, 2, 16, uuid::Uuid::new_v4(), now)
+                .expect("grow against the target's free space");
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            validate_decommission_capacity_reservation(Some(reservation)).expect("growth must satisfy the persisted reader");
+        }
     }
 
     #[test]
