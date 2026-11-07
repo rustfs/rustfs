@@ -24,6 +24,7 @@ STAGE=""
 PHASE=""
 OUT_ROOT="${PROJECT_ROOT}/target/bench/internode-transport"
 DRY_RUN=false
+LIFECYCLE_FEATURE="both"
 PASSTHROUGH=()
 
 usage() {
@@ -38,6 +39,8 @@ Required:
 Options:
   --out-root <dir>          Artifact root. Default: target/bench/internode-transport
   --dry-run                 Print the env + the command, do not run the bench.
+  --lifecycle-feature <prewarm|offline|both>
+                            P3 feature to enable. Default: both (legacy combined experiment).
   -h, --help                Show this help.
 
 Everything after `--` is passed through to the underlying bench:
@@ -60,6 +63,7 @@ while [[ $# -gt 0 ]]; do
     --phase) PHASE="$2"; shift 2 ;;
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
+    --lifecycle-feature) LIFECYCLE_FEATURE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; PASSTHROUGH=("$@"); break ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -67,6 +71,11 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ -n "${STAGE}" && -n "${PHASE}" ]] || { echo "ERROR: --stage and --phase are required" >&2; usage; exit 2; }
+case "${LIFECYCLE_FEATURE}" in prewarm|offline|both) ;; *) echo "ERROR: invalid --lifecycle-feature" >&2; exit 2 ;; esac
+if [[ "${STAGE}" != "p3" && "${LIFECYCLE_FEATURE}" != "both" ]]; then
+  echo "ERROR: --lifecycle-feature is only valid for --stage p3" >&2
+  exit 2
+fi
 case "${PHASE}" in before|after|request-only|canary|rollback) ;; *) echo "ERROR: --phase must be before, after, request-only, canary, or rollback" >&2; exit 2 ;; esac
 if [[ "${STAGE}" != "p2" ]]; then
   case "${PHASE}" in
@@ -88,7 +97,7 @@ stage_env() {
           'RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE=0' \
           'RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE=4194304'
       fi
-      # after: P0 defaults are the enabled state -> no overrides needed.
+      # The reset list below clears the baseline overrides before restoring defaults.
       ;;
     p1)
       if [[ "${phase}" == "after" ]]; then
@@ -120,8 +129,8 @@ stage_env() {
     p3)
       if [[ "${phase}" == "after" ]]; then
         printf '%s\n' \
-          'RUSTFS_INTERNODE_PREWARM=true' \
-          'RUSTFS_INTERNODE_OFFLINE_BYPASS=true' \
+          "RUSTFS_INTERNODE_PREWARM=$([[ "${LIFECYCLE_FEATURE}" != "offline" ]] && echo true || echo false)" \
+          "RUSTFS_INTERNODE_OFFLINE_BYPASS=$([[ "${LIFECYCLE_FEATURE}" != "prewarm" ]] && echo true || echo false)" \
           'RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS=5' \
           'RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD=3'
       else
@@ -135,6 +144,14 @@ stage_env() {
 }
 
 ENV_LINES="$(stage_env "${STAGE}" "${PHASE}")"
+# A phase owns only these settings. Clear them both in the emitted file and this process so
+# sourcing before/after in one shell cannot silently carry baseline overrides into a candidate.
+case "${STAGE}" in
+  p0) RESET_VARS=(RUSTFS_INTERNODE_RPC_TCP_NODELAY RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE) ;;
+  p1) RESET_VARS=(RUSTFS_INTERNODE_CHANNEL_ISOLATION RUSTFS_INTERNODE_BULK_CHANNELS RUSTFS_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT RUSTFS_INTERNODE_BULK_BUFFER_SIZE) ;;
+  p2) RESET_VARS=(RUSTFS_INTERNODE_RPC_MSGPACK_ONLY RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED) ;;
+  p3) RESET_VARS=(RUSTFS_INTERNODE_PREWARM RUSTFS_INTERNODE_OFFLINE_BYPASS RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD) ;;
+esac
 OUT_DIR="${OUT_ROOT}/${STAGE}-${PHASE}"
 mkdir -p "${OUT_DIR}"
 ENV_FILE="${OUT_DIR}/server-env.sh"
@@ -146,6 +163,7 @@ ENV_FILE="${OUT_DIR}/server-env.sh"
   else
     echo "# Source this on EVERY rustfs node before starting the server, then run the bench."
   fi
+  for variable in "${RESET_VARS[@]}"; do echo "unset ${variable}"; done
   if [[ -n "${ENV_LINES}" ]]; then
     while IFS= read -r line; do echo "export ${line}"; done <<<"${ENV_LINES}"
   else
@@ -159,6 +177,7 @@ sed 's/^/   /' "${ENV_FILE}"
 echo "-- artifacts: ${OUT_DIR}"
 
 # Export for the p3 docker path (best-effort: only takes effect if the compose forwards the env).
+for variable in "${RESET_VARS[@]}"; do unset "${variable}"; done
 if [[ -n "${ENV_LINES}" ]]; then
   while IFS= read -r line; do export "${line?}"; done <<<"${ENV_LINES}"
 fi

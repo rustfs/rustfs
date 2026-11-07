@@ -20,12 +20,16 @@ Every stage is env-gated, so "before" and "after" run the *same binary* with dif
 scripts/run_internode_grpc_ab_bench.sh --stage <p0|p1|p2|p3> --phase <before|after|request-only|canary|rollback> [--dry-run] [-- <bench args>]
 ```
 
-The driver writes the stage/phase server env to `<out-dir>/server-env.sh` and runs the underlying bench into `target/bench/internode-transport/<stage>-<phase>/`. `p0/p1/p3` accept `before|after`; `p2` also accepts `request-only|canary|rollback`. `--dry-run` prints the env and command only.
+The driver writes the stage/phase server env to `<out-dir>/server-env.sh` and runs the underlying bench into `target/bench/internode-transport/<stage>-<phase>/`. `p0/p1/p3` accept `before|after`; `p2` also accepts `request-only|canary|rollback`. Each phase first unsets its managed settings, then exports its overrides, so successive phases restore defaults correctly. Other environment variables retain their values. `--dry-run` writes the phase file and prints the command while skipping the workload. Apply the phase file through the deployment's service environment and read back the effective settings on every restarted node.
+
+For P3 single-variable experiments, select `--lifecycle-feature prewarm` or `--lifecycle-feature offline`. The default `both` preserves the combined experiment. Measure prewarm with cold first calls and delayed peer startup, and measure offline bypass with sustained peer loss and survivor-only client traffic. Record the selected feature with each result.
+
+Set `GRPC_BENCH_METRICS_URL` to the Collector Prometheus exporter endpoint. Generate each phase with `--dry-run`, apply its environment through the node service configuration, restart and verify all nodes, then execute the matching workload command.
 
 ```bash
 # P1 A/B: restart the cluster with each phase's server-env.sh between the two runs
-scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase before -- --access-key AK --secret-key SK --metrics-url http://node1:9000/metrics
-scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase after  -- --access-key AK --secret-key SK --metrics-url http://node1:9000/metrics
+scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase before -- --access-key AK --secret-key SK --metrics-url "${GRPC_BENCH_METRICS_URL:?set the Collector Prometheus exporter URL}"
+scripts/run_internode_grpc_ab_bench.sh --stage p1 --phase after  -- --access-key AK --secret-key SK --metrics-url "${GRPC_BENCH_METRICS_URL:?set the Collector Prometheus exporter URL}"
 # P3 failover A/B (docker four-node)
 scripts/run_internode_grpc_ab_bench.sh --stage p3 --phase after
 # P2 env previews
@@ -45,7 +49,7 @@ Run **before** at the baseline column and **after** at the enabled column, every
 | P0 conn window | `RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE` | `0` | unset (`DEFAULT_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE`) |
 | P0 msg limit | `RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE` | `4194304` (tonic default) | unset (RustFS default, see `rustfs/src/server/http.rs`) |
 | P1 isolation | `RUSTFS_INTERNODE_CHANNEL_ISOLATION` | `false` (default) | `true` |
-| P1 bulk pool | `RUSTFS_INTERNODE_BULK_CHANNELS` | `1` | unset (`DEFAULT_INTERNODE_BULK_CHANNELS`) or higher |
+| P1 bulk pool | `RUSTFS_INTERNODE_BULK_CHANNELS` | unset | `2` |
 | P2 msgpack-only | `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY` + `RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED` | both `false` (default) | per the convergence runbook |
 | P3 prewarm | `RUSTFS_INTERNODE_PREWARM` | `false` (default) | `true` |
 | P3 offline bypass | `RUSTFS_INTERNODE_OFFLINE_BYPASS` | `false` (default) | `true` |
@@ -53,18 +57,53 @@ Run **before** at the baseline column and **after** at the enabled column, every
 
 ## Metrics to capture
 
+The lifetime guards cover ReadAll, WriteAll, ReadMultiple and BatchReadVersion. Their active/completion metrics describe these measured operations and follow the general metrics runtime gate. Startup duration recording keeps the existing instrument, and disabled detailed metrics avoid the additional gauge/counter registrations. Bulk client unary duration covers each attempt from polling the tonic call through response-body decoding, including transport errors and cancellation by an outer deadline. Retries contribute separate samples. Channel acquisition and application serialization before the call require their own timing. The server handler duration covers handler entry through return or drop, including application payload decoding, disk work and response construction. Protobuf transport encoding and response transmission follow handler completion. Keep these two instruments separate when calculating quantiles.
+
 All names are defined in `crates/io-metrics/src/internode_metrics.rs`.
 
 | Metric | Stage signal |
 | --- | --- |
 | `rustfs_system_network_internode_operation_duration_ms{operation,backend}` | control-plane RTT (P0), lock/bulk latency (P1), first-op latency (P3) |
-| `rustfs_system_network_internode_operation_server_duration_ms{operation,backend}` | server-side `ReadMultiple` / `BatchReadVersion` handler lifetime, including decode, disk work, encode, errors, and cancellation; separate from client RTT |
+| `rustfs_system_network_internode_operation_server_duration_ms{operation,backend}` | server handler time for ReadAll, WriteAll, ReadMultiple and BatchReadVersion |
+| `rustfs_system_network_internode_rpc_active{operation,backend,side}` | live client attempts or server handlers, including pending unary response bodies on the client |
+| `rustfs_system_network_internode_rpc_completions_total{operation,backend,outcome}` | client attempt outcomes `success`, `error` and `cancelled`. An outer timeout cancels an attempt, while a returned transport timeout is an error |
 | `rustfs_system_network_internode_operation_payload_bytes` | payload size distribution (P0/P1 sizing) |
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing a channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `rustfs_system_network_internode_dial_errors_total` | connect cost and failures (P3) |
 | `rustfs_system_network_internode_msgpack_json_decode_total{direction,message,codec}`, `..._msgpack_json_fallback_total`, `..._msgpack_json_decode_error_total` | P2 gate inputs |
 | `rustfs_cluster_servers_offline_total` | offline detection correctness (P3 bypass) |
 | lock p99 (lock metrics, needs `RUSTFS_OBJECT_LOCK_DIAG_ENABLE=true`) | P1 head-of-line-blocking win |
+
+Verify `RUSTFS_OBS_METRICS_EXPORT_ENABLED=true` and that the Collector exports the intended node/process identities. The client `success` outcome denotes an `Ok` tonic exchange. Interpret payload-level success using the returned operation result and operation error counters. RPC duration buckets use milliseconds and resolve sub-millisecond samples; object-lock duration buckets use seconds. The active-client metric counts the complete measured unary future, while tonic's transport concurrency limit ends when its HTTP response future completes. The two counts have different lifetimes. `BatchReadVersion` traffic requires the batch gate, such as `RUSTFS_GET_METADATA_READ_VERSION_COALESCE=on` on compatible peers; verify actual batch request counts and keep that setting identical across A/B legs.
+
+## Isolated bulk tuning
+
+These settings apply when `RUSTFS_INTERNODE_CHANNEL_ISOLATION=true` selects an isolated bulk cache key. Control and dedicated recovery channels use their existing transport settings. Defaults preserve the existing transport behavior.
+
+P1 phase files clear bulk-specific overrides so an isolation experiment inherits the same common RPC window policy on both legs. For a separate bulk-tuning experiment, apply the chosen override after the phase file and include it in the effective configuration record.
+
+| Environment variable | Default | Scope |
+| --- | --- | --- |
+| `RUSTFS_INTERNODE_BULK_HTTP2_STREAM_WINDOW_SIZE` | Inherit `RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE` | Bulk response receive credit per stream, bytes |
+| `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE` | Inherit `RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE` | Bulk response receive credit per connection, bytes |
+| `RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT` | `64` | Active tonic transport response futures per bulk channel; minimum 1 |
+| `RUSTFS_INTERNODE_BULK_BUFFER_SIZE` | `1024` | Pending tonic service buffer capacity per bulk channel; minimum 1 |
+
+Zero receive-window values select the linked library default. In the locked Hyper 1.12 client this is 2 MiB per stream and 5 MiB per connection, while RustFS explicitly defaults to 1 MiB and 2 MiB. Record which policy the experiment actually selects. Values above the HTTP/2 31-bit limit fail channel acquisition with an invalid-input error. Change connection receive credit first, then stream credit only when measured bandwidth-delay product and resource budgets justify it. For example, compare the default 2 MiB connection window with `RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE=8388608`, holding other settings fixed. Request-upload flow control is configured by the receiving server. Keep server-wide window changes in a separate experiment.
+
+Bulk selection advances independently for each peer. Cursor bookkeeping caches up to 512 peer addresses; replacing an entry restarts its selection sequence while cached connection keys remain usable. HTTPS cache hits share the TLS-generation read lock, with generation validation retained before handoff. Connection misses still coalesce under the existing per-key dial lock.
+
+## Local transport experiment
+
+The [channel benchmark](../../crates/protos/examples/internode_channel_bench.rs) exercises the production channel acquisition path against two local tonic echo peers. It validates every returned byte and reports per-class request percentiles, bulk payload throughput and accepted connections per peer. An optional fourth argument selects control workers that continuously send 7-byte RPCs until the bulk workers complete. This is a closed-loop concurrency workload. Record achieved request rates and use fixed offered-load tests for the final control-plane SLO assessment. It bounds the requested workload and binds only to loopback. Its scope is the channel/HTTP2/TCP path. Distributed storage acceptance additionally requires the real four-node workload and fault matrix.
+
+```bash
+cargo build --release -p rustfs-protos --example internode_channel_bench
+RUSTFS_INTERNODE_CHANNEL_ISOLATION=false target/release/examples/internode_channel_bench 16 256 262144 2
+RUSTFS_INTERNODE_CHANNEL_ISOLATION=true RUSTFS_INTERNODE_BULK_CHANNELS=2 target/release/examples/internode_channel_bench 16 256 262144 2
+```
+
+Freeze the binary and environment, qualify repeated A baselines, then run A1/B1/B2/A2. Interpret payload throughput as one payload per validated round trip; the echo transfers that payload in both directions. Keep source revision, binary identity, workload arguments, connection counts, all errors and raw samples with the results. Stop attribution when baseline drift exceeds the declared gate. Use the effective four-node deployment configuration for final acceptance, with metadata, locks, multipart, TLS rotation and peer failure covered.
 
 ## Acceptance gates
 

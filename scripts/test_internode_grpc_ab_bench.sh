@@ -86,3 +86,54 @@ rg -qx 'export RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS=5' "$P3_AFTER_ENV"
 rg -qx 'export RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD=3' "$P3_AFTER_ENV"
 
 echo "internode grpc A/B bench env tests passed"
+
+# Exercise the generated files as operators use them, including a polluted starting shell.
+(
+  export RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS=17
+  # shellcheck source=/dev/null
+  source "$P0_BEFORE_ENV"
+  [[ "$RUSTFS_INTERNODE_RPC_TCP_NODELAY" == false ]]
+  # shellcheck source=/dev/null
+  source "$P0_AFTER_ENV"
+  for variable in RUSTFS_INTERNODE_RPC_TCP_NODELAY RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE; do
+    [[ -z "${!variable+x}" ]] || { echo "P0 candidate retained ${variable}" >&2; exit 1; }
+  done
+  [[ "$RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS" == 17 ]]
+  # shellcheck source=/dev/null
+  source "$P0_BEFORE_ENV"
+  [[ "$RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE" == 4194304 ]]
+  export RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE=33554432
+  export RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT=1
+  # shellcheck source=/dev/null
+  source "$P1_AFTER_ENV"
+  [[ "$RUSTFS_INTERNODE_CHANNEL_ISOLATION" == true ]]
+  [[ -z "${RUSTFS_INTERNODE_BULK_HTTP2_CONN_WINDOW_SIZE+x}" && -z "${RUSTFS_INTERNODE_BULK_CONCURRENCY_LIMIT+x}" ]]
+  # shellcheck source=/dev/null
+  source "$P1_BEFORE_ENV"
+  [[ "$RUSTFS_INTERNODE_CHANNEL_ISOLATION" == false && -z "${RUSTFS_INTERNODE_BULK_CHANNELS+x}" ]]
+  # shellcheck source=/dev/null
+  source "$P3_AFTER_ENV"
+  [[ "$RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS" == 5 ]]
+  # shellcheck source=/dev/null
+  source "$P3_BEFORE_ENV"
+  [[ "$RUSTFS_INTERNODE_PREWARM" == false && "$RUSTFS_INTERNODE_OFFLINE_BYPASS" == false ]]
+  [[ -z "${RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS+x}" && -z "${RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD+x}" ]]
+)
+
+for feature in prewarm offline; do
+  "$RUNNER" --stage p3 --phase after --lifecycle-feature "$feature" --out-root "$TMP_DIR/$feature" --dry-run >/dev/null
+  (
+    # shellcheck source=/dev/null
+    source "$TMP_DIR/$feature/p3-after/server-env.sh"
+    if [[ "$feature" == prewarm ]]; then
+      [[ "$RUSTFS_INTERNODE_PREWARM" == true && "$RUSTFS_INTERNODE_OFFLINE_BYPASS" == false ]]
+    else
+      [[ "$RUSTFS_INTERNODE_PREWARM" == false && "$RUSTFS_INTERNODE_OFFLINE_BYPASS" == true ]]
+    fi
+  )
+done
+if "$RUNNER" --stage p1 --phase after --lifecycle-feature prewarm --out-root "$TMP_DIR" --dry-run >/dev/null 2>&1; then
+  echo "expected lifecycle selection to be P3-only" >&2
+  exit 1
+fi
+echo "internode grpc A/B phase switching tests passed"
