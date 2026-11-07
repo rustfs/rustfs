@@ -14,7 +14,7 @@
 
 use crate::{
     ObjectKey,
-    client::LockClient,
+    client::{LockCleanupOutcome, LockClient},
     error::{LockError, Result},
     types::{LockId, LockInfo, LockRequest, LockResponse, LockStatus, LockType},
 };
@@ -35,6 +35,10 @@ use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+const EVENT_DISTRIBUTED_LOCK_CLEANUP: &str = "distributed_lock_cleanup";
+const LOG_COMPONENT_LOCK: &str = "lock";
+const LOG_SUBSYSTEM_NAMESPACE: &str = "namespace";
 
 const UNLOCK_RETRY_ATTEMPTS: usize = 3;
 const UNLOCK_RETRY_BACKOFF: Duration = Duration::from_millis(100);
@@ -863,7 +867,15 @@ impl DistributedLock {
         for attempt in 1..=UNLOCK_RETRY_ATTEMPTS {
             pending = Self::release_pending_once(pending, attempt, context).await;
             if pending.is_empty() {
-                debug!(attempt, context, "distributed unlock completed");
+                debug!(
+                    event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "completed",
+                    attempt,
+                    context,
+                    "Distributed unlock cleanup completed"
+                );
                 return;
             }
 
@@ -873,10 +885,14 @@ impl DistributedLock {
         }
 
         warn!(
+            event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+            component = LOG_COMPONENT_LOCK,
+            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+            state = "deferred",
             remaining = pending.len(),
             attempts = UNLOCK_RETRY_ATTEMPTS,
             context,
-            "distributed unlock left unreleased entries after retry; continuing with deferred retries"
+            "Distributed unlock cleanup remains unconfirmed; continuing with deferred retries"
         );
         Self::release_entries_deferred(pending, context).await;
     }
@@ -900,14 +916,33 @@ impl DistributedLock {
         context: &'static str,
     ) -> Vec<(LockId, Arc<dyn LockClient>)> {
         let release_results = join_all(pending.into_iter().map(|(lock_id, client)| async move {
-            match client.release(&lock_id).await {
-                Ok(true) => None,
-                Ok(false) => {
-                    warn!(%lock_id, attempt, context, "distributed unlock did not find lock on client");
+            match client.cleanup_grant(&lock_id).await {
+                Ok(LockCleanupOutcome::Released | LockCleanupOutcome::AlreadyAbsent) => None,
+                Ok(LockCleanupOutcome::Unconfirmed) => {
+                    warn!(
+                        event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                        component = LOG_COMPONENT_LOCK,
+                        subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                        state = "unconfirmed",
+                        %lock_id,
+                        attempt,
+                        context,
+                        "Distributed unlock cleanup was not confirmed by client"
+                    );
                     Some((lock_id, client))
                 }
                 Err(err) => {
-                    warn!(%lock_id, attempt, context, "distributed unlock failed on client: {}", err);
+                    warn!(
+                        event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                        component = LOG_COMPONENT_LOCK,
+                        subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                        state = "failed",
+                        %lock_id,
+                        attempt,
+                        context,
+                        error = %err,
+                        "Distributed unlock cleanup failed on client"
+                    );
                     Some((lock_id, client))
                 }
             }
@@ -919,7 +954,8 @@ impl DistributedLock {
 
     /// Bounded slow retries for entries the fast loop could not release. Every
     /// caller runs on a background task, so waiting here blocks nobody; after
-    /// the schedule is exhausted the server lease reclaims the entry.
+    /// the schedule is exhausted cleanup remains unconfirmed. A backend lease
+    /// bounds the lifetime of any grant that still exists.
     async fn release_entries_deferred(mut pending: Vec<(LockId, Arc<dyn LockClient>)>, context: &'static str) {
         let mut attempt = UNLOCK_RETRY_ATTEMPTS;
         for delay in DEFERRED_UNLOCK_BACKOFF {
@@ -927,16 +963,28 @@ impl DistributedLock {
             attempt += 1;
             pending = Self::release_pending_once(pending, attempt, context).await;
             if pending.is_empty() {
-                debug!(attempt, context, "deferred distributed unlock converged");
+                debug!(
+                    event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "completed",
+                    attempt,
+                    context,
+                    "Deferred distributed unlock cleanup converged"
+                );
                 return;
             }
         }
 
         warn!(
+            event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+            component = LOG_COMPONENT_LOCK,
+            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+            state = "unconfirmed",
             remaining = pending.len(),
             attempts = attempt,
             context,
-            "distributed unlock abandoned entries after deferred retry; the server lease will expire them"
+            "Distributed unlock cleanup remains unconfirmed after deferred retries"
         );
     }
 
@@ -1425,14 +1473,17 @@ fn record_lock_held_release(lock_type: LockType) {
 mod tests {
     use super::{
         DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_ATTEMPT_TIMEOUT, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
-        LOCK_ACQUIRE_SPARE_HEDGES, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, is_remote_lock_rpc_failure,
-        should_warn_lock_failure,
+        LOCK_ACQUIRE_SPARE_HEDGES, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF,
+        is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
-    use crate::{LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats, LockType, ObjectKey, client::LockClient};
+    use crate::{
+        GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
+        LockType, ObjectKey, client::LockClient,
+    };
     use rand::{SeedableRng as _, TryRng, rngs::StdRng};
     use std::assert_matches;
     use std::convert::Infallible;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::{
         collections::{HashMap, VecDeque},
         sync::{Arc, Mutex},
@@ -1949,6 +2000,7 @@ mod tests {
     struct FlakyReleaseClient {
         failures_left: AtomicUsize,
         release_calls: Arc<AtomicUsize>,
+        release_success: bool,
     }
 
     #[async_trait::async_trait]
@@ -1963,7 +2015,7 @@ mod tests {
                 self.failures_left.fetch_sub(1, Ordering::SeqCst);
                 return Err(LockError::internal("remote lock rpc timed out: release"));
             }
-            Ok(true)
+            Ok(self.release_success)
         }
 
         async fn refresh(&self, _lock_id: &LockId) -> crate::Result<bool> {
@@ -2001,6 +2053,7 @@ mod tests {
         let client: Arc<dyn LockClient> = Arc::new(FlakyReleaseClient {
             failures_left: AtomicUsize::new(UNLOCK_RETRY_ATTEMPTS + 2),
             release_calls: release_calls.clone(),
+            release_success: true,
         });
         let lock_id = LockId::new_unique(&ObjectKey::new("bucket", "object"));
 
@@ -2019,6 +2072,7 @@ mod tests {
         let client: Arc<dyn LockClient> = Arc::new(FlakyReleaseClient {
             failures_left: AtomicUsize::new(usize::MAX),
             release_calls: release_calls.clone(),
+            release_success: true,
         });
         let lock_id = LockId::new_unique(&ObjectKey::new("bucket", "object"));
 
@@ -2027,7 +2081,209 @@ mod tests {
         assert_eq!(
             release_calls.load(Ordering::SeqCst),
             UNLOCK_RETRY_ATTEMPTS + DEFERRED_UNLOCK_BACKOFF.len(),
-            "the retry budget is bounded; the server lease reclaims what remains"
+            "the retry budget stays bounded when cleanup cannot be confirmed"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_entries_keeps_retrying_unconfirmed_legacy_results() {
+        let release_calls = Arc::new(AtomicUsize::new(0));
+        let client: Arc<dyn LockClient> = Arc::new(FlakyReleaseClient {
+            failures_left: AtomicUsize::new(0),
+            release_calls: release_calls.clone(),
+            release_success: false,
+        });
+        let lock_id = LockId::new_unique(&ObjectKey::new("bucket", "legacy-unlock"));
+
+        DistributedLock::release_entries(vec![(lock_id, client)], "test_legacy_unlock").await;
+
+        assert_eq!(
+            release_calls.load(Ordering::SeqCst),
+            UNLOCK_RETRY_ATTEMPTS + DEFERRED_UNLOCK_BACKOFF.len()
+        );
+    }
+
+    /// Uses a real local backend, with only the transport acknowledgement lost.
+    #[derive(Debug)]
+    struct AckLossClient {
+        backend: Arc<LocalClient>,
+        lose_ack: AtomicBool,
+        release_calls: AtomicUsize,
+        released: tokio::sync::Notify,
+        resume: tokio::sync::Notify,
+    }
+
+    impl AckLossClient {
+        fn new(lose_ack: bool) -> Self {
+            Self {
+                backend: Arc::new(LocalClient::with_manager(Arc::new(GlobalLockManager::new()))),
+                lose_ack: AtomicBool::new(lose_ack),
+                release_calls: AtomicUsize::new(0),
+                released: tokio::sync::Notify::new(),
+                resume: tokio::sync::Notify::new(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LockClient for AckLossClient {
+        async fn acquire_lock(&self, request: &LockRequest) -> crate::Result<LockResponse> {
+            self.backend.acquire_lock(request).await
+        }
+
+        async fn release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.cleanup_grant(lock_id)
+                .await
+                .map(|outcome| matches!(outcome, LockCleanupOutcome::Released))
+        }
+
+        async fn cleanup_grant(&self, lock_id: &LockId) -> crate::Result<LockCleanupOutcome> {
+            self.release_calls.fetch_add(1, Ordering::SeqCst);
+            let outcome = self.backend.cleanup_grant(lock_id).await?;
+            if outcome == LockCleanupOutcome::Released {
+                self.released.notify_one();
+                if self.lose_ack.swap(false, Ordering::SeqCst) {
+                    self.resume.notified().await;
+                    return Err(LockError::internal("remote lock rpc timed out: release"));
+                }
+            }
+            Ok(outcome)
+        }
+
+        async fn refresh(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.backend.refresh(lock_id).await
+        }
+
+        async fn force_release(&self, lock_id: &LockId) -> crate::Result<bool> {
+            self.backend.force_release(lock_id).await
+        }
+
+        async fn check_status(&self, lock_id: &LockId) -> crate::Result<Option<LockInfo>> {
+            self.backend.check_status(lock_id).await
+        }
+
+        async fn get_stats(&self) -> crate::Result<LockStats> {
+            self.backend.get_stats().await
+        }
+
+        async fn close(&self) -> crate::Result<()> {
+            self.backend.close().await
+        }
+
+        async fn is_online(&self) -> bool {
+            true
+        }
+
+        async fn is_local(&self) -> bool {
+            false
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_entries_converges_after_lost_ack_without_releasing_successor() {
+        let client = Arc::new(AckLossClient::new(true));
+        let request = LockRequest::new(ObjectKey::new("bucket", "lost-release-ack"), LockType::Exclusive, "first-owner");
+        assert!(client.acquire_lock(&request).await.expect("acquire predecessor").success);
+        let cleanup_client = client.clone();
+        let lock_id = request.lock_id.clone();
+        let started = tokio::time::Instant::now();
+        let cleanup = tokio::spawn(async move {
+            DistributedLock::release_entries(vec![(lock_id, cleanup_client)], "test_lost_release_ack").await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), client.released.notified())
+            .await
+            .expect("predecessor was released before its ACK was lost");
+
+        let successor = LockRequest::new(request.resource.clone(), LockType::Exclusive, "successor");
+        assert!(client.acquire_lock(&successor).await.expect("acquire successor").success);
+        client.resume.notify_one();
+        tokio::time::timeout(Duration::from_secs(60), cleanup)
+            .await
+            .expect("cleanup stays bounded")
+            .expect("cleanup task completed");
+
+        assert_eq!(
+            client.release_calls.load(Ordering::SeqCst),
+            2,
+            "stop at the first authoritative absence response"
+        );
+        assert_eq!(started.elapsed(), UNLOCK_RETRY_BACKOFF, "do not enter the deferred retry schedule");
+        assert!(
+            client
+                .backend
+                .check_status(&request.lock_id)
+                .await
+                .expect("check predecessor")
+                .is_none()
+        );
+        assert!(
+            client
+                .backend
+                .check_status(&successor.lock_id)
+                .await
+                .expect("check successor")
+                .is_some()
+        );
+        // FastLock acquisition deadlines use the real clock. Resume Tokio time
+        // so virtual-time retries cannot expire the successor's lease while
+        // waiting for the contender's real-time deadline.
+        tokio::time::resume();
+        let contender =
+            LockRequest::new(request.resource, LockType::Exclusive, "contender").with_acquire_timeout(Duration::from_millis(50));
+        assert!(
+            !client
+                .acquire_lock(&contender)
+                .await
+                .expect("check successor exclusivity")
+                .success
+        );
+        assert!(client.backend.release(&successor.lock_id).await.expect("release successor"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn release_before_acquire_keeps_the_pending_grant_cleanup_owner() {
+        let client = Arc::new(AckLossClient::new(false));
+        let blocker = LockRequest::new(ObjectKey::new("bucket", "release-before-grant"), LockType::Exclusive, "blocker");
+        assert!(client.acquire_lock(&blocker).await.expect("acquire blocker").success);
+        let late = LockRequest::new(blocker.resource.clone(), LockType::Exclusive, "late-owner");
+        let late_id = late.lock_id.clone();
+        let started = Arc::new(tokio::sync::Notify::new());
+        let task_started = started.clone();
+        let acquire_client = client.clone();
+        let mut pending = tokio::task::JoinSet::new();
+        pending.spawn(async move {
+            task_started.notify_one();
+            (0, acquire_client.acquire_lock(&late).await)
+        });
+        tokio::time::timeout(Duration::from_secs(1), started.notified())
+            .await
+            .expect("pending acquire task started");
+        assert!(!client.release(&late_id).await.expect("release arrived before grant"));
+        let clients: Arc<[Arc<dyn LockClient>]> = vec![client.clone() as Arc<dyn LockClient>].into();
+        DistributedLock::spawn_pending_cleanup(pending, clients, late_id.clone(), "test_release_before_grant");
+        assert!(
+            client
+                .backend
+                .release(&blocker.lock_id)
+                .await
+                .expect("unblock pending acquire")
+        );
+        tokio::time::timeout(Duration::from_secs(1), client.released.notified())
+            .await
+            .expect("late grant retained its independent cleanup owner");
+
+        assert!(
+            client
+                .backend
+                .check_status(&late_id)
+                .await
+                .expect("check late grant")
+                .is_none()
+        );
+        assert_eq!(
+            client.release_calls.load(Ordering::SeqCst),
+            2,
+            "clean up again after the late grant actually succeeds"
         );
     }
 

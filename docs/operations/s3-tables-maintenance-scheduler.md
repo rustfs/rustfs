@@ -30,7 +30,7 @@ For example:
 }
 ```
 
-The optional snapshot-expiration and compaction fields request plans, not commits. An empty JSON object requests ordinary metadata planning. A nonzero retention value overrides the effective maintenance configuration for this request; omission or zero uses the effective configured retention.
+`max-rewrite-bytes-per-job` is accepted up to any value at or above `target-file-size-bytes`, but each rewrite group is packed to at most the smaller of that value and the 512 MiB per-group stored-input ceiling that the commit path holds in memory; the 1 GiB example therefore produces groups of at most 512 MiB. The optional snapshot-expiration and compaction fields request plans, not commits. An empty JSON object requests ordinary metadata planning. A nonzero retention value overrides the effective maintenance configuration for this request; omission or zero uses the effective configured retention.
 
 In durable-strong mode, successful planning returns HTTP 200 with a completed `DRY_RUN` job and persists its named, current, and latest reports with audit events. Read-only means that table data, metadata pointers, and catalog generations are unchanged; the request still writes maintenance report sidecars and requires the table-scoped `admin:RunTableMaintenance` permission. Inspect the returned plan and any manual-review state before taking further action.
 

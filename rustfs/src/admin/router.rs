@@ -474,14 +474,20 @@ fn parse_misc_extension_request(method: &Method, uri: &Uri) -> Option<MiscExtRou
 fn validate_object_lambda_query(uri: &Uri) -> S3Result<()> {
     let lambda_arns = query_values_exact(uri, "lambdaArn");
     if lambda_arns.len() != 1 || lambda_arns[0].trim().is_empty() {
-        return Err(s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "lambdaArn query parameter must be provided exactly once",
+        ));
     }
 
     let lambda_arn = lambda_arns[0].trim();
     let arn_parts = lambda_arn.split(':').collect::<Vec<_>>();
     let is_valid_arn = arn_parts.len() >= 6 && arn_parts[0] == "arn" && !arn_parts[1].is_empty() && !arn_parts[2].is_empty();
     if !is_valid_arn {
-        return Err(s3_error!(InvalidRequest, "lambdaArn query parameter must be a valid ARN string"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "lambdaArn query parameter must be a valid ARN string",
+        ));
     }
     Ok(())
 }
@@ -489,43 +495,56 @@ fn validate_object_lambda_query(uri: &Uri) -> S3Result<()> {
 fn validate_listen_notification_query(uri: &Uri) -> S3Result<()> {
     let events = query_values_exact(uri, "events");
     if events.is_empty() {
-        return Err(s3_error!(InvalidArgument, "events query parameter is required"));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "events query parameter is required"));
     }
 
     for event in events {
-        EventName::parse(&event).map_err(|_| s3_error!(InvalidArgument, "invalid event in events query parameter"))?;
+        EventName::parse(&event)
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid event in events query parameter"))?;
     }
 
     let prefixes = query_values_exact(uri, "prefix");
     if prefixes.len() > 1 {
-        return Err(s3_error!(InvalidArgument, "prefix query parameter must not be repeated"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "prefix query parameter must not be repeated",
+        ));
     }
     if let Some(prefix) = prefixes.first()
         && !is_valid_filter_rule_value(prefix)
     {
-        return Err(s3_error!(InvalidArgument, "invalid prefix filter value"));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid prefix filter value"));
     }
 
     let suffixes = query_values_exact(uri, "suffix");
     if suffixes.len() > 1 {
-        return Err(s3_error!(InvalidArgument, "suffix query parameter must not be repeated"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "suffix query parameter must not be repeated",
+        ));
     }
     if let Some(suffix) = suffixes.first()
         && !is_valid_filter_rule_value(suffix)
     {
-        return Err(s3_error!(InvalidArgument, "invalid suffix filter value"));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid suffix filter value"));
     }
 
     let pings = query_values_exact(uri, "ping");
     if pings.len() > 1 {
-        return Err(s3_error!(InvalidArgument, "ping query parameter must not be repeated"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "ping query parameter must not be repeated",
+        ));
     }
     if let Some(ping) = pings.first() {
-        let ping_interval = ping
-            .parse::<u64>()
-            .map_err(|_| s3_error!(InvalidArgument, "ping query parameter must be a positive integer"))?;
+        let ping_interval = ping.parse::<u64>().map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidArgument, "ping query parameter must be a positive integer")
+        })?;
         if ping_interval == 0 {
-            return Err(s3_error!(InvalidArgument, "ping query parameter must be greater than zero"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidArgument,
+                "ping query parameter must be greater than zero",
+            ));
         }
     }
 
@@ -536,7 +555,7 @@ fn parse_listen_notification_filter(uri: &Uri, bucket: Option<&str>) -> S3Result
     let mut event_mask = 0_u64;
     for event in query_values_exact(uri, "events") {
         event_mask |= EventName::parse(&event)
-            .map_err(|_| s3_error!(InvalidArgument, "invalid event in events query parameter"))?
+            .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "invalid event in events query parameter"))?
             .mask();
     }
 
@@ -569,7 +588,7 @@ fn uri_without_query_key(uri: &Uri, excluded_key: &str) -> S3Result<Uri> {
         Some(
             uri.path()
                 .parse()
-                .map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))?,
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "failed to rebuild request URI"))?,
         )
     } else {
         let query = form_urlencoded::Serializer::new(String::new())
@@ -578,10 +597,10 @@ fn uri_without_query_key(uri: &Uri, excluded_key: &str) -> S3Result<Uri> {
         Some(
             format!("{}?{}", uri.path(), query)
                 .parse()
-                .map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))?,
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "failed to rebuild request URI"))?,
         )
     };
-    Uri::from_parts(parts).map_err(|_| s3_error!(InvalidRequest, "failed to rebuild request URI"))
+    Uri::from_parts(parts).map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "failed to rebuild request URI"))
 }
 
 fn parse_optional_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Option<String>> {
@@ -591,7 +610,7 @@ fn parse_optional_header(headers: &HeaderMap, name: HeaderName) -> S3Result<Opti
             value
                 .to_str()
                 .map(|parsed| parsed.to_string())
-                .map_err(|_| s3_error!(InvalidRequest, "request header contains invalid utf-8"))
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "request header contains invalid utf-8"))
         })
         .transpose()
 }
@@ -600,7 +619,7 @@ fn parse_optional_timestamp_header(headers: &HeaderMap, name: HeaderName) -> S3R
     parse_optional_header(headers, name)?
         .map(|value| {
             Timestamp::parse(TimestampFormat::HttpDate, &value)
-                .map_err(|_| s3_error!(InvalidRequest, "request timestamp header is invalid"))
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "request timestamp header is invalid"))
         })
         .transpose()
 }
@@ -613,7 +632,7 @@ where
         .map(|value| {
             value
                 .parse::<T>()
-                .map_err(|_| s3_error!(InvalidRequest, "request etag condition header is invalid"))
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "request etag condition header is invalid"))
         })
         .transpose()
 }
@@ -623,14 +642,16 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
     let part_number = query_value_exact(&filtered_uri, "partNumber")
         .filter(|value| !value.is_empty())
         .map(|value| {
-            value
-                .parse::<i32>()
-                .map_err(|_| s3_error!(InvalidArgument, "partNumber query parameter must be a positive integer"))
+            value.parse::<i32>().map_err(|_| {
+                S3Error::with_message(S3ErrorCode::InvalidArgument, "partNumber query parameter must be a positive integer")
+            })
         })
         .transpose()?;
     let version_id = query_value_exact(&filtered_uri, "versionId").filter(|value| !value.is_empty());
     let range = parse_optional_header(&req.headers, header::RANGE)?
-        .map(|value| Range::parse(&value).map_err(|_| s3_error!(InvalidArgument, "Range header is invalid")))
+        .map(|value| {
+            Range::parse(&value).map_err(|_| S3Error::with_message(S3ErrorCode::InvalidArgument, "Range header is invalid"))
+        })
         .transpose()?;
 
     let mut builder = GetObjectInput::builder()
@@ -657,9 +678,9 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
         HeaderName::from_static("x-amz-server-side-encryption-customer-key-md5"),
     )?);
 
-    let input = builder
-        .build()
-        .map_err(|err| s3_error!(InvalidRequest, "failed to build object lambda get request: {err}"))?;
+    let input = builder.build().map_err(|err| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to build object lambda get request: {err}"))
+    })?;
 
     Ok(S3Request {
         input,
@@ -677,11 +698,16 @@ fn build_object_lambda_get_request(req: &S3Request<Body>, bucket: &str, object: 
 fn parse_object_lambda_arn(uri: &Uri) -> S3Result<rustfs_targets::arn::ARN> {
     let lambda_arn = query_value_exact(uri, "lambdaArn")
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"))?;
+        .ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, "lambdaArn query parameter must be provided exactly once")
+        })?;
 
-    lambda_arn
-        .parse::<rustfs_targets::arn::ARN>()
-        .map_err(|_| s3_error!(InvalidRequest, "lambdaArn query parameter must reference a supported target ARN"))
+    lambda_arn.parse::<rustfs_targets::arn::ARN>().map_err(|_| {
+        S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "lambdaArn query parameter must reference a supported target ARN",
+        )
+    })
 }
 
 fn config_enable_is_on(value: &str) -> bool {
@@ -694,38 +720,43 @@ fn resolve_object_lambda_webhook_config_from_server_config(
 ) -> S3Result<ObjectLambdaWebhookConfig> {
     let target_name = arn.target_id.name.to_ascii_lowercase();
     if target_name != "webhook" && !target_name.starts_with("webhook-") {
-        return Err(s3_error!(NotImplemented, "object lambda target type is not supported"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::NotImplemented,
+            "object lambda target type is not supported",
+        ));
     }
 
     let subsystem = config
         .0
         .get(LAMBDA_WEBHOOK_SUB_SYS)
         .or_else(|| config.0.get(NOTIFY_WEBHOOK_SUB_SYS))
-        .ok_or_else(|| s3_error!(InvalidRequest, "object lambda webhook subsystem is not configured"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda webhook subsystem is not configured"))?;
     let kvs = subsystem
         .get(&arn.target_id.id)
-        .ok_or_else(|| s3_error!(InvalidRequest, "object lambda target is not configured"))?;
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda target is not configured"))?;
 
     if !config_enable_is_on(&kvs.get(ENABLE_KEY)) {
-        return Err(s3_error!(InvalidRequest, "object lambda target is disabled"));
+        return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda target is disabled"));
     }
 
     let endpoint = kvs.lookup(WEBHOOK_ENDPOINT).unwrap_or_default();
     if endpoint.trim().is_empty() {
-        return Err(s3_error!(InvalidRequest, "object lambda target endpoint is empty"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "object lambda target endpoint is empty",
+        ));
     }
 
     let response_header_timeout = match kvs.lookup(WEBHOOK_RESPONSE_HEADER_TIMEOUT) {
         Some(value) if value.trim().is_empty() => None,
-        Some(value) => Some(
-            parse_duration(&value)
-                .map_err(|_| s3_error!(InvalidRequest, "object lambda target response_header_timeout is invalid"))?,
-        ),
+        Some(value) => Some(parse_duration(&value).map_err(|_| {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda target response_header_timeout is invalid")
+        })?),
         None => None,
     };
 
-    let parsed_endpoint =
-        Url::parse(&endpoint).map_err(|_| s3_error!(InvalidRequest, "object lambda target endpoint is invalid"))?;
+    let parsed_endpoint = Url::parse(&endpoint)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda target endpoint is invalid"))?;
     let outbound_resolver = outbound_policy()?
         .resolver_for(&parsed_endpoint)
         .map_err(|err| s3_error!(InvalidRequest, "object lambda target endpoint is not allowed: {}", err))?;
@@ -763,7 +794,8 @@ async fn load_current_server_config() -> S3Result<Config> {
         }
     }
 
-    let config = current_server_config().ok_or_else(|| s3_error!(InternalError, "server config is not initialized"))?;
+    let config = current_server_config()
+        .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "server config is not initialized"))?;
     Ok(config)
 }
 
@@ -802,10 +834,12 @@ fn build_object_lambda_http_client_with_resolver(
         );
         builder = builder.danger_accept_invalid_certs(true);
     } else if !config.client_ca.is_empty() {
-        let ca_pem = std::fs::read(&config.client_ca)
-            .map_err(|e| s3_error!(InternalError, "failed to read object lambda client_ca: {e}"))?;
-        let ca = reqwest::Certificate::from_pem(&ca_pem)
-            .map_err(|e| s3_error!(InternalError, "failed to parse object lambda client_ca: {e}"))?;
+        let ca_pem = std::fs::read(&config.client_ca).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to read object lambda client_ca: {e}"))
+        })?;
+        let ca = reqwest::Certificate::from_pem(&ca_pem).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to parse object lambda client_ca: {e}"))
+        })?;
         builder = builder.add_root_certificate(ca);
     }
 
@@ -817,25 +851,28 @@ fn build_object_lambda_http_client_with_resolver(
             ));
         }
 
-        let cert = std::fs::read(&config.client_cert)
-            .map_err(|e| s3_error!(InternalError, "failed to read object lambda client_cert: {e}"))?;
-        let key = std::fs::read(&config.client_key)
-            .map_err(|e| s3_error!(InternalError, "failed to read object lambda client_key: {e}"))?;
-        let identity = reqwest::Identity::from_pem(&[cert, key].concat())
-            .map_err(|e| s3_error!(InternalError, "failed to build object lambda client identity: {e}"))?;
+        let cert = std::fs::read(&config.client_cert).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to read object lambda client_cert: {e}"))
+        })?;
+        let key = std::fs::read(&config.client_key).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to read object lambda client_key: {e}"))
+        })?;
+        let identity = reqwest::Identity::from_pem(&[cert, key].concat()).map_err(|e| {
+            S3Error::with_message(S3ErrorCode::InternalError, format!("failed to build object lambda client identity: {e}"))
+        })?;
         builder = builder.identity(identity);
     }
 
     builder
         .build()
-        .map_err(|e| s3_error!(InternalError, "failed to build object lambda http client: {e}"))
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to build object lambda http client: {e}")))
 }
 
 async fn send_object_lambda_request(request: reqwest::RequestBuilder) -> S3Result<reqwest::Response> {
     request
         .send()
         .await
-        .map_err(|_| s3_error!(InternalError, "object lambda target request failed"))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "object lambda target request failed"))
 }
 
 fn outbound_policy() -> S3Result<&'static OutboundPolicy> {
@@ -868,21 +905,21 @@ fn extract_request_host(headers: &HeaderMap, uri: &Uri) -> Option<String> {
 }
 
 fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
-    let credentials = req
-        .credentials
-        .as_ref()
-        .ok_or_else(|| s3_error!(AccessDenied, "object lambda source URL requires authenticated credentials"))?;
-    let host = extract_request_host(&req.headers, &req.uri)
-        .ok_or_else(|| s3_error!(InvalidRequest, "object lambda source URL requires a valid host header"))?;
+    let credentials = req.credentials.as_ref().ok_or_else(|| {
+        S3Error::with_message(S3ErrorCode::AccessDenied, "object lambda source URL requires authenticated credentials")
+    })?;
+    let host = extract_request_host(&req.headers, &req.uri).ok_or_else(|| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, "object lambda source URL requires a valid host header")
+    })?;
     let scheme = extract_request_scheme(&req.headers, &req.uri);
     let filtered_uri = uri_without_query_key(&req.uri, "lambdaArn")?;
     let path_and_query = filtered_uri
         .path_and_query()
         .map(|value| value.as_str().to_string())
         .unwrap_or_else(|| filtered_uri.path().to_string());
-    let source_uri = format!("{scheme}://{host}{path_and_query}")
-        .parse::<Uri>()
-        .map_err(|e| s3_error!(InvalidRequest, "failed to construct object lambda source URL: {e}"))?;
+    let source_uri = format!("{scheme}://{host}{path_and_query}").parse::<Uri>().map_err(|e| {
+        S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to construct object lambda source URL: {e}"))
+    })?;
     let region = req
         .region
         .clone()
@@ -897,7 +934,9 @@ fn build_object_lambda_source_url(req: &S3Request<Body>) -> S3Result<String> {
             .uri(source_uri)
             .header(http::header::HOST, host)
             .body(Body::default())
-            .map_err(|e| s3_error!(InvalidRequest, "failed to build object lambda source request: {e}"))?,
+            .map_err(|e| {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("failed to build object lambda source request: {e}"))
+            })?,
         &credentials.access_key,
         credentials.secret_key.expose(),
         &session_token,
@@ -937,7 +976,7 @@ fn build_object_lambda_event_payload(
         },
         "protocolVersion": "rustfs-object-lambda-1.0",
     }))
-    .map_err(|e| s3_error!(InternalError, "failed to serialize object lambda payload: {e}"))
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize object lambda payload: {e}")))
 }
 
 fn validate_object_lambda_response_auth_headers(headers: &HeaderMap, output_route: &str, output_token: &str) -> S3Result<()> {
@@ -966,13 +1005,13 @@ fn format_timestamp_http_date(value: &Timestamp) -> S3Result<String> {
     let mut buf = Vec::new();
     value
         .format(TimestampFormat::HttpDate, &mut buf)
-        .map_err(|_| s3_error!(InternalError, "failed to format timestamp header"))?;
-    String::from_utf8(buf).map_err(|_| s3_error!(InternalError, "failed to format timestamp header"))
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to format timestamp header"))?;
+    String::from_utf8(buf).map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to format timestamp header"))
 }
 
 fn insert_string_header(headers: &mut HeaderMap, name: HeaderName, value: String) -> S3Result<()> {
-    let header_value =
-        HeaderValue::from_str(&value).map_err(|_| s3_error!(InternalError, "failed to build response header value"))?;
+    let header_value = HeaderValue::from_str(&value)
+        .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to build response header value"))?;
     headers.insert(name, header_value);
     Ok(())
 }
@@ -1007,7 +1046,8 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
     if let Some(etag) = &output.e_tag {
         headers.insert(
             http::header::ETAG,
-            etag.to_http_header().map_err(|_| s3_error!(InternalError, "invalid etag"))?,
+            etag.to_http_header()
+                .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "invalid etag"))?,
         );
     }
     if let Some(last_modified) = &output.last_modified {
@@ -1091,7 +1131,7 @@ fn build_get_object_response_headers(output: &GetObjectOutput, base_headers: &He
             let header_name = format!("x-amz-meta-{key}");
             if let Ok(parsed_name) = HeaderName::from_bytes(header_name.as_bytes()) {
                 let parsed_value = HeaderValue::from_str(value)
-                    .map_err(|_| s3_error!(InternalError, "failed to build metadata response header"))?;
+                    .map_err(|_| S3Error::with_message(S3ErrorCode::InternalError, "failed to build metadata response header"))?;
                 headers.insert(parsed_name, parsed_value);
             }
         }
@@ -1195,7 +1235,9 @@ async fn invoke_object_lambda_target(
     let client = build_object_lambda_http_client(&lambda_config)?;
     let lambda_arn = query_value_exact(&req.uri, "lambdaArn")
         .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| s3_error!(InvalidRequest, "lambdaArn query parameter must be provided exactly once"))?;
+        .ok_or_else(|| {
+            S3Error::with_message(S3ErrorCode::InvalidRequest, "lambdaArn query parameter must be provided exactly once")
+        })?;
     let input_s3_url = build_object_lambda_source_url(req)?;
     let output_route = Uuid::new_v4().to_string();
     let output_token = Uuid::new_v4().to_string();
@@ -1316,7 +1358,7 @@ fn serialize_listen_notification_event(event: &NotificationEvent) -> S3Result<By
             payload.push(b'\n');
             Bytes::from(payload)
         })
-        .map_err(|e| s3_error!(InternalError, "failed to serialize notification event: {e}"))
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("failed to serialize notification event: {e}")))
 }
 
 fn list_remote_live_event_peers() -> Vec<PeerLiveEventCursor> {
@@ -1340,13 +1382,174 @@ fn deserialize_peer_live_events(payload: &[u8]) -> Result<Vec<NotificationEvent>
     serde_json::from_slice(payload)
 }
 
+const LISTEN_AUTH_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
+const LISTEN_AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+
+// No Debug implementation: the admitted request retains its signing credentials.
+struct ListenNotificationAuthorization {
+    request: S3Request<()>,
+    action: Action,
+    bucket_incarnation: Option<(String, uuid::Uuid)>,
+    keystone_credentials: Option<rustfs_credentials::Credentials>,
+    refresh_at: tokio::time::Instant,
+}
+
+impl ListenNotificationAuthorization {
+    async fn capture(req: &S3Request<Body>, bucket: Option<&str>) -> S3Result<Self> {
+        let bucket_incarnation = if let Some(bucket) = bucket {
+            let store = crate::admin::runtime_sources::object_store_from_req(req)
+                .ok_or_else(|| S3Error::with_message(S3ErrorCode::InternalError, "Object store is unavailable"))?;
+            Some((
+                bucket.to_string(),
+                store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?,
+            ))
+        } else {
+            None
+        };
+        Ok(Self {
+            request: S3Request {
+                input: (),
+                method: req.method.clone(),
+                uri: req.uri.clone(),
+                headers: req.headers.clone(),
+                extensions: req.extensions.clone(),
+                credentials: req.credentials.clone(),
+                region: req.region.clone(),
+                service: req.service.clone(),
+                trailing_headers: req.trailing_headers.clone(),
+            },
+            action: Action::S3Action(if bucket.is_some() {
+                S3Action::ListenBucketNotificationAction
+            } else {
+                S3Action::ListenNotificationAction
+            }),
+            bucket_incarnation,
+            keystone_credentials: rustfs_keystone::KEYSTONE_CREDENTIALS.try_with(Clone::clone).ok().flatten(),
+            refresh_at: tokio::time::Instant::now(),
+        })
+    }
+
+    async fn still_allowed(&mut self) -> bool {
+        matches!(tokio::time::timeout(LISTEN_AUTH_TIMEOUT, self.reauthorize()).await, Ok(Ok(())))
+    }
+
+    async fn reauthorize(&mut self) -> S3Result<()> {
+        let now = tokio::time::Instant::now();
+        if now >= self.refresh_at {
+            if let Some(credentials) = &self.keystone_credentials {
+                let provider =
+                    crate::auth_keystone::get_keystone_auth().ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+                let token = self
+                    .request
+                    .headers
+                    .get("x-auth-token")
+                    .and_then(|v| v.to_str().ok())
+                    .or_else(|| self.request.headers.get("x-storage-token").and_then(|v| v.to_str().ok()))
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+                let current = provider
+                    .revalidate_subscription_token(token)
+                    .await
+                    .map_err(|_| S3Error::new(S3ErrorCode::AccessDenied))?;
+                if current.access_key != credentials.access_key {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied));
+                }
+                self.keystone_credentials = Some(current);
+            }
+            if let Some((bucket, expected)) = &self.bucket_incarnation {
+                let store = crate::admin::runtime_sources::object_store_from_req(&self.request)
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+                let actual = store.bucket_incarnation_id_from_disk(bucket).await.map_err(ApiError::from)?;
+                if actual != *expected {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied));
+                }
+            }
+            self.refresh_at = now + LISTEN_AUTH_REFRESH_INTERVAL;
+        }
+        if self
+            .keystone_credentials
+            .as_ref()
+            .and_then(|cred| cred.expiration)
+            .is_some_and(|expiry| expiry <= time::OffsetDateTime::now_utc())
+        {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied));
+        }
+        let context = app_context_from_req(&self.request);
+        if context.is_none() && self.request.extensions.get::<Arc<ServerContextSlot>>().is_some() {
+            return Err(S3Error::new(S3ErrorCode::AccessDenied));
+        }
+        let keystone = self.keystone_credentials.clone();
+        let input = self
+            .request
+            .credentials
+            .clone()
+            .or_else(|| {
+                keystone.as_ref().map(|credentials| s3s::auth::Credentials {
+                    access_key: credentials.access_key.clone(),
+                    secret_key: "".into(),
+                })
+            })
+            .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+        rustfs_keystone::KEYSTONE_CREDENTIALS
+            .scope(keystone, async {
+                let (cred, is_owner) = crate::auth::check_key_valid_with_context(
+                    get_session_token(&self.request.uri, &self.request.headers).unwrap_or_default(),
+                    &input.access_key,
+                    context.as_deref(),
+                )
+                .await?;
+                if self.keystone_credentials.is_none() && !constant_time_eq(&cred.secret_key, input.secret_key.expose()) {
+                    return Err(S3Error::new(S3ErrorCode::AccessDenied));
+                }
+                let mut info = self
+                    .request
+                    .extensions
+                    .get::<ReqInfo>()
+                    .cloned()
+                    .ok_or_else(|| S3Error::new(S3ErrorCode::AccessDenied))?;
+                info.cred = Some(cred);
+                info.is_owner = is_owner;
+                self.request.extensions.insert(info);
+                authorize_request(&mut self.request, self.action).await
+            })
+            .await
+    }
+
+    async fn still_allowed_until_closed(&mut self, tx: &mpsc::Sender<Result<Bytes, StdError>>) -> bool {
+        tokio::select! {
+            biased;
+            _ = tx.closed() => false,
+            allowed = self.still_allowed() => allowed,
+        }
+    }
+
+    async fn send(&mut self, tx: &mpsc::Sender<Result<Bytes, StdError>>, bytes: Bytes) -> bool {
+        loop {
+            tokio::select! {
+                permit = tx.reserve() => {
+                    let Ok(permit) = permit else { return false; };
+                    if !self.still_allowed_until_closed(tx).await { return false; }
+                    permit.send(Ok(bytes));
+                    return true;
+                }
+                _ = tokio::time::sleep(LISTEN_AUTH_REFRESH_INTERVAL) => {
+                    if !self.still_allowed_until_closed(tx).await { return false; }
+                }
+            }
+        }
+    }
+}
+
 async fn fan_in_remote_live_events(
     peers: &mut [PeerLiveEventCursor],
     filter: &ListenNotificationFilter,
     tx: &mpsc::Sender<Result<Bytes, StdError>>,
+    authorization: &mut ListenNotificationAuthorization,
 ) -> bool {
     for peer in peers.iter_mut() {
         loop {
+            if !authorization.still_allowed().await {
+                return false;
+            }
             let batch = match tokio::time::timeout(
                 Duration::from_secs(2),
                 peer.client
@@ -1392,7 +1595,7 @@ async fn fan_in_remote_live_events(
                             }
                             match serialize_listen_notification_event(&event) {
                                 Ok(serialized) => {
-                                    if tx.send(Ok(serialized)).await.is_err() {
+                                    if !authorization.send(tx, serialized).await {
                                         return false;
                                     }
                                 }
@@ -1434,7 +1637,11 @@ async fn fan_in_remote_live_events(
     true
 }
 
-fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Result<S3Response<Body>> {
+fn build_listen_notification_response(
+    uri: &Uri,
+    bucket: Option<&str>,
+    mut authorization: ListenNotificationAuthorization,
+) -> S3Result<S3Response<Body>> {
     let (interval_duration, payload) = listen_notification_keepalive_plan(uri);
     let filter = parse_listen_notification_filter(uri, bucket)?;
     let mut live_events = notification_system().map(|system| system.subscribe_live_events());
@@ -1446,6 +1653,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
     });
 
     spawn_traced(async move {
+        let mut authorization_ticker = tokio::time::interval(LISTEN_AUTH_REFRESH_INTERVAL);
         let mut ticker = tokio::time::interval(interval_duration);
         let mut peer_ticker = tokio::time::interval(LISTEN_NOTIFICATION_PEER_POLL_INTERVAL);
         // Skip the immediate first tick so behavior starts after interval duration.
@@ -1455,8 +1663,11 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
             if let Some(events_rx) = live_events.as_mut() {
                 tokio::select! {
                     _ = tx.closed() => break,
+                    _ = authorization_ticker.tick() => {
+                        if !authorization.still_allowed_until_closed(&tx).await { break; }
+                    },
                     _ = ticker.tick() => {
-                        if tx.send(Ok(payload.clone())).await.is_err() {
+                        if !authorization.send(&tx, payload.clone()).await {
                             break;
                         }
                     }
@@ -1468,7 +1679,7 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
                                 }
                                 match serialize_listen_notification_event(&event) {
                                     Ok(serialized) => {
-                                        if tx.send(Ok(serialized)).await.is_err() {
+                                        if !authorization.send(&tx, serialized).await {
                                             break;
                                         }
                                     }
@@ -1499,7 +1710,11 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
                         }
                     }
                     _ = peer_ticker.tick(), if !peer_live_events.is_empty() => {
-                        if !fan_in_remote_live_events(&mut peer_live_events, &filter, &tx).await {
+                        if !tokio::select! {
+                            biased;
+                            _ = tx.closed() => false,
+                            result = fan_in_remote_live_events(&mut peer_live_events, &filter, &tx, &mut authorization) => result,
+                        } {
                             break;
                         }
                     }
@@ -1507,13 +1722,20 @@ fn build_listen_notification_response(uri: &Uri, bucket: Option<&str>) -> S3Resu
             } else {
                 tokio::select! {
                     _ = tx.closed() => break,
+                    _ = authorization_ticker.tick() => {
+                        if !authorization.still_allowed_until_closed(&tx).await { break; }
+                    },
                     _ = ticker.tick() => {
-                        if tx.send(Ok(payload.clone())).await.is_err() {
+                        if !authorization.send(&tx, payload.clone()).await {
                             break;
                         }
                     }
                     _ = peer_ticker.tick(), if !peer_live_events.is_empty() => {
-                        if !fan_in_remote_live_events(&mut peer_live_events, &filter, &tx).await {
+                        if !tokio::select! {
+                            biased;
+                            _ = tx.closed() => false,
+                            result = fan_in_remote_live_events(&mut peer_live_events, &filter, &tx, &mut authorization) => result,
+                        } {
                             break;
                         }
                     }
@@ -1547,7 +1769,7 @@ async fn ensure_replication_bucket_exists(bucket: &str) -> S3Result<()> {
 async fn ensure_replication_config_exists(bucket: &str) -> S3Result<()> {
     match metadata_sys::get_replication_config(bucket).await {
         Ok(_) => Ok(()),
-        Err(StorageError::ConfigNotFound) => Err(s3_error!(ReplicationConfigurationNotFoundError)),
+        Err(StorageError::ConfigNotFound) => Err(S3Error::new(S3ErrorCode::ReplicationConfigurationNotFoundError)),
         Err(err) => Err(ApiError::from(err).into()),
     }
 }
@@ -1634,21 +1856,19 @@ fn serialize_replication_metrics_body(
 ) -> S3Result<Vec<u8>> {
     use crate::admin::replication_metrics_wire::{MetricsV2Wire, MetricsWire};
     match route {
-        ReplicationExtRoute::MetricsV1 => {
-            serde_json::to_vec(&MetricsWire::from(&bucket_stats.replication_stats)).map_err(|e| s3_error!(InternalError, "{e}"))
-        }
-        ReplicationExtRoute::MetricsV2 => {
-            serde_json::to_vec(&MetricsV2Wire::from_stats(bucket_stats, node_name)).map_err(|e| s3_error!(InternalError, "{e}"))
-        }
+        ReplicationExtRoute::MetricsV1 => serde_json::to_vec(&MetricsWire::from(&bucket_stats.replication_stats))
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}"))),
+        ReplicationExtRoute::MetricsV2 => serde_json::to_vec(&MetricsV2Wire::from_stats(bucket_stats, node_name))
+            .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}"))),
         ReplicationExtRoute::Check | ReplicationExtRoute::ResetStart | ReplicationExtRoute::ResetStatus => {
-            Err(s3_error!(InternalError, "invalid route for metrics response"))
+            Err(S3Error::with_message(S3ErrorCode::InternalError, "invalid route for metrics response"))
         }
     }
 }
 
 async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_req: &ReplicationExtRequest) -> S3Result<()> {
     let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(AccessDenied, "Signature is required"));
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required"));
     };
 
     let (cred, is_owner) =
@@ -1665,7 +1885,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
     });
 
     license_check().map_err(|er| match er.kind() {
-        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        std::io::ErrorKind::PermissionDenied => S3Error::with_message(S3ErrorCode::AccessDenied, format!("{er}")),
         _ => {
             error!(
                 event = EVENT_ADMIN_ROUTER_STATE,
@@ -1675,7 +1895,7 @@ async fn authorize_replication_extension_request(req: &mut S3Request<Body>, ext_
                 error = %er,
                 "admin router state"
             );
-            s3_error!(InternalError, "License validation failed")
+            S3Error::with_message(S3ErrorCode::InternalError, "License validation failed")
         }
     })?;
 
@@ -1700,10 +1920,12 @@ fn parse_reset_start_target(uri: &Uri) -> S3Result<ReplicationResetStartRequest>
     let now = OffsetDateTime::now_utc();
     let reset_before = match query_value_exact(uri, "older-than").filter(|v| !v.is_empty()) {
         Some(older_than) => {
-            let duration = parse_duration(&older_than)
-                .map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
-            let duration = time::Duration::try_from(duration)
-                .map_err(|err| s3_error!(InvalidRequest, "invalid older-than query parameter: {err}"))?;
+            let duration = parse_duration(&older_than).map_err(|err| {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid older-than query parameter: {err}"))
+            })?;
+            let duration = time::Duration::try_from(duration).map_err(|err| {
+                S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid older-than query parameter: {err}"))
+            })?;
             Some(now - duration)
         }
         None => Some(now),
@@ -1774,7 +1996,10 @@ fn resolve_replication_reset_target_arn(config: &s3s::dto::ReplicationConfigurat
 
     let (has_arn, existing_object_enabled) = config.has_existing_object_replication(requested_arn);
     if !has_arn {
-        return Err(s3_error!(InvalidRequest, "replication reset arn is not configured for this bucket"));
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidRequest,
+            "replication reset arn is not configured for this bucket",
+        ));
     }
     if !existing_object_enabled {
         return Err(s3_error!(
@@ -1787,7 +2012,8 @@ fn resolve_replication_reset_target_arn(config: &s3s::dto::ReplicationConfigurat
 }
 
 fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3Result<S3Response<Body>> {
-    let data = serde_json::to_vec(&ReplicationResetResponse { targets }).map_err(|e| s3_error!(InternalError, "{e}"))?;
+    let data = serde_json::to_vec(&ReplicationResetResponse { targets })
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
     let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
     resp.headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1797,7 +2023,7 @@ fn build_replication_reset_response(targets: Vec<ReplicationResetTarget>) -> S3R
 fn map_replication_resync_start_error(error: StorageError) -> S3Error {
     match replication::resync_start_conflict_id(&error) {
         Some(active_resync_id) => replication_resync_active_conflict_error(active_resync_id),
-        None => s3_error!(InternalError, "{error}"),
+        None => S3Error::with_message(S3ErrorCode::InternalError, format!("{error}")),
     }
 }
 
@@ -1849,7 +2075,7 @@ fn build_replication_reset_status_response(
     let data = serde_json::to_vec(&ReplicationResetStatusResponse {
         targets: build_replication_reset_status_targets(&status, arn_filter),
     })
-    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
     let mut resp = S3Response::with_status(Body::from(data), StatusCode::OK);
     resp.headers
         .insert(header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
@@ -1870,7 +2096,7 @@ fn build_replication_check_response(mut targets: Vec<ReplicationCheckTargetStatu
         probe_namespace: REPLICATION_CHECK_PROBE_PREFIX,
         targets,
     })
-    .map_err(|e| s3_error!(InternalError, "{e}"))?;
+    .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))?;
     let mut response = S3Response::with_status(Body::from(data), StatusCode::OK);
     response
         .headers
@@ -1955,7 +2181,10 @@ fn validate_replication_check_config_targets(
     let role = config.role.trim();
     if !role.is_empty() {
         if !configured_arns.contains(role) {
-            return Err(s3_error!(InvalidRequest, "replication config has stale target {role}"));
+            return Err(S3Error::with_message(
+                S3ErrorCode::InvalidRequest,
+                format!("replication config has stale target {role}"),
+            ));
         }
         return Ok(());
     }
@@ -2955,7 +3184,7 @@ async fn target_client_object_lock_enabled_with_client(
 
 async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartRequest) -> S3Result<ReplicationResetTarget> {
     let Some(pool) = current_replication_pool_handle() else {
-        return Err(s3_error!(InternalError, "replication pool is not initialized"));
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "replication pool is not initialized"));
     };
 
     let _targets_guard = lock_bucket_targets_metadata(bucket).await;
@@ -3000,12 +3229,12 @@ async fn start_replication_resync(bucket: &str, reset: &ReplicationResetStartReq
 
 async fn load_replication_resync_status(bucket: &str) -> S3Result<BucketReplicationResyncStatus> {
     let Some(pool) = current_replication_pool_handle() else {
-        return Err(s3_error!(InternalError, "replication pool is not initialized"));
+        return Err(S3Error::with_message(S3ErrorCode::InternalError, "replication pool is not initialized"));
     };
 
     pool.get_bucket_resync_status(bucket)
         .await
-        .map_err(|e| s3_error!(InternalError, "{e}"))
+        .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, format!("{e}")))
 }
 
 async fn handle_replication_extension_request(
@@ -3050,7 +3279,7 @@ async fn handle_replication_extension_request(
 
 async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &MiscExtRoute) -> S3Result<()> {
     let Some(input_cred) = req.credentials.as_ref() else {
-        return Err(s3_error!(AccessDenied, "Signature is required"));
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required"));
     };
 
     let (cred, is_owner) =
@@ -3077,7 +3306,7 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
     });
 
     license_check().map_err(|er| match er.kind() {
-        std::io::ErrorKind::PermissionDenied => s3_error!(AccessDenied, "{er}"),
+        std::io::ErrorKind::PermissionDenied => S3Error::with_message(S3ErrorCode::AccessDenied, format!("{er}")),
         _ => {
             error!(
                 event = EVENT_ADMIN_ROUTER_STATE,
@@ -3087,11 +3316,30 @@ async fn authorize_misc_extension_request(req: &mut S3Request<Body>, route: &Mis
                 error = %er,
                 "admin router state"
             );
-            s3_error!(InternalError, "License validation failed")
+            S3Error::with_message(S3ErrorCode::InternalError, "License validation failed")
         }
     })?;
 
+    if matches!(route, MiscExtRoute::ObjectLambda { .. }) {
+        // The bridged GetObject hook evaluates the actual version and all read conditions.
+        return Ok(());
+    }
     authorize_request(req, action).await
+}
+
+async fn authorized_object_lambda_get_request(
+    req: &S3Request<Body>,
+    bucket: &str,
+    object: &str,
+) -> S3Result<S3Request<GetObjectInput>> {
+    let mut get_req = build_object_lambda_get_request(req, bucket, object)?;
+    let slot = req
+        .extensions
+        .get::<Arc<ServerContextSlot>>()
+        .cloned()
+        .ok_or_else(server_context_not_ready_error)?;
+    s3s::access::S3Access::get_object(&crate::storage::ecfs::FS::with_server_ctx(slot), &mut get_req).await?;
+    Ok(get_req)
 }
 
 async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscExtRoute) -> S3Result<S3Response<Body>> {
@@ -3100,7 +3348,7 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
 
     match route {
         MiscExtRoute::ObjectLambda { bucket, object } => {
-            let get_req = build_object_lambda_get_request(req, bucket, object)?;
+            let get_req = authorized_object_lambda_get_request(req, bucket, object).await?;
             let usecase = default_object_usecase();
             let get_resp = usecase.execute_get_object(get_req).await?;
             invoke_object_lambda_target(req, bucket, object, get_resp).await
@@ -3115,7 +3363,8 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
                     .await
                     .map_err(ApiError::from)?;
             }
-            build_listen_notification_response(&req.uri, bucket.as_deref())
+            let authorization = ListenNotificationAuthorization::capture(req, bucket.as_deref()).await?;
+            build_listen_notification_response(&req.uri, bucket.as_deref(), authorization)
         }
     }
 }
@@ -3136,8 +3385,40 @@ fn is_public_health_path(path: &str) -> bool {
     path == HEALTH_PREFIX || path == HEALTH_READY_PATH
 }
 
+fn reject_unbound_custom_route_auth(req: &S3Request<Body>) -> S3Result<()> {
+    // V2 does not bind custom route query arguments or payloads to the signer.
+    let signed_v2 = req
+        .headers
+        .get_all(http::header::AUTHORIZATION)
+        .iter()
+        .any(|value| value.to_str().is_ok_and(|value| value.starts_with("AWS ")));
+    let presigned_v2 = req
+        .uri
+        .query()
+        .is_some_and(|query| url::form_urlencoded::parse(query.as_bytes()).any(|(key, _)| key == "Signature"));
+    let post_policy = req.method == Method::POST
+        && req.credentials.is_some()
+        && req
+            .headers
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| {
+                value
+                    .split(';')
+                    .next()
+                    .is_some_and(|media_type| media_type.trim().eq_ignore_ascii_case("multipart/form-data"))
+            });
+    if signed_v2 || presigned_v2 || post_policy {
+        return Err(s3_error!(
+            AccessDenied,
+            "Header or query Signature Version 4 is required for this operation"
+        ));
+    }
+    Ok(())
+}
+
 fn server_context_not_ready_error() -> S3Error {
-    s3_error!(ServiceUnavailable, "server context is not ready")
+    S3Error::with_message(S3ErrorCode::ServiceUnavailable, "server context is not ready")
 }
 
 fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
@@ -3287,9 +3568,10 @@ where
         if parse_replication_extension_request(&req.method, &req.uri).is_some()
             || parse_misc_extension_request(&req.method, &req.uri).is_some()
         {
+            reject_unbound_custom_route_auth(req)?;
             return match req.credentials {
                 Some(_) => Ok(()),
-                None => Err(s3_error!(AccessDenied, "Signature is required")),
+                None => Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required")),
             };
         }
 
@@ -3327,9 +3609,10 @@ where
         }
 
         // For non-RPC admin requests, check credentials
+        reject_unbound_custom_route_auth(req)?;
         match req.credentials {
             Some(_) => Ok(()),
-            None => Err(s3_error!(AccessDenied, "Signature is required")),
+            None => Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Signature is required")),
         }
     }
 
@@ -3359,7 +3642,7 @@ where
                     Err(e) => Err(s3_error!(InternalError, "{}", e)),
                 };
             }
-            return Err(s3_error!(InternalError, "console is not enabled"));
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
         }
 
         let canonical_path = canonicalize_admin_path(req.uri.path());
@@ -3380,7 +3663,7 @@ where
             return Ok(resp);
         }
 
-        Err(s3_error!(NotImplemented))
+        Err(S3Error::new(S3ErrorCode::NotImplemented))
     }
 }
 
@@ -3402,6 +3685,74 @@ impl Operation for AdminOperation {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_lambda_bridge_enforces_version_read_permissions() {
+        crate::app::gating_test_env::run_large_stack_test("lambda-version-permissions", || async {
+            use crate::admin::runtime_sources::AppContext;
+            use crate::admin::storage_api::contract::bucket::MakeBucketOptions;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()))));
+            let bucket = format!("lambda-version-{}", uuid::Uuid::new_v4());
+            store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("create bucket");
+            for (grant_current, grant_versions, deny_versions) in [
+                (true, false, false),
+                (true, true, true),
+                (true, true, false),
+                (false, true, false),
+            ] {
+                let mut statements = Vec::new();
+                if grant_current {
+                    statements.push(serde_json::json!({"Effect":"Allow","Principal":{"AWS":"*"},"Action":"s3:GetObject","Resource":format!("arn:aws:s3:::{bucket}/*")}));
+                }
+                for (enabled, effect) in [(grant_versions, "Allow"), (deny_versions, "Deny")] {
+                    if enabled {
+                        statements.push(serde_json::json!({"Effect":effect,"Principal":{"AWS":"*"},"Action":"s3:GetObjectVersion","Resource":format!("arn:aws:s3:::{bucket}/*")}));
+                    }
+                }
+                store
+                    .update_bucket_metadata_config(
+                        &bucket,
+                        crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_POLICY_CONFIG,
+                        serde_json::to_vec(&serde_json::json!({"Version":"2012-10-17","Statement":statements})).unwrap(),
+                    )
+                    .await
+                    .expect("publish policy");
+                for version in [None, Some("null"), Some("12345678-1234-1234-1234-123456789abc")] {
+                    let mut req = router_request(Method::GET, "/");
+                    req.uri = format!(
+                        "/{bucket}/object?lambdaArn=arn:aws:s3-object-lambda:us-east-1:123456789012:accesspoint/test{}",
+                        version.map(|v| format!("&versionId={v}")).unwrap_or_default()
+                    )
+                    .parse()
+                    .unwrap();
+                    req.extensions.insert(slot.clone());
+                    req.extensions.insert(ReqInfo::default());
+                    req.headers.insert(http::header::IF_NONE_MATCH, HeaderValue::from_static("*"));
+                    let result = authorized_object_lambda_get_request(&req, &bucket, "object").await;
+                    // Version-only Allow covers current reads; Version Deny overrides
+                    // the explicit current-read Allow as well as version grants.
+                    if deny_versions || (version.is_some() && !grant_versions) {
+                        assert_eq!(
+                            result
+                                .expect_err("version read must be denied before usecase or webhook")
+                                .code(),
+                            &s3s::S3ErrorCode::AccessDenied
+                        );
+                    } else {
+                        let request = result.expect("authorized read remains available");
+                        assert_eq!(request.input.version_id.as_deref(), version);
+                        assert_eq!(request.extensions.get::<ReqInfo>().unwrap().version_id.as_deref(), version);
+                    }
+                }
+            }
+        });
+    }
+
     use super::*;
     use http::HeaderMap;
     use http::Method;
@@ -5700,6 +6051,89 @@ mod tests {
         assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
     }
 
+    #[tokio::test]
+    async fn custom_routes_reject_signature_v2_arguments() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        for uri in [
+            "/rustfs/admin/v3/add-user?accessKey=target",
+            "/minio/admin/v3/set-user-or-group-policy?userOrGroup=target",
+            "/?Action=AssumeRole",
+            "/bucket?replication-metrics",
+            "/iceberg/v1/config",
+        ] {
+            for presigned in [false, true] {
+                let method = if uri.contains("replication-metrics") {
+                    Method::GET
+                } else {
+                    Method::POST
+                };
+                let mut req = router_request(method, uri);
+                req.credentials = Some(s3s::auth::Credentials {
+                    access_key: "test".into(),
+                    secret_key: "secret".into(),
+                });
+                req.headers
+                    .insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/x-www-form-urlencoded"));
+                if presigned {
+                    let separator = if uri.contains('?') { '&' } else { '?' };
+                    req.uri = format!("{uri}{separator}%53ignature=captured&AWSAccessKeyId=test&Expires=1790000000")
+                        .parse()
+                        .unwrap();
+                } else {
+                    req.headers
+                        .insert(http::header::AUTHORIZATION, HeaderValue::from_static("AWS test:captured"));
+                }
+                let error = router
+                    .check_access(&mut req)
+                    .await
+                    .expect_err("V2 custom arguments are not signed");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied, "{uri}");
+                assert_eq!(
+                    error.message(),
+                    Some("Header or query Signature Version 4 is required for this operation")
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_routes_preserve_verified_sigv4_access() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        for uri in ["/rustfs/admin/v3/info", "/bucket?replication-metrics", "/?Action=AssumeRole"] {
+            let mut req = router_request(Method::GET, uri);
+            req.credentials = Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: "secret".into(),
+            });
+            req.headers.insert(http::header::AUTHORIZATION, HeaderValue::from_static(
+                "AWS4-HMAC-SHA256 Credential=test/20260827/us-east-1/s3/aws4_request, SignedHeaders=host, Signature=0000000000000000000000000000000000000000000000000000000000000000"
+            ));
+            router
+                .check_access(&mut req)
+                .await
+                .expect("verified V4 requests remain accepted");
+        }
+    }
+
+    #[tokio::test]
+    async fn custom_routes_reject_post_policy_authentication() {
+        let router: S3Router<AdminOperation> = S3Router::new(false);
+        for content_type in ["multipart/form-data; boundary=upload", "Multipart/Form-Data; boundary=upload"] {
+            let mut req = router_request(Method::POST, "/rustfs/admin/v3/service?action=stop");
+            req.credentials = Some(s3s::auth::Credentials {
+                access_key: "test".into(),
+                secret_key: "secret".into(),
+            });
+            req.headers
+                .insert(http::header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+            let error = router
+                .check_access(&mut req)
+                .await
+                .expect_err("upload form signatures do not authorize admin routes");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+        }
+    }
+
     /// GHSA-g8w9-qw9q-fghr: custom routes must apply the presigned
     /// signed-header rule too, since they never reach `S3Access::check`.
     #[tokio::test]
@@ -6038,13 +6472,212 @@ mod tests {
         assert!(body.ends_with('\n'));
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn listen_notification_streams_close_after_identity_policy_or_bucket_revocation() {
+        crate::app::gating_test_env::run_large_stack_test("listen-revocation", || async {
+            use crate::admin::runtime_sources::{AppContext, IamInterface};
+            use crate::admin::storage_api::contract::bucket::{DeleteBucketOptions, MakeBucketOptions};
+            use rustfs_iam::store::{Store as _, UserType, object::ObjectStore};
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use rustfs_policy::policy::Policy;
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    Arc::clone(&self.0)
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version":1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("IAM format");
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.expect("IAM");
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let context = Arc::new(AppContext::new(store.clone(), Arc::new(ReadyIam(iam.clone())), ambient.kms()));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "listen-test-root".into(),
+                secret_key: "listen-root-secret".into(),
+                status: "on".into(),
+                ..Default::default()
+            }));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context));
+            for (case, bucket_scoped) in [
+                ("detach", false),
+                ("disable", true),
+                ("delete", false),
+                ("rotate", true),
+                ("recreate", true),
+                ("expire", true),
+            ] {
+                let key = format!("listen-{case}");
+                let bucket = format!("listen-{case}-{}", uuid::Uuid::new_v4());
+                store
+                    .make_bucket(&bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket");
+                iam.create_user(
+                    &key,
+                    &AddOrUpdateUserReq {
+                        secret_key: "listen-user-secret".into(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .expect("listener");
+                let policy = serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow",
+                    "Action":["s3:ListenNotification","s3:ListenBucketNotification"],"Resource":"arn:aws:s3:::*"}]});
+                iam.set_policy(
+                    &key,
+                    Policy::parse_config(&serde_json::to_vec(&policy).expect("policy JSON")).expect("policy"),
+                )
+                .await
+                .expect("set policy");
+                iam.policy_db_set(&key, UserType::Reg, false, &key)
+                    .await
+                    .expect("attach policy");
+                let temporary = if case == "expire" {
+                    let claims = std::collections::HashMap::from([
+                        (
+                            "exp".to_string(),
+                            serde_json::json!((time::OffsetDateTime::now_utc() + time::Duration::seconds(5)).unix_timestamp()),
+                        ),
+                        ("parent".to_string(), serde_json::json!(key)),
+                    ]);
+                    let mut cred = rustfs_policy::auth::get_new_credentials_with_metadata(&claims, "listen-root-secret")
+                        .expect("signed temporary credentials");
+                    cred.parent_user = key.clone();
+                    iam.set_temp_user(&cred.access_key, &cred, None)
+                        .await
+                        .expect("temporary listener");
+                    Some(cred)
+                } else {
+                    None
+                };
+                let uri: Uri = if bucket_scoped {
+                    format!("/{bucket}?events=s3:ObjectCreated:*&ping=1")
+                } else {
+                    "/?events=s3:ObjectCreated:*&ping=1".to_string()
+                }
+                .parse()
+                .expect("listen URI");
+                let mut request = S3Request {
+                    input: Body::empty(),
+                    method: Method::GET,
+                    uri: uri.clone(),
+                    headers: HeaderMap::new(),
+                    extensions: http::Extensions::new(),
+                    credentials: Some(s3s::auth::Credentials {
+                        access_key: key.clone(),
+                        secret_key: "listen-user-secret".into(),
+                    }),
+                    region: None,
+                    service: None,
+                    trailing_headers: None,
+                };
+                if let Some(cred) = &temporary {
+                    request.credentials = Some(s3s::auth::Credentials {
+                        access_key: cred.access_key.clone(),
+                        secret_key: cred.secret_key.clone().into(),
+                    });
+                    request
+                        .headers
+                        .insert("x-amz-security-token", cred.session_token.parse().expect("session header"));
+                }
+                request.extensions.insert(Arc::clone(&slot));
+                request.extensions.insert(ReqInfo {
+                    bucket: bucket_scoped.then(|| bucket.clone()),
+                    ..Default::default()
+                });
+                let mut authorization =
+                    ListenNotificationAuthorization::capture(&request, bucket_scoped.then_some(bucket.as_str()))
+                        .await
+                        .expect("admit subscription");
+                assert!(authorization.still_allowed().await, "initial listener {case}");
+                // Fill a real stream's output channel, then revoke while its next
+                // send is waiting. A consumer pause cannot defer reauthorization.
+                let (tx, mut rx) = mpsc::channel(1);
+                assert!(authorization.send(&tx, Bytes::from_static(b"before")).await);
+                match case {
+                    "expire" => {
+                        tokio::time::sleep(Duration::from_secs(6)).await;
+                    }
+                    "detach" => {
+                        iam.policy_db_set(&key, UserType::Reg, false, "").await.expect("detach");
+                    }
+                    "disable" => {
+                        iam.set_user_status(&key, AccountStatus::Disabled).await.expect("disable");
+                    }
+                    "delete" => {
+                        iam.delete_user(&key, false).await.expect("delete user");
+                    }
+                    "rotate" => {
+                        iam.rotate_user_secret_key(&key, "replacement-listen-secret")
+                            .await
+                            .expect("rotate");
+                    }
+                    "recreate" => {
+                        store
+                            .delete_bucket(&bucket, &DeleteBucketOptions::default())
+                            .await
+                            .expect("delete bucket");
+                        store
+                            .make_bucket(&bucket, &MakeBucketOptions::default())
+                            .await
+                            .expect("recreate bucket");
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(
+                    !tokio::time::timeout(Duration::from_secs(8), authorization.send(&tx, Bytes::from_static(b"after")))
+                        .await
+                        .expect("revocation must retire a backpressured stream"),
+                    "{case}"
+                );
+                assert_eq!(rx.recv().await.expect("previous event").expect("bytes"), Bytes::from_static(b"before"));
+                assert!(rx.try_recv().is_err(), "revoked event leaked: {case}");
+                let response = build_listen_notification_response(&uri, bucket_scoped.then_some(bucket.as_str()), authorization)
+                    .expect("stream headers");
+                tokio::time::timeout(Duration::from_secs(8), http_body_util::BodyExt::collect(response.output))
+                    .await
+                    .expect("an idle revoked stream must terminate")
+                    .expect("stream ends cleanly");
+            }
+        });
+    }
+
     #[tokio::test]
     async fn build_listen_notification_response_sets_event_stream_headers() {
         let uri: Uri = "/demo-bucket?events=s3:ObjectCreated:Put&ping=1"
             .parse()
             .expect("uri should parse");
 
-        let resp = build_listen_notification_response(&uri, Some("demo-bucket")).expect("response should build");
+        let authorization = ListenNotificationAuthorization {
+            request: S3Request {
+                input: (),
+                method: Method::GET,
+                uri: uri.clone(),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            },
+            action: Action::S3Action(S3Action::ListenBucketNotificationAction),
+            bucket_incarnation: None,
+            keystone_credentials: None,
+            refresh_at: tokio::time::Instant::now(),
+        };
+        let resp = build_listen_notification_response(&uri, Some("demo-bucket"), authorization).expect("response should build");
 
         assert_eq!(
             resp.headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()),

@@ -2731,6 +2731,11 @@ pub(crate) struct NamespaceMutationLease {
 }
 
 impl NamespaceMutationLease {
+    #[cfg(test)]
+    pub(crate) fn blocking_queue_for_test(&self) -> Arc<DiskBlockingQueue> {
+        self.blocking_queue.clone()
+    }
+
     pub(crate) fn attach_external_guard(&self, guard: Arc<dyn Send + Sync>) {
         *self.external_guard.lock() = Some(guard);
     }
@@ -3803,7 +3808,7 @@ pub(crate) async fn rename_reconciled_metadata(
     authority: Arc<crate::bucket::lifecycle::legacy_transition_state_reconcile::TransitionStateReconcileAuthority>,
 ) -> Result<()> {
     let lease = acquire_namespace_mutation_lease_with_owner(&destination, owner).await;
-    run_blocking_namespace_operation(lease, move || {
+    run_blocking_namespace_operation_with_sync(lease, true, move || {
         let preparation = prepare_rename_with_retry(&source, &destination, &base_dir, &publication_root)?;
         #[cfg(all(any(test, feature = "test-util"), not(windows)))]
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, &destination);
@@ -4803,6 +4808,23 @@ pub(crate) async fn run_cancellable_blocking_namespace_operation<T: Send + 'stat
         .await
 }
 
+pub(crate) async fn run_cancellable_blocking_namespace_operation_with_sync<T: Send + 'static>(
+    lease: Arc<NamespaceMutationLease>,
+    sync: bool,
+    operation: impl FnOnce(&dyn Fn() -> bool) -> io::Result<T> + Send + 'static,
+) -> io::Result<T> {
+    if !sync {
+        return run_cancellable_blocking_namespace_operation(lease, operation).await;
+    }
+    let queue = Arc::clone(&lease.blocking_queue);
+    queue
+        .run_fsync_cancellable(move |is_cancelled| {
+            let _lease = lease;
+            operation(is_cancelled)
+        })
+        .await
+}
+
 /// Admit one strict inline commit under the disk sync limit. The caller already
 /// owns the namespace lease, establishing namespace -> disk ordering. Holding
 /// admission across adjacent durability barriers prevents one transaction from
@@ -5380,6 +5402,29 @@ impl PublicationRoot {
             #[cfg(target_os = "linux")]
             io_path,
         })
+    }
+
+    /// Distinguish reconnects from replacement mounts before reusing disk-local state.
+    pub(crate) fn physical_identity(&self) -> io::Result<(u64, [u8; 16])> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            #[cfg(target_os = "linux")]
+            let metadata = self.directory.metadata()?;
+            #[cfg(not(target_os = "linux"))]
+            let metadata = std::fs::metadata(&*self.path)?;
+            let mut inode = [0; 16];
+            inode[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+            Ok((metadata.dev(), inode))
+        }
+        #[cfg(windows)]
+        {
+            windows_file_identity(&self.directory.handle)
+        }
+        #[cfg(not(any(unix, windows)))]
+        {
+            Err(io::Error::new(io::ErrorKind::Unsupported, "physical root identity unavailable"))
+        }
     }
 
     pub(crate) fn path(&self) -> &Path {

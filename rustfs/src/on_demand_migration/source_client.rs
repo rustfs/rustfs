@@ -273,6 +273,7 @@ impl SourceClientSpec {
             ca_cert_pem: self.ca_cert_pem.clone(),
             connect_timeout: Some(self.timeouts.connect),
             read_timeout: Some(self.timeouts.read),
+            operation_timeout: None,
             retry: self.retry,
             user_agent_suffix: USER_AGENT_SUFFIX,
         })
@@ -1723,6 +1724,7 @@ mod tests {
         assert_eq!(endpoint.user_agent_suffix, USER_AGENT_SUFFIX);
         assert_eq!(endpoint.connect_timeout, Some(Duration::from_secs(10)));
         assert_eq!(endpoint.read_timeout, Some(Duration::from_secs(60)));
+        assert_eq!(endpoint.operation_timeout, None);
         assert_eq!(endpoint.path_style, PathStyle::Path);
 
         s.endpoint = "http://[::1]:9000".to_string();

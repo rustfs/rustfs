@@ -6609,6 +6609,7 @@ mod tests {
             health_check_duration: std::time::Duration::from_secs(5),
             replicate_sync: false,
             client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
+            timeouts: Default::default(),
         })
     }
 

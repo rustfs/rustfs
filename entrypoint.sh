@@ -184,12 +184,47 @@ if [ "$1" = "/usr/bin/rustfs" ]; then
   validate_credential_source "RUSTFS_SECRET_KEY" "RUSTFS_SECRET_KEY_FILE" "RUSTFS_ROOT_PASSWORD or MINIO_ROOT_PASSWORD" "$SECRET_SOURCE"
 fi
 
+# Existing directories need no ownership scan; newly created directories get
+# only a best-effort, non-recursive owner change, including on large mounts.
+ensure_local_directory() {
+  [ -d "$1" ] && return 0
+
+  echo "  mkdir -p $1"
+  if ! mkdir -p "$1"; then
+    echo "ERROR: Cannot create $2. Check the configured path and write permissions for the container user (10001:10001 in official images)." >&2
+    if [ "$2" = "RUSTFS_OBS_LOG_DIRECTORY" ]; then
+      case "$1" in
+        \"*\"|\'*\')
+          echo 'HINT: RUSTFS_OBS_LOG_DIRECTORY contains literal surrounding quotes. In Docker Compose, use map syntax: RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/", or list syntax without inner quotes: - RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/' >&2
+          ;;
+      esac
+    fi
+    return 1
+  fi
+
+  if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
+    chown "$RUSTFS_UID:$RUSTFS_GID" "$1" 2>/dev/null || true
+  elif [ -n "$RUSTFS_USERNAME" ] && [ -n "$RUSTFS_GROUPNAME" ]; then
+    chown "$RUSTFS_USERNAME:$RUSTFS_GROUPNAME" "$1" 2>/dev/null || true
+  fi
+}
+
+has_volume_range() {
+  case "$1" in
+    *'{'*) printf '%s\n' "$1" | grep -E -q '\{[0-9]+\.\.\.?[0-9]+\}' ;;
+    *) return 1 ;;
+  esac
+}
+
 # 2) Process data volumes (separate from log directory)
 DATA_VOLUMES=""
 process_data_volumes() {
   VOLUME_RAW="${RUSTFS_VOLUMES:-/data}"
-  # Convert comma/tab to space
-  VOLUME_LIST_RAW=$(echo "$VOLUME_RAW" | tr ',\t' ' ')
+  # Normalize comma/tab delimiters only when present (the second pattern is a literal tab).
+  case "$VOLUME_RAW" in
+    *','*|*'	'*) VOLUME_LIST_RAW=$(printf '%s\n' "$VOLUME_RAW" | tr ',\t' ' ') ;;
+    *) VOLUME_LIST_RAW="$VOLUME_RAW" ;;
+  esac
   
   # Manually expand {N...M} ranges since sh doesn't support brace expansion on
   # variables. A single token can carry MORE than one range — the distributed
@@ -199,10 +234,10 @@ process_data_volumes() {
   # multi-range tokens intact; the previous single-pass expander collapsed them
   # to "http://rustfs1" and silently dropped the disk path.
   VOLUME_LIST="$VOLUME_LIST_RAW"
-  while echo "$VOLUME_LIST" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; do
+  while has_volume_range "$VOLUME_LIST"; do
       NEXT_LIST=""
       for vol in $VOLUME_LIST; do
-          if echo "$vol" | grep -E -q "\{[0-9]+\.\.\.?[0-9]+\}"; then
+          if has_volume_range "$vol"; then
                PREFIX=${vol%%\{*}
                REST=${vol#*\}}
                RANGE=${vol#*\{}
@@ -257,16 +292,7 @@ process_data_volumes() {
 
   echo "Initializing data directories:$CREATE_DIRS"
   for vol in $CREATE_DIRS; do
-    if [ ! -d "$vol" ]; then
-      echo "  mkdir -p $vol"
-      mkdir -p "$vol"
-      # If target user is specified, try to set directory owner to that user (non-recursive to avoid large disk overhead)
-      if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
-        chown "$RUSTFS_UID:$RUSTFS_GID" "$vol" 2>/dev/null || true
-      elif [ -n "$RUSTFS_USERNAME" ] && [ -n "$RUSTFS_GROUPNAME" ]; then
-        chown "$RUSTFS_USERNAME:$RUSTFS_GROUPNAME" "$vol" 2>/dev/null || true
-      fi
-    fi
+    ensure_local_directory "$vol" RUSTFS_VOLUMES
   done
 }
 
@@ -288,16 +314,7 @@ process_log_directory() {
   LOG_DIR="${RUSTFS_OBS_LOG_DIRECTORY}"
   
   echo "Initializing log directory: $LOG_DIR"
-  if [ ! -d "$LOG_DIR" ]; then
-    echo "  mkdir -p $LOG_DIR"
-    mkdir -p "$LOG_DIR"
-    # If target user is specified, try to set directory owner to that user (non-recursive to avoid large disk overhead)
-    if [ -n "$RUSTFS_UID" ] && [ -n "$RUSTFS_GID" ]; then
-      chown "$RUSTFS_UID:$RUSTFS_GID" "$LOG_DIR" 2>/dev/null || true
-    elif [ -n "$RUSTFS_USERNAME" ] && [ -n "$RUSTFS_GROUPNAME" ]; then
-      chown "$RUSTFS_USERNAME:$RUSTFS_GROUPNAME" "$LOG_DIR" 2>/dev/null || true
-    fi
-  fi
+  ensure_local_directory "$LOG_DIR" RUSTFS_OBS_LOG_DIRECTORY
 }
 
 # Execute the separate processes

@@ -15,6 +15,16 @@
 use std::collections::HashMap;
 use time::OffsetDateTime;
 
+/// Request authorization against the source selected under completion locks.
+/// Implementations must not mutate storage or acquire object/upload locks again.
+/// Called before comparing client checksums/parts or acknowledging a replay.
+#[async_trait::async_trait]
+pub trait MultipartCompletionAuthorization: Send + Sync {
+    type Error: std::error::Error + Send + Sync + 'static;
+
+    async fn authorize(&self, metadata: &HashMap<String, String>) -> Result<(), Self::Error>;
+}
+
 /// Checks upload absence before removing a bucket's data protections.
 #[async_trait::async_trait]
 pub trait MultipartUploadInspection: Send + Sync {

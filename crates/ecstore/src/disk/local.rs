@@ -25,6 +25,7 @@ pub(super) mod delete_recovery;
 #[cfg(all(unix, test))]
 #[path = "fd_cache_tests.rs"]
 mod fd_cache_tests;
+mod multipart_index;
 pub(in crate::disk) mod multipart_source_abort;
 mod multipart_source_recovery;
 pub(in crate::disk) mod multipart_source_state;
@@ -183,6 +184,13 @@ const DELETE_RESIDUE_PROBE_LIMIT: i32 = 8;
 /// `xl.meta` ends the walk), so the budget only caps the cost of hiding a
 /// large residue tree, which then hides one level at a time instead.
 const DELETE_RESIDUE_PROBE_READ_BUDGET: usize = 32;
+
+/// What one bounded directory read found under a prefix.
+enum PrefixListingProbe {
+    Visible,
+    Empty,
+    Cut(Vec<MetaCacheEntry>),
+}
 
 /// One directory read owed by the delete-residue probe.
 enum ResidueProbeStep {
@@ -644,6 +652,7 @@ async fn write_delete_rollback_files(
     let object_dir_buf = object_dir.to_path_buf();
     let volume_str = volume.to_owned();
     let inspect_object = inspect_object.map(str::to_owned);
+    let recovery_scope = delete_recovery::recovery_operation_scope();
     os::run_blocking_namespace_operation_with_sync(first_lease, sync, move || {
         for (path, _) in &removed_entries {
             reject_local_disk_symlink_components(&io_root, path).map_err(std::io::Error::from)?;
@@ -702,10 +711,21 @@ async fn write_delete_rollback_files(
             }
         }
         drop(staging_dir);
+        if entries.iter().any(|(name, _, _, _)| *name == DELETE_QUORUM_COMMITTED_FILE)
+            && let Some(scope) = recovery_scope.as_ref()
+        {
+            scope.receipt_published();
+        }
         let inspected = inspect_object
             .map(|object| {
-                delete_recovery::inspection_with_markers(&object_dir_buf, &volume_str, &object, rollback_dir)
-                    .map(|(state, _)| state)
+                delete_recovery::inspection_with_markers_bounded(
+                    &object_dir_buf,
+                    &volume_str,
+                    &object,
+                    rollback_dir,
+                    recovery_scope.as_ref().map(|scope| scope.budget.as_ref()),
+                )
+                .map(|(state, _)| state)
             })
             .transpose();
         drop((removed_entries, entries, inspect_lease));
@@ -777,7 +797,10 @@ async fn restore_delete_rollback_with_namespace_owner(
     let mut remove_new_metadata = false;
     match fs::read_dir(&rollback_path).await {
         Ok(mut entries) => {
-            while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+            while let Some(entry) = delete_recovery::next_recovery_entry(&mut entries)
+                .await
+                .map_err(to_file_error)?
+            {
                 let name = entry.file_name();
                 if name == DELETE_MARKER_ROLLBACK_FILE {
                     remove_new_metadata = true;
@@ -811,7 +834,10 @@ async fn restore_delete_rollback_with_namespace_owner(
         if recovery_journal.is_some() {
             let mut entries = fs::read_dir(&src).await.map_err(to_file_error)?;
             let mut files = Vec::new();
-            while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+            while let Some(entry) = delete_recovery::next_recovery_entry(&mut entries)
+                .await
+                .map_err(to_file_error)?
+            {
                 let name = entry.file_name();
                 let name = name.to_str().ok_or(DiskError::FileCorrupt)?;
                 if !entry.file_type().await.map_err(to_file_error)?.is_file()
@@ -909,10 +935,16 @@ async fn restore_delete_rollback_with_namespace_owner(
     match restored {
         Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
-            match os::remove_file_with_owner(xl_path, namespace_owner.clone()).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == ErrorKind::NotFound => {}
-                Err(err) => return Err(to_file_error(err).into()),
+            let preserves_child_prefix = recovery_journal
+                .as_ref()
+                .is_some_and(delete_recovery::missing_marker_preserves_child_prefix)
+                && fs::symlink_metadata(xl_path).await.is_ok_and(|metadata| metadata.is_dir());
+            if !preserves_child_prefix {
+                match os::remove_file_with_owner(xl_path, namespace_owner.clone()).await {
+                    Ok(()) => {}
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(to_file_error(err).into()),
+                }
             }
         }
         Err(DiskError::FileNotFound) if had_staged_paths => return Err(DiskError::FileNotFound),
@@ -962,7 +994,10 @@ async fn remove_version_delete_markers(
         Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
         Err(err) => return Err(to_file_error(err).into()),
     };
-    while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+    while let Some(entry) = delete_recovery::next_recovery_entry(&mut entries)
+        .await
+        .map_err(to_file_error)?
+    {
         if !entry.file_type().await.map_err(to_file_error)?.is_dir()
             || !entry.file_name().to_str().is_some_and(|name| Uuid::parse_str(name).is_ok())
         {
@@ -3124,6 +3159,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
             == Some(dst_path)
         || os::has_dir_fsync_test_failures()
         || os::file_sync_probe::is_active()
+        || os::prepared_publication_test_hooks::has_any_hooks()
 }
 
 #[cfg(all(not(test), feature = "test-util", target_os = "linux"))]
@@ -3134,6 +3170,7 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         .iter()
         .any(|target| target == dst_path)
         || os::has_dir_fsync_test_failures()
+        || os::prepared_publication_test_hooks::has_any_hooks()
 }
 
 #[cfg(any(not(any(test, feature = "test-util")), not(target_os = "linux")))]
@@ -4163,48 +4200,43 @@ fn reclaim_std_file_cache(file: &std::fs::File, reclaim_len: usize, reclaim_on_s
 #[cfg(not(target_os = "linux"))]
 fn reclaim_std_file_cache(_file: &std::fs::File, _reclaim_len: usize, _reclaim_on_shutdown: bool) {}
 
-static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+const PRESYNCED_TMP_DATA_DIRS_PER_SHARD: usize = 64;
+const PRESYNCED_TMP_FILES_PER_SHARD: usize = 128;
 
-static PRESYNCED_TMP_FILES: std::sync::LazyLock<ParkingLotMutex<HashSet<PathBuf>>> =
-    std::sync::LazyLock::new(|| ParkingLotMutex::new(HashSet::new()));
+static PRESYNCED_TMP_DATA_DIRS: std::sync::LazyLock<os::ShardedPathCache<()>> =
+    std::sync::LazyLock::new(|| os::ShardedPathCache::new(PRESYNCED_TMP_DATA_DIRS_PER_SHARD));
 
-fn mark_presynced_tmp_data_dir(dir: PathBuf) {
-    let mut set = PRESYNCED_TMP_DATA_DIRS.lock();
-    if set.len() >= 4096 {
-        set.clear();
-    }
-    set.insert(dir);
+static PRESYNCED_TMP_FILES: std::sync::LazyLock<os::ShardedPathCache<()>> =
+    std::sync::LazyLock::new(|| os::ShardedPathCache::new(PRESYNCED_TMP_FILES_PER_SHARD));
+
+fn mark_presynced_tmp_data_dir(dir: impl AsRef<Path>) {
+    PRESYNCED_TMP_DATA_DIRS.insert(dir.as_ref(), ());
 }
 
 fn unmark_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+    PRESYNCED_TMP_DATA_DIRS.remove(dir).is_some()
 }
 
 #[cfg(target_os = "linux")]
 pub(in crate::disk) fn is_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().contains(dir)
+    PRESYNCED_TMP_DATA_DIRS.with_get(dir, |()| ()).is_some()
 }
 
 #[cfg(target_os = "linux")]
 pub(in crate::disk) fn take_presynced_tmp_data_dir(dir: &Path) -> bool {
-    PRESYNCED_TMP_DATA_DIRS.lock().remove(dir)
+    PRESYNCED_TMP_DATA_DIRS.remove(dir).is_some()
 }
 
-fn mark_presynced_tmp_file(file: PathBuf) {
-    let mut set = PRESYNCED_TMP_FILES.lock();
-    if set.len() >= 8192 {
-        set.clear();
-    }
-    set.insert(file);
+fn mark_presynced_tmp_file(file: impl AsRef<Path>) {
+    PRESYNCED_TMP_FILES.insert(file.as_ref(), ());
 }
 
 fn unmark_presynced_tmp_file(file: &Path) {
-    PRESYNCED_TMP_FILES.lock().remove(file);
+    let _ = PRESYNCED_TMP_FILES.remove(file);
 }
 
 fn take_presynced_tmp_file(file: &Path) -> bool {
-    PRESYNCED_TMP_FILES.lock().remove(file)
+    PRESYNCED_TMP_FILES.remove(file).is_some()
 }
 
 fn open_lazy_local_file_std(file_path: &Path, volume_dir: &Path, _reclaim_on_shutdown: bool) -> std::io::Result<std::fs::File> {
@@ -4290,7 +4322,7 @@ impl LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -4312,7 +4344,7 @@ impl LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -4440,7 +4472,7 @@ impl AsyncWrite for LazyLocalFileWriter {
                         drop(file);
                         if sync_on_close {
                             if mark_dir_presynced && let Some(parent) = file_path.parent() {
-                                mark_presynced_tmp_data_dir(parent.to_path_buf());
+                                mark_presynced_tmp_data_dir(parent);
                             }
                             mark_presynced_tmp_file(file_path);
                         }
@@ -7476,6 +7508,7 @@ pub struct LocalDisk {
     pub root: PathBuf,
     publication_root: os::PublicationRoot,
     multipart_proof_authority: OnceLock<crate::disk::multipart_source::ProofVerificationContext>,
+    multipart_index: Arc<multipart_index::IndexOwner>,
     /// I/O root pinned to the mount instance that was opened while the disk
     /// was initialized. On Linux this is `/proc/self/fd/<dirfd>/.`; resolving
     /// paths beneath it keeps repair I/O on that mount even if the configured
@@ -8018,7 +8051,10 @@ impl LocalDisk {
 
         // TODO(backlog): add O_DIRECT I/O support for performance-critical paths
         // TODO(backlog): populate DiskInfo in constructor
+        let multipart_index = multipart_index::IndexOwner::acquire(&publication_root, &root, &io_root)?;
+        let blocking_queue = multipart_index.attach_blocking_queue(&root, &io_root);
         let mut disk = Self {
+            multipart_index,
             root: root.clone(),
             publication_root,
             multipart_proof_authority: OnceLock::new(),
@@ -8054,7 +8090,7 @@ impl LocalDisk {
             )
             .await,
             file_sync_permits: os::disk_file_sync_limiter(&root),
-            blocking_queue: os::register_disk_blocking_queue(&root, &io_root),
+            blocking_queue,
             snapshot_leases: Arc::new(ParkingLotMutex::new(SnapshotLeaseRegistry::default())),
             #[cfg(unix)]
             pool_meta_durable_head: ParkingLotMutex::new(None),
@@ -8107,6 +8143,7 @@ impl LocalDisk {
             publication_root,
             #[cfg(target_os = "linux")]
             disk.mount_lease.clone(),
+            disk.multipart_index.clone(),
             exit_rx,
         ));
         debug!(
@@ -8125,8 +8162,19 @@ impl LocalDisk {
         root: PathBuf,
         publication_root: os::PublicationRoot,
         #[cfg(target_os = "linux")] mount_lease: Arc<std::fs::File>,
+        multipart_index: Arc<multipart_index::IndexOwner>,
         mut exit_rx: tokio::sync::broadcast::Receiver<()>,
     ) {
+        // The multipart index bootstrap rides this task instead of its own:
+        // the disk lifecycle accounts for exactly this background task, and
+        // stopping the disk abandons the scan (a reconnect resumes it).
+        if let Some(bootstrap) = multipart_index.start() {
+            tokio::select! {
+                _ = bootstrap => {}
+                _ = exit_rx.recv() => return,
+            }
+        }
+        drop(multipart_index);
         let start_at = Instant::now() + DELETED_OBJECTS_CLEANUP_INTERVAL;
         let mut interval = interval_at(start_at, DELETED_OBJECTS_CLEANUP_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -9909,7 +9957,10 @@ impl LocalDisk {
         let mut transaction_cleanup = false;
         match fs::read_dir(&transaction_path).await {
             Ok(mut entries) => {
-                while let Some(entry) = entries.next_entry().await.map_err(to_file_error)? {
+                while let Some(entry) = delete_recovery::next_recovery_entry(&mut entries)
+                    .await
+                    .map_err(to_file_error)?
+                {
                     let name = entry.file_name();
                     if !entry.file_type().await.map_err(to_file_error)?.is_file()
                         || (name != STORAGE_FORMAT_FILE_BACKUP
@@ -10125,6 +10176,7 @@ impl LocalDisk {
             let data_path = file_path.clone();
             let sync = effective_durability(volume).syncs_commit_metadata();
             let keep_rollback_witnesses = opt.recoverable_delete;
+            let recovery_scope = delete_recovery::recovery_operation_scope();
             os::run_blocking_namespace_operation_with_sync(lease, sync, move || {
                 if let Some(check) = &multipart_check {
                     check.callback()()?;
@@ -10142,7 +10194,9 @@ impl LocalDisk {
                 let mut parts = Vec::new();
                 let mut markers = Vec::new();
                 let mut has_committed_marker = false;
-                for entry in entries {
+                for entry in
+                    delete_recovery::recovery_entries(entries, recovery_scope.as_ref().map(|scope| scope.budget.as_ref()))
+                {
                     let entry = entry?;
                     let name = entry.file_name();
                     let name = name.to_str().ok_or_else(corrupt)?;
@@ -10500,7 +10554,6 @@ impl LocalDisk {
         }))
     }
 
-    #[cfg(test)]
     async fn read_listing_metadata(&self, volume: &str, object_name: &str) -> Result<ListingMetadataRead> {
         let mut batch = self
             .spawn_listing_metadata_batch(volume, vec![object_name.to_owned()], None)
@@ -10647,6 +10700,14 @@ impl LocalDisk {
         let rollback_dir = opts.old_data_dir;
         let incarnation = opts.delete_recovery_bucket_incarnation;
         let xl_path = object_dir.join(STORAGE_FORMAT_FILE);
+        // An independent child key owns this directory. Reject before creating
+        // recovery evidence that could otherwise make a harmless prefix unhealable.
+        match fs::symlink_metadata(&xl_path).await {
+            Ok(metadata) if metadata.is_dir() => return Err(DiskError::IsNotRegular),
+            Ok(_) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
         let mut recovery_target = None;
         if let Some(rollback_dir) = rollback_dir {
             if opts.recoverable_delete {
@@ -11351,6 +11412,9 @@ impl LocalDisk {
         admission: Option<multipart_staging::MultipartSourceAdmission>,
     ) -> Result<()> {
         multipart_staging::reject_reserved_anchor(path)?;
+        if volume == RUSTFS_META_MULTIPART_BUCKET {
+            self.multipart_index.record_head(path, &buf).await?;
+        }
         let volume_dir = self.io_get_bucket_path(volume)?;
         let file_path = self.io_get_object_path(volume, path)?;
         check_path_length(file_path.to_string_lossy().as_ref())?;
@@ -11771,9 +11835,9 @@ impl LocalDisk {
                         continue;
                     }
 
-                    let metadata =
-                        with_walk_stall_timeout(stall, self.read_metadata(bucket, format!("{}/{}", current, entry).as_str()))
-                            .await?;
+                    let metadata = with_walk_stall_timeout(stall, self.read_listing_metadata(bucket, &current))
+                        .await?
+                        .bytes;
 
                     let entry = entry.strip_suffix(STORAGE_FORMAT_FILE).unwrap_or_default().to_owned();
                     let name = entry.trim_end_matches(SLASH_SEPARATOR);
@@ -11817,19 +11881,27 @@ impl LocalDisk {
                 });
             }
 
-            let mut dir_stack: Vec<(String, bool, Option<HashSet<String>>, bool)> = Vec::with_capacity(5);
+            type PendingDirectory = (String, bool, Option<HashSet<String>>, bool, bool);
+            let mut dir_stack: Vec<PendingDirectory> = Vec::with_capacity(5);
             // Explicit directory markers and real directories can resolve to the same logical path.
-            let schedule_dir = |dir_stack: &mut Vec<(String, bool, Option<HashSet<String>>, bool)>,
+            let schedule_dir = |dir_stack: &mut Vec<PendingDirectory>,
                                 dir_name: String,
                                 skip_object: bool,
                                 dir_to_skip: Option<HashSet<String>>,
-                                scan_required: bool| {
-                if let Some((last_dir_name, existing_skip_object, existing_dir_to_skip, existing_scan_required)) =
-                    dir_stack.last_mut()
+                                scan_required: bool,
+                                verify_prefix: bool| {
+                if let Some((
+                    last_dir_name,
+                    existing_skip_object,
+                    existing_dir_to_skip,
+                    existing_scan_required,
+                    existing_verify_prefix,
+                )) = dir_stack.last_mut()
                     && *last_dir_name == dir_name
                 {
                     *existing_skip_object |= skip_object;
                     *existing_scan_required |= scan_required;
+                    *existing_verify_prefix |= verify_prefix;
                     if let Some(existing_dir_to_skip) = existing_dir_to_skip {
                         if let Some(new_dir_to_skip) = &dir_to_skip {
                             existing_dir_to_skip.extend(new_dir_to_skip.iter().cloned());
@@ -11838,9 +11910,12 @@ impl LocalDisk {
                         *existing_dir_to_skip = dir_to_skip;
                     }
                 } else {
-                    dir_stack.push((dir_name, skip_object, dir_to_skip, scan_required));
+                    dir_stack.push((dir_name, skip_object, dir_to_skip, scan_required, verify_prefix));
                 }
             };
+            let bounded_probe =
+                !opts.recursive && !opts.incl_deleted && !opts.skip_hidden_prefix_check && opts.hidden_entry_budget > 0;
+            let mut remaining_hidden = opts.hidden_entry_budget;
             prefix = "".to_owned();
             let mut prefetched_batch: Option<ListingMetadataBatch> = None;
             let mut adaptive_batch_cap = WALK_DIR_BATCH_SIZE;
@@ -11856,7 +11931,7 @@ impl LocalDisk {
 
                 let name = path_join_buf(&[current.as_str(), entry.as_str()]);
 
-                while let Some((last_name, _, _, _)) = dir_stack.last()
+                while let Some((last_name, _, _, _, _)) = dir_stack.last()
                     && *last_name < name
                 {
                     // A prior iteration of this same loop may have just recursed
@@ -11870,7 +11945,20 @@ impl LocalDisk {
                         return Ok(true);
                     }
 
-                    let (pop, skip_object, dir_to_skip, scan_required) = dir_stack.pop().expect("operation should succeed");
+                    let (pop, skip_object, dir_to_skip, scan_required, verify_prefix) =
+                        dir_stack.pop().expect("operation should succeed");
+                    if verify_prefix {
+                        match self.probe_listing_prefix(opts, &pop, &mut remaining_hidden).await? {
+                            PrefixListingProbe::Empty => continue,
+                            PrefixListingProbe::Visible => {}
+                            PrefixListingProbe::Cut(entries) => {
+                                for entry in entries {
+                                    write_metacache_obj(out, &entry).await?;
+                                }
+                                return Ok(true);
+                            }
+                        }
+                    }
                     let more_ready_in_batch = !(opts.recursive && scan_required)
                         && prefetched_batch.as_ref().is_some_and(|b| b.remaining > 0 && !b.rx.is_empty());
                     if more_ready_in_batch {
@@ -11978,7 +12066,7 @@ impl LocalDisk {
                             };
                             let batch_names = if batch_limit > 1
                                 && dir_objes.is_empty()
-                                && dir_stack.iter().all(|(_, _, _, scan_required)| !*scan_required)
+                                && dir_stack.iter().all(|(_, _, _, scan_required, _)| !*scan_required)
                             {
                                 entries[entry_idx..]
                                     .iter()
@@ -12001,23 +12089,7 @@ impl LocalDisk {
                     }
                     .await
                 } else {
-                    let fname = format!("{}/{}", meta.name, STORAGE_FORMAT_FILE);
-                    with_walk_stall_timeout(stall, self.read_metadata(&opts.bucket, fname.as_str()))
-                        .await
-                        .map(|metadata| {
-                            let bytes = Vec::from(metadata);
-                            let (file_meta, data_dirs, counts_toward_limit) = parse_listing_metadata_bytes(&bytes);
-                            #[cfg(not(test))]
-                            let _ = file_meta;
-                            ListingMetadataRead {
-                                bytes,
-                                #[cfg(test)]
-                                file_meta,
-                                data_dirs,
-                                has_namespace_child_candidate: true,
-                                counts_toward_limit,
-                            }
-                        })
+                    with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &meta.name)).await
                 };
 
                 match metadata_read {
@@ -12063,12 +12135,20 @@ impl LocalDisk {
                                 true,
                                 if dir_to_skip.is_empty() { None } else { Some(dir_to_skip) },
                                 has_namespace_child_candidate,
+                                false,
                             );
                         } else if !is_dir_obj
                             && has_namespace_child_candidate
-                            && self
-                                .object_dir_has_listable_child(&opts.bucket, &meta.name, &dir_to_skip, opts.incl_deleted, stall)
-                                .await?
+                            && (bounded_probe
+                                || self
+                                    .object_dir_has_listable_child(
+                                        &opts.bucket,
+                                        &meta.name,
+                                        &dir_to_skip,
+                                        opts.incl_deleted,
+                                        stall,
+                                    )
+                                    .await?)
                         {
                             // A plain object `a` shares its backing directory with any
                             // children `a/...`, and non-recursive walks never descend into
@@ -12078,7 +12158,7 @@ impl LocalDisk {
                             // separate real directory entry handled above.
                             let mut dir_name = meta.name.clone();
                             dir_name.push_str(SLASH_SEPARATOR);
-                            schedule_dir(&mut dir_stack, dir_name, true, None, true);
+                            schedule_dir(&mut dir_stack, dir_name, true, None, true, bounded_probe);
                         }
                     }
                     Err(err) => {
@@ -12094,7 +12174,7 @@ impl LocalDisk {
                                 meta.name.push_str(SLASH_SEPARATOR);
                                 // Conservative listings verify physical prefixes. Never-versioned
                                 // buckets first rule out the data dirs a deleted version leaves behind.
-                                let listable = if opts.recursive || opts.incl_deleted {
+                                let listable = if opts.recursive || opts.incl_deleted || bounded_probe {
                                     true
                                 } else if opts.skip_hidden_prefix_check {
                                     !self.directory_is_delete_residue(&opts.bucket, &meta.name, stall).await?
@@ -12103,7 +12183,7 @@ impl LocalDisk {
                                         .await?
                                 };
                                 if listable {
-                                    schedule_dir(&mut dir_stack, meta.name, false, None, true);
+                                    schedule_dir(&mut dir_stack, meta.name, false, None, true, bounded_probe);
                                 }
                             }
 
@@ -12125,11 +12205,23 @@ impl LocalDisk {
                 };
             }
 
-            while let Some((dir, skip_object, dir_to_skip, scan_required)) = dir_stack.pop() {
+            while let Some((dir, skip_object, dir_to_skip, scan_required, verify_prefix)) = dir_stack.pop() {
                 if opts.limit > 0 && *objs_returned >= opts.limit {
                     return Ok(true);
                 }
 
+                if verify_prefix {
+                    match self.probe_listing_prefix(opts, &dir, &mut remaining_hidden).await? {
+                        PrefixListingProbe::Empty => continue,
+                        PrefixListingProbe::Visible => {}
+                        PrefixListingProbe::Cut(entries) => {
+                            for entry in entries {
+                                write_metacache_obj(out, &entry).await?;
+                            }
+                            return Ok(true);
+                        }
+                    }
+                }
                 write_metacache_obj(
                     out,
                     &MetaCacheEntry {
@@ -12347,6 +12439,86 @@ impl LocalDisk {
         }
     }
 
+    /// Probe a prefix in the same byte order as the listing stream. Keep the
+    /// ordinary one-prefix result when a live object is found; only publish
+    /// hidden entries when their budget forces a resumable stream cut.
+    async fn probe_listing_prefix(
+        &self,
+        opts: &WalkDirOptions,
+        prefix: &str,
+        remaining: &mut usize,
+    ) -> Result<PrefixListingProbe> {
+        if opts.forward_to.as_ref().is_some_and(|marker| prefix <= marker.as_str())
+            && opts.pending_prefix.as_deref() != Some(prefix)
+        {
+            return Ok(PrefixListingProbe::Empty);
+        }
+        let root = prefix.trim_end_matches('/').to_owned();
+        let mut pending = std::collections::BTreeMap::from([(root.clone(), root.clone())]);
+        let mut hidden = Vec::new();
+        let mut bytes = 0usize;
+        let stall = opts.stall_timeout_duration();
+        while let Some((name, path)) = pending.pop_first() {
+            #[cfg(test)]
+            let _previous_probe_count =
+                DIRECTORY_LISTING_ENTRY_PROBE_COUNT.try_with(|count| count.fetch_add(1, Ordering::Relaxed));
+            let mut data_dirs = HashSet::new();
+            match with_walk_stall_timeout(stall, self.read_listing_metadata(&opts.bucket, &path)).await {
+                Ok(read) => {
+                    data_dirs.extend(read.data_dirs.into_iter().map(|id| id.to_string()));
+                    // The root object's visibility does not prove that its
+                    // child prefix exists. Ancestor metadata still identifies
+                    // internal data directories that must never be traversed.
+                    if path != root && opts.forward_to.as_ref().is_none_or(|marker| &name > marker) {
+                        if read.counts_toward_limit {
+                            return Ok(PrefixListingProbe::Visible);
+                        }
+                        bytes = bytes.saturating_add(read.bytes.len());
+                        hidden.push(MetaCacheEntry {
+                            name: name.clone(),
+                            metadata: read.bytes,
+                            ..Default::default()
+                        });
+                        *remaining = remaining.saturating_sub(1);
+                        if *remaining == 0 || bytes >= LISTING_META_BATCH_MAX_BYTES {
+                            return Ok(PrefixListingProbe::Cut(hidden));
+                        }
+                    }
+                    if !read.has_namespace_child_candidate {
+                        continue;
+                    }
+                }
+                Err(Error::FileNotFound | Error::IsNotRegular) => {}
+                Err(err) => return Err(err),
+            }
+            let children = match with_walk_stall_timeout(stall, self.list_dir("", &opts.bucket, &path, -1)).await {
+                Ok(children) => children,
+                Err(Error::FileNotFound | Error::VolumeNotFound) => continue,
+                Err(err) => return Err(err),
+            };
+            for child in children {
+                let Some(child) = child.strip_suffix('/') else { continue };
+                if child.is_empty() || data_dirs.contains(child) {
+                    continue;
+                }
+                let path = path_join_buf(&[&path, child]);
+                let name = decode_dir_object(&path);
+                if name.is_empty() {
+                    continue;
+                }
+                if opts
+                    .forward_to
+                    .as_ref()
+                    .is_some_and(|marker| &name <= marker && !marker.starts_with(&format!("{name}/")))
+                {
+                    continue;
+                }
+                pending.insert(name, path);
+            }
+        }
+        Ok(PrefixListingProbe::Empty)
+    }
+
     /// Whether anything under `dir_name` would appear in a listing. With
     /// `incl_deleted`, any `xl.meta` counts (versioned listings surface
     /// delete-marker-only objects too); otherwise the metadata must hold a
@@ -12389,10 +12561,9 @@ impl LocalDisk {
                         return Ok(true);
                     }
 
-                    let metadata_path = path_join_buf(&[current.as_str(), STORAGE_FORMAT_FILE]);
-                    match with_walk_stall_timeout(stall, self.read_metadata(bucket, metadata_path.as_str())).await {
+                    match with_walk_stall_timeout(stall, self.read_listing_metadata(bucket, &current)).await {
                         Ok(metadata) => {
-                            let file_meta = match FileMeta::load(&metadata) {
+                            let file_meta = match FileMeta::load(&metadata.bytes) {
                                 Ok(file_meta) => file_meta,
                                 Err(_) => return Ok(true),
                             };
@@ -12976,6 +13147,7 @@ impl LocalDisk {
         let reserved_name = format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{rollback_dir}");
         let scan_object_path = object_path.clone();
         let scan_reserved_name = reserved_name.clone();
+        let recovery_scope = delete_recovery::recovery_operation_scope();
         let (matching_dirs, recovery_owned) = self
             .blocking_queue
             .run_cancellable(move |is_cancelled| {
@@ -12985,7 +13157,10 @@ impl LocalDisk {
                     Err(err) => return Err(err),
                 };
                 let mut matching = Vec::new();
-                for (idx, entry) in entries.enumerate() {
+                for (idx, entry) in
+                    delete_recovery::recovery_entries(entries, recovery_scope.as_ref().map(|scope| scope.budget.as_ref()))
+                        .enumerate()
+                {
                     if idx & 63 == 0 && is_cancelled() {
                         return Err(std::io::Error::other("blocking namespace operation cancelled"));
                     }
@@ -13287,6 +13462,7 @@ impl LocalDisk {
         } else {
             None
         };
+        let recovery_scope = delete_recovery::recovery_operation_scope();
         let matching_data_dirs = self
             .blocking_queue
             .run_cancellable(move |is_cancelled| {
@@ -13306,7 +13482,10 @@ impl LocalDisk {
                 };
                 let marker_name = format!("{prefix}{rollback_dir}");
                 let mut matched = Vec::new();
-                for (idx, entry) in entries.enumerate() {
+                for (idx, entry) in
+                    delete_recovery::recovery_entries(entries, recovery_scope.as_ref().map(|scope| scope.budget.as_ref()))
+                        .enumerate()
+                {
                     if idx & 63 == 0 && is_cancelled() {
                         return Err(std::io::Error::other("blocking namespace operation cancelled"));
                     }
@@ -13571,6 +13750,14 @@ fn measure_local_batch_stage<T>(
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDisk {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<crate::disk::multipart_index::MultipartIndexPage> {
+        self.multipart_index_page(bucket, marker).await
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
         Ok(())
     }
@@ -13616,6 +13803,14 @@ impl DiskAPI for LocalDisk {
     async fn has_delete_transaction_evidence(&self, volume: &str, object: &str) -> Result<bool> {
         self.delete_recovery_has_evidence(volume, object).await
     }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<super::BoundedDeleteRecoveryDiscovery> {
+        self.delete_recovery_discover_bounded(volume, object, max_entries).await
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -13624,6 +13819,24 @@ impl DiskAPI for LocalDisk {
         limit: u32,
     ) -> Result<super::DeleteRecoveryPage> {
         self.delete_recovery_discover(volume, object, cursor, limit).await
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: super::BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<super::BoundedDeleteRecoverySettlementReply> {
+        self.delete_recovery_settle_bounded(volume, request, namespace_owner).await
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        max_entries: u32,
+    ) -> Result<super::BoundedDeleteRecoveryInspection> {
+        self.delete_recovery_inspect_bounded(volume, object, transaction, max_entries)
+            .await
     }
     async fn inspect_delete_transaction(
         &self,
@@ -15090,20 +15303,16 @@ impl DiskAPI for LocalDisk {
         if opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = with_walk_stall_timeout(
                 stall,
-                self.read_metadata(
+                self.read_listing_metadata(
                     &opts.bucket,
-                    path_join_buf(&[
-                        format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX).as_str(),
-                        STORAGE_FORMAT_FILE,
-                    ])
-                    .as_str(),
+                    &format!("{}{}", opts.base_dir.trim_end_matches(SLASH_SEPARATOR), GLOBAL_DIR_SUFFIX),
                 ),
             )
             .await
             {
                 let meta = MetaCacheEntry {
                     name: opts.base_dir.clone(),
-                    metadata: data.to_vec(),
+                    metadata: data.bytes,
                     ..Default::default()
                 };
                 write_metacache_obj(&mut out, &meta).await?;
@@ -15121,15 +15330,9 @@ impl DiskAPI for LocalDisk {
             } && meta.is_file()
             {
                 skip_current_dir_object = true;
-                if let Ok(meta_bytes) = with_walk_stall_deadline(
-                    stall,
-                    self.read_metadata(
-                        opts.bucket.as_str(),
-                        path_join_buf(&[opts.base_dir.as_str(), STORAGE_FORMAT_FILE]).as_str(),
-                    ),
-                )
-                .await?
-                    && let Ok(file_meta) = FileMeta::load(&meta_bytes)
+                if let Ok(meta_bytes) =
+                    with_walk_stall_deadline(stall, self.read_listing_metadata(&opts.bucket, &opts.base_dir)).await?
+                    && let Ok(file_meta) = FileMeta::load(&meta_bytes.bytes)
                     && let Ok(data_dirs) = file_meta.get_data_dirs()
                 {
                     for data_dir in data_dirs.iter().flatten() {
@@ -15486,7 +15689,10 @@ impl DiskAPI for LocalDisk {
             check_path_length(file_path.to_string_lossy().as_ref())?;
 
             let xl_rel_path = format!("{path}/{STORAGE_FORMAT_FILE}");
-            if self.multipart_source_admission(volume, &xl_rel_path, true, false)?.is_none()
+            // The common publisher indexes the merged owner metadata before
+            // a multipart head becomes durable, including legacy source heads.
+            if volume != RUSTFS_META_MULTIPART_BUCKET
+                && self.multipart_source_admission(volume, &xl_rel_path, true, false)?.is_none()
                 && !crash_inject::is_armed(CrashPoint::MetaWriteAfterTmpBeforeRename, &xl_rel_path)
                 && !has_delete_version_test_failpoints()
                 && !has_rename_data_test_failpoints(&xl_rel_path)
@@ -16260,7 +16466,7 @@ mod test {
                 assert!(slots[0][0][1].is_some());
                 drop(slots);
                 drop(entries);
-                let (disks, errors) = crate::store::init_format::init_disks(&endpoints, &options).await;
+                let (disks, errors) = crate::store::init_format::init_disks(&ctx, &endpoints, &options).await;
                 assert!(disks[0].is_none());
                 assert!(disks[1].is_some());
                 assert_eq!(errors[0], Some(DiskError::FileAccessDenied));
@@ -21974,7 +22180,7 @@ mod test {
                 .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
                 .expect("staged shard directory should resolve");
             assert!(
-                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_none(),
                 "an unknown destination must defer payload sync until commit"
             );
 
@@ -22027,7 +22233,10 @@ mod test {
             let staged_dir = disk
                 .get_object_path_for_io(RUSTFS_META_TMP_BUCKET, &format!("{tmp_object}/{data_dir}"))
                 .expect("staged shard directory should resolve");
-            assert!(PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir), "the writer must pre-sync the shard");
+            assert!(
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_some(),
+                "the writer must pre-sync the shard"
+            );
             assert!(!os::fsync_dir_recorder::was_fsynced(&staged_dir));
 
             let mut fi = test_file_info(object, Uuid::new_v4(), Some(data_dir), None);
@@ -22038,7 +22247,7 @@ mod test {
                 .await
                 .expect("rename_data should commit");
             assert!(
-                !PRESYNCED_TMP_DATA_DIRS.lock().contains(&staged_dir),
+                PRESYNCED_TMP_DATA_DIRS.with_get(&staged_dir, |()| ()).is_none(),
                 "the fused commit must consume the pre-sync marker"
             );
             assert!(
@@ -22227,6 +22436,141 @@ mod test {
         // rustfs/backlog#1009: the overwritten live current version (size 1
         // from `test_file_info`) must be surfaced through the backfill.
         assert_eq!(resp.old_current_size, Some(OldCurrentSize::Present(1)));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn test_rename_data_fused_overwrite_and_rollback_double_failure() {
+        const CHILD: &str = "RUSTFS_TEST_FUSED_OVERWRITE_CHILD";
+        const TEST: &str = "disk::local::test::test_rename_data_fused_overwrite_and_rollback_double_failure";
+
+        // Other tests install process-wide hooks that deliberately force rename_data off the fused path.
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .env("RUSTFS_EXPERIMENTAL_DST_DIR_FSYNC_GROUP_COMMIT_ENABLE", "false")
+                .env("RUSTFS_EXPERIMENTAL_FILE_FDATASYNC_GROUP_COMMIT_ENABLE", "false")
+                .output()
+                .expect("fused overwrite subprocess");
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(output.status.success(), "{stdout}{stderr}");
+            assert!(stdout.contains("FUSED_OVERWRITE_OK"), "fused overwrite test did not run: {stdout}");
+            return;
+        }
+
+        assert!(!os::dst_dir_fsync_group_commit_enabled());
+        assert!(!os::file_fdatasync_group_commit_enabled());
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("utf8")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        let (bucket, object, version_id) = ("fused-overwrite-bucket", "fused-object", Uuid::nil());
+        let (data_dir_v1, data_dir_v2) = (Uuid::new_v4(), Uuid::new_v4());
+        ensure_test_volume(&disk, bucket).await;
+        ensure_test_volume(&disk, RUSTFS_META_TMP_BUCKET).await;
+
+        for (tmp, data_dir, payload) in [("tmp-v1", data_dir_v1, b"v1-d"), ("tmp-v2", data_dir_v2, b"v2-d")] {
+            let mut w = disk
+                .create_file(bucket, RUSTFS_META_TMP_BUCKET, &format!("{tmp}/{data_dir}/part.1"), 4)
+                .await
+                .expect("create shard");
+            w.write_all(payload).await.expect("write");
+            w.shutdown().await.expect("close");
+        }
+        let mut fi_v1 = test_file_info(object, version_id, Some(data_dir_v1), None);
+        (fi_v1.size, fi_v1.parts[0].size, fi_v1.parts[0].actual_size) = (4, 4, 4);
+        let resp1 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v1", fi_v1, bucket, object)
+            .await
+            .expect("commit v1");
+        assert_eq!((resp1.old_data_dir, resp1.rollback_data_dir), (None, None));
+        let dst_object_dir = disk.io_get_object_path(bucket, object).expect("dst object path");
+        let v1_meta_bytes = fs::read(dst_object_dir.join(STORAGE_FORMAT_FILE))
+            .await
+            .expect("read v1 xl.meta");
+
+        let mut fi_v2 = test_file_info(object, version_id, Some(data_dir_v2), None);
+        (fi_v2.size, fi_v2.parts[0].size, fi_v2.parts[0].actual_size) = (4, 4, 4);
+        assert!(!has_rename_data_test_failpoints(object));
+        let resp2 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v2", fi_v2, bucket, object)
+            .await
+            .expect("fused overwrite v2");
+        assert_eq!(
+            (resp2.old_data_dir, resp2.rollback_data_dir, resp2.cleanup_data_dir),
+            (Some(data_dir_v1), Some(data_dir_v1), Some(data_dir_v1))
+        );
+        assert_eq!(
+            fs::read(dst_object_dir.join(data_dir_v1.to_string()).join(STORAGE_FORMAT_FILE_BACKUP))
+                .await
+                .expect("v1 backup"),
+            v1_meta_bytes
+        );
+
+        fs::create_dir_all(dir.path().join(RUSTFS_META_TMP_BUCKET).join("tmp-v3"))
+            .await
+            .expect("create tmp-v3");
+        let fi_v3 = test_file_info(object, version_id, None, Some(Bytes::from_static(b"v3-inline")));
+        let resp3 = disk
+            .rename_data(RUSTFS_META_TMP_BUCKET, "tmp-v3", fi_v3, bucket, object)
+            .await
+            .expect("fused inline overwrite v3");
+        assert_eq!(
+            (resp3.old_data_dir, resp3.rollback_data_dir, resp3.cleanup_data_dir),
+            (Some(data_dir_v2), Some(data_dir_v2), Some(data_dir_v2))
+        );
+        assert!(
+            dst_object_dir
+                .join(data_dir_v2.to_string())
+                .join(STORAGE_FORMAT_FILE_BACKUP)
+                .is_file()
+        );
+
+        let dst_meta_path = dst_object_dir.join(STORAGE_FORMAT_FILE);
+        let dst_vol_dir = disk.io_get_bucket_path(bucket).expect("bucket path");
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&dst_meta_path, None).await;
+        let guard =
+            commit::lock_rename_commit_directories(&dst_object_dir, &dst_object_dir, &dst_vol_dir, &disk.publication_root, lease)
+                .await
+                .expect("lock commit guard");
+        let replacement_dir = dst_object_dir.join(Uuid::new_v4().to_string());
+        fs::create_dir_all(&replacement_dir).await.expect("create replacement_dir");
+        fs::write(replacement_dir.join("part.1"), b"live").await.expect("write part");
+
+        os::fsync_dir_recorder::set_failure(&dst_object_dir, std::io::ErrorKind::Other);
+        assert!(
+            commit::fsync_inline_commit_std(
+                &dst_meta_path,
+                &dst_vol_dir,
+                false,
+                Some(Uuid::new_v4()),
+                None,
+                Some(&replacement_dir),
+                &guard,
+            )
+            .is_err()
+        );
+        assert!(replacement_dir.join("part.1").is_file());
+
+        os::fsync_dir_recorder::set_failure(&dst_object_dir, std::io::ErrorKind::Other);
+        assert!(
+            commit::fsync_inline_commit_std(
+                &dst_meta_path,
+                &dst_vol_dir,
+                false,
+                Some(data_dir_v1),
+                None,
+                Some(&replacement_dir),
+                &guard,
+            )
+            .is_err()
+        );
+        assert!(!replacement_dir.exists());
+        assert_eq!(fs::read(&dst_meta_path).await.expect("restored"), v1_meta_bytes);
+        println!("FUSED_OVERWRITE_OK");
     }
 
     /// rustfs/backlog#1009: `observe_old_current_size` must mirror the pre-PUT
@@ -26367,6 +26711,7 @@ mod test {
             root.clone(),
             disk.publication_root.clone(),
             disk.mount_lease.clone(),
+            disk.multipart_index.clone(),
             exited,
         ));
         tokio::task::yield_now().await;
@@ -26661,6 +27006,162 @@ mod test {
             .expect("corrupt listing metadata read should not fail scan");
         assert!(corrupt_read.file_meta.is_none());
         assert!(FileMeta::load(&corrupt_read.bytes).is_err());
+    }
+
+    #[tokio::test]
+    async fn bounded_prefix_probe_resumes_hidden_subtrees_and_keeps_live_prefix_fast_path() {
+        use rustfs_filemeta::MetacacheReader;
+        let directory = tempfile::tempdir().expect("disk");
+        let bucket = "bounded-prefix-probe";
+        let modified = OffsetDateTime::from_unix_timestamp(1_705_312_500).expect("time");
+        for index in 0..600 {
+            let name = format!("prefix/{index:04}");
+            let mut info = if index < 250 {
+                FileInfo {
+                    name: name.clone(),
+                    deleted: true,
+                    ..Default::default()
+                }
+            } else {
+                FileInfo::new(&name, 1, 1)
+            };
+            info.version_id = Some(Uuid::new_v4());
+            info.mod_time = Some(modified);
+            let mut metadata = FileMeta::default();
+            metadata.add_version(info).expect("version");
+            assert_eq!(file_meta_counts_toward_limit(&metadata), index >= 250);
+            let path = directory.path().join(bucket).join(&name);
+            fs::create_dir_all(&path).await.expect("object directory");
+            fs::write(path.join(STORAGE_FORMAT_FILE), metadata.marshal_msg().expect("metadata"))
+                .await
+                .expect("object metadata");
+        }
+        let endpoint = Endpoint::try_from(directory.path().to_str().expect("path")).expect("endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("disk");
+        let mut marker = None;
+        for page in 0..3 {
+            let count = Arc::new(AtomicUsize::new(0));
+            let (reader, mut writer) = tokio::io::duplex(1024 * 1024);
+            DIRECTORY_LISTING_ENTRY_PROBE_COUNT
+                .scope(
+                    count.clone(),
+                    disk.walk_dir(
+                        WalkDirOptions {
+                            bucket: bucket.to_owned(),
+                            recursive: false,
+                            hidden_entry_budget: 100,
+                            forward_to: marker.clone(),
+                            pending_prefix: marker.as_ref().map(|_| "prefix/".to_owned()),
+                            ..Default::default()
+                        },
+                        &mut writer,
+                    ),
+                )
+                .await
+                .expect("bounded walk");
+            drop(writer);
+            let mut reader = MetacacheReader::new(reader);
+            let mut entries = reader.read_all().await.expect("stream");
+            assert!(count.load(Ordering::Relaxed) <= 102, "one page must not read the entire hidden subtree");
+            if page < 2 {
+                assert_eq!(entries.len(), 100);
+                assert_eq!(reader.limit_reached(), Some(true));
+                assert!(entries.iter_mut().all(|entry| entry.is_latest_delete_marker()));
+                marker = entries.last().map(|entry| entry.name.clone());
+                assert_eq!(marker, Some(format!("prefix/{:04}", (page + 1) * 100 - 1)));
+            } else {
+                assert_eq!(entries.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(), ["prefix/"]);
+                assert_eq!(reader.limit_reached(), Some(false));
+                assert!(
+                    count.load(Ordering::Relaxed) < 60,
+                    "a live witness must keep the whole remaining subtree out of the probe"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn listing_strips_inline_bodies_from_base_objects_and_directory_markers() {
+        use rustfs_filemeta::MetacacheReader;
+        let directory = tempfile::tempdir().expect("disk directory");
+        let bucket = "inline-listing";
+        let root = directory.path().join(bucket);
+        let mut expected = std::collections::HashMap::new();
+        for name in ["parent", "parent/child", "folder/", "folder/child"] {
+            let object_dir = root.join(encode_dir_object(name));
+            fs::create_dir_all(&object_dir).await.expect("object directory");
+            let mut info = FileInfo::new(name, 1, 1);
+            info.size = 128 * 1024;
+            info.data_dir = Some(Uuid::new_v4());
+            info.mod_time = Some(OffsetDateTime::now_utc());
+            info.data = Some(Bytes::from(vec![42; 128 * 1024]));
+            info.set_inline_data();
+            let mut meta = FileMeta::default();
+            meta.add_version(info).expect("inline metadata");
+            let full = meta.marshal_msg().expect("serialize metadata");
+            let envelope = read_xl_meta_no_data_sync(&mut std::io::Cursor::new(&full), full.len()).expect("metadata envelope");
+            assert!(full.len() > envelope.len() + 120 * 1024);
+            expected.insert(name.to_string(), envelope);
+            fs::write(object_dir.join(STORAGE_FORMAT_FILE), full)
+                .await
+                .expect("inline xl.meta");
+        }
+        let endpoint = Endpoint::try_from(directory.path().to_str().unwrap()).unwrap();
+        let disk = LocalDisk::new(&endpoint, false).await.expect("local disk");
+        for (base, recursive) in [
+            ("", true),
+            ("", false),
+            ("parent", true),
+            ("parent/", true),
+            ("folder/", true),
+        ] {
+            let (reader, mut writer) = tokio::io::duplex(1024 * 1024);
+            disk.walk_dir(
+                WalkDirOptions {
+                    bucket: bucket.into(),
+                    base_dir: base.into(),
+                    recursive,
+                    ..Default::default()
+                },
+                &mut writer,
+            )
+            .await
+            .expect("walk");
+            drop(writer);
+            let entries = MetacacheReader::new(reader).read_all().await.expect("listing stream");
+            let objects: Vec<_> = entries.iter().filter(|entry| !entry.metadata.is_empty()).collect();
+            let expected_names: &[&str] = match (base, recursive) {
+                ("", true) => &["folder/", "folder/child", "parent", "parent/child"],
+                ("", false) => &["folder/", "parent"],
+                ("parent", true) => &["parent/", "parent/child"],
+                ("parent/", true) => &["parent/child"],
+                ("folder/", true) => &["folder/", "folder/child"],
+                _ => unreachable!(),
+            };
+            assert_eq!(
+                objects.iter().map(|entry| entry.name.as_str()).collect::<Vec<_>>(),
+                expected_names,
+                "base {base}, recursive {recursive}"
+            );
+            for entry in objects {
+                // A walk rooted at a plain object's backing directory emits its
+                // own metadata with a trailing slash, unlike a root-level walk.
+                let physical_name = if base == "parent" && entry.name == "parent/" {
+                    "parent"
+                } else {
+                    entry.name.as_str()
+                };
+                assert_eq!(
+                    &entry.metadata,
+                    expected.get(physical_name).expect("known object"),
+                    "inline data leaked into listing of {} from base {base}, recursive {recursive}",
+                    entry.name
+                );
+            }
+        }
+        // Raw metadata is still required by non-listing recovery consumers.
+        let raw = disk.read_metadata(bucket, "parent/xl.meta").await.expect("raw metadata");
+        assert!(raw.len() > 128 * 1024);
     }
 
     #[tokio::test]

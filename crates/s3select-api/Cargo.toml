@@ -88,7 +88,7 @@ transform-stream.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
+rustfs-test-utils = { workspace = true }
 serial_test.workspace = true
 
 [lib]

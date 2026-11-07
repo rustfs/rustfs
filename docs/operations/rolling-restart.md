@@ -22,6 +22,16 @@ Each row is a feature whose activation makes older binaries unable to read what 
 - Rolling restart (no downtime): restart one node at a time, wait for the restarted node to report `200` on `/health/ready`, and then wait until the other nodes no longer list its drives under `details.storage.unavailableDrives` before touching the next one. The remaining nodes keep serving traffic.
 - Sequential cold start (several nodes down): nodes started before the cluster has quorum come up in degraded mode. The process stays alive, answers `503` with the blocking reason, and recovers automatically as soon as enough peers are online. Do not restart-loop them; keep starting the remaining nodes.
 
+## Returning a recovered node to a load balancer
+
+Probe each backend directly on its S3 listener, using its configured TLS verification when HTTPS is enabled. Require HTTP `200` from `/health/ready` (or `/minio/health/ready`) before routing object requests to that backend. For a workload that also requires write availability, additionally require HTTP `200` from `/minio/health/cluster` on that backend. A read-only workload can use node readiness alone; `/minio/health/cluster/read` has a more conservative lock check and adds no startup-publication guarantee. See the [probe semantics](../architecture/readiness-matrix.md#probe-semantics).
+
+Cluster write/read probes can return `200` while a restarted node still returns `503` for object requests: quorum observations can succeed before startup publishes `FullReady`, including while startup waits for peer re-admission. The node readiness aliases remain `503` during that interval, with `startup_finalization_pending` in `degradedReasons`. Liveness and cluster probes alone are therefore insufficient for backend admission. This also applies when every node's cluster probe succeeds.
+
+Readiness does not certify that healing has completed for every object. The startup peer re-admission wait is bounded and fails open; before stopping another node, also follow the survivor checks in the [rolling restart procedure](#rolling-restart-procedure). No health endpoint is an atomic guarantee that every subsequent object read or write will succeed. The [storage detail contract](../architecture/readiness-matrix.md#storage-detail-contract) describes these sampling limits.
+
+Clients should use bounded retries with backoff and jitter for transient `503` responses. Honor `Retry-After` when present, within the request's retry/deadline budget; it is a suggested delay, not a recovery deadline. The startup admission gate sends `Retry-After: 5` and `x-rustfs-readiness-pending` naming the pending dependency. Other `503` paths can use different headers, so inspect the actual response. Retrying a GET is safe; retrying a write with an ambiguous outcome requires accounting for versioning, concurrent writers, and request preconditions. For recovery validation, retain the first failed response and use distinct payloads or version IDs for overwrites so a successful retry cannot hide a failed assertion or identify the wrong version as durable.
+
 ## Why a single node cannot serve alone
 
 Erasure coding shards every object, including internal metadata such as IAM users, groups, and policies under `.rustfs.sys`, across the drives of a set. Reading an object back needs a read quorum of shards online. With the drives of one set spread over several nodes, one node alone can never satisfy the read quorum; this is a property of erasure coding, not a bug. The cluster becomes readable once enough nodes are up (for internal configuration objects, written with maximum parity, typically about half the nodes of a set).
@@ -59,6 +69,10 @@ On Kubernetes the dial itself is the slow part. A replaced pod gets a new IP, bu
 
 After a distributed node reaches local readiness, it asks the peers in every erasure set it serves how they currently see its drives. It uses the `PeerDriveAdmission` internode RPC, and each peer answers with the same predicate its own `/health/ready` uses for `unavailableDrives`. Startup readiness is published once a strict majority of each set's peers count all of this node's drives in that set as online. In a three-node set that means both peers. While the node waits, `/health/ready` stays `503` with `startup_finalization_pending` and the log shows `event="startup_peer_readmission" state="waiting"`.
 
+Both local dependency checks and peer re-admission rounds are bounded by the startup budget, including in-flight observations and polling delays. An exhausted peer-readmission budget starts no new probe round. Within a round, startup proceeds as soon as every shared set has its required peer majority; pending surplus read-only RPCs are cancelled. Votes are never carried across rounds. The unreachable-peer grace also bounds in-flight rounds: enough reachable replies clear an earlier shortfall before unrelated peers finish, and only a completed round can establish a new unreachable shortfall.
+
+After deferred IAM initialization succeeds, recovery retains that IAM owner while preparing the topology and claiming the application context once. A later local-readiness timeout retries publication with the prepared context; it does not reinitialize IAM or reinstall the context.
+
 The wait always ends in publication:
 
 - `result="admitted"`: the peers re-admitted the node.
@@ -93,7 +107,7 @@ When the whole cluster (or several nodes) went down and nodes are brought back o
 
 | Variable | Default | Effect |
 | --- | --- | --- |
-| `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | How long startup waits for full readiness before continuing in degraded mode with background recovery. Raising it delays the listener during genuinely slow starts; lowering it surfaces degraded mode sooner. Recovery retries continue regardless of this limit. |
+| `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` | `120` (`DEFAULT_STARTUP_READINESS_MAX_WAIT_SECS`) | Budget per readiness-publication attempt for local readiness and subsequent peer re-admission, including in-flight checks and polling delays. Local timeout returns an error to the startup/recovery caller; peer re-admission timeout publishes readiness with a warning. Raising it can delay S3 admission; the HTTP listeners are already bound. |
 | `RUSTFS_STARTUP_PEER_READMISSION_ENABLE` | `true` (`DEFAULT_STARTUP_PEER_READMISSION_ENABLE`) | Hold startup readiness until a strict majority of each erasure set's peers count this node's drives online. The wait is bounded by `RUSTFS_STARTUP_READINESS_MAX_WAIT_SECS` and fails open. Set `false` to publish on this node's own view only. |
 | `RUSTFS_DRIVE_RETURNING_PROBE_INTERVAL_SECS` | `2` (`DEFAULT_DRIVE_RETURNING_PROBE_INTERVAL_SECS`) | Interval between recovery probes to a remote drive that is `offline` or `returning`. |
 | `RUSTFS_DRIVE_RETURNING_SUCCESS_THRESHOLD` | `3` (`DEFAULT_DRIVE_RETURNING_SUCCESS_THRESHOLD`) | Consecutive successful probes before an `offline` remote drive is `online` again. Together with the interval this bounds how long survivors keep a restarted peer out after they can dial it. |

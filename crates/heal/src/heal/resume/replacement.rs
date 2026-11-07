@@ -345,6 +345,16 @@ pub(crate) fn merge_replacement_recovery_candidate(
 
     let candidate_revision = candidate.state.replacement_revision;
     let current_revision = current.state.replacement_revision;
+    let candidate_protocol = candidate.state.replacement_execution_protocol;
+    let current_protocol = current.state.replacement_execution_protocol;
+    if (candidate_protocol > current_protocol && candidate_revision <= current_revision)
+        || (candidate_protocol < current_protocol && candidate_revision >= current_revision)
+    {
+        return Err(Error::ReplacementGenerationConflict {
+            task_id: candidate.state.task_id,
+            reason: "replacement execution protocol regresses with durable revision".to_string(),
+        });
+    }
     if candidate_revision == current_revision && candidate.state != current.state {
         return Err(Error::ReplacementGenerationConflict {
             task_id: candidate.state.task_id,
@@ -374,7 +384,10 @@ fn same_replacement_generation_binding(left: &ResumeState, right: &ResumeState) 
         && left.replacement_target_identities == right.replacement_target_identities
         && left.replacement_buckets == right.replacement_buckets
         && left.replacement_generation == right.replacement_generation
-        && left.replacement_execution_protocol == right.replacement_execution_protocol
+        // A revision-ordered protocol-1 -> protocol-2 pass admission preserves
+        // the generation's target ownership and immutable lineage.
+        && matches!(left.replacement_execution_protocol, 1 | 2)
+        && matches!(right.replacement_execution_protocol, 1 | 2)
         && left.replacement_predecessor == right.replacement_predecessor
         && left.replacement_lineage == right.replacement_lineage
         && left.replacement_legacy_import == right.replacement_legacy_import
@@ -591,6 +604,12 @@ impl ResumeManager {
         let mut state = self.state.write().await;
         if state.replacement_generation.as_deref() != Some(state.task_id.as_str()) {
             return Err(replacement_recovery_conflict("replacement failure has no matching generation"));
+        }
+        if matches!(error, Error::ReplacementNamespaceChanged | Error::BucketDiscoveryIncomplete) {
+            // Namespace churn is not evidence that the replacement is irreparable.
+            state.error_message = Some(error.to_string());
+            drop(state);
+            return self.save_state_strict().await;
         }
         if let Error::DanglingDeleteDeferred { retry_not_before } = error {
             if !super::dangling_delete_deadline_is_representable(*retry_not_before) {

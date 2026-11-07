@@ -16,7 +16,8 @@ use crate::bucket::metadata::BucketMetadata;
 use crate::bucket::metadata_sys::get_bucket_targets_config;
 use crate::bucket::metadata_sys::get_replication_config;
 use crate::bucket::remote_s3_client::{
-    PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, build_remote_s3_client,
+    PathStyle, REPLICATION_TARGET_RETRY_POLICY, RemoteCredentials, RemoteS3EndpointSpec, RemoteS3RetryPolicy,
+    UploadResponseDeadline, build_remote_s3_client,
 };
 use crate::bucket::replication::{ObjectLockIntegrity, object_lock_put_integrity, replication_etags_match};
 use crate::bucket::replication::{ReplicationStatusType, ReplicationTargetConfigBridge};
@@ -119,6 +120,7 @@ impl From<&BucketTarget> for RemoteS3EndpointSpec {
             ca_cert_pem: (!target.ca_cert_pem.trim().is_empty()).then(|| target.ca_cert_pem.clone()),
             connect_timeout: None,
             read_timeout: None,
+            operation_timeout: Some(TargetRequestTimeouts::from_env().request),
             // Replication has no retry budget of its own on the request path,
             // so it keeps the SDK's standard three attempts; stating it here
             // pins the behaviour to this line instead of an SDK default.
@@ -1191,6 +1193,7 @@ impl BucketTargetSys {
             health_check_duration: target.health_check_duration,
             replicate_sync: target.replication_sync,
             client: Arc::new(client),
+            timeouts: TargetRequestTimeouts::from_env(),
         })
     }
 
@@ -1922,6 +1925,83 @@ impl std::fmt::Display for S3ClientError {
     }
 }
 
+/// Replication request budgets, snapshotted when a target client is built.
+/// Streamed GET bodies are not subject to the upload-response budget.
+#[derive(Debug, Clone, Copy)]
+pub struct TargetRequestTimeouts {
+    request: Duration,
+    complete: Duration,
+    minimum_transfer_rate: u64,
+}
+
+impl Default for TargetRequestTimeouts {
+    fn default() -> Self {
+        Self {
+            request: Duration::from_secs(60),
+            complete: Duration::from_secs(15 * 60),
+            minimum_transfer_rate: 1024 * 1024,
+        }
+    }
+}
+
+impl TargetRequestTimeouts {
+    fn from_env() -> Self {
+        let defaults = Self::default();
+        let seconds = |name: &str, fallback: Duration| {
+            let value = rustfs_utils::get_env_u64(name, fallback.as_secs());
+            Duration::from_secs(if (1..=86400).contains(&value) {
+                value
+            } else {
+                fallback.as_secs()
+            })
+        };
+        let minimum_transfer_rate =
+            rustfs_utils::get_env_u64("RUSTFS_REPLICATION_MIN_TRANSFER_RATE_BYTES_PER_SEC", defaults.minimum_transfer_rate);
+        Self {
+            request: seconds("RUSTFS_REPLICATION_REQUEST_TIMEOUT_SECS", defaults.request),
+            complete: seconds("RUSTFS_REPLICATION_COMPLETE_TIMEOUT_SECS", defaults.complete),
+            minimum_transfer_rate: if minimum_transfer_rate == 0 {
+                defaults.minimum_transfer_rate
+            } else {
+                minimum_transfer_rate
+            },
+        }
+    }
+
+    fn upload_timeout(self, size: i64) -> Result<Duration, S3ClientError> {
+        let size = u64::try_from(size).map_err(|_| S3ClientError::new("replication upload size must be non-negative"))?;
+        // The SDK can make three attempts. Leave transmission headroom for
+        // all three; the separate response deadline still bounds a trickling
+        // target after each upload finishes.
+        let attempts = match REPLICATION_TARGET_RETRY_POLICY {
+            RemoteS3RetryPolicy::Disabled => 1,
+            RemoteS3RetryPolicy::Standard { max_attempts } => u64::from(max_attempts.max(1)),
+        };
+        let seconds = size
+            .div_ceil(self.minimum_transfer_rate)
+            .checked_mul(attempts)
+            .ok_or_else(|| S3ClientError::new("replication upload timeout exceeds supported duration"))?;
+        let timeout = self
+            .request
+            .checked_add(Duration::from_secs(seconds))
+            .ok_or_else(|| S3ClientError::new("replication upload timeout exceeds supported duration"))?;
+        if Instant::now().checked_add(timeout).is_none() {
+            return Err(S3ClientError::new("replication upload timeout exceeds supported duration"));
+        }
+        Ok(timeout)
+    }
+
+    fn upload_override(self, size: i64) -> Result<aws_sdk_s3::config::Builder, S3ClientError> {
+        Ok(aws_sdk_s3::config::Builder::new()
+            .timeout_config(
+                aws_smithy_types::timeout::TimeoutConfig::builder()
+                    .operation_timeout(self.upload_timeout(size)?)
+                    .build(),
+            )
+            .interceptor(UploadResponseDeadline(self.request)))
+    }
+}
+
 #[derive(Debug)]
 pub struct TargetClient {
     pub endpoint: String,
@@ -1935,6 +2015,7 @@ pub struct TargetClient {
     pub health_check_duration: Duration,
     pub replicate_sync: bool,
     pub client: Arc<S3Client>,
+    pub timeouts: TargetRequestTimeouts,
 }
 
 impl TargetClient {
@@ -2360,12 +2441,11 @@ impl TargetClient {
 
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             });
+        let mut config = self.timeouts.upload_override(size)?;
         if forwards_source_checksum {
-            operation = operation.config_override(
-                aws_sdk_s3::config::Builder::new()
-                    .request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired),
-            );
+            config = config.request_checksum_calculation(aws_sdk_s3::config::RequestChecksumCalculation::WhenRequired);
         }
+        operation = operation.config_override(config);
         match operation.send().await {
             Ok(output) => {
                 // Under SSE-KMS/DSSE or SSE-C the target's ETag is not the MD5
@@ -2501,6 +2581,7 @@ impl TargetClient {
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
+            .config_override(self.timeouts.upload_override(size)?)
             .send()
             .await
         {
@@ -2538,6 +2619,13 @@ impl TargetClient {
                 }
                 Result::<_, aws_smithy_types::error::operation::BuildError>::Ok(req)
             })
+            .config_override(
+                aws_sdk_s3::config::Builder::new().timeout_config(
+                    aws_smithy_types::timeout::TimeoutConfig::builder()
+                        .operation_timeout(self.timeouts.complete)
+                        .build(),
+                ),
+            )
             .send()
             .await
         {
@@ -2966,9 +3054,239 @@ mod tests {
                 health_check_duration: Duration::from_secs(5),
                 replicate_sync: false,
                 client: Arc::new(client),
+                timeouts: TargetRequestTimeouts::default(),
             },
             request_headers,
         )
+    }
+
+    #[derive(Debug, Clone)]
+    struct TimedResponseConnector {
+        upload_delay: Duration,
+        response_delay: Duration,
+        prefix_bytes: usize,
+        response: bytes::Bytes,
+        frames: Arc<std::sync::atomic::AtomicUsize>,
+        dropped: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    struct ResponseDrop(Arc<std::sync::atomic::AtomicUsize>);
+    impl Drop for ResponseDrop {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    impl SmithyHttpConnector for TimedResponseConnector {
+        fn call(&self, request: HttpRequest) -> HttpConnectorFuture {
+            let settings = self.clone();
+            HttpConnectorFuture::new(async move {
+                http_body_util::BodyExt::collect(request.into_body())
+                    .await
+                    .map_err(aws_smithy_runtime_api::client::result::ConnectorError::io)?;
+                tokio::time::sleep(settings.upload_delay).await;
+                let guard = ResponseDrop(Arc::clone(&settings.dropped));
+                let stream = futures::stream::unfold(
+                    (settings.prefix_bytes, Some(settings.response), true, guard),
+                    move |(remaining, mut body, first, guard)| {
+                        let frames = Arc::clone(&settings.frames);
+                        async move {
+                            if remaining == 0 && body.is_none() {
+                                return None;
+                            }
+                            if !first {
+                                tokio::time::sleep(settings.response_delay).await;
+                            }
+                            let bytes = if remaining > 0 {
+                                bytes::Bytes::from_static(b" ")
+                            } else {
+                                body.take()?
+                            };
+                            frames.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                            Some((
+                                Ok::<_, std::io::Error>(http_body::Frame::data(bytes)),
+                                (remaining.saturating_sub(1), body, false, guard),
+                            ))
+                        }
+                    },
+                )
+                .fuse();
+                let body = SdkBody::from_body_1_x(http_body_util::StreamBody::new(stream));
+                let mut response =
+                    HttpResponse::new(aws_smithy_runtime_api::http::StatusCode::try_from(200u16).expect("status"), body);
+                response.headers_mut().insert("etag", "\"test-etag\"");
+                Ok(response)
+            })
+        }
+    }
+
+    fn timed_response_target(
+        upload_delay: Duration,
+        response_delay: Duration,
+        prefix_bytes: usize,
+        response: &'static [u8],
+    ) -> (TargetClient, Arc<std::sync::atomic::AtomicUsize>, Arc<std::sync::atomic::AtomicUsize>) {
+        let frames = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let connector = SharedHttpConnector::new(TimedResponseConnector {
+            upload_delay,
+            response_delay,
+            prefix_bytes,
+            response: bytes::Bytes::from_static(response),
+            frames: Arc::clone(&frames),
+            dropped: Arc::clone(&dropped),
+        });
+        let http_client = http_client_fn(move |_settings, _components| connector.clone());
+        let (mut target, _) = header_recording_target_client(Vec::new());
+        target.timeouts = TargetRequestTimeouts {
+            request: Duration::from_secs(2),
+            complete: Duration::from_secs(10),
+            minimum_transfer_rate: 1024 * 1024,
+        };
+        target.client = Arc::new(S3Client::from_conf(
+            target
+                .client
+                .config()
+                .to_builder()
+                .http_client(http_client)
+                .retry_config(aws_sdk_s3::config::retry::RetryConfig::disabled())
+                .timeout_config(
+                    aws_smithy_types::timeout::TimeoutConfig::builder()
+                        .operation_timeout(target.timeouts.request)
+                        .build(),
+                )
+                .build(),
+        ));
+        (target, frames, dropped)
+    }
+
+    #[test]
+    fn replication_upload_budgets_preserve_large_transfers_and_reject_invalid_sizes() {
+        let policy = TargetRequestTimeouts::default();
+        assert_eq!(policy.upload_timeout(0).expect("empty upload"), Duration::from_secs(60));
+        assert_eq!(
+            policy.upload_timeout(5 * 1024 * 1024 * 1024).expect("maximum single PUT"),
+            Duration::from_secs(15420)
+        );
+        assert!(policy.upload_timeout(-1).is_err());
+        let slow = TargetRequestTimeouts {
+            minimum_transfer_rate: 1,
+            ..policy
+        };
+        assert!(slow.upload_timeout(i64::MAX).is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replication_upload_response_deadline_is_independent_of_size_and_checksum_override() {
+        for operation in ["put", "forwarded-checksum", "part"] {
+            let (target, frames, dropped) = timed_response_target(Duration::from_secs(4), Duration::from_millis(500), 100, b"");
+            let body = vec![b'x'; 2 * 1024 * 1024];
+            let size = i64::try_from(body.len()).expect("size");
+            let started = tokio::time::Instant::now();
+            let error = if operation == "part" {
+                target
+                    .put_object_part(
+                        "bucket",
+                        "key",
+                        "upload",
+                        1,
+                        size,
+                        ByteStream::from(body),
+                        &PutObjectPartOptions::default(),
+                    )
+                    .await
+                    .expect_err("response deadline")
+            } else {
+                let mut opts = PutObjectOptions::default();
+                if operation == "forwarded-checksum" {
+                    opts.user_metadata.insert(
+                        "x-amz-checksum-sha256".to_owned(),
+                        "OoJ3yNhRwv3wwtZoGqEIPrPX9xwTnfLl+ka0wStN1g0=".to_owned(),
+                    );
+                }
+                target
+                    .put_object("bucket", "key", size, ByteStream::from(body), &opts)
+                    .await
+                    .expect_err("response deadline")
+            };
+            assert!(
+                started.elapsed() >= Duration::from_secs(6),
+                "upload gets its full independent window: {error}"
+            );
+            assert!(
+                started.elapsed() < target.timeouts.upload_timeout(size).expect("budget"),
+                "response must end before the larger total deadline"
+            );
+            assert!(
+                frames.load(std::sync::atomic::Ordering::SeqCst) >= 2,
+                "trickle delivered progress before failure"
+            );
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1, "transport body released");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replication_slow_upload_preserves_transfer_window_and_streaming_get_body() {
+        let (target, _, _) = timed_response_target(Duration::from_secs(4), Duration::from_millis(100), 5, b"");
+        let body = vec![b'x'; 2 * 1024 * 1024];
+        let size = i64::try_from(body.len()).expect("size");
+        target
+            .put_object("bucket", "key", size, ByteStream::from(body), &PutObjectOptions::default())
+            .await
+            .expect("slow upload, prompt response");
+        let (target, _, dropped) = timed_response_target(Duration::ZERO, Duration::from_secs(1), 5, b"payload");
+        let response = target
+            .get_object("bucket", "key", None, None, None, HeaderMap::new())
+            .await
+            .expect("GET headers");
+        let started = tokio::time::Instant::now();
+        let body = response
+            .body
+            .collect()
+            .await
+            .expect("streamed GET remains outside upload deadline")
+            .into_bytes();
+        assert!(started.elapsed() > target.timeouts.request);
+        assert_eq!(&body[..], b"     payload");
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replication_complete_processing_whitespace_has_a_separate_bounded_window() {
+        const RESULT: &[u8] = b"<CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ETag>\"etag\"</ETag></CompleteMultipartUploadResult>";
+        for prefix in [5, 100] {
+            let (target, frames, dropped) = timed_response_target(Duration::ZERO, Duration::from_secs(1), prefix, RESULT);
+            let started = tokio::time::Instant::now();
+            let result = target
+                .complete_multipart_upload(
+                    "bucket",
+                    "key",
+                    "upload",
+                    vec![CompletedPart::builder().part_number(1).e_tag("etag").build()],
+                    &PutObjectOptions::default(),
+                )
+                .await;
+            if prefix == 5 {
+                assert!(result.is_ok(), "legal processing whitespace: {result:?}");
+            } else {
+                assert!(result.is_err());
+                assert!(started.elapsed() <= Duration::from_secs(11));
+            }
+            assert!(started.elapsed() > target.timeouts.request);
+            assert!(frames.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+            assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn replication_control_operation_deadline_covers_response_trickle() {
+        let (target, frames, dropped) =
+            timed_response_target(Duration::ZERO, Duration::from_millis(500), 100, b"<VersioningConfiguration/>");
+        let started = tokio::time::Instant::now();
+        assert!(target.get_bucket_versioning("bucket").await.is_err());
+        assert!(started.elapsed() <= Duration::from_secs(3));
+        assert!(frames.load(std::sync::atomic::Ordering::SeqCst) >= 2);
+        assert_eq!(dropped.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     fn streaming_test_body(payload: &'static [u8]) -> ByteStream {
@@ -3279,6 +3597,7 @@ mod tests {
                 health_check_duration: Duration::from_secs(5),
                 replicate_sync: false,
                 client: Arc::new(client),
+                timeouts: TargetRequestTimeouts::default(),
             },
             request_uris,
         )
@@ -3591,6 +3910,7 @@ mod tests {
             health_check_duration: Duration::from_secs(5),
             replicate_sync: false,
             client: Arc::new(client),
+            timeouts: TargetRequestTimeouts::default(),
         })
     }
 

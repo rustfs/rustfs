@@ -1310,7 +1310,22 @@ impl HealTask {
                 .load(Ordering::Acquire)
                 .max(self.retry_attempts)
                 .saturating_add(1);
-            manager.record_replacement_failure(&failure, attempt).await
+            // A deletion can race any stage, including hidden-transaction recovery.
+            // Only a successful complete inventory may reclassify that failure;
+            // lookup/quorum failures remain the original storage failure.
+            if manager.get_state().await.replacement_bucket_incarnations.is_some()
+                && !matches!(failure, Error::TaskCancelled | Error::TaskTimeout)
+                && matches!(
+                    manager.verify_replacement_bucket_pass(self.storage.as_ref()).await,
+                    Err(Error::ReplacementNamespaceChanged)
+                )
+            {
+                manager
+                    .record_replacement_failure(&Error::ReplacementNamespaceChanged, attempt)
+                    .await
+            } else {
+                manager.record_replacement_failure(&failure, attempt).await
+            }
         }
         .await;
         match persisted {

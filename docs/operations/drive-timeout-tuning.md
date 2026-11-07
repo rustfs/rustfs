@@ -24,6 +24,12 @@ may therefore remain undetected until real I/O reaches it. Missing slots,
 invalidated identities, unhealthy drives, and remote endpoints still get probed
 for recovery. Scanner, heal, and other background services have separate controls.
 
+## Multipart shard completion
+
+UploadPart waits for every still-pending shard operation to finish or reach its existing `RUSTFS_OBJECT_DISK_WRITE_STALL_TIMEOUT` budget (default 30 seconds), bounded further by the remaining `RUSTFS_OBJECT_DISK_WRITE_ABSOLUTE_CAP` when configured. Reaching write quorum does not start the one-second straggler cutoff used by ordinary PUT. This keeps finite slow shards from being discarded on different disks for different parts, which could leave too few disks carrying the entire object at CompleteMultipartUpload.
+
+This does not require every disk to succeed, count an unfinished writer as committed, or reduce the final object's write quorum. Failed and expired writers remain excluded. The tradeoff is that a black-hole peer can delay each part up to the existing operation budget rather than one second after quorum. The stall budget resets per shard-write operation; the optional absolute cap belongs to one part's encoding instance, not the entire multipart upload. Setting both budgets to zero retains the existing unbounded-wait behavior. Actual failures can still leave different parts missing on different disks, in which case completion must fail if a common complete write quorum is unavailable.
+
 ## Background: what these timeouts bound
 
 Every foreground drive operation carries a liveness budget so a hung disk fails
@@ -75,6 +81,7 @@ Explicit per-operation overrides always win over the profile, so you can select
 | `RUSTFS_DRIVE_METADATA_TIMEOUT_SECS` | `5` | `60` | Timeout for metadata reads such as `read_metadata`. |
 | `RUSTFS_DRIVE_DISK_INFO_TIMEOUT_SECS` | `5` | `60` | Timeout for `disk_info()` calls. |
 | `RUSTFS_OBJECT_DISK_READ_TIMEOUT` | `10` | `60` | Per-read stall budget while streaming an object body from disk. |
+| `RUSTFS_GET_DISK_READ_IDLE_TIMEOUT_SECS` | `120` | `30` floor | How long a GET body may make no downstream progress before its disk-read admission is released and the stream fails; a client that resumes within the window is unaffected. The effective value is never below 30 seconds or twice `RUSTFS_OBJECT_DISK_READ_TIMEOUT`. |
 | `RUSTFS_CAPACITY_STAT_TIMEOUT` | `3` | `60` | Base cooperative budget for an object-capacity disk scan. |
 | `RUSTFS_CAPACITY_MAX_TIMEOUT` | `15` | `60` | Upper bound for the dynamically adjusted object-capacity scan budget. |
 | `RUSTFS_DRIVE_MAX_TIMEOUT_DURATION` | `30` | — | Deprecated global fallback for every per-operation knob without an explicit override. Prefer the per-operation knobs. |

@@ -21,6 +21,7 @@ use tokio::time::timeout;
 use crate::fast_lock::{
     metrics::ShardMetrics,
     object_pool::ObjectStatePool,
+    publication::{self, PublicationTicket},
     state::ObjectLockState,
     types::{LockMode, LockResult, ObjectKey, ObjectLockRequest},
 };
@@ -134,6 +135,9 @@ impl LockShard {
     /// Acquire lock with fast path optimization
     pub async fn acquire_lock(&self, request: &ObjectLockRequest) -> Result<(), LockResult> {
         let start_time = Instant::now();
+        if publication::applies(&request.key) {
+            return self.acquire_publication(request, start_time).await;
+        }
 
         // Try fast path first
         if let Some(_state) = self.try_fast_path(request) {
@@ -145,8 +149,50 @@ impl LockShard {
         self.acquire_lock_slow_path(request, start_time).await
     }
 
+    fn publication_ticket(&self, request: &ObjectLockRequest) -> Option<PublicationTicket> {
+        let mut objects = self.objects.write();
+        let state = objects
+            .entry(request.key.clone())
+            .or_insert_with(|| Arc::new(*self.object_pool.acquire()))
+            .clone();
+        PublicationTicket::new(state, request.mode)
+    }
+
+    async fn acquire_publication(&self, request: &ObjectLockRequest, started: Instant) -> Result<(), LockResult> {
+        let Some(ticket) = self.publication_ticket(request) else {
+            return Err(LockResult::Timeout);
+        };
+        let mut first_attempt = true;
+        loop {
+            // Register before checking so a release/cancellation cannot be lost
+            // between the eligibility check and the notification wait.
+            let notified = ticket.queue.changed.notified();
+            let remaining = request.acquire_timeout.saturating_sub(started.elapsed());
+            if !first_attempt && remaining.is_zero() {
+                self.metrics.record_timeout();
+                return Err(LockResult::Timeout);
+            }
+            if ticket.try_acquire(request) {
+                self.metrics.record_slow_path_success();
+                return Ok(());
+            }
+            first_attempt = false;
+            if remaining.is_zero() || timeout(remaining, notified).await.is_err() {
+                self.metrics.record_timeout();
+                return Err(LockResult::Timeout);
+            }
+        }
+    }
+
     /// Try fast path only (without fallback to slow path)
     pub fn try_fast_path_only(&self, request: &ObjectLockRequest) -> bool {
+        if publication::applies(&request.key) {
+            // Batch acquisition must join the same queue, even for a no-wait
+            // attempt. Dropping a failed ticket does not consume a queue turn.
+            return self
+                .publication_ticket(request)
+                .is_some_and(|ticket| ticket.try_acquire(request));
+        }
         // Early check to avoid unnecessary lock contention
         if let Some(state) = self.objects.read().get(&request.key)
             && !state.atomic_state.is_fast_path_available(request.mode)

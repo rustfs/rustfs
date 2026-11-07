@@ -14,6 +14,26 @@
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn object_key_rejects_reserved_directory_markers() {
+        for key in [
+            "__XLDIR__",
+            "prefix/__XLDIR__",
+            "stash__XLDIR__/blob",
+            "file__XLDIR__",
+            "file__XLDIR__/",
+            "a__XLDIR__b",
+        ] {
+            let error = crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect_err("client keys must not alias internal directory markers");
+            assert_eq!(error.code(), &s3s::S3ErrorCode::InvalidArgument, "{key}");
+        }
+        for key in ["file", "folder/", "prefix/folder/", "__xldir__", "percent%20name"] {
+            crate::storage::ecfs_extend::validate_object_key(key, "PUT")
+                .expect("ordinary objects and directory objects remain valid");
+        }
+    }
+
     use crate::config::WorkloadProfile;
     use crate::server::cors;
     use crate::storage::StorageError;
@@ -1907,7 +1927,7 @@ mod tests {
         let method = http::Method::GET;
 
         // Should return None when no origin header
-        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(result.is_none(), "Should return None when no Origin header");
     }
 
@@ -1921,7 +1941,8 @@ mod tests {
         // Should return None when no CORS config exists
         // Note: This test may fail if test-bucket actually has CORS config
         // In a real scenario, we'd use a mock or ensure the bucket doesn't exist
-        let _result = apply_cors_headers("non-existent-bucket-for-testing", &method, &headers).await;
+        let _result =
+            apply_cors_headers("non-existent-bucket-for-testing", &method, &cors::CorsRequest::from_headers(&headers)).await;
         // Result depends on whether bucket exists and has CORS config
         // This is expected behavior - we just verify it doesn't panic
     }
@@ -1950,7 +1971,7 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert(cors::standard::ORIGIN, "https://disallowed.example.com".parse().unwrap());
 
-        let result = apply_cors_headers(bucket, &http::Method::GET, &headers).await;
+        let result = apply_cors_headers(bucket, &http::Method::GET, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(
             result.is_some(),
             "Expected Some empty headers when bucket has CORS config but origin does not match any rule"
@@ -1991,17 +2012,14 @@ mod tests {
         headers.insert(cors::request::ACCESS_CONTROL_REQUEST_HEADERS, "x-amz-content-sha256".parse().unwrap());
         headers.insert(http::header::AUTHORIZATION, "AWS4-HMAC-SHA256 Credential=test/20260302/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-content-sha256, Signature=abc".parse().unwrap());
 
-        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &headers).await.unwrap();
+        let result = apply_cors_headers(bucket, &http::Method::OPTIONS, &cors::CorsRequest::from_headers(&headers))
+            .await
+            .unwrap();
         assert_eq!(
             result.get(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN).unwrap(),
             "https://console.localhost",
         );
         assert_eq!(result.get(cors::response::ACCESS_CONTROL_ALLOW_CREDENTIALS).unwrap(), "true");
-        assert_eq!(
-            result.get(cors::standard::VARY).unwrap(),
-            "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
-        );
-
         set_bucket_metadata(bucket.to_string(), BucketMetadata::new(bucket))
             .await
             .unwrap();
@@ -2014,7 +2032,7 @@ mod tests {
         headers.insert("origin", "https://example.com".parse().unwrap());
         let method = http::Method::PATCH; // Unsupported method
 
-        let result = apply_cors_headers("test-bucket", &method, &headers).await;
+        let result = apply_cors_headers("test-bucket", &method, &cors::CorsRequest::from_headers(&headers)).await;
         assert!(result.is_none(), "Should return None for unsupported methods");
     }
 

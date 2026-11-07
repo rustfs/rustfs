@@ -643,10 +643,19 @@ message GenerallyLockRequest {
     string args = 1;
 }
 
+// Authoritative unlock result for cleanup of a previously confirmed grant.
+// Older peers omit this field. Unspecified does not confirm absence.
+enum LockReleaseStatus {
+  LOCK_RELEASE_STATUS_UNSPECIFIED = 0;
+  LOCK_RELEASE_STATUS_RELEASED = 1;
+  LOCK_RELEASE_STATUS_ALREADY_ABSENT = 2;
+}
+
 message GenerallyLockResponse {
   bool success = 1;
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
+  LockReleaseStatus release_status = 4; // Only populated by unlock RPCs.
 }
 
 message BatchGenerallyLockRequest {
@@ -657,6 +666,7 @@ message GenerallyLockResult {
   bool success = 1;
   optional string error_info = 2;
   optional string lock_info = 3; // JSON serialized LockInfo
+  LockReleaseStatus release_status = 4; // Per-ID result for unlock batches.
 }
 
 message BatchGenerallyLockResponse {

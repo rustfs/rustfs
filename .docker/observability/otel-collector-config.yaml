@@ -28,6 +28,15 @@ processors:
     check_interval: 1s
     limit_mib: 1024
     spike_limit_mib: 256
+  transform/metrics:
+    error_mode: ignore
+    metric_statements:
+      # RustFS process metrics already expose process_pid as a metric label.
+      # Remove only the duplicate datapoint label and keep the shared resource
+      # process.pid available to sibling metrics and lock histograms.
+      - context: datapoint
+        statements:
+          - delete_key(attributes, "process_pid") where IsMatch(metric.name, "^rustfs_system_process_")
   transform/logs:
     error_mode: ignore
     log_statements:
@@ -112,7 +121,7 @@ service:
       exporters: [ otlp/tempo, otlp/jaeger ]
     metrics:
       receivers: [ otlp ]
-      processors: [ batch ]
+      processors: [ transform/metrics, memory_limiter, batch ]
       exporters: [ prometheus ]
     logs:
       receivers: [ otlp ]
