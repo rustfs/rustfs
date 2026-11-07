@@ -9103,6 +9103,9 @@ impl SetDisks {
         let mut futures = Vec::with_capacity(disks.len());
         let mut errs = Vec::with_capacity(disks.len());
 
+        let requires_bounded_delete_recovery = commit_context
+            .options
+            .is_some_and(|options| options.delete_recovery_work_budget.is_some());
         for disk in disks.iter() {
             let disk_namespace_owner = namespace_owner.clone().map(|owner| owner as Arc<dyn Send + Sync>);
             let transaction_guard = commit_context.transaction_guard.as_ref();
@@ -9114,6 +9117,7 @@ impl SetDisks {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: source_bucket_incarnation_id,
+                        requires_bounded_delete_recovery,
                         ..Default::default()
                     };
                     let result = if is_meta_bucketname(bucket) {
@@ -10557,6 +10561,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             .collect();
         let mut futures = Vec::with_capacity(disks.len());
         let lock_lost_during_commit = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let requires_bounded_delete_recovery = opts.delete_recovery_work_budget.is_some();
 
         // let mut errors = Vec::with_capacity(disks.len());
 
@@ -10574,6 +10579,7 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
                     let options = DeleteOptions {
                         old_data_dir: Some(rollback_dir),
                         delete_recovery_bucket_incarnation: opts.expected_bucket_incarnation_id,
+                        requires_bounded_delete_recovery,
                         ..Default::default()
                     };
                     if current_generations
