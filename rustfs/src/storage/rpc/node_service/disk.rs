@@ -35,12 +35,12 @@ use rustfs_filemeta::FileInfo;
 use rustfs_io_metrics::internode_metrics::{
     INTERNODE_MSGPACK_CODEC_JSON, INTERNODE_MSGPACK_CODEC_MSGPACK, INTERNODE_MSGPACK_DIRECTION_REQUEST,
     INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_COMPARE_AND_UPDATE_FILE,
-    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_VERSION, INTERNODE_OPERATION_GRPC_WRITE_ALL,
-    INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ, INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE,
-    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
-    INTERNODE_STAGE_READ_VERSION_DISK_READ, INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE,
-    INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE,
-    INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
+    INTERNODE_OPERATION_GRPC_READ_ALL, INTERNODE_OPERATION_GRPC_READ_MULTIPLE, INTERNODE_OPERATION_GRPC_READ_VERSION,
+    INTERNODE_OPERATION_GRPC_WRITE_ALL, INTERNODE_STAGE_BATCH_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_BATCH_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_BATCH_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_STAGE_READ_VERSION_DISK_READ,
+    INTERNODE_STAGE_READ_VERSION_REQUEST_DECODE, INTERNODE_STAGE_READ_VERSION_RESPONSE_JSON_ENCODE,
+    INTERNODE_STAGE_READ_VERSION_RESPONSE_MSGPACK_ENCODE, INTERNODE_TRANSPORT_BACKEND_GRPC, global_internode_metrics,
 };
 use rustfs_protos::proto_gen::node_service::*;
 use serde::de::DeserializeOwned;
@@ -385,6 +385,32 @@ fn record_batch_read_version_stage(stage: &'static str, started_at: Option<Insta
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             stage,
             started_at.elapsed(),
+        );
+    }
+}
+
+/// Records the complete server-side lifetime of a unary internode RPC, including request
+/// decoding, disk work, response encoding, error paths, and cancellation.
+struct InternodeOperationDurationGuard {
+    operation: &'static str,
+    started_at: Instant,
+}
+
+impl InternodeOperationDurationGuard {
+    fn new(operation: &'static str) -> Self {
+        Self {
+            operation,
+            started_at: Instant::now(),
+        }
+    }
+}
+
+impl Drop for InternodeOperationDurationGuard {
+    fn drop(&mut self) {
+        global_internode_metrics().record_server_duration_for_operation_and_backend(
+            self.operation,
+            INTERNODE_TRANSPORT_BACKEND_GRPC,
+            self.started_at.elapsed(),
         );
     }
 }
@@ -736,6 +762,7 @@ impl NodeService {
         &self,
         request: Request<ReadMultipleRequest>,
     ) -> Result<Response<ReadMultipleResponse>, Status> {
+        let _duration = InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_READ_MULTIPLE);
         let request = request.into_inner();
         if let Some(disk) = self.find_disk(&request.disk).await? {
             let read_multiple_req = match decode_msgpack_or_json::<ReadMultipleReq>(
@@ -796,6 +823,7 @@ impl NodeService {
         &self,
         request: Request<BatchReadVersionRequest>,
     ) -> Result<Response<BatchReadVersionResponse>, Status> {
+        let _duration = InternodeOperationDurationGuard::new(INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION);
         let attribution_enabled = rustfs_io_metrics::get_stage_metrics_enabled();
         let request = request.into_inner();
         if attribution_enabled {
@@ -2857,7 +2885,8 @@ impl NodeService {
 #[cfg(test)]
 mod tests {
     use super::{
-        DeleteOptions, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
+        DeleteOptions, INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION, INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        InternodeOperationDurationGuard, compat_response_json, decode_msgpack_or_json, decode_multipart_rename_request_file_info,
         decode_rename_data_request_file_info, encode_batch_read_version_response_payloads, encode_delete_versions_errors,
         encode_file_info_msgpack, encode_msgpack, encode_msgpack_named, encode_read_multiple_response_payloads,
         encode_rename_data_response_payloads, rejects_legacy_delete_transaction,
@@ -2961,6 +2990,127 @@ mod tests {
         assert_eq!(snapshot.errors_total, 1);
         assert!(snapshot.recv_bytes_total > 0);
         metrics.reset_for_test();
+    }
+
+    #[test]
+    fn unary_duration_guard_records_read_multiple_and_batch_operations() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            for operation in [
+                INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+                INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+            ] {
+                rustfs_io_metrics::internode_metrics::global_internode_metrics().record_duration_for_operation_and_backend(
+                    operation,
+                    super::INTERNODE_TRANSPORT_BACKEND_GRPC,
+                    std::time::Duration::from_secs(1),
+                );
+                drop(InternodeOperationDurationGuard::new(operation));
+            }
+        });
+
+        let entries = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                matches!(
+                    composite.key().name(),
+                    "rustfs_system_network_internode_operation_duration_ms"
+                        | "rustfs_system_network_internode_operation_server_duration_ms"
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            entries.len(),
+            4,
+            "client RTT and server latency must have distinct series for each operation"
+        );
+        for (composite, _, _, value) in entries {
+            let operation = composite
+                .key()
+                .labels()
+                .find(|label| label.key() == "operation")
+                .map(|label| label.value().to_string())
+                .expect("duration metric should carry an operation label");
+            assert!(
+                operation == INTERNODE_OPERATION_GRPC_READ_MULTIPLE || operation == INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+            );
+            match value {
+                DebugValue::Histogram(samples) => {
+                    assert_eq!(samples.len(), 1, "client RTT and server latency must not share a histogram");
+                    if composite.key().name() == "rustfs_system_network_internode_operation_duration_ms" {
+                        assert_eq!(samples[0].0, 1000.0);
+                    }
+                }
+                other => panic!("duration metric must be a histogram, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn handlers_record_duration_on_missing_disk_errors() {
+        use metrics_util::debugging::{DebugValue, DebuggingRecorder};
+        use rustfs_protos::proto_gen::node_service::{BatchReadVersionRequest, ReadMultipleRequest};
+
+        let recorder = DebuggingRecorder::new();
+        let snapshotter = recorder.snapshotter();
+        metrics::with_local_recorder(&recorder, || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("handler-level metrics test runtime");
+            runtime.block_on(async {
+                let server = make_server();
+                let read_multiple = server
+                    .handle_read_multiple(Request::new(ReadMultipleRequest {
+                        disk: "missing-disk".to_owned(),
+                        read_multiple_req: String::new(),
+                        read_multiple_req_bin: Vec::new().into(),
+                    }))
+                    .await
+                    .expect("ReadMultiple handler should return a response")
+                    .into_inner();
+                assert!(!read_multiple.success);
+
+                let batch_read_version = server
+                    .handle_batch_read_version(Request::new(BatchReadVersionRequest {
+                        disk: "missing-disk".to_owned(),
+                        batch_read_version_req: String::new(),
+                        batch_read_version_req_bin: Vec::new().into(),
+                    }))
+                    .await
+                    .expect("BatchReadVersion handler should return a response")
+                    .into_inner();
+                assert!(!batch_read_version.success);
+            });
+        });
+
+        let entries = snapshotter
+            .snapshot()
+            .into_vec()
+            .into_iter()
+            .filter(|(composite, _, _, _)| {
+                composite.key().name() == "rustfs_system_network_internode_operation_server_duration_ms"
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(entries.len(), 2);
+        for (composite, _, _, value) in entries {
+            let operation = composite
+                .key()
+                .labels()
+                .find(|label| label.key() == "operation")
+                .map(|label| label.value().to_string())
+                .expect("handler duration metric should carry an operation label");
+            assert!(
+                operation == INTERNODE_OPERATION_GRPC_READ_MULTIPLE || operation == INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION
+            );
+            assert!(matches!(value, DebugValue::Histogram(samples) if !samples.is_empty()));
+        }
     }
 
     #[test]

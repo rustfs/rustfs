@@ -429,6 +429,7 @@ const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
 const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
+const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_internode_operation_server_duration_ms";
 const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
@@ -562,6 +563,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
         labels: SERVER_OPERATION_BACKEND_LABELS,
     },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_SERVER_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
 ];
 
 static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
@@ -686,6 +691,78 @@ impl GrpcReadVersionMetricHandles {
 #[cfg(not(test))]
 static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> =
     LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+fn grpc_operation_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_VERSION => Some(&GRPC_READ_VERSION_METRIC_HANDLES.duration),
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_DURATION),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn grpc_server_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_SERVER_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_SERVER_DURATION),
+        _ => None,
+    }
+}
+
+fn operation_duration_histogram(name: &'static str, operation: &'static str, backend: &'static str) -> metrics::Histogram {
+    metrics::histogram!(
+        name,
+        SERVER_LABEL => current_server_label(),
+        OPERATION_LABEL => operation,
+        BACKEND_LABEL => backend
+    )
+}
 
 #[cfg(not(test))]
 fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
@@ -944,17 +1021,28 @@ impl InternodeMetrics {
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
         #[cfg(not(test))]
-        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
-            handles.duration.record(duration_ms);
+        if let Some(histogram) = grpc_operation_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
             return;
         }
-        metrics::histogram!(
-            INTERNODE_OPERATION_DURATION_MS,
-            SERVER_LABEL => current_server_label(),
-            OPERATION_LABEL => operation,
-            BACKEND_LABEL => backend
-        )
-        .record(duration_ms);
+        operation_duration_histogram(INTERNODE_OPERATION_DURATION_MS, operation, backend).record(duration_ms);
+    }
+
+    /// Records server-side handler latency in a separate histogram from client RPC duration.
+    /// The caller supplies the handler lifetime, including any error or cancellation path.
+    pub fn record_server_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(histogram) = grpc_server_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
+            return;
+        }
+        operation_duration_histogram(INTERNODE_OPERATION_SERVER_DURATION_MS, operation, backend).record(duration_ms);
     }
 
     pub fn record_stage_duration_for_operation_and_backend(
@@ -1699,7 +1787,7 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 22);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 23);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -1737,6 +1825,8 @@ mod tests {
         // Payload histogram + large-payload counter carry operation+backend labels.
         assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         assert_eq!(INTERNODE_OPERATION_METRICS[21].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].name, INTERNODE_OPERATION_SERVER_DURATION_MS);
     }
 
     #[test]

@@ -58,6 +58,7 @@ All names are defined in `crates/io-metrics/src/internode_metrics.rs`.
 | Metric | Stage signal |
 | --- | --- |
 | `rustfs_system_network_internode_operation_duration_ms{operation,backend}` | control-plane RTT (P0), lock/bulk latency (P1), first-op latency (P3) |
+| `rustfs_system_network_internode_operation_server_duration_ms{operation,backend}` | server-side `ReadMultiple` / `BatchReadVersion` handler lifetime, including decode, disk work, encode, errors, and cancellation; separate from client RTT |
 | `rustfs_system_network_internode_operation_payload_bytes` | payload size distribution (P0/P1 sizing) |
 | `rustfs_system_network_internode_operation_large_payloads_total` | large unary RPCs sharing a channel (P1 target) |
 | `rustfs_system_network_internode_dial_avg_time_nanos`, `rustfs_system_network_internode_dial_errors_total` | connect cost and failures (P3) |
