@@ -1326,6 +1326,16 @@ async fn table_catalog_request_principal(req: &S3Request<Body>) -> S3Result<Tabl
         Some(context.as_ref()),
     )
     .await?;
+    // Storage credentials are a data-plane delegation, never a catalog identity.
+    if ["rustfs:table-bucket", "rustfs:table-id", "rustfs:credential-scope-prefix"]
+        .iter()
+        .any(|claim| credentials.claims_or_empty().contains_key(*claim))
+    {
+        return Err(S3Error::with_message(
+            S3ErrorCode::AccessDenied,
+            "table-scoped storage credentials cannot access the catalog control plane",
+        ));
+    }
     let iam = context.iam();
     if !iam.is_ready() {
         return Err(table_catalog_internal_error("iam not init"));
