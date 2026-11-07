@@ -62,6 +62,12 @@ static GLOBAL: hotpath::CountingAllocator<std::alloc::System> = hotpath::Countin
 static GLOBAL: rustfs_mimalloc::MiMalloc = rustfs_mimalloc::MiMalloc;
 
 fn main() -> std::process::ExitCode {
+    #[cfg(target_os = "linux")]
+    #[allow(unsafe_code)]
+    // SAFETY: The binary entrypoint runs this before RustFS creates any threads.
+    unsafe {
+        rustfs_mimalloc::MiMalloc::option_set_default(rustfs_mimalloc_sys::mi_option_t::mi_option_purge_delay, 0);
+    }
     let _hotpath_guard = hotpath::HotpathGuardBuilder::new("main").build();
 
     rustfs::startup_entrypoint::run_process()
