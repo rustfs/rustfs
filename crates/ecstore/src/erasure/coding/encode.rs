@@ -3636,4 +3636,73 @@ mod tests {
         assert_eq!(encode_channel_capacity(16 * 1024 * 1024, 32 * 1024 * 1024), 2);
         assert_eq!(encode_channel_capacity(1, usize::MAX), DEFAULT_RUSTFS_ERASURE_ENCODE_MAX_INFLIGHT_BLOCKS);
     }
+
+    #[tokio::test]
+    async fn read_full_buf_or_eof_preserves_invalid_data_and_wraps_truncated_io_errors() {
+        use std::pin::Pin;
+        use std::task::{Context, Poll};
+        use tokio::io::{AsyncRead, ReadBuf};
+
+        struct StepReader {
+            prefix: Vec<u8>,
+            offset: usize,
+            err_kind: Option<std::io::ErrorKind>,
+            err_msg: &'static str,
+        }
+
+        impl AsyncRead for StepReader {
+            fn poll_read(mut self: Pin<&mut Self>, _cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if self.offset < self.prefix.len() {
+                    let take = (self.prefix.len() - self.offset).min(buf.remaining());
+                    buf.put_slice(&self.prefix[self.offset..self.offset + take]);
+                    self.offset += take;
+                    return Poll::Ready(Ok(()));
+                }
+                if let Some(kind) = self.err_kind.take() {
+                    return Poll::Ready(Err(std::io::Error::new(kind, self.err_msg)));
+                }
+                Poll::Ready(Ok(()))
+            }
+        }
+
+        // 1. Error on the very first read (total == 0) preserves the original ErrorKind.
+        let mut r1 = StepReader {
+            prefix: Vec::new(),
+            offset: 0,
+            err_kind: Some(std::io::ErrorKind::BrokenPipe),
+            err_msg: "immediate broken pipe",
+        };
+        let mut buf = BytesMut::with_capacity(16);
+        let err = read_full_buf_or_eof(&mut r1, &mut buf, 16)
+            .await
+            .expect_err("immediate read error must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        // 2. InvalidData (e.g. HashReader checksum/trailer mismatch) after partial fill preserves InvalidData.
+        let mut r2 = StepReader {
+            prefix: b"partial".to_vec(),
+            offset: 0,
+            err_kind: Some(std::io::ErrorKind::InvalidData),
+            err_msg: "Checksum mismatch",
+        };
+        let mut buf2 = BytesMut::with_capacity(16);
+        let err = read_full_buf_or_eof(&mut r2, &mut buf2, 16)
+            .await
+            .expect_err("InvalidData after partial fill must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Checksum mismatch"));
+
+        // 3. Non-InvalidData error after partial fill is normalized to UnexpectedEof.
+        let mut r3 = StepReader {
+            prefix: b"partial".to_vec(),
+            offset: 0,
+            err_kind: Some(std::io::ErrorKind::BrokenPipe),
+            err_msg: "mid-stream reset",
+        };
+        let mut buf3 = BytesMut::with_capacity(16);
+        let err = read_full_buf_or_eof(&mut r3, &mut buf3, 16)
+            .await
+            .expect_err("truncated stream error must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+    }
 }
