@@ -46,8 +46,8 @@ use super::super::{
     log_multipart_write_quorum_failure, multipart_part_logical_size, parts_after_marker, path_join_buf,
     prepare_complete_multipart_parts, record_compression_total_memory, record_multipart_write_quorum_failure,
     reduce_read_quorum_errs, reduce_write_quorum_errs, remove_header_map, resolve_write_layout,
-    restore_commit_operation_id_from_metadata, should_persist_encryption_original_size, strip_internal_multipart_metadata,
-    to_object_err, warn,
+    restore_commit_operation_id_from_metadata, restore_operation_id_from_metadata, should_persist_encryption_original_size,
+    strip_internal_multipart_metadata, to_object_err, warn,
 };
 use super::bitrot_self_verify::{BitrotSelfVerifyTarget, drop_failed_writer_disks, verify_written_bitrot_shards};
 #[cfg(test)]
@@ -2728,6 +2728,9 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
                 .map(crate::io_support::rio::compression_index_storage_bytes);
 
             let mut etag = data.stream.try_resolve_etag().unwrap_or_default();
+            let encrypted_etag = data.stream.encrypted_etag
+                && !etag.is_empty()
+                && opts.preserve_etag.as_ref().is_none_or(|preserved| preserved == &etag);
 
             if let Some(ref tag) = opts.preserve_etag {
                 etag = tag.clone();
@@ -2748,6 +2751,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
 
             let part_info = ObjectPartInfo {
                 etag: etag.clone(),
+                encrypted_etag,
                 number: part_id,
                 size: w_size,
                 mod_time: Some(OffsetDateTime::now_utc()),
@@ -3647,6 +3651,7 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
             ensure_multipart_bucket_lifecycle_lock_held(bucket, object, opts)?;
         }
         let source_condition = capture_source_condition(bucket, object, &upload_id_path, &fi, Uuid::new_v4())?;
+        let preserved_encrypted_etag = preserves_staged_encrypted_etag_proof(&fi, opts, expected_restore_operation_id);
         let upload_data_dir = source_condition.lineage.original_data_dir.to_string();
         // The source generation remains in the captured precondition. Its
         // ACTIVE/recovery controls are not final user-object metadata.
@@ -4117,11 +4122,17 @@ impl crate::storage_api_contracts::multipart::MultipartOperations for SetDisks {
         }
 
         // etag
-        let etag = resolve_complete_etag(opts, &uploaded_parts);
+        let (etag, encrypted_etag) = resolve_complete_etag(opts, &uploaded_parts, &fi.parts);
+        let encrypted_etag = encrypted_etag
+            || preserved_encrypted_etag
+                && fi.version_id.filter(|version| !version.is_nil()) == source_condition.lineage.original_version_id;
 
-        // An upload can contain parts from an older writer or a peer. Until
-        // every part's format is attested, keep its ETag out of keyless lists.
+        // New writes attest their selected parts. Same-version internal moves
+        // and restores can retain the proof from quorum-validated source metadata.
         rustfs_utils::http::metadata_compat::remove_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+        if encrypted_etag {
+            insert_str(&mut fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        }
 
         fi.metadata.insert("etag".to_owned(), etag);
 
@@ -4948,19 +4959,57 @@ fn completed_multipart_upload_matches(
     Ok(true)
 }
 
+// Capture only the original staged proof, before completion applies metadata
+// updates. Publication must also retain the source lineage's version.
+fn preserves_staged_encrypted_etag_proof(fi: &FileInfo, opts: &ObjectOptions, restore_operation_id: Option<Uuid>) -> bool {
+    if opts.replication_request {
+        return false;
+    }
+    let movement = opts.data_movement
+        && opts.version_id.is_some()
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD)
+            .is_some_and(|identity| !identity.is_empty());
+    // Commit rechecks this operation against the live object under its lock.
+    let restore = restore_operation_id
+        .is_some_and(|expected| restore_operation_id_from_metadata(&fi.metadata).is_ok_and(|id| id == Some(expected)));
+    if !movement && !restore {
+        return false;
+    }
+    let Ok(version) = opts.version_id.as_deref().map(Uuid::parse_str).transpose() else {
+        return false;
+    };
+    let Some(etag) = opts.preserve_etag.as_deref().filter(|etag| !etag.is_empty()) else {
+        return false;
+    };
+    version.filter(|version| !version.is_nil()) == fi.version_id.filter(|version| !version.is_nil())
+        && fi.metadata.get("etag").map(String::as_str) == Some(etag)
+        && get_consistent_str(&fi.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG) == Some("v1")
+}
+
 /// Final ETag for a completed multipart object. An authorized replication
 /// request preserves the source ETag so the replication HEAD comparison
 /// converges even when the source ETag is not derivable from the uploaded
 /// parts (foreign-origin objects, ciphertext-derived ETags); the internal
 /// metadata override comes next; otherwise the ETag is computed from parts.
-fn resolve_complete_etag(opts: &ObjectOptions, uploaded_parts: &[CompletePart]) -> String {
-    if let Some(etag) = opts.preserve_etag.as_ref().filter(|etag| !etag.is_empty()) {
-        return etag.clone();
+fn resolve_complete_etag(
+    opts: &ObjectOptions,
+    uploaded_parts: &[CompletePart],
+    stored_parts: &[ObjectPartInfo],
+) -> (String, bool) {
+    let preserved = opts
+        .preserve_etag
+        .as_ref()
+        .filter(|etag| !etag.is_empty())
+        .or_else(|| opts.user_defined.get("etag"));
+    let protected_parts = !stored_parts.is_empty() && stored_parts.iter().all(|part| part.encrypted_etag);
+    if let Some(etag) = preserved
+        && !protected_parts
+    {
+        return (etag.clone(), false);
     }
-    if let Some(etag) = opts.user_defined.get("etag") {
-        return etag.clone();
-    }
-    get_complete_multipart_md5(uploaded_parts)
+    let computed = get_complete_multipart_md5(uploaded_parts);
+    let encrypted_etag = protected_parts && preserved.is_none_or(|etag| etag == &computed);
+    (preserved.cloned().unwrap_or(computed), encrypted_etag)
 }
 
 /// Serialize the object-level checksum record that `complete_multipart_upload`
@@ -9093,6 +9142,26 @@ mod tests {
                 receipts.push(part.etag);
             }
         }
+        let (staged, _) = set
+            .check_upload_id_exists(bucket, "object", &upload.upload_id, false)
+            .await
+            .expect("read upload generation");
+        let upload_path = SetDisks::get_upload_id_dir(bucket, "object", &upload.upload_id);
+        let data_dir = staged.data_dir.expect("staging data directory");
+        for disk in &disks {
+            let metadata = disk
+                .read_parts(
+                    RUSTFS_META_MULTIPART_BUCKET,
+                    &[
+                        format!("{upload_path}/{data_dir}/part.1.meta"),
+                        format!("{upload_path}/{data_dir}/part.3.meta"),
+                    ],
+                )
+                .await
+                .expect("read persisted part proofs");
+            assert!(metadata[0].encrypted_etag, "rewritten protected part is attested");
+            assert!(!metadata[1].encrypted_etag, "an overridden part ETag has no producer proof");
+        }
         assert_ne!(receipts[0], receipts[1], "spare parts must not identify another part's plaintext");
         assert_ne!(receipts[0], receipts[2], "same-number retries get a new receipt");
         for _ in 0..2 {
@@ -9129,6 +9198,230 @@ mod tests {
             .await
             .expect("committed completion replay is stable");
         assert_eq!(replay.etag, committed.etag);
+        for completed in [committed, replay] {
+            assert!(
+                rustfs_utils::http::etag_can_be_listed(&completed.user_defined),
+                "the selected protected part retains its ETag after completion and replay"
+            );
+            assert_eq!(
+                rustfs_utils::http::get_consistent_str(&completed.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,),
+                Some("v1")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_encrypted_multipart_clears_unproven_upload_etag_marker() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "legacy-encrypted-etag";
+        make_bucket_on_all(&disks, bucket).await;
+        let mut opts = ObjectOptions {
+            user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+            ..Default::default()
+        };
+        insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        // Model an older writer whose part metadata has no protected-format proof.
+        let (upload_id, parts) = stage_upload_with_create_opts(&set, bucket, "object", b"legacy part", &opts).await;
+        let completed = set
+            .clone()
+            .complete_multipart_upload(bucket, "object", &upload_id, parts, &ObjectOptions::default())
+            .await
+            .expect("legacy part can still complete");
+        let reread = set
+            .get_object_info(bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("read completed metadata");
+        assert_eq!(completed.etag, reread.etag);
+        for info in [completed, reread] {
+            assert!(!rustfs_utils::http::etag_can_be_listed(&info.user_defined));
+            assert!(!contains_key_str(&info.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG));
+        }
+    }
+
+    #[test]
+    fn data_movement_etag_proof_requires_verified_source_identity() {
+        let version = Uuid::new_v4();
+        let mut source = FileInfo {
+            version_id: Some(version),
+            metadata: HashMap::from([("etag".to_owned(), "protected-source-etag".to_owned())]),
+            ..Default::default()
+        };
+        insert_str(
+            &mut source.metadata,
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            "source-generation".to_owned(),
+        );
+        insert_str(&mut source.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+        let opts = ObjectOptions {
+            data_movement: true,
+            version_id: Some(version.to_string()),
+            preserve_etag: source.metadata.get("etag").cloned(),
+            ..Default::default()
+        };
+        assert!(preserves_staged_encrypted_etag_proof(&source, &opts, None));
+        for version_id in [None, Some(Uuid::nil())] {
+            let null_source = FileInfo {
+                version_id,
+                ..source.clone()
+            };
+            let null_opts = ObjectOptions {
+                version_id: Some(Uuid::nil().to_string()),
+                ..opts.clone()
+            };
+            assert!(preserves_staged_encrypted_etag_proof(&null_source, &null_opts, None));
+        }
+        for rejected in [
+            ObjectOptions {
+                data_movement: false,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                replication_request: true,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some("invalid".to_owned()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                version_id: Some(Uuid::new_v4().to_string()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: None,
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some(String::new()),
+                ..opts.clone()
+            },
+            ObjectOptions {
+                preserve_etag: Some("replacement-etag".to_owned()),
+                ..opts.clone()
+            },
+        ] {
+            assert!(!preserves_staged_encrypted_etag_proof(&source, &rejected, None));
+        }
+        for suffix in [
+            rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+            rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG,
+        ] {
+            let mut missing = source.clone();
+            rustfs_utils::http::remove_str(&mut missing.metadata, suffix);
+            assert!(!preserves_staged_encrypted_etag_proof(&missing, &opts, None));
+            insert_str(&mut missing.metadata, suffix, String::new());
+            assert!(!preserves_staged_encrypted_etag_proof(&missing, &opts, None));
+            let mut conflicting = source.clone();
+            conflicting
+                .metadata
+                .insert(format!("x-minio-internal-{suffix}"), "conflict".to_owned());
+            assert!(!preserves_staged_encrypted_etag_proof(&conflicting, &opts, None));
+        }
+        for value in [None, Some("unknown")] {
+            let mut unproven = source.clone();
+            rustfs_utils::http::remove_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+            if let Some(value) = value {
+                insert_str(&mut unproven.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, value.to_owned());
+            }
+            let request_claim = ObjectOptions {
+                user_defined: source.metadata.clone(),
+                ..opts.clone()
+            };
+            assert!(!preserves_staged_encrypted_etag_proof(&unproven, &request_claim, None));
+        }
+    }
+
+    #[test]
+    fn restore_etag_proof_requires_matching_staged_operation() {
+        let operation_id = Uuid::new_v4();
+        for version_id in [None, Some(Uuid::new_v4())] {
+            let mut staged = FileInfo {
+                version_id,
+                metadata: HashMap::from([("etag".to_owned(), "source-etag".to_owned())]),
+                ..Default::default()
+            };
+            let opts = ObjectOptions {
+                version_id: version_id.map(|id| id.to_string()),
+                preserve_etag: Some("source-etag".to_owned()),
+                ..Default::default()
+            };
+            insert_str(&mut staged.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+            insert_str(&mut staged.metadata, SUFFIX_RESTORE_OPERATION_ID, operation_id.to_string());
+            assert!(preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(Uuid::new_v4())));
+            rustfs_utils::http::remove_str(&mut staged.metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG);
+            assert!(!preserves_staged_encrypted_etag_proof(&staged, &opts, Some(operation_id)));
+        }
+    }
+
+    #[tokio::test]
+    async fn complete_data_movement_etag_proof_rejects_version_rewrites_and_late_claims() {
+        let (_dirs, disks, set) = hermetic_set_disks(4).await;
+        let bucket = "movement-etag-proof";
+        make_bucket_on_all(&disks, bucket).await;
+        for (object, staged_proof, publish_versioned, late_claim, expected_proof) in [
+            ("same-version", true, true, false, true),
+            ("rewritten-version", true, false, false, false),
+            ("late-claim", false, true, true, false),
+        ] {
+            let version = Uuid::new_v4();
+            let mut opts = ObjectOptions {
+                data_movement: true,
+                versioned: true,
+                version_id: Some(version.to_string()),
+                preserve_etag: Some("protected-source-etag".to_owned()),
+                user_defined: HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+                ..Default::default()
+            };
+            insert_str(
+                &mut opts.user_defined,
+                rustfs_utils::http::SUFFIX_DATA_MOVEMENT_UPLOAD,
+                "source-generation".to_owned(),
+            );
+            if staged_proof {
+                insert_str(&mut opts.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+            }
+            let (upload_id, parts) = stage_upload_with_create_opts(&set, bucket, object, b"raw source bytes", &opts).await;
+            opts.versioned = publish_versioned;
+            if late_claim {
+                let mut metadata = HashMap::new();
+                insert_str(&mut metadata, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG, "v1".to_owned());
+                opts.eval_metadata = Some(metadata);
+            }
+            let completed = set
+                .clone()
+                .complete_multipart_upload(bucket, object, &upload_id, parts, &opts)
+                .await
+                .expect("complete raw internal movement");
+            assert_eq!(completed.version_id, publish_versioned.then_some(version), "{object}");
+            assert_eq!(completed.etag, opts.preserve_etag, "{object}");
+            let persisted = set
+                .get_object_info(
+                    bucket,
+                    object,
+                    &ObjectOptions {
+                        version_id: Some(crate::data_movement::data_movement_exact_version_id(completed.version_id)),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("read completed proof from disk");
+            assert_eq!(
+                rustfs_utils::http::etag_can_be_listed(&persisted.user_defined),
+                expected_proof,
+                "{object}"
+            );
+            assert_eq!(
+                get_consistent_str(&persisted.user_defined, rustfs_utils::http::SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+                expected_proof.then_some("v1"),
+                "{object}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -16205,7 +16498,7 @@ mod tests {
             preserve_etag: Some(foreign_etag.clone()),
             ..Default::default()
         };
-        assert_eq!(resolve_complete_etag(&opts, &[]), foreign_etag);
+        assert_eq!(resolve_complete_etag(&opts, &[], &[]), (foreign_etag, false));
 
         // Empty preserve value degrades to the next source.
         let opts_empty = ObjectOptions {
@@ -16213,11 +16506,67 @@ mod tests {
             user_defined: std::collections::HashMap::from([("etag".to_string(), "override-etag".to_string())]),
             ..Default::default()
         };
-        assert_eq!(resolve_complete_etag(&opts_empty, &[]), "override-etag");
+        assert_eq!(resolve_complete_etag(&opts_empty, &[], &[]), ("override-etag".to_string(), false));
 
         // Without either source the ETag is computed from the parts.
-        let computed = resolve_complete_etag(&ObjectOptions::default(), &[]);
-        assert_eq!(computed, get_complete_multipart_md5(&[]));
+        let computed = resolve_complete_etag(&ObjectOptions::default(), &[], &[]);
+        assert_eq!(computed, (get_complete_multipart_md5(&[]), false));
+    }
+
+    #[test]
+    fn complete_etag_proof_requires_all_selected_parts_and_matching_overrides() {
+        for proofs in [&[][..], &[true], &[true, true], &[true, false], &[false]] {
+            let stored: Vec<_> = proofs
+                .iter()
+                .enumerate()
+                .map(|(index, &encrypted_etag)| ObjectPartInfo {
+                    number: index + 1,
+                    etag: "0123456789abcdef0123456789abcdef".to_owned(),
+                    encrypted_etag,
+                    ..Default::default()
+                })
+                .collect();
+            let uploaded: Vec<_> = stored
+                .iter()
+                .map(|part| CompletePart {
+                    part_num: part.number,
+                    etag: Some(part.etag.clone()),
+                    ..Default::default()
+                })
+                .collect();
+            let computed = get_complete_multipart_md5(&uploaded);
+            let protected = !proofs.is_empty() && proofs.iter().all(|&proof| proof);
+            assert_eq!(
+                resolve_complete_etag(&ObjectOptions::default(), &uploaded, &stored),
+                (computed.clone(), protected)
+            );
+
+            for preserved in ["foreign-etag", computed.as_str(), ""] {
+                for opts in [
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        user_defined: HashMap::from([("etag".to_owned(), preserved.to_owned())]),
+                        ..Default::default()
+                    },
+                    ObjectOptions {
+                        preserve_etag: Some(preserved.to_owned()),
+                        user_defined: HashMap::from([("etag".to_owned(), "metadata-etag".to_owned())]),
+                        ..Default::default()
+                    },
+                ] {
+                    let expected_etag = if !preserved.is_empty() || opts.preserve_etag.is_none() {
+                        preserved
+                    } else {
+                        opts.user_defined.get("etag").map_or(computed.as_str(), String::as_str)
+                    };
+                    let result = resolve_complete_etag(&opts, &uploaded, &stored);
+                    assert_eq!(result, (expected_etag.to_owned(), protected && expected_etag == computed));
+                }
+            }
+        }
     }
 
     /// Accumulate the per-part digests and the running full-object checksum the
