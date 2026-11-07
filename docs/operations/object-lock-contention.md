@@ -61,7 +61,7 @@ The `object_namespace_lock` event covers store GET/read and write acquisition, s
 
 The diagnostic retains the parent tracing span available at acquisition. When an HTTP request span carries `request_id`, guard events retain that parent even if the guard moves into a background PUT commit tail. Heal events retain the available task span. Missing parent fields must not be reconstructed from adjacent log lines.
 
-Use `read_repair_data`, `read_repair_commit`, and `heal_object` to distinguish shared read-repair reconstruction, its exclusive revalidation/rename phase, and ordinary exclusive object healing. A PUT quorum ACK can precede the end of its rename tail and lock lifetime.
+Use `read_repair_data`, `read_repair_commit`, and `heal_object` to distinguish shared read-repair reconstruction, its exclusive revalidation/rename phase, and ordinary exclusive object healing. Application PUTs use `TailDrained` completion and await rename fan-out before returning success. Completion can succeed at write quorum with minority failures routed to repair. Internal quorum-completion callers may acknowledge before their rename tail and lock lifetime end.
 
 ## Distinguish the waiting chains
 

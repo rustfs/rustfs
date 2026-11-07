@@ -423,11 +423,15 @@ impl RemoteClient {
     /// peer toward the offline threshold. See issue #4567.
     fn is_transport_failure(status: &tonic::Status) -> bool {
         use tonic::Code;
+        // A valid stale-epoch request is rejected before execution. Its signed
+        // response refreshes the peer epoch on the existing healthy channel.
+        let epoch_rejection = status.code() == Code::Unavailable && status.message() == "RPC boot epoch changed";
         std::error::Error::source(status).is_some()
-            || matches!(
-                status.code(),
-                Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
-            )
+            || (!epoch_rejection
+                && matches!(
+                    status.code(),
+                    Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
+                ))
     }
 
     async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
@@ -2825,6 +2829,37 @@ mod tests {
                 "{code:?} is an application status and must not be treated as a transport failure"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_boot_epoch_rejections_do_not_open_lock_request_breaker() {
+        let addr = "http://stale-boot-epoch-lock-breaker:9000";
+        let client = RemoteClient::new(addr.to_string());
+        reset_lock_peer_health_for_test(addr);
+
+        for _ in 0..LOCK_RPC_REQUEST_BACKOFF_THRESHOLD {
+            let error = client
+                .execute_rpc::<(), _>(
+                    "lock",
+                    "bucket/new-object",
+                    Duration::from_secs(1),
+                    async { Err(tonic::Status::unavailable("RPC boot epoch changed")) },
+                    RpcCleanup::new(None, None, None),
+                )
+                .await
+                .expect_err("a stale epoch still rejects the operation before execution");
+            assert!(error.to_string().contains("RPC boot epoch changed"));
+        }
+
+        let health = lock_peer_health_for_test(addr);
+        assert_eq!(health.request_consecutive_timeouts, 0);
+        assert!(health.request_backoff_until.is_none());
+        assert!(health.last_eviction.is_none());
+        let admission = client
+            .admit_lock_request("lock")
+            .expect("authenticated epoch refresh may proceed immediately");
+        client.release_lock_request("lock", Some(admission));
+        reset_lock_peer_health_for_test(addr);
     }
 
     #[test]
