@@ -11318,7 +11318,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 [[package]]
 name = "s3s"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=1c5b20260fbeebff764d43a9c1da033db7281f90#1c5b20260fbeebff764d43a9c1da033db7281f90"
+source = "git+https://github.com/s3s-project/s3s?rev=4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa#4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa"
 dependencies = [
  "arc-swap",
  "arrayvec",
@@ -11375,7 +11375,7 @@ dependencies = [
 [[package]]
 name = "s3s-multipart"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=1c5b20260fbeebff764d43a9c1da033db7281f90#1c5b20260fbeebff764d43a9c1da033db7281f90"
+source = "git+https://github.com/s3s-project/s3s?rev=4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa#4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa"
 dependencies = [
  "arrayvec",
  "bytes",
@@ -11388,7 +11388,7 @@ dependencies = [
 [[package]]
 name = "s3s-rfc2047"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=1c5b20260fbeebff764d43a9c1da033db7281f90#1c5b20260fbeebff764d43a9c1da033db7281f90"
+source = "git+https://github.com/s3s-project/s3s?rev=4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa#4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa"
 dependencies = [
  "base64-simd",
  "thiserror 2.0.21",
@@ -11397,7 +11397,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv2"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=1c5b20260fbeebff764d43a9c1da033db7281f90#1c5b20260fbeebff764d43a9c1da033db7281f90"
+source = "git+https://github.com/s3s-project/s3s?rev=4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa#4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa"
 dependencies = [
  "base64-simd",
  "hmac 0.13.0",
@@ -11410,7 +11410,7 @@ dependencies = [
 [[package]]
 name = "s3s-sigv4"
 version = "0.17.0"
-source = "git+https://github.com/s3s-project/s3s?rev=1c5b20260fbeebff764d43a9c1da033db7281f90#1c5b20260fbeebff764d43a9c1da033db7281f90"
+source = "git+https://github.com/s3s-project/s3s?rev=4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa#4a463b9f4ad0eb535add1cd2afb86e6398fa7cfa"
 dependencies = [
  "arrayvec",
  "aws-lc-rs",
