@@ -368,6 +368,9 @@ fn log_list_path_finished(
 #[derive(Debug, Default, Clone)]
 pub struct ListPathOptions {
     pub caller: ListObjectsGatherCaller,
+    /// Internal native-walk admission, shared with every disk producer so
+    /// aborting an HTTP request cannot release its budget ahead of cleanup.
+    pub read_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub id: Option<String>,
 
     // Bucket of the listing.
@@ -1478,6 +1481,11 @@ impl ECStore {
         if o.transient {
             o.create = false;
         }
+        let fanout = self.pools.iter().fold(0usize, |total, pool| {
+            total.saturating_add(pool.disk_set.len().saturating_mul(pool.set_drive_count))
+        });
+        o.read_budget = self.ctx.acquire_list_read_budget(fanout).await.map_err(Error::other)?;
+
         let log_context = ListPathLogContext::from_options(&o);
 
         // cancel channel
@@ -2878,6 +2886,12 @@ impl SetDisks {
         if o.transient {
             o.create = false;
         }
+        o.read_budget = self
+            .instance_ctx()
+            .acquire_list_read_budget(self.set_drive_count)
+            .await
+            .map_err(Error::other)?;
+
         let log_context = ListPathLogContext::from_options(&o);
 
         let cancel = CancellationToken::new();
@@ -2949,6 +2963,7 @@ impl SetDisks {
         let result = list_path_raw_with_claim_tracker(
             rx,
             ListPathRawOptions {
+                read_budget: opts.read_budget.clone(),
                 disks: disks.into_iter().map(Some).collect(),
                 bucket: opts.bucket,
                 path: opts.base_dir,
@@ -3107,6 +3122,7 @@ impl SetDisks {
         let result = list_path_raw_with_outcome(
             rx,
             ListPathRawOptions {
+                read_budget: opts.read_budget.clone(),
                 disks: disks.into_iter().map(Some).collect(),
                 fallback_disks: fallback_disks.into_iter().map(Some).collect(),
                 bucket: opts.bucket,
@@ -6786,6 +6802,58 @@ mod test {
         .await
         .expect("initialize store");
         (dirs, store)
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_bounds_store_and_set_entrypoints_and_recovers_after_errors() {
+        let (_dirs, store) = single_set_store(4).await;
+        let held = store
+            .ctx
+            .acquire_list_read_budget(usize::MAX)
+            .await
+            .expect("occupy native budget");
+        let semaphore = held.as_ref().expect("bounded instance budget").semaphore();
+        let owners = Arc::strong_count(semaphore);
+        let opts = ListPathOptions {
+            bucket: "list-budget-absent-bucket".into(),
+            limit: 1,
+            authoritative: true,
+            ..Default::default()
+        };
+        let set = store.pools[0].disk_set[0].clone();
+        set.disks.write().await.fill(None);
+        {
+            let mut store_walk = std::pin::pin!(store.clone().list_path(&opts));
+            let mut set_walk = std::pin::pin!(set.clone().list_path_result(&opts));
+            assert!(futures::poll!(&mut store_walk).is_pending(), "store walk must await its budget");
+            assert_eq!(Arc::strong_count(semaphore), owners + 1, "store must queue on the shared budget");
+            assert!(futures::poll!(&mut set_walk).is_pending(), "set walk shares the same instance budget");
+            assert_eq!(Arc::strong_count(semaphore), owners + 2, "set must queue on the same budget");
+            let empty = store
+                .clone()
+                .list_path(&ListPathOptions {
+                    limit: 0,
+                    ..opts.clone()
+                })
+                .await
+                .expect("empty page needs no disk admission");
+            assert!(empty.exhausted);
+        }
+        assert_eq!(Arc::strong_count(semaphore), owners, "cancelled entry points release the queue ownership");
+        drop(held);
+        let result = timeout(Duration::from_secs(5), store.clone().list_path(&opts))
+            .await
+            .expect("failed walk terminates");
+        assert_eq!(
+            result.err(),
+            Some(DiskError::ErasureReadQuorum.into()),
+            "offline drives retain their quorum error"
+        );
+        let next = timeout(Duration::from_secs(5), store.ctx.acquire_list_read_budget(usize::MAX))
+            .await
+            .expect("failed and cancelled walks release their grants")
+            .expect("budget remains open");
+        assert!(next.is_some());
     }
 
     fn versioned_object_metadata(bucket: &str, name: &str, versions: &[(u128, i64)], slot: usize) -> Bytes {

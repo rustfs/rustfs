@@ -217,6 +217,8 @@ impl Drop for NotifyOnDrop {
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
+    /// Retain native listing admission through producer cancellation/draining.
+    pub read_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub disks: Vec<Option<DiskStore>>,
     pub fallback_disks: Vec<Option<DiskStore>>,
     pub bucket: String,
@@ -255,6 +257,7 @@ pub struct ListPathRawOptions {
 impl Clone for ListPathRawOptions {
     fn clone(&self) -> Self {
         Self {
+            read_budget: self.read_budget.clone(),
             disks: self.disks.clone(),
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
@@ -389,7 +392,9 @@ async fn list_path_raw_inner(
         let disk_io_context_clone = disk_io_context.clone();
         let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
+        let read_budget = opts.read_budget.clone();
         let producer = with_optional_disk_io_context(disk_io_context_clone, async move {
+            let _read_budget = read_budget;
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
             if let Some(observer) = &test_disk_io_context_observed {
@@ -1895,6 +1900,42 @@ mod tests {
         .expect("stalled reader within failure budget should not fail a quorum listing");
 
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_is_retained_by_raw_producer_until_cancellation() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let grant = Arc::new(semaphore.clone().acquire_many_owned(4).await.expect("listing grant"));
+        let weak_grant = Arc::downgrade(&grant);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                read_budget: Some(grant),
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::StallWithSignals {
+                    entered: entered.clone(),
+                    stopped: stopped.clone(),
+                }],
+                ..Default::default()
+            },
+        ));
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("producer entered");
+        assert!(weak_grant.strong_count() >= 2, "producer must retain a grant independently of the parent");
+        assert_eq!(semaphore.available_permits(), 0);
+        worker.abort();
+        assert!(worker.await.expect_err("parent cancelled").is_cancelled());
+        timeout(Duration::from_secs(5), stopped.notified())
+            .await
+            .expect("producer stopped");
+        let _next = timeout(Duration::from_secs(5), semaphore.acquire_many(4))
+            .await
+            .expect("cancelled listing releases all permits")
+            .expect("budget stays open");
     }
 
     #[tokio::test]
