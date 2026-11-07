@@ -732,29 +732,6 @@ pub(crate) fn metadata_maintenance_reachability_graph_report(
     }
 }
 
-pub(crate) async fn metadata_maintenance_object_cleanup_reports<B>(
-    backend: &B,
-    table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
-    warehouse_object_prefix: Option<&str>,
-    referenced_object_reports: &[TableMetadataMaintenanceReferencedObjectReport],
-    now: OffsetDateTime,
-) -> TableCatalogStoreResult<(usize, Vec<String>, Vec<String>, Vec<TableMetadataMaintenanceObjectCleanupReport>)>
-where
-    B: TableCatalogObjectBackend,
-{
-    metadata_maintenance_object_cleanup_reports_in_scope(
-        backend,
-        table_bucket,
-        TableMaintenanceObjectScope::Logical { namespace, table },
-        warehouse_object_prefix,
-        referenced_object_reports,
-        now,
-    )
-    .await
-}
-
 pub(crate) async fn metadata_maintenance_object_cleanup_reports_for_entry<B>(
     backend: &B,
     entry: &TableEntry,

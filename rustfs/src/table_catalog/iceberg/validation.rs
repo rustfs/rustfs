@@ -2756,11 +2756,28 @@ struct SnapshotGraphManifestLocation {
     from_manifest_list: bool,
 }
 
+enum SnapshotGraphValidation<'a> {
+    Commit(Option<&'a serde_json::Value>),
+    BackupInventory,
+}
+
 pub(crate) async fn validate_table_snapshot_changes<B>(
     context: &TableSnapshotGraphValidationContext<'_, B>,
     current_metadata: Option<&serde_json::Value>,
     metadata: &serde_json::Value,
 ) -> TableCatalogStoreResult<()>
+where
+    B: TableCatalogObjectBackend,
+{
+    validate_table_snapshot_changes_with_budget(context, SnapshotGraphValidation::Commit(current_metadata), metadata).await?;
+    Ok(())
+}
+
+async fn validate_table_snapshot_changes_with_budget<B>(
+    context: &TableSnapshotGraphValidationContext<'_, B>,
+    validation: SnapshotGraphValidation<'_>,
+    metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<SnapshotGraphReadBudget>
 where
     B: TableCatalogObjectBackend,
 {
@@ -2770,29 +2787,44 @@ where
     let mut budget = SnapshotGraphReadBudget::default();
     validate_table_statistics_objects(context, metadata).await?;
     let format_version = table_metadata_format_version(metadata)?;
+    let current_metadata = match validation {
+        SnapshotGraphValidation::Commit(current_metadata) => current_metadata,
+        SnapshotGraphValidation::BackupInventory => None,
+    };
     let snapshots = snapshots_requiring_graph_validation(current_metadata, metadata)?;
     for snapshot in snapshots {
         snapshot
             .get("snapshot-id")
             .and_then(serde_json::Value::as_i64)
             .ok_or_else(|| TableCatalogStoreError::Invalid("snapshot-id must be an integer".to_string()))?;
-        if format_version == 2
-            && snapshot.get("manifests").is_some()
-            && !snapshot_is_retained_v1_history(current_metadata, snapshot)
-        {
-            return Err(TableCatalogStoreError::Invalid(
-                "new Iceberg v2 snapshots require manifest-list".to_string(),
-            ));
-        }
         let snapshot_sequence_number = snapshot
             .get("sequence-number")
             .and_then(serde_json::Value::as_i64)
             .unwrap_or(0);
+        let graph_format_version = if format_version == 2 && snapshot.get("manifests").is_some() {
+            match validation {
+                // A persisted upgrade can retain an inline v1 snapshot. Walk
+                // its full graph using v1 manifest and file constraints.
+                SnapshotGraphValidation::BackupInventory if snapshot_sequence_number == 0 => 1,
+                SnapshotGraphValidation::Commit(current_metadata)
+                    if snapshot_is_retained_v1_history(current_metadata, snapshot) =>
+                {
+                    format_version
+                }
+                _ => {
+                    return Err(TableCatalogStoreError::Invalid(
+                        "new Iceberg v2 snapshots require manifest-list".to_string(),
+                    ));
+                }
+            }
+        } else {
+            format_version
+        };
         let manifests = snapshot_graph_manifest_references(
             context,
             metadata,
             snapshot,
-            format_version,
+            graph_format_version,
             snapshot_sequence_number,
             &mut budget,
         )
@@ -2807,6 +2839,69 @@ where
                 }
             }
         }
+    }
+    Ok(budget)
+}
+
+/// Validates every retained snapshot and returns its bounded physical object inventory.
+///
+/// Manifest lists and manifests are retained even when all their entries are deleted. Only live data/delete
+/// references are included, and every such object has passed the existing existence validation. This uses the
+/// validator's existing caches without another storage traversal or Avro decode. Statistics are enumerated
+/// separately with `table_statistics_object_references`.
+pub(crate) async fn validated_table_snapshot_graph_inventory<B>(
+    context: &TableSnapshotGraphValidationContext<'_, B>,
+    metadata: &serde_json::Value,
+) -> TableCatalogStoreResult<BTreeMap<String, TableMetadataMaintenanceObjectKind>>
+where
+    B: TableCatalogObjectBackend,
+{
+    let budget = validate_table_snapshot_changes_with_budget(context, SnapshotGraphValidation::BackupInventory, metadata).await?;
+    let mut inventory = BTreeMap::new();
+    for object in budget.manifest_lists.keys() {
+        insert_validated_snapshot_graph_inventory_object(
+            &mut inventory,
+            object.clone(),
+            TableMetadataMaintenanceObjectKind::ManifestList,
+        )?;
+    }
+    for (object, manifest) in &budget.manifests {
+        insert_validated_snapshot_graph_inventory_object(
+            &mut inventory,
+            object.clone(),
+            TableMetadataMaintenanceObjectKind::ManifestFile,
+        )?;
+        for reference in manifest.references.iter() {
+            if !matches!(reference.entry_status, Some(0 | 1)) {
+                continue;
+            }
+            let object = snapshot_graph_object_key(context, &reference.location, reference.object_kind.clone())?;
+            if !budget.validated_live_objects.contains(&object) {
+                return Err(TableCatalogStoreError::Internal(
+                    "snapshot inventory contains a live object without successful existence validation".to_string(),
+                ));
+            }
+            insert_validated_snapshot_graph_inventory_object(&mut inventory, object, reference.object_kind.clone())?;
+        }
+    }
+    Ok(inventory)
+}
+
+fn insert_validated_snapshot_graph_inventory_object(
+    inventory: &mut BTreeMap<String, TableMetadataMaintenanceObjectKind>,
+    object: String,
+    kind: TableMetadataMaintenanceObjectKind,
+) -> TableCatalogStoreResult<()> {
+    match inventory.entry(object) {
+        std::collections::btree_map::Entry::Vacant(entry) => {
+            entry.insert(kind);
+        }
+        std::collections::btree_map::Entry::Occupied(entry) if *entry.get() != kind => {
+            return Err(TableCatalogStoreError::Invalid(
+                "snapshot inventory object is referenced with conflicting kinds".to_string(),
+            ));
+        }
+        std::collections::btree_map::Entry::Occupied(_) => {}
     }
     Ok(())
 }

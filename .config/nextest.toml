@@ -110,7 +110,7 @@ threads-required = "num-test-threads"
 # Reserve capacity so sibling disk-heavy tests cannot consume its 2s
 # registration budget; retain the queued backup and deadlock assertions.
 [[profile.default.overrides]]
-filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_strong_registration_completes_while_other_bucket_backup_waits)'
+filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_object_registration_completes_while_other_bucket_backup_waits)'
 threads-required = "num-test-threads"
 
 [[profile.default.overrides]]
@@ -410,7 +410,7 @@ threads-required = "num-test-threads"
 # Reserve capacity so sibling disk-heavy tests cannot consume its 2s
 # registration budget; retain the queued backup and deadlock assertions.
 [[profile.ci.overrides]]
-filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_strong_registration_completes_while_other_bucket_backup_waits)'
+filter = 'package(rustfs) & test(=admin::handlers::table_catalog::tests::cold_object_registration_completes_while_other_bucket_backup_waits)'
 threads-required = "num-test-threads"
 
 [[profile.ci.overrides]]

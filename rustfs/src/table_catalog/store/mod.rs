@@ -16,11 +16,12 @@ use super::identifier::is_valid_table_metadata_file_name;
 use super::*;
 use crate::storage_api::table::{WriteCommitGuard, WriteCompletion};
 
-mod backup;
+mod backup_types;
 mod cleanup;
 mod directory_index;
-mod migration;
+mod manifest;
 mod object;
+mod object_backup;
 mod publication_deadline;
 mod registration_cache;
 pub(crate) use publication_deadline::TablePublicationPreparation;
@@ -32,22 +33,14 @@ use publication_deadline::{
 #[cfg(test)]
 mod registration_cache_tests;
 pub(crate) use registration_cache::TableCatalogRegistrationCache;
-mod strong;
 
-pub(crate) use backup::{TableCatalogBackupReport, TableCatalogRestoreReport};
+pub(crate) use backup_types::{TableCatalogBackupObjectPreparationReport, TableCatalogBackupReport, TableCatalogRestoreReport};
 #[cfg(test)]
-pub(crate) use backup::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
-use migration::{durable_strong_table_catalog_backing_manifest, table_catalog_backing_manifest};
+pub(super) use backup_types::{TableCatalogBackupStatus, TableCatalogRestoreStatus};
+use manifest::table_catalog_backing_manifest;
 pub(crate) use object::ObjectTableCatalogStore;
 #[cfg(test)]
 pub(super) use object::{bounded_table_entry_objects_for_data_plane_scan, maintenance_subtree_skip_cursor};
-#[cfg(test)]
-pub(super) use strong::{
-    STRONG_TABLE_CATALOG_RELOAD_MAX_ATTEMPTS, STRONG_TABLE_CATALOG_SNAPSHOT_MAX_SIZE, StrongCommitSnapshotRecord,
-    StrongTableCatalogBucketSnapshot, StrongTableCatalogSnapshot, strong_snapshot_write_version,
-    table_catalog_bucket_snapshot_fingerprint,
-};
-pub(crate) use strong::{StrongTableCatalogRuntime, StrongTableCatalogStore};
 
 struct PeriodicTableMaintenanceQueueGuard<'a> {
     table_id: &'a str,
@@ -484,11 +477,6 @@ pub(crate) trait TableCommitPublication: Send + Sync {
 
     fn holds_table(&self, table_bucket: &str, namespace: &str, table: &str) -> bool;
 
-    /// Whether bucket publication acquires its own migration read permits.
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        false
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -556,6 +544,25 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
         Ok(())
     }
 
+    fn attach_maintenance_bucket_read_guard(
+        &self,
+        table_bucket: &str,
+        guard: TableCatalogLockGuard,
+    ) -> TableCatalogStoreResult<()> {
+        if guard.is_lock_lost() {
+            return Err(TableCatalogStoreError::Conflict("table maintenance bucket permit was lost".to_string()));
+        }
+        let mut state = self.state.lock();
+        if state.table_bucket.is_some() || state.table.is_some() {
+            return Err(TableCatalogStoreError::Internal(
+                "table maintenance bucket permit must be attached before table publication".to_string(),
+            ));
+        }
+        state.table_bucket = Some(table_bucket.to_string());
+        state.guards.push(guard);
+        Ok(())
+    }
+
     fn attach_catalog_write_guard(&self, guard: TableCatalogLockGuard) -> TableCatalogStoreResult<()> {
         if guard.is_lock_lost() {
             return Err(TableCatalogStoreError::Conflict("table catalog write lock was lost".to_string()));
@@ -568,15 +575,6 @@ impl<'a, B> TableCommitLockPublication<'a, B> {
         }
         state.guards.push(guard);
         Ok(())
-    }
-
-    fn release_publication_locks(&self) {
-        // Read-only planning may proceed without excluding unrelated tables' commits.
-        // The migration permit remains attached until the whole operation completes.
-        let mut state = self.state.lock();
-        state.table = None;
-        state.table_bucket = None;
-        state.guards.clear();
     }
 }
 
@@ -848,8 +846,8 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         None
     }
 
-    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
-        None
+    fn acquires_catalog_migration_read_permit(&self) -> bool {
+        false
     }
 
     async fn acquire_catalog_migration_read_guards(
@@ -1128,11 +1126,6 @@ pub(crate) trait TableCatalogObjectBackend: Clone + Send + Sync + 'static {
         false
     }
 
-    /// Whether bucket publication acquires its own migration read permits.
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        false
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         None
     }
@@ -1263,10 +1256,6 @@ where
         self.table_commit_publication_is_held(table_bucket, namespace, table)
     }
 
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        TableCatalogObjectBackend::acquires_catalog_migration_read_permit(self)
-    }
-
     fn catalog_migration_read_permit_status(&self) -> Option<bool> {
         TableCatalogObjectBackend::catalog_migration_read_permit_status(self)
     }
@@ -1294,10 +1283,6 @@ impl Default for TableCatalogObjectPaths {
 }
 
 impl TableCatalogObjectPaths {
-    pub fn table_bucket_entries_prefix(&self) -> String {
-        format!("{}/{}/", self.catalog_root, TABLE_BUCKET_ROOT)
-    }
-
     pub fn table_bucket_entry_path(&self, table_bucket: &str) -> String {
         format!("{}{}", self.table_bucket_root_prefix(table_bucket), TABLE_BUCKET_ENTRY_FILE)
     }
@@ -1507,38 +1492,6 @@ impl TableCatalogObjectPaths {
         )
     }
 
-    pub fn backing_migration_fence_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}{}/{}",
-            self.table_bucket_root_prefix(table_bucket),
-            TABLE_CATALOG_MIGRATION_ROOT,
-            TABLE_CATALOG_MIGRATION_FENCE_FILE
-        )
-    }
-
-    pub fn backing_migration_fence_lock_path(&self, table_bucket: &str) -> String {
-        format!(
-            "{}{}/{}",
-            self.table_bucket_root_prefix(table_bucket),
-            TABLE_CATALOG_MIGRATION_ROOT,
-            TABLE_CATALOG_MIGRATION_FENCE_LOCK
-        )
-    }
-
-    pub fn backing_migration_global_fence_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_FILE
-        )
-    }
-
-    pub fn backing_migration_global_fence_lock_path(&self) -> String {
-        format!(
-            "{}/{}/{}",
-            self.catalog_root, TABLE_CATALOG_MIGRATION_ROOT, TABLE_CATALOG_MIGRATION_GLOBAL_FENCE_LOCK
-        )
-    }
-
     pub fn catalog_backup_path(&self, table_bucket: &str, backup_id: &str) -> String {
         format!(
             "{}/{}/{}/{}.json",
@@ -1549,14 +1502,75 @@ impl TableCatalogObjectPaths {
         )
     }
 
-    pub fn catalog_backup_restore_intent_path(&self, table_bucket: &str) -> String {
+    pub fn catalog_backup_fence_lock_path(&self, table_bucket: &str) -> String {
+        // Coordinate with directory activation, rollback, and writers from before the backing retirement.
+        self.backing_migration_fence_lock_path(table_bucket)
+    }
+
+    pub fn catalog_restore_state_path(&self, table_bucket: &str) -> String {
         format!(
-            "{}/{}/{}/{}",
+            "{}/{}/{}/restore-state.json",
             self.catalog_root,
-            TABLE_CATALOG_BACKUP_RESTORE_ROOT,
-            table_catalog_path_hash(table_bucket),
-            TABLE_CATALOG_BACKUP_RESTORE_INTENT_FILE
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket)
         )
+    }
+
+    pub fn catalog_restore_intent_path(&self, table_bucket: &str, restore_id: &str) -> String {
+        format!(
+            "{}/{}/{}/restores/{}.json",
+            self.catalog_root,
+            TABLE_CATALOG_BACKUP_ROOT,
+            table_catalog_path_hash(table_bucket),
+            table_catalog_path_hash(restore_id)
+        )
+    }
+
+    pub fn legacy_backing_migration_fence_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.table_bucket_root_prefix(table_bucket),
+            "backing-migration",
+            "durable-strong-fence.json"
+        )
+    }
+
+    /// Object used by the optional table-entry directory (and formerly by backing
+    /// migration). Kept under the historical backing-migration prefix so directory
+    /// state stays compatible with main.
+    pub fn backing_migration_fence_path(&self, table_bucket: &str) -> String {
+        self.legacy_backing_migration_fence_path(table_bucket)
+    }
+
+    pub fn backing_migration_fence_lock_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}{}/{}",
+            self.table_bucket_root_prefix(table_bucket),
+            "backing-migration",
+            "durable-strong-fence.lock"
+        )
+    }
+
+    pub fn legacy_backing_migration_global_fence_path(&self) -> String {
+        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.json")
+    }
+
+    pub fn legacy_catalog_restore_intent_path(&self, table_bucket: &str) -> String {
+        format!(
+            "{}/{}/{}/intent.json",
+            self.catalog_root,
+            "restore-intents",
+            table_catalog_path_hash(table_bucket)
+        )
+    }
+
+    pub fn legacy_catalog_snapshot_path(&self) -> String {
+        format!("{}/{}/{}", self.catalog_root, "strong-backing", "snapshot.json")
+    }
+
+    pub fn catalog_backup_global_fence_lock_path(&self) -> String {
+        // Older object-backed registry writers use this lock during a rolling upgrade.
+        format!("{}/{}/{}", self.catalog_root, "backing-migration", "durable-strong-global-fence.lock")
     }
 
     fn table_bucket_root_prefix(&self, table_bucket: &str) -> String {
@@ -1570,7 +1584,6 @@ where
     B: TableCatalogObjectBackend,
 {
     ObjectBacked(ObjectTableCatalogStore<B>),
-    DurableStrong(StrongTableCatalogStore<B>),
 }
 
 impl<B> ConfiguredTableCatalogStore<B>
@@ -1580,9 +1593,6 @@ where
     pub(crate) fn from_env(backend: B) -> TableCatalogStoreResult<Self> {
         Ok(match TableCatalogBackingMode::from_env()? {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
-            TableCatalogBackingMode::DurableStrong => {
-                Self::DurableStrong(StrongTableCatalogStore::new_requiring_snapshot(backend))
-            }
         })
     }
 
@@ -1590,25 +1600,21 @@ where
     pub(crate) fn new_for_test(backend: B, mode: TableCatalogBackingMode) -> Self {
         match mode {
             TableCatalogBackingMode::ObjectBacked => Self::ObjectBacked(ObjectTableCatalogStore::new(backend)),
-            TableCatalogBackingMode::DurableStrong => Self::DurableStrong(StrongTableCatalogStore::new(backend)),
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "exercised by table_catalog/tests.rs; the lib target cannot see test-only consumers (backlog#1823)"
-    )]
-    pub(crate) fn backing_mode(&self) -> TableCatalogBackingMode {
+    pub(crate) async fn resolve_table_data_plane_resource_for_authorization(
+        &self,
+        table_bucket: &str,
+        object: &str,
+    ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self {
-            Self::ObjectBacked(_) => TableCatalogBackingMode::ObjectBacked,
-            Self::DurableStrong(_) => TableCatalogBackingMode::DurableStrong,
+            Self::ObjectBacked(store) => {
+                store
+                    .resolve_table_data_plane_resource_for_authorization(table_bucket, object)
+                    .await
+            }
         }
-    }
-
-    fn unsupported_for_durable_strong(operation: &str) -> TableCatalogStoreError {
-        TableCatalogStoreError::Invalid(format!(
-            "{operation} is not supported with {TABLE_CATALOG_BACKING_DURABLE_STRONG} table catalog backing"
-        ))
     }
 
     pub(crate) async fn get_table_catalog_diagnostics_retention(
@@ -1622,9 +1628,6 @@ where
                 .get_table_maintenance_config(table_bucket, namespace, table)
                 .await?
                 .retain_recent_metadata_files),
-            // Durable-strong maintenance configuration is not persisted yet. Zero adds no
-            // count-based retention; reachability still protects references, and this API never deletes.
-            Self::DurableStrong(_) => Ok(0),
         }
     }
 }
@@ -1637,49 +1640,42 @@ where
     async fn get_table_bucket(&self, table_bucket: &str) -> TableCatalogStoreResult<Option<TableBucketEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_table_bucket(table_bucket).await,
-            Self::DurableStrong(store) => store.get_table_bucket(table_bucket).await,
         }
     }
 
     async fn put_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.put_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.put_table_bucket(entry).await,
         }
     }
 
     async fn ensure_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.ensure_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.ensure_table_bucket(entry).await,
         }
     }
 
     async fn disable_empty_table_bucket(&self, entry: TableBucketEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.disable_empty_table_bucket(entry).await,
-            Self::DurableStrong(store) => store.disable_empty_table_bucket(entry).await,
         }
     }
 
     async fn create_namespace(&self, entry: NamespaceEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_namespace(entry).await,
-            Self::DurableStrong(store) => store.create_namespace(entry).await,
         }
     }
 
     async fn list_namespaces(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces(table_bucket).await,
-            Self::DurableStrong(store) => store.list_namespaces(table_bucket).await,
         }
     }
 
     async fn list_namespaces_under(&self, table_bucket: &str, parent: &str) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces_under(table_bucket, parent).await,
-            Self::DurableStrong(store) => store.list_namespaces_under(table_bucket, parent).await,
         }
     }
 
@@ -1690,7 +1686,6 @@ where
     ) -> TableCatalogStoreResult<Vec<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespace_children(table_bucket, parent).await,
-            Self::DurableStrong(store) => store.list_namespace_children(table_bucket, parent).await,
         }
     }
 
@@ -1703,7 +1698,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_namespace_children_page(table_bucket, parent, cursor, limit).await,
         }
     }
 
@@ -1715,14 +1709,12 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_namespaces_page(table_bucket, cursor, limit).await,
         }
     }
 
     async fn get_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Option<NamespaceEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_namespace(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.get_namespace(table_bucket, namespace).await,
         }
     }
 
@@ -1734,28 +1726,24 @@ where
     ) -> TableCatalogStoreResult<NamespacePropertiesUpdateResult> {
         match self {
             Self::ObjectBacked(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
-            Self::DurableStrong(store) => store.update_namespace_properties(table_bucket, namespace, update).await,
         }
     }
 
     async fn drop_namespace(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_namespace(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.drop_namespace(table_bucket, namespace).await,
         }
     }
 
     async fn create_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_table(entry).await,
-            Self::DurableStrong(store) => store.create_table(entry).await,
         }
     }
 
     async fn register_table(&self, entry: TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.register_table(entry).await,
-            Self::DurableStrong(store) => store.register_table(entry).await,
         }
     }
 
@@ -1766,28 +1754,24 @@ where
     ) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.register_table_with_publication(entry, publication).await,
-            Self::DurableStrong(store) => store.register_table_with_publication(entry, publication).await,
         }
     }
 
     async fn list_tables(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.list_tables(table_bucket, namespace).await,
         }
     }
 
     async fn list_all_tables(&self, table_bucket: &str) -> TableCatalogStoreResult<Vec<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_all_tables(table_bucket).await,
-            Self::DurableStrong(store) => store.list_all_tables(table_bucket).await,
         }
     }
 
     async fn ensure_table_warehouse_location_available(&self, candidate: &TableEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.ensure_table_warehouse_location_available(candidate).await,
-            Self::DurableStrong(store) => store.ensure_table_warehouse_location_available(candidate).await,
         }
     }
 
@@ -1800,14 +1784,12 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_tables_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
     async fn load_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<Option<TableEntry>> {
         match self {
             Self::ObjectBacked(store) => store.load_table(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.load_table(table_bucket, namespace, table).await,
         }
     }
 
@@ -1825,11 +1807,6 @@ where
                     .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .rename_table(table_bucket, source_namespace, source_table, destination_namespace, destination_table)
-                    .await
-            }
         }
     }
 
@@ -1840,7 +1817,6 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self {
             Self::ObjectBacked(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
-            Self::DurableStrong(store) => store.resolve_table_data_plane_resource(table_bucket, object).await,
         }
     }
 
@@ -1851,14 +1827,12 @@ where
     ) -> TableCatalogStoreResult<Option<TableDataPlaneResource>> {
         match self {
             Self::ObjectBacked(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
-            Self::DurableStrong(store) => store.resolve_table_metadata_data_plane_resource(table_bucket, object).await,
         }
     }
 
     async fn commit_table(&self, request: TableCommitRequest) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.commit_table(request).await,
-            Self::DurableStrong(store) => store.commit_table(request).await,
         }
     }
 
@@ -1869,21 +1843,18 @@ where
     ) -> TableCatalogStoreResult<TableCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.commit_table_with_publication(request, publication).await,
-            Self::DurableStrong(store) => store.commit_table_with_publication(request, publication).await,
         }
     }
 
     async fn drop_table(&self, table_bucket: &str, namespace: &str, table: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_table(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.drop_table(table_bucket, namespace, table).await,
         }
     }
 
     async fn create_view(&self, entry: ViewEntry) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_view(entry).await,
-            Self::DurableStrong(store) => store.create_view(entry).await,
         }
     }
 
@@ -1894,14 +1865,12 @@ where
     ) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.create_view_with_publication(entry, publication).await,
-            Self::DurableStrong(store) => store.create_view_with_publication(entry, publication).await,
         }
     }
 
     async fn list_views(&self, table_bucket: &str, namespace: &str) -> TableCatalogStoreResult<Vec<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_views(table_bucket, namespace).await,
-            Self::DurableStrong(store) => store.list_views(table_bucket, namespace).await,
         }
     }
 
@@ -1914,21 +1883,18 @@ where
     ) -> TableCatalogStoreResult<TableCatalogListPage<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
-            Self::DurableStrong(store) => store.list_views_page(table_bucket, namespace, cursor, limit).await,
         }
     }
 
     async fn load_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<Option<ViewEntry>> {
         match self {
             Self::ObjectBacked(store) => store.load_view(table_bucket, namespace, view).await,
-            Self::DurableStrong(store) => store.load_view(table_bucket, namespace, view).await,
         }
     }
 
     async fn replace_view(&self, request: ViewCommitRequest) -> TableCatalogStoreResult<ViewCommitResult> {
         match self {
             Self::ObjectBacked(store) => store.replace_view(request).await,
-            Self::DurableStrong(store) => store.replace_view(request).await,
         }
     }
 
@@ -1944,18 +1910,12 @@ where
                     .replace_view_with_publication(request, table_bucket_fence_required, publication)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .replace_view_with_publication(request, table_bucket_fence_required, publication)
-                    .await
-            }
         }
     }
 
     async fn drop_view(&self, table_bucket: &str, namespace: &str, view: &str) -> TableCatalogStoreResult<()> {
         match self {
             Self::ObjectBacked(store) => store.drop_view(table_bucket, namespace, view).await,
-            Self::DurableStrong(store) => store.drop_view(table_bucket, namespace, view).await,
         }
     }
 
@@ -1967,7 +1927,6 @@ where
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
-            Self::DurableStrong(store) => store.get_commit_by_id(table_bucket, table_id, commit_id).await,
         }
     }
 
@@ -1979,11 +1938,6 @@ where
     ) -> TableCatalogStoreResult<Option<CommitLogEntry>> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .get_commit_by_idempotency_key(table_bucket, table_id, idempotency_key)
                     .await
@@ -2004,7 +1958,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
         match self {
             Self::ObjectBacked(store) => store.get_table_maintenance_config(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.get_table_maintenance_config(table_bucket, namespace, table).await,
         }
     }
 
@@ -2017,11 +1970,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceConfig> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .put_table_maintenance_config(table_bucket, namespace, table, config)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .put_table_maintenance_config(table_bucket, namespace, table, config)
                     .await
@@ -2042,11 +1990,6 @@ where
                     .get_table_metadata_maintenance_report(table_bucket, namespace, table, job_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .get_table_metadata_maintenance_report(table_bucket, namespace, table, job_id)
-                    .await
-            }
         }
     }
 
@@ -2058,11 +2001,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerReport> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .get_table_maintenance_scheduler_report(table_bucket, namespace, table)
                     .await
@@ -2079,11 +2017,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceSchedulerRunResult> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .run_table_maintenance_scheduler_once(table_bucket, namespace, table, scheduler_id)
                     .await
@@ -2114,17 +2047,6 @@ where
                     )
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .run_table_maintenance_scheduler_once_with_guard(
-                        &entry.table_bucket,
-                        &entry.namespace,
-                        &entry.table,
-                        scheduler_id,
-                        Some(&guard),
-                    )
-                    .await
-            }
         }
     }
 
@@ -2138,11 +2060,6 @@ where
     ) -> TableCatalogStoreResult<TableMaintenanceQuarantineOperationResult> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .apply_table_maintenance_quarantine_operation(table_bucket, namespace, table, job_id, request)
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .apply_table_maintenance_quarantine_operation(table_bucket, namespace, table, job_id, request)
                     .await
@@ -2163,11 +2080,6 @@ where
                     .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .run_table_metadata_maintenance_worker_once(table_bucket, namespace, table, worker_id)
-                    .await
-            }
         }
     }
 
@@ -2181,17 +2093,6 @@ where
     ) -> TableCatalogStoreResult<TableMetadataMaintenanceReport> {
         match self {
             Self::ObjectBacked(store) => {
-                store
-                    .run_table_metadata_maintenance_worker_once_conditionally(
-                        table_bucket,
-                        namespace,
-                        table,
-                        worker_id,
-                        condition,
-                    )
-                    .await
-            }
-            Self::DurableStrong(store) => {
                 store
                     .run_table_metadata_maintenance_worker_once_conditionally(
                         table_bucket,
@@ -2220,11 +2121,6 @@ where
                     .heartbeat_table_metadata_maintenance_job(table_bucket, namespace, table, job_id, lease_id, worker_id)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .heartbeat_table_metadata_maintenance_job(table_bucket, namespace, table, job_id, lease_id, worker_id)
-                    .await
-            }
         }
     }
 
@@ -2236,7 +2132,6 @@ where
     ) -> TableCatalogStoreResult<TableCatalogExport> {
         match self {
             Self::ObjectBacked(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.export_table_catalog_entry(table_bucket, namespace, table).await,
         }
     }
 
@@ -2253,11 +2148,6 @@ where
                     .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
                     .await
             }
-            Self::DurableStrong(store) => {
-                store
-                    .diagnose_table_catalog(table_bucket, namespace, table, retain_recent_metadata_files)
-                    .await
-            }
         }
     }
 
@@ -2269,7 +2159,6 @@ where
     ) -> TableCatalogStoreResult<TableCommitRecoveryReport> {
         match self {
             Self::ObjectBacked(store) => store.recover_table_commits(table_bucket, namespace, table).await,
-            Self::DurableStrong(store) => store.plan_table_commit_recovery(table_bucket, namespace, table).await,
         }
     }
 
@@ -2285,7 +2174,6 @@ where
     ) -> TableCatalogStoreResult<Option<ExternalCatalogBridgeEntry>> {
         match self {
             Self::ObjectBacked(store) => store.get_external_catalog_bridge(table_bucket, namespace, table).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
         }
     }
 
@@ -2299,41 +2187,69 @@ where
     ) -> TableCatalogStoreResult<ExternalCatalogBridgeEntry> {
         match self {
             Self::ObjectBacked(store) => store.put_external_catalog_bridge(entry).await,
-            Self::DurableStrong(_) => Err(Self::unsupported_for_durable_strong("external catalog bridge")),
         }
     }
 
-    pub(crate) async fn create_durable_catalog_backup(
+    pub(crate) async fn create_catalog_backup(
         &self,
         table_bucket: &str,
         expected_snapshot_etag: Option<&str>,
     ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "durable catalog backup requires durable-strong backing".to_string(),
-            )),
-            Self::DurableStrong(store) => {
+            Self::ObjectBacked(store) => store.create_object_catalog_backup(table_bucket, expected_snapshot_etag).await,
+        }
+    }
+
+    pub(crate) async fn export_catalog_backup(&self, table_bucket: &str, backup_id: &str) -> TableCatalogStoreResult<Vec<u8>> {
+        match self {
+            Self::ObjectBacked(store) => store.export_object_catalog_backup(table_bucket, backup_id).await,
+        }
+    }
+
+    pub(crate) async fn import_catalog_backup(
+        &self,
+        table_bucket: &str,
+        data: Vec<u8>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupReport> {
+        match self {
+            Self::ObjectBacked(store) => store.import_object_catalog_backup(table_bucket, data).await,
+        }
+    }
+
+    pub(crate) async fn prepare_catalog_backup_object(
+        &self,
+        table_bucket: &str,
+        backup_id: &str,
+        object: &str,
+        data: Vec<u8>,
+    ) -> TableCatalogStoreResult<TableCatalogBackupObjectPreparationReport> {
+        match self {
+            Self::ObjectBacked(store) => {
                 store
-                    .create_durable_catalog_backup(table_bucket, expected_snapshot_etag)
+                    .prepare_object_catalog_backup_object(table_bucket, backup_id, object, data)
                     .await
             }
         }
     }
 
-    pub(crate) async fn restore_durable_catalog_backup(
+    pub(crate) async fn restore_catalog_backup_with_id(
         &self,
         table_bucket: &str,
         backup_id: &str,
         expected_snapshot_etag: Option<&str>,
         allow_replace: bool,
+        restore_id: Option<&str>,
     ) -> TableCatalogStoreResult<TableCatalogRestoreReport> {
         match self {
-            Self::ObjectBacked(_) => Err(TableCatalogStoreError::Unsupported(
-                "durable catalog restore requires durable-strong backing".to_string(),
-            )),
-            Self::DurableStrong(store) => {
+            Self::ObjectBacked(store) => {
                 store
-                    .restore_durable_catalog_backup(table_bucket, backup_id, expected_snapshot_etag, allow_replace)
+                    .restore_object_catalog_backup_with_id(
+                        table_bucket,
+                        backup_id,
+                        expected_snapshot_etag,
+                        allow_replace,
+                        restore_id,
+                    )
                     .await
             }
         }
@@ -2342,7 +2258,6 @@ where
 
 pub(crate) struct EcStoreTableCatalogObjectBackend<S> {
     store: Arc<S>,
-    strong_runtime: StrongTableCatalogRuntime,
     registration_cache: TableCatalogRegistrationCache,
 }
 
@@ -2350,7 +2265,6 @@ impl<S> Clone for EcStoreTableCatalogObjectBackend<S> {
     fn clone(&self) -> Self {
         Self {
             store: self.store.clone(),
-            strong_runtime: self.strong_runtime.clone(),
             registration_cache: self.registration_cache.clone(),
         }
     }
@@ -2360,18 +2274,13 @@ impl<S> EcStoreTableCatalogObjectBackend<S>
 where
     S: TableCatalogStorage,
 {
-    pub fn new_with_strong_runtime(store: Arc<S>, strong_runtime: StrongTableCatalogRuntime) -> Self {
-        Self::new_with_runtimes(store, strong_runtime, TableCatalogRegistrationCache::default())
+    pub fn new(store: Arc<S>) -> Self {
+        Self::new_with_registration_cache(store, TableCatalogRegistrationCache::default())
     }
 
-    pub fn new_with_runtimes(
-        store: Arc<S>,
-        strong_runtime: StrongTableCatalogRuntime,
-        registration_cache: TableCatalogRegistrationCache,
-    ) -> Self {
+    pub fn new_with_registration_cache(store: Arc<S>, registration_cache: TableCatalogRegistrationCache) -> Self {
         Self {
             store,
-            strong_runtime,
             registration_cache,
         }
     }
@@ -2387,15 +2296,6 @@ where
     fn registration_cache(&self) -> Option<TableCatalogRegistrationCache> {
         Some(self.registration_cache.clone())
     }
-
-    fn strong_catalog_runtime(&self) -> Option<StrongTableCatalogRuntime> {
-        Some(self.strong_runtime.clone())
-    }
-
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        true
-    }
-
     async fn acquire_catalog_migration_read_guards(
         &self,
         table_bucket: &str,
@@ -2404,10 +2304,10 @@ where
         // migration read permits ahead of its publication lock, matching store mutations.
         let paths = TableCatalogObjectPaths::default();
         let global = self
-            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_global_fence_lock_path())
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_global_fence_lock_path())
             .await?;
         let bucket = self
-            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.backing_migration_fence_lock_path(table_bucket))
+            .acquire_read_lock(RUSTFS_META_BUCKET, &paths.catalog_backup_fence_lock_path(table_bucket))
             .await?;
         Ok(vec![global, bucket])
     }
@@ -2949,785 +2849,5 @@ where
             fence.ensure_held()?;
         }
         result
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::storage_api::protocols::client::{BucketOperations as _, MakeBucketOptions};
-    use crate::table_catalog::test_support::{RecordingLeaseClient, TestCatalogObjectBackend};
-    use crate::table_catalog::tests::{test_bucket_entry, test_namespace_entry, test_table_entry};
-    use rustfs_lock::LockClient;
-    use std::sync::{Arc, Mutex};
-    use std::time::Duration;
-
-    #[tokio::test]
-    async fn table_maintenance_publication_reuses_attached_migration_read_permit() {
-        let backend = TestCatalogObjectBackend::default();
-        let store = StrongTableCatalogStore::new(backend.clone());
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        store.put_table_bucket(test_bucket_entry(bucket)).await.unwrap();
-        store
-            .create_namespace(test_namespace_entry(bucket, &namespace))
-            .await
-            .unwrap();
-        let migration_path = TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path();
-        let guard = backend.acquire_read_lock(RUSTFS_META_BUCKET, &migration_path).await.unwrap();
-        let publication = TableCommitLockPublication::new(&backend);
-        publication.attach_catalog_migration_read_guard(guard).unwrap();
-        assert_eq!(publication.catalog_migration_read_permit_status(), Some(true));
-        assert!(
-            publication
-                .attach_catalog_migration_read_guard(TableCatalogLockGuard::stable(()))
-                .is_err()
-        );
-        let reads = backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_path).await;
-        let entry = test_table_entry(
-            bucket,
-            &namespace,
-            &table,
-            default_table_metadata_file_path(&namespace, &table, "00001.metadata.json"),
-        );
-        store.register_table_with_publication(entry, &publication).await.unwrap();
-        assert_eq!(backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &migration_path).await, reads);
-        assert_eq!(publication.catalog_migration_read_permit_status(), None);
-        tokio::time::timeout(Duration::from_secs(5), backend.acquire_write_lock(RUSTFS_META_BUCKET, &migration_path))
-            .await
-            .expect("completion releases the attached migration read permit")
-            .unwrap();
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn table_maintenance_migration_lease_loss_blocks_sidecars_and_cleanup() {
-        let backend = TestCatalogObjectBackend::default();
-        let bucket = "analytics";
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-        let orphan = default_table_metadata_file_path(&namespace, &table, "00000.metadata.json");
-        let entry = test_table_entry(bucket, &namespace, &table, current.clone());
-        backend
-            .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
-            .await;
-        backend.seed_object(bucket, &orphan, b"{}".to_vec()).await;
-        let sidecar = ObjectTableCatalogStore::new(backend.clone());
-        let config = TableMaintenanceConfig {
-            version: TABLE_MAINTENANCE_CONFIG_VERSION,
-            background_enabled: true,
-            delete_enabled: true,
-            retain_recent_metadata_files: 0,
-            ..Default::default()
-        };
-        sidecar
-            .put_table_maintenance_config_for_entry(&entry, config.clone())
-            .await
-            .unwrap();
-        let report = sidecar.plan_table_metadata_maintenance_for_entry(&entry, 0).await.unwrap();
-        assert_eq!(report.deletable_metadata_locations, vec![orphan.clone()]);
-        let client = Arc::new(RecordingLeaseClient {
-            inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
-                rustfs_lock::FastObjectLockManager::new(),
-            )))),
-            acquired: Mutex::new(None),
-        });
-        let lock = rustfs_lock::NamespaceLock::with_clients_and_quorum(
-            "maintenance-probe".to_string(),
-            vec![client.clone() as Arc<dyn LockClient>],
-            1,
-        );
-        let resource = rustfs_lock::ObjectKey::new(
-            RUSTFS_META_BUCKET,
-            TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path(),
-        );
-        // Observe real lease loss before the separate publication preparation
-        // deadline. Keep the lease TTL unchanged; only speed up this probe.
-        let request =
-            rustfs_lock::LockRequest::new(resource.clone(), rustfs_lock::LockType::Shared, "maintenance-migration-probe")
-                .with_acquire_timeout(Duration::from_secs(5))
-                .with_ttl(Duration::from_secs(30))
-                .with_refresh_interval(Duration::from_millis(20));
-        let guard = TableCatalogLockGuard::namespace(lock.acquire_guard(&request).await.unwrap().unwrap());
-        let id = client
-            .acquired
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("actual publication migration lease acquired");
-        // Completion clears the publication's guards. Keep another real lease
-        // to test rejection of an already-lost guard after that cleanup.
-        let attach_request = rustfs_lock::LockRequest::new(resource, rustfs_lock::LockType::Shared, "maintenance-attach-probe")
-            .with_acquire_timeout(Duration::from_secs(5))
-            .with_ttl(Duration::from_secs(30))
-            .with_refresh_interval(Duration::from_millis(20));
-        let lost = TableCatalogLockGuard::namespace(lock.acquire_guard(&attach_request).await.unwrap().unwrap());
-        let attach_id = client
-            .acquired
-            .lock()
-            .unwrap()
-            .clone()
-            .expect("actual attachment migration lease acquired");
-        assert_ne!(id, attach_id, "the attachment probe must use its own lease");
-        let publication = TableCommitLockPublication::new(&backend);
-        publication.attach_catalog_migration_read_guard(guard).unwrap();
-        publication.begin_table_bucket(bucket).await.unwrap();
-        publication.prepare(bucket, "sales", "orders").await.unwrap();
-        assert!(publication.holds_table(bucket, "sales", "orders"));
-        assert!(client.force_release(&id).await.unwrap());
-        assert!(client.force_release(&attach_id).await.unwrap());
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while publication.catalog_migration_read_permit_status() != Some(false) || !lost.is_lock_lost() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("heartbeat observes the released migration lease");
-        assert!(!publication.holds_table_bucket(bucket));
-        assert!(!publication.holds_table(bucket, "sales", "orders"));
-        assert!(matches!(
-            publication.begin_table_bucket(bucket).await,
-            Err(TableCatalogStoreError::Conflict(message)) if message.contains("migration read permit was lost")
-        ));
-        let mut changed_config = config.clone();
-        changed_config.worker_paused = true;
-        assert!(
-            sidecar
-                .put_table_maintenance_config_for_entry_with_publication(&entry, changed_config, Some(&publication))
-                .await
-                .is_err()
-        );
-        assert_eq!(sidecar.get_table_maintenance_config_for_entry(&entry).await.unwrap(), config);
-        let effective = TableMaintenanceEffectiveConfig {
-            config,
-            source: TableMaintenanceConfigSource::TableOverride,
-        };
-        assert!(
-            sidecar
-                .finish_table_metadata_maintenance_run_for_entry_with_publication(&entry, true, &effective, report, &publication)
-                .await
-                .is_err()
-        );
-        assert!(backend.object_exists(bucket, &current).await.unwrap());
-        assert!(backend.object_exists(bucket, &orphan).await.unwrap());
-        let paths = TableCatalogObjectPaths::default();
-        assert!(
-            !backend
-                .object_exists(
-                    RUSTFS_META_BUCKET,
-                    &paths.table_maintenance_current_job_path(bucket, &namespace, &table, &entry.table_id)
-                )
-                .await
-                .unwrap()
-        );
-        let store = StrongTableCatalogStore::new(backend.clone());
-        assert!(matches!(
-            store.register_table_with_publication(entry, &publication).await,
-            Err(TableCatalogStoreError::Conflict(message)) if message.contains("migration read permit was lost")
-        ));
-        let lost = publication.state.lock().migration_read_guard.take().unwrap();
-        let rejected = TableCommitLockPublication::new(&backend);
-        assert!(matches!(
-            rejected.attach_catalog_migration_read_guard(lost),
-            Err(TableCatalogStoreError::Conflict(message)) if message.contains("migration read permit was lost")
-        ));
-        assert_eq!(rejected.catalog_migration_read_permit_status(), None);
-    }
-
-    struct MaintenanceMutationFixture {
-        backend: TestCatalogObjectBackend,
-        sidecar: ObjectTableCatalogStore<TestCatalogObjectBackend>,
-        entry: TableEntry,
-        config: TableMaintenanceConfig,
-        report: TableMetadataMaintenanceReport,
-        orphan: String,
-    }
-
-    async fn maintenance_mutation_fixture(data_orphan: bool) -> MaintenanceMutationFixture {
-        let backend = TestCatalogObjectBackend::default();
-        let namespace = Namespace::parse("sales").unwrap();
-        let table = IdentifierSegment::parse("orders").unwrap();
-        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-        let orphan = if data_orphan {
-            format!("{}/orphan.parquet", default_table_data_dir_path(&namespace, &table))
-        } else {
-            default_table_metadata_file_path(&namespace, &table, "00000.metadata.json")
-        };
-        let entry = test_table_entry("analytics", &namespace, &table, current.clone());
-        backend
-            .seed_object("analytics", &current, br#"{"metadata-log":[]}"#.to_vec())
-            .await;
-        backend.seed_object("analytics", &orphan, b"{}".to_vec()).await;
-        let sidecar = ObjectTableCatalogStore::new(backend.clone());
-        let config = TableMaintenanceConfig {
-            version: TABLE_MAINTENANCE_CONFIG_VERSION,
-            background_enabled: true,
-            delete_enabled: true,
-            retain_recent_metadata_files: 0,
-            ..Default::default()
-        };
-        sidecar
-            .put_table_maintenance_config_for_entry(&entry, config.clone())
-            .await
-            .unwrap();
-        let report = sidecar.plan_table_metadata_maintenance_for_entry(&entry, 0).await.unwrap();
-        assert!(if data_orphan {
-            report.deletable_object_locations.contains(&orphan)
-        } else {
-            report.deletable_metadata_locations.contains(&orphan)
-        });
-        MaintenanceMutationFixture {
-            backend,
-            sidecar,
-            entry,
-            config,
-            report,
-            orphan,
-        }
-    }
-
-    async fn maintenance_loss_publication<'a>(
-        backend: &'a TestCatalogObjectBackend,
-        entry: &TableEntry,
-    ) -> (TableCommitLockPublication<'a, TestCatalogObjectBackend>, Arc<RecordingLeaseClient>) {
-        let client = Arc::new(RecordingLeaseClient {
-            inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
-                rustfs_lock::FastObjectLockManager::new(),
-            )))),
-            acquired: Mutex::new(None),
-        });
-        let lock = rustfs_lock::NamespaceLockWrapper::new(
-            rustfs_lock::NamespaceLock::with_clients_and_quorum(
-                "maintenance-await-probe".to_string(),
-                vec![client.clone() as Arc<dyn LockClient>],
-                1,
-            ),
-            rustfs_lock::ObjectKey::new(
-                RUSTFS_META_BUCKET,
-                TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path(),
-            ),
-            "maintenance-await-migration".to_string(),
-        );
-        let publication = TableCommitLockPublication::new(backend);
-        publication
-            .attach_catalog_migration_read_guard(TableCatalogLockGuard::namespace(
-                lock.get_read_lock(Duration::from_secs(5)).await.unwrap(),
-            ))
-            .unwrap();
-        publication.begin_table_bucket(&entry.table_bucket).await.unwrap();
-        publication
-            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
-            .await
-            .unwrap();
-        (publication, client)
-    }
-
-    async fn lose_maintenance_lease(
-        client: &RecordingLeaseClient,
-        publication: &TableCommitLockPublication<'_, TestCatalogObjectBackend>,
-    ) {
-        let id = client.acquired.lock().unwrap().clone().unwrap();
-        assert!(client.force_release(&id).await.unwrap());
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while publication.catalog_migration_read_permit_status() != Some(false) {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("heartbeat observes loss while backend mutation is suspended");
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn table_maintenance_await_loss_prevents_each_sidecar_storage_commit() {
-        for target in 0..4 {
-            let fixture = maintenance_mutation_fixture(false).await;
-            let MaintenanceMutationFixture {
-                backend,
-                sidecar,
-                entry,
-                config,
-                mut report,
-                ..
-            } = fixture;
-            sidecar
-                .put_table_metadata_maintenance_report_for_entry(&report, &entry)
-                .await
-                .unwrap();
-            let namespace = Namespace::parse(&entry.namespace).unwrap();
-            let table = IdentifierSegment::parse(&entry.table).unwrap();
-            let paths = TableCatalogObjectPaths::default();
-            let sidecars = [
-                paths.table_maintenance_config_path(&entry.table_bucket, &namespace, &table, &entry.table_id),
-                paths.table_maintenance_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id, &report.job.job_id),
-                paths.table_maintenance_latest_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id),
-                paths.table_maintenance_current_job_path(&entry.table_bucket, &namespace, &table, &entry.table_id),
-            ];
-            let before = backend.read_object(RUSTFS_META_BUCKET, &sidecars[target]).await.unwrap();
-            let later_before = if target < 3 {
-                backend.read_object(RUSTFS_META_BUCKET, &sidecars[3]).await.unwrap()
-            } else {
-                None
-            };
-            let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
-            let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &sidecars[target]).await;
-            let mut changed_config = config;
-            changed_config.worker_paused = true;
-            report.job.status = TableMetadataMaintenanceJobStatus::Running;
-            report.job.worker_id = Some("new-worker".to_string());
-            let operation = async {
-                if target == 0 {
-                    sidecar
-                        .put_table_maintenance_config_for_entry_with_publication(&entry, changed_config, Some(&publication))
-                        .await
-                        .map(|_| ())
-                } else {
-                    sidecar
-                        .put_table_metadata_maintenance_report_for_entry_with_publication(&report, &entry, Some(&publication))
-                        .await
-                }
-            };
-            let interfere = async {
-                tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                    .await
-                    .unwrap();
-                assert!(publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table));
-                lose_maintenance_lease(&client, &publication).await;
-                pause.release();
-            };
-            let (result, ()) = tokio::join!(operation, interfere);
-            assert!(result.is_err(), "sidecar target {target} must reject a loss inside backend await");
-            assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &sidecars[target]).await.unwrap(), before);
-            if target < 3 {
-                assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &sidecars[3]).await.unwrap(), later_before);
-            }
-            assert!(
-                backend
-                    .object_exists(&entry.table_bucket, &entry.metadata_location)
-                    .await
-                    .unwrap()
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn table_maintenance_await_loss_prevents_metadata_and_data_delete() {
-        for data_orphan in [false, true] {
-            let MaintenanceMutationFixture {
-                backend,
-                sidecar,
-                entry,
-                config,
-                report,
-                orphan,
-            } = maintenance_mutation_fixture(data_orphan).await;
-            let before = backend.read_object(&entry.table_bucket, &orphan).await.unwrap();
-            let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
-            let pause = backend.pause_next_delete(&entry.table_bucket, &orphan).await;
-            let effective = TableMaintenanceEffectiveConfig {
-                config,
-                source: TableMaintenanceConfigSource::TableOverride,
-            };
-            let operation = sidecar.finish_table_metadata_maintenance_run_for_entry_with_publication(
-                &entry,
-                true,
-                &effective,
-                report,
-                &publication,
-            );
-            let interfere = async {
-                tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                    .await
-                    .unwrap();
-                assert!(publication.holds_table(&entry.table_bucket, &entry.namespace, &entry.table));
-                lose_maintenance_lease(&client, &publication).await;
-                pause.release();
-            };
-            let (result, ()) = tokio::join!(operation, interfere);
-            assert!(result.is_err());
-            assert_eq!(backend.read_object(&entry.table_bucket, &orphan).await.unwrap(), before);
-            assert!(
-                backend
-                    .object_exists(&entry.table_bucket, &entry.metadata_location)
-                    .await
-                    .unwrap()
-            );
-            assert!(
-                sidecar
-                    .get_table_metadata_maintenance_report_for_entry_unlocked(
-                        &entry.table_bucket,
-                        &Namespace::parse(&entry.namespace).unwrap(),
-                        &IdentifierSegment::parse(&entry.table).unwrap(),
-                        &entry.table_id,
-                        MAINTENANCE_JOB_ALIAS_CURRENT,
-                    )
-                    .await
-                    .unwrap()
-                    .is_none()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn table_maintenance_sidecar_cas_preserves_concurrent_replacement() {
-        let MaintenanceMutationFixture {
-            backend,
-            sidecar,
-            entry,
-            config,
-            ..
-        } = maintenance_mutation_fixture(false).await;
-        let namespace = Namespace::parse(&entry.namespace).unwrap();
-        let table = IdentifierSegment::parse(&entry.table).unwrap();
-        let path = TableCatalogObjectPaths::default().table_maintenance_config_path(
-            &entry.table_bucket,
-            &namespace,
-            &table,
-            &entry.table_id,
-        );
-        let publication = TableCommitLockPublication::new(&backend);
-        publication
-            .attach_catalog_migration_read_guard(TableCatalogLockGuard::stable(()))
-            .unwrap();
-        publication.begin_table_bucket(&entry.table_bucket).await.unwrap();
-        publication
-            .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
-            .await
-            .unwrap();
-        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &path).await;
-        let mut changed_config = config.clone();
-        changed_config.worker_paused = true;
-        let mut replacement = config;
-        replacement.delete_enabled = false;
-        let bytes = serde_json::to_vec(&replacement).unwrap();
-        let operation =
-            sidecar.put_table_maintenance_config_for_entry_with_publication(&entry, changed_config, Some(&publication));
-        let interfere = async {
-            tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                .await
-                .unwrap();
-            backend.seed_object(RUSTFS_META_BUCKET, &path, bytes.clone()).await;
-            pause.release();
-        };
-        let (result, ()) = tokio::join!(operation, interfere);
-        assert!(matches!(result, Err(TableCatalogStoreError::Conflict(_))));
-        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &path).await.unwrap().unwrap().data, bytes);
-    }
-
-    #[tokio::test]
-    async fn table_maintenance_delete_cas_preserves_changed_candidates() {
-        for data_orphan in [false, true] {
-            let MaintenanceMutationFixture {
-                backend,
-                sidecar,
-                entry,
-                config,
-                report,
-                orphan,
-            } = maintenance_mutation_fixture(data_orphan).await;
-            let publication = TableCommitLockPublication::new(&backend);
-            publication
-                .attach_catalog_migration_read_guard(TableCatalogLockGuard::stable(()))
-                .unwrap();
-            publication.begin_table_bucket(&entry.table_bucket).await.unwrap();
-            publication
-                .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
-                .await
-                .unwrap();
-            let pause = backend.pause_next_delete(&entry.table_bucket, &orphan).await;
-            let effective = TableMaintenanceEffectiveConfig {
-                config,
-                source: TableMaintenanceConfigSource::TableOverride,
-            };
-            let operation = sidecar.finish_table_metadata_maintenance_run_for_entry_with_publication(
-                &entry,
-                true,
-                &effective,
-                report,
-                &publication,
-            );
-            let interfere = async {
-                tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                    .await
-                    .unwrap();
-                backend
-                    .seed_object(&entry.table_bucket, &orphan, b"replacement".to_vec())
-                    .await;
-                pause.release();
-            };
-            let (result, ()) = tokio::join!(operation, interfere);
-            assert!(matches!(result, Err(TableCatalogStoreError::Conflict(_))));
-            assert_eq!(
-                backend.read_object(&entry.table_bucket, &orphan).await.unwrap().unwrap().data,
-                b"replacement".to_vec()
-            );
-            assert!(
-                backend
-                    .object_exists(&entry.table_bucket, &entry.metadata_location)
-                    .await
-                    .unwrap()
-            );
-        }
-    }
-
-    fn maintenance_rename_destination(entry: &TableEntry) -> (TableEntry, String, String) {
-        let mut destination = entry.clone();
-        destination.table = "tablearchived".to_string();
-        let paths = TableCatalogObjectPaths::default();
-        let namespace = Namespace::parse(&entry.namespace).unwrap();
-        let source_path = paths.table_maintenance_config_path(
-            &entry.table_bucket,
-            &namespace,
-            &IdentifierSegment::parse(&entry.table).unwrap(),
-            &entry.table_id,
-        );
-        let destination_path = paths.table_maintenance_config_path(
-            &destination.table_bucket,
-            &namespace,
-            &IdentifierSegment::parse(&destination.table).unwrap(),
-            &destination.table_id,
-        );
-        (destination, source_path, destination_path)
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn table_maintenance_rename_await_loss_prevents_destination_copy() {
-        let MaintenanceMutationFixture {
-            backend, sidecar, entry, ..
-        } = maintenance_mutation_fixture(false).await;
-        let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
-        let source_before = backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap();
-        assert!(source_before.is_some());
-        assert!(!backend.object_exists(RUSTFS_META_BUCKET, &destination_path).await.unwrap());
-        let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
-        let fence = publication.object_mutation_fence().unwrap();
-        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &destination_path).await;
-        let operation = sidecar.prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence);
-        let interfere = async {
-            tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                .await
-                .unwrap();
-            lose_maintenance_lease(&client, &publication).await;
-            pause.release();
-        };
-        let (result, ()) = tokio::join!(operation, interfere);
-        assert!(result.is_err());
-        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap(), source_before);
-        assert!(!backend.object_exists(RUSTFS_META_BUCKET, &destination_path).await.unwrap());
-        assert!(
-            sidecar
-                .read_table_maintenance_rename_intent(&entry.table_bucket)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn table_maintenance_rename_await_loss_prevents_source_cleanup() {
-        let MaintenanceMutationFixture {
-            backend, sidecar, entry, ..
-        } = maintenance_mutation_fixture(false).await;
-        let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
-        let source_before = backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap();
-        assert!(source_before.is_some());
-        let (publication, client) = maintenance_loss_publication(&backend, &entry).await;
-        let fence = publication.object_mutation_fence().unwrap();
-        let (intent, intent_etag) = sidecar
-            .prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence)
-            .await
-            .unwrap()
-            .expect("source maintenance config must be prepared for rename");
-        let destination_before = backend.read_object(RUSTFS_META_BUCKET, &destination_path).await.unwrap();
-        assert!(destination_before.is_some());
-        let pause = backend.pause_next_delete(RUSTFS_META_BUCKET, &source_path).await;
-        let operation = sidecar.finish_table_maintenance_rename(&intent, &intent_etag, true, &fence);
-        let interfere = async {
-            tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                .await
-                .unwrap();
-            lose_maintenance_lease(&client, &publication).await;
-            pause.release();
-        };
-        let (result, ()) = tokio::join!(operation, interfere);
-        assert!(result.is_err());
-        assert_eq!(backend.read_object(RUSTFS_META_BUCKET, &source_path).await.unwrap(), source_before);
-        assert_eq!(
-            backend.read_object(RUSTFS_META_BUCKET, &destination_path).await.unwrap(),
-            destination_before
-        );
-        assert!(
-            sidecar
-                .read_table_maintenance_rename_intent(&entry.table_bucket)
-                .await
-                .unwrap()
-                .is_some()
-        );
-    }
-
-    #[tokio::test]
-    async fn table_maintenance_rename_delete_cas_preserves_same_content_replacement() {
-        for committed in [true, false] {
-            let MaintenanceMutationFixture {
-                backend, sidecar, entry, ..
-            } = maintenance_mutation_fixture(false).await;
-            let (destination, source_path, destination_path) = maintenance_rename_destination(&entry);
-            let fence = TableCatalogObjectMutationFence::default();
-            let (intent, intent_etag) = sidecar
-                .prepare_table_maintenance_rename(&entry, &destination, "source-snapshot-etag", &fence)
-                .await
-                .unwrap()
-                .expect("source maintenance config must be prepared for rename");
-            let (target_path, other_path) = if committed {
-                (&source_path, &destination_path)
-            } else {
-                (&destination_path, &source_path)
-            };
-            let target_before = backend.read_object(RUSTFS_META_BUCKET, target_path).await.unwrap().unwrap();
-            let other_before = backend.read_object(RUSTFS_META_BUCKET, other_path).await.unwrap();
-            assert!(other_before.is_some());
-            let pause = backend.pause_next_delete(RUSTFS_META_BUCKET, target_path).await;
-            let operation = sidecar.finish_table_maintenance_rename(&intent, &intent_etag, committed, &fence);
-            let interfere = async {
-                tokio::time::timeout(Duration::from_secs(5), pause.wait_started())
-                    .await
-                    .unwrap();
-                backend
-                    .seed_object(RUSTFS_META_BUCKET, target_path, target_before.data.clone())
-                    .await;
-                pause.release();
-            };
-            let (result, ()) = tokio::join!(operation, interfere);
-            assert!(matches!(result, Err(TableCatalogStoreError::Conflict(_))));
-            let replacement = backend.read_object(RUSTFS_META_BUCKET, target_path).await.unwrap().unwrap();
-            assert_eq!(replacement.data, target_before.data);
-            assert_ne!(replacement.etag, target_before.etag);
-            assert_eq!(backend.read_object(RUSTFS_META_BUCKET, other_path).await.unwrap(), other_before);
-            assert!(
-                sidecar
-                    .read_table_maintenance_rename_intent(&entry.table_bucket)
-                    .await
-                    .unwrap()
-                    .is_some()
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn table_maintenance_delete_respects_original_plan_watermark() {
-        for data_orphan in [false, true] {
-            let MaintenanceMutationFixture {
-                backend,
-                sidecar,
-                entry,
-                config,
-                mut report,
-                orphan,
-            } = maintenance_mutation_fixture(data_orphan).await;
-            let now = OffsetDateTime::now_utc();
-            let window = time::Duration::seconds(TABLE_METADATA_CLEANUP_SAFETY_WINDOW_SECONDS);
-            report.job.cleanup_watermark_unix_seconds = (now - window * 3_i32).unix_timestamp();
-            backend
-                .seed_object_with_mod_time(
-                    &entry.table_bucket,
-                    &orphan,
-                    b"changed since plan".to_vec(),
-                    Some(now - window * 2_i32),
-                )
-                .await;
-            let before = backend.read_object(&entry.table_bucket, &orphan).await.unwrap();
-            let publication = TableCommitLockPublication::new(&backend);
-            publication
-                .attach_catalog_migration_read_guard(TableCatalogLockGuard::stable(()))
-                .unwrap();
-            publication.begin_table_bucket(&entry.table_bucket).await.unwrap();
-            publication
-                .prepare(&entry.table_bucket, &entry.namespace, &entry.table)
-                .await
-                .unwrap();
-            let effective = TableMaintenanceEffectiveConfig {
-                config,
-                source: TableMaintenanceConfigSource::TableOverride,
-            };
-            let completed = sidecar
-                .finish_table_metadata_maintenance_run_for_entry_with_publication(&entry, true, &effective, report, &publication)
-                .await
-                .unwrap();
-            assert_eq!(completed.job.deleted_metadata_file_count, 0);
-            assert_eq!(completed.job.deleted_object_count, 0);
-            assert_eq!(backend.read_object(&entry.table_bucket, &orphan).await.unwrap(), before);
-            assert!(
-                backend
-                    .object_exists(&entry.table_bucket, &entry.metadata_location)
-                    .await
-                    .unwrap()
-            );
-        }
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn catalog_writer_loss_prevents_recovery_storage_commit() {
-        let (_temp, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-        let bucket = "catalog-fence-loss-probe";
-        store
-            .make_bucket(bucket, &MakeBucketOptions::default())
-            .await
-            .expect("make probe bucket");
-        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
-        let client = Arc::new(RecordingLeaseClient {
-            inner: rustfs_lock::LocalClient::with_manager(Arc::new(rustfs_lock::GlobalLockManager::Enabled(Arc::new(
-                rustfs_lock::FastObjectLockManager::new(),
-            )))),
-            acquired: Mutex::new(None),
-        });
-        let lock = rustfs_lock::NamespaceLockWrapper::new(
-            rustfs_lock::NamespaceLock::with_clients_and_quorum(
-                "catalog-probe".to_string(),
-                vec![client.clone() as Arc<dyn LockClient>],
-                1,
-            ),
-            rustfs_lock::ObjectKey::new(bucket, default_table_bucket_publication_lock_path()),
-            "catalog-backup-probe".to_string(),
-        );
-        // These are the exact acquisition and conversion used by the production
-        // EcStoreTableCatalogObjectBackend::acquire_write_lock implementation.
-        let owner = WriteCommitGuard::acquire(&lock, Duration::from_secs(5))
-            .await
-            .expect("acquire distributed writer");
-        let guard = TableCatalogLockGuard::write_namespace(owner);
-        let fence = TableCatalogObjectMutationFence::from_signals([guard.lock_lost_signal()]);
-        assert!(!guard.is_lock_lost(), "models backup's last outer fencing check");
-        let id = client
-            .acquired
-            .lock()
-            .expect("lease recorded")
-            .clone()
-            .expect("actual lease acquired");
-        assert!(client.force_release(&id).await.expect("force-release lease"));
-        tokio::time::timeout(Duration::from_secs(15), async {
-            while !guard.is_lock_lost() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("actual heartbeat must observe released distributed lease");
-        let result = backend
-            .put_object_fenced(
-                bucket,
-                "recovery-artifact.json",
-                b"stale recovery artifact".to_vec(),
-                TableCatalogPutPrecondition::IfAbsent,
-                &fence,
-            )
-            .await;
-        let persisted = backend
-            .read_object(bucket, "recovery-artifact.json")
-            .await
-            .expect("read real persisted object");
-        assert!(
-            result.is_err() && persisted.is_none(),
-            "lost publication writer must prevent storage commit; result={result:?}, persisted={}",
-            persisted.is_some()
-        );
     }
 }

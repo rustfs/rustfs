@@ -902,8 +902,7 @@ mod tests {
             status: "on".to_owned(),
             ..Default::default()
         }));
-        let backend =
-            EcStoreTableCatalogObjectBackend::new_with_strong_runtime(Arc::clone(&store), context.table_catalog_strong_runtime());
+        let backend = EcStoreTableCatalogObjectBackend::new(Arc::clone(&store));
         let catalog =
             ConfiguredTableCatalogStore::new_for_test(backend, TableCatalogBackingMode::from_env().expect("catalog mode"));
         catalog

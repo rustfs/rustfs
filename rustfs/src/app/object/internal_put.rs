@@ -243,10 +243,7 @@ impl DefaultObjectUsecase {
             .clone()
             .or_else(current_app_context)
             .ok_or_else(not_initialized)?;
-        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-            context.object_store(),
-            context.table_catalog_strong_runtime(),
-        );
+        let backend = EcStoreTableCatalogObjectBackend::new(context.object_store());
         let guard = backend
             .acquire_read_lock(bucket, &default_table_bucket_publication_lock_path())
             .await
