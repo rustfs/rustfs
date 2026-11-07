@@ -1728,4 +1728,149 @@ mod tests {
         let xxh3_multipart = ChecksumType(ChecksumType::XXHASH3.0 | ChecksumType::MULTIPART.0);
         assert!(!xxh3_multipart.is_s3s_typed());
     }
+
+    #[test]
+    fn checksum_matches_covers_positive_and_negative_branches() {
+        let payload = b"durability check payload";
+        let valid = Checksum::new_from_data(ChecksumType::CRC32C, payload).expect("valid crc32c");
+
+        // Positive match with no multipart count.
+        assert!(valid.matches(payload, 0).is_ok());
+
+        // Empty encoded checksum is a no-op success.
+        let mut empty_encoded = valid.clone();
+        empty_encoded.encoded.clear();
+        assert!(empty_encoded.matches(b"anything", 0).is_ok());
+
+        // Non-empty encoded checksum with unset/no-hasher type fails closed.
+        let no_hasher = Checksum {
+            checksum_type: ChecksumType::NONE,
+            encoded: valid.encoded.clone(),
+            raw: valid.raw.clone(),
+            want_parts: 0,
+        };
+        let err = no_hasher.matches(payload, 0).expect_err("NONE hasher must fail");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains("no hasher available"), "unexpected error: {err_msg}");
+
+        // Multipart want_parts mismatch fails with formatted "<encoded>-<parts>" want/got.
+        let mp = Checksum::new_with_type(ChecksumType::CRC32C, &format!("{}-3", valid.encoded)).expect("multipart checksum");
+        assert_eq!(mp.want_parts, 3);
+        let err = mp.matches(payload, 2).expect_err("parts count mismatch must fail");
+        let err_msg = err.to_string();
+        assert!(err_msg.contains(&format!("{}-3", valid.encoded)), "missing want parts: {err_msg}");
+        assert!(err_msg.contains(&format!("{}-2", valid.encoded)), "missing got parts: {err_msg}");
+        assert!(mp.matches(payload, 3).is_ok(), "matching parts count should succeed");
+
+        // Payload digest mismatch fails closed.
+        let err = valid
+            .matches(b"corrupted payload", 0)
+            .expect_err("corrupted payload must fail");
+        assert_eq!(err.want, valid.encoded);
+        assert_ne!(err.got, valid.encoded);
+    }
+
+    #[test]
+    fn checksum_constructors_add_part_and_header_negative_branches() {
+        use super::get_content_checksum;
+        use http::{HeaderMap, HeaderValue};
+
+        // new_with_type negative branches
+        assert!(Checksum::new_with_type(ChecksumType::NONE, "AAAA").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "AAAA-1-2").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "AAAA-notanint").is_none());
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, "!!!not_base64!!!").is_none());
+        let short_b64 = base64_simd::STANDARD.encode_to_string([1u8, 2u8]);
+        assert!(Checksum::new_with_type(ChecksumType::CRC32, &short_b64).is_none());
+
+        // as_map returns None when raw length does not match raw_byte_len()
+        let mut invalid_raw = Checksum::new_from_data(ChecksumType::CRC32, b"hello").expect("crc32");
+        assert!(invalid_raw.as_map().is_some());
+        invalid_raw.raw.pop();
+        assert!(invalid_raw.as_map().is_none());
+
+        // obj_type and from_header coverage
+        assert_eq!(ChecksumType::CRC64_NVME.obj_type(), "FULL_OBJECT");
+        assert_eq!(ChecksumType(ChecksumType::SHA256.0 | ChecksumType::MULTIPART.0).obj_type(), "COMPOSITE");
+        assert_eq!(ChecksumType::NONE.obj_type(), "");
+
+        let mut headers = HeaderMap::new();
+        assert_eq!(ChecksumType::from_header(&headers), ChecksumType::NONE);
+        headers.insert("x-amz-checksum-algorithm", HeaderValue::from_static("CRC32C"));
+        headers.insert("x-amz-checksum-type", HeaderValue::from_static("FULL_OBJECT"));
+        let parsed = ChecksumType::from_header(&headers);
+        assert!(parsed.is(ChecksumType::CRC32C) && parsed.full_object_requested());
+
+        // add_part positive and negative branches
+        let part_a = b"hello ";
+        let part_b = b"world!";
+        let part_b_len = part_b.len() as i64;
+        for t in [ChecksumType::CRC32, ChecksumType::CRC32C, ChecksumType::CRC64_NVME] {
+            let mut acc = Checksum::new_from_data(t, part_a).expect("part a");
+            let b_sum = Checksum::new_from_data(t, part_b).expect("part b");
+            let full = Checksum::new_from_data(t, b"hello world!").expect("full");
+            // size == 0 is a no-op
+            acc.add_part(&b_sum, 0).expect("zero size no-op");
+            assert_eq!(acc.encoded, Checksum::new_from_data(t, part_a).unwrap().encoded);
+            // size > 0 combines CRCs into full-object digest
+            acc.add_part(&b_sum, part_b_len).expect("combine");
+            assert_eq!(acc.encoded, full.encoded, "combined CRC mismatch for {t:?}");
+        }
+
+        // add_part rejects unmergeable algorithm, mismatched types, and invalid raw lengths
+        let mut sha_a = Checksum::new_from_data(ChecksumType::SHA256, part_a).expect("sha256");
+        let sha_b = Checksum::new_from_data(ChecksumType::SHA256, part_b).expect("sha256");
+        let err = sha_a
+            .add_part(&sha_b, part_b_len)
+            .expect_err("unmergeable algorithm must fail");
+        assert!(err.contains("checksum type cannot be merged"), "unexpected error: {err}");
+
+        let mut crc32_a = Checksum::new_from_data(ChecksumType::CRC32, part_a).expect("crc32");
+        let crc32c_b = Checksum::new_from_data(ChecksumType::CRC32C, part_b).expect("crc32c");
+        let err = crc32_a
+            .add_part(&crc32c_b, part_b_len)
+            .expect_err("mismatched types must fail");
+        assert!(err.contains("checksum type does not match"), "unexpected error: {err}");
+
+        let mut bad_base = crc32_a.clone();
+        bad_base.raw.truncate(1);
+        let err = bad_base
+            .add_part(&crc32_a, part_b_len)
+            .expect_err("invalid base raw len must fail");
+        assert!(err.contains("invalid base checksum"), "unexpected error: {err}");
+
+        let mut bad_part = crc32_a.clone();
+        bad_part.raw.truncate(1);
+        let err = crc32_a
+            .add_part(&bad_part, part_b_len)
+            .expect_err("invalid part raw len must fail");
+        assert!(err.contains("invalid part checksum"), "unexpected error: {err}");
+
+        // get_content_checksum negative branches
+        let mut dup_trailer = HeaderMap::new();
+        dup_trailer.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32, x-amz-checksum-crc32c"));
+        let err = get_content_checksum(&dup_trailer).expect_err("duplicate trailer checksums must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut unmergeable_full_trailer = HeaderMap::new();
+        unmergeable_full_trailer.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-sha256"));
+        unmergeable_full_trailer.insert("x-amz-checksum-type", HeaderValue::from_static("FULL_OBJECT"));
+        let err = get_content_checksum(&unmergeable_full_trailer).expect_err("FULL_OBJECT SHA256 trailer must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut invalid_type_header = HeaderMap::new();
+        invalid_type_header.insert("x-amz-trailer", HeaderValue::from_static("x-amz-checksum-crc32"));
+        invalid_type_header.insert("x-amz-checksum-type", HeaderValue::from_static("BOGUS_TYPE"));
+        let err = get_content_checksum(&invalid_type_header).expect_err("BOGUS_TYPE checksum-type must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("Invalid checksum"), "unexpected error: {err}");
+
+        let mut malformed_direct = HeaderMap::new();
+        malformed_direct.insert("x-amz-checksum-crc32", HeaderValue::from_static("not_valid_base64!"));
+        let err = get_content_checksum(&malformed_direct).expect_err("malformed base64 header must fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("invalid checksum value"), "unexpected error: {err}");
+    }
 }

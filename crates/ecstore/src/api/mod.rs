@@ -191,8 +191,11 @@ pub mod bucket {
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
-        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
-        pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, validate_tag_set_entries};
+        pub use crate::bucket::metadata::{
+            BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE,
+            SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
+        };
+        pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, is_swift_bucket_metadata_tag_key, validate_tag_set_entries};
     }
 
     pub mod config_parse_mode {
@@ -218,11 +221,12 @@ pub mod bucket {
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
-            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
+            get_request_payment_config, get_s3_tagging_config, get_sse_config, get_tagging_config, get_versioning_config,
+            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
             remove_bucket_metadata_if_absent, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
             update_config_with, update_if_incarnation, update_if_incarnation_at, update_quota_if_incarnation,
-            update_quota_if_incarnation_at, update_under_transaction_lock, update_under_transaction_lock_at,
+            update_quota_if_incarnation_at, update_s3_tagging_config, update_under_transaction_lock,
+            update_under_transaction_lock_at,
         };
         #[cfg(feature = "test-util")]
         pub use crate::bucket::metadata_sys::{ConfigWriteLockProbe, test_support};

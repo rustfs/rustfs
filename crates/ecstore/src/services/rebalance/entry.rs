@@ -1910,6 +1910,10 @@ mod tests {
                 &ObjectOptions {
                     version_id: Some(version_id.to_string()),
                     mod_time: earlier(version.mod_time),
+                    // Without the object lock the rename waits for every
+                    // drive, so no early-ACK tail is still writing the copies
+                    // removed below.
+                    no_lock: true,
                     ..versioned
                 },
             ))

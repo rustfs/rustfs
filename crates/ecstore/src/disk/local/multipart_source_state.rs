@@ -1517,7 +1517,7 @@ impl LocalDisk {
                     }
                     Err(error) => return Err(error),
                 };
-                let _directory = os::pin_multipart_source_directory(&directory, base, root)?;
+                let directory_pin = os::pin_multipart_source_directory(&directory, base, root)?;
                 if !parts.is_empty() {
                     let anchor_path = directory.join(RETIREMENT_ANCHOR);
                     let bytes = os::read_multipart_source_metadata(&anchor_path, base, root)?;
@@ -1550,7 +1550,13 @@ impl LocalDisk {
                 }
                 // An anchor-less empty DD is only rmdir'ed. A new child makes
                 // this fail closed; no recursive removal can consume its bytes.
+                // A Windows pin refuses DELETE sharing, so the leaf pin is
+                // released first; the object pin still holds the parent.
+                #[cfg(windows)]
+                drop(directory_pin);
                 std::fs::remove_dir(&directory)?;
+                #[cfg(not(windows))]
+                drop(directory_pin);
                 if sync {
                     os::fsync_dir_std(&object_path)?;
                 }
