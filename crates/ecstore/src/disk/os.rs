@@ -7294,28 +7294,12 @@ pub(crate) fn sync_multipart_owned_record_parents_options(
 
 /// Install a complete proxy without truncating the original head, retaining
 /// this exact open inode for the following source-head -> target publication.
-#[cfg(any(test, not(target_os = "linux")))]
 pub(crate) fn install_multipart_prepared_head(
-    prepared: PreparedRenameSource,
-    canonical_head: &Path,
-    base: &Path,
-    publication_root: &PublicationRoot,
-) -> io::Result<PreparedRenameSource> {
-    let parent = canonical_head
-        .parent()
-        .ok_or_else(|| io::Error::other("MPU head has no parent"))?;
-    #[cfg(not(target_os = "linux"))]
-    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
-    install_multipart_prepared_head_with_guard(prepared, canonical_head, base, publication_root, &guard)
-}
-
-pub(crate) fn install_multipart_prepared_head_with_guard(
     mut prepared: PreparedRenameSource,
     canonical_head: &Path,
     base: &Path,
     publication_root: &PublicationRoot,
-    directory_guard: &RenameCommitGuard,
+    directory_guard: Option<&RenameCommitGuard>,
 ) -> io::Result<PreparedRenameSource> {
     let original_path = prepared.path.clone();
     let parent = canonical_head
@@ -7325,24 +7309,23 @@ pub(crate) fn install_multipart_prepared_head_with_guard(
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
     #[cfg(target_os = "linux")]
-    let same_dir_guard = if directory_guard.directories.source_path == parent {
-        let src_dir = LinuxCommitDirectory {
-            file: Arc::clone(&directory_guard.directories.source.file),
-            device: directory_guard.directories.source.device,
-            inode: directory_guard.directories.source.inode,
-        };
-        let dst_dir = LinuxCommitDirectory {
-            file: Arc::clone(&directory_guard.directories.source.file),
-            device: directory_guard.directories.source.device,
-            inode: directory_guard.directories.source.inode,
-        };
+    let guard = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+        let dir = &directory_guard.directories.source;
         RenameCommitGuard {
             directories: Arc::new(LinuxCommitDirectories {
                 root: directory_guard.directories.root.clone(),
                 source_path: parent.to_path_buf(),
                 destination_path: parent.to_path_buf(),
-                source: src_dir,
-                destination: std::sync::OnceLock::from(dst_dir),
+                source: LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                },
+                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                }),
                 destination_base: base.to_path_buf(),
             }),
         }
@@ -7350,14 +7333,15 @@ pub(crate) fn install_multipart_prepared_head_with_guard(
         prepare_rename_commit_guard(parent, parent, base, publication_root)?
     };
     #[cfg(not(target_os = "linux"))]
-    let same_dir_guard = {
+    let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
+    #[cfg(not(target_os = "linux"))]
+    let guard = {
         let _ = directory_guard;
-        let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
         prepare_rename_commit_guard(parent, parent, base, publication_root)?
     };
-    rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &same_dir_guard)?;
+    rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
-    fsync_commit_directory_limited_std(parent, &same_dir_guard)?;
+    fsync_commit_directory_limited_std(parent, &guard)?;
     Ok(prepared)
 }
 

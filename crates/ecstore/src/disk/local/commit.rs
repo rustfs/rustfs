@@ -15,8 +15,6 @@
 //! Single-disk object rename publication and rollback. The shared execution core
 //! retains instrumentation, mutation leases, and commit guards through the syscall.
 
-#[cfg(target_os = "linux")]
-use super::has_rename_data_test_failpoints;
 #[cfg(all(test, windows))]
 use super::run_destination_commit_directory_preparation;
 #[cfg(any(not(windows), test))]
@@ -24,8 +22,8 @@ use super::should_fail_local_inline_rollback_hardlink;
 use super::{
     EVENT_DISK_LOCAL_ACCESS_FAILED, EVENT_DISK_LOCAL_HEAL_PURGE_FAILED, EVENT_DISK_LOCAL_RENAME_REJECTED, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_DISK_LOCAL, LocalDisk, SyncMode, effective_durability, has_inline_commit_test_failpoints,
-    inline_metadata_rollback_dir, observe_old_current, remove_dir_all_if_exists, remove_dst_base_before_commit,
-    remove_file_if_exists, rename_data_versions_signature, run_inline_preparation_before_backup,
+    has_rename_data_test_failpoints, inline_metadata_rollback_dir, observe_old_current, remove_dir_all_if_exists,
+    remove_dst_base_before_commit, remove_file_if_exists, rename_data_versions_signature, run_inline_preparation_before_backup,
     should_fail_after_metadata_commit, should_fail_before_old_metadata_backup, should_fail_commit_rename,
     should_remove_staged_meta_before_commit, skip_access_checks, tmp_staging_mutation_path,
 };
@@ -173,11 +171,7 @@ impl RenameCommitContext<'_> {
 }
 
 #[cfg(any(not(windows), test))]
-fn write_local_inline_rollback_backup_from_bytes(
-    staging_file_path: &Path,
-    old_metadata: &[u8],
-    sync: bool,
-) -> std::io::Result<PathBuf> {
+fn inline_rollback_backup_path(staging_file_path: &Path) -> std::io::Result<PathBuf> {
     let Some(staging_parent) = staging_file_path.parent() else {
         return Err(std::io::Error::new(ErrorKind::InvalidInput, "missing staging metadata parent"));
     };
@@ -187,6 +181,16 @@ fn write_local_inline_rollback_backup_from_bytes(
         staging_file_path.with_extension("meta.bkp")
     };
     remove_file_if_exists(&backup_path)?;
+    Ok(backup_path)
+}
+
+#[cfg(any(not(windows), test))]
+fn write_local_inline_rollback_backup_from_bytes(
+    staging_file_path: &Path,
+    old_metadata: &[u8],
+    sync: bool,
+) -> std::io::Result<PathBuf> {
+    let backup_path = inline_rollback_backup_path(staging_file_path)?;
     let write_res = (|| -> std::io::Result<()> {
         #[cfg(test)]
         run_owned_file_before_open(&backup_path);
@@ -211,15 +215,7 @@ pub(super) fn create_local_inline_rollback_backup(
     old_metadata: &[u8],
     sync: bool,
 ) -> std::io::Result<PathBuf> {
-    let Some(staging_parent) = staging_file_path.parent() else {
-        return Err(std::io::Error::new(ErrorKind::InvalidInput, "missing staging metadata parent"));
-    };
-    let backup_path = if staging_file_path.file_name().and_then(|n| n.to_str()) == Some(STORAGE_FORMAT_FILE) {
-        staging_parent.join(STORAGE_FORMAT_FILE_BACKUP)
-    } else {
-        staging_file_path.with_extension("meta.bkp")
-    };
-    remove_file_if_exists(&backup_path)?;
+    let backup_path = inline_rollback_backup_path(staging_file_path)?;
     if should_fail_local_inline_rollback_hardlink(dst_file_path) || std::fs::hard_link(dst_file_path, &backup_path).is_err() {
         return write_local_inline_rollback_backup_from_bytes(staging_file_path, old_metadata, sync);
     } else if cfg!(test) && sync && !old_metadata.is_empty() {
@@ -741,8 +737,7 @@ impl LocalDisk {
             && !fi_healing
             && !os::dst_dir_fsync_group_commit_enabled()
             && !os::file_fdatasync_group_commit_enabled()
-            && !has_rename_data_test_failpoints(dst_path)
-            && !super::has_owned_file_before_open_hooks();
+            && !has_rename_data_test_failpoints(dst_path);
         let src_file_path = match multipart_publication.as_ref() {
             Some(publication) => publication.canonical_head(),
             None if flat_inline_tmp => {
@@ -922,11 +917,14 @@ impl LocalDisk {
                 run_owned_file_before_open(&src_file_path_owned);
                 let mut prepared_metadata_source =
                     os::create_prepared_rename_source_with_commit_guard(&src_file_path_owned, &dst_file_path_owned, &guard)?;
-                if let Err(err) = prepared_metadata_source.write_all(&new_dst_buf, false) {
-                    drop(prepared_metadata_source);
+                let cleanup_flat_tmp = || {
                     if flat_inline_tmp {
                         let _ = remove_file_if_exists(&src_file_path_owned);
                     }
+                };
+                if let Err(err) = prepared_metadata_source.write_all(&new_dst_buf, false) {
+                    drop(prepared_metadata_source);
+                    cleanup_flat_tmp();
                     return Err(err);
                 }
                 if !no_inline {
@@ -947,9 +945,7 @@ impl LocalDisk {
                         Ok(path) => path,
                         Err(err) => {
                             drop(prepared_metadata_source);
-                            if flat_inline_tmp {
-                                let _ = remove_file_if_exists(&src_file_path_owned);
-                            }
+                            cleanup_flat_tmp();
                             return Err(err);
                         }
                     };
@@ -982,9 +978,7 @@ impl LocalDisk {
                     }
                 } else if sync_commit_metadata && let Err(err) = prepared_metadata_source.sync_data() {
                     drop(prepared_metadata_source);
-                    if flat_inline_tmp {
-                        let _ = remove_file_if_exists(&src_file_path_owned);
-                    }
+                    cleanup_flat_tmp();
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                         let _ = remove_file_if_exists(backup_path);
                     }
@@ -993,9 +987,7 @@ impl LocalDisk {
 
                 if is_cancelled() {
                     drop(prepared_metadata_source);
-                    if flat_inline_tmp {
-                        let _ = remove_file_if_exists(&src_file_path_owned);
-                    }
+                    cleanup_flat_tmp();
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                         let _ = remove_file_if_exists(backup_path);
                     }
@@ -1013,9 +1005,7 @@ impl LocalDisk {
                     Ok(guard) => guard,
                     Err(err) => {
                         drop(prepared_metadata_source);
-                        if flat_inline_tmp {
-                            let _ = remove_file_if_exists(&src_file_path_owned);
-                        }
+                        cleanup_flat_tmp();
                         if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                             let _ = remove_file_if_exists(backup_path);
                         }
@@ -1100,9 +1090,7 @@ impl LocalDisk {
                         sync_commit_metadata,
                     ) {
                         drop(prepared_metadata_source);
-                        if flat_inline_tmp {
-                            let _ = remove_file_if_exists(&src_file_path_owned);
-                        }
+                        cleanup_flat_tmp();
                         let _ = remove_file_if_exists(staged_backup);
                         return Ok(FusedCommitAttempt::CommitErr(to_file_error(err).into()));
                     }
@@ -1123,9 +1111,7 @@ impl LocalDisk {
                     )
                 };
                 if let Err(err) = rename_res {
-                    if flat_inline_tmp {
-                        let _ = remove_file_if_exists(&src_file_path_owned);
-                    }
+                    cleanup_flat_tmp();
                     if let Some(backup_path) = staged_rollback_path.as_ref().map(StagedRollbackBackup::path) {
                         let _ = remove_file_if_exists(backup_path);
                     }

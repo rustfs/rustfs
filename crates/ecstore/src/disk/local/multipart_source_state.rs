@@ -1973,56 +1973,27 @@ impl NativeMultipartPublication {
         let canonical = self.canonical_head();
         let prepared = (|| -> std::io::Result<os::PreparedRenameSource> {
             if let Some((ref original_bytes, _, _)) = deferred_initial {
-                let fast_uninitialized_match = if !cfg!(test) && can_mark_presynced {
-                    Ok(true)
-                } else {
-                    (|| -> std::io::Result<bool> {
-                        let pinned = os::pin_multipart_source_directory(source, base, root)?;
-                        match os::read_multipart_source_metadata_in_pinned(
-                            &pinned,
-                            source,
-                            std::ffi::OsStr::new(STATE),
-                            base,
-                            root,
-                        ) {
-                            Ok(_) => return Ok(false),
-                            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-                            Err(err) => return Err(err),
-                        }
-                        let head = os::read_multipart_source_metadata_in_pinned(
-                            &pinned,
-                            source,
-                            std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
-                            base,
-                            root,
-                        )?;
-                        Ok(head.as_slice() == original_bytes.as_slice())
-                    })()
-                };
-                match fast_uninitialized_match {
-                    Ok(true) => {}
-                    _ => {
-                        let current =
-                            load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
-                        let snapshot = current
-                            .snapshot
-                            .as_ref()
-                            .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
-                        let current_head = current
-                            .head
-                            .as_ref()
-                            .and_then(SourceHead::raw)
-                            .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
-                        if !current.head_matches_state
-                            || snapshot.phase != MultipartSourcePhase::Active
-                            || snapshot.capability_sha256.is_some()
-                            || snapshot.lineage != expected_lineage
-                            || snapshot.generation != expected_generation
-                            || snapshot.revision.checked_add(1) != Some(expected_revision)
-                            || current_head != original_bytes.as_slice()
-                        {
-                            return Err(IoError::other(DiskError::ConditionalDeleteConflict));
-                        }
+                if cfg!(test) || !can_mark_presynced {
+                    let current =
+                        load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
+                    let snapshot = current
+                        .snapshot
+                        .as_ref()
+                        .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+                    let current_head = current
+                        .head
+                        .as_ref()
+                        .and_then(SourceHead::raw)
+                        .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+                    if !current.head_matches_state
+                        || snapshot.phase != MultipartSourcePhase::Active
+                        || snapshot.capability_sha256.is_some()
+                        || snapshot.lineage != expected_lineage
+                        || snapshot.generation != expected_generation
+                        || snapshot.revision.checked_add(1) != Some(expected_revision)
+                        || current_head != original_bytes.as_slice()
+                    {
+                        return Err(IoError::other(DiskError::ConditionalDeleteConflict));
                     }
                 }
             } else {
@@ -2076,7 +2047,7 @@ impl NativeMultipartPublication {
                 let _ = std::fs::remove_file(prepared_path);
                 return Err(err);
             }
-            os::install_multipart_prepared_head_with_guard(prepared_metadata_source, &canonical, base, root, directory_guard)
+            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, base, root, Some(directory_guard))
         })()
         .map_err(DiskError::from)?;
         *self.state.lock() = state;
@@ -2186,7 +2157,7 @@ impl NativeMultipartPublication {
             let mut prepared_metadata_source =
                 os::create_prepared_rename_source_with_commit_guard(&prepared_path, &dst_file_path, &owned_directory_guard)?;
             prepared_metadata_source.write_all(&new_bytes, true)?;
-            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, &base, &root)
+            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, &base, &root, Some(&owned_directory_guard))
         })
         .await
         .map_err(DiskError::from)?;
@@ -2233,7 +2204,7 @@ impl NativeMultipartPublication {
         let base = self.store.base.clone();
         let root = self.store.publication_root.clone();
         os::run_blocking_namespace_operation(self.store.lease.clone(), move || {
-            os::install_multipart_prepared_head(prepared, &canonical, &base, &root)
+            os::install_multipart_prepared_head(prepared, &canonical, &base, &root, None)
         })
         .await
         .map_err(DiskError::from)

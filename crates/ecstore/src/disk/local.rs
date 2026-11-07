@@ -3205,6 +3205,10 @@ pub(super) fn has_rename_data_test_failpoints(dst_path: &str) -> bool {
         || os::has_dir_fsync_test_failures()
         || os::file_sync_probe::is_active()
         || os::prepared_publication_test_hooks::has_any_hooks()
+        || !OWNED_FILE_BEFORE_OPEN
+            .lock()
+            .expect("test file open hook lock should not be poisoned")
+            .is_empty()
 }
 
 #[cfg(all(not(test), feature = "test-util", target_os = "linux"))]
@@ -3267,19 +3271,6 @@ fn run_owned_file_before_open(path: &Path) {
         let _pause = os::enter_blocking_test_hook();
         hook();
     }
-}
-
-#[cfg(test)]
-fn has_owned_file_before_open_hooks() -> bool {
-    !OWNED_FILE_BEFORE_OPEN
-        .lock()
-        .expect("test file open hook lock should not be poisoned")
-        .is_empty()
-}
-
-#[cfg(not(test))]
-const fn has_owned_file_before_open_hooks() -> bool {
-    false
 }
 
 #[cfg(all(test, windows))]
