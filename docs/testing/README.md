@@ -41,6 +41,8 @@ The [immutable validation candidate reference](validation-candidates.md) describ
 
 The [distributed multipart RPC delay gates](multipart-rpc-delay.md) define authenticated method-entry barriers, latency and peer-loss oracles, and the boundary between hook evidence and production incident attribution.
 
+The [Docker rejoin readiness reproduction](docker-rejoin-readiness.md) compares node and cluster admission gates with fixed-source HTTPS containers and preserves the first object failure across recovery.
+
 ## Naming conventions
 
 ### Reserved test-name substrings (migration gate)

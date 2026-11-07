@@ -71,6 +71,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_nightly_candidate.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_functional_chain_health.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_repro_rejoin_readiness_docker.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_validation_registry.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_validation_runner.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
