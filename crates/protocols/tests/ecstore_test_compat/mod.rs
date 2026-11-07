@@ -21,5 +21,7 @@
 //! Swift implementation.
 
 pub use rustfs_ecstore::api::bucket::metadata::load_bucket_metadata;
-pub use rustfs_ecstore::api::bucket::metadata_sys::{get as get_bucket_metadata, set_bucket_metadata};
+pub use rustfs_ecstore::api::bucket::metadata_sys::{
+    get as get_bucket_metadata, get_s3_tagging_config, set_bucket_metadata, update_s3_tagging_config,
+};
 pub use rustfs_ecstore::api::runtime::object_store_handle;
