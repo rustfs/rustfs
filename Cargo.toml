@@ -296,6 +296,7 @@ local-ip-address = "0.6.13"
 log = "0.4"
 memmap2 = "0.9.12"
 lz4 = "1.28.1"
+lz4_flex = { version = "=0.14.0", default-features = false, features = ["std", "frame"] }
 matchit = "0.9.2"
 md-5 = "0.11.0"
 mime_guess = "2.0.5"

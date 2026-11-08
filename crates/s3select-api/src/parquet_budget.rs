@@ -760,21 +760,34 @@ fn validate_compressed_page(payload: &[u8], sizes: PageHeaderSizes, codec: Compr
             bounded_stream_size(brotli::Decompressor::new(payload, 4096), expanded)?;
             Ok(window)
         }
-        Compression::LZ4 if payload.starts_with(&[4, 34, 77, 24]) => {
-            let descriptor = *payload.get(5).ok_or_else(ThriftCompactCursor::error)?;
-            let block = match (descriptor >> 4) & 7 {
-                4 => 64 * 1024,
-                5 => 256 * 1024,
-                6 => 1024 * 1024,
-                7 => 4 * 1024 * 1024,
-                _ => return Err(ThriftCompactCursor::error()),
+        Compression::LZ4 if payload.starts_with(&[4, 34, 77, 24]) || payload.starts_with(&[2, 33, 76, 24]) => {
+            let (block, linked) = if payload.starts_with(&[2, 33, 76, 24]) {
+                (8 * 1024 * 1024, false)
+            } else {
+                let descriptor = *payload.get(5).ok_or_else(ThriftCompactCursor::error)?;
+                let block = match (descriptor >> 4) & 7 {
+                    4 => 64 * 1024,
+                    5 => 256 * 1024,
+                    6 => 1024 * 1024,
+                    7 => 4 * 1024 * 1024,
+                    _ => return Err(ThriftCompactCursor::error()),
+                };
+                (block, payload[4] & 0x20 == 0)
             };
-            let working = block * 2;
+            // Match parquet's pinned fallback decoder: compressed input plus
+            // output, with an extra output block and 64 KiB history when linked.
+            let working = if linked { block * 3 + 64 * 1024 } else { block * 2 };
             if working > limit {
                 return Err(budget_error());
             }
-            bounded_stream_size(lz4::Decoder::new(payload)?, expanded)?;
-            Ok(working)
+            match bounded_stream_size(lz4_flex::frame::FrameDecoder::new(payload), expanded) {
+                // Hadoop data can share the magic prefix, and parquet also
+                // tries bounded RAW decoding after a frame error. The bounded
+                // sink proved the frame produced no more than `expanded` bytes
+                // before that error; let the actual reader select its fallback.
+                Err(ParquetBudgetError::Codec(_)) => Ok(working),
+                result => result.map(|()| working),
+            }
         }
         _ => Ok(0),
     }
@@ -849,6 +862,49 @@ mod tests {
         validate_compressed_page(&payload, compressed_page(&payload, bytes.len()), Compression::LZ4, 1024 * 1024)
             .expect("valid compressed page");
         assert!(validate_compressed_page(&payload, compressed_page(&payload, 64), Compression::LZ4, 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn legacy_lz4_scratch_is_admitted_before_the_fallback_decoder() {
+        let payload = [2, 33, 76, 24, 5, 0, 0, 0, 0x40, 42, 0, 0, 0];
+        let header = compressed_page(&payload, 4);
+        assert!(matches!(
+            validate_compressed_page(&payload, header, Compression::LZ4, 1024 * 1024),
+            Err(ParquetBudgetError::Exceeded)
+        ));
+        let admitted = validate_compressed_page(&payload, header, Compression::LZ4, 32 * 1024 * 1024)
+            .expect("legacy LZ4 remains supported with enough scratch memory");
+        assert!(admitted >= 16 * 1024 * 1024);
+        assert!(validate_compressed_page(&payload, compressed_page(&payload, 1), Compression::LZ4, 32 * 1024 * 1024).is_err());
+    }
+
+    #[test]
+    fn hadoop_lz4_can_share_the_legacy_magic_without_becoming_a_frame() {
+        let size = usize::try_from(u32::from_be_bytes([2, 33, 76, 24])).expect("Hadoop size");
+        let bytes = vec![b'x'; size];
+        let block = lz4_flex::block::compress(&bytes);
+        let mut payload = vec![2, 33, 76, 24];
+        payload.extend(u32::try_from(block.len()).expect("compressed block").to_be_bytes());
+        payload.extend(block);
+        validate_compressed_page(&payload, compressed_page(&payload, size), Compression::LZ4, 64 * 1024 * 1024)
+            .expect("Hadoop framing takes priority over the frame fallback");
+    }
+
+    #[test]
+    fn linked_lz4_accounts_for_the_history_and_both_block_buffers() {
+        use lz4_flex::frame::{BlockMode, BlockSize, FrameEncoder, FrameInfo};
+        let frame = FrameInfo::new().block_mode(BlockMode::Linked).block_size(BlockSize::Max64KB);
+        let mut encoder = FrameEncoder::with_frame_info(frame, Vec::new());
+        encoder.write_all(&vec![b'x'; 256 * 1024]).expect("linked input");
+        let payload = encoder.finish().expect("linked frame");
+        let header = compressed_page(&payload, 256 * 1024);
+        assert!(matches!(
+            validate_compressed_page(&payload, header, Compression::LZ4, 192 * 1024),
+            Err(ParquetBudgetError::Exceeded)
+        ));
+        let admitted = validate_compressed_page(&payload, header, Compression::LZ4, 1024 * 1024)
+            .expect("linked frame with enough scratch memory");
+        assert!(admitted >= 256 * 1024);
     }
 
     #[test]
