@@ -977,6 +977,7 @@ async fn restore_delete_rollback_with_namespace_owner(
             .insert(backup_path.clone());
         os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
     };
+    let restored_backup = restored.is_ok();
     match restored {
         Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
@@ -1006,6 +1007,16 @@ async fn restore_delete_rollback_with_namespace_owner(
         os::fsync_dir_with_owner(object_dir, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;
+    }
+    if restored_backup {
+        // Renaming two hardlinks to the same inode can leave the backup in place.
+        match os::remove_file_with_owner(&backup_path, namespace_owner.clone()).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+    if effective_durability(volume).syncs_commit_metadata() {
         os::fsync_dir_with_owner(&rollback_path, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;

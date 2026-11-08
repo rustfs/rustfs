@@ -7240,6 +7240,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn delete_recovery_fused_prepare_checkpoint_reopens_before_head_publication() {
+        use std::os::unix::fs::MetadataExt;
+
+        let _mode = durability_mode_override::set(DurabilityMode::Strict);
         let (_temp, disk, mut first, _) = fixture().await;
         first.version_id = Some(Uuid::new_v4());
         let mut second = first.clone();
@@ -7263,12 +7266,25 @@ mod tests {
             let source = source_root.join(transaction.to_string());
             let destination = copy_root.join(transaction.to_string());
             std::fs::create_dir(&destination).expect("create checkpoint transaction");
-            std::fs::copy(source_root.join(STORAGE_FORMAT_FILE), copy_root.join(STORAGE_FORMAT_FILE))
-                .expect("capture head before publication");
+            let source_head = source_root.join(STORAGE_FORMAT_FILE);
+            let source_head_meta = std::fs::metadata(&source_head).expect("stat source head");
+            let copy_head = copy_root.join(STORAGE_FORMAT_FILE);
+            std::fs::copy(&source_head, &copy_head).expect("capture head before publication");
             for entry in std::fs::read_dir(source).expect("read published preparation") {
                 let entry = entry.expect("prepared file");
                 assert!(entry.file_type().expect("prepared file type").is_file());
-                std::fs::copy(entry.path(), destination.join(entry.file_name())).expect("capture prepared file");
+                let dst = destination.join(entry.file_name());
+                if entry.file_name() == STORAGE_FORMAT_FILE_BACKUP {
+                    let backup_meta = entry.metadata().expect("stat prepared backup");
+                    assert_eq!(
+                        (backup_meta.dev(), backup_meta.ino()),
+                        (source_head_meta.dev(), source_head_meta.ino()),
+                        "fused preparation must hardlink backup to live head"
+                    );
+                    std::fs::hard_link(&copy_head, &dst).expect("preserve hardlinked backup");
+                } else {
+                    std::fs::copy(entry.path(), dst).expect("capture prepared file");
+                }
             }
         });
         let opts = DeleteOptions {
@@ -7292,10 +7308,42 @@ mod tests {
             .await
             .expect("actual preparation checkpoint must remain recoverable");
         assert_eq!(inspection.state, DeleteRecoveryState::NewPrepared);
-        reopened
-            .settle_delete_transaction("recovery", "object", transaction, inspection.fingerprint, DeleteRecoveryAction::Rollback)
+        let reopened_tx = reopened
+            .io_get_object_path("recovery", &format!("object/{transaction}"))
+            .expect("reopened transaction path");
+        os::fsync_dir_recorder::set_failure(&reopened_tx, ErrorKind::Other);
+        assert!(
+            reopened
+                .settle_delete_transaction(
+                    "recovery",
+                    "object",
+                    transaction,
+                    inspection.fingerprint,
+                    DeleteRecoveryAction::Rollback
+                )
+                .await
+                .is_err(),
+            "failed transaction directory sync after backup removal must retain journal"
+        );
+        assert!(reopened_tx.join(PREPARED).is_file());
+        assert!(!reopened_tx.join(STORAGE_FORMAT_FILE_BACKUP).exists());
+        let retry_inspection = reopened
+            .delete_recovery_inspect("recovery", "object", transaction)
+            .await
+            .expect("inspect interrupted rollback");
+        assert_eq!(retry_inspection.state, DeleteRecoveryState::NewPrepared);
+        let settled = reopened
+            .settle_delete_transaction(
+                "recovery",
+                "object",
+                transaction,
+                retry_inspection.fingerprint,
+                DeleteRecoveryAction::Rollback,
+            )
             .await
             .expect("roll back interrupted preparation");
+        assert_eq!(settled.state, DeleteRecoveryState::Absent, "same-inode backup must not survive rollback");
+        assert!(!checkpoint_root.join(transaction.to_string()).exists());
         assert_eq!(
             fs::read(checkpoint_root.join(STORAGE_FORMAT_FILE))
                 .await
