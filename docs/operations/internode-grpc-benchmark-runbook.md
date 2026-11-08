@@ -118,6 +118,53 @@ For fleet-wide transport changes such as switching between plaintext and TLS, st
 
 Object workload latency and RPC latency describe different boundaries. Verify that the intended bulk RPCs actually occurred before attributing isolation, pool or window effects; large S3 objects alone do not prove large unary gRPC payload coverage. Record the histogram boundaries when comparing code versions: a finer bucket layout changes quantile estimates without establishing a latency improvement. Keep the instrument name, units and client/server boundaries with the raw evidence.
 
+## Measurement identity and maintenance observations
+
+Freeze a fresh main revision and candidate before rebuilding both binaries in separate source and Cargo target directories. Record the actual deployed executable identity, configuration, workload and resource ownership. Earlier reports remain attached to their original revisions. Run fault recovery on separate test volumes from the steady-state campaign, or finish recovery and demonstrate stable maintenance observations before measuring. Keep healing enabled; bypassing recovery changes the correctness contract.
+
+`ReadVersion` uses the control channel and already exports `read_version_request_encode`, `read_version_rpc_roundtrip` and `read_version_response_decode` under `rustfs_system_network_internode_operation_stage_duration_ms`; its server stages include `read_version_disk_read`. Metrics export enables these GET stages without the PUT-specific stage flag. The roundtrip timer starts after Channel acquisition, so it does not measure TLS cache or connection acquisition. Ordinary small-object GET can predominantly exercise this control method. Confirm the actual bulk methods, payloads and achieved control request rate before changing bulk settings.
+
+Normal GET aggregation requires `RUSTFS_GET_METADATA_READ_VERSION_COALESCE=auto|on`, which defaults off. Setting only `RUSTFS_METADATA_BATCH_READ` does not assemble GET batches. The remote batch gate resolves `RUSTFS_GET_METADATA_READ_VERSION_COALESCE` before `RUSTFS_METADATA_BATCH_READ`, then the legacy `RUSTFS_BATCH_METADATA_RPC`; `auto` can fall back on UNIMPLEMENTED, while `on` cannot. Restart after changing these cached gates and verify `rustfs_get_metadata_read_version_coalescer_total{event="attempted_batch"}` and `rustfs_remote_disk_batch_read_version_gate_total{mode,decision}`. Treat enabling aggregation as its own experiment because it changes the method distribution and adds the coalescing delay.
+
+For each cell, record prepare, warmup, measure and cleanup separately. Request-level timestamps from the load driver define the measurement window; a Prometheus snapshot bracketing the entire Warp command includes preparation and cleanup. Do not divide such counter deltas by the timed workload duration or call object STAT/GET P99 a control-RPC P99. Record cumulative histogram bucket bounds and per-series timestamps; a bucket upper bound is not an exact quantile. Use external RPC samples for comparisons across changed bucket layouts.
+
+The offline [maintenance-window checker](../../scripts/check_internode_grpc_window.py) consumes recorded OTLP JSON, retaining resource identity and producer point timestamps that a collector's cached Prometheus exposition may conceal. Build one snapshot per observation from the most recent export of each current RustFS process. Do not concatenate multiple exports of the same series into a snapshot. Independently record each node's PID, `/proc/<pid>/stat` start-time ticks and `/proc/sys/kernel/random/boot_id` at every observation; process names can contain spaces and parentheses, so parse the fields after the final `)` before reading the start-time field. A PID alone does not detect reuse, and start-time ticks alone do not detect a reboot. Synchronize producer and capture clocks, and predeclare export-age and sample-gap budgets suitable for the configured export interval. Repeated cached points, stale/future points, resets, missing required gauges, process changes and phase mismatches invalidate evidence.
+
+The manifest is a bounded JSON object with this shape; replace the illustrative timestamps and identities with recorded values. Capture times at the first and last observations must match the driver-marked measurement boundaries. Every sample carries an independent process observation, even when the identity is unchanged.
+
+```json
+{
+  "scope": "measurement",
+  "start_ns": 100000000000,
+  "end_ns": 220000000000,
+  "max_sample_gap_ns": 2000000000,
+  "max_export_age_ns": 2000000000,
+  "processes": [{"node": "node1", "pid": 101, "start_ticks": 500, "boot_id": "11111111-1111-4111-8111-111111111111"}],
+  "samples": [
+    {"phase": "measurement", "captured_ns": 100000000000, "path": "measure-start.json", "processes": [{"node": "node1", "pid": 101, "start_ticks": 500, "boot_id": "11111111-1111-4111-8111-111111111111"}]},
+    {"phase": "measurement", "captured_ns": 102000000000, "path": "measure-002.json", "processes": [{"node": "node1", "pid": 101, "start_ticks": 500, "boot_id": "11111111-1111-4111-8111-111111111111"}]}
+  ]
+}
+```
+
+Include all intermediate observations and a final sample at `end_ns`; the abbreviated example is intentionally incomplete and does not pass. The `node` value matches OTLP `service.instance.id`, and `pid` matches `process.pid`. Supply every test node in each process inventory; `--expected-nodes` defaults to four and rejects a partial inventory. The checker ignores exports from other processes, requires current-process MRF, heal-activity and scanner-activity gauges on every node, checks optional running-task gauges when present, and detects heal-start counter increments even if the gauge is zero at both endpoints. Lazy counters may be absent while idle; a newly appearing nonzero counter is activity, not an assumed zero baseline.
+
+```bash
+python3 scripts/check_internode_grpc_window.py --manifest /path/to/cell/window.json --out /path/to/cell/maintenance-report.json
+```
+
+Exit 0 means the sampled maintenance observations were stable, 1 means activity was observed, and 2 means the evidence is invalid. The report binds the manifest and each snapshot's SHA-256. Use a fresh output path per invocation and retain the exit status; exit 2 cannot qualify even if an earlier report exists. This does not authorize performance attribution or establish that no activity occurred between samples: method coverage, external RPC timing, sufficient duration/sample count, errors, resource isolation and baseline/ABBA drift gates remain separate requirements. Do not relabel old whole-command snapshots as measurement-only evidence or fill missing points with zero. Collect native OTLP for new experiments; the checker deliberately does not turn old Prometheus snapshots into fresh producer observations.
+
+Use this zero-maintenance check for isolated experiments that predeclare maintenance-free observations. A busy verdict is not a production health failure: legitimate healing or scanning under mixed load can be part of the workload. Such experiments need a separately declared maintenance-rate/queue envelope and comparable system observations on both sides; do not disable required recovery or reuse the zero-maintenance verdict as their general acceptance criterion.
+
+The shared server currently uses fixed HTTP/2 receive windows. With locked Hyper 1.12.0, the fixed stream and connection window setters following `adaptive_window(true)` disable adaptation. Moving that call last would change flow-control behavior; it is a separate experiment affecting the shared HTTP/2 listener, not a no-op cleanup. Keep fixed-window and adaptive-policy changes separate from client receive-window experiments.
+
+## Shutdown diagnostics
+
+Enable the existing `RUSTFS_OBS_LOG_STDOUT_ENABLED=true` on the task-owned diagnostic deployment and verify the sink before testing; `RUST_LOG` only sets filtering. Select the server module at debug level for the low-frequency `http_connection_drain` lifecycle events, while keeping other filtering identical between compared cells. Record `graceful_retired`, `children_retired`, `tls_reloader_retired`, and timeout `phase` (`graceful`, `child_join`, `completion_observed`, or `tls_reloader`), elapsed time, budget available at phase entry and tracked future count. `completion_observed` means the result was observed after the original deadline, not that tasks remain running. A tracked-future count is a snapshot, not proof that the original JoinHandles have been observed. No task identity, request body or credential is emitted by these diagnostics.
+
+Reproduce empty/active RPC drains on baseline and candidate, plaintext and TLS, single-node and full-stop barriers, with independent test data. Preserve the first deadline failure even if every process eventually exits. The original shared deadline remains authoritative, and timeout still waits for the real child/reloader retirement. Never abort accepted writes, discard join evidence, clear unclean-shutdown markers or extend the deadline merely to make a benchmark green. Compare confirmed writes and recovery state before declaring a shutdown fix.
+
 ## Acceptance gates
 
 Record the verdict (pass/fail plus measured delta) in the paired directory's summary.

@@ -90,7 +90,7 @@ use std::io::{Error, Result};
 use std::net::{IpAddr, SocketAddr};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
@@ -880,6 +880,8 @@ async fn retire_http12_children(
     unverified_tls_reloader: bool,
     active_connections: usize,
 ) -> Http12ShutdownOutcome {
+    let started = tokio::time::Instant::now();
+    let graceful_complete = AtomicBool::new(false);
     #[cfg(test)]
     if let Some(control) = tasks.test_control() {
         *control.deadline.lock() = Some(deadline);
@@ -887,6 +889,16 @@ async fn retire_http12_children(
     }
     let drain = async {
         graceful.await;
+        graceful_complete.store(true, Ordering::Relaxed);
+        debug!(
+            event = EVENT_HTTP_CONNECTION_DRAIN,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "graceful_retired",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            tracked_futures = tasks.0.tracker.len(),
+            "HTTP graceful shutdown retired"
+        );
         #[cfg(test)]
         if let Some(control) = tasks.test_control() {
             control.graceful_finished.cancel();
@@ -902,6 +914,16 @@ async fn retire_http12_children(
             component = LOG_COMPONENT_SERVER,
             subsystem = LOG_SUBSYSTEM_TRANSPORT,
             state = "timeout",
+            phase = if observed.is_ok() {
+                "completion_observed"
+            } else if graceful_complete.load(Ordering::Relaxed) {
+                "child_join"
+            } else {
+                "graceful"
+            },
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            budget_ms = deadline.saturating_duration_since(started).as_secs_f64() * 1000.0,
+            tracked_futures = tasks.0.tracker.len(),
             active_connections,
             timeout_secs = 10,
             "HTTP connection drain timed out"
@@ -911,6 +933,16 @@ async fn retire_http12_children(
         Ok(result) => result,
         Err(_) => drain.as_mut().await,
     };
+    debug!(
+        event = EVENT_HTTP_CONNECTION_DRAIN,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        state = "children_retired",
+        deadline_missed,
+        child_failures,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "HTTP child tasks retired"
+    );
     Http12ShutdownOutcome {
         deadline_missed,
         first_child_error,
@@ -944,15 +976,38 @@ pub(super) async fn retire_tls_reloader(
     outcome: &mut Http12ShutdownOutcome,
     deadline: tokio::time::Instant,
 ) {
+    let started = tokio::time::Instant::now();
     let stop = task.wait_stopped();
     tokio::pin!(stop);
     let observed = tokio::time::timeout_at(deadline, stop.as_mut()).await;
-    outcome.deadline_missed |= observed.is_err() || tokio::time::Instant::now() >= deadline;
+    let deadline_missed = observed.is_err() || tokio::time::Instant::now() >= deadline;
+    outcome.deadline_missed |= deadline_missed;
+    if deadline_missed {
+        warn!(
+            event = EVENT_HTTP_CONNECTION_DRAIN,
+            component = LOG_COMPONENT_SERVER,
+            subsystem = LOG_SUBSYSTEM_TRANSPORT,
+            state = "timeout",
+            phase = "tls_reloader",
+            elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+            budget_ms = deadline.saturating_duration_since(started).as_secs_f64() * 1000.0,
+            "TLS reloader retirement timed out"
+        );
+    }
     outcome.unverified_tls_reloader = true;
     outcome.tls_reloader = Some(match observed {
         Ok(receipt) => receipt,
         Err(_) => stop.as_mut().await,
     });
+    debug!(
+        event = EVENT_HTTP_CONNECTION_DRAIN,
+        component = LOG_COMPONENT_SERVER,
+        subsystem = LOG_SUBSYSTEM_TRANSPORT,
+        state = "tls_reloader_retired",
+        deadline_missed,
+        elapsed_ms = started.elapsed().as_secs_f64() * 1000.0,
+        "TLS reloader retired"
+    );
 }
 
 #[cfg(test)]
