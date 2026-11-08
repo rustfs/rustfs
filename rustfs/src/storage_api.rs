@@ -523,8 +523,6 @@ pub(crate) mod table {
     #[cfg(test)]
     pub(crate) mod test_support {
         pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::init_bucket_metadata_sys;
-        pub(crate) use crate::storage::storage_api::ecstore_bucket::metadata_sys::test_support::isolated_store_over_temp_disks;
     }
 }
 

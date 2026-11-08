@@ -20,12 +20,12 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use futures::{FutureExt, future::BoxFuture};
 use rustfs_lock::{
-    LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
+    LockCleanupOutcome, LockClient, LockError, LockInfo, LockRequest, LockResponse, LockStats, LockStatus, LockType, Result,
     types::{LockId, LockMetadata, LockPriority},
 };
 use rustfs_protos::proto_gen::node_service::{
     BatchGenerallyLockRequest, BatchGenerallyLockResponse, GenerallyLockRequest, GenerallyLockResponse, GenerallyLockResult,
-    PingRequest,
+    LockReleaseStatus, PingRequest,
 };
 use rustfs_protos::{
     ConnectionEvictionLogLevel, evict_failed_connection_with_log_level, models::PingBodyBuilder,
@@ -281,6 +281,31 @@ fn acquired_lock_ids(lock_ids: &[LockId], results: &[GenerallyLockResult]) -> Ve
         .collect()
 }
 
+fn cleanup_outcome(success: bool, error_info: Option<&str>, release_status: i32) -> Result<LockCleanupOutcome> {
+    let status =
+        LockReleaseStatus::try_from(release_status).map_err(|_| LockError::internal("Unknown remote lock release status"))?;
+    match status {
+        LockReleaseStatus::AlreadyAbsent if !success => Ok(LockCleanupOutcome::AlreadyAbsent),
+        LockReleaseStatus::Released if success && error_info.is_none() => Ok(LockCleanupOutcome::Released),
+        LockReleaseStatus::Unspecified => {
+            if let Some(error) = error_info {
+                Err(LockError::internal(error))
+            } else if success {
+                Ok(LockCleanupOutcome::Released)
+            } else {
+                Ok(LockCleanupOutcome::Unconfirmed)
+            }
+        }
+        _ => Err(LockError::internal("Inconsistent remote lock release status")),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum AcquisitionCleanup {
+    Confirmed,
+    Uncertain,
+}
+
 /// Remote lock client implementation
 #[derive(Debug, Clone)]
 pub struct RemoteClient {
@@ -290,13 +315,18 @@ pub struct RemoteClient {
 impl RemoteClient {
     const ONLINE_CHECK_RESOURCE: &'static str = "health-lock-online";
 
-    fn record_release_ack(&self, lock_id: &LockId) {
+    fn record_release_ack(&self, lock_id: &LockId, outcome: LockCleanupOutcome) {
         tracing::trace!(
             target: "rustfs_ecstore::object_lock_diag",
             event = EVENT_NAMESPACE_LOCK_RELEASE,
             component = LOG_COMPONENT_ECSTORE,
             subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
             state = "acknowledged",
+            result = match outcome {
+                LockCleanupOutcome::Released => "released",
+                LockCleanupOutcome::AlreadyAbsent => "already_absent",
+                LockCleanupOutcome::Unconfirmed => "unconfirmed",
+            },
             peer_kind = "remote",
             lock_id = %lock_id,
             peer = %self.addr,
@@ -393,11 +423,15 @@ impl RemoteClient {
     /// peer toward the offline threshold. See issue #4567.
     fn is_transport_failure(status: &tonic::Status) -> bool {
         use tonic::Code;
+        // A valid stale-epoch request is rejected before execution. Its signed
+        // response refreshes the peer epoch on the existing healthy channel.
+        let epoch_rejection = status.code() == Code::Unavailable && status.message() == "RPC boot epoch changed";
         std::error::Error::source(status).is_some()
-            || matches!(
-                status.code(),
-                Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
-            )
+            || (!epoch_rejection
+                && matches!(
+                    status.code(),
+                    Code::Unavailable | Code::DeadlineExceeded | Code::Unknown | Code::Cancelled
+                ))
     }
 
     async fn evict_connection(&self, op: &'static str, reason: &str, resource_summary: &str) {
@@ -803,7 +837,9 @@ impl RemoteClient {
         Some(Box::new(move |response: Response<GenerallyLockResponse>| {
             Box::pin(async move {
                 if response.get_ref().success {
-                    client.release_late_acquisitions(vec![lock_id]).await;
+                    client
+                        .release_late_acquisitions(vec![lock_id], AcquisitionCleanup::Confirmed)
+                        .await;
                 }
             })
         }))
@@ -815,7 +851,9 @@ impl RemoteClient {
             Box::pin(async move {
                 let acquired = acquired_lock_ids(&lock_ids, &response.get_ref().results);
                 if !acquired.is_empty() {
-                    client.release_late_acquisitions(acquired).await;
+                    client
+                        .release_late_acquisitions(acquired, AcquisitionCleanup::Confirmed)
+                        .await;
                 }
             })
         }))
@@ -825,19 +863,98 @@ impl RemoteClient {
         let client = self.clone();
         Some(Box::new(move |_| {
             Box::pin(async move {
-                client.release_late_acquisitions(lock_ids).await;
+                // Absence cannot settle an acquisition whose grant is still
+                // uncertain. Keep the conservative retry schedule.
+                client
+                    .release_late_acquisitions(lock_ids, AcquisitionCleanup::Uncertain)
+                    .await;
             })
         }))
     }
 
-    /// A lock granted after its caller stopped waiting is an orphan until its
-    /// lease expires; hand it back right away, best effort.
-    async fn release_late_acquisitions(&self, mut lock_ids: Vec<LockId>) {
+    async fn request_release(&self, lock_id: &LockId) -> Result<GenerallyLockResponse> {
+        let unlock_request = Self::create_unlock_request(lock_id);
+        let request_string = serde_json::to_string(&unlock_request)
+            .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
+        let mut client = self.get_client().await?;
+        let resource_summary = unlock_request.resource.to_string();
+        let mut req = Request::new(GenerallyLockRequest { args: request_string });
+        attach_lock_mutation_body_digest(&mut req)?;
+        Ok(self
+            .execute_rpc(
+                "release",
+                &resource_summary,
+                Self::rpc_timeout(),
+                async move { client.un_lock(req).await },
+                RpcCleanup::new(None, None, None),
+            )
+            .await?
+            .into_inner())
+    }
+
+    async fn request_release_batch(&self, lock_ids: &[LockId]) -> Result<BatchGenerallyLockResponse> {
+        let unlock_requests = lock_ids.iter().map(Self::create_unlock_request).collect::<Vec<_>>();
+        let mut client = self.get_client().await?;
+        let resource_summary = Self::summarize_resources(&unlock_requests);
+        let mut req = Request::new(BatchGenerallyLockRequest {
+            args: unlock_requests
+                .iter()
+                .map(|request| {
+                    serde_json::to_string(request).map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        });
+        attach_lock_mutation_body_digest(&mut req)?;
+
+        Ok(self
+            .execute_rpc(
+                "release_batch",
+                &resource_summary,
+                Self::rpc_timeout(),
+                async move { client.un_lock_batch(req).await },
+                RpcCleanup::new(None, None, None),
+            )
+            .await?
+            .into_inner())
+    }
+
+    fn cleanup_batch_results(&self, lock_ids: &[LockId], results: &[GenerallyLockResult]) -> Vec<LockCleanupOutcome> {
+        lock_ids
+            .iter()
+            .enumerate()
+            .map(|(idx, lock_id)| {
+                let outcome = results
+                    .get(idx)
+                    .and_then(|result| cleanup_outcome(result.success, result.error_info.as_deref(), result.release_status).ok())
+                    .unwrap_or(LockCleanupOutcome::Unconfirmed);
+                if matches!(outcome, LockCleanupOutcome::Released | LockCleanupOutcome::AlreadyAbsent) {
+                    self.record_release_ack(lock_id, outcome);
+                }
+                outcome
+            })
+            .collect()
+    }
+
+    async fn cleanup_grants_batch(&self, lock_ids: &[LockId]) -> Result<Vec<LockCleanupOutcome>> {
+        if lock_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let response = self.request_release_batch(lock_ids).await?;
+        Ok(self.cleanup_batch_results(lock_ids, &response.results))
+    }
+
+    /// A confirmed late grant can settle on authoritative absence. An
+    /// uncertain acquisition must retain retries because release may race it.
+    async fn release_late_acquisitions(&self, mut lock_ids: Vec<LockId>, acquisition: AcquisitionCleanup) {
         if !self.admit_late_release() {
             rustfs_io_metrics::lock_metrics::record_remote_lock_late_release("failed");
             let (log_warning, suppressed_timeouts) = self.timeout_log_decision("late_release", Self::rpc_timeout());
             if log_warning {
                 warn!(
+                    event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                    state = "budget_exhausted",
                     addr = %self.addr,
                     count = lock_ids.len(),
                     outcome = "budget_exhausted",
@@ -855,12 +972,27 @@ impl RemoteClient {
                 tokio::time::sleep(delay).await;
             }
 
-            match self.release_locks_batch(&lock_ids).await {
+            let released = match acquisition {
+                AcquisitionCleanup::Confirmed => self.cleanup_grants_batch(&lock_ids).await,
+                AcquisitionCleanup::Uncertain => self.release_locks_batch(&lock_ids).await.map(|results| {
+                    results
+                        .into_iter()
+                        .map(|released| {
+                            if released {
+                                LockCleanupOutcome::Released
+                            } else {
+                                LockCleanupOutcome::Unconfirmed
+                            }
+                        })
+                        .collect()
+                }),
+            };
+            match released {
                 Ok(released) => {
                     lock_ids = lock_ids
                         .into_iter()
                         .zip(released)
-                        .filter_map(|(lock_id, released)| (!released).then_some(lock_id))
+                        .filter_map(|(lock_id, outcome)| matches!(outcome, LockCleanupOutcome::Unconfirmed).then_some(lock_id))
                         .collect();
                     if lock_ids.is_empty() {
                         outcome = "released";
@@ -884,10 +1016,10 @@ impl RemoteClient {
                 event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
                 component = LOG_COMPONENT_ECSTORE,
                 subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
-                state = "late_grants_released",
+                state = "late_cleanup_completed",
                 addr = %self.addr,
                 count = original_count,
-                "Released remote locks granted after their caller stopped waiting"
+                "Confirmed cleanup of late remote lock acquisitions"
             );
         } else {
             let (log_warning, suppressed_timeouts) = self.timeout_log_decision("late_release", Self::rpc_timeout());
@@ -896,15 +1028,25 @@ impl RemoteClient {
                     event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
                     component = LOG_COMPONENT_ECSTORE,
                     subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
-                    state = "late_grants_unreleased",
+                    state = "late_cleanup_unconfirmed",
                     addr = %self.addr,
                     count = original_count,
                     outcome,
                     suppressed_timeouts,
-                    "Could not release every remote lock granted after its caller stopped waiting; the server lease will expire it"
+                    "Could not confirm cleanup of every late remote lock acquisition"
                 );
             } else {
-                debug!(addr = %self.addr, count = original_count, outcome, suppressed_timeouts, "Suppressed repeated late remote lock release warning");
+                debug!(
+                    event = EVENT_REMOTE_LOCK_RPC_CLEANUP,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REMOTE_LOCK,
+                    state = "warning_suppressed",
+                    addr = %self.addr,
+                    count = original_count,
+                    outcome,
+                    suppressed_timeouts,
+                    "Suppressed repeated late remote lock cleanup warning"
+                );
             }
         }
     }
@@ -1352,68 +1494,37 @@ impl LockClient for RemoteClient {
     }
 
     async fn release(&self, lock_id: &LockId) -> Result<bool> {
-        let unlock_request = Self::create_unlock_request(lock_id);
-        let request_string = serde_json::to_string(&unlock_request)
-            .map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))?;
-        let mut client = self.get_client().await?;
-        let resource_summary = unlock_request.resource.to_string();
-        let mut req = Request::new(GenerallyLockRequest { args: request_string });
-        attach_lock_mutation_body_digest(&mut req)?;
-        let resp = self
-            .execute_rpc(
-                "release",
-                &resource_summary,
-                Self::rpc_timeout(),
-                async move { client.un_lock(req).await },
-                RpcCleanup::new(None, None, None),
-            )
-            .await?
-            .into_inner();
+        let resp = self.request_release(lock_id).await?;
         if let Some(error_info) = resp.error_info {
             return Err(LockError::internal(error_info));
         }
         if resp.success {
-            self.record_release_ack(lock_id);
+            self.record_release_ack(lock_id, LockCleanupOutcome::Released);
         }
         Ok(resp.success)
+    }
+
+    async fn cleanup_grant(&self, lock_id: &LockId) -> Result<LockCleanupOutcome> {
+        let resp = self.request_release(lock_id).await?;
+        let outcome = cleanup_outcome(resp.success, resp.error_info.as_deref(), resp.release_status)?;
+        if matches!(outcome, LockCleanupOutcome::Released | LockCleanupOutcome::AlreadyAbsent) {
+            self.record_release_ack(lock_id, outcome);
+        }
+        Ok(outcome)
     }
 
     async fn release_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
         if lock_ids.is_empty() {
             return Ok(Vec::new());
         }
-
-        let unlock_requests = lock_ids.iter().map(Self::create_unlock_request).collect::<Vec<_>>();
-        let mut client = self.get_client().await?;
-        let resource_summary = Self::summarize_resources(&unlock_requests);
-        let mut req = Request::new(BatchGenerallyLockRequest {
-            args: unlock_requests
-                .iter()
-                .map(|request| {
-                    serde_json::to_string(request).map_err(|e| LockError::internal(format!("Failed to serialize request: {e}")))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        });
-        attach_lock_mutation_body_digest(&mut req)?;
-
-        let resp = self
-            .execute_rpc(
-                "release_batch",
-                &resource_summary,
-                Self::rpc_timeout(),
-                async move { client.un_lock_batch(req).await },
-                RpcCleanup::new(None, None, None),
-            )
-            .await?
-            .into_inner();
-
+        let resp = self.request_release_batch(lock_ids).await?;
         Ok(lock_ids
             .iter()
             .enumerate()
             .map(|(idx, lock_id)| {
                 let result = resp.results.get(idx);
                 if result.is_some_and(|result| result.success && result.error_info.is_none()) {
-                    self.record_release_ack(lock_id);
+                    self.record_release_ack(lock_id, LockCleanupOutcome::Released);
                 }
                 result.map(|result| result.success).unwrap_or(false)
             })
@@ -1615,6 +1726,84 @@ impl LockClient for RemoteClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cleanup_outcome_requires_authoritative_absence() {
+        assert_eq!(
+            cleanup_outcome(false, Some("diagnostic text is not a protocol"), LockReleaseStatus::AlreadyAbsent.into())
+                .expect("structured absence is authoritative"),
+            LockCleanupOutcome::AlreadyAbsent
+        );
+        assert!(cleanup_outcome(false, Some("lock not found for release"), LockReleaseStatus::Unspecified.into()).is_err());
+        assert_eq!(
+            cleanup_outcome(false, None, LockReleaseStatus::Unspecified.into()).expect("legacy result is uncertain"),
+            LockCleanupOutcome::Unconfirmed
+        );
+        for status in [LockReleaseStatus::Unspecified, LockReleaseStatus::Released] {
+            assert_eq!(
+                cleanup_outcome(true, None, status.into()).expect("positive release ACK"),
+                LockCleanupOutcome::Released
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_outcome_rejects_inconsistent_and_unknown_statuses() {
+        for (success, error, status) in [
+            (true, None, LockReleaseStatus::AlreadyAbsent.into()),
+            (false, None, LockReleaseStatus::Released.into()),
+            (true, Some("backend error"), LockReleaseStatus::Released.into()),
+            (true, None, 99),
+            (false, Some("backend error"), 99),
+        ] {
+            assert!(
+                cleanup_outcome(success, error, status).is_err(),
+                "must retain cleanup ownership for status {status}"
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_batch_results_preserves_each_lock_id_and_unknown_entries() {
+        let client = RemoteClient::new("http://cleanup-batch-results-test".to_string());
+        let lock_ids = (0..5)
+            .map(|idx| LockId::new_unique(&ObjectKey::new("bucket", format!("cleanup-{idx}"))))
+            .collect::<Vec<_>>();
+        let results = vec![
+            GenerallyLockResult {
+                success: true,
+                release_status: LockReleaseStatus::Released.into(),
+                ..Default::default()
+            },
+            GenerallyLockResult {
+                success: false,
+                error_info: Some("already released".to_string()),
+                release_status: LockReleaseStatus::AlreadyAbsent.into(),
+                ..Default::default()
+            },
+            GenerallyLockResult {
+                success: false,
+                error_info: Some("lock not found for release".to_string()),
+                ..Default::default()
+            },
+            GenerallyLockResult {
+                success: true,
+                release_status: 99,
+                ..Default::default()
+            },
+        ];
+        assert_eq!(
+            client.cleanup_batch_results(&lock_ids, &results),
+            vec![
+                LockCleanupOutcome::Released,
+                LockCleanupOutcome::AlreadyAbsent,
+                LockCleanupOutcome::Unconfirmed,
+                LockCleanupOutcome::Unconfirmed,
+                LockCleanupOutcome::Unconfirmed,
+            ],
+            "missing or unrecognized entries must not hide confirmed cleanup of other IDs"
+        );
+    }
     use crate::runtime::sources as runtime_sources;
     use rustfs_lock::{ObjectKey, types::LockPriority};
     use tokio::net::TcpListener;
@@ -2640,6 +2829,37 @@ mod tests {
                 "{code:?} is an application status and must not be treated as a transport failure"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn stale_boot_epoch_rejections_do_not_open_lock_request_breaker() {
+        let addr = "http://stale-boot-epoch-lock-breaker:9000";
+        let client = RemoteClient::new(addr.to_string());
+        reset_lock_peer_health_for_test(addr);
+
+        for _ in 0..LOCK_RPC_REQUEST_BACKOFF_THRESHOLD {
+            let error = client
+                .execute_rpc::<(), _>(
+                    "lock",
+                    "bucket/new-object",
+                    Duration::from_secs(1),
+                    async { Err(tonic::Status::unavailable("RPC boot epoch changed")) },
+                    RpcCleanup::new(None, None, None),
+                )
+                .await
+                .expect_err("a stale epoch still rejects the operation before execution");
+            assert!(error.to_string().contains("RPC boot epoch changed"));
+        }
+
+        let health = lock_peer_health_for_test(addr);
+        assert_eq!(health.request_consecutive_timeouts, 0);
+        assert!(health.request_backoff_until.is_none());
+        assert!(health.last_eviction.is_none());
+        let admission = client
+            .admit_lock_request("lock")
+            .expect("authenticated epoch refresh may proceed immediately");
+        client.release_lock_request("lock", Some(admission));
+        reset_lock_peer_health_for_test(addr);
     }
 
     #[test]

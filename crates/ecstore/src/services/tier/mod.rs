@@ -26,6 +26,7 @@ pub(crate) mod tier_probe_intent;
 pub mod warm_backend;
 pub mod warm_backend_aliyun;
 pub mod warm_backend_azure;
+pub mod warm_backend_azure_blob;
 #[cfg(feature = "gcs")]
 pub mod warm_backend_gcs;
 pub mod warm_backend_huaweicloud;

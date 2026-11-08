@@ -445,6 +445,13 @@ impl ECStore {
             return Ok(());
         }
 
+        let scoped_cleanup = opts
+            .scanner_publication_commit_scope
+            .as_ref()
+            .zip(opts.http_preconditions.as_ref())
+            .filter(|_| bucket == RUSTFS_META_BUCKET && opts.delete_prefix_object);
+        let _cleanup_outcome =
+            scoped_cleanup.map(|(scope, _)| crate::object_api::ScannerPublicationCommitScopeGuard::new(scope.clone()));
         let mut first_error = None;
         let mut first_volume_error = None;
         let mut has_success = false;
@@ -457,9 +464,30 @@ impl ECStore {
             }
             let mut opts = opts.clone();
             opts.delete_prefix = true;
+            if let Some((scope, preconditions)) = scoped_cleanup {
+                // The exact-object delete retains its namespace writer across
+                // this lookup and dispatch. Never remove an unobserved revision.
+                let lookup = ObjectOptions {
+                    no_lock: true,
+                    suppress_read_repair: true,
+                    preserve_delete_marker: true,
+                    ..Default::default()
+                };
+                let disks = pool.get_disks_by_key(object);
+                let current = disks.get_object_info(bucket, object, &lookup).await;
+                if let Some(error) =
+                    crate::set_disk::SetDisks::evaluate_write_precondition(current, preconditions, bucket, object, &lookup)
+                {
+                    if matches!(error, StorageError::PreconditionFailed) || crate::error::is_err_object_not_found(&error) {
+                        continue;
+                    }
+                    return Err(error);
+                }
+                opts.scanner_publication_commit_scope = Some(scope.pool_delete_participant());
+            }
             match pool.delete_object(bucket, object, opts).await {
                 Ok(_) => has_success = true,
-                Err(err) if is_err_strict_volume_not_found(&err) => {
+                Err(err) if scoped_cleanup.is_none() && is_err_strict_volume_not_found(&err) => {
                     if first_volume_error.is_none() {
                         first_volume_error = Some(err);
                     }
@@ -472,14 +500,21 @@ impl ECStore {
             }
         }
 
-        match first_error {
+        let result = match first_error {
             Some(err) => Err(err),
             None if has_success => Ok(()),
             None => match first_volume_error {
                 Some(err) => Err(err),
+                None if scoped_cleanup.is_some() => Err(StorageError::PreconditionFailed),
                 None => Ok(()),
             },
+        };
+        if let Some((scope, _)) = scoped_cleanup
+            && result.is_ok()
+        {
+            let _ = scope.mark_committed();
         }
+        result
     }
 
     pub(super) async fn get_available_pool_idx(&self, bucket: &str, object: &str, size: i64) -> Option<usize> {
@@ -1377,6 +1412,129 @@ mod tests {
         .expect("multi-pool store should initialize");
         crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
         (temp_dir, store, shutdown)
+    }
+
+    async fn run_scanner_observed_cleanup(
+        if_match_override: Option<&str>,
+        second_payload: Option<&[u8]>,
+        lose_second_quorum: bool,
+    ) -> (
+        Result<crate::object_api::ObjectInfo>,
+        crate::object_api::ScannerPublicationCommitState,
+        Vec<bool>,
+    ) {
+        use crate::config::com::save_config_with_opts_and_metadata;
+        use crate::storage_api_contracts::object::HTTPPreconditions;
+        use std::time::Duration;
+
+        let (_directories, store, shutdown) = setup_multi_pool_test_store("scanner-observed-cleanup", &[4, 4]).await;
+        let object = "buckets/.usage.observed.json";
+        let mut tags = Vec::new();
+        let old_payload = b"old observed snapshot";
+        for (pool, payload) in store.pools.iter().zip([Some(old_payload.as_slice()), second_payload]) {
+            let Some(payload) = payload else { continue };
+            let info = save_config_with_opts_and_metadata(pool.clone(), object, payload.to_vec(), &ObjectOptions::default())
+                .await
+                .expect("seed an observed snapshot on each pool");
+            tags.push(info.etag.expect("seed has CAS tag"));
+        }
+        if let Some(second_payload) = second_payload {
+            assert_eq!(tags[0] == tags[1], old_payload == second_payload);
+        }
+        let epoch = store.scanner_data_usage_publication_epoch().await.expect("publication epoch");
+        let scope = store
+            .scanner_data_usage_publication_commit_scope(epoch, tokio::time::Instant::now() + Duration::from_secs(30), Vec::new())
+            .await
+            .expect("admit observed cleanup");
+        let disconnected = if lose_second_quorum {
+            let pool = &store.pools[1];
+            tokio::time::timeout(Duration::from_secs(10), pool.stop_endpoint_monitor_for_test())
+                .await
+                .expect("fixture must own the disk slots");
+            let set = pool.get_disks_by_key(object);
+            let original = {
+                let mut disks = set.disks.write().await;
+                let offline = vec![None; disks.len()];
+                std::mem::replace(&mut *disks, offline)
+            };
+            Some((set, original))
+        } else {
+            None
+        };
+        let result = store
+            .delete_object(
+                crate::disk::RUSTFS_META_BUCKET,
+                object,
+                ObjectOptions {
+                    delete_prefix: true,
+                    delete_prefix_object: true,
+                    http_preconditions: Some(HTTPPreconditions {
+                        if_match: Some(if_match_override.map_or_else(|| tags.remove(0), str::to_owned)),
+                        ..Default::default()
+                    }),
+                    scanner_publication_commit_scope: Some(scope.clone()),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if let Some((set, disks)) = disconnected {
+            *set.disks.write().await = disks;
+            assert!(!scope.release_movement_permit().await, "partial cleanup cannot release its permit");
+        }
+        let mut still_present = Vec::new();
+        for pool in &store.pools {
+            still_present.push(
+                read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object)
+                    .await
+                    .is_ok(),
+            );
+        }
+        shutdown.cancel();
+        (result, scope.state(), still_present)
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_keep_scope_live_across_both_pools() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"old observed snapshot"), false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_preserve_both_pools_if_cas_changed() {
+        let (result, state, still_present) =
+            run_scanner_observed_cleanup(Some("stale-cas-token"), Some(b"old observed snapshot"), false).await;
+        assert!(
+            matches!(result, Err(StorageError::PreconditionFailed))
+                && state == crate::object_api::ScannerPublicationCommitState::AbortedBeforeCommit
+                && still_present == [true, true],
+            "result {result:?}, scope {state:?}, pool copies {still_present:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_preserve_a_nonmatching_pool_copy() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"newer observed snapshot"), false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, true]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_succeed_when_another_pool_has_no_copy() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, None, false).await;
+        assert!(result.is_ok(), "result {result:?}, scope {state:?}, pool copies {still_present:?}");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Committed);
+        assert_eq!(still_present, vec![false, false]);
+    }
+
+    #[tokio::test]
+    async fn scanner_observed_cleanup_must_retain_ownership_after_partial_failure() {
+        let (result, state, still_present) = run_scanner_observed_cleanup(None, Some(b"old observed snapshot"), true).await;
+        assert!(result.is_err(), "partial cleanup must fail");
+        assert_eq!(state, crate::object_api::ScannerPublicationCommitState::Indeterminate);
+        assert_eq!(still_present, vec![false, true]);
     }
 
     struct LifecycleDeleteAllFailureGuard;

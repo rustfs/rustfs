@@ -42,15 +42,18 @@ use super::source_client::{
 };
 use super::storage_api::HTTPRangeSpec;
 use super::storage_api::remote_s3_client::RemoteS3ClientError;
+#[cfg(test)]
 use hmac::{Hmac, Mac, digest::KeyInit};
 use http::{HeaderMap, HeaderValue, Method};
 use percent_encoding::percent_decode_str;
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
+#[cfg(test)]
 use sha2::Sha256;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use url::Url;
 
+#[cfg(test)]
 type HmacSha256 = Hmac<Sha256>;
 
 /// Blob REST version this backend pins. Every response field it reads exists
@@ -301,61 +304,8 @@ impl SourceBackend for AzureSourceBackend {
 /// canonicalized resource. GET and HEAD carry no body, so every `Content-*`
 /// slot stays empty.
 fn shared_key_signature(key: &[u8], account: &str, method: &str, url: &Url, headers: &HeaderMap) -> Result<String, SourceError> {
-    let mut string_to_sign = String::with_capacity(256);
-    string_to_sign.push_str(method);
-    string_to_sign.push('\n');
-    // Content-Encoding, Content-Language, Content-Length, Content-MD5,
-    // Content-Type, Date, If-Modified-Since, If-Match, If-None-Match,
-    // If-Unmodified-Since: all empty. `Date` stays empty because `x-ms-date`
-    // carries the timestamp and Azure then ignores this slot.
-    for _ in 0..10 {
-        string_to_sign.push('\n');
-    }
-    string_to_sign.push_str(header(headers, "range").unwrap_or_default());
-    string_to_sign.push('\n');
-
-    // Canonicalized headers: every `x-ms-*` header, lowercased and sorted.
-    let mut canonical_headers = BTreeMap::new();
-    for (name, value) in headers {
-        let name = name.as_str();
-        if let Some(rest) = name.strip_prefix("x-ms-")
-            && !rest.is_empty()
-            && let Ok(value) = value.to_str()
-        {
-            canonical_headers.insert(name.to_string(), value.trim().to_string());
-        }
-    }
-    for (name, value) in &canonical_headers {
-        string_to_sign.push_str(name);
-        string_to_sign.push(':');
-        string_to_sign.push_str(value);
-        string_to_sign.push('\n');
-    }
-
-    // Canonicalized resource: the account, the encoded path, then every query
-    // parameter lowercased and sorted, with repeated values joined by commas.
-    string_to_sign.push('/');
-    string_to_sign.push_str(account);
-    string_to_sign.push_str(url.path());
-    let mut canonical_query: BTreeMap<String, Vec<String>> = BTreeMap::new();
-    for (name, value) in url.query_pairs() {
-        canonical_query
-            .entry(name.to_ascii_lowercase())
-            .or_default()
-            .push(value.into_owned());
-    }
-    for (name, mut values) in canonical_query {
-        values.sort();
-        string_to_sign.push('\n');
-        string_to_sign.push_str(&name);
-        string_to_sign.push(':');
-        string_to_sign.push_str(&values.join(","));
-    }
-
-    let mut mac = HmacSha256::new_from_slice(key)
-        .map_err(|_| SourceError::Other("azure account key has an unusable length".to_string()))?;
-    mac.update(string_to_sign.as_bytes());
-    Ok(base64_simd::STANDARD.encode_to_string(mac.finalize().into_bytes()))
+    rustfs_signer::azure_shared_key_signature(key, account, method, url, headers)
+        .map_err(|err| SourceError::Other(err.to_string()))
 }
 
 #[derive(Debug)]

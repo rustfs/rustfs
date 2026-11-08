@@ -1106,6 +1106,22 @@ impl HealStorageAPI for MockStorage {
         if bucket.starts_with("legacy-ambiguity-scheduler-") {
             return Err(Error::Storage(EcstoreError::DeleteRecoveryLegacyAmbiguous));
         }
+        if bucket == "legacy-held-pending-scheduler" {
+            let drives = vec![rustfs_madmin::heal_commands::HealDriveInfo {
+                state: "ok".to_owned(),
+                ..Default::default()
+            }];
+            return Ok((
+                HealResultItem {
+                    legacy_identity_unverified: true,
+                    detail: rustfs_heal_contracts::heal_channel::LEGACY_OBJECT_IDENTITY_UNVERIFIED_DETAIL.to_owned(),
+                    before: rustfs_madmin::heal_commands::Infos { drives: drives.clone() },
+                    after: rustfs_madmin::heal_commands::Infos { drives },
+                    ..Default::default()
+                },
+                None,
+            ));
+        }
         if bucket == "completed-retention-failed" {
             return Err(Error::TaskExecutionFailed {
                 message: "retention fixture failure".to_string(),
@@ -2151,6 +2167,53 @@ fn only_typed_mrf_result_can_pause_unverified_legacy() {
             }
         }
     }
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn mrf_legacy_completed_attempt_retains_responsibility_without_failed_statistics() {
+    use crate::heal::failure_logging::test_support::FailureLogCapture;
+
+    let capture = FailureLogCapture::default();
+    let _subscriber = tracing::subscriber::set_default(capture.clone());
+    let (target, _) = unverified_legacy_fixture("legacy-held-pending-scheduler");
+    let bucket = target.bucket.clone();
+    let anchor = target.durable_anchor.clone().expect("durable MRF anchor");
+    let manager = HealManager::new_without_root_recovery_for_test(Arc::new(MockStorage), None);
+    let mut request = HealRequest::object(bucket.to_string(), target.object.to_string(), None);
+    request.source = HealRequestSource::Mrf;
+    request.expected_mrf_bucket_incarnation_id = Some(anchor.bucket_incarnation_id);
+    request.options.pool_index = Some(1);
+    request.options.set_index = Some(2);
+    let receipt = manager
+        .submit_mrf_heal_request_with_receipt_and_identity(request, target)
+        .await
+        .expect("admit durable MRF check");
+    assert_eq!(receipt.result, HealAdmissionResult::Accepted);
+    process_manager_queue_once(&manager).await;
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while manager.get_statistics().await.unverified_tasks == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("publish completed unverified attempt");
+    let stats = manager.get_statistics().await;
+    assert_eq!(stats.unverified_tasks, 1);
+    assert_eq!(stats.failed_tasks, 0);
+    assert_eq!(stats.successful_tasks, 0);
+    assert_eq!(stats.total_objects_healed, 0);
+    let report = manager.get_task_report(&receipt.task_id).await.expect("retained task report");
+    assert_eq!(report.status, HealTaskStatus::Completed);
+    let outcome = report.outcome.expect("retained unknown outcome");
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(outcome.counters.failed, 0);
+    assert!(rustfs_common::mrf_channel::take_mrf_verified_repair_events_for(&bucket).is_empty());
+    let held = rustfs_common::mrf_channel::take_mrf_unverified_legacy_events_for(&bucket);
+    assert_eq!(held.len(), 1);
+    assert_eq!(held[0].anchor, anchor);
+    assert!(manager.retrying_heals.lock().await.is_empty());
+    assert_eq!(capture.count(tracing::Level::ERROR, Some("rustfs::heal::manager")), 0);
+    assert_eq!(capture.count(tracing::Level::WARN, Some("rustfs::heal::manager")), 1);
 }
 
 #[test]

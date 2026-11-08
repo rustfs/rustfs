@@ -741,8 +741,8 @@ def live_conformance_evidence(
 
 
 def pyiceberg_catalog_probe_results(backing: str, *, skipped: bool, vended: bool) -> dict[str, str]:
-    if backing not in {"object", "durable-strong"}:
-        raise ValueError("PyIceberg probe evidence requires an observed RustFS backing")
+    if backing != "object":
+        raise ValueError("PyIceberg probe evidence requires the object catalog backing")
     if skipped:
         return {"direct-rest": "skipped"}
     probes = dict.fromkeys(("metadata-location", "refs", "views-and-namespace-properties", "rename", "load-table-delegation"), "pass")
@@ -751,7 +751,7 @@ def pyiceberg_catalog_probe_results(backing: str, *, skipped: bool, vended: bool
         "maintenance-config", "maintenance-scheduler", "maintenance-worker-dry-run",
         "maintenance-job", "maintenance-quarantine-inspect", "diagnostics", "export",
     ), "pass"))
-    probes["metadata-maintenance"] = "expected-unsupported" if backing == "durable-strong" else "pass"
+    probes["metadata-maintenance"] = "pass"
     return probes
 
 
@@ -1029,33 +1029,35 @@ def production_operations_guide(
                     ),
                     OrderedDict(
                         [
-                            ("name", "catalog-backing-cutover"),
-                            ("objective", "Verify durable backing readiness before selecting a non-object-backed catalog mode."),
-                            ("commands", [f"GET {warehouse_catalog_path(warehouse=warehouse, rest_path=rest_path, suffix='/catalog/migration')}"]),
+                            ("name", "catalog-backup-restore"),
+                            ("objective", "Verify object catalog backup and restore remain safe under the recorded pointer and recovery state."),
+                            ("commands", [
+                                f"POST {warehouse_catalog_path(warehouse=warehouse, rest_path=rest_path, suffix='/catalog/backup')}",
+                                f"POST {warehouse_catalog_path(warehouse=warehouse, rest_path=rest_path, suffix='/catalog/restore')}",
+                            ]),
                             (
                                 "required_evidence",
                                 [
-                                    "migration dry-run response",
-                                    "commit recovery blockers",
-                                    "idempotency index readiness",
-                                    "warehouse prefix index readiness",
-                                    "rollback configuration",
+                                    "catalog backup artifact and referenced-object watermarks",
+                                    "commit recovery and idempotency state",
+                                    "target pointer and generation before and after restore",
+                                    "restore interruption and retry result",
                                 ],
                             ),
                             (
                                 "pass_criteria",
                                 [
-                                    "blockers is empty",
-                                    "recommended actions are completed",
-                                    "object-backed catalog backup exists before cutover",
+                                    "backup validates the complete Iceberg metadata and manifest/data/delete object graph",
+                                    "restore either advances through the expected CAS or returns a retryable conflict",
+                                    "a repeated restore with the same backup is idempotent",
                                 ],
                             ),
                             (
                                 "fail_closed_signals",
                                 [
-                                    "non-empty blockers",
-                                    "recoverable commit gaps require repair",
-                                    "warehouse prefix index is missing or stale",
+                                    "missing or changed referenced objects",
+                                    "stale target pointer or generation",
+                                    "interrupted finalization requires the same backup to be retried",
                                 ],
                             ),
                         ]

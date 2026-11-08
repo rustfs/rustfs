@@ -215,7 +215,8 @@ jobs:
 
       - name: Archive workspace test binaries
         env:
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+          # Workspace test compilation has high per-process memory use.
+          CARGO_BUILD_JOBS: "2"
         run: |
           ./scripts/ci/resource_sampler.sh start workspace-archive
           trap './scripts/ci/resource_sampler.sh stop' EXIT

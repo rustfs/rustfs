@@ -61,27 +61,6 @@ pub(crate) fn metadata_log_locations_matching(
     locations
 }
 
-pub(crate) async fn metadata_locations_for_protected_snapshot_refs<B>(
-    backend: &B,
-    table_bucket: &str,
-    namespace: &Namespace,
-    table: &IdentifierSegment,
-    current_metadata: &serde_json::Value,
-    metadata_locations: &[String],
-) -> TableCatalogStoreResult<BTreeSet<String>>
-where
-    B: TableCatalogObjectBackend,
-{
-    metadata_locations_for_protected_snapshot_refs_matching(
-        backend,
-        table_bucket,
-        current_metadata,
-        metadata_locations,
-        |location| is_valid_table_metadata_location(namespace, table, location),
-    )
-    .await
-}
-
 pub(crate) async fn metadata_locations_for_protected_snapshot_refs_matching<B>(
     backend: &B,
     table_bucket: &str,

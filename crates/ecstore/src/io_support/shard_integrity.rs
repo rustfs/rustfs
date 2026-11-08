@@ -934,4 +934,124 @@ mod tests {
             "cached record must still reject corrupt or mismatched shard payloads"
         );
     }
+
+    #[tokio::test]
+    async fn shard_verifier_rejects_out_of_bounds_index_and_empty_proof_sources_fail_closed() {
+        let mut builder = IntegrityBuilder::new(IntegrityLayout::new(2, 2, 8, false).expect("layout"), 1).expect("builder");
+        builder
+            .push([b"abcd".as_slice(), b"efgh", b"ijkl", b"mnop"].into_iter())
+            .await
+            .expect("stripe");
+        let prepared = builder.finish(8).await.expect("index");
+        let proof = Arc::new(PartProofReader {
+            part: prepared.part,
+            sources: Vec::new(),
+            volume: "bucket".to_owned(),
+            inline: None,
+            cached: Mutex::new(ProofCache::default()),
+        });
+
+        // coding_index >= layout.shards() is rejected at construction time.
+        let err = ShardVerifier::new(proof.clone(), 4, 0, None)
+            .err()
+            .expect("coding_index out of bounds must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("shard integrity verification failed"));
+
+        // Valid coding_index with neither inline bytes nor disk sources fails closed when reading stripe record.
+        let mut verifier = ShardVerifier::new(proof, 0, 0, None).expect("verifier");
+        let err = verifier
+            .verify(b"abcd")
+            .await
+            .expect_err("empty proof sources with no inline index must fail closed");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(err.to_string().contains("shard integrity verification failed"));
+    }
+
+    #[tokio::test]
+    async fn spilled_index_write_verify_and_restore_proof_replicas_round_trip() {
+        let (_dirs, store) = crate::services::rebalance::test_store_with_persisted_rebalance_meta(Default::default()).await;
+        let mut disk_slots = store.pools[0].disk_set[0].get_local_disks().await;
+        let disks: Vec<_> = disk_slots.iter().flatten().cloned().collect();
+        assert_eq!(disks.len(), 2);
+        let volume = "spilled-integrity-bucket";
+        for disk in &disks {
+            disk.make_volume(volume).await.expect("make volume");
+        }
+
+        // 2 shards (1 data + 1 parity) matches the 2-disk fixture; 2350 stripes * 448B > 1 MiB spills to Spool::File(_).
+        let layout = IntegrityLayout::new(1, 1, 8, false).expect("layout");
+        let mut builder = IntegrityBuilder::new(layout, 1).expect("builder");
+        let shards = [b"abcdefgh".as_slice(); 2];
+        for _ in 0..2350 {
+            builder.push(shards.into_iter()).await.expect("stripe");
+        }
+        let part_size = 2350 * 8;
+        let prepared = builder.finish(part_size).await.expect("spilled index");
+        assert!(matches!(prepared.index, Spool::File(_)));
+
+        let data_dir = uuid::Uuid::new_v4();
+        let object = "object";
+        let directory = format!("{object}/{data_dir}");
+        let part = prepared
+            .write(&mut disk_slots, volume, volume, &directory)
+            .await
+            .expect("write spilled index");
+
+        let rel_path = format!("{directory}/{}", part.file_name());
+        for disk in &disks {
+            verify_index_file(disk, volume, &rel_path, &part)
+                .await
+                .expect("verify spilled index on disk");
+        }
+
+        // Corrupt replica 0; restore_proof_replicas should repair it from healthy replica 1.
+        disks[0]
+            .write_all(volume, &rel_path, bytes::Bytes::from_static(b"corrupted-index"))
+            .await
+            .expect("corrupt disk 0");
+        assert!(verify_index_file(&disks[0], volume, &rel_path, &part).await.is_err());
+
+        let mut fi = rustfs_filemeta::FileInfo {
+            volume: volume.to_owned(),
+            name: object.to_owned(),
+            data_dir: Some(data_dir),
+            erasure: rustfs_filemeta::ErasureInfo {
+                data_blocks: 1,
+                parity_blocks: 1,
+                block_size: 8,
+                ..Default::default()
+            },
+            parts: vec![rustfs_filemeta::ObjectPartInfo {
+                number: 1,
+                size: part_size,
+                actual_size: part_size as i64,
+                integrity: Some(part.clone()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        fi.persist_shard_integrity().expect("persist shard integrity");
+        let repaired = restore_proof_replicas(&fi, &disk_slots, volume, object)
+            .await
+            .expect("restore proof replica 0");
+        assert_eq!(repaired, 1);
+        verify_index_file(&disks[0], volume, &rel_path, &part)
+            .await
+            .expect("repaired replica 0 must verify");
+
+        // Negative durability boundary: when all replicas are corrupted, restore_proof_replicas must fail closed.
+        for disk in &disks {
+            disk.write_all(volume, &rel_path, bytes::Bytes::from_static(b"all-corrupted"))
+                .await
+                .expect("corrupt all replicas");
+        }
+        let err = restore_proof_replicas(&fi, &disk_slots, volume, object)
+            .await
+            .expect_err("all corrupted proof replicas must fail closed");
+        assert!(
+            err.to_string().contains("shard integrity verification failed"),
+            "unexpected error when all proof replicas are corrupt: {err}"
+        );
+    }
 }

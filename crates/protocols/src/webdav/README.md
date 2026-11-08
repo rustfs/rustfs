@@ -82,6 +82,22 @@ Configure WebDAV via environment variables:
 | `RUSTFS_WEBDAV_MAX_BODY_SIZE` | Max upload size (bytes) | 5GB |
 | `RUSTFS_WEBDAV_REQUEST_TIMEOUT` | Request timeout (seconds) | 300 |
 | `RUSTFS_WEBDAV_MAX_CONNECTIONS` | Max concurrently served connections | 1024 |
+| `RUSTFS_CORS_ALLOWED_ORIGINS` | Browser origins allowed by the S3 and WebDAV listeners | empty |
+
+## Browser Access and CORS
+
+WebDAV reads `RUSTFS_CORS_ALLOWED_ORIGINS` at server startup. Set a comma-separated list of exact frontend origins to allow browser clients, for example `https://dav-console.example,https://files.example`. Explicit origins allow credentialed requests. The default empty value disables cross-origin access. A standalone `*` permits any origin with credentials mode `omit` and emits no `Access-Control-Allow-Credentials` header.
+
+Valid `OPTIONS` preflight requests from an allowed origin receive `204 No Content` without Basic authentication. Actual WebDAV requests and ordinary `OPTIONS` requests still use Basic authentication and the existing IAM checks. Allowed origins receive CORS headers on success and error responses. Preflights allow WebDAV methods and explicitly echo valid requested header names, including `Authorization`, `Depth`, `Destination`, and `If-Match`. Responses expose `ETag`, `DAV`, `Allow`, `Lock-Token`, and range headers to browser code.
+
+```bash
+curl -i -X OPTIONS http://localhost:8080/ \
+  -H 'Origin: https://dav-console.example' \
+  -H 'Access-Control-Request-Method: PROPFIND' \
+  -H 'Access-Control-Request-Headers: authorization,depth,content-type'
+```
+
+Configure an explicit HTTPS frontend origin for credentialed browser access and use HTTPS on the WebDAV listener when sending access keys and secret keys. This listener-wide policy applies across WebDAV paths. S3 bucket CORS rules remain scoped to the S3 API.
 
 ## Quick Start
 

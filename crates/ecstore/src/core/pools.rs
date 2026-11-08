@@ -2208,9 +2208,14 @@ fn ensure_decommission_capacity_reservations_available(
             continue;
         }
         metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
-        return Err(decommission_capacity_blocked_error(format!(
+        let detail = format!(
             "target pool {target_pool_index} reservation requires {required} physical bytes, but only {available} bytes remain during {phase}"
-        )));
+        );
+        return Err(if growth_pool.is_some() {
+            decommission_target_no_longer_fits_error(target_pool_index, detail)
+        } else {
+            decommission_capacity_blocked_error(detail)
+        });
     }
     Ok(())
 }
@@ -2341,36 +2346,41 @@ fn grow_decommission_target_reservation(
         let existing_remaining = existing_target
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
             .unwrap_or_default();
+        let existing_reserved = existing_target
+            .map(|target| target.reserved_physical_bytes)
+            .unwrap_or_default();
+        let allocation_limit = existing_target
+            .map(|target| target.physical_free_at_reservation)
+            .unwrap_or_default()
+            .max(target_capacity.physical_free);
         if required_peak <= existing_remaining {
             return Ok(false);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            return Err(decommission_target_no_longer_fits_error(
-                target_pool_index,
-                format!("source pool {source_pool_index} reservation estimate is exhausted"),
-            ));
-        }
-        if let Some(target) = existing_target
-            && target_capacity.physical_free <= target.physical_free_at_reservation
-        {
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
-            )));
-        }
+        // Scanner estimates can predate source writes. Grow against current
+        // target capacity, then validate the aggregate reservation below.
         let current_peak = reservation.remaining_peak_physical_bytes();
         let additional_peak = required_peak.saturating_sub(existing_remaining);
         let additional_predicted = additional_peak.div_ceil(1usize.saturating_add(reservation.temporary_copies));
         let additional_source_data = capacity_source_data_equivalent(additional_predicted, target_layout)?;
-        reservation.source_data_equivalent_bytes = reservation
-            .source_data_equivalent_bytes
-            .saturating_add(additional_source_data);
         reservation.source_physical_bytes = reservation
             .source_physical_bytes
             .saturating_add(capacity_target_physical_bytes(additional_source_data, reservation.source_layout)?);
+        // Recompute from the physical total so EC rounding matches the
+        // persisted reader after every growth, including repeated growth.
+        reservation.source_data_equivalent_bytes =
+            capacity_source_data_equivalent(reservation.source_physical_bytes, reservation.source_layout)?;
         reservation.predicted_physical_bytes = reservation
-            .predicted_physical_bytes
-            .saturating_add(additional_predicted)
-            .max(capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, target_layout)?);
+            .targets
+            .iter()
+            .map(|target| target.layout)
+            .chain(std::iter::once(target_layout))
+            .try_fold(
+                reservation.predicted_physical_bytes.saturating_add(additional_predicted),
+                |predicted, layout| {
+                    capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, layout)
+                        .map(|required| predicted.max(required))
+                },
+            )?;
         reservation.temporary_physical_bytes = reservation
             .predicted_physical_bytes
             .saturating_mul(reservation.temporary_copies);
@@ -2378,6 +2388,15 @@ fn grow_decommission_target_reservation(
             .predicted_physical_bytes
             .saturating_add(reservation.temporary_physical_bytes);
         let allocation_growth = reservation.remaining_peak_physical_bytes().saturating_sub(current_peak);
+        let required_allocation = existing_reserved.saturating_add(allocation_growth);
+        if required_allocation > allocation_limit {
+            return Err(decommission_target_no_longer_fits_error(
+                target_pool_index,
+                format!(
+                    "target pool {target_pool_index} reservation requires {required_allocation} physical bytes, but its observed allocation limit is {allocation_limit} bytes"
+                ),
+            ));
+        }
         if let Some(target) = reservation
             .targets
             .iter_mut()
@@ -2402,6 +2421,7 @@ fn grow_decommission_target_reservation(
             });
         }
         renew_decommission_capacity_reservation(reservation, now, true);
+        validate_decommission_capacity_reservation(Some(reservation))?;
         pool.last_update = pool.last_update.max(now);
         Ok(true)
     })();
@@ -8292,16 +8312,18 @@ where
     S: EcstoreObjectIO,
 {
     // Bound the CAS state retained by callers, including ordinary metadata
-    // transactions that never enter identity repair. Large inline retry states
+    // transactions that never enter owner repair. Large inline retry states
     // otherwise propagate through startup and cross-crate storage futures.
     Box::pin(async move {
-        if object != POOL_META_IDENTITY_NAME {
+        let native_owner_repair = object == POOL_META_NAME && matches!(phase, "native_heal" | "prepare_cas");
+        if object != POOL_META_IDENTITY_NAME && !native_owner_repair {
             return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
         }
-        // Keep the exact identity owned by this transaction. A quorum read alone
-        // cannot discharge repair responsibility for a missing disk replica.
-        let identity = data;
-        let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
+        // Repair only the exact payload already published by this owner. A
+        // quorum read cannot discharge responsibility for a missing replica.
+        let committed_payload = data;
+        let mut outcome =
+            execute_pool_meta_object_cas_once(pool.clone(), object, committed_payload.clone(), opts, fence, phase).await;
         for delay_secs in [1, 2, 4] {
             if !outcome.source.as_deref().is_some_and(|err| {
                 matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
@@ -8314,19 +8336,28 @@ where
             let repair_options = async {
                 fence.ensure_held()?;
                 let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
-                if current != identity {
+                if current != committed_payload {
                     return Err(Error::PreconditionFailed);
                 }
-                let token = info
-                    .etag
-                    .filter(|etag| !etag.trim().is_empty())
-                    .map(PoolMetaCasToken::Existing)
-                    .unwrap_or(PoolMetaCasToken::Unsafe);
+                let token = if native_owner_repair {
+                    match pool_meta_cas_token_from_info(info) {
+                        token @ PoolMetaCasToken::ExistingNative { .. } => token,
+                        _ => return Err(Error::PreconditionFailed),
+                    }
+                } else {
+                    info.etag
+                        .filter(|etag| !etag.trim().is_empty())
+                        .map(PoolMetaCasToken::Existing)
+                        .unwrap_or(PoolMetaCasToken::Unsafe)
+                };
                 pool_meta_cas_options(object, &token, fence)
             }
             .await;
             outcome = match repair_options {
-                Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
+                Ok(opts) => {
+                    execute_pool_meta_object_cas_once(pool.clone(), object, committed_payload.clone(), opts, fence, phase)
+                        .await
+                }
                 Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
             };
             // A rejected repair cannot turn the preceding committed write into a
@@ -12134,8 +12165,13 @@ async fn pause_decommission_start_for_test(store_id: uuid::Uuid, point: Decommis
 }
 
 #[cfg(any(test, feature = "test-util"))]
-type DecommissionCapacityInfoOverrides =
-    std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
+struct DecommissionCapacityInfoOverride {
+    snapshots: std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>,
+    owned_snapshots: Option<std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+type DecommissionCapacityInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, DecommissionCapacityInfoOverride>>;
 
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
@@ -12152,16 +12188,30 @@ pub(crate) fn set_decommission_capacity_info_overrides_for_test(
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned")
-        .insert(store_id, snapshots.into());
+        .insert(
+            store_id,
+            DecommissionCapacityInfoOverride {
+                snapshots: snapshots.into(),
+                owned_snapshots: None,
+            },
+        );
 }
 
 #[cfg(any(test, feature = "test-util"))]
-fn take_decommission_capacity_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<DecommissionPoolCapacityInfo>> {
+fn take_decommission_capacity_info_override_for_test(
+    store_id: uuid::Uuid,
+    use_owned_usage: bool,
+) -> Option<Vec<DecommissionPoolCapacityInfo>> {
     let mut overrides = DECOMMISSION_CAPACITY_INFO_OVERRIDES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned");
-    let queue = overrides.get_mut(&store_id)?;
+    let entry = overrides.get_mut(&store_id)?;
+    let queue = if use_owned_usage {
+        entry.owned_snapshots.as_mut().unwrap_or(&mut entry.snapshots)
+    } else {
+        &mut entry.snapshots
+    };
     if queue.len() > 1 {
         queue.pop_front()
     } else {
@@ -15231,7 +15281,7 @@ impl ECStore {
         ensure_decommission_start_pool_states(&latest_pool_meta, indices)?;
         ensure_decommission_ledger_persistence_supported(&latest_pool_meta)?;
         ensure_decommission_capacity_writer_supported(&latest_pool_meta)?;
-        let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+        let capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
         activation_fence.ensure_held()?;
         let target_fence_proof = crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof();
 
@@ -15593,7 +15643,7 @@ impl ECStore {
 
     async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, false) {
             return capacity_infos
                 .iter()
                 .find(|capacity| capacity.pool_index == target_pool_index)
@@ -15616,7 +15666,7 @@ impl ECStore {
 
     async fn get_decommission_pool_capacity_infos(&self, use_owned_usage: bool) -> Result<Vec<DecommissionPoolCapacityInfo>> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, use_owned_usage) {
             return Ok(capacity_infos);
         }
 
@@ -15834,14 +15884,8 @@ impl ECStore {
             log_decommission_adopted_target_choice(reservation, owner, pool_index, &over_budget);
             return Ok(pool_index);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            let mut skipped = over_budget.iter().copied().collect::<Vec<_>>();
-            skipped.sort_unstable();
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {} has no target allocation for {expected_data_bytes} data bytes; target pools over their temporary-copy budget: {skipped:?}",
-                owner.source_pool_index
-            )));
-        }
+        // A stale nonzero estimate can exhaust its allocation too. Selection
+        // is provisional until fenced growth persists the new reservation.
         let capacities = self.get_decommission_all_pool_capacity_infos().await?;
         let active_sources = active_decommission_source_indices(&pool_meta);
         capacities
@@ -25775,6 +25819,55 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_activation_reserves_owned_usage_on_a_shared_filesystem() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let target = DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0);
+        let filesystem_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 400);
+        let owned_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 30);
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![vec![filesystem_source, target]]);
+        {
+            let mut overrides = super::DECOMMISSION_CAPACITY_INFO_OVERRIDES
+                .get()
+                .expect("capacity overrides initialized")
+                .lock()
+                .expect("capacity overrides lock");
+            overrides
+                .get_mut(&store.id)
+                .expect("this store has an override")
+                .owned_snapshots = Some(vec![vec![owned_source, target]].into());
+        }
+
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activation should reserve the owned bytes rather than unrelated mount usage");
+
+        let local = store.pool_meta.read().await;
+        let reservation = local.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
+        drop(local);
+        let mut persisted = PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("activation should be durable");
+        let reservation = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("persisted activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_activation_lock_recheck_rejects_sudden_space_drop_without_persisting() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let layout = DecommissionErasureLayout { data: 1, parity: 0 };
@@ -25805,6 +25898,173 @@ mod tests {
             .await
             .expect("the rejected activation must leave baseline metadata readable");
         assert!(persisted.pools[0].decommission.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_copies_native_object_after_nonzero_usage_estimate_is_exhausted() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let bucket = format!("stale-owned-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create source bucket");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacities = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1 << 30, 1),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities]);
+        let expected = vec![0x57; 16 * 1024];
+        let mut body = crate::object_api::PutObjReader::from_vec(expected.clone());
+        store.pools[0]
+            .put_object(&bucket, object, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write an object larger than the earlier scanner estimate");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate the stale nonzero reservation");
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run the real native-disk mover");
+
+        let mut reader = store.pools[1]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer object must reach the target despite the stale estimate");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read migrated payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "source cleanup follows the verified target copy"
+        );
+        let meta = store.pool_meta.read().await;
+        let state = meta.pools[0].decommission.as_ref().expect("retirement state is retained");
+        assert!(state.complete && !state.failed);
+        assert_eq!(state.items_decommission_failed, 0);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-util")]
+    #[serial_test::serial]
+    async fn decommission_native_ec_growth_keeps_all_metadata_replicas_readable() {
+        use rustfs_data_usage::{DataUsageCache, DataUsageEntry};
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+        let bucket = format!("stale-ec-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for set in &store.pools[0].disk_set {
+            let encoded = rmp_serde::to_vec_named(&serde_json::json!({
+                "info": {
+                    "name": DATA_USAGE_ROOT,
+                    "next_cycle": 1,
+                    "last_update": std::time::SystemTime::now(),
+                    "skip_healing": false,
+                    "snapshot_complete": true
+                },
+                "cache": {
+                    DATA_USAGE_ROOT: DataUsageEntry { size: 3, objects: 1, ..Default::default() }
+                }
+            }))
+            .expect("encode completed scanner fixture");
+            let cache = DataUsageCache::unmarshal(&encoded).expect("read scanner fixture");
+            assert!(cache.dui(DATA_USAGE_ROOT, &[]).is_complete_bucket_usage_snapshot());
+            set.put_object(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", crate::disk::BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME),
+                &mut crate::object_api::PutObjReader::from_vec(encoded),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("persist the earlier complete cache");
+        }
+        let expected = vec![0x37; 16 * 1024];
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut crate::object_api::PutObjReader::from_vec(expected.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write after the scan");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate from the earlier owned estimate");
+        {
+            let meta = store.pool_meta.read().await;
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            assert_eq!(reservation.source_layout, DecommissionErasureLayout { data: 3, parity: 1 });
+            assert_eq!(reservation.source_physical_bytes, 8);
+        }
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run native EC migration");
+        for pool in &store.pools {
+            let mut reloaded = PoolMeta::default();
+            reloaded
+                .load_no_lock_from_replicas(vec![pool.clone()])
+                .await
+                .expect("each saved metadata replica must reload");
+            let state = reloaded.pools[0].decommission.as_ref().expect("saved retirement state");
+            assert!(state.complete && !state.failed);
+        }
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("target object must remain readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read migrated EC payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -31049,6 +31309,10 @@ mod pools_tests {
                 std::future::pending::<()>().await;
             }
             let mut reader = self.inner.get_object_reader(bucket, object, range, headers, opts).await?;
+            if object == POOL_META_NAME {
+                reader.object_info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+                reader.object_info.data_dir = Some(uuid::Uuid::from_u128(7));
+            }
             match self.fault {
                 IdentityRepairFault::Changed => {
                     reader.stream = Box::new(Cursor::new(b"other-identity".to_vec()));
@@ -31078,16 +31342,30 @@ mod pools_tests {
                         .and_then(HTTPPreconditions::if_none_match_value),
                     None
                 );
+                let written = if object == POOL_META_NAME {
+                    &self.inner.stored
+                } else {
+                    &self.inner.identity
+                };
+                let current_etag = written.lock().expect("metadata lock").as_ref().map(|(_, etag)| etag.clone());
                 assert_eq!(
                     opts.http_preconditions.as_ref().and_then(HTTPPreconditions::if_match_value),
-                    self.inner
-                        .identity
-                        .lock()
-                        .expect("identity lock")
-                        .as_ref()
-                        .map(|(_, etag)| etag.as_str()),
+                    current_etag.as_deref(),
                     "repair must use the observed post-commit CAS token",
                 );
+                if object == POOL_META_NAME {
+                    let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                        &opts.user_defined,
+                        crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                    )
+                    .expect("native repair requires a physical predecessor condition");
+                    let condition: crate::disk::PoolMetaNativeCasCondition =
+                        serde_json::from_str(condition).expect("parse native CAS condition");
+                    let parent = condition.parent.expect("native CAS uses the actual committed head");
+                    assert_eq!(Some(parent.etag), current_etag);
+                    assert_eq!(parent.mod_time_unix_nanos, 1_000_000_000);
+                    assert_eq!(parent.data_dir, Some(uuid::Uuid::from_u128(7)));
+                }
                 if self.fault == IdentityRepairFault::Reject {
                     return Err(Error::PreconditionFailed);
                 }
@@ -31189,6 +31467,46 @@ mod pools_tests {
             if fault == IdentityRepairFault::Always {
                 assert_eq!(started.elapsed(), StdDuration::from_secs(7), "repair backoff must be bounded");
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_meta_prepare_owner_repair_uses_exact_native_head() {
+        let payload = b"owned-pending-pool-meta";
+        for (fault, writes, reads, succeeds) in [
+            (IdentityRepairFault::Once, 2, 1, true),
+            (IdentityRepairFault::Changed, 1, 1, false),
+            (IdentityRepairFault::MissingEtag, 1, 1, false),
+            (IdentityRepairFault::Unknown, 1, 0, false),
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = super::PoolMetaWriteState::default();
+            let mut arm = state.arm_transaction();
+            let result = save_pool_meta_object_cas(
+                pool.clone(),
+                POOL_META_NAME,
+                payload.to_vec(),
+                &PoolMetaCasToken::Missing,
+                &PoolMetaPersistenceFence::OfflineRecovery,
+                "prepare_cas",
+                &mut arm,
+            )
+            .await;
+
+            if succeeds {
+                result.expect("prepare must repair its own partially replicated payload");
+                arm.disarm();
+                assert_eq!(pool.inner.stored.lock().expect("metadata lock").as_ref().expect("written").0, payload);
+            } else {
+                let error = result.expect_err("uncertain or changed authority must remain blocked");
+                let failure = error.pool_metadata_failure().expect("typed transaction uncertainty");
+                assert_eq!(failure.kind, crate::error::PoolMetadataFailure::TransactionUnknown);
+                assert_eq!(failure.phase, "prepare_cas");
+            }
+            drop(arm);
+            assert_eq!(state.ensure_write_safe("after prepare owner repair").is_ok(), succeeds);
+            assert_eq!(pool.writes.load(Ordering::SeqCst), writes, "{fault:?}");
+            assert_eq!(pool.reads.load(Ordering::SeqCst), reads, "{fault:?}");
         }
     }
 
@@ -37556,10 +37874,88 @@ mod pools_tests {
             .as_ref()
             .and_then(|info| info.capacity_reservation.as_ref())
             .unwrap();
-        assert_eq!(reservation.source_data_equivalent_bytes, 2);
-        assert_eq!(reservation.predicted_physical_bytes, 3);
+        assert_eq!(reservation.source_data_equivalent_bytes, 3);
+        assert_eq!(reservation.predicted_physical_bytes, 4);
         assert_eq!(reservation.targets.len(), 1);
-        assert_eq!(reservation.targets[0].reserved_physical_bytes, 6);
+        assert_eq!(reservation.targets[0].reserved_physical_bytes, 8);
+        validate_decommission_capacity_reservation(Some(reservation)).expect("empty-snapshot growth must remain readable");
+    }
+
+    #[test]
+    fn decommission_capacity_grows_a_stale_nonzero_estimate_and_rolls_back_if_space_is_short() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        let layout = DecommissionErasureLayout { data: 3, parity: 1 };
+        let initial = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64, 2),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 64, 64, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, initial[0].space).expect("activate source");
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[0],
+            &initial,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("reserve the stale estimate");
+        assert!(
+            grow_decommission_target_reservation(&mut meta, &initial, 0, 1, 16, uuid::Uuid::new_v4(), now)
+                .expect("a nonzero stale estimate may grow against real free space")
+        );
+        let before = serde_json::to_value(&meta).expect("snapshot reservation before rejected growth");
+        let shortage = vec![initial[0], DecommissionPoolCapacityInfo::for_test(1, layout, 43, 64, 21)];
+        let error = grow_decommission_target_reservation(&mut meta, &shortage, 0, 1, 32, uuid::Uuid::new_v4(), now)
+            .expect_err("real free-space shortage still rejects growth");
+        assert_eq!(super::decommission_capacity_stale_target_index(&error), Some(1));
+        assert_eq!(serde_json::to_value(&meta).expect("snapshot after rejected growth"), before);
+    }
+
+    #[test]
+    fn decommission_capacity_growth_keeps_rounded_and_mixed_layout_estimates_loadable() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        for source_layout in [
+            DecommissionErasureLayout { data: 3, parity: 1 },
+            DecommissionErasureLayout { data: 2, parity: 2 },
+        ] {
+            let capacities = vec![
+                DecommissionPoolCapacityInfo::for_test(0, source_layout, 0, 8, 8),
+                DecommissionPoolCapacityInfo::for_test(1, DecommissionErasureLayout { data: 2, parity: 2 }, 16, 16, 0),
+                DecommissionPoolCapacityInfo::for_test(2, DecommissionErasureLayout { data: 3, parity: 1 }, 1024, 1024, 0),
+            ];
+            let mut meta = PoolMeta {
+                version: POOL_META_VERSION,
+                pools: (0..3).map(|index| decommission_test_pool_status(index, None)).collect(),
+                ..Default::default()
+            };
+            meta.decommission(0, capacities[0].space).unwrap();
+            reserve_decommission_start_target_capacity(
+                &mut meta,
+                &[0],
+                &capacities,
+                uuid::Uuid::new_v4(),
+                1,
+                now,
+                DECOMMISSION_CAPACITY_MODEL_VERSION,
+            )
+            .expect("initial reservation");
+            grow_decommission_target_reservation(&mut meta, &capacities, 0, 2, 16, uuid::Uuid::new_v4(), now)
+                .expect("grow against the target's free space");
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            validate_decommission_capacity_reservation(Some(reservation)).expect("growth must satisfy the persisted reader");
+        }
     }
 
     #[test]

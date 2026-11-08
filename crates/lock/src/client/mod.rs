@@ -20,6 +20,17 @@ use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
 
+/// Outcome of cleaning up a lock whose acquisition has already completed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LockCleanupOutcome {
+    /// This request released the granted lock.
+    Released,
+    /// The authoritative backend no longer holds this exact lock ID.
+    AlreadyAbsent,
+    /// The backend did not confirm release or authoritative absence.
+    Unconfirmed,
+}
+
 /// Lock client trait
 #[async_trait]
 pub trait LockClient: Send + Sync + std::fmt::Debug {
@@ -36,6 +47,29 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
 
     /// Release lock
     async fn release(&self, lock_id: &LockId) -> Result<bool>;
+
+    /// Idempotently clean up a previously confirmed grant for this exact lock ID.
+    ///
+    /// Call only after acquisition has completed successfully. An absent lock
+    /// cannot settle an acquisition that may still grant it later; that
+    /// acquisition must retain its own completion cleanup. This operation must
+    /// never release another owner's lock on the same resource.
+    ///
+    /// The default preserves conservative behavior for clients without an
+    /// authoritative absence result. Cancellation or an error leaves cleanup
+    /// unconfirmed, so the caller must retain its retry ownership.
+    ///
+    /// # Errors
+    /// Returns backend or transport errors when cleanup cannot be confirmed.
+    async fn cleanup_grant(&self, lock_id: &LockId) -> Result<LockCleanupOutcome> {
+        self.release(lock_id).await.map(|released| {
+            if released {
+                LockCleanupOutcome::Released
+            } else {
+                LockCleanupOutcome::Unconfirmed
+            }
+        })
+    }
 
     /// Release multiple locks. Default implementation fans out to single-lock releases.
     async fn release_locks_batch(&self, lock_ids: &[LockId]) -> Result<Vec<bool>> {
