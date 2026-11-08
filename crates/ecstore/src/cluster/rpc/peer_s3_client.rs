@@ -798,12 +798,12 @@ fn try_acquire_bucket_heal_movement_guard<'a>(
 }
 
 async fn acquire_bucket_heal_write_guard<'a>(
-    gate: Option<&'a tokio::sync::Mutex<PoolMetaWriteState>>,
-) -> Result<Option<tokio::sync::MutexGuard<'a, PoolMetaWriteState>>> {
+    gate: Option<&'a tokio::sync::RwLock<PoolMetaWriteState>>,
+) -> Result<Option<tokio::sync::RwLockWriteGuard<'a, PoolMetaWriteState>>> {
     let Some(gate) = gate else {
         return Ok(None);
     };
-    let guard = gate.lock().await;
+    let guard = gate.write().await;
     guard
         .ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")
         .map_err(|e| e.narrow_to_disk().unwrap_or_else(Error::other))?;
@@ -2388,8 +2388,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_bucket_heal_refuses_receiver_with_unsafe_pool_metadata() {
-        let gate = tokio::sync::Mutex::new(PoolMetaWriteState::default());
-        gate.lock().await.observe_replicas(PoolMetaReplicaState {
+        let gate = tokio::sync::RwLock::new(PoolMetaWriteState::default());
+        gate.write().await.observe_replicas(PoolMetaReplicaState {
             needs_repair: true,
             repair_write_safe: false,
         });

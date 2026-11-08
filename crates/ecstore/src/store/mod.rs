@@ -480,9 +480,11 @@ pub struct ECStore {
     /// Serializes full-document pool metadata saves and retains a fail-closed
     /// write block after startup observes an unreadable replica.
     ///
+    /// Immutable admission proofs share authority; publication, recovery and
+    /// authority changes retain exclusive access through their existing I/O.
     /// Lock order: acquire `pool_meta_save_gate`, then the distributed
     /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
-    pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
+    pub(crate) pool_meta_save_gate: RwLock<PoolMetaWriteState>,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -1936,7 +1938,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: tokio::sync::RwLock::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         };
@@ -2011,7 +2013,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: tokio::sync::RwLock::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

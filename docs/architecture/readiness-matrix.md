@@ -45,6 +45,7 @@ In a distributed deployment, startup publishes `FullReady` only after that local
 - Liveness reports process availability and must not depend on storage, IAM,
   lock quorum, or peer health.
 - Node readiness (`/health/ready`, `/minio/health/ready`) reports whether this process can serve reads: storage read quorum, IAM, and shared-lock quorum. It is the Kubernetes Service membership signal. Losing write quorum, the pool-metadata writer, or exclusive-lock quorum does not remove a node that can still read. The public health handler still returns 503 until startup publishes `FullReady`, so a process that has never opened S3 admission does not join the Service. Runtime storage diagnostics do not change that startup gate.
+- Immutable pool metadata admission proofs and health inspections share the local authority gate. Publication, recovery, identity changes and operations requiring serialization retain exclusive ownership and their existing distributed namespace fences. A multi-phase operation releases its reader before acquiring the writer and revalidates under exclusive ownership; it never upgrades a held reader. Read-only network I/O does not exclude unrelated authority readers, while an actual authority writer still bounds health inspection with the existing timeout.
 - A blocked pool metadata writer degrades cluster-write readiness with
   `pool_meta_write_blocked`. It does not withdraw `/health/ready`, and the node
   probe omits that reason from `degradedReasons`. Metadata save-gate inspection
