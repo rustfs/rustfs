@@ -229,6 +229,7 @@ pub struct ListPathRawOptions {
     pub hidden_entry_budget: usize,
     pub pending_prefix: Option<String>,
     pub filter_prefix: Option<String>,
+    pub identifier_tree_leaf: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
     /// Deliver every replica to the partial callback, including matching headers.
@@ -268,6 +269,7 @@ impl Clone for ListPathRawOptions {
             hidden_entry_budget: self.hidden_entry_budget,
             pending_prefix: self.pending_prefix.clone(),
             filter_prefix: self.filter_prefix.clone(),
+            identifier_tree_leaf: self.identifier_tree_leaf.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
             preserve_replica_metadata: self.preserve_replica_metadata,
@@ -300,6 +302,7 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         pending_prefix: opts.pending_prefix.clone(),
         report_notfound: opts.report_not_found,
         filter_prefix: opts.filter_prefix.clone(),
+        identifier_tree_leaf: opts.identifier_tree_leaf.clone(),
         forward_to: opts.forward_to.clone(),
         limit: opts.per_disk_limit,
         skip_total_timeout: opts.skip_walkdir_total_timeout,
@@ -1231,6 +1234,21 @@ mod tests {
         assert_eq!(options.timeout_ms, Some(0));
         assert_eq!(options.stall_timeout_ms, None);
         assert!(!options.skip_total_timeout);
+    }
+
+    #[test]
+    fn identifier_tree_selection_survives_job_clone_and_disk_request() {
+        let request = ListPathRawOptions {
+            path: "catalog/namespaces/".to_string(),
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            recursive: true,
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        let walk = walk_dir_options(&cloned);
+        assert_eq!(walk.identifier_tree_leaf, request.identifier_tree_leaf);
+        assert_eq!(walk.base_dir, request.path);
+        assert!(walk.recursive);
     }
 
     #[test]

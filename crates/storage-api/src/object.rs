@@ -591,6 +591,34 @@ pub trait AuthoritativeListOperations: ListOperations {
         max_keys: i32,
     ) -> Result<Self::ListObjectVersionsInfo, Self::Error>;
 
+    /// Enumerate an exact dotted leaf below identifier-like directory components
+    /// containing ASCII letters, digits, `_` or `-`. Noncandidate object metadata
+    /// is outside the scan. Namespace components may occur at any depth; reserved
+    /// words do not identify a subtree that can be skipped.
+    ///
+    /// Returned keys retain the quorum, unversioned, EOF and cancellation
+    /// guarantees of `list_unversioned_objects_authoritative`. Older peers may
+    /// perform extra I/O; the coordinator must filter their extra rows before
+    /// resolving metadata. Callers fence concurrent mutations separately.
+    ///
+    /// # Errors
+    /// Rejects an invalid directory prefix/leaf, invalid page size, uncertain
+    /// matching metadata, versioned entries or insufficient read quorum. Backends
+    /// without this capability return Unsupported; ordinary listing is not a fallback.
+    async fn list_identifier_tree_leaves_authoritative(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _leaf: &str,
+        _marker: Option<String>,
+        _max_keys: i32,
+    ) -> Result<Self::ListObjectVersionsInfo, Self::Error>
+    where
+        Self::Error: From<std::io::Error>,
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authoritative identifier-tree listing is not supported").into())
+    }
+
     /// Resolves every set at its version read quorum, including reserved prefixes.
     ///
     /// # Errors
