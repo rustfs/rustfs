@@ -142,15 +142,23 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+      - name: Install pinned typos through GitHub API
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TYPOS_VERSION: 1.50.2
+        run: |
+          python3 .github/actions/setup/download_release_asset.py --repository crate-ci/typos --tag "v${TYPOS_VERSION}" --asset "typos-v${TYPOS_VERSION}-x86_64-unknown-linux-musl.tar.gz" --output "$RUNNER_TEMP/typos.tar.gz"
+          mkdir -p "$RUNNER_TEMP/typos"
+          tar -xzf "$RUNNER_TEMP/typos.tar.gz" -C "$RUNNER_TEMP/typos"
       - name: Typos check with custom config file
-        uses: crate-ci/typos@512fc24f32f44ab01972217aaaf3dc86ec234d53 # v1.50.2
+        run: '"$RUNNER_TEMP/typos/typos" .'
 
   # Fail early with compile-free checks for every pull request.
   quick-checks:
     name: Quick Checks
     if: github.event_name != 'pull_request' || github.event.action != 'closed'
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 20
     steps:
       - name: Checkout repository
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
@@ -1137,11 +1145,16 @@ jobs:
 
       - name: Install mc
         env:
+          GH_TOKEN: ${{ github.token }}
           MC_VERSION: RELEASE.2025-08-13T08-35-41Z
           MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
         run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
           MC_BINARY="mc.linux-amd64.${MC_VERSION}"
-          curl -fsSLo "$RUNNER_TEMP/mc" "https://github.com/minio/mc/releases/download/${MC_VERSION}/${MC_BINARY}"
+          python3 .github/actions/setup/download_release_asset.py --repository minio/mc --tag "$MC_VERSION" --asset "$MC_BINARY" --output "$RUNNER_TEMP/mc" --sha256 "$MC_SHA256"
           echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
           chmod +x "$RUNNER_TEMP/mc"
           echo "$RUNNER_TEMP" >> "$GITHUB_PATH"

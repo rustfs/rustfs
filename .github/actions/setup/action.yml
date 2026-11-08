@@ -66,10 +66,7 @@ inputs:
 runs:
   using: "composite"
   steps:
-    # protobuf-compiler is deliberately absent: the setup-protoc step below
-    # installs 35.1 into the tool cache and prepends it to PATH, so the apt
-    # build (older, and never version-matched) was shadowed on every run and
-    # simply never used.
+    # Use the pinned code generators rather than Ubuntu's older packages.
     - name: Install system dependencies (Ubuntu)
       if: runner.os == 'Linux'
       shell: bash
@@ -79,7 +76,9 @@ runs:
           build-essential \
           pkg-config \
           libssl-dev \
-          ripgrep
+          ripgrep \
+          python3 \
+          gh
 
     # musl-gcc is needed by the native musl release leg, and zip/unzip by the
     # release packaging steps. No CI test lane touches any of them.
@@ -88,13 +87,32 @@ runs:
       shell: bash
       run: sudo apt-get install -y musl-tools zip unzip
 
+    - name: Install pinned code generators through GitHub API (Linux x64)
+      if: runner.os == 'Linux' && runner.arch == 'X64'
+      shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ASSET_DOWNLOADER: ${{ github.action_path }}/download_release_asset.py
+      run: |
+        python3 "$ASSET_DOWNLOADER" --repository protocolbuffers/protobuf --tag v35.1 --asset protoc-35.1-linux-x86_64.zip --output "$RUNNER_TEMP/protoc.zip"
+        python3 "$ASSET_DOWNLOADER" --repository google/flatbuffers --tag v25.12.19 --asset 'Linux.flatc.binary.g++-13.zip' --output "$RUNNER_TEMP/flatc.zip"
+        python3 -m zipfile -e "$RUNNER_TEMP/protoc.zip" "$RUNNER_TEMP/protoc"
+        python3 -m zipfile -e "$RUNNER_TEMP/flatc.zip" "$RUNNER_TEMP/flatc"
+        chmod +x "$RUNNER_TEMP/protoc/bin/protoc" "$RUNNER_TEMP/flatc/flatc"
+        "$RUNNER_TEMP/protoc/bin/protoc" --version
+        "$RUNNER_TEMP/flatc/flatc" --version
+        echo "$RUNNER_TEMP/protoc/bin" >> "$GITHUB_PATH"
+        echo "$RUNNER_TEMP/flatc" >> "$GITHUB_PATH"
+
     - name: Install protoc
+      if: runner.os != 'Linux' || runner.arch != 'X64'
       uses: rustfs/setup-protoc@a3705324d8f9bf5b6c3573fb6cf8ae421db55dd6 # v3.0.1
       with:
         version: "35.1"
         repo-token: ${{ github.token }}
 
     - name: Install flatc
+      if: runner.os != 'Linux' || runner.arch != 'X64'
       uses: Nugine/setup-flatc@698800de72a96bfb22cf60431dc21a2ff9a7e07b # v1
       with:
         version: "25.12.19"

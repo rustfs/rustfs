@@ -28,11 +28,12 @@ runs:
 
     - name: Install actionlint
       shell: bash
+      env:
+        GH_TOKEN: ${{ github.token }}
+        ASSET_DOWNLOADER: ${{ github.action_path }}/../setup/download_release_asset.py
       run: |
         actionlint_dir="$(mktemp -d "${RUNNER_TEMP}/actionlint.XXXXXX")"
-        curl --fail --location --silent --show-error \
-          --output "$actionlint_dir/actionlint.tar.gz" \
-          https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz
+        python3 "$ASSET_DOWNLOADER" --repository rhysd/actionlint --tag v1.7.12 --asset actionlint_1.7.12_linux_amd64.tar.gz --output "$actionlint_dir/actionlint.tar.gz" --sha256 8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8
         echo "8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8  $actionlint_dir/actionlint.tar.gz" | sha256sum --check --status
         tar -xzf "$actionlint_dir/actionlint.tar.gz" -C "$actionlint_dir" actionlint
         rm "$actionlint_dir/actionlint.tar.gz"
