@@ -424,7 +424,8 @@ impl SimpleQueryDispatcher {
         tracker: &QueryExecutionTracker,
     ) -> QueryResult<MetadataProvider> {
         if self.input.request.input_serialization.parquet.is_some() {
-            let provider = ParquetSelectTable::try_new(session.inner(), self.input.as_ref()).await?;
+            let query_guard = tracker.query_guard().ok_or(QueryError::Cancel)?;
+            let provider = ParquetSelectTable::try_new(session.inner(), self.input.as_ref(), Some(query_guard)).await?;
             let current_session_table_provider = self.build_table_handle_provider()?;
             let metadata_provider =
                 MetadataProvider::new(provider, current_session_table_provider, self.func_manager.clone(), session.clone());

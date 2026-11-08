@@ -73,6 +73,8 @@ rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
 flate2.workspace = true
+brotli.workspace = true
+lz4.workspace = true
 http.workspace = true
 memchr.workspace = true
 s3s = { workspace = true, features = ["minio"] }
