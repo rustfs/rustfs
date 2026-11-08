@@ -199,7 +199,7 @@ docker run -d --name rustfs -p 9000:9000 \
 Notes:
 - `RUSTFS_NOTIFY_ENABLE=true` enables the global notify module switch.
 - For ARN `arn:rustfs:sqs::primary:webhook`, use instance-scoped env vars with `_PRIMARY`.
-- If queue dir is omitted, the official image maps `/opt/rustfs/events` into the persistent `/data` volume so it is writable by the runtime user and pending events survive container recreation. Override `queue_dir` when using another deployment layout.
+- If queue dir is omitted, the official image maps `/opt/rustfs/events` into the persistent `/data` volume so it is writable by the runtime user and pending events survive container recreation. Override `queue_dir` when using another deployment layout, or set `RUSTFS_TARGET_STORE_DIR` to move every default queue; native Windows defaults to `%ProgramData%\RustFS`. See [Target queue storage](docs/operations/target-queue-storage.md).
 - `RUSTFS_NOTIFY_WEBHOOK_SKIP_TLS_VERIFY_PRIMARY` defaults to `false`; enabling it skips webhook TLS certificate verification, allows MITM attacks, and emits a startup warning. Prefer `RUSTFS_NOTIFY_WEBHOOK_CLIENT_CA_PRIMARY` for private CAs.
 - Since `1.0.0-beta.11`, webhook endpoints on private or container networks
   (`Docker Compose service names`, `host.docker.internal`, RFC 1918 addresses) are
