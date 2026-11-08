@@ -132,7 +132,9 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(301);
 // Preserve capacity for the full validity window at maximum accepted clock skew.
 const REPLAY_CACHE_CAPACITY_WINDOW_SECS: usize = 601;
-const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
+// A reserved index avoids overlapping old/new tables during a rehash. Include
+// index slack, compact expiry storage, and page/allocator bookkeeping.
+const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: usize = 2 * std::mem::size_of::<Uuid>() + std::mem::size_of::<RpcNonceExpiration>() + 16;
 // Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
 const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
@@ -229,7 +231,7 @@ fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Op
     let memory_based_capacity = memory_limit_bytes
         .map(|bytes| {
             let budget = bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
-            saturating_usize_from_u64(budget / REPLAY_CACHE_ENTRY_BYTES_ESTIMATE)
+            saturating_usize_from_u64(budget / u64::try_from(REPLAY_CACHE_ENTRY_BYTES_ESTIMATE).unwrap_or(u64::MAX))
         })
         .unwrap_or(REPLAY_CACHE_AUTO_MAX_CAPACITY);
     let capacity = memory_based_capacity
@@ -500,6 +502,12 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
 }
 
 impl RpcNonceCache {
+    fn reserve_index(&mut self, capacity: usize) -> std::io::Result<()> {
+        self.nonces
+            .try_reserve(capacity)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))
+    }
+
     fn remove_expired(&mut self, now: Instant, wall_time: i64) -> usize {
         let mut removed = 0;
         while let Some(nonce) = self.expirations.pop_expired(now, wall_time) {
@@ -539,6 +547,11 @@ impl RpcNonceCache {
                     ..metrics
                 }),
             );
+        }
+        if self.nonces.is_empty()
+            && let Err(error) = self.reserve_index(record.capacity.min(REPLAY_CACHE_AUTO_MAX_CAPACITY))
+        {
+            return (Err(error), Some(metrics));
         }
         self.nonces.insert(record.nonce);
         self.expirations
@@ -1702,6 +1715,9 @@ pub fn verify_tonic_rpc_signature_with_bootstrap(
 }
 
 pub fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
+    if error.kind() == std::io::ErrorKind::OutOfMemory {
+        return "replay_cache_allocation";
+    }
     match error.to_string().as_str() {
         "Missing RPC audience" => "missing_audience",
         "Invalid RPC request path" => "invalid_request_path",
@@ -3141,9 +3157,9 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 17_448_304);
+        assert_eq!(decision.memory_based_capacity, 31_019_208);
         assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 17_448_304);
+        assert_eq!(decision.capacity, 19_693_568);
     }
 
     #[test]
@@ -3153,13 +3169,13 @@ mod tests {
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 34_896_609);
+        assert_eq!(decision.memory_based_capacity, 62_038_416);
         assert_eq!(decision.cpu_based_capacity, 39_387_136);
         assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
 
         let observed_field_node =
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
-        assert_eq!(observed_field_node.memory_based_capacity, 33_806_090);
+        assert_eq!(observed_field_node.memory_based_capacity, 60_099_715);
         assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
         assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
@@ -3297,6 +3313,71 @@ mod tests {
             ))
             .0
             .expect("release capacity only once future timestamp validity has closed");
+    }
+
+    #[test]
+    fn nonce_index_rejects_unallocatable_capacity_with_typed_error() {
+        let mut cache = RpcNonceCache::default();
+        let error = cache
+            .reserve_index(usize::MAX)
+            .expect_err("unallocatable capacity must fail without a panic");
+        assert_eq!(error.kind(), std::io::ErrorKind::OutOfMemory);
+        assert!(
+            error
+                .get_ref()
+                .is_some_and(|source| source.is::<std::collections::TryReserveError>())
+        );
+        assert_eq!(tonic_rpc_auth_failure_reason(&error), "replay_cache_allocation");
+        assert!(cache.nonces.is_empty());
+        assert!(cache.expirations.pages.is_empty());
+    }
+
+    #[test]
+    fn nonce_cache_reserves_the_bounded_index_before_sustained_traffic() {
+        let now = Instant::now();
+        let expiry = now + REPLAY_CACHE_RETENTION;
+        let mut cache = RpcNonceCache::default();
+        let capacity = 4096;
+        cache
+            .check_and_record(test_nonce_record(Uuid::from_u128(1), 1000, now, 1000, expiry, capacity))
+            .0
+            .expect("record first nonce");
+        let allocated = cache.nonces.capacity();
+        assert!(allocated >= capacity, "the hash index must not rehash while serving the bounded window");
+        for n in 2..=capacity {
+            cache
+                .check_and_record(test_nonce_record(
+                    Uuid::from_u128(u128::try_from(n).expect("nonce index")),
+                    1000,
+                    now,
+                    1000,
+                    expiry,
+                    capacity,
+                ))
+                .0
+                .expect("record within bounded capacity");
+        }
+        assert_eq!(cache.nonces.capacity(), allocated);
+        let full = cache
+            .check_and_record(test_nonce_record(Uuid::from_u128(9999), 1000, now, 1000, expiry, capacity))
+            .0
+            .expect_err("preallocation must not relax the logical capacity fence");
+        assert_eq!(full.to_string(), "RPC replay cache capacity exceeded");
+        assert_eq!(cache.nonces.len(), capacity);
+    }
+
+    #[test]
+    fn replay_cache_compact_storage_fits_two_cpu_window_in_2800_mib() {
+        let decision = replay_cache_capacity_decision(
+            rustfs_utils::EnvParseOutcome::Absent,
+            2,
+            Some(2800 * 1024 * 1024),
+            Some(MemoryBasis::Cgroup),
+        );
+        assert_eq!(decision.cpu_based_capacity, 4_923_392);
+        assert_eq!(decision.capacity, decision.cpu_based_capacity);
+        assert!(decision.memory_based_capacity >= decision.capacity);
+        assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
     }
 
     #[test]
