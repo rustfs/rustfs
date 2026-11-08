@@ -127,8 +127,11 @@ const HTTP_PUT_FILE_CAPABILITY_AUTH_DOMAIN: &[u8] = b"rustfs-http-put-file-capab
 const UNSIGNED_PAYLOAD: &str = "UNSIGNED-PAYLOAD";
 const UNSIGNED_PAYLOAD_NONCE: &str = "unsigned";
 const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
-const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(601);
-const REPLAY_CACHE_RETENTION_SECS: usize = 601;
+// Timestamp validity and the wall-clock high-water mark still gate eviction,
+// including future-dated signatures and replay attempts after clock rollback.
+const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(301);
+// Preserve capacity for the full validity window at maximum accepted clock skew.
+const REPLAY_CACHE_CAPACITY_WINDOW_SECS: usize = 601;
 const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: u64 = 128;
 // Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
 const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
@@ -222,7 +225,7 @@ fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Op
     let cpu_count = cpu_count.max(1);
     let cpu_based_capacity = cpu_count
         .saturating_mul(REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU)
-        .saturating_mul(REPLAY_CACHE_RETENTION_SECS);
+        .saturating_mul(REPLAY_CACHE_CAPACITY_WINDOW_SECS);
     let memory_based_capacity = memory_limit_bytes
         .map(|bytes| {
             let budget = bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
@@ -3227,6 +3230,73 @@ mod tests {
                 rpc_path: "/node_service.NodeService/ReadAll",
             },
         }
+    }
+
+    #[test]
+    fn nonce_cache_releases_expired_timestamp_capacity_without_allowing_clock_rollback_replay() {
+        let now = Instant::now();
+        let expiry = now + REPLAY_CACHE_RETENTION;
+        let later = now + Duration::from_secs(302);
+        let nonce = Uuid::new_v4();
+        let replacement = Uuid::new_v4();
+        let mut cache = RpcNonceCache::default();
+        cache
+            .check_and_record(test_nonce_record(nonce, 1_000, now, 1_000, expiry, 1))
+            .0
+            .expect("record initial nonce");
+
+        let boundary = cache
+            .check_and_record(test_nonce_record(nonce, 1_000, later, 1_300, later + REPLAY_CACHE_RETENTION, 1))
+            .0
+            .expect_err("a signature at the inclusive freshness boundary must remain protected");
+        assert_eq!(boundary.to_string(), "RPC request replay detected");
+        cache
+            .check_and_record(test_nonce_record(replacement, 1_302, later, 1_302, later + REPLAY_CACHE_RETENTION, 1))
+            .0
+            .expect("an expired signature must release bounded cache capacity");
+        assert!(!cache.nonces.contains(&nonce));
+        assert!(cache.nonces.contains(&replacement));
+
+        let rollback = cache
+            .check_and_record(test_nonce_record(nonce, 1_000, later, 1_000, later + REPLAY_CACHE_RETENTION, 1))
+            .0
+            .expect_err("clock rollback must not resurrect an evicted signature");
+        assert_eq!(rollback.to_string(), "RPC request timestamp expired after clock regression");
+    }
+
+    #[test]
+    fn nonce_cache_keeps_future_timestamp_reserved_until_its_full_validity_window_closes() {
+        let now = Instant::now();
+        let expiry = now + REPLAY_CACHE_RETENTION;
+        let later = now + Duration::from_secs(302);
+        let nonce = Uuid::new_v4();
+        let mut cache = RpcNonceCache::default();
+        cache
+            .check_and_record(test_nonce_record(nonce, 1_300, now, 1_000, expiry, 1))
+            .0
+            .expect("record nonce signed at maximum allowed forward skew");
+        let replay = cache
+            .check_and_record(test_nonce_record(nonce, 1_300, later, 1_302, later + REPLAY_CACHE_RETENTION, 1))
+            .0
+            .expect_err("monotonic expiry must not remove a still-valid future signature");
+        assert_eq!(replay.to_string(), "RPC request replay detected");
+        let full = cache
+            .check_and_record(test_nonce_record(Uuid::new_v4(), 1_302, later, 1_302, later + REPLAY_CACHE_RETENTION, 1))
+            .0
+            .expect_err("a still-valid nonce must continue consuming capacity");
+        assert_eq!(full.to_string(), "RPC replay cache capacity exceeded");
+        let expired = now + Duration::from_secs(602);
+        cache
+            .check_and_record(test_nonce_record(
+                Uuid::new_v4(),
+                1_602,
+                expired,
+                1_602,
+                expired + REPLAY_CACHE_RETENTION,
+                1,
+            ))
+            .0
+            .expect("release capacity only once future timestamp validity has closed");
     }
 
     #[test]
