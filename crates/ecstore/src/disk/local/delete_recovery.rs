@@ -2638,8 +2638,6 @@ impl LocalDisk {
                 for file in written_files {
                     file.sync_data()?;
                 }
-                let linked_in_staged =
-                    target.is_some() && std::fs::hard_link(staged_dir.join(TARGET), staged_dir.join("delete-xl")).is_ok();
                 if sync {
                     os::fsync_dir_std(&staged_dir)?;
                 }
@@ -2664,6 +2662,8 @@ impl LocalDisk {
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
                 }
+                #[cfg(all(test, unix))]
+                fused_prepare_checkpoint::run(&file_path);
                 let mut reserved_data_path = None;
                 if let Some(old_path) = old_data_path {
                     let reserved_marker = old_path.join(format!("{RESERVED_DELETE_DATA_DIR_MARKER_PREFIX}{transaction}"));
@@ -2683,33 +2683,25 @@ impl LocalDisk {
                     reserved_data_path = Some((old_path, reserved_marker));
                 }
                 if let Some(ref target_bytes) = target {
-                    let write_res = if linked_in_staged {
-                        let staged_xl_in_dest = destination.join("delete-xl");
-                        let rename_res = std::fs::rename(&staged_xl_in_dest, &xl_path);
+                    // A provisional head must stay outside the published recovery transaction.
+                    let target_in_rollback = destination.join(TARGET);
+                    let linked_xl = staging_root.join(format!("delete-xl-{transaction}"));
+                    let _ = std::fs::remove_file(&linked_xl);
+                    let write_res = if std::fs::hard_link(&target_in_rollback, &linked_xl).is_ok() {
+                        let rename_res = std::fs::rename(&linked_xl, &xl_path);
                         if rename_res.is_err() {
-                            let _ = std::fs::remove_file(&staged_xl_in_dest);
+                            let _ = std::fs::remove_file(&linked_xl);
                         }
                         rename_res
                     } else {
-                        let target_in_rollback = destination.join(TARGET);
-                        let linked_xl = staging_root.join(format!("delete-xl-{transaction}"));
-                        let _ = std::fs::remove_file(&linked_xl);
-                        if std::fs::hard_link(&target_in_rollback, &linked_xl).is_ok() {
-                            let rename_res = std::fs::rename(&linked_xl, &xl_path);
-                            if rename_res.is_err() {
-                                let _ = std::fs::remove_file(&linked_xl);
+                        (|| -> std::io::Result<()> {
+                            let mut staged_xl = tempfile::NamedTempFile::new_in(&staging_root)?;
+                            std::io::Write::write_all(staged_xl.as_file_mut(), target_bytes)?;
+                            if sync && !target_bytes.is_empty() {
+                                staged_xl.as_file().sync_data()?;
                             }
-                            rename_res
-                        } else {
-                            (|| -> std::io::Result<()> {
-                                let mut staged_xl = tempfile::NamedTempFile::new_in(&staging_root)?;
-                                std::io::Write::write_all(staged_xl.as_file_mut(), target_bytes)?;
-                                if sync && !target_bytes.is_empty() {
-                                    staged_xl.as_file().sync_data()?;
-                                }
-                                std::fs::rename(staged_xl.path(), &xl_path)
-                            })()
-                        }
+                            std::fs::rename(staged_xl.path(), &xl_path)
+                        })()
                     };
                     if let Err(err) = write_res {
                         if let Some((_, reserved_marker)) = &reserved_data_path {
@@ -3292,6 +3284,42 @@ pub(super) async fn restore_barrier(volume: &str, object_dir: &Path, transaction
     }
     let _ = (volume, object_dir, transaction);
     Ok(())
+}
+
+#[cfg(all(test, unix))]
+mod fused_prepare_checkpoint {
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    type Hook = Box<dyn FnOnce() + Send>;
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hook>>> = LazyLock::new(|| Mutex::new(HashMap::new()));
+
+    pub(super) struct Guard(PathBuf);
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            HOOKS.lock().expect("checkpoint hooks").remove(&self.0);
+        }
+    }
+
+    pub(super) fn install(root: &Path, hook: impl FnOnce() + Send + 'static) -> Guard {
+        assert!(
+            HOOKS
+                .lock()
+                .expect("checkpoint hooks")
+                .insert(root.to_path_buf(), Box::new(hook))
+                .is_none()
+        );
+        Guard(root.to_path_buf())
+    }
+
+    pub(super) fn run(root: &Path) {
+        let hook = HOOKS.lock().expect("checkpoint hooks").remove(root);
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -7207,6 +7235,73 @@ mod tests {
         assert_eq!(final_meta.versions.len(), 2);
         assert_eq!(final_meta.versions[0].header.version_id, marker.version_id);
         marker.deleted = false;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn delete_recovery_fused_prepare_checkpoint_reopens_before_head_publication() {
+        let (_temp, disk, mut first, _) = fixture().await;
+        first.version_id = Some(Uuid::new_v4());
+        let mut second = first.clone();
+        second.version_id = Some(Uuid::new_v4());
+        let mut meta = FileMeta::new();
+        meta.add_version(first).expect("add surviving version");
+        meta.add_version(second.clone()).expect("add deleted version");
+        let original = meta.marshal_msg().expect("encode original versions");
+        let (_, root) = disk.io_get_bucket_and_object_path("recovery", "object").expect("object path");
+        fs::write(root.join(STORAGE_FORMAT_FILE), &original)
+            .await
+            .expect("write versions");
+
+        let (checkpoint_temp, checkpoint_disk, _, _) = fixture().await;
+        let checkpoint_root = checkpoint_temp.path().join("recovery/object");
+        drop(checkpoint_disk);
+        let transaction = Uuid::new_v4();
+        let source_root = root.clone();
+        let copy_root = checkpoint_root.clone();
+        let _capture = fused_prepare_checkpoint::install(&root, move || {
+            let source = source_root.join(transaction.to_string());
+            let destination = copy_root.join(transaction.to_string());
+            std::fs::create_dir(&destination).expect("create checkpoint transaction");
+            std::fs::copy(source_root.join(STORAGE_FORMAT_FILE), copy_root.join(STORAGE_FORMAT_FILE))
+                .expect("capture head before publication");
+            for entry in std::fs::read_dir(source).expect("read published preparation") {
+                let entry = entry.expect("prepared file");
+                assert!(entry.file_type().expect("prepared file type").is_file());
+                std::fs::copy(entry.path(), destination.join(entry.file_name())).expect("capture prepared file");
+            }
+        });
+        let opts = DeleteOptions {
+            recoverable_delete: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            disk.try_fused_recoverable_delete_version("recovery", "object", &second, &opts, transaction, None)
+                .await
+                .expect("finish original preparation"),
+            Some(())
+        );
+        assert!(checkpoint_root.join(transaction.to_string()).join(PREPARED).is_file());
+        let endpoint =
+            Endpoint::try_from(checkpoint_temp.path().to_str().expect("checkpoint path")).expect("checkpoint endpoint");
+        let reopened = LocalDisk::new(&endpoint, false)
+            .await
+            .expect("reopen checkpoint as a fresh disk");
+        let inspection = reopened
+            .delete_recovery_inspect("recovery", "object", transaction)
+            .await
+            .expect("actual preparation checkpoint must remain recoverable");
+        assert_eq!(inspection.state, DeleteRecoveryState::NewPrepared);
+        reopened
+            .settle_delete_transaction("recovery", "object", transaction, inspection.fingerprint, DeleteRecoveryAction::Rollback)
+            .await
+            .expect("roll back interrupted preparation");
+        assert_eq!(
+            fs::read(checkpoint_root.join(STORAGE_FORMAT_FILE))
+                .await
+                .expect("read rolled-back versions"),
+            original
+        );
     }
 
     #[tokio::test]
