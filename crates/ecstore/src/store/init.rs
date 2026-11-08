@@ -676,7 +676,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::new(pool_meta_write_state),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(pool_meta_write_state),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.

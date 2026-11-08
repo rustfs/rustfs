@@ -527,7 +527,7 @@ impl ECStore {
     async fn acquire_heal_format_fence(
         &self,
     ) -> Result<(
-        tokio::sync::RwLockWriteGuard<'_, PoolMetaWriteState>,
+        crate::core::pools::PoolMetaSaveGateWriteGuard<'_>,
         NamespaceLockGuard,
         NamespaceLockGuard,
         PoolMeta,
@@ -2527,7 +2527,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -3862,7 +3862,7 @@ mod tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(vec![None; 2]),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::new(state),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(state),
             ctx: Arc::clone(&source.ctx),
             bucket_fence_registry: Arc::default(),
         })
@@ -5124,7 +5124,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         };
@@ -5144,7 +5144,7 @@ mod tests {
             .save_for_startup(store.pools.clone())
             .await
             .expect("pool metadata should be persisted before format heal");
-        *store.pool_meta_save_gate.write().await = PoolMetaWriteState::default();
+        *store.pool_meta_save_gate.write().await = crate::core::pools::PoolMetaWriteState::default();
 
         let replacement_endpoint = store.pools[1].endpoints.endpoints.as_ref()[2].clone();
         tokio::fs::remove_file(
