@@ -25,6 +25,7 @@ PHASE=""
 OUT_ROOT="${PROJECT_ROOT}/target/bench/internode-transport"
 DRY_RUN=false
 LIFECYCLE_FEATURE="both"
+TRANSPORT_FEATURE="all"
 PASSTHROUGH=()
 
 usage() {
@@ -41,6 +42,8 @@ Options:
   --dry-run                 Print the env + the command, do not run the bench.
   --lifecycle-feature <prewarm|offline|both>
                             P3 feature to enable. Default: both (legacy combined experiment).
+  --transport-feature <nodelay|stream-window|connection-window|max-message|all>
+                            P0 parameter to compare. Default: all (legacy combined experiment).
   -h, --help                Show this help.
 
 Everything after `--` is passed through to the underlying bench:
@@ -64,6 +67,9 @@ while [[ $# -gt 0 ]]; do
     --out-root) OUT_ROOT="$2"; shift 2 ;;
     --dry-run) DRY_RUN=true; shift ;;
     --lifecycle-feature) LIFECYCLE_FEATURE="$2"; shift 2 ;;
+    --transport-feature)
+      [[ $# -ge 2 ]] || { echo "ERROR: --transport-feature requires a value" >&2; exit 2; }
+      TRANSPORT_FEATURE="$2"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     --) shift; PASSTHROUGH=("$@"); break ;;
     *) echo "Unknown argument: $1" >&2; usage; exit 2 ;;
@@ -72,6 +78,11 @@ done
 
 [[ -n "${STAGE}" && -n "${PHASE}" ]] || { echo "ERROR: --stage and --phase are required" >&2; usage; exit 2; }
 case "${LIFECYCLE_FEATURE}" in prewarm|offline|both) ;; *) echo "ERROR: invalid --lifecycle-feature" >&2; exit 2 ;; esac
+case "${TRANSPORT_FEATURE}" in nodelay|stream-window|connection-window|max-message|all) ;; *) echo "ERROR: invalid --transport-feature" >&2; exit 2 ;; esac
+if [[ "${STAGE}" != "p0" && "${TRANSPORT_FEATURE}" != "all" ]]; then
+  echo "ERROR: --transport-feature is only valid for --stage p0" >&2
+  exit 2
+fi
 if [[ "${STAGE}" != "p3" && "${LIFECYCLE_FEATURE}" != "both" ]]; then
   echo "ERROR: --lifecycle-feature is only valid for --stage p3" >&2
   exit 2
@@ -91,11 +102,18 @@ stage_env() {
   case "${stage}" in
     p0)
       if [[ "${phase}" == "before" ]]; then
-        printf '%s\n' \
-          'RUSTFS_INTERNODE_RPC_TCP_NODELAY=false' \
-          'RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE=0' \
-          'RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE=0' \
-          'RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE=4194304'
+        if [[ "${TRANSPORT_FEATURE}" == "all" || "${TRANSPORT_FEATURE}" == "nodelay" ]]; then
+          printf '%s\n' 'RUSTFS_INTERNODE_RPC_TCP_NODELAY=false'
+        fi
+        if [[ "${TRANSPORT_FEATURE}" == "all" || "${TRANSPORT_FEATURE}" == "stream-window" ]]; then
+          printf '%s\n' 'RUSTFS_INTERNODE_RPC_HTTP2_STREAM_WINDOW_SIZE=0'
+        fi
+        if [[ "${TRANSPORT_FEATURE}" == "all" || "${TRANSPORT_FEATURE}" == "connection-window" ]]; then
+          printf '%s\n' 'RUSTFS_INTERNODE_RPC_HTTP2_CONN_WINDOW_SIZE=0'
+        fi
+        if [[ "${TRANSPORT_FEATURE}" == "all" || "${TRANSPORT_FEATURE}" == "max-message" ]]; then
+          printf '%s\n' 'RUSTFS_INTERNODE_RPC_MAX_MESSAGE_SIZE=4194304'
+        fi
       fi
       # The reset list below clears the baseline overrides before restoring defaults.
       ;;
@@ -152,12 +170,17 @@ case "${STAGE}" in
   p2) RESET_VARS=(RUSTFS_INTERNODE_RPC_MSGPACK_ONLY RUSTFS_INTERNODE_RPC_MSGPACK_ONLY_FLEET_CONFIRMED) ;;
   p3) RESET_VARS=(RUSTFS_INTERNODE_PREWARM RUSTFS_INTERNODE_OFFLINE_BYPASS RUSTFS_INTERNODE_OFFLINE_REPROBE_SECS RUSTFS_INTERNODE_OFFLINE_FAILURE_THRESHOLD) ;;
 esac
-OUT_DIR="${OUT_ROOT}/${STAGE}-${PHASE}"
+ARTIFACT_STAGE="${STAGE}"
+if [[ "${STAGE}" == "p0" && "${TRANSPORT_FEATURE}" != "all" ]]; then
+  ARTIFACT_STAGE="${STAGE}-${TRANSPORT_FEATURE}"
+fi
+OUT_DIR="${OUT_ROOT}/${ARTIFACT_STAGE}-${PHASE}"
 mkdir -p "${OUT_DIR}"
 ENV_FILE="${OUT_DIR}/server-env.sh"
 
 {
   echo "# RustFS server env for internode stage ${STAGE} / phase ${PHASE}."
+  if [[ "${STAGE}" == "p0" ]]; then echo "# Transport feature: ${TRANSPORT_FEATURE}"; fi
   if [[ "${STAGE}" == "p2" && "${PHASE}" == "canary" ]]; then
     echo "# Source this only on the selected canary RustFS node before starting that node; keep the rest on p2/before or p2/request-only env."
   else
@@ -184,7 +207,26 @@ fi
 
 run() {
   if [[ "${DRY_RUN}" == "true" ]]; then
-    echo "-- dry-run, would execute:"; printf '   %q ' "$@"; echo
+    local redact_next=false argument
+    echo "-- dry-run, would execute:"
+    for argument in "$@"; do
+      if [[ "${redact_next}" == "true" ]]; then
+        printf '   %q ' REDACTED
+        redact_next=false
+        continue
+      fi
+      case "${argument}" in
+        --access-key|--secret-key|--session-token)
+          printf '   %q ' "${argument}"
+          redact_next=true
+          ;;
+        --access-key=*|--secret-key=*|--session-token=*|-accessKey=*|-secretKey=*)
+          printf '   %q ' "${argument%%=*}=REDACTED"
+          ;;
+        *) printf '   %q ' "${argument}" ;;
+      esac
+    done
+    echo
     return 0
   fi
   "$@"

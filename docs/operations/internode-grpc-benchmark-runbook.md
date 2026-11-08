@@ -24,6 +24,15 @@ The driver writes the stage/phase server env to `<out-dir>/server-env.sh` and ru
 
 For P3 single-variable experiments, select `--lifecycle-feature prewarm` or `--lifecycle-feature offline`. The default `both` preserves the combined experiment. Measure prewarm with cold first calls and delayed peer startup, and measure offline bypass with sustained peer loss and survivor-only client traffic. Record the selected feature with each result.
 
+For P0 single-parameter experiments, select `--transport-feature nodelay`, `stream-window`, `connection-window` or `max-message`. The default `all` retains the original combined preset and cannot attribute a result to one parameter. Selected P0 features write to `<out-root>/p0-<feature>-<phase>/`, keeping separate parameter artifacts from overwriting each other. Both legs clear the four P0-managed settings; the baseline overrides only the selected setting, while the candidate restores defaults. Apply any intended non-default production settings equally after the phase file, and read back effective settings, including bulk overrides that may take precedence. Zero receive windows select the linked library default, rather than a zero-byte or historical 64 KiB window; the phase names do not imply that the candidate is faster.
+
+```bash
+scripts/run_internode_grpc_ab_bench.sh --stage p0 --phase before --transport-feature connection-window --dry-run
+scripts/run_internode_grpc_ab_bench.sh --stage p0 --phase after --transport-feature connection-window --dry-run
+```
+
+Dry-run command display redacts access keys, secret keys and session tokens. Actual dispatch preserves the supplied arguments. Keep credentials out of published evidence and shell history; only use task-owned buckets because load tools may clear their selected bucket.
+
 Set `GRPC_BENCH_METRICS_URL` to the Collector Prometheus exporter endpoint. Generate each phase with `--dry-run`, apply its environment through the node service configuration, restart and verify all nodes, then execute the matching workload command.
 
 ```bash
@@ -104,6 +113,10 @@ RUSTFS_INTERNODE_CHANNEL_ISOLATION=true RUSTFS_INTERNODE_BULK_CHANNELS=2 target/
 ```
 
 Freeze the binary and environment, qualify repeated A baselines, then run A1/B1/B2/A2. Interpret payload throughput as one payload per validated round trip; the echo transfers that payload in both directions. Keep source revision, binary identity, workload arguments, connection counts, all errors and raw samples with the results. Stop attribution when baseline drift exceeds the declared gate. Use the effective four-node deployment configuration for final acceptance, with metadata, locks, multipart, TLS rotation and peer failure covered.
+
+For fleet-wide transport changes such as switching between plaintext and TLS, stop all test nodes and verify their processes have exited before starting any node with the new settings. A per-node stop/start loop can temporarily mix protocols and exhaust peer startup retries. Preserve real shutdown failures such as `http12_deadline_missed`; a successful `systemctl stop` command alone does not establish a clean application exit. Use independent collector endpoints and configure its own telemetry listener too, so a second collector does not collide with an existing instance's default internal metrics port.
+
+Object workload latency and RPC latency describe different boundaries. Verify that the intended bulk RPCs actually occurred before attributing isolation, pool or window effects; large S3 objects alone do not prove large unary gRPC payload coverage. Record the histogram boundaries when comparing code versions: a finer bucket layout changes quantile estimates without establishing a latency improvement. Keep the instrument name, units and client/server boundaries with the raw evidence.
 
 ## Acceptance gates
 
