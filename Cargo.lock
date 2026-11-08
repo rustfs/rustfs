@@ -9837,6 +9837,7 @@ dependencies = [
  "google-cloud-auth",
  "google-cloud-storage",
  "h2",
+ "hashbrown 0.17.1",
  "hex-simd",
  "hmac 0.13.0",
  "hostname",

@@ -1664,6 +1664,9 @@ async fn handle_put_file(req: Request<Incoming>, require_auth: bool) -> Response
             INTERNODE_TRANSPORT_BACKEND_TCP_HTTP,
         )
     {
+        if crate::storage::storage_api::rpc_auth_is_resource_exhausted(&e) {
+            return response_with_status(StatusCode::SERVICE_UNAVAILABLE, "RPC replay admission exhausted");
+        }
         log_internode_rpc_response_failure!(
             StatusCode::FORBIDDEN,
             &path,

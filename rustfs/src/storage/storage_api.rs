@@ -621,7 +621,7 @@ pub(crate) mod ecstore_rpc {
         KMS_SIGNAL_SUBSYSTEM, LocalPeerS3Client, MAX_NETWORK_PROBE_BYTES, MAX_NETWORK_PROBE_DURATION, NetworkPeerProbeClient,
         NetworkPeerProbeError, PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS, PeerRestClient, PeerS3Client,
         SERVICE_SIGNAL_REFRESH_CONFIG, SERVICE_SIGNAL_RELOAD_DYNAMIC, TONIC_RPC_PREFIX, check_and_record_signed_rpc_nonce,
-        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_background_admission,
+        decode_heal_bucket_rpc_options, normalize_tonic_rpc_audience, rpc_auth_is_resource_exhausted, rpc_background_admission,
         sign_ns_scanner_capability_with_checkpoint_coverage, sign_put_file_capability, sign_tonic_rpc_response_proof,
         tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
         verify_put_file_auth_trailer, verify_rpc_signature, verify_tonic_canonical_body_digest,
@@ -630,8 +630,8 @@ pub(crate) mod ecstore_rpc {
     };
     #[cfg(test)]
     pub(crate) use rustfs_ecstore::api::rpc::{
-        ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers, gen_tonic_replay_scope_headers,
-        gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_put_file_capability,
+        RpcReplayCacheAdmissionError, ScannerScopedDirtyUsageAckEntry, build_put_file_auth_trailer, gen_signature_headers,
+        gen_tonic_replay_scope_headers, gen_tonic_signature_headers, set_tonic_canonical_body_digest, verify_put_file_capability,
         verify_tonic_boot_epoch_response, verify_tonic_rpc_response_proof,
     };
 }
@@ -2431,6 +2431,10 @@ pub(crate) fn verify_tonic_rpc_signature_with_bootstrap(
     allow_replay_scope_bootstrap: bool,
 ) -> std::io::Result<()> {
     ecstore_rpc::verify_tonic_rpc_signature_with_bootstrap(audience, path, headers, allow_replay_scope_bootstrap)
+}
+
+pub(crate) fn rpc_auth_is_resource_exhausted(error: &std::io::Error) -> bool {
+    ecstore_rpc::rpc_auth_is_resource_exhausted(error)
 }
 
 pub(crate) fn tonic_rpc_auth_failure_reason(error: &std::io::Error) -> &'static str {
