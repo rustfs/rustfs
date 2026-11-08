@@ -75,6 +75,7 @@ futures-core = { workspace = true }
 flate2.workspace = true
 brotli.workspace = true
 lz4.workspace = true
+lz4_flex.workspace = true
 http.workspace = true
 memchr.workspace = true
 s3s = { workspace = true, features = ["minio"] }

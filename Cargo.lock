@@ -10770,6 +10770,7 @@ dependencies = [
  "hotpath",
  "http 1.5.0",
  "lz4",
+ "lz4_flex",
  "memchr",
  "metrics",
  "parking_lot 0.13.0",
