@@ -33,6 +33,7 @@ enum PutStorageTestStage {
 #[cfg(test)]
 tokio::task_local! {
     static PUT_STORAGE_TEST_FAILURE: (PutStorageTestStage, StorageError);
+    static PUT_STORAGE_TEST_COMPLETION: std::cell::Cell<Option<crate::app::storage_api::object_usecase::WriteCompletion>>;
 }
 
 #[cfg(test)]
@@ -1571,6 +1572,8 @@ impl DefaultObjectUsecase {
         )
         .await
         .map_err(ApiError::from)?;
+        // Keep the request awaiting the rename fan-out that owns its namespace guard.
+        opts.write_completion = crate::app::storage_api::object_usecase::WriteCompletion::TailDrained;
         if let Some(etag) = preserve_etag {
             opts.preserve_etag = Some(etag);
         }
@@ -1879,9 +1882,16 @@ impl DefaultObjectUsecase {
 
         reader = write_plan.apply(reader, actual_size).map_err(ApiError::from)?;
         if let Some(control) = progress_control {
-            use rustfs_rio::HashReaderMut;
-            let inner = reader.take_inner();
-            reader.inner = rustfs_rio::boxed_reader(super::request_body::DemandReader::new(inner, control));
+            if !should_compress
+                && (use_zero_copy_eager_put_path || use_empty_or_small_eager_put_path)
+                && trailing_headers.is_none()
+            {
+                control.finish();
+            } else {
+                use rustfs_rio::HashReaderMut;
+                let inner = reader.take_inner();
+                reader.inner = rustfs_rio::boxed_reader(super::request_body::DemandReader::new(inner, control));
+            }
         }
         rustfs_io_metrics::record_put_object_stage_duration_from("app_encryption_prepare", encryption_stage_start);
 
@@ -1958,6 +1968,8 @@ impl DefaultObjectUsecase {
         } else {
             None
         };
+        #[cfg(test)]
+        let _ = PUT_STORAGE_TEST_COMPLETION.try_with(|observed| observed.set(Some(opts.write_completion)));
         #[cfg(test)]
         let injected_commit_error = injected_put_storage_failure(PutStorageTestStage::Commit);
         let put_commit_future = {
@@ -2226,6 +2238,43 @@ mod tests {
     use super::*;
     use futures::StreamExt;
     use http::{HeaderMap, HeaderName, HeaderValue, Method};
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn s3_put_uses_tail_drained_completion_before_acknowledgement() {
+        use crate::app::storage_api::object_usecase::WriteCompletion;
+        use crate::app::storage_api::test::contract::bucket::{BucketOperations as _, MakeBucketOptions};
+
+        let (store, context) = real_store_test_context().await;
+        let bucket = format!("put-tail-completion-{}", Uuid::new_v4());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create PUT completion bucket");
+        let payload = Bytes::from_static(b"readable after PUT acknowledgement");
+        let input = PutObjectInput::builder()
+            .bucket(bucket.clone())
+            .key("object".to_owned())
+            .content_length(Some(i64::try_from(payload.len()).expect("small payload length")))
+            .body(Some(StreamingBlob::from_bytes(payload.clone())))
+            .build()
+            .expect("PUT completion request");
+        let usecase = DefaultObjectUsecase::with_context(Some(context));
+        let fs = FS::new();
+        let (response, observed) = PUT_STORAGE_TEST_COMPLETION
+            .scope(std::cell::Cell::new(None), async {
+                let response = Box::pin(usecase.execute_put_object(&fs, build_request(input, Method::PUT))).await;
+                (response, PUT_STORAGE_TEST_COMPLETION.with(std::cell::Cell::get))
+            })
+            .await;
+        response.expect("PUT completion response");
+        assert_eq!(observed, Some(WriteCompletion::TailDrained));
+        let object = store
+            .get_object_info(&bucket, "object", &ObjectOptions::default())
+            .await
+            .expect("acknowledged PUT metadata remains readable");
+        assert_eq!(object.size, i64::try_from(payload.len()).expect("small payload length"));
+    }
 
     #[test]
     #[serial_test::serial]

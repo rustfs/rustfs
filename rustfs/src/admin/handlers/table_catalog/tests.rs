@@ -1,3 +1,6 @@
+#[path = "tests/catalog_migration_scope.rs"]
+mod catalog_migration_scope;
+
 use super::*;
 use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, ServerContextSlot};
 use crate::storage::storage_api::contract::bucket::{BucketOperations as _, MakeBucketOptions};
@@ -87,6 +90,52 @@ async fn call_load_table_handler(request: S3Request<Body>) -> S3Result<S3Respons
     RestLoadTableHandler {}.call(request, matched.params).await
 }
 
+async fn call_catalog_restore_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    router
+        .insert("/iceberg/v1/{warehouse}/catalog/restore", ())
+        .expect("restore test route should insert");
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("restore test route should match");
+    RestoreTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
+async fn call_catalog_backup_export_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/export"), ())
+            .expect("backup export test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup export test route should match");
+    ExportTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
+async fn call_catalog_backup_import_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/import"), ())
+            .expect("backup import test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup import test route should match");
+    ImportTableCatalogBackupHandler {}.call(request, matched.params).await
+}
+
+async fn call_catalog_backup_prepare_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
+    let mut router = matchit::Router::new();
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        router
+            .insert(format!("{prefix}/{{warehouse}}/catalog/backup/prepare"), ())
+            .expect("backup preparation test route should insert");
+    }
+    let path = request.uri.path().to_string();
+    let matched = router.at(&path).expect("backup preparation test route should match");
+    PrepareTableCatalogBackupObjectHandler {}.call(request, matched.params).await
+}
+
 async fn call_disable_table_bucket_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
     let mut router = matchit::Router::new();
     router.insert("/iceberg/v1/buckets/{warehouse}", ()).unwrap();
@@ -106,21 +155,11 @@ async fn call_maintenance_worker_handler(request: S3Request<Body>) -> S3Result<S
     RunTableMaintenanceWorkerHandler {}.call(request, matched.params).await
 }
 
-async fn call_metadata_maintenance_handler(request: S3Request<Body>) -> S3Result<S3Response<(StatusCode, Body)>> {
-    let mut router = matchit::Router::new();
-    router
-        .insert("/iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/metadata", ())
-        .expect("maintenance test route should insert");
-    let path = request.uri.path().to_string();
-    let matched = router.at(&path).expect("maintenance test route should match");
-    RestTableMetadataMaintenanceHandler {}.call(request, matched.params).await
-}
-
 #[tokio::test]
 async fn commit_backend_borrowed_put_preserves_owner_authorization_and_precondition() {
     use crate::admin::storage_api::object::WriteCommitGuard;
     use crate::storage::storage_api::contract::namespace::NamespaceLocking as _;
-    use crate::table_catalog::{EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, TableCatalogPutPrecondition};
+    use crate::table_catalog::{EcStoreTableCatalogObjectBackend, TableCatalogPutPrecondition};
     use std::time::Duration;
 
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
@@ -134,7 +173,7 @@ async fn commit_backend_borrowed_put_preserves_owner_authorization_and_precondit
     let guard = WriteCommitGuard::acquire(&lock, Duration::from_secs(5))
         .await
         .expect("hold actual target owner");
-    let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
+    let backend = EcStoreTableCatalogObjectBackend::new(store);
     let authorized = Arc::new(tokio::sync::Mutex::new(Vec::new()));
     let commit = TableCommitObjectBackend::test(backend.clone(), Arc::clone(&authorized), None);
     let payload = br#"{"version":1}"#.to_vec();
@@ -187,6 +226,788 @@ async fn commit_backend_borrowed_put_preserves_owner_authorization_and_precondit
             .expect("original remains")
             .data,
         payload
+    );
+}
+
+#[tokio::test]
+async fn staged_create_is_invisible_until_assert_create_commit_across_backings() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+
+        let staged =
+            create_table_response(&store, &commit_backend, "warehouse", &namespace, staged_events_create_request(), true)
+                .await
+                .expect("stage-create should return initialized metadata");
+
+        assert_eq!(staged.metadata_location, None, "{mode:?}");
+        let staged_json = serde_json::to_value(&staged).expect("staged response should serialize");
+        assert!(staged_json["metadata-location"].is_null(), "{mode:?}");
+        assert!(
+            store
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("table lookup should succeed")
+                .is_none(),
+            "{mode:?}"
+        );
+        let metadata_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/";
+        assert!(
+            metadata_backend
+                .list_objects("warehouse", metadata_prefix)
+                .await
+                .expect("metadata listing should succeed")
+                .is_empty(),
+            "{mode:?}"
+        );
+
+        let committed = commit_table_response(
+            &store,
+            &commit_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            staged_create_commit_request(&staged.metadata, []),
+        )
+        .await
+        .expect("assert-create commit should publish the table");
+
+        assert_eq!(committed.generation, 1, "{mode:?}");
+        assert_eq!(committed.metadata["table-uuid"], staged.metadata["table-uuid"], "{mode:?}");
+        assert_eq!(committed.metadata["metadata-log"], serde_json::json!([]), "{mode:?}");
+        let entry = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup should succeed")
+            .expect("committed table should be visible");
+        assert_eq!(entry.table_uuid, staged.metadata["table-uuid"].as_str().unwrap(), "{mode:?}");
+        assert_eq!(
+            committed.metadata_location,
+            table_metadata_location_for_client("warehouse", &entry.metadata_location),
+            "{mode:?}"
+        );
+        assert!(
+            metadata_backend
+                .object_exists("warehouse", &entry.metadata_location)
+                .await
+                .expect("metadata lookup should succeed"),
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn staged_create_rejects_an_active_table_warehouse_location() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        let catalog_backend = TestTableCatalogObjectBackend::content_addressed();
+        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(catalog_backend, mode);
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(&store, "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            &store,
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let commit_backend = TableCommitObjectBackend::trusted(metadata_backend);
+        let active_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "name": "active_events",
+            "location": "s3://warehouse/shared/events",
+            "schema": {"type": "struct", "fields": []}
+        }))
+        .expect("active create request should parse");
+        create_table_response(&store, &commit_backend, "warehouse", &namespace, active_request, true)
+            .await
+            .expect("active table should be created");
+        let staged_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
+            "name": "staged_events",
+            "location": "s3://warehouse/shared/events/child",
+            "schema": {"type": "struct", "fields": []},
+            "stage-create": true
+        }))
+        .expect("staged create request should parse");
+
+        let error = create_table_response(&store, &commit_backend, "warehouse", &namespace, staged_request, true)
+            .await
+            .expect_err("stage-create must reject a location owned by an active table");
+
+        assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()), "{mode:?}");
+        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
+        assert!(
+            store
+                .load_table("warehouse", "analytics", "staged_events")
+                .await
+                .expect("table lookup should succeed")
+                .is_none(),
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn concurrent_staged_create_commits_publish_exactly_one_table() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        let catalog_backend = TestTableCatalogObjectBackend::content_addressed();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let metadata_backend = TestTableCatalogObjectBackend {
+            put_object_barrier: Some(Arc::clone(&barrier)),
+            ..TestTableCatalogObjectBackend::content_addressed()
+        };
+        let store = Arc::new(crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(catalog_backend, mode));
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        ensure_table_bucket_entry(store.as_ref(), "warehouse", true)
+            .await
+            .expect("table bucket entry should be seeded");
+        create_namespace_response(
+            store.as_ref(),
+            "warehouse",
+            CreateNamespaceRequest {
+                namespace: vec!["analytics".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .expect("namespace should be created");
+        let staged = create_table_response(
+            store.as_ref(),
+            &TableCommitObjectBackend::trusted(metadata_backend.clone()),
+            "warehouse",
+            &namespace,
+            staged_events_create_request(),
+            true,
+        )
+        .await
+        .expect("stage-create should succeed");
+        let first_store = Arc::clone(&store);
+        let first_namespace = namespace.clone();
+        let first_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+        let first_request = staged_create_commit_request(&staged.metadata, []);
+        let first = tokio::spawn(async move {
+            commit_table_response(
+                first_store.as_ref(),
+                &first_backend,
+                "warehouse",
+                &first_namespace,
+                "events",
+                first_request,
+            )
+            .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while metadata_backend.state.lock().await.objects.is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("first metadata write should reach the publication pause");
+        metadata_backend.lock_attempts.lock().await.clear();
+        let second_store = Arc::clone(&store);
+        let second_namespace = namespace.clone();
+        let second_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
+        let second_request = staged_create_commit_request(&staged.metadata, []);
+        let second = tokio::spawn(async move {
+            commit_table_response(
+                second_store.as_ref(),
+                &second_backend,
+                "warehouse",
+                &second_namespace,
+                "events",
+                second_request,
+            )
+            .await
+        });
+        metadata_backend.wait_for_lock_attempts(1).await;
+        assert!(
+            !second.is_finished(),
+            "second create must wait after observing the table as absent: {mode:?}"
+        );
+
+        barrier.wait().await;
+        let _winner = tokio::time::timeout(StdDuration::from_secs(2), first)
+            .await
+            .expect("first assert-create commit should complete")
+            .expect("first assert-create task should join")
+            .expect("first assert-create commit should win");
+        tokio::time::timeout(StdDuration::from_secs(2), async {
+            while metadata_backend.state.lock().await.objects.len() < 2 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("second metadata write should reach the publication pause");
+        barrier.wait().await;
+        let loser = tokio::time::timeout(StdDuration::from_secs(2), second)
+            .await
+            .expect("second assert-create commit should complete")
+            .expect("second assert-create task should join")
+            .expect_err("second assert-create commit must lose at atomic registration");
+
+        assert_eq!(loser.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()), "{mode:?}");
+        assert_eq!(loser.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
+        assert_eq!(
+            store
+                .list_tables("warehouse", "analytics")
+                .await
+                .expect("table listing should succeed")
+                .len(),
+            1,
+            "{mode:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metadata_files() {
+    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::ObjectBacked, "curated").await;
+}
+
+#[tokio::test]
+async fn concurrent_identical_commits_reuse_table_scoped_metadata_winner() {
+    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+    let store = crate::table_catalog::ObjectTableCatalogStore::new(metadata_backend.clone());
+    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+    create_standard_events_table(&store, &metadata_backend, &namespace).await;
+    let current = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    let mut foreign_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &current.metadata_location)
+        .await
+        .expect("current metadata should load");
+    foreign_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
+    let commit_id = "11111111-1111-4111-8111-111111111111";
+    let primary_location =
+        crate::table_catalog::table_metadata_file_path_for_entry(&current, &next_metadata_file_name(2, commit_id))
+            .expect("primary metadata path should be valid");
+    metadata_backend
+        .put_json("warehouse", &primary_location, foreign_metadata)
+        .await;
+
+    let barrier_backend = TestTableCatalogObjectBackend {
+        put_object_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
+        ..metadata_backend.clone()
+    };
+    let first_backend = trusted_table_commit_backend(&barrier_backend);
+    let second_backend = trusted_table_commit_backend(&barrier_backend);
+    let (first, second) = tokio::join!(
+        standard_commit_table_response(
+            &store,
+            &first_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
+        ),
+        standard_commit_table_response(
+            &store,
+            &second_backend,
+            "warehouse",
+            &namespace,
+            "events",
+            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
+        )
+    );
+    let first = first.expect("first identical commit should succeed");
+    let second = second.expect("second identical commit should replay the winner");
+
+    assert_eq!(first.commit_id, second.commit_id);
+    assert_eq!(first.metadata_location, second.metadata_location);
+    assert_eq!(first.metadata, second.metadata);
+    assert!(
+        first
+            .metadata_location
+            .ends_with(&table_scoped_metadata_file_name(2, &current.table_id, commit_id))
+    );
+    let committed = store
+        .load_table("warehouse", "analytics", "events")
+        .await
+        .expect("table lookup should succeed")
+        .expect("table should exist");
+    assert_eq!(committed.generation, current.generation + 1);
+}
+
+#[tokio::test]
+async fn commit_publication_replays_historical_standard_commit_across_backings() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
+        create_standard_events_table(&store, &metadata_backend, &namespace).await;
+        let first_request = serde_json::json!({
+            "commit-id": "commit-a",
+            "idempotency-key": "request-a",
+            "writer": "test-client",
+            "requirements": [],
+            "updates": [{
+                "action": "set-properties",
+                "updates": {"owner": "first"}
+            }]
+        });
+        let first = standard_commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&metadata_backend),
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(first_request.clone()).expect("first commit request should parse"),
+        )
+        .await
+        .expect("first commit should update the table");
+
+        if mode == crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
+            let current = store
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("first committed table lookup should succeed")
+                .expect("first committed table should exist");
+            let mut historical = store
+                .get_commit_by_id("warehouse", &current.table_id, "commit-a")
+                .await
+                .expect("historical commit lookup should succeed")
+                .expect("historical commit should exist");
+            historical.requirements = vec![metadata_digest_requirement(&first.metadata).expect("metadata digest should build")];
+            let paths = crate::table_catalog::TableCatalogObjectPaths::default();
+            let commit_path = paths.commit_log_entry_path("warehouse", &current.table_id, "commit-a");
+            let idempotency_path = paths.commit_idempotency_entry_path("warehouse", &current.table_id, "request-a");
+            let historical = serde_json::to_value(historical).expect("historical commit should serialize");
+            for path in [commit_path, idempotency_path] {
+                metadata_backend
+                    .put_json(crate::admin::storage_api::RUSTFS_META_BUCKET, &path, historical.clone())
+                    .await;
+            }
+        }
+
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
+        let second = standard_commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&metadata_backend),
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(serde_json::json!({
+                "commit-id": "commit-b",
+                "idempotency-key": "request-b",
+                "requirements": [],
+                "updates": [{
+                    "action": "set-properties",
+                    "updates": {"owner": "current"}
+                }]
+            }))
+            .expect("second commit request should parse"),
+        )
+        .await
+        .expect("second commit should advance the table");
+        let current = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("current table lookup should succeed")
+            .expect("current table should exist");
+
+        let replay = standard_commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&metadata_backend),
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(first_request.clone()).expect("first commit retry should parse"),
+        )
+        .await
+        .expect("an exact old commit retry should succeed");
+
+        assert_eq!(replay.commit_id, "commit-a", "{mode:?}");
+        assert_eq!(replay.metadata_location, second.metadata_location, "{mode:?}");
+        assert_eq!(replay.version_token, second.version_token, "{mode:?}");
+        assert_eq!(replay.generation, second.generation, "{mode:?}");
+        assert_eq!(replay.metadata["properties"]["owner"], "current", "{mode:?}");
+        let unchanged = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("table lookup after replay should succeed")
+            .expect("table should remain present");
+        assert_eq!(unchanged.metadata_location, current.metadata_location, "{mode:?}");
+        assert_eq!(unchanged.version_token, current.version_token, "{mode:?}");
+
+        let mut mutated_request = first_request;
+        mutated_request["updates"][0]["updates"]["owner"] = serde_json::Value::String("mutated".to_string());
+        let error = standard_commit_table_response(
+            &store,
+            &trusted_table_commit_backend(&metadata_backend),
+            "warehouse",
+            &namespace,
+            "events",
+            serde_json::from_value(mutated_request).expect("mutated retry should parse"),
+        )
+        .await
+        .expect_err("mutating updates under a persisted idempotency key must conflict");
+        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
+    }
+}
+
+#[tokio::test]
+async fn renamed_table_vending_preserves_identity_and_isolates_recreated_metadata_across_backings() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        for destination in ["analytics", "curated"] {
+            let backend = TestTableCatalogObjectBackend::content_addressed();
+            let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+            let source = crate::table_catalog::Namespace::parse("analytics").expect("source namespace");
+            let destination_namespace = crate::table_catalog::Namespace::parse(destination).expect("destination namespace");
+            create_standard_events_table(&store, &backend, &source).await;
+            if destination != "analytics" {
+                create_namespace_response(
+                    &store,
+                    "warehouse",
+                    CreateNamespaceRequest {
+                        namespace: vec![destination.to_string()],
+                        properties: BTreeMap::new(),
+                    },
+                    true,
+                )
+                .await
+                .expect("destination namespace should be created");
+            }
+            let before = store
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("lookup")
+                .expect("table");
+            store
+                .rename_table("warehouse", "analytics", "events", destination, "renamed_events")
+                .await
+                .expect("rename should succeed");
+            let renamed = store
+                .load_table("warehouse", destination, "renamed_events")
+                .await
+                .expect("lookup")
+                .expect("table");
+            assert_eq!(renamed.table_id, before.table_id);
+            assert_eq!(renamed.table_uuid, before.table_uuid);
+            assert_eq!(renamed.warehouse_location, before.warehouse_location);
+            assert_eq!(renamed.metadata_location, before.metadata_location);
+            assert_eq!(renamed.version_token, before.version_token);
+            assert_eq!(renamed.generation, before.generation);
+            let issuer = RecordingTableCredentialIssuer::default();
+            let delegated = load_table_response_with_credentials(
+                &store,
+                &backend,
+                "warehouse",
+                &destination_namespace,
+                "renamed_events",
+                &issuer,
+                None,
+            )
+            .await
+            .expect("renamed table should vend credentials for its retained metadata");
+            let credentials =
+                load_credentials_response(&store, &backend, "warehouse", &destination_namespace, "renamed_events", &issuer, None)
+                    .await
+                    .expect("credentials endpoint should accept the retained metadata");
+            assert_eq!(
+                serde_json::to_value(&credentials.storage_credentials).expect("credential JSON"),
+                serde_json::to_value(&delegated.storage_credentials).expect("delegated JSON")
+            );
+            assert_eq!(delegated.metadata["table-uuid"], before.table_uuid);
+            assert_eq!(delegated.storage_credentials.len(), 2);
+            assert_eq!(delegated.storage_credentials[0].prefix, format!("{}/", before.warehouse_location));
+            assert_eq!(
+                delegated.storage_credentials[1].prefix,
+                table_metadata_location_for_client("warehouse", &before.metadata_location)
+            );
+            let missing = load_table_response_with_credentials(&store, &backend, "warehouse", &source, "events", &issuer, None)
+                .await
+                .expect_err("old identifier must not remain loadable");
+            assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+            let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+                "name": "events", "schema": {"type": "struct", "schema-id": 0, "fields": []}
+            }))
+            .expect("recreate request");
+            create_table_response(
+                &store,
+                &TableCommitObjectBackend::trusted(backend.clone()),
+                "warehouse",
+                &source,
+                request,
+                true,
+            )
+            .await
+            .expect("old identifier should be reusable");
+            let recreated = store
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("lookup")
+                .expect("table");
+            assert_ne!(recreated.table_id, renamed.table_id);
+            assert_ne!(recreated.table_uuid, renamed.table_uuid);
+            assert_ne!(recreated.metadata_location, renamed.metadata_location);
+            assert_ne!(recreated.warehouse_location, renamed.warehouse_location);
+            let metadata_object =
+                table_metadata_location_for_catalog("warehouse", &renamed.metadata_location).expect("metadata key");
+            let prefix = renamed
+                .warehouse_location
+                .strip_prefix("s3://warehouse/")
+                .expect("warehouse prefix");
+            let policy =
+                table_credential_session_policy(&renamed, &format!("{prefix}/"), &metadata_object).expect("session policy");
+            let conditions = HashMap::new();
+            let claims = HashMap::new();
+            for (object, allowed) in [
+                (metadata_object.clone(), true),
+                (format!("{metadata_object}.neighbor"), false),
+                (
+                    table_metadata_location_for_catalog("warehouse", &recreated.metadata_location).expect("recreated key"),
+                    false,
+                ),
+            ] {
+                assert_eq!(
+                    policy
+                        .is_allowed(&rustfs_policy::policy::Args {
+                            account: "temporary-access-key",
+                            groups: &None,
+                            action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
+                            bucket: "warehouse",
+                            conditions: &conditions,
+                            is_owner: false,
+                            object: &object,
+                            claims: &claims,
+                            deny_only: false,
+                        })
+                        .await,
+                    allowed,
+                    "{mode:?} {destination} {object}"
+                );
+            }
+            let reloaded = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+            for (namespace, name, expected) in [
+                (&destination_namespace, "renamed_events", &renamed),
+                (&source, "events", &recreated),
+            ] {
+                let response =
+                    load_table_response_with_credentials(&reloaded, &backend, "warehouse", namespace, name, &issuer, None)
+                        .await
+                        .expect("fresh store should vend for the correct persisted identity");
+                assert_eq!(response.metadata["table-uuid"], expected.table_uuid);
+                assert_eq!(response.storage_credentials[0].prefix, format!("{}/", expected.warehouse_location));
+                assert_eq!(
+                    response.storage_credentials[1].prefix,
+                    table_metadata_location_for_client("warehouse", &expected.metadata_location)
+                );
+                let credentials = load_credentials_response(&reloaded, &backend, "warehouse", namespace, name, &issuer, None)
+                    .await
+                    .expect("fresh store credentials endpoint should bind the persisted identity");
+                assert_eq!(
+                    serde_json::to_value(&credentials.storage_credentials).expect("credential JSON"),
+                    serde_json::to_value(&response.storage_credentials).expect("delegated JSON")
+                );
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn credential_vending_rejects_corrupt_or_foreign_metadata_before_issuance_across_backings() {
+    for mode in [crate::table_catalog::TableCatalogBackingMode::ObjectBacked] {
+        let backend = TestTableCatalogObjectBackend::content_addressed();
+        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
+        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
+        let created = create_standard_events_table(&store, &backend, &namespace).await;
+        let before = store
+            .load_table("warehouse", "analytics", "events")
+            .await
+            .expect("lookup")
+            .expect("table");
+        let issuer = RecordingTableCredentialIssuer::default();
+        let mut foreign_uuid = created.metadata.clone();
+        foreign_uuid["table-uuid"] = serde_json::Value::from("foreign-table-uuid");
+        let mut foreign_warehouse = created.metadata.clone();
+        foreign_warehouse["location"] = serde_json::Value::from("s3://warehouse/tables/another-table");
+        let mut cross_bucket = created.metadata.clone();
+        cross_bucket["location"] = serde_json::Value::from("s3://other/tables/another-table");
+        let mut missing_uuid = created.metadata.clone();
+        missing_uuid.as_object_mut().expect("metadata object").remove("table-uuid");
+        let mut unsupported_format = created.metadata.clone();
+        unsupported_format["format-version"] = serde_json::Value::from(99);
+        for metadata in [
+            foreign_uuid,
+            foreign_warehouse,
+            cross_bucket,
+            missing_uuid,
+            unsupported_format,
+            serde_json::Value::Null,
+        ] {
+            backend.put_json("warehouse", &before.metadata_location, metadata).await;
+            let credentials_error = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
+                .await
+                .expect_err("invalid persisted metadata must not produce credentials");
+            let delegated_error =
+                load_table_response_with_credentials(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
+                    .await
+                    .expect_err("delegated load must fail closed");
+            for error in [credentials_error, delegated_error] {
+                assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+                assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
+                assert_eq!(error.message(), Some("persisted table metadata is invalid"));
+            }
+            assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            let after = store
+                .load_table("warehouse", "analytics", "events")
+                .await
+                .expect("lookup")
+                .expect("table");
+            assert_eq!(after.table_uuid, before.table_uuid);
+            assert_eq!(after.metadata_location, before.metadata_location);
+            assert_eq!(after.version_token, before.version_token);
+            assert_eq!(after.generation, before.generation);
+        }
+        let disabled =
+            load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &DisabledTableCredentialIssuer, None)
+                .await
+                .expect("disabled vending should not read or validate metadata");
+        assert!(disabled.storage_credentials.is_empty());
+        backend
+            .put_json("warehouse", &before.metadata_location, created.metadata)
+            .await;
+        backend.fail_next_read("warehouse", &before.metadata_location).await;
+        let read_error = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
+            .await
+            .expect_err("metadata read failure must prevent issuance");
+        assert_eq!(read_error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(read_error.message(), Some("persisted table metadata is invalid"));
+        backend
+            .delete_object("warehouse", &before.metadata_location)
+            .await
+            .expect("remove metadata fixture");
+        let missing_metadata = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
+            .await
+            .expect_err("missing metadata must prevent issuance");
+        assert_eq!(missing_metadata.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
+        assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let missing =
+            load_credentials_response(&store, &backend, "warehouse", &namespace, "missing", &DisabledTableCredentialIssuer, None)
+                .await
+                .expect_err("disabled vending must still reject missing tables");
+        assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
+    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+    let bucket = format!("disable-{}", Uuid::new_v4().simple());
+    object_store
+        .make_bucket(&bucket, &MakeBucketOptions::default())
+        .await
+        .unwrap();
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store.clone());
+    let catalog = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+        .await
+        .unwrap();
+    let rejected = object_store
+        .update_bucket_metadata_config_validated(&bucket, crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG, Vec::new(), || {
+            Err(crate::admin::storage_api::error::StorageError::other("lost publication fence"))
+        })
+        .await;
+    assert!(rejected.is_err());
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    backend
+        .put_object(
+            &bucket,
+            "external/orders.parquet",
+            b"parquet-fixture".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    let response = disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+        .await
+        .unwrap();
+    assert!(!response.enabled);
+    assert!(ensure_table_bucket_entry(&catalog, &bucket, true).await.is_err());
+    assert!(
+        !object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
+    );
+    assert_eq!(
+        backend
+            .read_object(&bucket, "external/orders.parquet")
+            .await
+            .unwrap()
+            .unwrap()
+            .data,
+        b"parquet-fixture"
+    );
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    assert!(
+        !disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
+    assert!(
+        enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .unwrap()
+            .enabled
+    );
+    backend
+        .put_object(
+            &bucket,
+            ".rustfs-table/staged.json",
+            b"{}".to_vec(),
+            crate::table_catalog::TableCatalogPutPrecondition::Any,
+        )
+        .await
+        .unwrap();
+    let publication = TableCommitObjectBackend::preauthorized(backend);
+    assert!(
+        disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
+            .await
+            .is_err()
+    );
+    assert!(
+        object_store
+            .get_bucket_metadata(&bucket)
+            .await
+            .unwrap()
+            .table_bucket_enabled()
     );
 }
 
@@ -765,308 +1586,6 @@ async fn table_maintenance_worker_handler_enforces_conditions_after_authorizatio
 
 #[tokio::test]
 #[serial_test::serial]
-async fn strong_metadata_maintenance_handler_plans_without_changing_table_objects() {
-    use crate::admin::storage_api::RUSTFS_META_BUCKET;
-    use crate::table_catalog::{
-        TableCatalogObject, TableCatalogObjectPaths, TableMaintenanceAuditAction, TableMetadataMaintenanceJobStatus,
-        TableMetadataMaintenanceOperation, TableMetadataMaintenanceReport,
-    };
-
-    async fn inventory<B: TableCatalogObjectBackend>(backend: &B) -> BTreeMap<(String, String), TableCatalogObject> {
-        let mut objects = BTreeMap::new();
-        for bucket in ["warehouse", RUSTFS_META_BUCKET] {
-            for object in backend.list_objects(bucket, "").await.expect("list isolated fixture objects") {
-                let stored = backend
-                    .read_object(bucket, &object)
-                    .await
-                    .expect("read fixture object")
-                    .expect("listed object exists");
-                objects.insert((bucket.to_string(), object), stored);
-            }
-        }
-        objects
-    }
-
-    temp_env::async_with_vars(
-        [(
-            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
-            Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
-        )],
-        async {
-            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-            object_store
-                .make_bucket("warehouse", &MakeBucketOptions::default())
-                .await
-                .expect("create table bucket");
-            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
-                .save_iam_config(
-                    serde_json::json!({"version": 1}),
-                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
-                )
-                .await
-                .expect("seed request IAM format");
-            let iam = rustfs_iam::build_iam_sys(object_store.clone())
-                .await
-                .expect("initialize request IAM");
-            let reader_access_key = "planning-handler-reader";
-            let reader_secret_key = "planning-handler-reader-secret";
-            iam.create_user(
-                reader_access_key,
-                &AddOrUpdateUserReq {
-                    secret_key: reader_secret_key.to_string(),
-                    policy: None,
-                    status: AccountStatus::Enabled,
-                },
-            )
-            .await
-            .expect("create read-only user");
-            iam.set_policy(
-                "planning-handler-read",
-                Policy::parse_config(br#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:GetTable"]}]}"#)
-                    .expect("read-only policy"),
-            )
-            .await
-            .expect("save read-only policy");
-            iam.policy_db_set(reader_access_key, UserType::Reg, false, "planning-handler-read")
-                .await
-                .expect("attach read-only policy");
-            let context = Arc::new(AppContext::new(
-                object_store.clone(),
-                Arc::new(RequestIam { handle: iam }),
-                Arc::new(RequestKms),
-            ));
-            let access_key = "planning-handler-root";
-            let secret_key = "planning-handler-root-secret";
-            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
-                access_key: access_key.to_string(),
-                secret_key: secret_key.to_string(),
-                status: "on".to_string(),
-                ..Default::default()
-            }));
-            let request = |body: &str| {
-                let mut request = table_catalog_handler_request(context.clone(), access_key, secret_key);
-                request.method = Method::POST;
-                request.uri = "/iceberg/v1/warehouse/namespaces/analytics/tables/events/maintenance/metadata"
-                    .parse()
-                    .expect("maintenance URI");
-                request.input = Body::from(body.as_bytes().to_vec());
-                request
-            };
-            let setup = request("{}");
-            let backend = table_catalog_backend_from_extensions(&setup.extensions).expect("request catalog backend");
-            enable_table_bucket_marker(object_store.as_ref(), "warehouse")
-                .await
-                .expect("enable table bucket");
-            // The isolated ECStore does not run catalog startup. Seed its snapshot
-            // before using the production request path, which requires it to exist.
-            let bootstrap = crate::table_catalog::StrongTableCatalogStore::new(backend.clone());
-            ensure_table_bucket_entry(&bootstrap, "warehouse", true)
-                .await
-                .expect("seed durable snapshot and bucket entry");
-            let catalog = table_catalog_store_from_backend(backend.clone()).expect("strong catalog");
-            assert!(matches!(&catalog, crate::table_catalog::ConfiguredTableCatalogStore::DurableStrong(_)));
-            ensure_table_bucket_entry(&catalog, "warehouse", true)
-                .await
-                .expect("read bootstrapped bucket through configured catalog");
-            let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
-            let table = crate::table_catalog::IdentifierSegment::parse("events").expect("table");
-            create_namespace_response(
-                &catalog,
-                "warehouse",
-                CreateNamespaceRequest {
-                    namespace: vec!["analytics".to_string()],
-                    properties: BTreeMap::new(),
-                },
-                true,
-            )
-            .await
-            .expect("create namespace");
-            let create_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
-                "name": "events",
-                "schema": {"type": "struct", "schema-id": 0,
-                    "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]}
-            }))
-            .expect("create request");
-            create_table_response(
-                &catalog,
-                &TableCommitObjectBackend::trusted(backend.clone()),
-                "warehouse",
-                &namespace,
-                create_request,
-                true,
-            )
-            .await
-            .expect("create table and metadata");
-            let entry = catalog.load_table("warehouse", "analytics", "events").await.unwrap().unwrap();
-            let before = inventory(&backend).await;
-
-            for body in [
-                r#"{"delete":true}"#,
-                r#"{"commit-snapshot-expiration":true}"#,
-                r#"{"commit-compaction":true}"#,
-            ] {
-                let error = call_metadata_maintenance_handler(request(body))
-                    .await
-                    .expect_err("strong mutation must be rejected");
-                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
-                assert!(
-                    error
-                        .message()
-                        .unwrap_or_default()
-                        .contains("not supported with durable-strong")
-                );
-                assert_eq!(inventory(&backend).await, before, "{body}");
-            }
-            for body in [
-                r#"{"delete":null}"#,
-                r#"{"retain-recent-metadata-files":-1}"#,
-                r#"{"snapshot-expiration":{"min-snapshots-to-keep":"1","max-snapshot-age-ms":1000}}"#,
-                r#"{"compaction":true}"#,
-                r#"{"force":true}"#,
-                r#"{"delete":false,"delete":true}"#,
-            ] {
-                let error = call_metadata_maintenance_handler(request(body))
-                    .await
-                    .expect_err("malformed request must be rejected");
-                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
-                assert_eq!(inventory(&backend).await, before, "{body}");
-            }
-            let mut anonymous = request("{}");
-            anonymous.credentials = None;
-            let error = call_metadata_maintenance_handler(anonymous)
-                .await
-                .expect_err("planning requires authentication");
-            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
-            assert!(error.message().unwrap_or_default().contains("authentication required"));
-            let mut reader = request("not-json");
-            reader.credentials = Some(s3s::auth::Credentials {
-                access_key: reader_access_key.to_string(),
-                secret_key: s3s::auth::SecretKey::from(reader_secret_key.to_string()),
-            });
-            let error = call_metadata_maintenance_handler(reader)
-                .await
-                .expect_err("read-only permission must not authorize planning");
-            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
-            assert_eq!(inventory(&backend).await, before);
-
-            for body in [
-                serde_json::json!({}),
-                serde_json::json!({
-                    "retain-recent-metadata-files": 2,
-                    "snapshot-expiration": {"min-snapshots-to-keep": 1, "max-snapshot-age-ms": 1000},
-                    "compaction": {"target-file-size-bytes": 1024, "small-file-threshold-bytes": 512,
-                        "min-input-files": 2, "max-rewrite-bytes-per-job": 4096}
-                }),
-            ] {
-                let before = inventory(&backend).await;
-                let response = call_metadata_maintenance_handler(request(&body.to_string()))
-                    .await
-                    .expect("authorized strong planning");
-                assert_eq!(response.output.0, StatusCode::OK);
-                let report: TableMetadataMaintenanceReport =
-                    serde_json::from_slice(&response.output.1.bytes().expect("buffered planning response"))
-                        .expect("planning report");
-                assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
-                assert_eq!(report.job.operation, TableMetadataMaintenanceOperation::DryRun);
-                assert_eq!(report.job.table_id, entry.table_id);
-                assert_eq!(report.current_metadata_location, entry.metadata_location);
-                assert_eq!(report.job.current_generation, entry.generation);
-                assert_eq!(report.job.deleted_metadata_file_count, 0);
-                assert_eq!(report.job.deleted_object_count, 0);
-                assert_eq!(
-                    report.job.retain_recent_metadata_files,
-                    if body.get("compaction").is_some() { 2 } else { 0 }
-                );
-                assert_eq!(report.snapshot_expiration.is_some(), body.get("snapshot-expiration").is_some());
-                assert_eq!(report.compaction.is_some(), body.get("compaction").is_some());
-                if let Some(plan) = &report.snapshot_expiration {
-                    assert_eq!(plan.config.min_snapshots_to_keep, 1);
-                    assert_eq!(plan.config.max_snapshot_age_ms, 1000);
-                    assert!(plan.committed_metadata_location.is_none());
-                }
-                if let Some(plan) = &report.compaction {
-                    assert_eq!(plan.config.target_file_size_bytes, 1024);
-                    assert_eq!(plan.config.max_rewrite_bytes_per_job, 4096);
-                    assert!(plan.committed_metadata_location.is_none());
-                }
-                assert!(
-                    report
-                        .audit_events
-                        .iter()
-                        .any(|event| event.action == TableMaintenanceAuditAction::WorkerStarted)
-                );
-                assert!(
-                    report
-                        .audit_events
-                        .iter()
-                        .any(|event| event.action == TableMaintenanceAuditAction::WorkerSucceeded)
-                );
-                let reloaded = table_catalog_store_from_backend(backend.clone()).expect("reload strong catalog");
-                for id in [report.job.job_id.as_str(), "latest", "current"] {
-                    assert_eq!(
-                        reloaded
-                            .get_table_metadata_maintenance_report("warehouse", "analytics", "events", id)
-                            .await
-                            .unwrap(),
-                        Some(report.clone())
-                    );
-                }
-                assert_eq!(
-                    reloaded.load_table("warehouse", "analytics", "events").await.unwrap(),
-                    Some(entry.clone())
-                );
-                let paths = TableCatalogObjectPaths::default();
-                let report_paths = [
-                    paths.table_maintenance_job_path("warehouse", &namespace, &table, &entry.table_id, &report.job.job_id),
-                    paths.table_maintenance_latest_job_path("warehouse", &namespace, &table, &entry.table_id),
-                    paths.table_maintenance_current_job_path("warehouse", &namespace, &table, &entry.table_id),
-                ];
-                let outside_report = |((bucket, key), _): &((String, String), TableCatalogObject)| {
-                    bucket != RUSTFS_META_BUCKET || !report_paths.contains(key)
-                };
-                assert_eq!(
-                    inventory(&backend)
-                        .await
-                        .into_iter()
-                        .filter(outside_report)
-                        .collect::<BTreeMap<_, _>>(),
-                    before.into_iter().filter(outside_report).collect::<BTreeMap<_, _>>(),
-                    "planning may only publish its named, latest, and current audit reports",
-                );
-            }
-
-            catalog
-                .put_table_maintenance_config(
-                    "warehouse",
-                    "analytics",
-                    "events",
-                    crate::table_catalog::TableMaintenanceConfig {
-                        background_enabled: true,
-                        ..Default::default()
-                    },
-                )
-                .await
-                .expect("enable queue admission");
-            let queued = catalog
-                .run_table_maintenance_scheduler_once("warehouse", "analytics", "events", "planning-test-scheduler".to_string())
-                .await
-                .expect("queue a maintenance job")
-                .report;
-            assert_eq!(queued.job.status, TableMetadataMaintenanceJobStatus::Queued);
-            let before = inventory(&backend).await;
-            let error = call_metadata_maintenance_handler(request("{}"))
-                .await
-                .expect_err("planning must not replace a queued job");
-            assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
-            assert_eq!(inventory(&backend).await, before);
-            assert_eq!(catalog.load_table("warehouse", "analytics", "events").await.unwrap(), Some(entry));
-        },
-    )
-    .await;
-}
-
-#[tokio::test]
-#[serial_test::serial]
 async fn load_table_handler_negotiates_vended_credentials_without_breaking_metadata_only_callers() {
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     object_store
@@ -1123,12 +1642,14 @@ async fn load_table_handler_negotiates_vended_credentials_without_breaking_metad
         .await
         .expect("vended credential policy should be attached");
 
-    let action_credentials = rustfs_credentials::Credentials {
-        access_key: "load-table-root-access-key".to_string(),
-        secret_key: "load-table-root-secret-key".to_string(),
-        status: "on".to_string(),
-        ..Default::default()
-    };
+    // IAM's persistence reader verifies STS tokens with the process-wide root
+    // key, so this context must use the same signer when another test ran first.
+    let _ = rustfs_credentials::init_global_action_credentials(
+        Some("load-table-root-access-key".to_string()),
+        Some("load-table-root-secret-key".to_string()),
+    );
+    let action_credentials =
+        rustfs_credentials::get_global_action_cred().expect("a process-wide root signer should be initialized before vending");
     let context = Arc::new(AppContext::new(
         object_store.clone(),
         Arc::new(RequestIam { handle: iam }),
@@ -1363,33 +1884,6 @@ fn catalog_config_response_lists_standard_rest_endpoints() {
 
 #[test]
 #[serial_test::serial]
-fn catalog_config_response_reports_durable_strong_backing_override() {
-    let response = temp_env::with_var(
-        crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
-        Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG),
-        || catalog_config_response(None),
-    )
-    .expect("catalog config should build");
-
-    assert_eq!(
-        response.overrides.get(CATALOG_BACKING_CONFIG_KEY).map(String::as_str),
-        Some(crate::table_catalog::TABLE_CATALOG_BACKING_DURABLE_STRONG)
-    );
-    assert!(
-        response
-            .endpoints
-            .contains(&"POST /v1/{prefix}/namespaces/{namespace}/properties")
-    );
-    assert!(response.endpoints.contains(&"POST /v1/{prefix}/tables/rename"));
-    assert!(response.endpoints.ends_with(TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS));
-    assert_eq!(
-        response.endpoints.len(),
-        TABLE_CATALOG_ENDPOINTS.len() + TABLE_CATALOG_DURABLE_STRONG_ENDPOINTS.len()
-    );
-}
-
-#[test]
-#[serial_test::serial]
 fn catalog_config_response_uses_requested_warehouse_as_standard_prefix() {
     let response = temp_env::with_var_unset(crate::table_catalog::ENV_TABLE_CATALOG_BACKING, || {
         catalog_config_response(Some("analytics"))
@@ -1561,8 +2055,10 @@ fn table_catalog_handlers_require_table_admin_actions() {
         ("EnableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("DisableTableBucketHandler", "AdminAction::SetTableBucketAction"),
         ("GetTableBucketHandler", "AdminAction::GetTableBucketAction"),
-        ("GetTableCatalogMigrationHandler", "AdminAction::GetTableCatalogAction"),
         ("CreateTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("ExportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("ImportTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
+        ("PrepareTableCatalogBackupObjectHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestoreTableCatalogBackupHandler", "AdminAction::MigrateTableCatalogAction"),
         ("RestListNamespacesHandler", "AdminAction::GetTableNamespaceAction"),
         ("RestCreateNamespaceHandler", "AdminAction::SetTableNamespaceAction"),
@@ -1647,27 +2143,29 @@ fn table_catalog_handlers_require_table_admin_actions() {
     assert_eq!(rename_block.matches("AdminAction::SetTableAction").count(), 2);
     assert!(rename_block.contains("rename_table_response("));
 
-    let migration_block = operation_block(&src, "GetTableCatalogMigrationHandler");
+    let handler = "BackfillTableWarehouseIndexHandler";
+    let block = operation_block(&src, handler);
+    let warehouse = block.find("warehouse_from_params(&params)?;").expect("warehouse parsing");
+    let resource = block
+        .find("TableCatalogResource::warehouse(&warehouse)")
+        .expect("warehouse resource");
+    let authorize = block
+        .find("authorize_table_catalog_resource_request(&req, &resource, AdminAction::MigrateTableCatalogAction).await?;")
+        .expect("warehouse-aware backfill authorization");
+    let marker = block
+        .find("ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;")
+        .expect("table bucket marker check");
+    let store = block
+        .find("table_catalog_object_store_from_extensions(&req.extensions)?;")
+        .expect("request catalog store");
     assert!(
-        migration_block.contains("TableCatalogResource::warehouse(&warehouse)"),
-        "catalog migration dry-run should authorize against the warehouse resource"
+        warehouse < resource && resource < authorize && authorize < marker && marker < store,
+        "{handler} must authorize its warehouse before checking the marker or resolving the store"
     );
-    for handler in [
-        "MaterializeTableCatalogMigrationHandler",
-        "CancelTableCatalogMigrationHandler",
-        "BackfillTableWarehouseIndexHandler",
-    ] {
-        let block = operation_block(&src, handler);
-        assert!(
-            block.contains("authorize_table_catalog_request(&req, AdminAction::MigrateTableCatalogAction).await?;"),
-            "{handler} should require the global catalog migration action"
-        );
-        assert!(
-            !block.contains("authorize_table_catalog_resource_request("),
-            "{handler} must not imply that a global backing cutover is warehouse-scoped"
-        );
-    }
-
+    assert!(
+        !block.contains("authorize_table_catalog_request(&req,"),
+        "{handler} must not use unscoped catalog authorization"
+    );
     for (handler, action) in [
         ("RestLoadTableHandler", "AdminAction::GetTableMetadataAction"),
         ("RestTableExistsHandler", "AdminAction::GetTableAction"),
@@ -1806,9 +2304,9 @@ fn table_catalog_handlers_require_enabled_table_bucket_marker_before_catalog_sta
     let src = table_catalog_handler_source();
 
     for handler in [
-        "GetTableCatalogMigrationHandler",
-        "MaterializeTableCatalogMigrationHandler",
-        "CancelTableCatalogMigrationHandler",
+        "ExportTableCatalogBackupHandler",
+        "ImportTableCatalogBackupHandler",
+        "PrepareTableCatalogBackupObjectHandler",
         "BackfillTableWarehouseIndexHandler",
         "RestListNamespacesHandler",
         "RestCreateNamespaceHandler",
@@ -1947,7 +2445,7 @@ async fn table_commit_publication_forwards_lease_loss_to_storage_mutation_fence(
         ),
         rustfs_lock::ObjectKey::new(
             RUSTFS_META_BUCKET,
-            TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path(),
+            TableCatalogObjectPaths::default().catalog_backup_global_fence_lock_path(),
         ),
         "rest-publication-migration".to_string(),
     );
@@ -2071,10 +2569,9 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
 
     let _: &EnableTableBucketHandler = &ENABLE_TABLE_BUCKET_HANDLER;
     let _: &GetTableBucketHandler = &GET_TABLE_BUCKET_HANDLER;
-    let _: &GetTableCatalogMigrationHandler = &GET_TABLE_CATALOG_MIGRATION_HANDLER;
-    let _: &MaterializeTableCatalogMigrationHandler = &MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER;
-    let _: &CancelTableCatalogMigrationHandler = &CANCEL_TABLE_CATALOG_MIGRATION_HANDLER;
     let _: &CreateTableCatalogBackupHandler = &CREATE_TABLE_CATALOG_BACKUP_HANDLER;
+    let _: &PrepareTableCatalogBackupObjectHandler = &PREPARE_TABLE_CATALOG_BACKUP_OBJECT_HANDLER;
+    assert_operation::<PrepareTableCatalogBackupObjectHandler>();
     let _: &RestoreTableCatalogBackupHandler = &RESTORE_TABLE_CATALOG_BACKUP_HANDLER;
     let _: &RestListNamespacesHandler = &LIST_NAMESPACES_HANDLER;
     let _: &RestCreateNamespaceHandler = &CREATE_NAMESPACE_HANDLER;
@@ -2117,9 +2614,6 @@ fn rest_catalog_mvp_routes_use_implemented_handlers() {
 
     assert_operation::<EnableTableBucketHandler>();
     assert_operation::<GetTableBucketHandler>();
-    assert_operation::<GetTableCatalogMigrationHandler>();
-    assert_operation::<MaterializeTableCatalogMigrationHandler>();
-    assert_operation::<CancelTableCatalogMigrationHandler>();
     assert_operation::<RestListNamespacesHandler>();
     assert_operation::<RestCreateNamespaceHandler>();
     assert_operation::<RestGetNamespaceHandler>();
@@ -2321,6 +2815,1040 @@ fn table_maintenance_worker_condition_rejects_null_malformed_duplicate_and_unkno
     ] {
         assert!(serde_json::from_str::<TableMaintenanceWorkerRunRequest>(body).is_err(), "{body}");
     }
+}
+
+struct BackupTransferHandlerFixture {
+    context: Arc<AppContext>,
+    backend: crate::table_catalog::EcStoreTableCatalogObjectBackend<ECStore>,
+    catalog: crate::table_catalog::EcStoreTableCatalogStore<ECStore>,
+    bucket: String,
+    root: rustfs_credentials::Credentials,
+    _data_root: tempfile::TempDir,
+}
+
+struct BackupPreparationSourceArtifact {
+    backup_id: String,
+    artifact: Vec<u8>,
+    object: String,
+    data: Vec<u8>,
+    sha256: String,
+}
+
+fn backup_object_prepare_body(backup_id: &str, object: &str, data: &[u8]) -> Vec<u8> {
+    serde_json::to_vec(&serde_json::json!({
+        "backup-id": backup_id,
+        "object": object,
+        "data-base64": base64_simd::STANDARD.encode_to_string(data),
+    }))
+    .expect("object preparation request JSON")
+}
+
+impl BackupTransferHandlerFixture {
+    async fn create_preparation_source(&self) -> BackupPreparationSourceArtifact {
+        self.catalog
+            .put_table_bucket(table_bucket_entry_from_metadata_marker(&self.bucket))
+            .await
+            .unwrap();
+        let namespace = crate::table_catalog::Namespace::parse("sales").unwrap();
+        create_namespace_response(
+            &self.catalog,
+            &self.bucket,
+            CreateNamespaceRequest {
+                namespace: vec!["sales".to_string()],
+                properties: BTreeMap::new(),
+            },
+            true,
+        )
+        .await
+        .unwrap();
+        let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
+            "name": "orders",
+            "schema": {
+                "type": "struct", "schema-id": 0,
+                "fields": [{"id": 1, "name": "id", "required": true, "type": "long"}]
+            }
+        }))
+        .unwrap();
+        create_table_response(
+            &self.catalog,
+            &TableCommitObjectBackend::trusted(self.backend.clone()),
+            &self.bucket,
+            &namespace,
+            request,
+            true,
+        )
+        .await
+        .expect("Catalog create must publish the source metadata through its normal control-plane boundary");
+        let table = self
+            .catalog
+            .load_table(&self.bucket, "sales", "orders")
+            .await
+            .unwrap()
+            .unwrap();
+        let backup = self.catalog.create_catalog_backup(&self.bucket, None).await.unwrap();
+        let artifact = self
+            .backend
+            .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+            .await
+            .unwrap()
+            .unwrap();
+        let value: serde_json::Value = serde_json::from_slice(&artifact.data).unwrap();
+        assert_eq!(value["version"], 2);
+        let reference = value["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reference| reference["bucket"] == self.bucket && reference["object"] == table.metadata_location)
+            .expect("source v2 backup must inventory its current metadata");
+        assert_eq!(reference["kind"], "TABLE_METADATA");
+        let payload = self
+            .backend
+            .read_object(&self.bucket, &table.metadata_location)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(reference["size_bytes"].as_u64(), Some(u64::try_from(payload.data.len()).unwrap()));
+        BackupPreparationSourceArtifact {
+            backup_id: backup.backup_id,
+            artifact: artifact.data,
+            object: table.metadata_location,
+            data: payload.data,
+            sha256: reference["sha256"].as_str().unwrap().to_string(),
+        }
+    }
+
+    async fn new(bucket: &str) -> Self {
+        let (data_root, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+        object_store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("transfer bucket should be created");
+        enable_table_bucket_marker(&object_store, bucket)
+            .await
+            .expect("transfer bucket marker should be enabled");
+        rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+            .save_iam_config(
+                serde_json::json!({"version": 1}),
+                format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+            )
+            .await
+            .expect("transfer request IAM format");
+        let iam = rustfs_iam::build_iam_sys(object_store.clone())
+            .await
+            .expect("transfer request IAM");
+        for (access_key, secret_key) in [
+            ("backup-transfer-reader", "backup-transfer-reader-secret"),
+            ("backup-transfer-operator", "backup-transfer-operator-secret"),
+        ] {
+            iam.create_user(
+                access_key,
+                &AddOrUpdateUserReq {
+                    secret_key: secret_key.to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("transfer request user");
+        }
+        iam.set_policy(
+            "backup-transfer-policy",
+            Policy::parse_config(
+                &serde_json::to_vec(&serde_json::json!({
+                    "Version": "2012-10-17",
+                    "Statement": [{
+                        "Effect": "Allow",
+                        "Action": "admin:MigrateTableCatalog",
+                        "Resource": format!("arn:aws:s3:::{bucket}")
+                    }]
+                }))
+                .expect("transfer policy JSON"),
+            )
+            .expect("transfer policy"),
+        )
+        .await
+        .expect("transfer policy should be stored");
+        iam.policy_db_set("backup-transfer-operator", UserType::Reg, false, "backup-transfer-policy")
+            .await
+            .expect("transfer policy should be warehouse-scoped");
+
+        let _ = rustfs_credentials::init_global_action_credentials(
+            Some("backup-transfer-root".to_string()),
+            Some("backup-transfer-root-secret".to_string()),
+        );
+        let mut root = rustfs_credentials::get_global_action_cred().expect("transfer test root signer");
+        root.status = "on".to_string();
+        let context = Arc::new(AppContext::new(
+            object_store.clone(),
+            Arc::new(RequestIam { handle: iam }),
+            Arc::new(RequestKms),
+        ));
+        assert!(context.publish_action_credentials(root.clone()));
+        let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store);
+        let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+            backend.clone(),
+            crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+        );
+        Self {
+            _data_root: data_root,
+            context,
+            backend,
+            catalog,
+            bucket: bucket.to_string(),
+            root,
+        }
+    }
+
+    fn request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
+        let mut request = table_catalog_handler_request(self.context.clone(), &self.root.access_key, &self.root.secret_key);
+        request.method = Method::POST;
+        request.uri = format!("{prefix}/{}/catalog/backup/{operation}", self.bucket)
+            .parse()
+            .expect("transfer request URI");
+        request.input = Body::from(data);
+        request
+    }
+
+    fn operator_request(&self, prefix: &str, operation: &str, data: Vec<u8>) -> S3Request<Body> {
+        let mut request = self.request(prefix, operation, data);
+        request.credentials = Some(s3s::auth::Credentials {
+            access_key: "backup-transfer-operator".to_string(),
+            secret_key: s3s::auth::SecretKey::from("backup-transfer-operator-secret".to_string()),
+        });
+        request
+    }
+
+    async fn inventory(&self) -> BTreeMap<(String, String), (Vec<u8>, Option<String>)> {
+        let mut objects = BTreeMap::new();
+        for bucket in [crate::admin::storage_api::RUSTFS_META_BUCKET, self.bucket.as_str()] {
+            for path in self
+                .backend
+                .list_objects(bucket, "")
+                .await
+                .expect("transfer inventory should list")
+            {
+                let object = self
+                    .backend
+                    .read_object(bucket, &path)
+                    .await
+                    .expect("transfer inventory object should read")
+                    .expect("listed transfer object should exist");
+                objects.insert((bucket.to_string(), path), (object.data, object.etag));
+            }
+        }
+        objects
+    }
+}
+
+fn assert_backup_transfer_response_is_private(response: &S3Response<(StatusCode, Body)>) {
+    assert_eq!(response.output.0, StatusCode::OK);
+    assert_eq!(response.headers.get(CONTENT_TYPE), Some(&HeaderValue::from_static(JSON_CONTENT_TYPE)));
+    assert_eq!(
+        response.headers.get(http::header::CACHE_CONTROL),
+        Some(&HeaderValue::from_static("no-store, private"))
+    );
+    assert_eq!(response.headers.get(http::header::PRAGMA), Some(&HeaderValue::from_static("no-cache")));
+    assert_eq!(response.headers.get(http::header::EXPIRES), Some(&HeaderValue::from_static("0")));
+}
+
+#[test]
+fn catalog_backup_export_request_is_strict() {
+    let request: CatalogBackupExportRequest = serde_json::from_str(r#"{"backup-id":"backup-a"}"#).expect("export request");
+    assert_eq!(request.backup_id, "backup-a");
+    for body in [
+        r#"{}"#,
+        r#"{"backup-id":false}"#,
+        r#"{"backup-id":"backup-a","backup-id":"backup-b"}"#,
+        r#"{"backup-id":"backup-a","metadata-location":"arbitrary-object"}"#,
+        r#"{"backupId":"backup-a"}"#,
+    ] {
+        assert!(serde_json::from_str::<CatalogBackupExportRequest>(body).is_err(), "{body}");
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_transfer_handlers_preserve_artifact_bytes_and_do_not_publish_catalogs() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-transfer-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            source
+                .catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("source catalog should exist before capture");
+            let backup = source
+                .catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("source backup");
+            let artifact = source
+                .backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+                .await
+                .expect("read saved artifact")
+                .expect("saved artifact");
+            let export_body = serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id})).unwrap();
+            let source_before = source.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let exported = call_catalog_backup_export_handler(source.operator_request(prefix, "export", export_body.clone()))
+                    .await
+                    .expect("warehouse-authorized operator can export");
+                assert_backup_transfer_response_is_private(&exported);
+                assert_eq!(exported.output.1.bytes().expect("raw export body").as_ref(), artifact.data.as_slice());
+                assert_eq!(source.inventory().await, source_before, "export modified the saved artifact or catalog");
+            }
+
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            let target_before = target.inventory().await;
+            assert!(
+                target
+                    .catalog
+                    .get_table_bucket(&bucket)
+                    .await
+                    .expect("target catalog lookup")
+                    .is_none()
+            );
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                for operation in ["export", "import"] {
+                    let data = if operation == "export" {
+                        export_body.clone()
+                    } else {
+                        artifact.data.clone()
+                    };
+                    let mut request = target.request(prefix, operation, data);
+                    request.credentials = Some(s3s::auth::Credentials {
+                        access_key: "backup-transfer-reader".to_string(),
+                        secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
+                    });
+                    let error = if operation == "export" {
+                        call_catalog_backup_export_handler(request).await
+                    } else {
+                        call_catalog_backup_import_handler(request).await
+                    }
+                    .expect_err("a reader without migrate permission cannot transfer an artifact");
+                    assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                    assert_eq!(target.inventory().await, target_before, "permission denial modified target objects");
+                }
+            }
+
+            let imported = call_catalog_backup_import_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                artifact.data.clone(),
+            ))
+            .await
+            .expect("import should only save the candidate artifact");
+            assert_backup_transfer_response_is_private(&imported);
+            let imported: serde_json::Value = serde_json::from_slice(&imported.output.1.bytes().expect("import body")).unwrap();
+            assert_eq!(imported["status"], "CREATED");
+            assert_eq!(imported["backup_id"], backup.backup_id);
+            assert_eq!(imported["created_at"], backup.created_at);
+            let mut after_import = target.inventory().await;
+            let saved = after_import
+                .remove(&(crate::admin::storage_api::RUSTFS_META_BUCKET.to_string(), backup.backup_path.clone()))
+                .expect("only the artifact path should have been added");
+            assert_eq!(saved.0, artifact.data);
+            assert!(saved.1.is_some());
+            assert_eq!(after_import, target_before, "import published catalog, metadata, or recovery objects");
+            assert!(
+                target
+                    .catalog
+                    .get_table_bucket(&bucket)
+                    .await
+                    .expect("target remains unpublished")
+                    .is_none()
+            );
+
+            let target_after = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let repeated =
+                    call_catalog_backup_import_handler(target.operator_request(prefix, "import", artifact.data.clone()))
+                        .await
+                        .expect("identical import should be idempotent");
+                assert_backup_transfer_response_is_private(&repeated);
+                let mut repeated: serde_json::Value =
+                    serde_json::from_slice(&repeated.output.1.bytes().expect("repeat body")).unwrap();
+                assert_eq!(repeated["status"], "ALREADY_PRESENT");
+                repeated["status"] = imported["status"].clone();
+                assert_eq!(repeated, imported, "retry changed the saved timestamp or report");
+                let exported = call_catalog_backup_export_handler(target.operator_request(prefix, "export", export_body.clone()))
+                    .await
+                    .expect("a saved candidate is exportable before restore");
+                assert_backup_transfer_response_is_private(&exported);
+                assert_eq!(exported.output.1.bytes().expect("target export").as_ref(), artifact.data.as_slice());
+                assert_eq!(target.inventory().await, target_after, "retry or export rewrote object bytes or ETags");
+            }
+
+            let foreign_bucket = format!("foreign-transfer-{}", Uuid::new_v4().simple());
+            let target_store = target.context.object_store();
+            target_store
+                .make_bucket(&foreign_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            enable_table_bucket_marker(&target_store, &foreign_bucket).await.unwrap();
+            let before = target.inventory().await;
+            for operation in ["export", "import"] {
+                let data = if operation == "export" {
+                    export_body.clone()
+                } else {
+                    artifact.data.clone()
+                };
+                let mut request = target.operator_request(TABLE_CATALOG_PREFIX, operation, data);
+                request.uri = format!("{TABLE_CATALOG_PREFIX}/{foreign_bucket}/catalog/backup/{operation}")
+                    .parse()
+                    .unwrap();
+                let error = if operation == "export" {
+                    call_catalog_backup_export_handler(request).await
+                } else {
+                    call_catalog_backup_import_handler(request).await
+                }
+                .expect_err("warehouse-scoped permission cannot transfer another warehouse");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before);
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_transfer_handlers_reject_invalid_bodies_and_disabled_buckets_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-import-limits-{}", Uuid::new_v4().simple());
+            let fixture = BackupTransferHandlerFixture::new(&bucket).await;
+            fixture
+                .catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("source catalog for validation fixture");
+            let backup = fixture
+                .catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("validation artifact");
+            let stored = fixture
+                .backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+                .await
+                .unwrap()
+                .unwrap();
+            let before = fixture.inventory().await;
+            for modification in ["malformed", "unknown-field", "foreign-warehouse", "identity"] {
+                let data = if modification == "malformed" {
+                    b"not-json".to_vec()
+                } else {
+                    let mut candidate: serde_json::Value = serde_json::from_slice(&stored.data).unwrap();
+                    match modification {
+                        "unknown-field" => candidate["allow-replace"] = serde_json::Value::Bool(true),
+                        "foreign-warehouse" => candidate["table_bucket"] = serde_json::json!("unrelated-warehouse"),
+                        "identity" => candidate["backup_id"] = serde_json::json!("wrong-backup-identity"),
+                        _ => unreachable!(),
+                    }
+                    serde_json::to_vec(&candidate).unwrap()
+                };
+                let error = call_catalog_backup_import_handler(fixture.request(TABLE_CATALOG_PREFIX, "import", data))
+                    .await
+                    .expect_err("invalid artifact must not enter persistent storage");
+                assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST), "{modification}");
+                assert_eq!(fixture.inventory().await, before, "invalid {modification} mutated persistent state");
+            }
+
+            let error = call_catalog_backup_export_handler(fixture.request(
+                TABLE_CATALOG_PREFIX,
+                "export",
+                serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id, "unknown": true})).unwrap(),
+            ))
+            .await
+            .expect_err("export JSON must reject unknown fields");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(fixture.inventory().await, before);
+
+            let error = call_catalog_backup_import_handler(fixture.request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                vec![b' '; CATALOG_BACKUP_IMPORT_BODY_MAX_SIZE + 1],
+            ))
+            .await
+            .expect_err("import body limit must apply before artifact decoding or persistence");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(fixture.inventory().await, before);
+
+            let disabled_bucket = format!("backup-disabled-{}", Uuid::new_v4().simple());
+            fixture
+                .context
+                .object_store()
+                .make_bucket(&disabled_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            let before = fixture.inventory().await;
+            for operation in ["export", "import"] {
+                let data = if operation == "export" {
+                    serde_json::to_vec(&serde_json::json!({"backup-id": backup.backup_id})).unwrap()
+                } else {
+                    stored.data.clone()
+                };
+                let mut request = fixture.request(TABLE_CATALOG_PREFIX, operation, data);
+                request.uri = format!("{TABLE_CATALOG_PREFIX}/{disabled_bucket}/catalog/backup/{operation}")
+                    .parse()
+                    .unwrap();
+                let error = if operation == "export" {
+                    call_catalog_backup_export_handler(request).await
+                } else {
+                    call_catalog_backup_import_handler(request).await
+                }
+                .expect_err("a bucket without the table marker must reject artifact transfer");
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(error.message().unwrap_or_default().contains("not table-enabled"));
+                assert_eq!(fixture.inventory().await, before);
+            }
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn catalog_backup_transfer_handlers_authenticate_before_store_access() {
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        for operation in ["export", "import"] {
+            let request = S3Request {
+                input: Body::from(b"not-an-artifact".to_vec()),
+                method: Method::POST,
+                uri: format!("{prefix}/warehouse/catalog/backup/{operation}")
+                    .parse()
+                    .expect("transfer URI"),
+                headers: HeaderMap::new(),
+                extensions: http::Extensions::new(),
+                credentials: None,
+                region: None,
+                service: None,
+                trailing_headers: None,
+            };
+            let error = if operation == "export" {
+                call_catalog_backup_export_handler(request).await
+            } else {
+                call_catalog_backup_import_handler(request).await
+            }
+            .expect_err("transfer must authenticate before resolving its object store or body");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("authentication required"));
+        }
+    }
+}
+
+#[test]
+fn catalog_backup_object_prepare_request_is_strict() {
+    let request: CatalogBackupObjectPrepareRequest =
+        serde_json::from_str(r#"{"backup-id":"backup-a","object":"tables/table-id/data/part.parquet","data-base64":"Zg=="}"#)
+            .unwrap();
+    assert_eq!(request.backup_id, "backup-a");
+    assert_eq!(request.object, "tables/table-id/data/part.parquet");
+    assert_eq!(request.data_base64, "Zg==");
+    for invalid in [
+        r#"{}"#,
+        r#"{"backup-id":"a","object":"object"}"#,
+        r#"{"backup-id":"a","data-base64":"Zg=="}"#,
+        r#"{"object":"object","data-base64":"Zg=="}"#,
+        r#"{"backupId":"a","object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","dataBase64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":"Zg==","unknown":true}"#,
+        r#"{"backup-id":"a","backup-id":"b","object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","object":"other","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":"Zg==","data-base64":"Zg=="}"#,
+        r#"{"backup-id":null,"object":"object","data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":null,"data-base64":"Zg=="}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":null}"#,
+        r#"{"backup-id":"a","object":"object","data-base64":42}"#,
+        r#"[]"#,
+    ] {
+        assert!(
+            serde_json::from_str::<CatalogBackupObjectPrepareRequest>(invalid).is_err(),
+            "accepted {invalid}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn catalog_backup_prepare_handler_authenticates_before_store_or_body_access() {
+    for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+        let request = S3Request {
+            input: Body::from(b"not-json".to_vec()),
+            method: Method::POST,
+            uri: format!("{prefix}/warehouse/catalog/backup/prepare").parse().unwrap(),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let error = call_catalog_backup_prepare_handler(request)
+            .await
+            .expect_err("preparation must authenticate first");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("authentication required"));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_prepare_handler_uses_isolated_targets_without_catalog_publication() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-prepare-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            let backup = source.create_preparation_source().await;
+            let source_before = source.inventory().await;
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            assert!(target.catalog.get_table_bucket(&bucket).await.unwrap().is_none());
+            let imported = call_catalog_backup_import_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "import",
+                backup.artifact.clone(),
+            ))
+            .await
+            .expect("target must accept the candidate artifact before object preparation");
+            assert_backup_transfer_response_is_private(&imported);
+            let request_body = backup_object_prepare_body(&backup.backup_id, &backup.object, &backup.data);
+            let before = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.request(prefix, "prepare", request_body.clone());
+                request.credentials = Some(s3s::auth::Credentials {
+                    access_key: "backup-transfer-reader".to_string(),
+                    secret_key: s3s::auth::SecretKey::from("backup-transfer-reader-secret".to_string()),
+                });
+                let error = call_catalog_backup_prepare_handler(request)
+                    .await
+                    .expect_err("reader cannot prepare backup objects");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before);
+            }
+            let prepared = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                request_body.clone(),
+            ))
+            .await
+            .expect("warehouse-authorized operator can prepare the exact source payload");
+            assert_backup_transfer_response_is_private(&prepared);
+            let prepared: serde_json::Value = serde_json::from_slice(&prepared.output.1.bytes().unwrap()).unwrap();
+            assert_eq!(prepared["status"], "PREPARED");
+            assert_eq!(prepared["table_bucket"], bucket);
+            assert_eq!(prepared["backup_id"], backup.backup_id);
+            assert_eq!(prepared["object"], backup.object);
+            assert_eq!(prepared["sha256"], backup.sha256);
+            assert_eq!(prepared["size_bytes"].as_u64(), Some(u64::try_from(backup.data.len()).unwrap()));
+            let mut after = target.inventory().await;
+            let stored = after
+                .remove(&(bucket.clone(), backup.object.clone()))
+                .expect("preparation must add only the referenced payload");
+            assert_eq!(stored.0, backup.data);
+            assert!(stored.1.is_some());
+            assert_eq!(prepared["etag"].as_str(), stored.1.as_deref());
+            assert_eq!(after, before, "preparation published catalog, intent, or other objects");
+            assert!(target.catalog.get_table_bucket(&bucket).await.unwrap().is_none());
+            let prepared_versions = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let repeated =
+                    call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", request_body.clone()))
+                        .await
+                        .expect("exact preparation retries must remain idempotent");
+                assert_backup_transfer_response_is_private(&repeated);
+                let mut repeated: serde_json::Value = serde_json::from_slice(&repeated.output.1.bytes().unwrap()).unwrap();
+                assert_eq!(repeated["status"], "ALREADY_PRESENT");
+                repeated["status"] = prepared["status"].clone();
+                assert_eq!(repeated, prepared);
+                assert_eq!(target.inventory().await, prepared_versions, "retry changed bytes or ETags");
+            }
+            let mut changed = backup.data.clone();
+            changed.push(b' ');
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                backup_object_prepare_body(&backup.backup_id, &backup.object, &changed),
+            ))
+            .await
+            .expect_err("a changed body cannot overwrite prepared bytes");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, prepared_versions);
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_COMPAT_PREFIX,
+                "prepare",
+                backup_object_prepare_body(&backup.backup_id, "unlisted/object.metadata.json", &backup.data),
+            ))
+            .await
+            .expect_err("a valid body cannot authorize an unlisted object");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, prepared_versions);
+
+            let foreign_bucket = format!("foreign-prepare-{}", Uuid::new_v4().simple());
+            let target_store = target.context.object_store();
+            target_store
+                .make_bucket(&foreign_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            enable_table_bucket_marker(&target_store, &foreign_bucket).await.unwrap();
+            let before_foreign = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.operator_request(prefix, "prepare", request_body.clone());
+                request.uri = format!("{prefix}/{foreign_bucket}/catalog/backup/prepare").parse().unwrap();
+                let error = call_catalog_backup_prepare_handler(request)
+                    .await
+                    .expect_err("warehouse permission must not authorize another warehouse");
+                assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+                assert_eq!(target.inventory().await, before_foreign);
+                assert!(target.backend.list_objects(&foreign_bucket, "").await.unwrap().is_empty());
+            }
+            assert_eq!(source.inventory().await, source_before);
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_backup_prepare_handler_rejects_strict_json_base64_limits_and_disabled_buckets_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let bucket = format!("backup-prepare-limits-{}", Uuid::new_v4().simple());
+            let source = BackupTransferHandlerFixture::new(&bucket).await;
+            let backup = source.create_preparation_source().await;
+            let target = BackupTransferHandlerFixture::new(&bucket).await;
+            call_catalog_backup_import_handler(target.operator_request(TABLE_CATALOG_PREFIX, "import", backup.artifact.clone()))
+                .await
+                .unwrap();
+            let before = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                for body in [
+                    b"not-json".to_vec(),
+                    br#"{"backup-id":"a","object":"object","data-base64":null}"#.to_vec(),
+                    br#"{"backup-id":"a","object":"object","data-base64":"","unknown":true}"#.to_vec(),
+                    br#"{"backup-id":"a","object":"object","object":"other","data-base64":""}"#.to_vec(),
+                ] {
+                    let error = call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", body))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                    assert_eq!(target.inventory().await, before);
+                }
+                for encoded in ["***", "Zg", "_w==", "Zm9v\n", "Zg===", "Zh=="] {
+                    let body = serde_json::to_vec(&serde_json::json!({
+                        "backup-id": backup.backup_id, "object": backup.object, "data-base64": encoded,
+                    }))
+                    .unwrap();
+                    let error = call_catalog_backup_prepare_handler(target.operator_request(prefix, "prepare", body))
+                        .await
+                        .unwrap_err();
+                    assert_eq!(error.code(), &S3ErrorCode::InvalidRequest, "accepted nonstandard Base64 {encoded:?}");
+                    assert_eq!(target.inventory().await, before);
+                }
+            }
+            let oversized_encoded = serde_json::to_vec(&serde_json::json!({
+                "backup-id": backup.backup_id, "object": backup.object,
+                "data-base64": "A".repeat(CATALOG_BACKUP_PREPARE_BASE64_MAX_SIZE + 4),
+            }))
+            .unwrap();
+            let error =
+                call_catalog_backup_prepare_handler(target.operator_request(TABLE_CATALOG_PREFIX, "prepare", oversized_encoded))
+                    .await
+                    .expect_err("encoded length must be bounded before Base64 allocation");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("encoded preparation limit"));
+            assert_eq!(target.inventory().await, before);
+            let decoded_over_limit = backup_object_prepare_body(
+                &backup.backup_id,
+                &backup.object,
+                &vec![0; CATALOG_BACKUP_PREPARE_OBJECT_MAX_SIZE + 1],
+            );
+            let error =
+                call_catalog_backup_prepare_handler(target.operator_request(TABLE_CATALOG_PREFIX, "prepare", decoded_over_limit))
+                    .await
+                    .expect_err("the equal-length padded Base64 boundary must still enforce the decoded limit");
+            assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+            assert_eq!(target.inventory().await, before);
+            let error = call_catalog_backup_prepare_handler(target.operator_request(
+                TABLE_CATALOG_PREFIX,
+                "prepare",
+                vec![b' '; CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1],
+            ))
+            .await
+            .expect_err("the JSON body must be bounded before deserialization");
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert_eq!(target.inventory().await, before);
+            let mut length_request = target.operator_request(TABLE_CATALOG_PREFIX, "prepare", Vec::new());
+            length_request.headers.insert(
+                http::header::CONTENT_LENGTH,
+                HeaderValue::from_str(&(CATALOG_BACKUP_PREPARE_BODY_MAX_SIZE + 1).to_string()).unwrap(),
+            );
+            let error = call_catalog_backup_prepare_handler(length_request).await.unwrap_err();
+            assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+            assert!(error.message().unwrap_or_default().contains("request body is too large"));
+            assert_eq!(target.inventory().await, before);
+
+            let disabled_bucket = format!("disabled-prepare-{}", Uuid::new_v4().simple());
+            target
+                .context
+                .object_store()
+                .make_bucket(&disabled_bucket, &MakeBucketOptions::default())
+                .await
+                .unwrap();
+            let before_disabled = target.inventory().await;
+            for prefix in [TABLE_CATALOG_PREFIX, TABLE_CATALOG_COMPAT_PREFIX] {
+                let mut request = target.request(prefix, "prepare", b"not-json".to_vec());
+                request.uri = format!("{prefix}/{disabled_bucket}/catalog/backup/prepare").parse().unwrap();
+                let error = call_catalog_backup_prepare_handler(request).await.unwrap_err();
+                assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+                assert!(error.message().unwrap_or_default().contains("not table-enabled"));
+                assert_eq!(target.inventory().await, before_disabled);
+                assert!(target.backend.list_objects(&disabled_bucket, "").await.unwrap().is_empty());
+            }
+        },
+    )
+    .await;
+}
+
+#[test]
+fn catalog_restore_request_accepts_legacy_and_explicit_restore_id() {
+    let legacy: CatalogRestoreRequest =
+        serde_json::from_str(r#"{"backup-id":"backup-a"}"#).expect("legacy restore request should parse");
+    assert_eq!(legacy.backup_id, "backup-a");
+    assert!(legacy.restore_id.is_none());
+    assert!(legacy.expected_snapshot_etag.is_none());
+    assert!(!legacy.allow_replace);
+
+    let explicit: CatalogRestoreRequest = serde_json::from_str(
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","expected-snapshot-etag":"target-a","allow-replace":true}"#,
+    )
+    .expect("restore request with id should parse");
+    assert_eq!(explicit.restore_id.as_deref(), Some("restore-a"));
+    assert_eq!(explicit.expected_snapshot_etag.as_deref(), Some("target-a"));
+    assert!(explicit.allow_replace);
+}
+
+#[test]
+fn catalog_restore_request_rejects_ambiguous_or_unknown_fields() {
+    for body in [
+        r#"{"backup-id":"backup-a","restore-id":42}"#,
+        r#"{"backup-id":"backup-a","restore-id":false}"#,
+        r#"{"backup-id":"backup-a","restore-id":[]}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","restore-id":"restore-b"}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a","force":true}"#,
+        r#"{"backup-id":"backup-a","restoreId":"restore-a"}"#,
+    ] {
+        assert!(serde_json::from_str::<CatalogRestoreRequest>(body).is_err(), "{body}");
+    }
+}
+
+#[tokio::test]
+async fn catalog_restore_handler_authenticates_legacy_and_identified_requests_before_store_access() {
+    for body in [
+        r#"{"backup-id":"backup-a"}"#,
+        r#"{"backup-id":"backup-a","restore-id":"restore-a"}"#,
+    ] {
+        let request = S3Request {
+            input: Body::from(body.as_bytes().to_vec()),
+            method: Method::POST,
+            uri: "/iceberg/v1/warehouse/catalog/restore".parse().expect("restore URI"),
+            headers: HeaderMap::new(),
+            extensions: http::Extensions::new(),
+            credentials: None,
+            region: None,
+            service: None,
+            trailing_headers: None,
+        };
+        let error = call_catalog_restore_handler(request)
+            .await
+            .expect_err("restore requires authentication before resolving an object store");
+        assert_eq!(error.code(), &S3ErrorCode::InvalidRequest);
+        assert!(error.message().unwrap_or_default().contains("authentication required"));
+    }
+}
+
+#[tokio::test]
+#[serial_test::serial]
+async fn catalog_restore_handler_forwards_restore_id_and_replays_without_writes() {
+    temp_env::async_with_vars(
+        [(
+            crate::table_catalog::ENV_TABLE_CATALOG_BACKING,
+            Some(crate::table_catalog::TABLE_CATALOG_BACKING_OBJECT),
+        )],
+        async {
+            let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            let bucket = format!("restore-request-{}", Uuid::new_v4().simple());
+            object_store
+                .make_bucket(&bucket, &MakeBucketOptions::default())
+                .await
+                .expect("restore bucket should be created");
+            enable_table_bucket_marker(&object_store, &bucket)
+                .await
+                .expect("restore bucket marker should be enabled");
+            rustfs_iam::store::object::ObjectStore::new(object_store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .expect("request IAM format should be seeded");
+            let iam = rustfs_iam::build_iam_sys(object_store.clone())
+                .await
+                .expect("request IAM should initialize");
+            iam.create_user(
+                "restore-request-reader",
+                &AddOrUpdateUserReq {
+                    secret_key: "restore-request-reader-secret".to_string(),
+                    policy: None,
+                    status: AccountStatus::Enabled,
+                },
+            )
+            .await
+            .expect("unprivileged restore caller should be created");
+            let context = Arc::new(AppContext::new(
+                object_store.clone(),
+                Arc::new(RequestIam { handle: iam }),
+                Arc::new(RequestKms),
+            ));
+            let root_access_key = "restore-request-root";
+            let root_secret_key = "restore-request-root-secret";
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: root_access_key.to_string(),
+                secret_key: root_secret_key.to_string(),
+                status: "on".to_string(),
+                ..Default::default()
+            }));
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store);
+            let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
+                backend.clone(),
+                crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
+            );
+            catalog
+                .put_table_bucket(table_bucket_entry_from_metadata_marker(&bucket))
+                .await
+                .expect("restore bucket catalog should be seeded");
+            let backup = catalog
+                .create_catalog_backup(&bucket, None)
+                .await
+                .expect("backup should be created");
+            let request = |body: serde_json::Value| {
+                let mut request = table_catalog_handler_request(context.clone(), root_access_key, root_secret_key);
+                request.method = Method::POST;
+                request.uri = format!("/iceberg/v1/{bucket}/catalog/restore")
+                    .parse()
+                    .expect("restore request URI");
+                request.input = Body::from(serde_json::to_vec(&body).expect("restore request body"));
+                request
+            };
+            let inventory = || async {
+                let mut objects = BTreeMap::new();
+                for path in backend
+                    .list_objects(crate::admin::storage_api::RUSTFS_META_BUCKET, "")
+                    .await
+                    .expect("catalog inventory should list")
+                {
+                    let object = backend
+                        .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &path)
+                        .await
+                        .expect("catalog inventory object should read")
+                        .expect("listed catalog object should exist");
+                    objects.insert(path, (object.data, object.etag));
+                }
+                objects
+            };
+            for restore_id in [String::new(), "x".repeat(1025)] {
+                let before = inventory().await;
+                let error = call_catalog_restore_handler(request(serde_json::json!({
+                    "backup-id": backup.backup_id,
+                    "restore-id": restore_id
+                })))
+                .await
+                .expect_err("invalid restore id must be rejected");
+                assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_BAD_REQUEST.into()));
+                assert_eq!(error.status_code(), Some(StatusCode::BAD_REQUEST));
+                assert_eq!(inventory().await, before, "invalid id mutated catalog objects");
+            }
+            let body = serde_json::json!({"backup-id": backup.backup_id, "restore-id": "restore-a"});
+            let before = inventory().await;
+            let mut unauthenticated = request(body.clone());
+            unauthenticated.credentials = None;
+            let error = call_catalog_restore_handler(unauthenticated)
+                .await
+                .expect_err("unauthenticated restore must be rejected");
+            assert!(error.message().unwrap_or_default().contains("authentication required"));
+            assert_eq!(inventory().await, before, "unauthenticated restore mutated catalog objects");
+
+            let mut unauthorized = request(body.clone());
+            unauthorized.credentials = Some(s3s::auth::Credentials {
+                access_key: "restore-request-reader".to_string(),
+                secret_key: s3s::auth::SecretKey::from("restore-request-reader-secret".to_string()),
+            });
+            let error = call_catalog_restore_handler(unauthorized)
+                .await
+                .expect_err("unprivileged restore caller must be rejected");
+            assert_eq!(error.code(), &S3ErrorCode::AccessDenied);
+            assert_eq!(inventory().await, before, "unauthorized restore mutated catalog objects");
+
+            let initial = call_catalog_restore_handler(request(body.clone()))
+                .await
+                .expect("identified restore should succeed");
+            assert_eq!(initial.output.0, StatusCode::OK);
+            let initial = http_body_util::BodyExt::collect(initial.output.1)
+                .await
+                .expect("initial receipt body")
+                .to_bytes();
+            let initial: serde_json::Value = serde_json::from_slice(&initial).expect("initial receipt JSON");
+            let state_path = crate::table_catalog::TableCatalogObjectPaths::default().catalog_restore_state_path(&bucket);
+            let barrier = backend
+                .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &state_path)
+                .await
+                .expect("restore barrier should read")
+                .expect("restore barrier should exist");
+            let barrier: serde_json::Value = serde_json::from_slice(&barrier.data).expect("restore barrier JSON");
+            assert_eq!(barrier["restore_id"], "restore-a", "handler did not forward explicit restore id");
+            let before = inventory().await;
+            let repeated = call_catalog_restore_handler(request(body))
+                .await
+                .expect("same restore id should replay");
+            assert_eq!(repeated.output.0, StatusCode::OK);
+            let repeated = http_body_util::BodyExt::collect(repeated.output.1)
+                .await
+                .expect("repeated receipt body")
+                .to_bytes();
+            let mut repeated: serde_json::Value = serde_json::from_slice(&repeated).expect("repeated receipt JSON");
+            assert_eq!(repeated["status"], "ALREADY_RESTORED");
+            repeated["status"] = initial["status"].clone();
+            assert_eq!(repeated, initial, "replay changed the persisted receipt");
+            assert_eq!(inventory().await, before, "replay changed object bytes or ETags");
+
+            let error = call_catalog_restore_handler(request(serde_json::json!({
+                "backup-id": backup.backup_id,
+                "restore-id": "restore-a",
+                "allow-replace": true
+            })))
+            .await
+            .expect_err("reuse with different request options must conflict");
+            assert_eq!(error.status_code(), Some(StatusCode::CONFLICT));
+            assert_eq!(inventory().await, before, "request identity conflict mutated objects");
+        },
+    )
+    .await;
 }
 
 #[tokio::test]
@@ -2832,7 +4360,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     assert_eq!(cursor, None);
     assert_eq!(limit.get(), 2);
     let next_page_token = first_pagination
-        .next_page_token(Some("strong:beta".to_string()))
+        .next_page_token(Some("object:beta".to_string()))
         .expect("page token should encode")
         .expect("page token should be present");
     let second_request = format!("/?pageSize=2&pageToken={next_page_token}")
@@ -2842,7 +4370,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     let (cursor, limit) = second_pagination
         .page_request()
         .expect("continuation should remain paginated");
-    assert_eq!(cursor, Some("strong:beta"));
+    assert_eq!(cursor, Some("object:beta"));
     assert_eq!(limit.get(), 2);
     assert!(
         second_pagination
@@ -2859,7 +4387,7 @@ fn rest_pagination_round_trips_context_bound_tokens() {
     let (cursor, limit) = default_size_pagination
         .page_request()
         .expect("continuation should remain paginated");
-    assert_eq!(cursor, Some("strong:beta"));
+    assert_eq!(cursor, Some("object:beta"));
     assert_eq!(limit.get(), REST_DEFAULT_PAGE_SIZE);
 
     for other_context in [
@@ -2948,13 +4476,13 @@ fn rest_pagination_rejects_malformed_token_payloads() {
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION,
             "context": context_fingerprint,
-            "cursor": "strong:alpha",
+            "cursor": "legacy:alpha",
             "unknown": true
         })),
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION + 1,
             "context": context_fingerprint,
-            "cursor": "strong:alpha"
+            "cursor": "legacy:alpha"
         })),
         encoded_json(serde_json::json!({
             "version": REST_PAGE_TOKEN_VERSION,
@@ -4733,92 +6261,6 @@ async fn concurrent_create_table_responses_keep_one_catalog_winner_with_distinct
 }
 
 #[tokio::test]
-async fn staged_create_is_invisible_until_assert_create_commit_across_backings() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
-        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        ensure_table_bucket_entry(&store, "warehouse", true)
-            .await
-            .expect("table bucket entry should be seeded");
-        create_namespace_response(
-            &store,
-            "warehouse",
-            CreateNamespaceRequest {
-                namespace: vec!["analytics".to_string()],
-                properties: BTreeMap::new(),
-            },
-            true,
-        )
-        .await
-        .expect("namespace should be created");
-        let commit_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
-
-        let staged =
-            create_table_response(&store, &commit_backend, "warehouse", &namespace, staged_events_create_request(), true)
-                .await
-                .expect("stage-create should return initialized metadata");
-
-        assert_eq!(staged.metadata_location, None, "{mode:?}");
-        let staged_json = serde_json::to_value(&staged).expect("staged response should serialize");
-        assert!(staged_json["metadata-location"].is_null(), "{mode:?}");
-        assert!(
-            store
-                .load_table("warehouse", "analytics", "events")
-                .await
-                .expect("table lookup should succeed")
-                .is_none(),
-            "{mode:?}"
-        );
-        let metadata_prefix = ".rustfs-table/warehouses/default/namespaces/analytics/tables/events/metadata/";
-        assert!(
-            metadata_backend
-                .list_objects("warehouse", metadata_prefix)
-                .await
-                .expect("metadata listing should succeed")
-                .is_empty(),
-            "{mode:?}"
-        );
-
-        let committed = commit_table_response(
-            &store,
-            &commit_backend,
-            "warehouse",
-            &namespace,
-            "events",
-            staged_create_commit_request(&staged.metadata, []),
-        )
-        .await
-        .expect("assert-create commit should publish the table");
-
-        assert_eq!(committed.generation, 1, "{mode:?}");
-        assert_eq!(committed.metadata["table-uuid"], staged.metadata["table-uuid"], "{mode:?}");
-        assert_eq!(committed.metadata["metadata-log"], serde_json::json!([]), "{mode:?}");
-        let entry = store
-            .load_table("warehouse", "analytics", "events")
-            .await
-            .expect("table lookup should succeed")
-            .expect("committed table should be visible");
-        assert_eq!(entry.table_uuid, staged.metadata["table-uuid"].as_str().unwrap(), "{mode:?}");
-        assert_eq!(
-            committed.metadata_location,
-            table_metadata_location_for_client("warehouse", &entry.metadata_location),
-            "{mode:?}"
-        );
-        assert!(
-            metadata_backend
-                .object_exists("warehouse", &entry.metadata_location)
-                .await
-                .expect("metadata lookup should succeed"),
-            "{mode:?}"
-        );
-    }
-}
-
-#[tokio::test]
 async fn staged_create_commit_accepts_initial_snapshot_for_spark_ctas() {
     let store = TestTableCatalogStore::default();
     let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
@@ -4899,181 +6341,6 @@ fn staged_create_commit_defaults_to_format_version_two_without_upgrade() {
 
     assert_eq!(metadata["format-version"], 2);
     assert_eq!(metadata["last-sequence-number"], 0);
-}
-
-#[tokio::test]
-async fn staged_create_rejects_an_active_table_warehouse_location() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        let catalog_backend = TestTableCatalogObjectBackend::content_addressed();
-        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(catalog_backend, mode);
-        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        ensure_table_bucket_entry(&store, "warehouse", true)
-            .await
-            .expect("table bucket entry should be seeded");
-        create_namespace_response(
-            &store,
-            "warehouse",
-            CreateNamespaceRequest {
-                namespace: vec!["analytics".to_string()],
-                properties: BTreeMap::new(),
-            },
-            true,
-        )
-        .await
-        .expect("namespace should be created");
-        let commit_backend = TableCommitObjectBackend::trusted(metadata_backend);
-        let active_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
-            "name": "active_events",
-            "location": "s3://warehouse/shared/events",
-            "schema": {"type": "struct", "fields": []}
-        }))
-        .expect("active create request should parse");
-        create_table_response(&store, &commit_backend, "warehouse", &namespace, active_request, true)
-            .await
-            .expect("active table should be created");
-        let staged_request = serde_json::from_value::<CreateTableRequest>(serde_json::json!({
-            "name": "staged_events",
-            "location": "s3://warehouse/shared/events/child",
-            "schema": {"type": "struct", "fields": []},
-            "stage-create": true
-        }))
-        .expect("staged create request should parse");
-
-        let error = create_table_response(&store, &commit_backend, "warehouse", &namespace, staged_request, true)
-            .await
-            .expect_err("stage-create must reject a location owned by an active table");
-
-        assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()), "{mode:?}");
-        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
-        assert!(
-            store
-                .load_table("warehouse", "analytics", "staged_events")
-                .await
-                .expect("table lookup should succeed")
-                .is_none(),
-            "{mode:?}"
-        );
-    }
-}
-
-#[tokio::test]
-async fn concurrent_staged_create_commits_publish_exactly_one_table() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        let catalog_backend = TestTableCatalogObjectBackend::content_addressed();
-        let barrier = Arc::new(tokio::sync::Barrier::new(2));
-        let metadata_backend = TestTableCatalogObjectBackend {
-            put_object_barrier: Some(Arc::clone(&barrier)),
-            ..TestTableCatalogObjectBackend::content_addressed()
-        };
-        let store = Arc::new(crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(catalog_backend, mode));
-        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        ensure_table_bucket_entry(store.as_ref(), "warehouse", true)
-            .await
-            .expect("table bucket entry should be seeded");
-        create_namespace_response(
-            store.as_ref(),
-            "warehouse",
-            CreateNamespaceRequest {
-                namespace: vec!["analytics".to_string()],
-                properties: BTreeMap::new(),
-            },
-            true,
-        )
-        .await
-        .expect("namespace should be created");
-        let staged = create_table_response(
-            store.as_ref(),
-            &TableCommitObjectBackend::trusted(metadata_backend.clone()),
-            "warehouse",
-            &namespace,
-            staged_events_create_request(),
-            true,
-        )
-        .await
-        .expect("stage-create should succeed");
-        let first_store = Arc::clone(&store);
-        let first_namespace = namespace.clone();
-        let first_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
-        let first_request = staged_create_commit_request(&staged.metadata, []);
-        let first = tokio::spawn(async move {
-            commit_table_response(
-                first_store.as_ref(),
-                &first_backend,
-                "warehouse",
-                &first_namespace,
-                "events",
-                first_request,
-            )
-            .await
-        });
-        tokio::time::timeout(StdDuration::from_secs(2), async {
-            while metadata_backend.state.lock().await.objects.is_empty() {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("first metadata write should reach the publication pause");
-        metadata_backend.lock_attempts.lock().await.clear();
-        let second_store = Arc::clone(&store);
-        let second_namespace = namespace.clone();
-        let second_backend = TableCommitObjectBackend::trusted(metadata_backend.clone());
-        let second_request = staged_create_commit_request(&staged.metadata, []);
-        let second = tokio::spawn(async move {
-            commit_table_response(
-                second_store.as_ref(),
-                &second_backend,
-                "warehouse",
-                &second_namespace,
-                "events",
-                second_request,
-            )
-            .await
-        });
-        metadata_backend.wait_for_lock_attempts(1).await;
-        assert!(
-            !second.is_finished(),
-            "second create must wait after observing the table as absent: {mode:?}"
-        );
-
-        barrier.wait().await;
-        let _winner = tokio::time::timeout(StdDuration::from_secs(2), first)
-            .await
-            .expect("first assert-create commit should complete")
-            .expect("first assert-create task should join")
-            .expect("first assert-create commit should win");
-        tokio::time::timeout(StdDuration::from_secs(2), async {
-            while metadata_backend.state.lock().await.objects.len() < 2 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("second metadata write should reach the publication pause");
-        barrier.wait().await;
-        let loser = tokio::time::timeout(StdDuration::from_secs(2), second)
-            .await
-            .expect("second assert-create commit should complete")
-            .expect("second assert-create task should join")
-            .expect_err("second assert-create commit must lose at atomic registration");
-
-        assert_eq!(loser.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_ALREADY_EXISTS.into()), "{mode:?}");
-        assert_eq!(loser.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
-        assert_eq!(
-            store
-                .list_tables("warehouse", "analytics")
-                .await
-                .expect("table listing should succeed")
-                .len(),
-            1,
-            "{mode:?}"
-        );
-    }
 }
 
 #[tokio::test]
@@ -5282,11 +6549,6 @@ fn table_metadata_file_name_scoping_is_bounded_and_identity_sensitive() {
 }
 
 #[tokio::test]
-async fn renamed_and_recreated_tables_with_the_same_commit_id_use_disjoint_metadata_files() {
-    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::DurableStrong, "curated").await;
-}
-
-#[tokio::test]
 async fn object_catalog_cross_namespace_rename_accepts_isolated_standard_commits() {
     assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::ObjectBacked, "curated").await;
 }
@@ -5294,11 +6556,6 @@ async fn object_catalog_cross_namespace_rename_accepts_isolated_standard_commits
 #[tokio::test]
 async fn object_catalog_same_namespace_rename_accepts_isolated_standard_commits() {
     assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::ObjectBacked, "analytics").await;
-}
-
-#[tokio::test]
-async fn strong_catalog_same_namespace_rename_accepts_isolated_standard_commits() {
-    assert_renamed_and_recreated_table_commits(crate::table_catalog::TableCatalogBackingMode::DurableStrong, "analytics").await;
 }
 
 async fn assert_renamed_and_recreated_table_commits(mode: crate::table_catalog::TableCatalogBackingMode, destination: &str) {
@@ -5920,72 +7177,6 @@ async fn standard_commit_recovers_matching_table_scoped_metadata_orphan() {
 }
 
 #[tokio::test]
-async fn concurrent_identical_commits_reuse_table_scoped_metadata_winner() {
-    let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-    let store = crate::table_catalog::StrongTableCatalogStore::new(metadata_backend.clone());
-    let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-    create_standard_events_table(&store, &metadata_backend, &namespace).await;
-    let current = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should exist");
-    let mut foreign_metadata = read_table_metadata_json(&metadata_backend, "warehouse", &current.metadata_location)
-        .await
-        .expect("current metadata should load");
-    foreign_metadata["table-uuid"] = serde_json::Value::String(Uuid::new_v4().to_string());
-    let commit_id = "11111111-1111-4111-8111-111111111111";
-    let primary_location =
-        crate::table_catalog::table_metadata_file_path_for_entry(&current, &next_metadata_file_name(2, commit_id))
-            .expect("primary metadata path should be valid");
-    metadata_backend
-        .put_json("warehouse", &primary_location, foreign_metadata)
-        .await;
-
-    let barrier_backend = TestTableCatalogObjectBackend {
-        put_object_barrier: Some(Arc::new(tokio::sync::Barrier::new(2))),
-        ..metadata_backend.clone()
-    };
-    let first_backend = trusted_table_commit_backend(&barrier_backend);
-    let second_backend = trusted_table_commit_backend(&barrier_backend);
-    let (first, second) = tokio::join!(
-        standard_commit_table_response(
-            &store,
-            &first_backend,
-            "warehouse",
-            &namespace,
-            "events",
-            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
-        ),
-        standard_commit_table_response(
-            &store,
-            &second_backend,
-            "warehouse",
-            &namespace,
-            "events",
-            standard_property_commit_request(commit_id, &current.table_uuid, "target"),
-        )
-    );
-    let first = first.expect("first identical commit should succeed");
-    let second = second.expect("second identical commit should replay the winner");
-
-    assert_eq!(first.commit_id, second.commit_id);
-    assert_eq!(first.metadata_location, second.metadata_location);
-    assert_eq!(first.metadata, second.metadata);
-    assert!(
-        first
-            .metadata_location
-            .ends_with(&table_scoped_metadata_file_name(2, &current.table_id, commit_id))
-    );
-    let committed = store
-        .load_table("warehouse", "analytics", "events")
-        .await
-        .expect("table lookup should succeed")
-        .expect("table should exist");
-    assert_eq!(committed.generation, current.generation + 1);
-}
-
-#[tokio::test]
 async fn standard_commit_rejects_mismatched_table_scoped_metadata_orphan() {
     let (store, metadata_backend, namespace, current, current_metadata, request, fallback_location) =
         standard_commit_foreign_primary_fixture().await;
@@ -6282,126 +7473,6 @@ async fn commit_publication_uses_idempotency_key_as_retry_identity() {
 
     assert_eq!(commit.commit_id, idempotency_key);
     assert!(commit.metadata_location.contains(&idempotency_key));
-}
-
-#[tokio::test]
-async fn commit_publication_replays_historical_standard_commit_across_backings() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        let metadata_backend = TestTableCatalogObjectBackend::content_addressed();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
-        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace should parse");
-        create_standard_events_table(&store, &metadata_backend, &namespace).await;
-        let first_request = serde_json::json!({
-            "commit-id": "commit-a",
-            "idempotency-key": "request-a",
-            "writer": "test-client",
-            "requirements": [],
-            "updates": [{
-                "action": "set-properties",
-                "updates": {"owner": "first"}
-            }]
-        });
-        let first = standard_commit_table_response(
-            &store,
-            &trusted_table_commit_backend(&metadata_backend),
-            "warehouse",
-            &namespace,
-            "events",
-            serde_json::from_value(first_request.clone()).expect("first commit request should parse"),
-        )
-        .await
-        .expect("first commit should update the table");
-
-        if mode == crate::table_catalog::TableCatalogBackingMode::ObjectBacked {
-            let current = store
-                .load_table("warehouse", "analytics", "events")
-                .await
-                .expect("first committed table lookup should succeed")
-                .expect("first committed table should exist");
-            let mut historical = store
-                .get_commit_by_id("warehouse", &current.table_id, "commit-a")
-                .await
-                .expect("historical commit lookup should succeed")
-                .expect("historical commit should exist");
-            historical.requirements = vec![metadata_digest_requirement(&first.metadata).expect("metadata digest should build")];
-            let paths = crate::table_catalog::TableCatalogObjectPaths::default();
-            let commit_path = paths.commit_log_entry_path("warehouse", &current.table_id, "commit-a");
-            let idempotency_path = paths.commit_idempotency_entry_path("warehouse", &current.table_id, "request-a");
-            let historical = serde_json::to_value(historical).expect("historical commit should serialize");
-            for path in [commit_path, idempotency_path] {
-                metadata_backend
-                    .put_json(crate::admin::storage_api::RUSTFS_META_BUCKET, &path, historical.clone())
-                    .await;
-            }
-        }
-
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(metadata_backend.clone(), mode);
-        let second = standard_commit_table_response(
-            &store,
-            &trusted_table_commit_backend(&metadata_backend),
-            "warehouse",
-            &namespace,
-            "events",
-            serde_json::from_value(serde_json::json!({
-                "commit-id": "commit-b",
-                "idempotency-key": "request-b",
-                "requirements": [],
-                "updates": [{
-                    "action": "set-properties",
-                    "updates": {"owner": "current"}
-                }]
-            }))
-            .expect("second commit request should parse"),
-        )
-        .await
-        .expect("second commit should advance the table");
-        let current = store
-            .load_table("warehouse", "analytics", "events")
-            .await
-            .expect("current table lookup should succeed")
-            .expect("current table should exist");
-
-        let replay = standard_commit_table_response(
-            &store,
-            &trusted_table_commit_backend(&metadata_backend),
-            "warehouse",
-            &namespace,
-            "events",
-            serde_json::from_value(first_request.clone()).expect("first commit retry should parse"),
-        )
-        .await
-        .expect("an exact old commit retry should succeed");
-
-        assert_eq!(replay.commit_id, "commit-a", "{mode:?}");
-        assert_eq!(replay.metadata_location, second.metadata_location, "{mode:?}");
-        assert_eq!(replay.version_token, second.version_token, "{mode:?}");
-        assert_eq!(replay.generation, second.generation, "{mode:?}");
-        assert_eq!(replay.metadata["properties"]["owner"], "current", "{mode:?}");
-        let unchanged = store
-            .load_table("warehouse", "analytics", "events")
-            .await
-            .expect("table lookup after replay should succeed")
-            .expect("table should remain present");
-        assert_eq!(unchanged.metadata_location, current.metadata_location, "{mode:?}");
-        assert_eq!(unchanged.version_token, current.version_token, "{mode:?}");
-
-        let mut mutated_request = first_request;
-        mutated_request["updates"][0]["updates"]["owner"] = serde_json::Value::String("mutated".to_string());
-        let error = standard_commit_table_response(
-            &store,
-            &trusted_table_commit_backend(&metadata_backend),
-            "warehouse",
-            &namespace,
-            "events",
-            serde_json::from_value(mutated_request).expect("mutated retry should parse"),
-        )
-        .await
-        .expect_err("mutating updates under a persisted idempotency key must conflict");
-        assert_eq!(error.status_code(), Some(StatusCode::CONFLICT), "{mode:?}");
-    }
 }
 
 #[tokio::test]
@@ -7205,7 +8276,7 @@ async fn commit_publication_lock_order_remains_compatible_with_old_maintenance_n
             .await
     });
     metadata_backend.wait_for_lock_attempts(3).await;
-    let migration_lock = crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_fence_lock_path("warehouse");
+    let migration_lock = crate::table_catalog::TableCatalogObjectPaths::default().catalog_backup_fence_lock_path("warehouse");
     assert_eq!(
         metadata_backend.lock_attempts.lock().await.as_slice(),
         &[
@@ -7624,16 +8695,14 @@ async fn commit_publication_accepts_unchanged_legacy_bytes() {
 
 #[tokio::test]
 async fn catalog_body_revision_changes_on_real_identical_body_overwrite() {
-    use crate::table_catalog::{
-        EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, TableCatalogObjectBackend as _, TableCatalogPutPrecondition,
-    };
+    use crate::table_catalog::{EcStoreTableCatalogObjectBackend, TableCatalogObjectBackend as _, TableCatalogPutPrecondition};
     let (_temp_dir, _disk_paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = "catalog-body-revision";
     store
         .make_bucket(bucket, &MakeBucketOptions::default())
         .await
         .expect("create bucket");
-    let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(store, StrongTableCatalogRuntime::default());
+    let backend = EcStoreTableCatalogObjectBackend::new(store);
     backend
         .put_object(bucket, "manifest.avro", b"same bytes".to_vec(), TableCatalogPutPrecondition::IfAbsent)
         .await
@@ -10897,6 +11966,21 @@ async fn manifest_rewrite_preserves_v1_files_after_upgrade() {
     )
     .await
     .expect("the table should upgrade while retaining v1 history");
+    let backup = store
+        .create_object_catalog_backup("warehouse", None)
+        .await
+        .expect("backup should capture the upgraded table and its inline v1 manifests");
+    let backup_object = backend
+        .read_object(crate::admin::storage_api::RUSTFS_META_BUCKET, &backup.backup_path)
+        .await
+        .expect("read captured backup")
+        .expect("backup artifact exists");
+    let backup_json: serde_json::Value = serde_json::from_slice(&backup_object.data).expect("decode backup artifact");
+    let references = backup_json["references"].as_array().expect("physical object inventory");
+    for location in [&manifest, &file] {
+        let key = test_snapshot_object_key("warehouse", location);
+        assert!(references.iter().any(|reference| reference["object"] == key), "missing {key}");
+    }
     let inherited_list = format!("{location}/metadata/snap-11.avro");
     for sequence in [1, 0] {
         backend
@@ -13602,257 +14686,6 @@ impl TableCredentialIssuer for RecordingTableCredentialIssuer {
     }
 }
 
-#[tokio::test]
-async fn renamed_table_vending_preserves_identity_and_isolates_recreated_metadata_across_backings() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        for destination in ["analytics", "curated"] {
-            let backend = TestTableCatalogObjectBackend::content_addressed();
-            let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
-            let source = crate::table_catalog::Namespace::parse("analytics").expect("source namespace");
-            let destination_namespace = crate::table_catalog::Namespace::parse(destination).expect("destination namespace");
-            create_standard_events_table(&store, &backend, &source).await;
-            if destination != "analytics" {
-                create_namespace_response(
-                    &store,
-                    "warehouse",
-                    CreateNamespaceRequest {
-                        namespace: vec![destination.to_string()],
-                        properties: BTreeMap::new(),
-                    },
-                    true,
-                )
-                .await
-                .expect("destination namespace should be created");
-            }
-            let before = store
-                .load_table("warehouse", "analytics", "events")
-                .await
-                .expect("lookup")
-                .expect("table");
-            store
-                .rename_table("warehouse", "analytics", "events", destination, "renamed_events")
-                .await
-                .expect("rename should succeed");
-            let renamed = store
-                .load_table("warehouse", destination, "renamed_events")
-                .await
-                .expect("lookup")
-                .expect("table");
-            assert_eq!(renamed.table_id, before.table_id);
-            assert_eq!(renamed.table_uuid, before.table_uuid);
-            assert_eq!(renamed.warehouse_location, before.warehouse_location);
-            assert_eq!(renamed.metadata_location, before.metadata_location);
-            assert_eq!(renamed.version_token, before.version_token);
-            assert_eq!(renamed.generation, before.generation);
-            let issuer = RecordingTableCredentialIssuer::default();
-            let delegated = load_table_response_with_credentials(
-                &store,
-                &backend,
-                "warehouse",
-                &destination_namespace,
-                "renamed_events",
-                &issuer,
-                None,
-            )
-            .await
-            .expect("renamed table should vend credentials for its retained metadata");
-            let credentials =
-                load_credentials_response(&store, &backend, "warehouse", &destination_namespace, "renamed_events", &issuer, None)
-                    .await
-                    .expect("credentials endpoint should accept the retained metadata");
-            assert_eq!(
-                serde_json::to_value(&credentials.storage_credentials).expect("credential JSON"),
-                serde_json::to_value(&delegated.storage_credentials).expect("delegated JSON")
-            );
-            assert_eq!(delegated.metadata["table-uuid"], before.table_uuid);
-            assert_eq!(delegated.storage_credentials.len(), 2);
-            assert_eq!(delegated.storage_credentials[0].prefix, format!("{}/", before.warehouse_location));
-            assert_eq!(
-                delegated.storage_credentials[1].prefix,
-                table_metadata_location_for_client("warehouse", &before.metadata_location)
-            );
-            let missing = load_table_response_with_credentials(&store, &backend, "warehouse", &source, "events", &issuer, None)
-                .await
-                .expect_err("old identifier must not remain loadable");
-            assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
-            let request: CreateTableRequest = serde_json::from_value(serde_json::json!({
-                "name": "events", "schema": {"type": "struct", "schema-id": 0, "fields": []}
-            }))
-            .expect("recreate request");
-            create_table_response(
-                &store,
-                &TableCommitObjectBackend::trusted(backend.clone()),
-                "warehouse",
-                &source,
-                request,
-                true,
-            )
-            .await
-            .expect("old identifier should be reusable");
-            let recreated = store
-                .load_table("warehouse", "analytics", "events")
-                .await
-                .expect("lookup")
-                .expect("table");
-            assert_ne!(recreated.table_id, renamed.table_id);
-            assert_ne!(recreated.table_uuid, renamed.table_uuid);
-            assert_ne!(recreated.metadata_location, renamed.metadata_location);
-            assert_ne!(recreated.warehouse_location, renamed.warehouse_location);
-            let metadata_object =
-                table_metadata_location_for_catalog("warehouse", &renamed.metadata_location).expect("metadata key");
-            let prefix = renamed
-                .warehouse_location
-                .strip_prefix("s3://warehouse/")
-                .expect("warehouse prefix");
-            let policy =
-                table_credential_session_policy(&renamed, &format!("{prefix}/"), &metadata_object).expect("session policy");
-            let conditions = HashMap::new();
-            let claims = HashMap::new();
-            for (object, allowed) in [
-                (metadata_object.clone(), true),
-                (format!("{metadata_object}.neighbor"), false),
-                (
-                    table_metadata_location_for_catalog("warehouse", &recreated.metadata_location).expect("recreated key"),
-                    false,
-                ),
-            ] {
-                assert_eq!(
-                    policy
-                        .is_allowed(&rustfs_policy::policy::Args {
-                            account: "temporary-access-key",
-                            groups: &None,
-                            action: Action::S3Action(rustfs_policy::policy::action::S3Action::GetObjectAction),
-                            bucket: "warehouse",
-                            conditions: &conditions,
-                            is_owner: false,
-                            object: &object,
-                            claims: &claims,
-                            deny_only: false,
-                        })
-                        .await,
-                    allowed,
-                    "{mode:?} {destination} {object}"
-                );
-            }
-            let reloaded = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
-            for (namespace, name, expected) in [
-                (&destination_namespace, "renamed_events", &renamed),
-                (&source, "events", &recreated),
-            ] {
-                let response =
-                    load_table_response_with_credentials(&reloaded, &backend, "warehouse", namespace, name, &issuer, None)
-                        .await
-                        .expect("fresh store should vend for the correct persisted identity");
-                assert_eq!(response.metadata["table-uuid"], expected.table_uuid);
-                assert_eq!(response.storage_credentials[0].prefix, format!("{}/", expected.warehouse_location));
-                assert_eq!(
-                    response.storage_credentials[1].prefix,
-                    table_metadata_location_for_client("warehouse", &expected.metadata_location)
-                );
-                let credentials = load_credentials_response(&reloaded, &backend, "warehouse", namespace, name, &issuer, None)
-                    .await
-                    .expect("fresh store credentials endpoint should bind the persisted identity");
-                assert_eq!(
-                    serde_json::to_value(&credentials.storage_credentials).expect("credential JSON"),
-                    serde_json::to_value(&response.storage_credentials).expect("delegated JSON")
-                );
-            }
-        }
-    }
-}
-
-#[tokio::test]
-async fn credential_vending_rejects_corrupt_or_foreign_metadata_before_issuance_across_backings() {
-    for mode in [
-        crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
-        crate::table_catalog::TableCatalogBackingMode::DurableStrong,
-    ] {
-        let backend = TestTableCatalogObjectBackend::content_addressed();
-        let store = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(backend.clone(), mode);
-        let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
-        let created = create_standard_events_table(&store, &backend, &namespace).await;
-        let before = store
-            .load_table("warehouse", "analytics", "events")
-            .await
-            .expect("lookup")
-            .expect("table");
-        let issuer = RecordingTableCredentialIssuer::default();
-        let mut foreign_uuid = created.metadata.clone();
-        foreign_uuid["table-uuid"] = serde_json::Value::from("foreign-table-uuid");
-        let mut foreign_warehouse = created.metadata.clone();
-        foreign_warehouse["location"] = serde_json::Value::from("s3://warehouse/tables/another-table");
-        let mut cross_bucket = created.metadata.clone();
-        cross_bucket["location"] = serde_json::Value::from("s3://other/tables/another-table");
-        let mut missing_uuid = created.metadata.clone();
-        missing_uuid.as_object_mut().expect("metadata object").remove("table-uuid");
-        let mut unsupported_format = created.metadata.clone();
-        unsupported_format["format-version"] = serde_json::Value::from(99);
-        for metadata in [
-            foreign_uuid,
-            foreign_warehouse,
-            cross_bucket,
-            missing_uuid,
-            unsupported_format,
-            serde_json::Value::Null,
-        ] {
-            backend.put_json("warehouse", &before.metadata_location, metadata).await;
-            let credentials_error = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
-                .await
-                .expect_err("invalid persisted metadata must not produce credentials");
-            let delegated_error =
-                load_table_response_with_credentials(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
-                    .await
-                    .expect_err("delegated load must fail closed");
-            for error in [credentials_error, delegated_error] {
-                assert_eq!(error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
-                assert_eq!(error.code(), &S3ErrorCode::Custom(ICEBERG_ERROR_REST.into()));
-                assert_eq!(error.message(), Some("persisted table metadata is invalid"));
-            }
-            assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-            let after = store
-                .load_table("warehouse", "analytics", "events")
-                .await
-                .expect("lookup")
-                .expect("table");
-            assert_eq!(after.table_uuid, before.table_uuid);
-            assert_eq!(after.metadata_location, before.metadata_location);
-            assert_eq!(after.version_token, before.version_token);
-            assert_eq!(after.generation, before.generation);
-        }
-        let disabled =
-            load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &DisabledTableCredentialIssuer, None)
-                .await
-                .expect("disabled vending should not read or validate metadata");
-        assert!(disabled.storage_credentials.is_empty());
-        backend
-            .put_json("warehouse", &before.metadata_location, created.metadata)
-            .await;
-        backend.fail_next_read("warehouse", &before.metadata_location).await;
-        let read_error = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
-            .await
-            .expect_err("metadata read failure must prevent issuance");
-        assert_eq!(read_error.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
-        assert_eq!(read_error.message(), Some("persisted table metadata is invalid"));
-        backend
-            .delete_object("warehouse", &before.metadata_location)
-            .await
-            .expect("remove metadata fixture");
-        let missing_metadata = load_credentials_response(&store, &backend, "warehouse", &namespace, "events", &issuer, None)
-            .await
-            .expect_err("missing metadata must prevent issuance");
-        assert_eq!(missing_metadata.status_code(), Some(StatusCode::INTERNAL_SERVER_ERROR));
-        assert_eq!(issuer.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
-        let missing =
-            load_credentials_response(&store, &backend, "warehouse", &namespace, "missing", &DisabledTableCredentialIssuer, None)
-                .await
-                .expect_err("disabled vending must still reject missing tables");
-        assert_eq!(missing.status_code(), Some(StatusCode::NOT_FOUND));
-    }
-}
-
 #[async_trait::async_trait]
 impl TableCredentialIssuer for TestTableCredentialIssuer {
     async fn issue_table_credentials(
@@ -15072,10 +15905,7 @@ async fn namespace_property_handler_updates_object_backed_catalog_and_maps_error
             let slot = ServerContextSlot::new();
             assert!(slot.install(context.clone()));
 
-            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-                object_store,
-                context.table_catalog_strong_runtime(),
-            );
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store);
             let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
                 backend.clone(),
                 crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
@@ -16587,15 +17417,14 @@ async fn legacy_commit_rejects_mismatched_table_uuid_before_commit() {
 }
 
 #[derive(Clone)]
-struct ColdStrongRegistrationBackend<B> {
+struct ColdRegistrationBackend<B> {
     inner: B,
     armed: Arc<std::sync::atomic::AtomicBool>,
     reader_ready: Arc<tokio::sync::Notify>,
     resume: Arc<tokio::sync::Notify>,
-    backup_writer_waiting: Arc<tokio::sync::Notify>,
 }
 
-impl<B> ColdStrongRegistrationBackend<B> {
+impl<B> ColdRegistrationBackend<B> {
     async fn pause_after_reader(&self) {
         if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
             self.reader_ready.notify_one();
@@ -16606,14 +17435,10 @@ impl<B> ColdStrongRegistrationBackend<B> {
 
 #[async_trait::async_trait]
 impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::TableCatalogObjectBackend
-    for ColdStrongRegistrationBackend<B>
+    for ColdRegistrationBackend<B>
 {
-    fn strong_catalog_runtime(&self) -> Option<crate::table_catalog::StrongTableCatalogRuntime> {
-        self.inner.strong_catalog_runtime()
-    }
-
-    fn acquires_catalog_migration_read_permit(&self) -> bool {
-        self.inner.acquires_catalog_migration_read_permit()
+    fn registration_cache(&self) -> Option<crate::table_catalog::TableCatalogRegistrationCache> {
+        self.inner.registration_cache()
     }
 
     async fn acquire_catalog_migration_read_guards(
@@ -16631,7 +17456,7 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
         object: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
         let guard = self.inner.acquire_read_lock(bucket, object).await?;
-        if object == crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path() {
+        if object == crate::table_catalog::TableCatalogObjectPaths::default().catalog_backup_global_fence_lock_path() {
             self.pause_after_reader().await;
         }
         Ok(guard)
@@ -16642,16 +17467,7 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
         bucket: &str,
         object: &str,
     ) -> crate::table_catalog::TableCatalogStoreResult<crate::table_catalog::TableCatalogLockGuard> {
-        let mut acquire = self.inner.acquire_write_lock(bucket, object);
-        if bucket == crate::admin::storage_api::RUSTFS_META_BUCKET
-            && object == crate::table_catalog::TableCatalogObjectPaths::default().backing_migration_global_fence_lock_path()
-        {
-            match futures::poll!(acquire.as_mut()) {
-                std::task::Poll::Ready(result) => return result,
-                std::task::Poll::Pending => self.backup_writer_waiting.notify_one(),
-            }
-        }
-        acquire.await
+        self.inner.acquire_write_lock(bucket, object).await
     }
 
     async fn read_object(
@@ -16714,6 +17530,31 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
             .await
     }
 
+    async fn put_object_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        fence: &crate::table_catalog::TableCatalogObjectMutationFence,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner.put_object_fenced(bucket, object, data, precondition, fence).await
+    }
+
+    async fn put_object_unlocked_fenced(
+        &self,
+        bucket: &str,
+        object: &str,
+        data: Vec<u8>,
+        precondition: crate::table_catalog::TableCatalogPutPrecondition,
+        guards: Vec<crate::admin::storage_api::object::WriteCommitGuard>,
+        fence: &crate::table_catalog::TableCatalogObjectMutationFence,
+    ) -> crate::table_catalog::TableCatalogStoreResult<()> {
+        self.inner
+            .put_object_unlocked_fenced(bucket, object, data, precondition, guards, fence)
+            .await
+    }
+
     async fn delete_object(&self, bucket: &str, object: &str) -> crate::table_catalog::TableCatalogStoreResult<()> {
         self.inner.delete_object(bucket, object).await
     }
@@ -16730,13 +17571,19 @@ impl<B: crate::table_catalog::TableCatalogObjectBackend> crate::table_catalog::T
     async fn list_objects(&self, bucket: &str, prefix: &str) -> crate::table_catalog::TableCatalogStoreResult<Vec<String>> {
         self.inner.list_objects(bucket, prefix).await
     }
+
+    async fn list_objects_for_cleanup(
+        &self,
+        bucket: &str,
+        prefix: &str,
+    ) -> crate::table_catalog::TableCatalogStoreResult<Vec<crate::table_catalog::TableCatalogCleanupObject>> {
+        self.inner.list_objects_for_cleanup(bucket, prefix).await
+    }
 }
 
 #[tokio::test]
-async fn cold_strong_registration_completes_while_other_bucket_backup_waits() {
-    use crate::table_catalog::{
-        EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, StrongTableCatalogStore, TableCatalogPutPrecondition,
-    };
+async fn cold_object_registration_completes_while_other_bucket_backup_waits() {
+    use crate::table_catalog::{EcStoreTableCatalogObjectBackend, ObjectTableCatalogStore, TableCatalogPutPrecondition};
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("cold-register-{}", Uuid::new_v4().simple());
     let backup_bucket = format!("other-backup-{}", Uuid::new_v4().simple());
@@ -16749,20 +17596,19 @@ async fn cold_strong_registration_completes_while_other_bucket_backup_waits() {
             .await
             .expect("enable table bucket marker");
     }
-    let inner = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(object_store, StrongTableCatalogRuntime::default());
-    let backend = ColdStrongRegistrationBackend {
+    let inner = EcStoreTableCatalogObjectBackend::new(object_store);
+    let backend = ColdRegistrationBackend {
         inner: inner.clone(),
         armed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         reader_ready: Arc::new(tokio::sync::Notify::new()),
         resume: Arc::new(tokio::sync::Notify::new()),
-        backup_writer_waiting: Arc::new(tokio::sync::Notify::new()),
     };
-    let catalog = StrongTableCatalogStore::new(backend.clone());
+    let catalog = ObjectTableCatalogStore::new(backend.clone());
     for bucket in [&bucket, &backup_bucket] {
         catalog
             .put_table_bucket(table_bucket_entry_from_metadata_marker(bucket))
             .await
-            .expect("seed durable table bucket");
+            .expect("seed object table bucket");
     }
     let namespace = crate::table_catalog::Namespace::parse("analytics").expect("namespace");
     catalog
@@ -16816,18 +17662,17 @@ async fn cold_strong_registration_completes_while_other_bucket_backup_waits() {
         .await
         .expect("registration holds first real global reader");
     // The backup targets another bucket, so its documented writer-drain precondition is met.
-    let backup_catalog = StrongTableCatalogStore::new(backend.clone());
-    // Keep driving route discovery and snapshot I/O until the global write lock itself is pending.
-    let backup = tokio::spawn(async move { backup_catalog.create_durable_catalog_backup(&backup_bucket, None).await });
-    tokio::time::timeout(StdDuration::from_secs(5), backend.backup_writer_waiting.notified())
-        .await
-        .expect("actual backup writer must queue behind held registration reader");
+    let backup_catalog = ObjectTableCatalogStore::new(inner);
+    let mut backup = Box::pin(backup_catalog.create_object_catalog_backup(&backup_bucket, None));
+    assert!(
+        futures::poll!(backup.as_mut()).is_pending(),
+        "actual backup writer must queue behind held registration reader"
+    );
     backend.resume.notify_one();
     let result = tokio::time::timeout(StdDuration::from_secs(2), &mut registration).await;
     if result.is_err() {
         // Prove that the queued backup, rather than ECStore I/O latency, caused the stall.
-        backup.abort();
-        assert!(backup.await.unwrap_err().is_cancelled());
+        drop(backup);
         tokio::time::timeout(StdDuration::from_secs(5), &mut registration)
             .await
             .expect("registration must resume once only the queued backup is cancelled")
@@ -16842,108 +17687,7 @@ async fn cold_strong_registration_completes_while_other_bucket_backup_waits() {
     tokio::time::timeout(StdDuration::from_secs(5), backup)
         .await
         .expect("the other bucket backup should resume when registration releases its reader")
-        .expect("backup task joins")
         .expect("the other bucket backup succeeds");
-}
-
-#[tokio::test]
-#[serial_test::serial]
-async fn disable_table_bucket_preserves_objects_and_can_be_reenabled() {
-    let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
-    let bucket = format!("disable-{}", Uuid::new_v4().simple());
-    object_store
-        .make_bucket(&bucket, &MakeBucketOptions::default())
-        .await
-        .unwrap();
-    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        object_store.clone(),
-        crate::table_catalog::StrongTableCatalogRuntime::default(),
-    );
-    let catalog = crate::table_catalog::ObjectTableCatalogStore::new(backend.clone());
-    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
-    enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-        .await
-        .unwrap();
-    let rejected = object_store
-        .update_bucket_metadata_config_validated(&bucket, crate::table_catalog::TABLE_BUCKET_MARKER_CONFIG, Vec::new(), || {
-            Err(crate::admin::storage_api::error::StorageError::other("lost publication fence"))
-        })
-        .await;
-    assert!(rejected.is_err());
-    assert!(
-        object_store
-            .get_bucket_metadata(&bucket)
-            .await
-            .unwrap()
-            .table_bucket_enabled()
-    );
-    backend
-        .put_object(
-            &bucket,
-            "external/orders.parquet",
-            b"parquet-fixture".to_vec(),
-            crate::table_catalog::TableCatalogPutPrecondition::Any,
-        )
-        .await
-        .unwrap();
-    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
-    let response = disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-        .await
-        .unwrap();
-    assert!(!response.enabled);
-    assert!(ensure_table_bucket_entry(&catalog, &bucket, true).await.is_err());
-    assert!(
-        !object_store
-            .get_bucket_metadata(&bucket)
-            .await
-            .unwrap()
-            .table_bucket_enabled()
-    );
-    assert_eq!(
-        backend
-            .read_object(&bucket, "external/orders.parquet")
-            .await
-            .unwrap()
-            .unwrap()
-            .data,
-        b"parquet-fixture"
-    );
-    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
-    assert!(
-        !disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-            .await
-            .unwrap()
-            .enabled
-    );
-    let publication = TableCommitObjectBackend::preauthorized(backend.clone());
-    assert!(
-        enable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-            .await
-            .unwrap()
-            .enabled
-    );
-    backend
-        .put_object(
-            &bucket,
-            ".rustfs-table/staged.json",
-            b"{}".to_vec(),
-            crate::table_catalog::TableCatalogPutPrecondition::Any,
-        )
-        .await
-        .unwrap();
-    let publication = TableCommitObjectBackend::preauthorized(backend);
-    assert!(
-        disable_table_bucket_response(&catalog, &publication, object_store.as_ref(), &bucket)
-            .await
-            .is_err()
-    );
-    assert!(
-        object_store
-            .get_bucket_metadata(&bucket)
-            .await
-            .unwrap()
-            .table_bucket_enabled()
-    );
 }
 
 async fn create_dropped_empty_tables_for_cleanup<S, B>(
@@ -17019,14 +17763,13 @@ where
 async fn object_catalog_registration_cache_checks_real_records_without_additional_objects() {
     use crate::admin::storage_api::RUSTFS_META_BUCKET;
     use crate::table_catalog::{
-        ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, StrongTableCatalogRuntime, TableCatalogBackingMode,
-        TableCatalogObjectPaths, TableCatalogStoreError,
+        ConfiguredTableCatalogStore, EcStoreTableCatalogObjectBackend, TableCatalogBackingMode, TableCatalogObjectPaths,
+        TableCatalogStoreError,
     };
 
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("registration-cache-{}", Uuid::new_v4().simple());
-    let backend =
-        EcStoreTableCatalogObjectBackend::new_with_strong_runtime(object_store.clone(), StrongTableCatalogRuntime::default());
+    let backend = EcStoreTableCatalogObjectBackend::new(object_store.clone());
     let catalog = ConfiguredTableCatalogStore::new_for_test(backend.clone(), TableCatalogBackingMode::ObjectBacked);
     object_store
         .make_bucket(&bucket, &MakeBucketOptions::default())
@@ -17076,10 +17819,7 @@ async fn object_catalog_registration_cache_checks_real_records_without_additiona
         create_micros.push(started.elapsed().as_micros());
         if matches!(number + 1, 20 | 100) {
             let before = backend.list_objects(RUSTFS_META_BUCKET, &catalog_prefix).await.unwrap();
-            let cold_backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-                object_store.clone(),
-                StrongTableCatalogRuntime::default(),
-            );
+            let cold_backend = EcStoreTableCatalogObjectBackend::new(object_store.clone());
             let probe = ConfiguredTableCatalogStore::new_for_test(cold_backend, TableCatalogBackingMode::ObjectBacked);
             let mut duplicate = catalog
                 .load_table(&bucket, "analytics", &format!("events_{number:03}"))
@@ -17120,10 +17860,7 @@ async fn object_catalog_registration_cache_checks_real_records_without_additiona
 async fn cleanup_empty_table_bucket_reclaims_twenty_dropped_tables_and_allows_bucket_deletion() {
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("cleanup-{}", Uuid::new_v4().simple());
-    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        object_store.clone(),
-        crate::table_catalog::StrongTableCatalogRuntime::default(),
-    );
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store.clone());
     let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
         backend.clone(),
         crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
@@ -17178,10 +17915,7 @@ async fn cleanup_empty_table_bucket_validates_directory_candidate_path_and_body_
 
     let (_temp, _disks, storage) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("cleanup-directory-{}", Uuid::new_v4().simple());
-    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        storage.clone(),
-        crate::table_catalog::StrongTableCatalogRuntime::default(),
-    );
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(storage.clone());
     let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
         backend.clone(),
         crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
@@ -17235,10 +17969,7 @@ async fn cleanup_empty_table_bucket_validates_directory_candidate_path_and_body_
 async fn cleanup_empty_table_bucket_validates_authorization_and_metadata_before_deleting() {
     let (_temp_dir, _disk_paths, object_store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
     let bucket = format!("cleanup-check-{}", Uuid::new_v4().simple());
-    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
-        object_store.clone(),
-        crate::table_catalog::StrongTableCatalogRuntime::default(),
-    );
+    let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new(object_store.clone());
     let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
         backend.clone(),
         crate::table_catalog::TableCatalogBackingMode::ObjectBacked,
@@ -17349,9 +18080,9 @@ async fn cleanup_empty_table_bucket_handler_enforces_request_object_permissions(
                 status: "on".to_string(),
                 ..Default::default()
             }));
-            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_strong_runtime(
+            let backend = crate::table_catalog::EcStoreTableCatalogObjectBackend::new_with_registration_cache(
                 object_store.clone(),
-                context.table_catalog_strong_runtime(),
+                context.table_catalog_registration_cache(),
             );
             let catalog = crate::table_catalog::ConfiguredTableCatalogStore::new_for_test(
                 backend.clone(),
@@ -18012,6 +18743,17 @@ async fn directory_management_handlers_enforce_migration_permission_before_mutat
         (
             "directory-denied",
             serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["admin:*"]},{"Effect":"Deny","Action":["admin:MigrateTableCatalog"]}]}),
+            false,
+        ),
+        (
+            "directory-warehouse-denied",
+            serde_json::json!({
+                "Version":"2012-10-17",
+                "Statement":[
+                    {"Effect":"Allow","Action":["admin:*"],"Resource":"*"},
+                    {"Effect":"Deny","Action":["admin:MigrateTableCatalog"],"Resource":"arn:aws:s3:::warehouse"}
+                ]
+            }),
             false,
         ),
         (

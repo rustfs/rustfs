@@ -183,6 +183,54 @@ async fn active_wait_wakes_for_fastest_idle_off_and_smaller_max_wait() {
 
 #[tokio::test(start_paused = true)]
 #[serial]
+async fn disk_bound_pacing_does_not_repeat_global_foreground_backoff() {
+    let _idle = IdleGuard::enabled();
+    struct ForegroundGuard;
+    impl Drop for ForegroundGuard {
+        fn drop(&mut self) {
+            crate::reset_foreground_read_activity_for_test();
+        }
+    }
+    let _foreground = ForegroundGuard;
+    crate::set_foreground_read_activity(25);
+    let disk = tempfile::tempdir().expect("disk identity");
+    let sleeper = DynamicSleeper::new(ScannerSpeed::Default).for_disk_with_budget_for_tests(
+        disk.path(),
+        ScannerDiskIoBudgetLimits {
+            iops: Some(0),
+            bytes_per_sec: None,
+        },
+    );
+    let mut debt = PacingDebt::default();
+    let begin = Instant::now();
+    for _ in 0..100 {
+        sleeper.pace_object(&mut debt, Duration::from_micros(20)).await;
+    }
+    sleeper.flush_pacing(&mut debt).await;
+    assert_eq!(begin.elapsed(), Duration::from_millis(4));
+    assert_eq!(debt.charged_objects, 100);
+    assert_eq!(debt.pending, Duration::ZERO);
+    // The first operation consumes the token bucket's one-operation burst.
+    sleeper.admit_disk_io(1, 0).await;
+    let begin = Instant::now();
+    sleeper.sleep_folder_paced(&mut debt).await;
+    assert_eq!(
+        begin.elapsed(),
+        SCANNER_DISK_IO_BUDGET_MAX_WAIT + Duration::from_millis(2),
+        "the per-disk budget and preset folder gap must still apply"
+    );
+    assert_eq!(
+        scanner_disk_io_budget_status()
+            .into_iter()
+            .find(|status| status.disk == disk.path().to_string_lossy())
+            .expect("disk charges remain visible")
+            .charged_ops,
+        2
+    );
+}
+
+#[tokio::test(start_paused = true)]
+#[serial]
 async fn foreground_backoff_flushes_tail_without_double_charging_or_max_wait_cap() {
     let _idle = IdleGuard::enabled();
     let sleeper = DynamicSleeper::new(ScannerSpeed::Default);

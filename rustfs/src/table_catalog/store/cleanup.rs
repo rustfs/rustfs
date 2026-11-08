@@ -58,14 +58,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
         validate_table_bucket_entry(&entry)?;
         let mut guards = Vec::new();
         if publication.is_some_and(|publication| publication.catalog_migration_read_permit_status() == Some(true)) {
-            if self
-                .backend
-                .read_object(self.catalog_bucket(), &self.paths.backing_migration_global_fence_path())
-                .await?
-                .is_some()
-            {
-                return Err(cleanup_conflict("table bucket registry migration is in progress"));
-            }
+            self.reject_legacy_catalog_global_state().await?;
             self.ensure_object_backed_catalog_write_permit_after_lock(&entry.table_bucket)
                 .await?;
         } else {
@@ -253,12 +246,8 @@ impl<B: TableCatalogObjectBackend> ConfiguredTableCatalogStore<B> {
         entry: TableBucketEntry,
         publication: &impl TableCatalogObjectBackend,
     ) -> TableCatalogStoreResult<EmptyTableBucketCleanup> {
-        match self {
-            Self::ObjectBacked(store) => store.prepare_empty_table_bucket_cleanup(entry, publication).await,
-            Self::DurableStrong(_) => Err(TableCatalogStoreError::Unsupported(
-                "empty table bucket cleanup requires object-backed catalog storage".to_string(),
-            )),
-        }
+        let Self::ObjectBacked(store) = self;
+        store.prepare_empty_table_bucket_cleanup(entry, publication).await
     }
 
     pub(crate) async fn execute_empty_table_bucket_cleanup(
@@ -266,11 +255,7 @@ impl<B: TableCatalogObjectBackend> ConfiguredTableCatalogStore<B> {
         cleanup: &mut EmptyTableBucketCleanup,
         incarnation: Uuid,
     ) -> TableCatalogStoreResult<()> {
-        match self {
-            Self::ObjectBacked(store) => store.execute_empty_table_bucket_cleanup(cleanup, incarnation).await,
-            Self::DurableStrong(_) => Err(TableCatalogStoreError::Unsupported(
-                "empty table bucket cleanup requires object-backed catalog storage".to_string(),
-            )),
-        }
+        let Self::ObjectBacked(store) = self;
+        store.execute_empty_table_bucket_cleanup(cleanup, incarnation).await
     }
 }

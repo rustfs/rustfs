@@ -266,6 +266,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
                 .backend
                 .acquire_write_lock(self.catalog_bucket(), &self.paths.backing_migration_fence_lock_path(table_bucket))
                 .await?;
+            self.ensure_no_active_restore(table_bucket).await?;
             if self
                 .backend
                 .object_metadata(self.catalog_bucket(), &fence_path)
@@ -369,6 +370,7 @@ impl<B: TableCatalogObjectBackend> ObjectTableCatalogStore<B> {
             .backend
             .acquire_write_lock(self.catalog_bucket(), &self.paths.backing_migration_fence_lock_path(table_bucket))
             .await?;
+        self.ensure_no_active_restore(table_bucket).await?;
         if self.read_table_directory_state(table_bucket).await?.is_some() {
             // Entry publication has always retained the legacy objects. Exclude
             // backfill and all writers until the old authority is restored.
@@ -631,6 +633,25 @@ fn validate_directory_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+    enum LegacyBackingMigrationFenceStatus {
+        Preparing,
+        Materialized,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct LegacyBackingMigrationFence {
+        version: u16,
+        table_bucket: String,
+        migration_id: String,
+        status: LegacyBackingMigrationFenceStatus,
+        target_bucket_existed: bool,
+        source_fingerprint: Option<String>,
+        target_snapshot_etag: Option<String>,
+    }
     use crate::table_catalog::test_support::TestCatalogObjectBackend;
     use crate::table_catalog::tests::{test_bucket_entry, test_namespace_entry, test_table_entry};
 
@@ -716,7 +737,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(
-            serde_json::from_slice::<super::super::strong::TableCatalogBackingMigrationFence>(&fence.data).is_err(),
+            serde_json::from_slice::<LegacyBackingMigrationFence>(&fence.data).is_err(),
             "legacy writer parser must reject the directory capability fence"
         );
         finish(&store).await;
@@ -764,6 +785,39 @@ mod tests {
                 .table,
             "orders"
         );
+    }
+
+    #[tokio::test]
+    async fn backup_and_restore_treat_directory_objects_as_derived() {
+        let (backend, store) = fixture().await;
+        let baseline = store
+            .create_object_catalog_backup("warehouse", None)
+            .await
+            .expect("empty enabled catalog is a valid backup source");
+        let namespace = Namespace::parse("sales").unwrap();
+        let orphan = entry("warehouse", &namespace, "aborted");
+        let table = IdentifierSegment::parse("aborted").unwrap();
+        let target = store.paths.table_entry_path("warehouse", &namespace, &table);
+        let candidate = store.paths.table_directory_candidate(&orphan).unwrap();
+        // This is the exact immutable path reference a writer persists before its
+        // entry PUT. An aborted PUT followed by rollback leaves only the candidate.
+        backend.seed_object(RUSTFS_META_BUCKET, &candidate, target.into_bytes()).await;
+        finish(&store).await;
+        let with_directory = store.create_object_catalog_backup("warehouse", None).await.unwrap();
+        assert_eq!(with_directory.backup_id, baseline.backup_id);
+        assert!(matches!(
+            store.restore_object_catalog_backup("warehouse", &baseline.backup_id, None, false).await,
+            Err(TableCatalogStoreError::Conflict(message)) if message.contains("disable the table directory")
+        ));
+
+        store.disable_table_directory("warehouse").await.unwrap();
+        let after_rollback = store.create_object_catalog_backup("warehouse", None).await.unwrap();
+        assert_eq!(after_rollback.backup_id, baseline.backup_id);
+        store
+            .restore_object_catalog_backup("warehouse", &after_rollback.backup_id, None, false)
+            .await
+            .expect("derived candidates must not count as restore targets");
+        assert!(backend.object_exists(RUSTFS_META_BUCKET, &candidate).await.unwrap());
     }
 
     #[tokio::test]
@@ -979,6 +1033,55 @@ mod tests {
             "renamed"
         );
     }
+    #[tokio::test]
+    async fn directory_activation_drains_in_flight_entry_writer_before_first_page() {
+        let (backend, store) = fixture().await;
+        let namespace = Namespace::parse("sales").unwrap();
+        store
+            .create_namespace(test_namespace_entry("warehouse", &namespace))
+            .await
+            .unwrap();
+        let table = entry("warehouse", &namespace, "orders");
+        let table_path = store
+            .paths
+            .table_entry_path("warehouse", &namespace, &IdentifierSegment::parse("orders").unwrap());
+        let pause = backend.pause_next_put(RUSTFS_META_BUCKET, &table_path).await;
+        let create_store = store.clone();
+        let create = tokio::spawn(async move { create_store.create_table(table).await });
+        tokio::time::timeout(StdDuration::from_secs(5), pause.wait_started())
+            .await
+            .unwrap();
+
+        // An in-flight writer has checked that directory state is absent and
+        // holds its per-bucket permit. Activation must queue on the same key.
+        let lock_path = store.paths.catalog_backup_fence_lock_path("warehouse");
+        let writes = backend.write_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await;
+        let advance_store = store.clone();
+        let mut advance = tokio::spawn(async move {
+            advance_store
+                .advance_table_directory_with_confirmation("warehouse", true, true)
+                .await
+        });
+        tokio::time::timeout(StdDuration::from_secs(5), async {
+            tokio::select! {
+                result = &mut advance => panic!("activation passed an in-flight writer: {result:?}"),
+                () = async {
+                    while backend.write_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await == writes {
+                        tokio::task::yield_now().await;
+                    }
+                } => {}
+            }
+        })
+        .await
+        .expect("activation must queue on the writer's per-bucket fence");
+        pause.release();
+        create.await.unwrap().unwrap();
+        assert_eq!(advance.await.unwrap().unwrap().phase, Some(TableDirectoryPhase::Building));
+        finish(&store).await;
+        let scan = store.table_directory_objects("warehouse", None).await.unwrap().unwrap();
+        assert_eq!(scan.objects, vec![table_path]);
+    }
+
     #[tokio::test]
     async fn directory_index_cancelled_initial_write_retains_guard_until_rollback_can_finish() {
         let (backend, store) = fixture().await;
@@ -1278,7 +1381,7 @@ mod tests {
         use crate::storage_api::table::test_support::{BucketOperations as _, MakeBucketOptions};
         let (_temp, paths, storage) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
         storage.make_bucket("warehouse", &MakeBucketOptions::default()).await.unwrap();
-        let backend = EcStoreTableCatalogObjectBackend::new_with_strong_runtime(storage, StrongTableCatalogRuntime::default());
+        let backend = EcStoreTableCatalogObjectBackend::new(storage);
         let catalog = ObjectTableCatalogStore::new(backend.clone());
         catalog.put_table_bucket(test_bucket_entry("warehouse")).await.unwrap();
         let prefix = catalog.paths.namespace_entries_prefix("warehouse");

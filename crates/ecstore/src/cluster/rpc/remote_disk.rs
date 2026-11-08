@@ -380,6 +380,21 @@ struct WalkCopyError {
     source: io::Error,
 }
 
+impl WalkCopyError {
+    fn into_disk_error(self) -> DiskError {
+        // Only a local output write/flush proves the metacache consumer closed.
+        // An identical I/O kind from the remote input remains a transport failure.
+        if matches!(self.reason, RemoteWalkFailureReason::Write | RemoteWalkFailureReason::Flush)
+            && self.source.kind() == io::ErrorKind::BrokenPipe
+            && self.source.get_ref().is_none()
+        {
+            DiskError::metacache_output_stream_closed()
+        } else {
+            DiskError::Io(self.source)
+        }
+    }
+}
+
 async fn copy_stream_with_buffer<R, W>(
     reader: &mut R,
     writer: &mut W,
@@ -2100,6 +2115,7 @@ impl RemoteDisk {
         failure_health_action: FailureHealthAction,
     ) {
         if let Err(err) = operation_result
+            && !err.is_metacache_output_stream_closed()
             && is_network_like_disk_error(err)
         {
             counter!(
@@ -4056,7 +4072,7 @@ impl DiskAPI for RemoteDisk {
                             Ok(_) => return Ok(()),
                             Err(error) => {
                                 failure_reason = Some(error.reason);
-                                return Err(DiskError::Io(error.source));
+                                return Err(error.into_disk_error());
                             }
                         }
                     }
@@ -9678,6 +9694,43 @@ mod tests {
                 assert_eq!(writer.bytes, b"walk payload");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn remote_walk_preserves_local_metacache_consumer_close() {
+        let transport =
+            RetryingWalkDirInternodeDataTransport::with_steps(vec![WalkDirTestStep::Data(b"metacache payload".to_vec())]);
+        let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let (mut writer, reader) = tokio::io::duplex(1);
+        drop(reader);
+        let error = disk
+            .walk_dir(WalkDirOptions::default(), &mut writer)
+            .await
+            .expect_err("a dropped metacache consumer must stop the producer");
+        assert!(
+            error.is_metacache_output_stream_closed(),
+            "preserve the benign completion marker: {error:?}"
+        );
+        assert_eq!(transport.calls().len(), 1, "local consumer closure is not a remote open retry");
+        assert!(!disk.health.is_faulty());
+    }
+
+    #[tokio::test]
+    async fn remote_walk_keeps_remote_read_broken_pipe_as_transport_failure() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![WalkDirTestStep::PartialDataThenError {
+            data: b"partial metacache".to_vec(),
+            error: io::ErrorKind::BrokenPipe.into(),
+        }]);
+        let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let mut writer = Vec::new();
+        let error = disk
+            .walk_dir(WalkDirOptions::default(), &mut writer)
+            .await
+            .expect_err("an upstream close after partial output is a failed walk");
+        assert!(!error.is_metacache_output_stream_closed());
+        assert!(error.contains_io_error_kind(io::ErrorKind::BrokenPipe));
+        assert_eq!(writer, b"partial metacache");
+        assert_eq!(transport.calls().len(), 1, "partial output must not be replayed");
     }
 
     #[tokio::test]

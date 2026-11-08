@@ -160,7 +160,7 @@ impl BodyReadControl {
         state.waited = Duration::ZERO;
     }
 
-    fn finish(&self) {
+    pub(super) fn finish(&self) {
         let mut state = self.0.budget.lock();
         self.0.active.store(false, Ordering::Release);
         state.finished = true;

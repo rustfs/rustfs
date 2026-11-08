@@ -1293,8 +1293,20 @@ pub async fn update_config_with<F>(bucket: &str, config_file: &str, mutate: F) -
 where
     F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
 {
+    update_config_with_expected(bucket, config_file, None, mutate).await
+}
+
+async fn update_config_with_expected<F>(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Option<Uuid>,
+    mutate: F,
+) -> Result<OffsetDateTime>
+where
+    F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
+{
     let sys = get_bucket_metadata_sys()?;
-    let guard = Box::pin(acquire_config_write_guard(sys.clone(), bucket)).await?;
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id)).await?;
     guard.ensure_valid(bucket)?;
     let metadata_sys = sys.read().await.clone();
     let updated = await_bucket_namespace_operation(
@@ -1311,6 +1323,70 @@ where
     .await?;
     guard.ensure_valid(bucket)?;
     Ok(updated)
+}
+
+fn swift_manages_bucket_tags(tagging: &Tagging) -> bool {
+    tagging
+        .tag_set
+        .iter()
+        .any(|tag| tag.key.as_deref() == Some(super::metadata::SWIFT_TAGGING_MARKER) && tag.value.as_deref() == Some("1"))
+}
+
+/// Read the S3 tag set while keeping Swift's internal tags private.
+pub async fn get_s3_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
+    let (mut tagging, updated) = get_tagging_config(bucket).await?;
+    if swift_manages_bucket_tags(&tagging) {
+        tagging.tag_set.retain(|tag| {
+            !tag.key
+                .as_deref()
+                .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+        });
+    }
+    Ok((tagging, updated))
+}
+
+/// Replace or clear S3 tags atomically while retaining Swift metadata.
+///
+/// The expected incarnation, when present, is checked under the bucket
+/// lifecycle and metadata guards. A failed write leaves the previous config
+/// intact. Repeated writes replace the same S3 set.
+pub async fn update_s3_tagging_config(
+    bucket: &str,
+    tagging: Option<Tagging>,
+    expected_incarnation_id: Option<Uuid>,
+) -> Result<OffsetDateTime> {
+    let tags = tagging.map(|tagging| tagging.tag_set).unwrap_or_default();
+    let invalid = |message: &str| Error::InvalidArgument(bucket.to_owned(), String::new(), message.to_owned());
+    if tags.len() > super::metadata::MAX_BUCKET_TAGS {
+        return Err(invalid("Cannot have more than 50 tags per bucket"));
+    }
+    super::metadata::validate_tag_set_entries(&tags).map_err(invalid)?;
+    update_config_with_expected(bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id, |metadata| {
+        let mut merged = metadata.tagging_config.clone().unwrap_or_default();
+        if swift_manages_bucket_tags(&merged) {
+            if tags.iter().any(|tag| {
+                tag.key
+                    .as_deref()
+                    .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+            }) {
+                return Err(invalid("Tag key is reserved for Swift metadata on this bucket"));
+            }
+            merged.tag_set.retain(|tag| {
+                tag.key
+                    .as_deref()
+                    .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+            });
+        } else {
+            merged.tag_set.clear();
+        }
+        merged.tag_set.extend(tags);
+        if merged.tag_set.is_empty() {
+            Ok(Vec::new())
+        } else {
+            super::utils::serialize(&merged).map_err(Error::other)
+        }
+    })
+    .await
 }
 
 /// Acquire a bucket's metadata transaction lock, held across a whole

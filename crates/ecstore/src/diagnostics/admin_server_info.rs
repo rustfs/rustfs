@@ -682,15 +682,11 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
         return Err(Error::other("ServerNotInitialized"));
     };
 
-    let mut pools_info: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
-    for d in all_disks {
-        let pool_info = pools_info.entry(d.pool_index).or_default();
-        let erasure_set = pool_info.entry(d.set_index).or_default();
-
-        if erasure_set.id == 0 {
-            erasure_set.id = d.set_index;
+    collect_pools_info(all_disks, |pool_index, set_index| {
+        let store = store.clone();
+        async move {
             let load = load_data_usage_cache(
-                store.pools[d.pool_index as usize].disk_set[d.set_index as usize].as_ref(),
+                store.pools[pool_index as usize].disk_set[set_index as usize].as_ref(),
                 DATA_USAGE_CACHE_NAME,
             );
             #[cfg(feature = "diagnostic-read-version-caller")]
@@ -698,11 +694,34 @@ async fn get_pools_info(all_disks: &[Disk]) -> Result<HashMap<i32, HashMap<i32, 
                 rustfs_io_metrics::internode_metrics::ReadVersionEntrySource::ServerInfoPools,
                 load,
             );
-            match load.await {
-                Ok(cache) => apply_erasure_set_usage(&cache, erasure_set),
-                Err(_) => erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
-            }
+            load.await
         }
+    })
+    .await
+}
+
+async fn collect_pools_info<F, Fut>(all_disks: &[Disk], mut load_usage: F) -> Result<HashMap<i32, HashMap<i32, ErasureSetInfo>>>
+where
+    F: FnMut(i32, i32) -> Fut,
+    Fut: std::future::Future<Output = Result<rustfs_data_usage::DataUsageCache>>,
+{
+    let mut pools_info: HashMap<i32, HashMap<i32, ErasureSetInfo>> = HashMap::new();
+    for d in all_disks {
+        let pool_info = pools_info.entry(d.pool_index).or_default();
+        let erasure_set = match pool_info.entry(d.set_index) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let erasure_set = entry.insert(ErasureSetInfo {
+                    id: d.set_index,
+                    ..Default::default()
+                });
+                match load_usage(d.pool_index, d.set_index).await {
+                    Ok(cache) => apply_erasure_set_usage(&cache, erasure_set),
+                    Err(_) => erasure_set.usage_error = Some(DATA_USAGE_UNAVAILABLE_ERROR.to_string()),
+                }
+                erasure_set
+            }
+        };
 
         erasure_set.raw_capacity += d.total_space;
         erasure_set.raw_usage += d.used_space;
@@ -1239,6 +1258,59 @@ mod tests {
         let info = get_server_info(false).await;
 
         assert_eq!(info.deployment_id, expected_deployment_id);
+    }
+
+    #[tokio::test]
+    async fn pool_usage_is_loaded_once_per_set_including_set_zero() {
+        let mut disks = Vec::new();
+        for (pool, set, count) in [(0, 0, 16), (1, 0, 16), (1, 1, 4)] {
+            disks.extend((0..count).map(|_| Disk {
+                pool_index: pool,
+                set_index: set,
+                used_space: 10,
+                total_space: 100,
+                ..Default::default()
+            }));
+        }
+        let mut loads = Vec::new();
+        let info = super::collect_pools_info(&disks, |pool, set| {
+            loads.push((pool, set));
+            async move {
+                if pool == 1 && set == 0 {
+                    return Err(crate::error::Error::other("usage unavailable"));
+                }
+                let mut cache = rustfs_data_usage::DataUsageCache::default();
+                cache.info.name = DATA_USAGE_ROOT.to_owned();
+                cache.info.last_update = Some(std::time::SystemTime::UNIX_EPOCH);
+                cache.info.snapshot_complete = true;
+                cache.replace(
+                    DATA_USAGE_ROOT,
+                    "",
+                    rustfs_data_usage::DataUsageEntry {
+                        size: 25,
+                        objects: 2,
+                        ..Default::default()
+                    },
+                );
+                Ok(cache)
+            }
+        })
+        .await
+        .expect("collect mixed successful and unavailable usage");
+        assert_eq!(loads, [(0, 0), (1, 0), (1, 1)]);
+        for (pool, set, count) in [(0, 0, 16), (1, 0, 16), (1, 1, 4)] {
+            let set_info = &info[&pool][&set];
+            assert_eq!(set_info.id, set);
+            assert_eq!(set_info.raw_usage, count * 10);
+            assert_eq!(set_info.raw_capacity, count * 100);
+            if pool == 1 && set == 0 {
+                assert_eq!(set_info.usage_error.as_deref(), Some(DATA_USAGE_UNAVAILABLE_ERROR));
+            } else {
+                assert_eq!(set_info.usage, 25, "logical usage must not multiply by drive count");
+                assert_eq!(set_info.objects_count, 2);
+                assert!(set_info.usage_error.is_none());
+            }
+        }
     }
 
     #[serial]
