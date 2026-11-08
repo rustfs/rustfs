@@ -186,10 +186,13 @@ pub(crate) mod server {
         pub(crate) use crate::storage::storage_api::ecstore_disk::{
             DiskAPI, DiskOption, new_disk, with_background_resource_unit,
         };
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_rpc::RpcReplayCacheAdmissionError;
         pub(crate) use crate::storage::storage_api::{
-            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, rpc_background_admission,
-            tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-            verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
+            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
+            rpc_auth_is_resource_exhausted, rpc_background_admission, tonic_boot_epoch_challenge,
+            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
+            with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
