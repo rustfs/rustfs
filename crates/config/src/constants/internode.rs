@@ -190,12 +190,21 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 /// v3 request consumes both its v3 and compatibility-v2 nonces, so size for receiver nonce intake,
 /// not S3 request rate or CPU count.
 ///
-/// Auto sizing budgets 13% of effective process memory for the rounded handle index, UUID pages,
-/// expiry fragmentation and allocation overhead, with this minimum floor and a 33,554,432-entry
-/// maximum. The CPU estimate is only a fallback when memory is unknown.
-/// Explicit operator values retain the floor and bypass the automatic memory budget; measure
-/// memory headroom before raising them. Overflow fails closed and increments
-/// `rustfs_system_network_internode_replay_cache_overflow_total`.
+/// Automatic admission budgets 13% of effective process memory for signed-time
+/// hash tables, allocator overhead and simultaneous old/new tables during growth.
+/// The reported count is an absolute UUID payload ceiling, not guaranteed throughput:
+/// actual byte admission can reject earlier depending on timestamp distribution.
+/// Tables grow with demand and are released together when their signed time expires.
+/// CPU count, a historical minimum, and a fixed 32M ceiling do not constrain this budget.
+/// If memory detection fails, the historical default remains a bounded count fallback.
+///
+/// Explicit values remain count ceilings with the historical minimum of 1,048,576
+/// for configuration compatibility, and bypass automatic byte admission. That
+/// compatibility floor does not apply to the automatically detected memory budget.
+/// Zero never disables replay protection.
+/// Overflow rejects the request without evicting a still-valid identity, increments
+/// `rustfs_system_network_internode_replay_cache_overflow_total`, and returns resource
+/// exhaustion rather than invalid credentials. Measure headroom before overriding.
 pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
 pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
 

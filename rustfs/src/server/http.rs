@@ -3405,6 +3405,16 @@ fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
     }
 }
 
+fn rpc_auth_failure_status(error: &std::io::Error) -> Status {
+    if storage::rpc_auth_is_resource_exhausted(error) {
+        Status::resource_exhausted("RPC replay admission exhausted")
+    } else if storage::tonic_rpc_auth_failure_reason(error) == "stale_boot_epoch" {
+        Status::unavailable("RPC boot epoch changed")
+    } else {
+        Status::unauthenticated("No valid auth token")
+    }
+}
+
 #[allow(clippy::result_large_err)]
 fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
     let local_node_name =
@@ -3467,6 +3477,12 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
             INTERNODE_TRANSPORT_BACKEND_GRPC,
             failure_reason,
         );
+        let rejection = rpc_auth_failure_status(&e);
+        if rejection.code() == tonic::Code::ResourceExhausted {
+            // Existing scoped counters describe overload without producing an
+            // authentication error log for every otherwise valid request.
+            return rejection;
+        }
         if failure_reason == "stale_boot_epoch" {
             // The signature is valid, but the peer restarted before this request. Reject it
             // before execution and let the client retry after its authenticated epoch refresh.
@@ -3485,7 +3501,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
                 error = %e,
                 "RPC boot epoch changed; request rejected for retry"
             );
-            Status::unavailable("RPC boot epoch changed")
+            rejection
         } else {
             error!(
                 event = EVENT_RPC_SIGNATURE_VERIFICATION_FAILED,
@@ -3502,7 +3518,7 @@ fn check_auth(req: Request<()>) -> std::result::Result<Request<()>, Status> {
                 error = %e,
                 "RPC signature verification failed"
             );
-            Status::unauthenticated("No valid auth token")
+            rejection
         }
     })?;
 
@@ -6999,6 +7015,31 @@ mod tests {
             },
         )
         .await;
+    }
+
+    #[test]
+    fn rpc_auth_resource_exhaustion_does_not_report_invalid_credentials() {
+        for source in [
+            storage::RpcReplayCacheAdmissionError::Capacity,
+            storage::RpcReplayCacheAdmissionError::MemoryBudget,
+        ] {
+            let error = std::io::Error::new(std::io::ErrorKind::WouldBlock, source);
+            assert_eq!(rpc_auth_failure_status(&error).code(), tonic::Code::ResourceExhausted);
+        }
+        for message in [
+            "RPC request replay detected",
+            "Invalid RPC v2 signature",
+            "Missing signature header",
+        ] {
+            assert_eq!(
+                rpc_auth_failure_status(&std::io::Error::other(message)).code(),
+                tonic::Code::Unauthenticated
+            );
+        }
+        assert_eq!(
+            rpc_auth_failure_status(&std::io::Error::other("RPC boot epoch is stale")).code(),
+            tonic::Code::Unavailable
+        );
     }
 
     #[tokio::test]
