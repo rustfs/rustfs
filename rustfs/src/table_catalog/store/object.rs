@@ -430,20 +430,6 @@ pub(in crate::table_catalog) fn bounded_table_entry_objects_for_data_plane_scan(
     Ok(entries)
 }
 
-/// When `object` lies in a table's `maintenance/` subtree, the cursor that skips
-/// the rest of that subtree. Only keys under that directory are skipped, never
-/// the table entry or any other table beside it.
-pub(in crate::table_catalog) fn maintenance_subtree_skip_cursor(prefix: &str, object: &str) -> Option<String> {
-    let relative = object.strip_prefix(prefix)?;
-    let mut segments = relative.splitn(5, '/');
-    let namespace = segments.next()?;
-    let root = segments.next()?;
-    let table = segments.next()?;
-    let maintenance = segments.next()?;
-    (root == TABLE_ROOT && maintenance == MAINTENANCE_ROOT && segments.next().is_some())
-        .then(|| format!("{prefix}{namespace}/{root}/{table}/{maintenance}/\u{10ffff}"))
-}
-
 #[derive(Clone)]
 pub(crate) struct ObjectTableCatalogStore<B> {
     pub(in crate::table_catalog) backend: B,
@@ -2861,41 +2847,21 @@ where
         max_catalog_objects: usize,
     ) -> TableCatalogStoreResult<Vec<String>> {
         let mut objects = Vec::new();
-        let mut entries = 0_usize;
-        let mut pages = 0_usize;
         let mut cursor: Option<String> = None;
         let prefix = self.paths.namespace_entries_prefix(table_bucket);
         let limit = NonZeroUsize::new(TABLE_CATALOG_LIST_MAX_KEYS)
             .ok_or_else(|| TableCatalogStoreError::Internal("table catalog listing page size must be positive".to_string()))?;
         loop {
-            // A page that ends inside a table's maintenance subtree skips the
-            // rest of it, so each entry can waste at most one page: honest
-            // catalogs scale with their entries while a report flood under one
-            // table stays within the fixed budget.
-            if pages >= TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES.saturating_add(entries) {
-                return Err(TableCatalogStoreError::Unavailable(format!(
-                    "table data-plane warehouse-index miss scan exceeds the {TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES}-page listing budget"
-                )));
-            }
             let page = self
                 .backend
-                .list_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
+                .list_table_entry_objects_page(self.catalog_bucket(), &prefix, cursor.as_deref(), limit)
                 .await?;
-            pages += 1;
-            let next_cursor = page
-                .objects
-                .last()
-                .map(|last| maintenance_subtree_skip_cursor(&prefix, last).unwrap_or_else(|| last.clone()));
-            entries += page
-                .objects
-                .iter()
-                .filter(|object| object.ends_with(TABLE_ENTRY_FILE))
-                .count();
+            let next_cursor = page.objects.last().cloned();
             objects.extend(page.objects);
             if !page.is_truncated {
                 return bounded_table_entry_objects_for_data_plane_scan(objects, false, max_catalog_objects);
             }
-            if entries > max_catalog_objects {
+            if objects.len() > max_catalog_objects {
                 return bounded_table_entry_objects_for_data_plane_scan(objects, true, max_catalog_objects);
             }
             let Some(next_cursor) = next_cursor else {
