@@ -27,7 +27,10 @@ use datafusion::{
     datasource::{
         TableProvider,
         listing::{ListingTableUrl, PartitionedFile},
-        physical_plan::{FileScanConfigBuilder, ParquetSource, parquet::ParquetAccessPlan},
+        physical_plan::{
+            FileScanConfigBuilder, ParquetSource,
+            parquet::{ParquetAccessPlan, ParquetFileReaderFactory},
+        },
         source::DataSourceExec,
     },
     execution::{memory_pool::MemoryLimit, object_store::ObjectStoreUrl},
@@ -40,6 +43,7 @@ use datafusion::{
     },
     physical_plan::{
         ExecutionPlan, SendableRecordBatchStream,
+        metrics::ExecutionPlanMetricsSet,
         stream::RecordBatchStreamAdapter,
         streaming::{PartitionStream, StreamingTableExec},
     },
@@ -49,6 +53,8 @@ use rustfs_s3select_api::request::SelectObjectContentInput;
 use rustfs_s3select_api::{
     QueryResult,
     object_store::{SelectScanRange, scan_range_from_bounds},
+    parquet_budget::{ParquetBudgetError, page_decode_budget, validate_footer},
+    query::session::QueryExecutionGuard,
 };
 
 #[derive(Clone)]
@@ -59,6 +65,7 @@ pub struct ParquetSelectTable {
     object_size: u64,
     access_plan: Option<Arc<ParquetAccessPlan>>,
     expanded_row_budget: usize,
+    reader_factory: Arc<BudgetParquetReaderFactory>,
 }
 
 impl fmt::Debug for ParquetSelectTable {
@@ -72,11 +79,30 @@ impl fmt::Debug for ParquetSelectTable {
     }
 }
 
+#[derive(Debug)]
 struct ObjectStoreParquetReader {
     store: Arc<dyn ObjectStore>,
     path: Path,
     file_size: u64,
     metadata_read_limit: usize,
+    metadata_decode_limit: usize,
+    metadata: Option<Arc<ParquetMetaData>>,
+    query_guard: Option<QueryExecutionGuard>,
+}
+
+async fn validate_in_worker<T: Send + 'static>(
+    query_guard: Option<QueryExecutionGuard>,
+    operation: impl FnOnce() -> Result<T, ParquetBudgetError> + Send + 'static,
+) -> ParquetResult<T> {
+    tokio::task::spawn_blocking(move || {
+        // Cancellation cannot release admission while the decoder preflight
+        // still owns input buffers or codec allocations.
+        let _query_guard = query_guard;
+        operation()
+    })
+    .await
+    .map_err(|error| ParquetError::External(Box::new(error)))?
+    .map_err(|error| ParquetError::External(Box::new(error)))
 }
 
 impl AsyncFileReader for ObjectStoreParquetReader {
@@ -94,7 +120,16 @@ impl AsyncFileReader for ObjectStoreParquetReader {
         if total.is_none_or(|total| total > self.metadata_read_limit as u64) {
             return async { Err(ParquetError::External(Box::new(parquet_budget_error()))) }.boxed();
         }
-        async move { self.store.get_ranges(&self.path, &ranges).await.map_err(parquet_store_error) }.boxed()
+        async move {
+            // Read requested ranges directly so sparse offsets cannot amplify
+            // a small request into a large coalesced allocation.
+            let mut bytes = Vec::with_capacity(ranges.len());
+            for range in ranges {
+                bytes.push(self.store.get_range(&self.path, range).await.map_err(parquet_store_error)?);
+            }
+            Ok(bytes)
+        }
+        .boxed()
     }
 
     fn get_metadata<'a>(
@@ -102,6 +137,27 @@ impl AsyncFileReader for ObjectStoreParquetReader {
         options: Option<&'a ArrowReaderOptions>,
     ) -> BoxFuture<'a, ParquetResult<Arc<ParquetMetaData>>> {
         async move {
+            if let Some(metadata) = self.metadata.as_ref() {
+                return Ok(Arc::clone(metadata));
+            }
+            let tail_start = self
+                .file_size
+                .checked_sub(8)
+                .ok_or_else(|| ParquetError::EOF("Parquet footer is truncated".into()))?;
+            let tail = self.get_bytes(tail_start..self.file_size).await?;
+            let tail: &[u8; 8] = tail
+                .as_ref()
+                .try_into()
+                .map_err(|_| ParquetError::EOF("Parquet footer is truncated".into()))?;
+            let footer = datafusion::parquet::file::metadata::FooterTail::try_new(tail)?;
+            let length =
+                u64::try_from(footer.metadata_length()).map_err(|_| ParquetError::External(Box::new(parquet_budget_error())))?;
+            let start = tail_start
+                .checked_sub(length)
+                .ok_or_else(|| ParquetError::EOF("Parquet metadata is truncated".into()))?;
+            let bytes = self.get_bytes(start..tail_start).await?;
+            let limit = self.metadata_decode_limit;
+            validate_in_worker(self.query_guard.clone(), move || validate_footer(&bytes, limit)).await?;
             let metadata_options = options.map(|options| options.metadata_options().clone());
             let mut metadata_reader = ParquetMetaDataReader::new().with_metadata_options(metadata_options);
 
@@ -119,8 +175,84 @@ impl AsyncFileReader for ObjectStoreParquetReader {
     }
 }
 
+#[derive(Debug)]
+struct BudgetParquetReaderFactory {
+    store: Arc<dyn ObjectStore>,
+    path: Path,
+    file_size: u64,
+    metadata: Arc<ParquetMetaData>,
+    read_limit: usize,
+}
+
+impl ParquetFileReaderFactory for BudgetParquetReaderFactory {
+    fn create_reader(
+        &self,
+        _partition_index: usize,
+        file: PartitionedFile,
+        _metadata_size_hint: Option<usize>,
+        _metrics: &ExecutionPlanMetricsSet,
+    ) -> DFResult<Box<dyn AsyncFileReader + Send>> {
+        if file.object_meta.location != self.path || file.object_meta.size != self.file_size {
+            return Err(DataFusionError::Execution("Parquet reader input differs from its admitted object".into()));
+        }
+        Ok(Box::new(ObjectStoreParquetReader {
+            store: Arc::clone(&self.store),
+            path: self.path.clone(),
+            file_size: self.file_size,
+            metadata_read_limit: self.read_limit,
+            metadata_decode_limit: self.read_limit,
+            metadata: Some(Arc::clone(&self.metadata)),
+            query_guard: None,
+        }))
+    }
+}
+
+async fn validate_parquet_pages(
+    store: &Arc<dyn ObjectStore>,
+    path: &Path,
+    file_size: u64,
+    metadata: &ParquetMetaData,
+    plan: Option<&ParquetAccessPlan>,
+    limit: usize,
+    query_guard: &Option<QueryExecutionGuard>,
+) -> DFResult<()> {
+    for (index, group) in metadata.row_groups().iter().enumerate() {
+        if plan.is_some_and(|plan| !plan.should_scan(index)) {
+            continue;
+        }
+        let mut resident = 0usize;
+        for column in group.columns() {
+            let start = u64::try_from(column.dictionary_page_offset().unwrap_or(column.data_page_offset()))
+                .map_err(|_| parquet_budget_error())?;
+            let length = u64::try_from(column.compressed_size()).map_err(|_| parquet_budget_error())?;
+            let end = start
+                .checked_add(length)
+                .filter(|end| *end <= file_size)
+                .ok_or_else(parquet_budget_error)?;
+            if length > u64::try_from(limit).map_err(|_| parquet_budget_error())? {
+                return Err(parquet_budget_error());
+            }
+            let bytes = store.get_range(path, start..end).await?;
+            let declared = usize::try_from(column.uncompressed_size()).map_err(|_| parquet_budget_error())?;
+            let codec = column.compression();
+            let required = validate_in_worker(query_guard.clone(), move || page_decode_budget(&bytes, declared, limit, codec))
+                .await
+                .map_err(DataFusionError::from)?;
+            resident = resident
+                .checked_add(required)
+                .filter(|total| *total <= limit)
+                .ok_or_else(parquet_budget_error)?;
+        }
+    }
+    Ok(())
+}
+
 impl ParquetSelectTable {
-    pub async fn try_new(state: &dyn Session, input: &SelectObjectContentInput) -> QueryResult<Arc<dyn TableProvider>> {
+    pub async fn try_new(
+        state: &dyn Session,
+        input: &SelectObjectContentInput,
+        query_guard: Option<QueryExecutionGuard>,
+    ) -> QueryResult<Arc<dyn TableProvider>> {
         let table_path = ListingTableUrl::parse(format!("s3://{}/{}", input.bucket, input.key))?;
         let object_store_url = table_path.object_store();
         let object_location = Path::from(input.key.clone());
@@ -136,9 +268,12 @@ impl ParquetSelectTable {
         };
         let reader = ObjectStoreParquetReader {
             store: Arc::clone(&store),
-            path: object_location,
+            path: object_location.clone(),
             file_size: object_meta.size,
             metadata_read_limit: (memory_budget / 16).max(1),
+            metadata_decode_limit: (memory_budget / 4).max(1),
+            metadata: None,
+            query_guard: query_guard.clone(),
         };
         let builder = ParquetRecordBatchStreamBuilder::new(reader)
             .await
@@ -153,11 +288,26 @@ impl ParquetSelectTable {
             builder.schema().metadata().clone(),
         ));
         let metadata = Arc::clone(builder.metadata());
-        // This is admission for valid Parquet declarations, not a replacement
-        // for limits inside the footer parser or native compression codecs.
         let expanded_row_budget = (memory_budget / 16).max(1);
         let access_plan = parquet_access_plan(input, object_meta.size, metadata.as_ref())?;
         admit_parquet_decode(metadata.as_ref(), access_plan.as_deref(), memory_budget / 4)?;
+        validate_parquet_pages(
+            &store,
+            &object_location,
+            object_meta.size,
+            &metadata,
+            access_plan.as_deref(),
+            memory_budget / 4,
+            &query_guard,
+        )
+        .await?;
+        let reader_factory = Arc::new(BudgetParquetReaderFactory {
+            store,
+            path: object_location,
+            file_size: object_meta.size,
+            metadata,
+            read_limit: (memory_budget / 4).max(1),
+        });
 
         Ok(Arc::new(Self {
             schema,
@@ -166,6 +316,7 @@ impl ParquetSelectTable {
             object_size: object_meta.size,
             access_plan,
             expanded_row_budget,
+            reader_factory,
         }))
     }
 
@@ -202,7 +353,12 @@ impl TableProvider for ParquetSelectTable {
             ));
         }
         let scan_limit = if filters.is_empty() { limit } else { None };
-        let file_source = Arc::new(ParquetSource::new(Arc::clone(&self.schema)));
+        let file_source = Arc::new(
+            ParquetSource::new(Arc::clone(&self.schema))
+                .with_parquet_file_reader_factory(self.reader_factory.clone())
+                .with_enable_page_index(false)
+                .with_bloom_filter_on_read(false),
+        );
         let config = FileScanConfigBuilder::new(self.object_store_url.clone(), file_source)
             .with_file(self.partitioned_file())
             .with_projection_indices(projection.cloned())?
@@ -439,6 +595,39 @@ pub(super) fn dictionary_parquet_for_test(value_bytes: usize, rows: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn parquet_cancelled_preflight_retains_admission_until_worker_finishes() {
+        let admission = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = Arc::clone(&admission).acquire_owned().await.expect("initial admission");
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let task = tokio::spawn(validate_in_worker(Some(Arc::new(permit)), move || {
+            started_tx.send(()).expect("report running worker");
+            release_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .expect("worker release");
+            Ok(())
+        }));
+        tokio::time::timeout(std::time::Duration::from_secs(5), started_rx)
+            .await
+            .expect("worker starts before deadline")
+            .expect("worker started");
+        task.abort();
+        assert!(task.await.expect_err("cancelled request task").is_cancelled());
+        assert!(Arc::clone(&admission).try_acquire_owned().is_err(), "running worker still owns admission");
+        release_tx.send(()).expect("release worker");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if Arc::clone(&admission).try_acquire_owned().is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("worker releases admission after completion");
+    }
     use datafusion::{
         arrow::{
             array::Int32Array,
@@ -519,7 +708,7 @@ mod tests {
         let context = parquet_session(store);
         let state = context.state();
 
-        let error = match ParquetSelectTable::try_new(&state, &parquet_input("missing.parquet")).await {
+        let error = match ParquetSelectTable::try_new(&state, &parquet_input("missing.parquet"), None).await {
             Ok(_) => panic!("missing parquet object must fail"),
             Err(error) => error,
         };
@@ -538,7 +727,7 @@ mod tests {
         let context = parquet_session(store);
         let state = context.state();
 
-        let error = match ParquetSelectTable::try_new(&state, &parquet_input(object.as_ref())).await {
+        let error = match ParquetSelectTable::try_new(&state, &parquet_input(object.as_ref()), None).await {
             Ok(_) => panic!("corrupt parquet metadata must fail"),
             Err(error) => error,
         };
@@ -581,7 +770,7 @@ mod tests {
             .put(&Path::from("dictionary.parquet"), Bytes::from(bytes).into())
             .await
             .expect("fixture");
-        let table = ParquetSelectTable::try_new(&context.state(), &parquet_input("dictionary.parquet"))
+        let table = ParquetSelectTable::try_new(&context.state(), &parquet_input("dictionary.parquet"), None)
             .await
             .expect("valid dictionary metadata");
         context.register_table("source", table).expect("table");
@@ -752,7 +941,7 @@ mod tests {
             start: Some(starts[0]),
             end: Some(starts[0]),
         });
-        let table = ParquetSelectTable::try_new(&context.state(), &input)
+        let table = ParquetSelectTable::try_new(&context.state(), &input, None)
             .await
             .expect("an unselected large row group must not reject the small range");
         context.register_table("source", table).expect("table");
@@ -770,7 +959,7 @@ mod tests {
             start: Some(starts[1]),
             end: Some(starts[1]),
         });
-        let error = match ParquetSelectTable::try_new(&context.state(), &input).await {
+        let error = match ParquetSelectTable::try_new(&context.state(), &input, None).await {
             Ok(_) => panic!("the selected oversized row group must still be rejected before decoding"),
             Err(error) => error,
         };
@@ -806,11 +995,115 @@ mod tests {
             .put(&Path::from("large.parquet"), Bytes::from(bytes).into())
             .await
             .expect("fixture");
-        let error = match ParquetSelectTable::try_new(&context.state(), &parquet_input("large.parquet")).await {
+        let error = match ParquetSelectTable::try_new(&context.state(), &parquet_input("large.parquet"), None).await {
             Ok(_) => panic!("valid declared decoded size must be admitted before page decode"),
             Err(error) => error,
         };
         assert!(error.to_string().contains("query memory budget"));
+    }
+
+    #[tokio::test]
+    async fn parquet_footer_collection_budget_is_checked_before_metadata_decode() {
+        // A root schema with no leaves and 50 empty, valid row groups. The
+        // encoded footer fits the read budget; its reservations do not.
+        let mut footer = vec![0x15, 2, 0x19, 0x1c, 0x48, 4];
+        footer.extend(b"root");
+        footer.extend([0x15, 0, 0, 0x16, 0, 0x19, 0xfc, 50]);
+        for _ in 0..50 {
+            footer.extend([0x19, 0x0c, 0x16, 0, 0x16, 0, 0]);
+        }
+        footer.push(0);
+        let decoded = ParquetMetaDataReader::decode_metadata(&footer).expect("valid compact footer fixture");
+        assert_eq!(decoded.num_row_groups(), 50);
+        let mut bytes = b"PAR1".to_vec();
+        bytes.extend(&footer);
+        bytes.extend(u32::try_from(footer.len()).expect("small footer").to_le_bytes());
+        bytes.extend(b"PAR1");
+        let store = Arc::new(InMemory::new());
+        let context = parquet_session_with_memory(store.clone(), 8192);
+        store
+            .put(&Path::from("footer.parquet"), Bytes::from(bytes).into())
+            .await
+            .expect("fixture");
+        let error = match ParquetSelectTable::try_new(&context.state(), &parquet_input("footer.parquet"), None).await {
+            Ok(_) => panic!("footer collection reservations exceed the query budget"),
+            Err(error) => error,
+        };
+        assert_eq!(error.select_error(), SelectError::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn parquet_forged_footer_cannot_hide_oversized_compressed_pages() {
+        use datafusion::parquet::file::metadata::ParquetMetaDataWriter;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("v", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(datafusion::arrow::array::StringArray::from(vec![
+                "x".repeat(32 * 1024 * 1024),
+            ]))],
+        )
+        .expect("large compressible value");
+        let properties = datafusion::parquet::file::properties::WriterProperties::builder()
+            .set_dictionary_page_size_limit(64 * 1024 * 1024)
+            .set_compression(datafusion::parquet::basic::Compression::ZSTD(Default::default()))
+            .build();
+        let mut encoded = Vec::new();
+        let mut writer = ArrowWriter::try_new(&mut encoded, schema, Some(properties)).expect("writer");
+        writer.write(&batch).expect("compressed value");
+        writer.close().expect("footer");
+        let original = Bytes::from(encoded);
+        let builder = ParquetRecordBatchReaderBuilder::try_new(original.clone()).expect("valid compressed fixture");
+        let metadata = builder.metadata();
+        let groups = metadata
+            .row_groups()
+            .iter()
+            .map(|group| {
+                let columns = group
+                    .columns()
+                    .iter()
+                    .cloned()
+                    .map(|column| {
+                        column
+                            .into_builder()
+                            .set_total_uncompressed_size(64)
+                            .build()
+                            .expect("forged column")
+                    })
+                    .collect();
+                group
+                    .clone()
+                    .into_builder()
+                    .set_column_metadata(columns)
+                    .build()
+                    .expect("forged group")
+            })
+            .collect();
+        let forged = metadata.as_ref().clone().into_builder().set_row_groups(groups).build();
+        let footer_size = u32::from_le_bytes(
+            original[original.len() - 8..original.len() - 4]
+                .try_into()
+                .expect("footer size"),
+        );
+        let mut bytes = original[..original.len() - 8 - usize::try_from(footer_size).expect("footer length")].to_vec();
+        ParquetMetaDataWriter::new(&mut bytes, &forged)
+            .finish()
+            .expect("forged footer");
+        assert!(bytes.len() < 256 * 1024, "compressed input remains small");
+        admit_parquet_decode(&forged, None, 4 * 1024 * 1024).expect("footer-only admission misses the page size");
+
+        let store = Arc::new(InMemory::new());
+        let context = parquet_session_with_memory(store.clone(), 16 * 1024 * 1024);
+        store
+            .put(&Path::from("forged.parquet"), Bytes::from(bytes).into())
+            .await
+            .expect("fixture");
+        let result = ParquetSelectTable::try_new(&context.state(), &parquet_input("forged.parquet"), None).await;
+        let error = match result {
+            Ok(_) => panic!("actual query admission must reject oversized page buffers before decoding"),
+            Err(error) => error,
+        };
+        assert_eq!(error.select_error(), SelectError::ResourceExhausted);
     }
 
     #[tokio::test]

@@ -135,7 +135,7 @@ impl DynamicSleeper {
         if let Some(elapsed) = elapsed {
             debt.charge(proportional_delay(elapsed, config), Instant::now());
         }
-        let foreground = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+        let foreground = self.foreground_backoff();
         let now = Instant::now();
         let folder_reaches_deadline = folder
             && debt.started.is_some_and(|start| {

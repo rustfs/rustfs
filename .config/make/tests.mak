@@ -56,6 +56,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_build_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_glibc.py

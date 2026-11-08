@@ -66,11 +66,26 @@ pub fn select_effective_memory(host_total: u64, host_available: u64, cgroup: Opt
 
 /// Resolves the effective memory from an already-refreshed system handle.
 ///
-/// `cgroup_limits()` is computed fresh on each call and is only implemented on
-/// Linux (it returns `None` elsewhere), so non-Linux hosts always use host
-/// values.
+/// On Linux, the current process cgroup and its ancestors are read on each call,
+/// including limits imposed by systemd services. System-wide cgroup limits are
+/// used if process information is unavailable. Other platforms use host values.
 pub fn effective_memory_from_system(system: &System) -> EffectiveMemory {
-    let cgroup = system.cgroup_limits().map(|limits| (limits.total_memory, limits.free_memory));
+    #[cfg(target_os = "linux")]
+    let limits = sysinfo::get_current_pid()
+        .ok()
+        .and_then(|pid| {
+            let mut processes = System::new().ok()?;
+            processes.refresh_processes_specifics(
+                sysinfo::ProcessesToUpdate::Some(&[pid]),
+                false,
+                sysinfo::ProcessRefreshKind::nothing().with_memory(),
+            );
+            processes.process(pid)?.cgroup_limits()
+        })
+        .or_else(|| system.cgroup_limits());
+    #[cfg(not(target_os = "linux"))]
+    let limits = system.cgroup_limits();
+    let cgroup = limits.map(|limits| (limits.total_memory, limits.free_memory));
     select_effective_memory(system.total_memory(), system.available_memory(), cgroup)
 }
 
@@ -88,6 +103,32 @@ mod tests {
     use super::{MemoryBasis, select_effective_memory};
 
     const GIB: u64 = 1024 * 1024 * 1024;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn effective_memory_uses_current_process_cgroup() {
+        use sysinfo::{ProcessRefreshKind, ProcessesToUpdate, System, get_current_pid};
+
+        let pid = get_current_pid().expect("current process ID");
+        let mut system = System::new().expect("system memory handle");
+        system.refresh_memory();
+        let mut process_system = System::new().expect("process memory handle");
+        process_system.refresh_processes_specifics(
+            ProcessesToUpdate::Some(&[pid]),
+            false,
+            ProcessRefreshKind::nothing().with_memory(),
+        );
+        let limits = process_system.process(pid).expect("current process entry").cgroup_limits();
+        let expected = select_effective_memory(
+            system.total_memory(),
+            system.available_memory(),
+            limits.map(|limits| (limits.total_memory, limits.free_memory)),
+        );
+        let actual = super::effective_memory_from_system(&system);
+        assert_eq!(actual.basis, expected.basis);
+        assert_eq!(actual.total_bytes, expected.total_bytes);
+        assert!(actual.available_bytes <= actual.total_bytes);
+    }
 
     #[test]
     fn select_effective_memory_prefers_constraining_cgroup() {

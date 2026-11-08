@@ -2428,6 +2428,7 @@ pub(crate) const MAX_FSYNC_WORKERS_PER_DISK: usize = 8;
 // Return busy workers to the shared pool so other disks can acquire a slot.
 const MAX_BLOCKING_JOBS_PER_WORKER: usize = 64;
 const WORKER_IDLE_SPIN_ITERS: usize = 256;
+const FSYNC_WORKER_IDLE_SPIN_ITERS: usize = 1024;
 const FALLBACK_NAMESPACE_QUEUE_SHARDS: usize = 8;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2636,7 +2637,7 @@ impl DiskBlockingQueue {
                         .ready
                         .store(!state.jobs.is_empty(), std::sync::atomic::Ordering::Relaxed);
                     if job.is_none() {
-                        if state.idle_workers > 0 {
+                        if lane != DiskBlockingLane::Fsync && state.idle_workers > 0 {
                             state.active_workers = state.active_workers.saturating_sub(1);
                             guard.state = DiskBlockingWorkerState::Retired;
                             return;
@@ -2654,7 +2655,12 @@ impl DiskBlockingQueue {
                     }
                     idle_polled = false;
                 } else {
-                    for _ in 0..WORKER_IDLE_SPIN_ITERS {
+                    let spin_iters = if lane == DiskBlockingLane::Fsync {
+                        FSYNC_WORKER_IDLE_SPIN_ITERS
+                    } else {
+                        WORKER_IDLE_SPIN_ITERS
+                    };
+                    for _ in 0..spin_iters {
                         if queue.lane(lane).ready.load(std::sync::atomic::Ordering::Relaxed) {
                             break;
                         }
@@ -7692,6 +7698,7 @@ pub(crate) fn install_multipart_prepared_head(
     canonical_head: &Path,
     base: &Path,
     publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
 ) -> io::Result<PreparedRenameSource> {
     let original_path = prepared.path.clone();
     let parent = canonical_head
@@ -7700,9 +7707,37 @@ pub(crate) fn install_multipart_prepared_head(
     if original_path.parent() != Some(parent) || original_path == canonical_head {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
+    #[cfg(target_os = "linux")]
+    let guard = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+        let dir = &directory_guard.directories.source;
+        RenameCommitGuard {
+            directories: Arc::new(LinuxCommitDirectories {
+                root: directory_guard.directories.root.clone(),
+                source_path: parent.to_path_buf(),
+                destination_path: parent.to_path_buf(),
+                source: LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                },
+                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                }),
+                destination_base: base.to_path_buf(),
+            }),
+        }
+    } else {
+        prepare_rename_commit_guard(parent, parent, base, publication_root)?
+    };
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+    #[cfg(not(target_os = "linux"))]
+    let guard = {
+        let _ = directory_guard;
+        prepare_rename_commit_guard(parent, parent, base, publication_root)?
+    };
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;

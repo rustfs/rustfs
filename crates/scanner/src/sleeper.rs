@@ -230,6 +230,17 @@ impl DynamicSleeper {
         SCANNER_IDLE_MODE.load(Ordering::Relaxed)
     }
 
+    fn foreground_backoff(&self) -> Duration {
+        // Local walkers already use disk-priority admission and a shared I/O
+        // budget. A global per-operation floor duplicates that control and
+        // throttles idle disks because unrelated foreground work is active.
+        if self.disk_io_budget.is_some() {
+            Duration::ZERO
+        } else {
+            foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity())
+        }
+    }
+
     fn read_params(&self) -> (f64, Duration) {
         let config = self.read_config();
         (config.factor, config.max_sleep)
@@ -252,15 +263,14 @@ impl DynamicSleeper {
         }
         let (factor, max_sleep) = self.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
-            let foreground_sleep =
-                foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+            let foreground_sleep = self.foreground_backoff();
             if !foreground_sleep.is_zero() {
                 tokio::time::sleep(foreground_sleep).await;
                 global_metrics().record_scanner_throttle_sleep(foreground_sleep);
             }
             return;
         }
-        let foreground_sleep = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+        let foreground_sleep = self.foreground_backoff();
         let sleep_dur = Duration::from_secs_f64(MIN_SLEEP.as_secs_f64() * factor)
             .min(max_sleep)
             .max(foreground_sleep);
@@ -354,8 +364,7 @@ impl SleepTimer {
         }
         let (factor, max_sleep) = self.sleeper.read_params();
         if factor == 0.0 || max_sleep.is_zero() {
-            let foreground_sleep =
-                foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+            let foreground_sleep = self.sleeper.foreground_backoff();
             if !foreground_sleep.is_zero() {
                 tokio::time::sleep(foreground_sleep).await;
                 global_metrics().record_scanner_throttle_sleep(foreground_sleep);
@@ -363,7 +372,7 @@ impl SleepTimer {
             return;
         }
         let elapsed = self.start.elapsed();
-        let foreground_sleep = foreground_workload_backoff_duration(crate::workload_admission::foreground_workload_activity());
+        let foreground_sleep = self.sleeper.foreground_backoff();
         let sleep_dur = Duration::from_secs_f64(elapsed.as_secs_f64() * factor)
             .max(MIN_SLEEP)
             .min(max_sleep)
