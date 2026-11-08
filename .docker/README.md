@@ -22,9 +22,9 @@ The following files in the project root are essential for Docker operations:
 | File | Description | Usage |
 | :--- | :--- | :--- |
 | **`docker-buildx.sh`** | **Multi-Arch Build Script**<br>Automates building and pushing Docker images for `amd64` and `arm64`. Supports release and dev channels. | `./docker-buildx.sh --push` |
-| **`Dockerfile`** | **Production Image (Alpine)**<br>Lightweight image using musl libc. Downloads pre-built binaries from GitHub Releases. | `docker build -t rustfs:latest .` |
-| **`Dockerfile.glibc`** | **Production Image (Ubuntu)**<br>Standard image using glibc. Useful if you need specific dynamic libraries. | `docker build -f Dockerfile.glibc .` |
-| **`Dockerfile.source`** | **Development Image**<br>Builds RustFS from source code. Includes build tools. Ideal for local development and CI. | `docker build -f Dockerfile.source .` |
+| **`Dockerfile`** | **Production Image (Alpine)**<br>Lightweight image using musl libc. Downloads verified RustFS and `rc` binaries from GitHub Releases and bundles `/etc/rustfs/bootstrap`. | `docker build -t rustfs:latest .` |
+| **`Dockerfile.glibc`** | **Production Image (Ubuntu)**<br>Standard image using glibc. Includes the bundled bootstrap configuration. | `docker build -f Dockerfile.glibc .` |
+| **`Dockerfile.source`** | **Development Image**<br>Builds RustFS from source code and bundles `rc` and the default bootstrap configuration. | `docker build -f Dockerfile.source .` |
 
 ### Docker Compose Configurations
 
@@ -107,6 +107,36 @@ For users preferring a lightweight, all-in-one solution, we support OpenObserve.
 cd .docker/openobserve-otel
 docker compose up -d
 ```
+
+---
+
+## Docker Compose environment values
+
+Use map syntax when quoting environment values in YAML:
+
+```yaml
+services:
+  rustfs:
+    image: rustfs/rustfs:latest
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - ./data:/data
+      - ./logs:/var/log/rustfs
+    environment:
+      RUSTFS_ADDRESS: ":9000"
+      RUSTFS_CONSOLE_ADDRESS: ":9001"
+      RUSTFS_CONSOLE_ENABLE: "true"
+      RUSTFS_OBS_LOGGER_LEVEL: error
+      RUSTFS_OBS_LOG_DIRECTORY: "/var/log/rustfs/"
+      RUSTFS_ACCESS_KEY: "${RUSTFS_ACCESS_KEY:?Set RUSTFS_ACCESS_KEY}"
+      RUSTFS_SECRET_KEY: "${RUSTFS_SECRET_KEY:?Set RUSTFS_SECRET_KEY}"
+```
+
+Create the host directories and grant the container user write access before starting this example; official images run as UID/GID `10001:10001`. Set both credential variables to your own values, then run `docker compose config` to inspect the resolved configuration locally before `docker compose up -d`. The resolved output includes credentials, so do not share it publicly.
+
+With list syntax, use `- RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/` or quote the whole item as `- "RUSTFS_OBS_LOG_DIRECTORY=/var/log/rustfs/"`. Writing `- RUSTFS_OBS_LOG_DIRECTORY="/var/log/rustfs/"` passes the inner quotes literally, making this a relative path beginning with `"`, which can fail with `mkdir: cannot create directory '"': Permission denied`. This also applies to addresses and credentials: fix every affected list item, rather than only the log directory. The entrypoint preserves configured values, including literal quotes in valid paths and secrets.
 
 ---
 

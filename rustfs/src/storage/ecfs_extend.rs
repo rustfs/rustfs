@@ -322,11 +322,36 @@ pub(crate) fn get_buffer_size_opt_in(file_size: i64) -> usize {
     buffer_size
 }
 
-/// Validate object key for control characters and log special characters
+/// Reject XML-incompatible and storage-sidecar keys at new object boundaries.
+pub(crate) fn validate_new_object_key(key: &str, operation: &str) -> S3Result<()> {
+    validate_object_key(key, operation)?;
+    // These persistent sidecar filenames share directories with client objects.
+    // Case-insensitive checks also protect case-insensitive disk deployments.
+    if key.split('/').any(|segment| {
+        ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"]
+            .iter()
+            .any(|reserved| segment.eq_ignore_ascii_case(reserved))
+    }) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved storage filename",
+        ));
+    }
+    if crate::storage::storage_api::ecstore_bucket::utils::has_xml_invalid_control_characters(key) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains characters unsupported by XML listings",
+        ));
+    }
+    Ok(())
+}
+
+/// Validate client object keys and log special characters
 ///
 /// This function:
 /// 1. Rejects keys containing control characters (null bytes, newlines, carriage returns)
-/// 2. Logs debug information for keys containing spaces, plus signs, or percent signs
+/// 2. Rejects reserved directory markers and invalid path segments
+/// 3. Logs debug information for keys containing spaces, plus signs, or percent signs
 ///
 /// The s3s library handles URL decoding, so keys are already decoded when they reach this function.
 /// This validation ensures that invalid characters that could cause issues are rejected early.
@@ -336,6 +361,19 @@ pub(crate) fn validate_object_key(key: &str, operation: &str) -> S3Result<()> {
         return Err(S3Error::with_message(
             S3ErrorCode::InvalidArgument,
             format!("Object key contains invalid control characters: {key:?}"),
+        ));
+    }
+
+    // Storage encodes directory objects as `<name>__XLDIR__` after this client-key
+    // boundary, and `scan_dir` decodes every entry with that suffix back into a
+    // marker. A client key carrying the suffix would be mistaken for a marker:
+    // the bare key `__XLDIR__` makes the walk schedule the directory it is
+    // scanning as its own child until the stack overflows, and keys below a
+    // `*__XLDIR__/` segment vanish from listings and quota accounting.
+    if key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX) {
+        return Err(S3Error::with_message(
+            S3ErrorCode::InvalidArgument,
+            "Object key contains a reserved directory marker",
         ));
     }
 
@@ -894,18 +932,12 @@ pub(crate) fn needs_cors_processing(headers: &HeaderMap) -> bool {
 ///
 /// Note: This function should only be called if `needs_cors_processing()` returns true
 /// to avoid unnecessary overhead for non-CORS requests.
-pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, headers: &HeaderMap) -> Option<HeaderMap> {
+pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, request: &cors::CorsRequest) -> Option<HeaderMap> {
     use http::HeaderValue;
 
-    fn is_credentialed_request(headers: &HeaderMap) -> bool {
-        headers.contains_key(http::header::AUTHORIZATION)
-            || headers.contains_key(http::header::COOKIE)
-            || headers.contains_key("x-amz-security-token")
-            || headers.contains_key("x-amz-content-sha256")
-    }
-
-    // Get Origin header from request
-    let origin = headers.get(cors::standard::ORIGIN)?.to_str().ok()?;
+    // Invalid and absent origins do not require a bucket metadata lookup.
+    let origin_header = request.origin.as_ref()?;
+    let origin = origin_header.to_str().ok()?;
 
     // Get CORS configuration for the bucket
     let cors_config = match get_bucket_cors_config(bucket).await {
@@ -928,15 +960,17 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
     // Use Access-Control-Request-Method if present (for preflight and non-preflight requests),
     // otherwise fall back to the actual HTTP method.
     let is_preflight = method == http::Method::OPTIONS;
-    let requested_method = headers
-        .get(cors::request::ACCESS_CONTROL_REQUEST_METHOD)
+    let requested_method = request
+        .requested_method
+        .as_ref()
         .and_then(|v| v.to_str().ok())
         .unwrap_or(method_str);
 
     // Get requested headers from preflight request
     let requested_headers = if is_preflight {
-        headers
-            .get(cors::request::ACCESS_CONTROL_REQUEST_HEADERS)
+        request
+            .requested_headers
+            .as_ref()
             .and_then(|v| v.to_str().ok())
             .map(|h| h.split(',').map(|s| s.trim().to_lowercase()).collect::<Vec<_>>())
     } else {
@@ -999,27 +1033,16 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
         // Credentials mode + wildcard allow list requires echoing the request origin.
         // Browsers reject `Access-Control-Allow-Origin: *` with `credentials: include`.
         let has_wildcard_origin = rule.allowed_origins.iter().any(|o| o == "*");
-        let credentialed_request = is_credentialed_request(headers);
-        let mut origin_reflected = false;
+        let credentialed_request = request.credentialed;
 
         if has_wildcard_origin {
             if credentialed_request {
-                if let Ok(origin_value) = HeaderValue::from_str(origin) {
-                    response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
-                    origin_reflected = true;
-                }
+                response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header.clone());
             } else {
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, HeaderValue::from_static("*"));
             }
-        } else if let Ok(origin_value) = HeaderValue::from_str(origin) {
-            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_value);
-            origin_reflected = true;
-        }
-
-        // Vary: Origin whenever origin is reflected (non-"*" allow-origin).
-        // This prevents proxy/browser caches from reusing CORS headers across different origins.
-        if origin_reflected {
-            response_headers.insert(cors::standard::VARY, HeaderValue::from_static("Origin"));
+        } else {
+            response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_ORIGIN, origin_header.clone());
         }
 
         // Credentials mode requires explicit allow-credentials.
@@ -1044,15 +1067,6 @@ pub(crate) async fn apply_cors_headers(bucket: &str, method: &http::Method, head
                 response_headers.insert(cors::response::ACCESS_CONTROL_ALLOW_HEADERS, headers_value);
             }
         }
-        if is_preflight {
-            let vary = if origin_reflected {
-                "Origin, Access-Control-Request-Method, Access-Control-Request-Headers"
-            } else {
-                "Access-Control-Request-Method, Access-Control-Request-Headers"
-            };
-            response_headers.insert(cors::standard::VARY, HeaderValue::from_static(vary));
-        }
-
         // Access-Control-Expose-Headers (for actual requests)
         if !is_preflight && let Some(ref expose_headers) = rule.expose_headers {
             let expose_headers_str = expose_headers.iter().map(|h| h.as_str()).collect::<Vec<_>>().join(", ");
@@ -1089,7 +1103,8 @@ pub(crate) fn matches_origin_pattern(pattern: &str, origin: &str) -> bool {
     }
 }
 
-/// Wrap S3Response with CORS headers if needed
+/// Wrap S3Response with CORS grants if needed. Cache variation is applied by
+/// `ConditionalCorsService` to all responses, including originless requests.
 /// This function performs a lightweight check first to avoid unnecessary CORS processing
 /// for non-CORS requests (requests without Origin header)
 pub(crate) async fn wrap_response_with_cors<T>(
@@ -1098,18 +1113,13 @@ pub(crate) async fn wrap_response_with_cors<T>(
     headers: &HeaderMap,
     output: T,
 ) -> S3Response<T> {
-    let mut response = S3Response::new(output);
-
-    // Quick check: only process CORS if Origin header is present
     if needs_cors_processing(headers)
-        && let Some(cors_headers) = apply_cors_headers(bucket, method, headers).await
+        && let Some(cors_headers) = apply_cors_headers(bucket, method, &cors::CorsRequest::from_headers(headers)).await
     {
-        for (key, value) in cors_headers.iter() {
-            response.headers.insert(key, value.clone());
-        }
+        S3Response::with_headers(output, cors_headers)
+    } else {
+        S3Response::new(output)
     }
-
-    response
 }
 
 /// Parse part number from Option<i32> to Option<usize> with validation
@@ -1133,5 +1143,60 @@ pub(crate) fn parse_part_number_i32_to_usize(part_number: Option<i32>, op: &'sta
             format!("{op}: partNumber must be between 1 and {MAX_MULTIPART_PART_NUMBER}"),
         )),
         Some(n) => Ok(Some(n as usize)),
+    }
+}
+
+#[cfg(test)]
+mod object_key_admission_tests {
+    use super::{validate_new_object_key, validate_object_key};
+
+    #[test]
+    fn storage_sidecar_keys_are_rejected_only_for_new_writes() {
+        for reserved in ["xl.meta", "xl.meta.bkp", "delete-prepared", "delete-quorum-committed"] {
+            for key in [
+                reserved.to_string(),
+                format!("parent/uuid/{reserved}"),
+                format!("parent/{reserved}/child"),
+                reserved.to_uppercase(),
+            ] {
+                for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                    assert!(validate_new_object_key(&key, operation).is_err(), "{operation}: {key}");
+                }
+                assert!(validate_object_key(&key, "GetObject").is_ok(), "legacy read: {key}");
+                assert!(validate_object_key(&key, "DeleteObject").is_ok(), "legacy cleanup: {key}");
+            }
+            assert!(validate_new_object_key(&format!("ordinary/{reserved}-report"), "PutObject").is_ok());
+        }
+    }
+
+    #[test]
+    fn xml_invalid_keys_are_rejected_only_for_new_writes() {
+        for byte in (1u8..32).filter(|byte| !matches!(byte, 9 | 10 | 13)) {
+            let key = format!("legacy-{}", char::from(byte));
+            assert!(validate_new_object_key(&key, "PutObject").is_err());
+            assert!(validate_object_key(&key, "GetObject").is_ok());
+            assert!(validate_object_key(&key, "DeleteObject").is_ok());
+        }
+        for key in ["ordinary/key", "tab\tkey", "unicode-中文", "directory/"] {
+            assert!(validate_new_object_key(key, "PutObject").is_ok());
+        }
+    }
+
+    #[test]
+    fn reserved_directory_marker_keys_are_rejected() {
+        for key in [
+            "__XLDIR__",
+            "__XLDIR__/",
+            "prefix__XLDIR__/object",
+            "object__XLDIR__",
+            "a/__XLDIR__/b",
+        ] {
+            for operation in ["PutObject", "COPY (dest)", "CreateMultipartUpload", "CompleteMultipartUpload"] {
+                assert!(validate_object_key(key, operation).is_err(), "{operation}: {key}");
+            }
+        }
+        for key in ["ordinary/key", "xldir", "__xldir__", "directory/", "unicode-中文"] {
+            assert!(validate_object_key(key, "PutObject").is_ok(), "{key}");
+        }
     }
 }

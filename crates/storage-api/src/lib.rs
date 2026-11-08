@@ -91,6 +91,8 @@ pub use bucket::{BucketInfo, BucketOperations, BucketOptions, DeleteBucketOption
 pub use capability::{CapabilitySnapshotError, CapabilityState, CapabilityStatus};
 pub use error::{StorageErrorCode, StorageResult};
 pub use multipart::{CompletePart, ListMultipartsInfo, ListPartsInfo, MultipartInfo, MultipartUploadResult, PartInfo};
+pub use multipart::{MultipartCompletionAuthorization, MultipartUploadInspection};
+pub use object::AuthoritativeListOperations;
 pub use object::DeleteAccounting;
 pub use object::ObjectLockDeleteOptions;
 pub use object::ObjectToDeleteIdentity;

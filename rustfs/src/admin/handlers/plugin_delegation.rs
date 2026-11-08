@@ -98,7 +98,7 @@ pub(super) async fn owner(
         &credentials,
         false,
         Action::AdminAction(action),
-        req.remote_addr(),
+        req.policy_source_addr(),
         AdminResourceScope::bucket_object("", ""),
     )
     .await?;

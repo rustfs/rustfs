@@ -478,6 +478,7 @@ struct ScannerPublicationCommitScopeInner {
 #[derive(Clone)]
 pub struct ScannerPublicationCommitScope {
     inner: Arc<ScannerPublicationCommitScopeInner>,
+    owns_completion: bool,
 }
 
 /// RAII fallback for storage paths that return before their commit closure
@@ -569,6 +570,16 @@ impl ScannerPublicationCommitScope {
                 movement_permit: Mutex::new(Some(movement_permit)),
                 lease_release_safe,
             }),
+            owns_completion: true,
+        }
+    }
+
+    /// A pool may use the shared fence, but only the enclosing operation may
+    /// report completion and authorize release of its leases.
+    pub(crate) fn pool_delete_participant(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+            owns_completion: false,
         }
     }
 
@@ -607,7 +618,9 @@ impl ScannerPublicationCommitScope {
     /// storage mutation owner. Once set, dropping a scanner waiter leaves the
     /// scope in-flight until that owner reports committed or indeterminate.
     pub fn attach_mutation_owner(&self) {
-        self.inner.owner_attached.store(true, Ordering::Release);
+        if self.owns_completion {
+            self.inner.owner_attached.store(true, Ordering::Release);
+        }
     }
 
     fn owner_attached(&self) -> bool {
@@ -654,16 +667,17 @@ impl ScannerPublicationCommitScope {
     }
 
     pub fn mark_aborted_before_commit(&self) -> bool {
-        if self
-            .inner
-            .state
-            .compare_exchange(
-                SCANNER_PUBLICATION_SCOPE_ADMITTED,
-                SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        if self.owns_completion
+            && self
+                .inner
+                .state
+                .compare_exchange(
+                    SCANNER_PUBLICATION_SCOPE_ADMITTED,
+                    SCANNER_PUBLICATION_SCOPE_ABORTED_BEFORE_COMMIT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
         {
             self.inner.lease_release_safe.store(true, Ordering::Release);
             self.inner.completed.notify_waiters();
@@ -677,6 +691,9 @@ impl ScannerPublicationCommitScope {
     }
 
     fn mark_terminal(&self, terminal: ScannerPublicationCommitState) -> bool {
+        if !self.owns_completion {
+            return false;
+        }
         self.inner
             .state
             .compare_exchange(SCANNER_PUBLICATION_SCOPE_IN_FLIGHT, terminal.as_u8(), Ordering::AcqRel, Ordering::Acquire)
@@ -709,7 +726,7 @@ impl ScannerPublicationCommitScope {
     /// Release the storage-owned movement permit only after a known-safe
     /// terminal result. Returns `false` for in-flight or indeterminate work.
     pub async fn release_movement_permit(&self) -> bool {
-        if !self.state().permits_lease_release() {
+        if !self.owns_completion || !self.state().permits_lease_release() {
             return false;
         }
         self.inner.movement_permit.lock().await.take().is_some()
@@ -949,8 +966,82 @@ pub enum ShardIntegrityWriteMode {
     Protected,
 }
 
+/// Shared foreground recovery allowance. Clones of ObjectOptions retain one request budget.
+/// Credits cover directory entries (including a minimum charge for an empty probe) and
+/// transaction inspections. Each bounded call is admitted while credits remain and is
+/// charged for the entries it visited when it completes.
+#[derive(Debug)]
+pub struct DeleteRecoveryWorkBudget {
+    remaining: std::sync::atomic::AtomicU32,
+}
+
+/// Entries one disk may visit per recovery step (discovery plus inspection).
+/// Every disk of every set a request fans out to is admitted up to this much
+/// and charged on completion, so a budget must cover that many disks.
+const DELETE_RECOVERY_RESERVATION_PER_DISK: u32 = 4096 + 65_536;
+
+impl Default for DeleteRecoveryWorkBudget {
+    /// Covers a full 16-drive set with headroom; `for_disks` scales it when a
+    /// request spans more drives than that.
+    fn default() -> Self {
+        Self::new(16 * 1024 * 1024)
+    }
+}
+
+impl DeleteRecoveryWorkBudget {
+    /// A per-request budget sized for `disks` concurrently admitted recovery steps.
+    pub(crate) fn for_disks(disks: usize) -> Self {
+        let per_disk = u64::from(DELETE_RECOVERY_RESERVATION_PER_DISK) * 2;
+        let scaled = u64::try_from(disks).unwrap_or(u64::MAX).saturating_mul(per_disk);
+        let default = u64::from(Self::default().remaining());
+        Self::new(u32::try_from(scaled.max(default)).unwrap_or(u32::MAX))
+    }
+
+    pub(crate) fn new(entries: u32) -> Self {
+        Self {
+            remaining: std::sync::atomic::AtomicU32::new(entries),
+        }
+    }
+
+    pub(crate) fn reserve(&self, maximum: u32) -> crate::disk::error::Result<u32> {
+        use std::sync::atomic::Ordering;
+        self.remaining
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                (remaining > 0).then(|| remaining.saturating_sub(maximum))
+            })
+            .map(|remaining| remaining.min(maximum))
+            .map_err(|_| crate::disk::error::DiskError::DeleteRecoveryWorkLimit)
+    }
+
+    pub(crate) fn remaining(&self) -> u32 {
+        self.remaining.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Admit one bounded disk call: refuse once the budget is spent, otherwise
+    /// cap the call at `maximum` or what remains. The work actually performed is
+    /// charged on completion with `charge`, so concurrent calls never exhaust
+    /// the budget by reservation alone (a bulk delete fans out dozens of
+    /// inspections per key); each call is still bounded by its own cap.
+    pub(crate) fn admit(&self, maximum: u32) -> crate::disk::error::Result<u32> {
+        match self.remaining() {
+            0 => Err(crate::disk::error::DiskError::DeleteRecoveryWorkLimit),
+            remaining => Ok(remaining.min(maximum)),
+        }
+    }
+
+    /// Record the entries a bounded call visited (at least one per call).
+    pub(crate) fn charge(&self, visited: u32) {
+        use std::sync::atomic::Ordering;
+        let _ = self.remaining.try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+            Some(remaining.saturating_sub(visited.max(1)))
+        });
+    }
+}
+
 #[derive(Default, Clone)]
 pub struct ObjectOptions {
+    #[doc(hidden)]
+    pub delete_recovery_work_budget: Option<Arc<DeleteRecoveryWorkBudget>>,
     // Use the maximum parity (N/2), used when saving server configuration files
     pub max_parity: bool,
     pub mod_time: Option<OffsetDateTime>,
@@ -1106,6 +1197,12 @@ pub struct ObjectOptions {
     pub expiration: ExpirationOptions,
     pub lifecycle_audit_event: LcAuditEvent,
 
+    /// In-process request gate evaluated on authoritative completion metadata.
+    /// Not persisted or sent over RPC. The trait deliberately has no Debug bound:
+    /// implementations may own customer encryption keys.
+    #[doc(hidden)]
+    pub multipart_completion_authorization:
+        Option<Arc<dyn crate::storage_api_contracts::multipart::MultipartCompletionAuthorization<Error = Error>>>,
     pub eval_metadata: Option<HashMap<String, String>>,
     /// Internal compare-and-set condition for replication workers publishing
     /// terminal status after remote I/O. Storage validates it while holding
@@ -1119,6 +1216,10 @@ pub struct ObjectOptions {
     /// Authoritative bucket Object Lock snapshot installed inside `ECStore`
     /// before a destructive commit reaches the set layer.
     pub object_lock_config_snapshot: Option<Arc<ObjectLockConfigSnapshot>>,
+    /// ECStore single PUTs acquire their destructive-write configuration guards
+    /// only after staging the client body. External lock owners supply a snapshot.
+    #[doc(hidden)]
+    pub defer_put_object_lock_snapshot: bool,
 
     pub want_checksum: Option<Checksum>,
     pub skip_verify_bitrot: bool,
@@ -1150,6 +1251,11 @@ pub enum ReplicationStatusWritebackMode {
 }
 
 impl ObjectOptions {
+    pub(crate) fn ensure_delete_recovery_work_budget(&mut self) {
+        self.delete_recovery_work_budget
+            .get_or_insert_with(|| Arc::new(DeleteRecoveryWorkBudget::default()));
+    }
+
     pub(crate) fn shard_integrity_write_enabled(&self) -> bool {
         match self.shard_integrity_write_mode {
             Some(ShardIntegrityWriteMode::Protected) => true,
@@ -1547,6 +1653,8 @@ pub struct ObjectInfo {
     /// published by the same upload. Callers must not repeat quota, replication,
     /// lifecycle, or object-created side effects for that response.
     pub multipart_completion_replayed: bool,
+    /// Previous current version's size observed during `rename_data` commit.
+    pub backfilled_old_current_size: Option<crate::disk::OldCurrentSize>,
 }
 
 impl Default for ObjectInfo {
@@ -1589,6 +1697,7 @@ impl Default for ObjectInfo {
             replication_decision: String::new(),
             checksum: None,
             multipart_completion_replayed: false,
+            backfilled_old_current_size: None,
         }
     }
 }
@@ -1632,6 +1741,7 @@ impl Clone for ObjectInfo {
             replication_decision: self.replication_decision.clone(),
             checksum: self.checksum.clone(),
             multipart_completion_replayed: self.multipart_completion_replayed,
+            backfilled_old_current_size: self.backfilled_old_current_size,
             expires: self.expires,
         }
     }

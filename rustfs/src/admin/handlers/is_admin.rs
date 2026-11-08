@@ -66,7 +66,7 @@ impl Operation for IsAdminHandler {
             let empty_claims = HashMap::new();
             let iam_store = crate::admin::runtime_sources::current_ready_iam_handle()
                 .map_err(|_| s3_error!(InternalError, "iam not init"))?;
-            let conditions = get_condition_values(req.headers(), &cred, None, None, None);
+            let conditions = get_condition_values(req.headers(), &cred, None, None, req.policy_source_addr());
             iam_store
                 .is_allowed(&Args {
                     account: &cred.access_key,

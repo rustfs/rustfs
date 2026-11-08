@@ -19,7 +19,7 @@
 //! usage caches, with a one-level sub-prefix breakdown — the data console
 //! buckets view MinIO serves from `loadPrefixUsageFromBackend`.
 
-use crate::admin::auth::authorize_admin_envelope;
+use crate::admin::auth::{authenticate_envelope_credentials, validate_admin_request_with_bucket};
 use crate::admin::handlers::system::data_usage_info_gate_actions;
 use crate::admin::operation::{AdminRequest, AdminResponse, Operation};
 use crate::admin::router::{AdminOperation, S3Router};
@@ -69,15 +69,24 @@ fn parse_usage_prefix_query(query: Option<&str>) -> S3Result<(String, usize)> {
 #[async_trait::async_trait]
 impl Operation for BucketPrefixUsageHandler {
     async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
-        // The shared gate reports the same `InvalidRequest` "get cred failed" this
-        // handler has always returned for a credential-less request, so it needs no
-        // message-preserving pre-check.
-        authorize_admin_envelope(req.envelope(), data_usage_info_gate_actions()).await?;
-
+        let Some(input_cred) = req.credentials() else {
+            return Err(S3Error::with_message(S3ErrorCode::InvalidRequest, "get cred failed"));
+        };
+        let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
         let bucket = params.get("bucket").unwrap_or_default().to_string();
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket path parameter is required"));
         }
+        validate_admin_request_with_bucket(
+            req.headers(),
+            &cred,
+            owner,
+            false,
+            data_usage_info_gate_actions(),
+            req.policy_source_addr(),
+            &bucket,
+        )
+        .await?;
         let (prefix, max_entries) = parse_usage_prefix_query(req.uri().query())?;
 
         // Authorization is bucket-scoped by the same any-of gate as the

@@ -743,6 +743,7 @@ pub(crate) fn lookup_scanner_runtime_config(
         max_duration: cycle_max_duration.filter(|duration| !duration.is_zero()),
         max_objects: cycle_max_objects,
         max_directories: cycle_max_directories,
+        ..Default::default()
     };
 
     let (bitrot_cycle, bitrot_cycle_source) = if let Some(value) = rustfs_utils::get_env_opt_str(ENV_SCANNER_BITROT_CYCLE_SECS) {
@@ -1171,6 +1172,7 @@ mod tests {
                 max_duration: Some(Duration::from_secs(1800)),
                 max_objects: Some(1000),
                 max_directories: Some(8000),
+                ..Default::default()
             },
             ..Default::default()
         };

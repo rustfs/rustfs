@@ -481,7 +481,8 @@ mod bucket_default_sse_lookup_tests {
         let err = classify_bucket_default_sse_lookup("bucket", Err(StorageError::ErasureReadQuorum))
             .expect_err("an unreadable metadata subsystem must never degrade to plaintext");
 
-        assert_eq!(err.code(), &S3ErrorCode::Custom("SlowDownRead".into()));
+        // Write path: retryable ServiceUnavailable, not the GET-only SlowDownRead.
+        assert_eq!(err.code(), &S3ErrorCode::ServiceUnavailable);
     }
 
     #[test]
@@ -702,7 +703,8 @@ fn build_put_object_expiration_header(event: &lifecycle::Event) -> Option<String
     // HTTP-date, not ISO-8601: the AWS SDKs hand this value to an RFC 822
     // parser, which rejects `2026-10-02T00:00:00Z` and drops the metadata.
     let expiry_date = format_http_date(&Timestamp::from(expire_time)).ok()?;
-    Some(format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id))
+    let value = format!("expiry-date=\"{}\", rule-id=\"{}\"", expiry_date, event.rule_id);
+    http::HeaderValue::from_str(&value).is_ok().then_some(value)
 }
 
 pub(super) fn internal_object_info_lookup_opts(mut opts: ObjectOptions) -> ObjectOptions {
@@ -876,7 +878,7 @@ pub(crate) fn build_put_like_object_lock_metadata(
     Ok(Some(eval_metadata))
 }
 
-pub(super) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
+pub(in crate::app) fn put_like_write_creates_new_version(opts: &ObjectOptions) -> bool {
     opts.version_id.is_none() && opts.versioned && !opts.version_suspended
 }
 
@@ -999,7 +1001,7 @@ pub(crate) async fn object_lock_checks_required(bucket: &str) -> bool {
         .map_or(true, |metadata| metadata.object_lock_checks_required())
 }
 
-pub(super) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
+pub(in crate::app) fn object_lock_checks_required_for_state(state: &metadata_sys::ObjectLockConfigState) -> bool {
     match state {
         metadata_sys::ObjectLockConfigState::Configured { .. } | metadata_sys::ObjectLockConfigState::Fabricated => true,
         metadata_sys::ObjectLockConfigState::ConfirmedAbsent => false,
@@ -1954,6 +1956,27 @@ mod tests {
         };
 
         assert!(build_put_object_expiration_header(&event).is_none());
+    }
+
+    #[test]
+    fn expiration_header_ignores_unsafe_legacy_rule_ids() {
+        let mut event = lifecycle::Event {
+            action: lifecycle::IlmAction::DeleteAction,
+            rule_id: String::new(),
+            due: Some(OffsetDateTime::from_unix_timestamp(1_700_000_000).expect("valid expiry")),
+            noncurrent_days: 0,
+            newer_noncurrent_versions: 0,
+            storage_class: String::new(),
+            expiry_policy: None,
+        };
+        for id in ["rule\nname", "rule\rname", "rule\0name", "rule\u{7f}name"] {
+            event.rule_id = id.to_owned();
+            assert!(build_put_object_expiration_header(&event).is_none(), "{id:?}");
+        }
+        event.rule_id = "保留策略".to_owned();
+        let header = build_put_object_expiration_header(&event).expect("valid UTF-8 IDs remain supported");
+        assert!(http::HeaderValue::from_str(&header).is_ok());
+        assert!(header.contains("保留策略"));
     }
 
     #[test]

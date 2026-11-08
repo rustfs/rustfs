@@ -415,6 +415,16 @@ where
 
         self.api.save_iam_config(IAMFormat::new_version_1(), path).await
     }
+    /// Current built-in IAM group membership, independent of credential snapshots.
+    pub fn user_group_memberships(&self, name: &str) -> Vec<String> {
+        self.cache
+            .snapshot()
+            .user_group_memberships
+            .get(name)
+            .map(|groups| groups.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
     pub async fn get_user(&self, access_key: &str) -> Option<UserIdentity> {
         let cache = self.cache.snapshot();
         cache
@@ -1005,6 +1015,17 @@ where
     }
 
     pub async fn sts_policy_db_get(&self, name: &str, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
+        self.sts_policy_db_get_with_identity_mapping(name, groups)
+            .await
+            .map(|(policies, _)| policies)
+    }
+
+    /// Resolve STS policies and whether that same lookup found a nonempty identity mapping.
+    pub async fn sts_policy_db_get_with_identity_mapping(
+        &self,
+        name: &str,
+        groups: &Option<Vec<String>>,
+    ) -> Result<(Vec<String>, bool)> {
         if name.is_empty() {
             return Err(Error::InvalidArgument);
         }
@@ -1031,7 +1052,10 @@ where
             }
         };
 
-        self.policy_db_get_with_groups(mapped_policy.to_slice(), groups).await
+        let direct_policies = mapped_policy.to_slice();
+        let has_identity_mapping = !direct_policies.is_empty();
+        let policies = self.policy_db_get_with_groups(direct_policies, groups).await?;
+        Ok((policies, has_identity_mapping))
     }
 
     async fn policy_db_get_with_groups(&self, mut policies: Vec<String>, groups: &Option<Vec<String>>) -> Result<Vec<String>> {
@@ -1158,7 +1182,7 @@ where
         if let Some(groups) = u.credentials.groups.as_ref() {
             for group in groups.iter() {
                 if groups_cache.get(group).filter(|v| v.status == STATUS_DISABLED).is_some() {
-                    return Ok((Vec::new(), OffsetDateTime::now_utc()));
+                    continue;
                 }
 
                 let mp = match group_policies.get(group) {
@@ -1189,7 +1213,7 @@ where
 
         for group in user_group_memberships.get(name).cloned().unwrap_or_default().iter() {
             if groups_cache.get(group).filter(|v| v.status == STATUS_DISABLED).is_some() {
-                return Ok((Vec::new(), OffsetDateTime::now_utc()));
+                continue;
             }
 
             let mp = match group_policies.get(group) {
@@ -1486,7 +1510,27 @@ where
         args: &AddOrUpdateUserReq,
         updated_at: OffsetDateTime,
     ) -> Result<OffsetDateTime> {
+        self.add_user_at_with_secret_change(access_key, args, updated_at)
+            .await
+            .map(|(updated_at, _, _guard)| updated_at)
+    }
+
+    /// Return whether this write replaced a different regular-user secret.
+    pub(crate) async fn add_user_at_with_secret_change(
+        &self,
+        access_key: &str,
+        args: &AddOrUpdateUserReq,
+        updated_at: OffsetDateTime,
+    ) -> Result<(OffsetDateTime, bool, tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>)> {
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let parent_guard = parent_lock.lock_owned().await;
+        let _service_guard = self.cache.service_account_mutation_lock().lock().await;
+        let sts_lock = self.cache.sts_account_mutation_lock(access_key);
+        let _sts_guard = sts_lock.lock().await;
         let cache = self.cache.snapshot();
+        if cache.sts_accounts.contains_key(access_key) {
+            return Err(Error::AccessKeyAlreadyExists);
+        }
         let users = Arc::clone(&cache.users);
         if let Some(x) = users.get(access_key) {
             debug!(
@@ -1496,10 +1540,13 @@ where
                 state = "existing",
                 "Updating existing IAM user"
             );
-            if x.credentials.is_temp() {
+            if x.credentials.is_temp() || x.credentials.is_service_account() {
                 return Err(Error::AccessKeyAlreadyExists);
             }
         }
+        let secret_changed = users
+            .get(access_key)
+            .is_some_and(|user| user.credentials.secret_key != args.secret_key);
         drop(cache);
         drop(users);
 
@@ -1523,7 +1570,7 @@ where
 
         self.update_user_with_claims(access_key, user_entry)?;
 
-        Ok(updated_at)
+        Ok((updated_at, secret_changed, parent_guard))
     }
 
     pub async fn delete_user(&self, access_key: &str, utype: UserType) -> Result<()> {
@@ -1540,12 +1587,17 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = (utype == UserType::Reg).then(|| self.cache.parent_mutation_lock(access_key));
+        let _parent_guard = match &parent_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let sts_mutation_lock = (utype == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(access_key));
         let _sts_mutation_guard = match &sts_mutation_lock {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
-        let _service_account_guard = if utype == UserType::Svc {
+        let _service_account_guard = if matches!(utype, UserType::Svc | UserType::Reg) {
             Some(self.cache.service_account_mutation_lock().lock().await)
         } else {
             None
@@ -1640,16 +1692,45 @@ where
     }
 
     pub async fn update_user_secret_key(&self, access_key: &str, secret_key: &str) -> Result<(OffsetDateTime, AccountStatus)> {
+        self.update_user_secret_key_with_guard(access_key, secret_key, None)
+            .await
+            .map(|(updated_at, status, _guard)| (updated_at, status))
+    }
+
+    pub(crate) async fn update_user_secret_key_with_guard(
+        &self,
+        access_key: &str,
+        secret_key: &str,
+        expected_secret: Option<&str>,
+    ) -> Result<(
+        OffsetDateTime,
+        AccountStatus,
+        tokio::sync::OwnedMutexGuard<crate::cache::MutationLockState>,
+    )> {
         if access_key.is_empty() || secret_key.is_empty() {
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let parent_guard = parent_lock.lock_owned().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
             Some(u) => u,
+            None if expected_secret.is_some() => return Err(Error::IAMActionNotAllowed),
             None => return Err(Error::NoSuchUser(access_key.to_string())),
         };
+
+        if let Some(expected) = expected_secret {
+            use subtle::ConstantTimeEq as _;
+            if !u.credentials.is_valid()
+                || u.credentials.is_temp()
+                || u.credentials.is_service_account()
+                || !bool::from(u.credentials.secret_key.as_bytes().ct_eq(expected.as_bytes()))
+            {
+                return Err(Error::IAMActionNotAllowed);
+            }
+        }
 
         let mut cred = u.credentials.clone();
         cred.secret_key = secret_key.to_string();
@@ -1672,7 +1753,7 @@ where
             .await?;
 
         self.update_user_with_claims(access_key, u)?;
-        Ok((updated_at, status))
+        Ok((updated_at, status, parent_guard))
     }
 
     /// Add SSH public key for a user (for SFTP authentication)
@@ -1681,6 +1762,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let _parent_guard = parent_lock.lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -1720,6 +1803,8 @@ where
             return Err(Error::InvalidArgument);
         }
 
+        let parent_lock = self.cache.parent_mutation_lock(access_key);
+        let _parent_guard = parent_lock.lock().await;
         let cache = self.cache.snapshot();
         let users = Arc::clone(&cache.users);
         let u = match users.get(access_key) {
@@ -2238,6 +2323,11 @@ where
         Ok(())
     }
     pub async fn user_notification_handler(&self, name: &str, user_type: UserType) -> Result<()> {
+        let parent_lock = (user_type == UserType::Reg).then(|| self.cache.parent_mutation_lock(name));
+        let _parent_guard = match &parent_lock {
+            Some(lock) => Some(lock.lock().await),
+            None => None,
+        };
         let sts_mutation_lock = (user_type == UserType::Sts).then(|| self.cache.sts_account_mutation_lock(name));
         let _sts_mutation_guard = match &sts_mutation_lock {
             Some(lock) => Some(lock.lock().await),
@@ -2982,6 +3072,58 @@ mod tests {
             "credentials",
         ] {
             assert!(!captured.contains(forbidden), "credential material must not appear in logs: {forbidden}");
+        }
+    }
+
+    #[tokio::test]
+    async fn disabled_group_preserves_direct_and_other_group_policies() {
+        for credential_groups in [false, true] {
+            let iam = build_test_iam_cache(FailingInitialLoadStore);
+            let groups = vec!["disabled".to_string(), "enabled".to_string()];
+            let user = UserIdentity::new(Credentials {
+                access_key: "alice".to_string(),
+                secret_key: "alice-secret".to_string(),
+                status: STATUS_ENABLED.to_string(),
+                groups: credential_groups.then(|| groups.clone()),
+                ..Default::default()
+            });
+            let now = OffsetDateTime::now_utc();
+            iam.cache.add_or_update_user("alice", &user, now);
+            iam.cache
+                .add_or_update_user_policy("alice", &MappedPolicy::new("direct-deny"), now);
+            if !credential_groups {
+                iam.cache
+                    .add_or_update_user_group_membership("alice", &groups.iter().cloned().collect(), now);
+            }
+            for (group, status, policy) in [
+                ("disabled", STATUS_DISABLED, "disabled-grant"),
+                ("enabled", STATUS_ENABLED, "other-group-deny"),
+            ] {
+                iam.cache.add_or_update_group(
+                    group,
+                    &GroupInfo {
+                        status: status.to_string(),
+                        members: vec!["alice".to_string()],
+                        ..Default::default()
+                    },
+                    now,
+                );
+                iam.cache.add_or_update_group_policy(group, &MappedPolicy::new(policy), now);
+            }
+            let policies: HashSet<_> = iam
+                .policy_db_get("alice", &None)
+                .await
+                .expect("user policy lookup")
+                .into_iter()
+                .collect();
+            assert_eq!(policies, HashSet::from(["direct-deny".to_string(), "other-group-deny".to_string()]));
+            assert!(
+                iam.policy_db_get_internal("disabled", true, false)
+                    .await
+                    .expect("disabled group lookup")
+                    .0
+                    .is_empty()
+            );
         }
     }
 

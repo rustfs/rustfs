@@ -143,15 +143,27 @@ async fn test_root_requests_keep_policy_owner_flag() -> Result<(), Box<dyn std::
         .send()
         .await?;
 
-    // Duplicate stored tags are ambiguous. An owner request must not enter the
-    // OPA tag-loading path, which rejects this metadata before evaluation.
-    client
+    // Duplicate tag keys are ambiguous, so PutBucketTagging rejects them
+    // before they can reach stored metadata or the OPA tag-loading path.
+    let duplicate = client
         .put_bucket_tagging()
         .bucket(bucket)
         .tagging(
             Tagging::builder()
                 .tag_set(Tag::builder().key("department").value("finance").build()?)
                 .tag_set(Tag::builder().key("department").value("engineering").build()?)
+                .build()?,
+        )
+        .send()
+        .await
+        .expect_err("duplicate bucket tag keys must be rejected");
+    assert_eq!(duplicate.into_service_error().meta().code(), Some("InvalidTag"));
+    client
+        .put_bucket_tagging()
+        .bucket(bucket)
+        .tagging(
+            Tagging::builder()
+                .tag_set(Tag::builder().key("department").value("finance").build()?)
                 .build()?,
         )
         .send()

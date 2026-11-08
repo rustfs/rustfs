@@ -1200,6 +1200,84 @@ fn log_missing_set_snapshot_metadata(store: &SetDisks, info: &DataUsageCacheInfo
     );
 }
 
+/// Saves a set's service order over its unchanged cache, which an incomplete
+/// cycle otherwise never writes. Under the set cache lock and its revisions the
+/// save cannot replace newer coverage; a failed save costs fairness only.
+pub(super) async fn persist_scanner_service_ledger(
+    store: Arc<SetDisks>,
+    source: DataUsageCacheSource,
+    mut ledger: DataUsageBucketServiceLedger,
+    cycle: u64,
+    leader_epoch: u64,
+    expected_publication_epoch: u64,
+) -> bool {
+    let log_skipped = |state: &str, error: &dyn std::fmt::Display| {
+        warn!(
+            target: "rustfs::scanner::io",
+            event = EVENT_SCANNER_CACHE_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_IO,
+            state,
+            pool = source.pool_index,
+            set = source.set_index,
+            cycle,
+            leader_epoch,
+            cache_name = DATA_USAGE_CACHE_NAME,
+            error = %error,
+            "Scanner kept the previous bucket service order"
+        );
+    };
+    let guard = match acquire_scanner_cache_locks(store.as_ref(), DATA_USAGE_CACHE_NAME, source).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            log_skipped(error.state(), &error);
+            return false;
+        }
+    };
+    let mut persisted = DataUsageCache::default();
+    let revisions = match persisted.load_with_revisions(store.clone(), DATA_USAGE_CACHE_NAME).await {
+        Ok(revisions) => revisions,
+        Err(error) => {
+            log_skipped("service_order_load_failed", &error);
+            return false;
+        }
+    };
+    if persisted.info.next_cycle > cycle
+        || persisted.info.leader_epoch > leader_epoch
+        || persisted
+            .info
+            .scan_bucket_service
+            .as_ref()
+            .is_some_and(|saved| saved.leader_epoch > leader_epoch)
+    {
+        log_skipped("service_order_stale", &"a newer scanner owns the set cache");
+        return false;
+    }
+    if guard.is_lock_lost() {
+        log_skipped("service_order_lock_lost", &"set cache lock was lost");
+        return false;
+    }
+    if persisted.info.name.is_empty() {
+        // First incomplete cycle of a set: the order is its only content.
+        persisted.info.name = DATA_USAGE_ROOT.to_string();
+        persisted.info.source = Some(source);
+        persisted.info.leader_epoch = leader_epoch;
+        persisted.info.cache_key_format = DATA_USAGE_CACHE_KEY_FORMAT;
+    }
+    ledger.leader_epoch = leader_epoch;
+    persisted.info.scan_bucket_service = Some(ledger);
+    match persisted
+        .save_with_revisions_for_epoch(store, DATA_USAGE_CACHE_NAME, &revisions, expected_publication_epoch)
+        .await
+    {
+        Ok(()) => true,
+        Err(error) => {
+            log_skipped("service_order_save_failed", &error);
+            false
+        }
+    }
+}
+
 pub(super) async fn persist_and_publish_cache_snapshot(
     store: Arc<SetDisks>,
     updates: &mpsc::Sender<DataUsageCache>,

@@ -24,7 +24,7 @@
 //! `StageFilter`"). This layer is not one of the nine rows of that table.
 //! Removed by: T2.12 (rustfs/backlog#2771).
 
-use super::{SerializedS3Error, is_xml_response};
+use super::{SerializedS3Error, is_xml_compat_body, is_xml_response};
 use crate::server::hybrid::HybridBody;
 use crate::server::is_table_catalog_path;
 use bytes::Bytes;
@@ -85,6 +85,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let (rest_body, converted_status) = convert_iceberg_error_in_xml(
                         rest_body,

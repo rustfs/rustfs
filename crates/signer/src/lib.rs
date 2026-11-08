@@ -20,12 +20,14 @@
 //! passes through unchanged, so callers sign whatever body type they send.
 
 pub mod constants;
+pub mod request_signature_azure;
 pub mod request_signature_streaming;
 pub mod request_signature_streaming_unsigned_trailer;
 pub mod request_signature_v2;
 pub mod request_signature_v4;
 pub mod utils;
 
+pub use request_signature_azure::{AzureSignError, azure_shared_key_signature};
 pub use request_signature_streaming::streaming_sign_v4;
 pub use request_signature_streaming::try_streaming_sign_v4;
 pub use request_signature_v2::SignV2Error;

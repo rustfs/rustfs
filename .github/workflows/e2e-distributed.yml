@@ -17,8 +17,8 @@
 # Each selected test starts a real localhost cluster via
 # `RustFSTestClusterEnvironment` (4 processes; 4 drives per node unless the
 # case is a two-site 4-node 1-drive pair or a 4-node upgrade). Membership is
-# `[profile.e2e-distributed]` in `.config/nextest.toml`. Storage-sensitive PRs,
-# nightly runs, and manual dispatches all execute the same fail-closed suite.
+# `[profile.e2e-distributed]` in `.config/nextest.toml`. The nightly schedule
+# and manual dispatches execute the same fail-closed suite.
 # Upgrade cases download the same pinned previous release as e2e-upgrade.yml.
 #
 # Isolated pool filesystems: expand/decommission/rebalance cases require
@@ -33,32 +33,6 @@
 name: e2e-distributed
 
 on:
-  pull_request:
-    paths:
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - ".config/nextest.toml"
-      - ".config/e2e-distributed-selection.txt"
-      - ".github/workflows/e2e-distributed.yml"
-      - "crates/audit/**"
-      - "crates/common/**"
-      - "crates/config/**"
-      - "crates/e2e_test/**"
-      - "crates/ecstore/**"
-      - "crates/filemeta/**"
-      - "crates/heal/**"
-      - "crates/iam/**"
-      - "crates/lock/**"
-      - "crates/madmin/**"
-      - "crates/notify/**"
-      - "crates/replication/**"
-      - "crates/s3-client/**"
-      - "crates/s3-ops/**"
-      - "crates/s3-types/**"
-      - "crates/scanner/**"
-      - "crates/storage-api/**"
-      - "crates/utils/**"
-      - "rustfs/**"
   workflow_dispatch:
     inputs:
       filter:

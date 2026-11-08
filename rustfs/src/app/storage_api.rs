@@ -24,6 +24,13 @@ pub(crate) fn EndpointServerPools(
     crate::storage::storage_api::EndpointServerPools::from(pools)
 }
 
+/// Streaming body types the request-body adapters implement against.
+pub(crate) mod request_body {
+    pub(crate) use s3s::StdError;
+    pub(crate) use s3s::dto::StreamingBlob;
+    pub(crate) use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+}
+
 #[cfg(feature = "diagnostic-read-version-caller")]
 pub(crate) mod diagnostic {
     pub(crate) use crate::storage::storage_api::ecstore_diagnostic::{
@@ -305,11 +312,11 @@ pub(crate) mod access {
     pub(crate) use crate::storage::storage_api::access_consumer::{
         PostObjectRequestMarker, TABLE_DATA_PLANE_LIST_CURSOR_PREFIX, TableDataPlaneListAccess, TableDataPlaneListCursorPosition,
         TableDataPlanePublicationGuards, apply_bucket_generation_guard, apply_copy_source_bucket_generation_guard,
-        authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action, has_bypass_governance_header,
-        load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
+        authorize_copy_object_tags, authorize_request, bucket_config_mutation_incarnation, delete_object_authorize_action,
+        has_bypass_governance_header, load_bucket_generation_from_store, log_list_buckets_iam_implicit_deny, odm_read_generation,
         prepare_list_buckets_iam_authorization, prepare_odm_read_generation, recursive_force_delete_has_authenticated_caller,
-        replication_request_authorized, req_info_mut, req_info_ref, retained_table_data_plane_publication_guards,
-        set_requested_object_lock_retain_until,
+        replication_proxy_allowed, replication_request_authorized, req_info_mut, req_info_ref,
+        retained_table_data_plane_publication_guards, set_requested_object_lock_retain_until,
     };
 }
 
@@ -915,8 +922,6 @@ pub(crate) mod bucket {
         pub(crate) const BUCKET_REPLICATION_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_REPLICATION_CONFIG;
         pub(crate) const BUCKET_SSECONFIG: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_SSECONFIG;
-        pub(crate) const BUCKET_TAGGING_CONFIG: &str =
-            crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TAGGING_CONFIG;
         pub(crate) const BUCKET_TARGETS_FILE: &str = crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_TARGETS_FILE;
         pub(crate) const BUCKET_VERSIONING_CONFIG: &str =
             crate::storage::storage_api::ecstore_bucket::metadata::BUCKET_VERSIONING_CONFIG;
@@ -1037,7 +1042,20 @@ pub(crate) mod bucket {
         pub(crate) async fn get_tagging_config(
             bucket: &str,
         ) -> Result<(PersistedTagging, OffsetDateTime), crate::storage::storage_api::StorageError> {
-            crate::storage::storage_api::ecstore_bucket::metadata_sys::get_tagging_config(bucket).await
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::get_s3_tagging_config(bucket).await
+        }
+
+        pub(crate) async fn update_s3_tagging_config(
+            bucket: &str,
+            tagging: Option<PersistedTagging>,
+            expected_incarnation_id: Option<uuid::Uuid>,
+        ) -> Result<OffsetDateTime, crate::storage::storage_api::StorageError> {
+            crate::storage::storage_api::ecstore_bucket::metadata_sys::update_s3_tagging_config(
+                bucket,
+                tagging,
+                expected_incarnation_id,
+            )
+            .await
         }
 
         pub(crate) async fn update(
@@ -1149,7 +1167,6 @@ pub(crate) mod bucket {
         pub(crate) type DeleteReplicationConfigSnapshot =
             crate::storage::storage_api::ecstore_bucket::replication::DeleteReplicationConfigSnapshot;
         pub(crate) type ReplicateDecision = replication_contracts::ReplicateDecision;
-        #[cfg(test)]
         pub(crate) type ReplicationState = replication_contracts::ReplicationState;
         pub(crate) type ReplicationStatusType = replication_contracts::ReplicationStatusType;
         pub(crate) type ReplicationTargetValidationError = replication_contracts::ReplicationTargetValidationError;
@@ -1400,6 +1417,54 @@ pub(crate) mod bucket {
             replication_contracts::delete_replication_state_from_config(config, &source)
         }
 
+        /// Replication state for forwarding a replica delete (an inbound
+        /// replication request) to this site's own targets.
+        ///
+        /// Operator rules with ReplicaModifications keep forwarding, so chained
+        /// replication A -> B -> C propagates deletes (rustfs#2609). Derived
+        /// site-replication rules never do: site replication is a full mesh
+        /// where the origin delivers, and MRF-retries, every delete to each
+        /// peer itself. Forwarding along a `site-repl-<deploymentId>` rule only
+        /// echoes the delete back to the origin, where it removes the origin's
+        /// pending-purge version before its own delivery state is written back,
+        /// and duplicates it to every other peer (rustfs#9121). MinIO never
+        /// re-replicates a replication request at all.
+        ///
+        /// Rule ids and target ARN shapes are not reserved: an ordinary bucket
+        /// target ARN also carries a target id, so an operator rule can match
+        /// the derived shape. Only a rule naming a current remote peer in
+        /// `site_peer_deployment_ids` is skipped; with site replication
+        /// disabled the set is empty and every rule forwards.
+        pub(crate) fn replica_delete_fanout_state_from_config(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+            obj_info: &crate::storage::storage_api::StorageObjectInfo,
+            version_id: Option<Uuid>,
+            site_peer_deployment_ids: &HashSet<String>,
+        ) -> Option<replication_contracts::ReplicationState> {
+            let is_site_peer_rule = |rule: &rustfs_gateway_types::persistence::PersistedReplicationRule| {
+                replication_contracts::site_replication_rule_deployment_id(rule)
+                    .is_some_and(|deployment_id| site_peer_deployment_ids.contains(deployment_id))
+            };
+            if !config.rules.iter().any(is_site_peer_rule) {
+                return delete_replication_state_from_config(config, obj_info, version_id, true);
+            }
+
+            let mut operator_config = config.clone();
+            operator_config.rules.retain(|rule| !is_site_peer_rule(rule));
+            delete_replication_state_from_config(&operator_config, obj_info, version_id, true)
+        }
+
+        /// Whether `config` has a rule with the derived site-replication shape,
+        /// so the replica-delete fan-out needs the current peer set.
+        pub(crate) fn has_site_replication_shaped_rule(
+            config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
+        ) -> bool {
+            config
+                .rules
+                .iter()
+                .any(|rule| replication_contracts::site_replication_rule_deployment_id(rule).is_some())
+        }
+
         pub(crate) fn replication_target_arns(
             config: &rustfs_gateway_types::persistence::PersistedReplicationConfiguration,
         ) -> HashSet<String> {
@@ -1528,13 +1593,17 @@ pub(crate) mod head_prefix {
 }
 
 pub(crate) mod helper {
+    #[cfg(test)]
     pub(crate) use crate::storage::storage_api::helper_consumer::{
-        OperationHelper, build_event_resp_elements, spawn_background_with_context,
+        MutationCompletionProbe, capture_mutation_event_for_test, pause_committed_mutation_for_test,
+    };
+    pub(crate) use crate::storage::storage_api::helper_consumer::{
+        OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
     };
 }
 
 pub(crate) mod object_utils {
-    pub(crate) use crate::storage::storage_api::to_s3s_etag;
+    pub(crate) use crate::storage::storage_api::{to_s3s_etag, to_s3s_xml_etag};
 }
 
 pub(crate) mod io {
@@ -1565,14 +1634,15 @@ pub(crate) mod request_context {
 pub(crate) mod sse {
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         DecryptionRequest, EncryptionRequest, PrepareEncryptionRequest, SseKmsPrincipal, apply_bucket_default_lock_retention,
-        authorize_sse_kms_object_read, classify_sse_read_response, extract_server_side_encryption_from_headers,
-        get_buffer_size_opt_in, load_bucket_object_lock_config_state, project_sse_read_response_headers, sse_decryption,
-        sse_encryption, sse_prepare_encryption, validate_bucket_object_lock_enabled_state,
+        authorize_sse_kms_multipart_write, authorize_sse_kms_object_read, classify_sse_read_response,
+        extract_server_side_encryption_from_headers, get_buffer_size_opt_in, load_bucket_object_lock_config_state,
+        project_sse_read_response_headers, sse_decryption, sse_encryption, sse_prepare_encryption,
+        validate_bucket_object_lock_enabled_state,
     };
     pub(crate) use crate::storage::storage_api::sse_consumer::{
         EncryptionKeyKind, bucket_default_write_sse, build_ssec_read_headers, encryption_material_to_metadata,
         extract_ssec_params_from_headers, extract_ssekms_context_from_headers, map_get_object_reader_error,
-        mark_encrypted_multipart_metadata,
+        mark_encrypted_multipart_metadata, multipart_completion_authorization, stored_ssec_metadata,
     };
 }
 
@@ -1611,7 +1681,7 @@ pub(crate) mod s3_api {
 
     pub(crate) mod tagging {
         pub(crate) use crate::storage::storage_api::s3_api_consumer::tagging::{
-            parse_copy_object_tags, resolve_copy_object_tags,
+            parse_copy_object_tags, resolve_copy_object_tags, validate_bucket_tag_set,
         };
     }
 }
@@ -1646,7 +1716,7 @@ pub(crate) mod bucket_usecase {
         }
     }
 
-    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api};
+    pub(crate) use super::{access, bucket, error, helper, object_utils, request_context, s3, s3_api, sse};
     pub(crate) use crate::storage::storage_api::{
         ECStore, StorageObjectInfo, StorageObjectOptions, get_validated_store, process_lambda_configurations,
         process_queue_configurations, process_topic_configurations, validate_list_object_unordered_with_delimiter,
@@ -1696,8 +1766,9 @@ pub(crate) mod object_usecase {
         ECStore, GetObjectReader, OldCurrentSize, RFC1123, StorageDeletedObject, StorageObjectInfo,
         StorageObjectLockDeleteOptions, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, check_preconditions,
         parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
-        validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+        remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
+        validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+        wrap_response_with_cors,
     };
 }
 
@@ -1729,7 +1800,9 @@ pub(crate) mod multipart_usecase {
     pub(crate) use super::{
         access, bucket, compression, data_usage, error, helper, io, object_utils, options, request_context, s3_api, set_disk, sse,
     };
-    pub(crate) use crate::storage::storage_api::{ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader};
+    pub(crate) use crate::storage::storage_api::{
+        ECStore, StorageObjectInfo, StorageObjectOptions, StoragePutObjReader, validate_new_object_key,
+    };
 }
 
 pub(crate) mod select_object {
@@ -1761,6 +1834,7 @@ pub(crate) mod context {
 #[cfg(test)]
 pub(crate) mod test {
     pub(crate) use super::EndpointServerPools;
+    pub(crate) use s3s::access::S3Access;
     pub(crate) mod contract {
         pub(crate) mod bucket {
             pub(crate) use super::super::super::storage_contracts::{
@@ -1791,6 +1865,11 @@ pub(crate) mod test {
 
     pub(crate) use super::access::ReqInfo;
     pub(crate) use super::options::VERSIONING_CONFIG_LOOKUPS;
+    pub(crate) mod sse {
+        pub(crate) use crate::storage::storage_api::test_consumer::sse::{
+            RecordingKmsKeyAuthorizer, TestAuthorizationHooks, sse_kms_object_metadata,
+        };
+    }
     pub(crate) use super::{bucket, ecfs, object_utils, runtime};
     pub(crate) mod data_usage {
         pub(crate) use super::super::data_usage::*;
@@ -1804,7 +1883,8 @@ pub(crate) mod test {
     pub(crate) mod set_disk {
         pub(crate) use crate::storage::storage_api::ecstore_set_disk::{
             ConditionalReadBenchmarkMetadataGuard, MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier,
-            PutObjectCommitPause, fail_next_quota_ledger_save_for_test,
+            PutObjectCommitPause, fail_next_quota_ledger_save_for_test, initialize_quota_ledger_for_test,
+            retry_quota_reconciliation_for_test,
         };
     }
 

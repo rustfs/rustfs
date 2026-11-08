@@ -12,30 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# Single-node upgrade and rollback lane.
+#
+# The weekly Monday schedule, version tags, and workflow_dispatch run this
+# suite. Distributed upgrade cases stay on the nightly e2e-distributed lane.
+
 name: Upgrade Compatibility
 
 on:
-  pull_request:
-    paths:
-      - ".github/workflows/e2e-upgrade.yml"
-      - "crates/e2e_test/src/common.rs"
-      - "crates/e2e_test/src/distributed/**"
-      - "crates/e2e_test/src/fake_s3_target/**"
-      - "crates/e2e_test/src/lib.rs"
-      - "crates/e2e_test/src/replication_extension_test.rs"
-      - "crates/e2e_test/src/rpc_fault_proxy.rs"
-      - "crates/e2e_test/src/upgrade_compatibility_test.rs"
-      - "crates/ecstore/**"
-      - "crates/filemeta/**"
-      - "crates/heal/**"
-      - "crates/kms/**"
-      - "crates/storage-api/**"
-      - "rustfs/**"
-      - "Cargo.lock"
   push:
     tags:
       - "[0-9]*.[0-9]*.[0-9]*"
   schedule:
+    # 03:17 UTC every Monday.
     - cron: "17 3 * * 1"
   workflow_dispatch:
 
@@ -44,7 +33,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: always

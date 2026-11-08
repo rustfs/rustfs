@@ -103,6 +103,7 @@ pub(crate) fn prepare_optional_runtime_shutdowns(optional_runtimes: OptionalRunt
 pub(crate) async fn shutdown_optional_runtime_services(
     protocol_shutdowns: &mut Vec<ShutdownHandle>,
     failures: &mut Vec<ShutdownWaitError>,
+    _retired: &mut usize,
 ) {
     for handle in protocol_shutdowns.iter() {
         handle.signal();
@@ -111,8 +112,11 @@ pub(crate) async fn shutdown_optional_runtime_services(
     while let Some(handle) = protocol_shutdowns.first_mut() {
         let result = handle.wait_checked().await;
         protocol_shutdowns.remove(0);
-        if let Err(error) = result {
-            failures.push(error);
+        match result {
+            #[cfg(feature = "webdav")]
+            Ok(crate::server::ShutdownReceipt::WebDavChildrenRetired) => *_retired += 1,
+            Ok(_) => {}
+            Err(error) => failures.push(error),
         }
     }
 }
@@ -188,7 +192,7 @@ mod tests {
         assert!(events.lock().unwrap_or_else(|err| err.into_inner()).is_empty());
 
         let mut failures = Vec::new();
-        shutdown_optional_runtime_services(&mut protocol_shutdowns, &mut failures).await;
+        shutdown_optional_runtime_services(&mut protocol_shutdowns, &mut failures, &mut 0).await;
         assert!(failures.is_empty(), "all configured front task joins succeeded");
         assert!(protocol_shutdowns.is_empty(), "all actual owners were joined");
 
@@ -231,7 +235,8 @@ mod tests {
         let cancelled = ShutdownHandle::new(tx, cancelled);
         let mut handles = vec![panic, held, cancelled];
         let mut failures = Vec::new();
-        let mut observer = Box::pin(shutdown_optional_runtime_services(&mut handles, &mut failures));
+        let mut retired = 0;
+        let mut observer = Box::pin(shutdown_optional_runtime_services(&mut handles, &mut failures, &mut retired));
         let pending = std::future::poll_fn(|cx| Poll::Ready(observer.as_mut().poll(cx).is_pending())).await;
         drop(observer);
         let retained = handles.len() == 2 && failures.len() == 1;
@@ -245,7 +250,7 @@ mod tests {
         let completed = tokio::time::timeout(Duration::from_secs(5), done_rx)
             .await
             .is_ok_and(|r| r.is_ok());
-        shutdown_optional_runtime_services(&mut handles, &mut failures).await;
+        shutdown_optional_runtime_services(&mut handles, &mut failures, &mut 0).await;
         assert!(ready && pending && retained && entered && completed);
         assert!(handles.is_empty());
         assert_eq!(failures.len(), 2);
@@ -272,7 +277,7 @@ mod tests {
         handle.wait_checked().await.expect("actual initial join");
         let mut handles = vec![handle];
         let mut failures = Vec::new();
-        shutdown_optional_runtime_services(&mut handles, &mut failures).await;
+        shutdown_optional_runtime_services(&mut handles, &mut failures, &mut 0).await;
         assert!(handles.is_empty());
         assert!(matches!(failures.as_slice(), [crate::server::ShutdownWaitError::MissingTask]));
     }

@@ -2146,3 +2146,4 @@ mod tests {
         );
     }
 }
+// event-drill: isolated harness-only change

@@ -135,21 +135,10 @@ impl ProxyChainAnalyzer {
         })
     }
 
-    /// Lenient mode: Accepts the entire chain if the last proxy is trusted.
+    /// Lenient mode still derives identity from the trusted suffix: accepting
+    /// a connection does not make client-written earlier hops authoritative.
     fn analyze_lenient(&self, chain: &[IpAddr]) -> (IpAddr, Vec<IpAddr>, usize) {
-        if chain.is_empty() {
-            return (IpAddr::from([0, 0, 0, 0]), Vec::new(), 0);
-        }
-
-        if let Some(last_proxy) = chain.last()
-            && self.is_ip_trusted(last_proxy)
-        {
-            let client_ip = chain.first().copied().unwrap_or(*last_proxy);
-            return (client_ip, chain.to_vec(), chain.len());
-        }
-
-        let client_ip = chain.first().copied().unwrap_or_else(|| IpAddr::from([0, 0, 0, 0]));
-        (client_ip, Vec::new(), 0)
+        self.analyze_hop_by_hop(chain)
     }
 
     /// Strict mode: Requires every IP in the chain to be trusted.

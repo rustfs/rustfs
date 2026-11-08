@@ -700,6 +700,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn key_management_cannot_preempt_or_disable_the_readiness_probe() {
+        let temp_dir = tempfile::tempdir().expect("key directory");
+        let backend = local_backend(&temp_dir).await;
+        let mut config = KmsConfig::local(temp_dir.path().to_path_buf()).with_insecure_development_defaults();
+        config.allow_immediate_deletion = true;
+        let manager = crate::manager::KmsManager::new(backend.clone(), config);
+        let request = CreateKeyRequest {
+            key_name: Some(PROBE_KEY_ID.to_owned()),
+            ..Default::default()
+        };
+        assert!(matches!(manager.create_key(request).await, Err(KmsError::InvalidOperation { .. })));
+        let worker = worker(backend.clone());
+        assert_eq!(worker.round().await, ProbeResult::Success, "the probe still provisions its reserved key");
+        assert!(matches!(manager.disable_key(PROBE_KEY_ID).await, Err(KmsError::InvalidOperation { .. })));
+        for immediate in [false, true] {
+            assert!(matches!(
+                manager
+                    .delete_key(DeleteKeyRequest {
+                        key_id: PROBE_KEY_ID.to_owned(),
+                        pending_window_in_days: Some(7),
+                        force_immediate: Some(immediate),
+                        confirm_key_id: Some(PROBE_KEY_ID.to_owned())
+                    })
+                    .await,
+                Err(KmsError::InvalidOperation { .. })
+            ));
+            assert_eq!(worker.round().await, ProbeResult::Success);
+        }
+        let customer = manager
+            .create_key(CreateKeyRequest {
+                key_name: Some("customer-probe-control".to_owned()),
+                ..Default::default()
+            })
+            .await
+            .expect("customer key");
+        manager
+            .disable_key(&customer.key_id)
+            .await
+            .expect("customer key can be disabled");
+        manager
+            .delete_key(DeleteKeyRequest {
+                key_id: customer.key_id,
+                pending_window_in_days: Some(7),
+                ..Default::default()
+            })
+            .await
+            .expect("customer deletion remains available");
+        assert_eq!(worker.round().await, ProbeResult::Success);
+    }
+
     #[test]
     fn read_only_backend_is_reported_unsupported_without_failures() {
         let (snapshot, result) = record_metrics(|| {

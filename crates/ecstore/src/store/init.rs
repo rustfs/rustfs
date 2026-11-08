@@ -540,6 +540,7 @@ impl ECStore {
             // failures can still spawn recovery probes for peers that come up
             // after this node.
             let (mut disks, errs) = init_format::init_disks(
+                &instance_ctx,
                 &pool_eps.endpoints,
                 &DiskOption {
                     cleanup: true,
@@ -5155,6 +5156,11 @@ mod tests {
         let offline_disk = force_set_disk_range_offline_for_test(set, 0..1).await;
         let _without_proof = crate::services::notification_sys::without_cross_pool_fence_fleet_proof_for_test();
         assert!(crate::services::notification_sys::acquire_cross_pool_fence_fleet_proof().is_none());
+        if !sharded {
+            crate::bucket::quota::reservation::initialize_quota_ledger_for_test(Arc::clone(&store), &bucket)
+                .await
+                .expect("bootstrap quota with one disk offline");
+        }
 
         let payload = vec![0x51; 4096];
         let mut reader = PutObjReader::from_vec(payload.clone());
@@ -5338,6 +5344,203 @@ mod tests {
         assert!(matches!(err, StorageError::ErasureWriteQuorum));
 
         shutdown.cancel();
+    }
+
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn conditional_multipart_must_not_commit_against_an_older_readable_pool() {
+        use crate::storage_api_contracts::multipart::CompletePart;
+        use crate::storage_api_contracts::object::HTTPPreconditions;
+
+        let temp_dir = tempfile::tempdir().expect("create conditional multipart test directory");
+        let (_ctx, store, shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp_dir.path(), "conditional-mpu-unreadable", &[4, 4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("conditional-mpu-{}", uuid::Uuid::new_v4().simple());
+        let object = "object";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create conditional multipart test bucket");
+        let mut old_body = PutObjReader::from_vec(b"older-pool".to_vec());
+        let old = store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut old_body,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write old object to staging pool");
+        let upload = store.pools[0]
+            .new_multipart_upload(&bucket, object, &ObjectOptions::default())
+            .await
+            .expect("create multipart upload in pool 0");
+        let mut part_body = PutObjReader::from_vec(b"stale-writer".to_vec());
+        let part = store.pools[0]
+            .put_object_part(&bucket, object, &upload.upload_id, 1, &mut part_body, &ObjectOptions::default())
+            .await
+            .expect("stage multipart part in pool 0");
+        let mut new_body = PutObjReader::from_vec(b"newer-pool".to_vec());
+        let new = store.pools[1]
+            .put_object(
+                &bucket,
+                object,
+                &mut new_body,
+                &ObjectOptions {
+                    mod_time: Some(OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("write newer object to pool 1");
+        let old_etag = old.etag.clone().expect("old object must have an ETag");
+        let before = store.get_object_info(&bucket, object, &ObjectOptions::default()).await;
+
+        let mut metadata = Vec::new();
+        for disk_index in 0..4 {
+            let path = temp_dir
+                .path()
+                .join(format!("pool1/set0/disk{disk_index}/{bucket}/{object}/xl.meta"));
+            let original = tokio::fs::read(&path)
+                .await
+                .expect("save original object metadata before fault injection");
+            metadata.push((path, original));
+        }
+        let mut fault_error = None;
+        for (path, _) in &metadata {
+            if let Err(err) = tokio::fs::write(path, b"invalid object metadata").await {
+                fault_error = Some(err);
+                break;
+            }
+        }
+        let mut fault_contents = Vec::new();
+        if fault_error.is_none() {
+            for (path, _) in &metadata {
+                fault_contents.push(tokio::fs::read(path).await);
+            }
+            store.pools[1]
+                .get_disks_by_key(object)
+                .invalidate_get_object_metadata_cache(&bucket, object)
+                .await;
+        }
+        let unreadable = if fault_error.is_none() {
+            Some(
+                store.pools[1]
+                    .get_object_info(
+                        &bucket,
+                        object,
+                        &ObjectOptions {
+                            no_lock: true,
+                            metadata_cache_safe: false,
+                            suppress_read_repair: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await,
+            )
+        } else {
+            None
+        };
+        let completed = if fault_error.is_none() {
+            let completion_store = Arc::clone(&store);
+            let completion_bucket = bucket.clone();
+            let upload_id = upload.upload_id.clone();
+            let part_etag = part.etag.clone();
+            Some(
+                tokio::spawn(async move {
+                    completion_store
+                        .complete_multipart_upload(
+                            &completion_bucket,
+                            object,
+                            &upload_id,
+                            vec![CompletePart {
+                                part_num: 1,
+                                etag: part_etag,
+                                ..Default::default()
+                            }],
+                            &ObjectOptions {
+                                http_preconditions: Some(HTTPPreconditions {
+                                    if_match: Some(old_etag),
+                                    ..Default::default()
+                                }),
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                })
+                .await,
+            )
+        } else {
+            None
+        };
+        let mut restore_error = None;
+        for (path, original) in &metadata {
+            if let Err(err) = tokio::fs::write(path, original).await {
+                restore_error = Some(err);
+            }
+        }
+        store.pools[1]
+            .get_disks_by_key(object)
+            .invalidate_get_object_metadata_cache(&bucket, object)
+            .await;
+        let after = store.get_object_info(&bucket, object, &ObjectOptions::default()).await;
+        let recovered_body = match store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+        {
+            Ok(mut reader) => {
+                let mut body = Vec::new();
+                let result = reader
+                    .read_to_end(&mut body)
+                    .await
+                    .map(|_| body)
+                    .map_err(|err| err.to_string());
+                drop(reader);
+                result
+            }
+            Err(err) => Err(err.to_string()),
+        };
+        let parts = store
+            .list_object_parts(&bucket, object, &upload.upload_id, None, 100, &ObjectOptions::default())
+            .await;
+        shutdown.cancel();
+
+        assert!(fault_error.is_none(), "failed to inject metadata fault: {fault_error:?}");
+        assert!(restore_error.is_none(), "failed to restore metadata: {restore_error:?}");
+        assert_eq!(fault_contents.len(), 4, "all four pool 1 metadata files must be inspected");
+        for observed in fault_contents {
+            assert_eq!(
+                observed.expect("read injected metadata"),
+                b"invalid object metadata",
+                "each pool 1 metadata file must contain the injected corruption"
+            );
+        }
+        assert_eq!(before.expect("latest object before fault").etag, new.etag);
+        assert_ne!(old.etag, new.etag, "fixture bodies must produce different ETags");
+        let read_error = unreadable
+            .expect("metadata fault should have been injected")
+            .expect_err("the newer pool must fail its object metadata read during the fault");
+        assert!(
+            !crate::error::is_err_object_not_found(&read_error) && !crate::error::is_err_version_not_found(&read_error),
+            "corrupt metadata must produce a non-not-found read error: {read_error:?}"
+        );
+        let completed = completed
+            .expect("completion should have been attempted")
+            .expect("completion task should not panic");
+        let Err(completion_error) = completed else {
+            panic!("stale If-Match must not commit while the newer object's metadata is unreadable");
+        };
+        assert_eq!(completion_error, read_error, "completion must propagate the unreadable pool's error");
+        assert_eq!(after.expect("newer object after recovery").etag, new.etag);
+        assert_eq!(recovered_body.expect("newer body after recovery"), b"newer-pool");
+        let parts = parts.expect("failed completion must leave the upload retryable");
+        assert_eq!(parts.parts.len(), 1);
+        assert_eq!(parts.parts[0].etag, part.etag);
     }
 
     async fn migrate_versioned_decommission_test_object(
@@ -20807,6 +21010,308 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "test-util")]
+    async fn seed_retained_null_version(
+        store: &Arc<crate::store::ECStore>,
+        bucket: &str,
+        object: &str,
+        protection: &str,
+        latest_is_marker: bool,
+    ) {
+        let metadata = if protection == "legal-hold" {
+            HashMap::from([("x-amz-object-lock-legal-hold".to_string(), "ON".to_string())])
+        } else {
+            HashMap::from([
+                ("x-amz-object-lock-mode".to_string(), protection.to_string()),
+                ("x-amz-object-lock-retain-until-date".to_string(), "2099-01-01T00:00:00Z".to_string()),
+            ])
+        };
+        let mut original = PutObjReader::from_vec(b"protected null version".to_vec());
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut original,
+                &ObjectOptions {
+                    user_defined: metadata,
+                    mod_time: Some(OffsetDateTime::now_utc() - time::Duration::days(1)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed retained null version");
+        let mut latest = PutObjReader::from_vec(b"unprotected latest version".to_vec());
+        store
+            .put_object(
+                bucket,
+                object,
+                &mut latest,
+                &ObjectOptions {
+                    versioned: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("seed newer unprotected UUID version");
+        if latest_is_marker {
+            store
+                .delete_object(
+                    bucket,
+                    object,
+                    ObjectOptions {
+                        versioned: true,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("create a UUID delete marker above the retained null version");
+        }
+    }
+
+    #[cfg(feature = "test-util")]
+    async fn assert_retained_null_version_body(store: &Arc<crate::store::ECStore>, bucket: &str, object: &str) {
+        let mut reader = store
+            .get_object_reader(
+                bucket,
+                object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(Uuid::nil().to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("retained null version must remain readable");
+        let mut body = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut body)
+            .await
+            .expect("read retained null version");
+        assert_eq!(body, b"protected null version");
+    }
+
+    /// A versionless delete removes the null version, so the Object Lock check
+    /// must judge that version even when a UUID version or delete marker is
+    /// the key's latest entry (rustfs/backlog#3017).
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn null_version_object_lock_delete_checks_actual_target() {
+        use crate::bucket::replication::DeleteReplicationConfigSnapshot;
+        use rustfs_gateway_types::persistence::PersistedVersioningConfiguration as VersioningConfiguration;
+
+        let temp = tempfile::tempdir().expect("create null-version delete store");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "null-version-delete-lock", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("null-delete-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket");
+        let configs = [
+            VersioningConfiguration::default(),
+            VersioningConfiguration {
+                status: Some("Suspended".to_owned()),
+                ..Default::default()
+            },
+            VersioningConfiguration {
+                status: Some("Enabled".to_owned()),
+                excluded_prefixes: Some(vec![Some("archive/".to_string())]),
+                ..Default::default()
+            },
+        ];
+        for (case, config) in configs.into_iter().enumerate() {
+            let snapshot = Arc::new(DeleteReplicationConfigSnapshot::from_configs_for_test(config, None));
+            for protection in ["COMPLIANCE", "GOVERNANCE", "legal-hold"] {
+                for latest_is_marker in [false, true] {
+                    let object = format!("archive/{case}-{protection}-{latest_is_marker}");
+                    seed_retained_null_version(&store, &bucket, &object, protection, latest_is_marker).await;
+                    let (_, errors) = store
+                        .delete_objects(
+                            &bucket,
+                            vec![ObjectToDelete {
+                                object_name: object.clone(),
+                                ..Default::default()
+                            }],
+                            ObjectOptions {
+                                delete_replication_config_snapshot: Some(Arc::clone(&snapshot)),
+                                ..Default::default()
+                            },
+                        )
+                        .await;
+                    assert!(
+                        matches!(errors.as_slice(), [Some(StorageError::PrefixAccessDenied(_, _))]),
+                        "batch delete must judge the retained null version: {object}: {errors:?}"
+                    );
+                    let error = store
+                        .delete_object(
+                            &bucket,
+                            &object,
+                            ObjectOptions {
+                                version_suspended: true,
+                                ..Default::default()
+                            },
+                        )
+                        .await
+                        .expect_err("suspended single delete must also judge the retained null version");
+                    assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+                    assert_retained_null_version_body(&store, &bucket, &object).await;
+                    if protection == "GOVERNANCE" {
+                        let (_, errors) = store
+                            .delete_objects(
+                                &bucket,
+                                vec![ObjectToDelete {
+                                    object_name: object.clone(),
+                                    ..Default::default()
+                                }],
+                                ObjectOptions {
+                                    delete_replication_config_snapshot: Some(Arc::clone(&snapshot)),
+                                    object_lock_delete: Some(crate::storage_api_contracts::object::ObjectLockDeleteOptions {
+                                        bypass_governance: true,
+                                    }),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        assert!(errors.iter().all(Option::is_none), "authorized governance bypass: {errors:?}");
+                        let removed = store
+                            .get_object_info(
+                                &bucket,
+                                &object,
+                                &ObjectOptions {
+                                    version_id: Some(Uuid::nil().to_string()),
+                                    ..Default::default()
+                                },
+                            )
+                            .await;
+                        match removed {
+                            Ok(marker) => {
+                                assert!(marker.delete_marker, "only a null delete marker may replace the payload");
+                                assert_eq!(marker.size, 0);
+                                assert!(marker.data_dir.is_none());
+                            }
+                            Err(error) => assert!(
+                                matches!(
+                                    error,
+                                    StorageError::MethodNotAllowed
+                                        | StorageError::ObjectNotFound(_, _)
+                                        | StorageError::VersionNotFound(_, _, _)
+                                ),
+                                "unexpected bypass result: {error:?}"
+                            ),
+                        }
+                        assert!(
+                            store
+                                .get_object_reader(
+                                    &bucket,
+                                    &object,
+                                    None,
+                                    HeaderMap::new(),
+                                    &ObjectOptions {
+                                        version_id: Some(Uuid::nil().to_string()),
+                                        ..Default::default()
+                                    }
+                                )
+                                .await
+                                .is_err(),
+                            "authorized deletion must make the retained null payload unreadable"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// A versionless PUT or multipart completion replaces the null version in
+    /// place, so the commit-time WORM gate must judge that version even when a
+    /// UUID version or delete marker is the key's latest entry
+    /// (rustfs/backlog#3019).
+    #[cfg(feature = "test-util")]
+    #[tokio::test]
+    #[serial_test::serial(storage_class_env)]
+    async fn null_version_object_lock_put_and_multipart_preserve_retained_target() {
+        let temp = tempfile::tempdir().expect("create null-version overwrite store");
+        let (_ctx, store, _shutdown) =
+            without_storage_class_env(build_isolated_test_store(temp.path(), "null-version-overwrite-lock", &[4])).await;
+        crate::bucket::metadata_sys::init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = format!("null-overwrite-lock-{}", Uuid::new_v4());
+        store
+            .make_bucket(
+                &bucket,
+                &MakeBucketOptions {
+                    lock_enabled: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("create Object Lock bucket");
+        for protection in ["COMPLIANCE", "GOVERNANCE", "legal-hold"] {
+            for latest_is_marker in [false, true] {
+                let object = format!("{protection}-{latest_is_marker}");
+                seed_retained_null_version(&store, &bucket, &object, protection, latest_is_marker).await;
+                let mut replacement = PutObjReader::from_vec(b"replacement".to_vec());
+                let error = store
+                    .put_object(&bucket, &object, &mut replacement, &ObjectOptions::default())
+                    .await
+                    .expect_err("PUT must reject replacement of a retained null version");
+                assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+
+                let upload = store
+                    .clone()
+                    .new_multipart_upload(&bucket, &object, &ObjectOptions::default())
+                    .await
+                    .expect("initiate multipart upload");
+                let mut part_reader = PutObjReader::from_vec(b"multipart replacement".to_vec());
+                let part = store
+                    .clone()
+                    .put_object_part(&bucket, &object, &upload.upload_id, 1, &mut part_reader, &ObjectOptions::default())
+                    .await
+                    .expect("stage multipart replacement");
+                let error = store
+                    .clone()
+                    .complete_multipart_upload(
+                        &bucket,
+                        &object,
+                        &upload.upload_id,
+                        vec![crate::storage_api_contracts::multipart::CompletePart {
+                            part_num: part.part_num,
+                            etag: part.etag,
+                            ..Default::default()
+                        }],
+                        &ObjectOptions::default(),
+                    )
+                    .await
+                    .expect_err("multipart completion must reject replacement of a retained null version");
+                assert!(matches!(error, StorageError::PrefixAccessDenied(_, _)), "{object}: {error:?}");
+                assert_retained_null_version_body(&store, &bucket, &object).await;
+
+                let mut next_version = PutObjReader::from_vec(b"new UUID version".to_vec());
+                store
+                    .put_object(
+                        &bucket,
+                        &object,
+                        &mut next_version,
+                        &ObjectOptions {
+                            versioned: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .expect("a new UUID version must remain allowed");
+                assert_retained_null_version_body(&store, &bucket, &object).await;
+            }
+        }
+    }
+
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
     async fn exact_version_put_uses_only_its_own_bucket_object_lock_snapshot() {
@@ -25182,6 +25687,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-record", &[4])).await;
         let mutation_id = uuid::Uuid::new_v4();
         let intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -25367,6 +25873,7 @@ mod tests {
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan", &[4])).await;
         let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -25428,6 +25935,7 @@ mod tests {
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-advance", &[4])).await;
         let mutation_id = uuid::Uuid::new_v4();
         let intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -25502,6 +26010,7 @@ mod tests {
 
         let abort_id = uuid::Uuid::new_v4();
         let abort_intent = TierMutationIntent {
+            requires_native_azure: false,
             mutation_id: abort_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -25544,6 +26053,7 @@ mod tests {
         candidate_digest: [u8; 32],
     ) -> TierMutationIntent {
         TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -27032,6 +27542,7 @@ mod tests {
         let (_ctx, store, _shutdown) =
             without_storage_class_env(build_isolated_test_store(temp_dir.path(), "tier-mutation-intent-scan-page", &[4])).await;
         let build_intent = |mutation_id: uuid::Uuid, tier_name: &str| TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Edit,

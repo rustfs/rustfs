@@ -489,7 +489,7 @@ impl Operation for UserMfaStatusHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.remote_addr(),
+            req.policy_source_addr(),
         )
         .await?;
 
@@ -526,7 +526,7 @@ impl Operation for UserMfaResetHandler {
             caller.is_owner,
             false,
             vec![Action::AdminAction(AdminAction::EnableUserAdminAction)],
-            req.remote_addr(),
+            req.policy_source_addr(),
         )
         .await
         .inspect_err(|_| {

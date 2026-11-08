@@ -115,7 +115,7 @@ jobs:
             printf '%s\n' 'mode=full' >> "$GITHUB_OUTPUT"
             echo "Base CI policy unavailable; running the full matrix."
           fi
-          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^rehearse_shards=' "$GITHUB_OUTPUT"; then
+          if ! grep -q '^plan=' "$GITHUB_OUTPUT" || ! grep -q '^plan_contract=3$' "$GITHUB_OUTPUT"; then
             printf '%s\n' 'mode=full' 'connect=true' 'full_validation=true' 'rehearse_shards=false' 'packages=' 'plan=' >> "$GITHUB_OUTPUT"
             echo "Base policy does not cover this workflow contract; retaining the full matrix."
           fi
@@ -162,7 +162,7 @@ jobs:
       - name: Run shared quick checks
         uses: ./.github/actions/quick-checks
 
-  test-and-lint:
+  workspace-lint-and-build:
     name: Workspace Lint and Build
     if: contains(fromJSON('["full", "e2e"]'), needs.classify-changes.outputs.mode) && (github.event_name != 'pull_request' || github.event.action != 'closed')
     needs: [ quick-checks, classify-changes ]
@@ -195,13 +195,13 @@ jobs:
 
       - name: Prepare test evidence
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           {
             echo "run_id=${GITHUB_RUN_ID}"
             echo "job=${GITHUB_JOB}"
             echo "runner=${RUNNER_NAME}"
             echo "started_at=$(date --utc --iso-8601=seconds)"
-          } > artifacts/test-and-lint/run-metadata.txt
+          } > artifacts/workspace/run-metadata.txt
 
       # Clippy gates every event, pull requests included. When it ran only after
       # merge, a lint regression merged freely and then failed every main run
@@ -217,7 +217,8 @@ jobs:
 
       - name: Archive workspace test binaries
         env:
-          CARGO_BUILD_JOBS: ${{ (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && '3' || '2' }}
+          # Workspace test compilation has high per-process memory use.
+          CARGO_BUILD_JOBS: "2"
         run: |
           ./scripts/ci/resource_sampler.sh start workspace-archive
           trap './scripts/ci/resource_sampler.sh stop' EXIT
@@ -235,11 +236,11 @@ jobs:
 
       - name: Run documentation tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           set +e
           timeout --verbose --signal=TERM --kill-after=30s 15m \
             python3 scripts/ci_test_artifact.py cargo doc --configuration workspace \
-            2>&1 | tee artifacts/test-and-lint/doctest.log
+            2>&1 | tee artifacts/workspace/doctest.log
           status=${PIPESTATUS[0]}
           {
             echo "command=cargo test --all --exclude e2e_test --doc"
@@ -248,7 +249,7 @@ jobs:
             echo
             echo "Remaining test-related processes:"
             pgrep -af 'cargo|rustdoc|target/.*/deps/' || true
-          } > artifacts/test-and-lint/doctest-diagnostics.txt
+          } > artifacts/workspace/doctest-diagnostics.txt
           exit "${status}"
 
       - name: Upload test reports and diagnostics
@@ -257,7 +258,7 @@ jobs:
         with:
           name: junit-test-and-lint-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: error
 
@@ -270,7 +271,7 @@ jobs:
 
   workspace-tests:
     name: Workspace tests
-    needs: [ test-and-lint, classify-changes ]
+    needs: [ workspace-lint-and-build, classify-changes ]
     # The archive retains compile-time fixture paths and the large test set
     # requires the same runner image until the hosted-runtime pilot passes.
     runs-on: sm-standard-4
@@ -295,14 +296,14 @@ jobs:
 
       - name: Extract and list workspace tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           cargo nextest list --profile ci --archive-file "$RUNNER_TEMP/workspace-tests.tar.zst" --workspace-remap "$GITHUB_WORKSPACE" --extract-to "$GITHUB_WORKSPACE" --extract-overwrite --message-format json \
-            > artifacts/test-and-lint/core-test-listing.json
-          python3 scripts/check_test_wiring.py --check-core artifacts/test-and-lint/core-test-listing.json
+            > artifacts/workspace/core-test-listing.json
+          python3 scripts/check_test_wiring.py --check-core artifacts/workspace/core-test-listing.json
 
       - name: Run nextest tests
         run: |
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           rm -f target/nextest/ci/junit.xml
           ./scripts/ci/resource_sampler.sh start nextest
           trap './scripts/ci/resource_sampler.sh stop' EXIT
@@ -311,7 +312,7 @@ jobs:
             cargo nextest run --profile ci --cargo-metadata target/nextest/cargo-metadata.json --binaries-metadata target/nextest/binaries-metadata.json \
             --workspace-remap "$GITHUB_WORKSPACE" --target-dir-remap "$GITHUB_WORKSPACE/target" \
             --status-level all --final-status-level all \
-            2>&1 | tee artifacts/test-and-lint/nextest.log
+            2>&1 | tee artifacts/workspace/nextest.log
           status=${PIPESTATUS[0]}
           {
             echo "command=workspace archive execution"
@@ -323,13 +324,13 @@ jobs:
             echo
             echo "Kernel OOM / kill events:"
             dmesg -T 2>/dev/null | grep -iE 'oom|out of memory|killed process' | tail -20 || true
-          } > artifacts/test-and-lint/nextest-diagnostics.txt
+          } > artifacts/workspace/nextest-diagnostics.txt
           exit "${status}"
 
       - name: Verify workspace execution completeness
         run: |
-          python3 scripts/ci_test_artifact.py evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
-          ./scripts/check_migration_gate_count.sh evidence artifacts/test-and-lint/core-test-listing.json target/nextest/ci/junit.xml
+          python3 scripts/ci_test_artifact.py evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
+          ./scripts/check_migration_gate_count.sh evidence artifacts/workspace/core-test-listing.json target/nextest/ci/junit.xml
 
       - name: Run ignored ILM integration tests serially
         if: needs.classify-changes.outputs.mode == 'full'
@@ -360,7 +361,7 @@ jobs:
           name: workspace-test-evidence-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
-            artifacts/test-and-lint
+            artifacts/workspace
             artifacts/ilm-integration
           retention-days: 3
           if-no-files-found: error
@@ -370,7 +371,7 @@ jobs:
         if: needs.classify-changes.outputs.rehearse_shards == 'true'
         run: |
           python3 scripts/ci_test_shards.py prepare \
-            --listing artifacts/test-and-lint/core-test-listing.json \
+            --listing artifacts/workspace/core-test-listing.json \
             --junit target/nextest/ci/junit.xml --output artifacts/workspace-shard-plan
       - name: Upload same-run shard plan
         if: needs.classify-changes.outputs.rehearse_shards == 'true'
@@ -451,7 +452,7 @@ jobs:
 
   connect-feature-boundaries:
     name: Connect Feature Boundaries
-    if: needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect != 'false' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && needs.classify-changes.outputs.connect != 'false' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -499,13 +500,72 @@ jobs:
       - name: Check offline enrollment E2E root boundary
         run: ./scripts/check_offline_enrollment_e2e.sh
 
+  fips-provider:
+    name: FIPS provider boundaries
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
+    needs: [ quick-checks, classify-changes ]
+    # This builds the RustFS library test target, which exceeds hosted-runner disk capacity.
+    runs-on: sm-standard-4
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [default, fips]
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          persist-credentials: false
+
+      - name: Setup Rust environment
+        uses: ./.github/actions/setup
+        with:
+          rust-version: stable
+          cache-shared-key: ci-fips-provider
+          cache-save-if: 'false'
+          install-build-packaging-tools: 'false'
+
+      - name: Install FIPS build tools
+        if: matrix.mode == 'fips'
+        run: sudo apt-get install -y cmake golang clang libclang-dev
+
+      - name: Verify provider installation
+        shell: bash
+        run: |
+          args=()
+          if [[ '${{ matrix.mode }}' == 'fips' ]]; then
+            args+=(--features fips)
+          fi
+          cargo nextest run --locked -p rustfs-tls-runtime --lib "${args[@]}" --no-tests fail -E 'test(provider_policy_isolated)'
+          cargo nextest run --locked -p rustfs-s3-client --lib "${args[@]}" --no-tests fail -E 'test(overflowing_closed_range_is_rejected_before_network_io)'
+          cargo nextest run --locked -p rustfs-targets --lib "${args[@]}" --no-tests fail -E 'test(validate_pulsar)'
+          cargo nextest run --locked -p rustfs-targets --lib "${args[@]}" --no-tests fail -E 'test(webhook_provider_policy_isolated)'
+          if [[ '${{ matrix.mode }}' == 'fips' ]]; then
+            cargo nextest run --locked -p rustfs-protocols --lib --features ftps,webdav,fips --no-tests fail -E 'test(protocols_reject_incompatible_host_provider)'
+            cargo nextest run --locked -p rustfs-targets --lib --features fips --no-tests fail -E 'test(fips_postgres_rejects_incompatible_host_provider)'
+            cargo nextest run --locked -p rustfs-s3-client --lib --features fips --no-tests fail -E 'test(fips_transition_rejects_incompatible_host_provider)'
+          fi
+          tests=(provider_installation_isolated prepared_generation_shares_crypto_and_serves_sni_with_mtls)
+          if [[ '${{ matrix.mode }}' == 'fips' ]]; then
+            tests+=(fips_provider_builds_fips_tls_configs fips_provider_tls_handshake_accepts_and_rejects_algorithms)
+          fi
+          for test_name in "${tests[@]}"; do
+            cargo nextest run --locked -p rustfs --lib "${args[@]}" --no-tests fail -E "test($test_name)"
+          done
+          cargo clippy --locked -p rustfs --lib "${args[@]}" -- -D warnings
+
   test-and-lint-rio-v2:
     name: Test and Lint (rio-v2)
-    # Alternate feature configurations run on the nightly schedule, merge
-    # groups and manual dispatch. The default workspace remains the PR gate and
-    # the per-push main baseline: repeating four feature builds on every merge
-    # bought nothing the nightly run does not report within a day.
-    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
+    # Specialized boundary, hardware and alternate-feature lanes run only on
+    # the nightly schedule and manual dispatch. They do not gate a merge: the
+    # nightly run reports a regression within a day, and repeating these builds
+    # on every PR revision and merge group bought no earlier signal worth the
+    # runner occupancy. Workspace lint and tests, the core contract, the debug
+    # build, E2E smoke and the S3 lanes remain the pull-request gate.
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -542,12 +602,12 @@ jobs:
           # --profile ci so the quarantine list (and its junit flaky markers)
           # covers this leg too; the default profile is the local no-retry
           # profile and silently ignored quarantined flakes here (rustfs#6703).
-          mkdir -p artifacts/test-and-lint
+          mkdir -p artifacts/workspace
           rm -f target/nextest/ci/junit.xml
           ./scripts/ci/resource_sampler.sh start nextest-rio-v2
           trap './scripts/ci/resource_sampler.sh stop' EXIT
           cargo nextest run --profile ci -p rustfs -p rustfs-ecstore --features rio-v2 \
-            2>&1 | tee artifacts/test-and-lint/nextest.log
+            2>&1 | tee artifacts/workspace/nextest.log
           cargo test -p rustfs --doc --features rio-v2
 
       - name: Upload rio-v2 test reports and diagnostics
@@ -557,14 +617,14 @@ jobs:
           name: junit-test-and-lint-rio-v2-${{ github.run_number }}-${{ github.run_attempt }}
           path: |
             target/nextest/ci/junit.xml
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: error
 
   test-and-lint-protocols:
     name: "Test and Lint (${{ matrix.features.name }})"
     # Same cadence as test-and-lint-rio-v2 above.
-    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["merge_group", "schedule", "workflow_dispatch"]'), github.event_name)
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     runs-on: sm-standard-4
     timeout-minutes: 90
@@ -633,7 +693,7 @@ jobs:
           path: |
             target/nextest/ci/junit.xml
             artifacts/protocol-tests
-            artifacts/test-and-lint
+            artifacts/workspace
           retention-days: 3
           if-no-files-found: warn
 
@@ -785,7 +845,7 @@ jobs:
     # job had neither, so each closed/merged PR really ran the whole io_uring
     # suite (measured 4m17s / 7m19s / 7m31s on runs 30678272341 / 30678117601 /
     # 30662728539) and kept the cancellation run in progress for minutes.
-    if: needs.classify-changes.outputs.mode == 'full' && (github.event_name != 'pull_request' || github.event.action != 'closed')
+    if: needs.classify-changes.outputs.mode == 'full' && contains(fromJSON('["schedule", "workflow_dispatch"]'), github.event_name)
     needs: [ quick-checks, classify-changes ]
     # GitHub-hosted ubuntu-latest runs a recent kernel with io_uring and, unlike
     # a container, applies no seccomp filter that would block io_uring_setup — so
@@ -982,7 +1042,7 @@ jobs:
           path: |
             ${{ runner.temp }}/rustfs-e2e-smoke-logs/
             ${{ runner.temp }}/rustfs-e2e-smoke-list.json
-            artifacts/test-and-lint
+            artifacts/workspace
           if-no-files-found: warn
 
       - name: Upload e2e smoke JUnit report
@@ -1497,12 +1557,13 @@ jobs:
       - classify-changes
       - typos
       - quick-checks
-      - test-and-lint
+      - workspace-lint-and-build
       - workspace-tests
       - workspace-shards
       - workspace-shard-evidence
       - core-contract
       - connect-feature-boundaries
+      - fips-provider
       - test-and-lint-rio-v2
       - test-and-lint-protocols
       - build-rustfs-debug-binary
@@ -1530,10 +1591,11 @@ jobs:
     needs:
       - classify-changes
       - connect-feature-boundaries
+      - fips-provider
       - required-checks
       - typos
       - quick-checks
-      - test-and-lint
+      - workspace-lint-and-build
       - workspace-tests
       - core-contract
       - test-and-lint-rio-v2

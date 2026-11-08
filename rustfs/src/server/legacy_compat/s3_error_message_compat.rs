@@ -22,7 +22,7 @@
 //! `docs/middleware.md`, "The nine RustFS tower patch layers", row 6).
 //! Removed by: T2.12 (rustfs/backlog#2771).
 
-use super::{StsQueryRequest, is_xml_response};
+use super::{StsQueryRequest, is_xml_compat_body, is_xml_response};
 use crate::error::ApiError;
 use crate::server::hybrid::HybridBody;
 use crate::storage_api::server::legacy_compat::S3ErrorCode;
@@ -83,6 +83,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let (rest_body, changed) = fix_s3_error_message_in_xml(rest_body).await.map_err(Into::into)?;
                     let mut parts = parts;

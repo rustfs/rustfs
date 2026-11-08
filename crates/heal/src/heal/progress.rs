@@ -506,6 +506,9 @@ pub struct HealStatistics {
     pub successful_tasks: u64,
     /// Failed tasks
     pub failed_tasks: u64,
+    /// Completed attempts without independent verification; not the current durable MRF backlog.
+    #[serde(default)]
+    pub unverified_tasks: u64,
     /// Running tasks
     pub running_tasks: u64,
     /// Total healed objects
@@ -528,6 +531,7 @@ impl HealStatistics {
             total_tasks: 0,
             successful_tasks: 0,
             failed_tasks: 0,
+            unverified_tasks: 0,
             running_tasks: 0,
             total_objects_healed: 0,
             total_bytes_healed: 0,
@@ -546,6 +550,11 @@ impl HealStatistics {
 
     pub fn update_running_tasks(&mut self, count: u64) {
         self.running_tasks = count;
+        self.last_update_time = SystemTime::now();
+    }
+
+    pub(crate) fn update_unverified_task_completion(&mut self) {
+        self.unverified_tasks = self.unverified_tasks.saturating_add(1);
         self.last_update_time = SystemTime::now();
     }
 
@@ -913,6 +922,21 @@ mod tests {
         assert_eq!(stats.total_tasks, 0);
         assert_eq!(stats.successful_tasks, 0);
         assert_eq!(stats.failed_tasks, 0);
+    }
+
+    #[test]
+    fn unverified_statistics_preserve_old_snapshot_compatibility() {
+        let mut stats = HealStatistics::new();
+        stats.update_unverified_task_completion();
+        assert_eq!(stats.unverified_tasks, 1);
+        assert_eq!(stats.successful_tasks, 0);
+        assert_eq!(stats.failed_tasks, 0);
+        let mut wire = serde_json::to_value(&stats).expect("serialize task statistics");
+        let current: HealStatistics = serde_json::from_value(wire.clone()).expect("read new statistics");
+        assert_eq!(current.unverified_tasks, 1);
+        wire.as_object_mut().expect("statistics object").remove("unverified_tasks");
+        let old: HealStatistics = serde_json::from_value(wire).expect("read statistics without new field");
+        assert_eq!(old.unverified_tasks, 0);
     }
 
     #[test]

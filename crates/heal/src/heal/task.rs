@@ -291,7 +291,7 @@ pub enum HealTaskStatus {
     Running,
     /// Retrying after a recoverable failure
     Retrying { error: String, retry_attempt: u32 },
-    /// Completed
+    /// Execution completed; the outcome and durable MRF ledger retain any unverified responsibility.
     Completed,
     /// Failed
     Failed { error: String },
@@ -485,7 +485,7 @@ pub struct HealTask {
     pub cancel_token: tokio_util::sync::CancellationToken,
     /// Storage layer interface
     pub storage: Arc<dyn HealStorageAPI>,
-    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+    mainline_pacer: Option<super::pacing::ForegroundPacing>,
 }
 
 impl HealTask {
@@ -586,7 +586,7 @@ impl HealTask {
         task
     }
 
-    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<super::pacing::ForegroundPacing>) -> Self {
         self.mainline_pacer = pacer;
         self
     }
@@ -1232,6 +1232,22 @@ impl HealTask {
                     "Heal task completed"
                 });
             }
+            Err(Error::LegacyMrfUnverified { .. }) => {
+                // The qualified Deep attempt finished, but its Unknown outcome
+                // cannot discharge the separately owned durable responsibility.
+                self.progress.write().await.mark_completed();
+                *self.status.write().await = HealTaskStatus::Completed;
+                debug!(
+                    target: "rustfs::heal::task",
+                    event = EVENT_HEAL_TASK_STATE,
+                    component = LOG_COMPONENT_HEAL,
+                    subsystem = LOG_SUBSYSTEM_TASK,
+                    state = "verification_unavailable",
+                    task_id = %self.id,
+                    heal_type = self.heal_type.kind_label(),
+                    "Heal attempt completed without independent verification"
+                );
+            }
             Err(Error::TaskCancelled) => {
                 let mut status = self.status.write().await;
                 *status = HealTaskStatus::Cancelled;
@@ -1281,11 +1297,16 @@ impl HealTask {
 
         let terminal_state = match &result {
             Ok(_) => "completed",
+            Err(Error::LegacyMrfUnverified { .. }) => "verification_unavailable",
             Err(Error::TaskCancelled) => "cancelled",
             Err(Error::TaskTimeout) => "timed_out",
             Err(_) => "failed",
         };
-        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), result.as_ref().err());
+        let terminal_error = result
+            .as_ref()
+            .err()
+            .filter(|error| !matches!(error, Error::LegacyMrfUnverified { .. }));
+        self.emit_trace_task_state(terminal_state, start_instant.elapsed(), terminal_error);
 
         result
     }
@@ -1310,7 +1331,22 @@ impl HealTask {
                 .load(Ordering::Acquire)
                 .max(self.retry_attempts)
                 .saturating_add(1);
-            manager.record_replacement_failure(&failure, attempt).await
+            // A deletion can race any stage, including hidden-transaction recovery.
+            // Only a successful complete inventory may reclassify that failure;
+            // lookup/quorum failures remain the original storage failure.
+            if manager.get_state().await.replacement_bucket_incarnations.is_some()
+                && !matches!(failure, Error::TaskCancelled | Error::TaskTimeout)
+                && matches!(
+                    manager.verify_replacement_bucket_pass(self.storage.as_ref()).await,
+                    Err(Error::ReplacementNamespaceChanged)
+                )
+            {
+                manager
+                    .record_replacement_failure(&Error::ReplacementNamespaceChanged, attempt)
+                    .await
+            } else {
+                manager.record_replacement_failure(&failure, attempt).await
+            }
         }
         .await;
         match persisted {

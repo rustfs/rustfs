@@ -112,7 +112,7 @@ fn test_ipv6_client_behind_trusted_proxy_resolves_client() {
     let config = TrustedProxyConfig::new(
         vec![TrustedProxy::Cidr("fd00::/8".parse().unwrap())],
         ValidationMode::HopByHop,
-        true,
+        false,
         5,
         true,
         vec![],
@@ -176,11 +176,11 @@ fn test_validator_caches_trusted_direct_peer_decision() {
     assert_eq!(validator.cache_stats().size, 0);
 
     let first = validator.validate_request(peer_addr, &headers).unwrap();
-    assert!(first.is_from_trusted_proxy);
+    assert!(!first.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 
     let second = validator.validate_request(peer_addr, &headers).unwrap();
-    assert!(second.is_from_trusted_proxy);
+    assert!(!second.is_from_trusted_proxy);
     assert_eq!(validator.cache_stats().size, 1);
 }
 

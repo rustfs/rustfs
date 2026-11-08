@@ -21,15 +21,16 @@ pub mod fingerprint;
 pub mod material;
 pub mod metrics;
 pub mod outbound;
+pub mod provider;
 pub mod server;
 pub mod source;
 pub mod state;
 
 pub use certs::{
     CertDirectoryLoadOptions, TlsCertPairInspection, TlsCertPairStatus, TlsDirectoryInspection, TlsDomainInspection,
-    WebPkiClientVerifierOptions, build_webpki_client_verifier, create_multi_cert_resolver, inspect_cert_directory,
-    load_all_certs_from_directory, load_all_certs_from_directory_strict, load_cert_bundle_der_bytes, load_certs,
-    load_private_key, validate_certified_key,
+    WebPkiClientVerifierOptions, build_webpki_client_verifier, build_webpki_client_verifier_from_ca_file,
+    create_multi_cert_resolver, inspect_cert_directory, load_all_certs_from_directory, load_all_certs_from_directory_strict,
+    load_cert_bundle_der_bytes, load_certs, load_private_key, validate_certified_key,
 };
 pub use config::{ReloadApplyHint, ReloadDetectMode, TlsReloadOptions};
 pub use coordinator::{TlsConsumer, TlsReloadCoordinator};
@@ -45,6 +46,7 @@ pub use outbound::{
     GlobalOutboundTlsStateSummary, GlobalPublishedOutboundTlsState, load_global_outbound_tls_generation,
     load_global_outbound_tls_state, publish_global_outbound_tls_state, summarize_global_outbound_tls_state,
 };
+pub use provider::{CryptoProviderError, CryptoProviderStatus, default_crypto_provider, ensure_crypto_provider};
 pub use server::{ReloadableServerCertResolver, spawn_server_cert_reload_loop};
 pub use source::{TlsFileLayout, TlsSource, TlsSourceKind, TlsSourceSnapshot};
 pub use state::OutboundOnlySnapshotArgs;

@@ -32,8 +32,8 @@ use super::storage_api::bucket_usecase::bucket::{
     },
     metadata::{
         BUCKET_CORS_CONFIG, BUCKET_LIFECYCLE_CONFIG, BUCKET_NOTIFICATION_CONFIG, BUCKET_POLICY_CONFIG,
-        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TAGGING_CONFIG,
-        BUCKET_TARGETS_FILE, BUCKET_VERSIONING_CONFIG,
+        BUCKET_PUBLIC_ACCESS_BLOCK_CONFIG, BUCKET_REPLICATION_CONFIG, BUCKET_SSECONFIG, BUCKET_TARGETS_FILE,
+        BUCKET_VERSIONING_CONFIG,
     },
     metadata_sys,
     policy_sys::PolicySys,
@@ -54,7 +54,7 @@ use super::storage_api::bucket_usecase::contract::list::{
 };
 use super::storage_api::bucket_usecase::error::StorageError;
 use super::storage_api::bucket_usecase::helper::{OperationHelper, spawn_background_with_context};
-use super::storage_api::bucket_usecase::object_utils::to_s3s_etag;
+use super::storage_api::bucket_usecase::object_utils::to_s3s_xml_etag;
 use super::storage_api::bucket_usecase::s3_api::bucket::{
     ListObjectVersionsParams, ListObjectsV2Params, build_list_buckets_output, build_list_object_versions_output,
     build_list_objects_output, build_list_objects_v2_output, encode_list_objects_v2_continuation_token,
@@ -969,6 +969,12 @@ fn encode_list_objects_v2_value(value: &str, encoding_type: Option<&EncodingType
 }
 
 fn build_metadata_extension_user_metadata(user_defined: &HashMap<String, String>) -> Option<UserMetadata> {
+    // Even builds unable to decrypt MinIO SSE-C must not expose its key-protected metadata.
+    if super::storage_api::bucket_usecase::sse::stored_ssec_metadata(user_defined)
+        || user_defined.contains_key(rustfs_utils::http::object_encryption_keys::MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER)
+    {
+        return None;
+    }
     let mut items = extract_user_defined_metadata(user_defined)
         .into_iter()
         .filter(|(key, _)| !key.is_empty())
@@ -1128,7 +1134,7 @@ fn build_list_object_versions_metadata_output(
                             .etag
                             .as_ref()
                             .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
-                            .map(|etag| to_s3s_etag(etag)),
+                            .map(|etag| to_s3s_xml_etag(etag)),
                         storage_class: Some(ObjectVersionStorageClass::from(
                             object
                                 .storage_class
@@ -1219,7 +1225,7 @@ fn build_list_objects_v2_metadata_output(
                         .etag
                         .as_ref()
                         .filter(|_| rustfs_utils::http::etag_can_be_listed(&object.user_defined))
-                        .map(|etag| to_s3s_etag(etag)),
+                        .map(|etag| to_s3s_xml_etag(etag)),
                     storage_class: Some(ObjectStorageClass::from(
                         object
                             .storage_class
@@ -1270,19 +1276,22 @@ fn build_list_objects_v2_metadata_output(
     }
 }
 
-fn create_bucket_exists_response(is_owner: bool, region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
-    if is_owner && region == RUSTFS_REGION {
-        // AWS preserves the legacy idempotent response for buckets recreated in
-        // us-east-1 (the default RustFS region).
+/// Answer a `CreateBucket` for a bucket that already exists.
+///
+/// A deployment owns one bucket namespace, so every requester that passed
+/// authorization belongs to the same owner as the bucket's creator; there is no
+/// second account that could trigger `BucketAlreadyExists`. That leaves the AWS
+/// account-owner semantics: the default region returns the legacy idempotent
+/// `200 OK`, any other region returns `BucketAlreadyOwnedByYou`.
+fn create_bucket_exists_response(region: &str) -> S3Result<S3Response<CreateBucketOutput>> {
+    if region == RUSTFS_REGION {
         return Ok(S3Response::new(CreateBucketOutput::default()));
     }
 
-    let error_code = if is_owner {
-        S3ErrorCode::BucketAlreadyOwnedByYou
-    } else {
-        S3ErrorCode::BucketAlreadyExists
-    };
-    Err(S3Error::with_message(error_code, "The requested bucket already exists."))
+    Err(S3Error::with_message(
+        S3ErrorCode::BucketAlreadyOwnedByYou,
+        "The requested bucket already exists.",
+    ))
 }
 
 fn resolve_notification_region(global_region: Option<Region>, request_region: Option<Region>) -> String {
@@ -1463,14 +1472,12 @@ impl DefaultBucketUsecase {
         current_object_store_handle_for_context(self.context.as_deref())
     }
 
-    fn create_bucket_exists_result(&self, requester_is_owner: bool) -> S3Result<S3Response<CreateBucketOutput>> {
-        // Match AWS CreateBucket semantics: an owned bucket is idempotent in
-        // us-east-1 and returns BucketAlreadyOwnedByYou elsewhere.
+    fn create_bucket_exists_result(&self) -> S3Result<S3Response<CreateBucketOutput>> {
         let region = self
             .global_region()
             .map(|region| region.to_string())
             .unwrap_or_else(|| RUSTFS_REGION.to_string());
-        create_bucket_exists_response(requester_is_owner, &region)
+        create_bucket_exists_response(&region)
     }
 
     #[instrument(
@@ -1500,7 +1507,7 @@ impl DefaultBucketUsecase {
 
         // An existing bucket needs no mutation. Answer before the mutation queue and the
         // bucket's exclusive locks, which wait for every in-flight object write.
-        if let Ok(req_info) = req_info_ref(&req)
+        if req_info_ref(&req).is_ok()
             && let Some(store) = self.object_store()
             && store
                 .get_bucket_info(&req.input.bucket, &BucketOptions::default())
@@ -1508,7 +1515,7 @@ impl DefaultBucketUsecase {
                 .is_ok()
         {
             let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
-            let result = self.create_bucket_exists_result(req_info.is_owner);
+            let result = self.create_bucket_exists_result();
             let _ = helper.complete(&result);
             return result;
         }
@@ -1526,12 +1533,9 @@ impl DefaultBucketUsecase {
     ) -> S3Result<S3Response<CreateBucketOutput>> {
         let helper = OperationHelper::new(&req, EventName::BucketCreated, S3Operation::CreateBucket);
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
-        let requester_is_owner = match req_info_ref(&req) {
-            Ok(r) => r.is_owner,
-            Err(_) => {
-                return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
-            }
-        };
+        if req_info_ref(&req).is_err() {
+            return Err(S3Error::with_message(S3ErrorCode::InternalError, "Missing request info".to_string()));
+        }
         let CreateBucketInput {
             bucket,
             object_lock_enabled_for_bucket,
@@ -1591,7 +1595,7 @@ impl DefaultBucketUsecase {
                 .await;
             }
             Err(StorageError::BucketExists(_)) => {
-                let result = self.create_bucket_exists_result(requester_is_owner);
+                let result = self.create_bucket_exists_result();
                 let _ = helper.complete(&result);
                 return result;
             }
@@ -1735,7 +1739,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(GetBucketLocationOutput { location_constraint }))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_list_buckets(&self, req: S3Request<ListBucketsInput>) -> S3Result<S3Response<ListBucketsOutput>> {
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -1802,7 +1806,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::with_status(DeleteBucketEncryptionOutput::default(), StatusCode::NO_CONTENT))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket_cors(
         &self,
         req: S3Request<DeleteBucketCorsInput>,
@@ -1834,7 +1838,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketCorsOutput {}))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket_lifecycle(
         &self,
         req: S3Request<DeleteBucketLifecycleInput>,
@@ -1979,7 +1983,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketReplicationOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_bucket_tagging(
         &self,
         req: S3Request<DeleteBucketTaggingInput>,
@@ -1988,7 +1992,7 @@ impl DefaultBucketUsecase {
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let DeleteBucketTaggingInput { bucket, .. } = req.input;
 
-        delete_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id)
+        metadata_sys::update_s3_tagging_config(&bucket, None, expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2006,7 +2010,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(DeleteBucketTaggingOutput {}))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_delete_public_access_block(
         &self,
         req: S3Request<DeletePublicAccessBlockInput>,
@@ -2069,7 +2073,7 @@ impl DefaultBucketUsecase {
         Ok(server_side_encryption_configuration)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_cors(&self, req: S3Request<GetBucketCorsInput>) -> S3Result<PersistedCorsConfiguration> {
         let GetBucketCorsInput { bucket, .. } = req.input;
 
@@ -2106,7 +2110,7 @@ impl DefaultBucketUsecase {
         Ok(cors_configuration)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_lifecycle_configuration(
         &self,
         req: S3Request<GetBucketLifecycleConfigurationInput>,
@@ -2329,7 +2333,7 @@ impl DefaultBucketUsecase {
         Ok(replication_configuration)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_tagging(&self, req: S3Request<GetBucketTaggingInput>) -> S3Result<PersistedTagging> {
         let GetBucketTaggingInput { bucket, .. } = req.input;
 
@@ -2363,7 +2367,7 @@ impl DefaultBucketUsecase {
         Ok(tagging)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_public_access_block(
         &self,
         req: S3Request<GetPublicAccessBlockInput>,
@@ -2395,7 +2399,7 @@ impl DefaultBucketUsecase {
         Ok(config)
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_get_bucket_versioning(
         &self,
         req: S3Request<GetBucketVersioningInput>,
@@ -2475,7 +2479,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketEncryptionOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_bucket_lifecycle_configuration(
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
@@ -2756,7 +2760,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketPolicyOutput {}))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_bucket_cors(
         &self,
         req: S3Request<PutBucketCorsInput>,
@@ -2848,7 +2852,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketReplicationOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_public_access_block(
         &self,
         req: S3Request<PutPublicAccessBlockInput>,
@@ -2878,7 +2882,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutPublicAccessBlockOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_bucket_tagging(
         &self,
         req: S3Request<PutBucketTaggingInput>,
@@ -2887,6 +2891,15 @@ impl DefaultBucketUsecase {
         let expected_incarnation_id = bucket_config_mutation_incarnation(&req, &req.input.bucket)?;
         let request_context = req.extensions.get::<request_context::RequestContext>().cloned();
         let PutBucketTaggingInput { bucket, .. } = req.input;
+        let s3_tag_set: Vec<s3s::dto::Tag> = tagging
+            .tag_set
+            .iter()
+            .map(|tag| s3s::dto::Tag {
+                key: tag.key.clone(),
+                value: tag.value.clone(),
+            })
+            .collect();
+        super::storage_api::bucket_usecase::s3_api::tagging::validate_bucket_tag_set(&s3_tag_set)?;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
@@ -2897,9 +2910,7 @@ impl DefaultBucketUsecase {
             .await
             .map_err(ApiError::from)?;
 
-        let data = serialize_config(&tagging)?;
-
-        update_bucket_config_for_incarnation(&bucket, BUCKET_TAGGING_CONFIG, data, expected_incarnation_id)
+        metadata_sys::update_s3_tagging_config(&bucket, Some(tagging.clone()), expected_incarnation_id)
             .await
             .map_err(ApiError::from)?;
 
@@ -2918,7 +2929,7 @@ impl DefaultBucketUsecase {
         Ok(S3Response::new(PutBucketTaggingOutput::default()))
     }
 
-    #[instrument(level = "debug", skip(self))]
+    #[instrument(level = "debug", skip(self, req))]
     pub async fn execute_put_bucket_versioning(
         &self,
         req: S3Request<PutBucketVersioningInput>,
@@ -4493,20 +4504,14 @@ mod tests {
     }
 
     #[test]
-    fn create_bucket_exists_response_returns_ok_for_owner() {
-        let response = create_bucket_exists_response(true, RUSTFS_REGION).expect("owner recreate in us-east-1 should succeed");
+    fn create_bucket_exists_response_returns_ok_in_default_region() {
+        let response = create_bucket_exists_response(RUSTFS_REGION).expect("recreate in us-east-1 should succeed");
         assert_eq!(response.output.location, None);
     }
 
     #[test]
-    fn create_bucket_exists_response_returns_bucket_already_exists_for_non_owner() {
-        let err = create_bucket_exists_response(false, RUSTFS_REGION).expect_err("non-owner recreate should fail");
-        assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyExists);
-    }
-
-    #[test]
-    fn create_bucket_exists_response_returns_owned_by_you_outside_us_east_1() {
-        let err = create_bucket_exists_response(true, "eu-west-1").expect_err("owner recreate outside us-east-1 should fail");
+    fn create_bucket_exists_response_returns_owned_by_you_outside_default_region() {
+        let err = create_bucket_exists_response("eu-west-1").expect_err("recreate outside us-east-1 should report ownership");
         assert_eq!(err.code(), &S3ErrorCode::BucketAlreadyOwnedByYou);
     }
 
@@ -4569,9 +4574,11 @@ mod tests {
                 .expect("hold the bucket lifecycle lock");
             let usecase = DefaultBucketUsecase::with_context(Some(context));
 
-            for (is_owner, location, expected_error) in [
+            // The requester's owner flag must not change the duplicate response:
+            // one deployment has a single bucket owner.
+            for (requester_is_owner, location, expected_error) in [
                 (true, None, None),
-                (false, None, Some(S3ErrorCode::BucketAlreadyExists)),
+                (false, None, None),
                 (true, Some("ap-south-1"), Some(S3ErrorCode::InvalidLocationConstraint)),
             ] {
                 let input = CreateBucketInput {
@@ -4586,7 +4593,7 @@ mod tests {
                     input,
                     Method::PUT,
                     ReqInfo {
-                        is_owner,
+                        is_owner: requester_is_owner,
                         ..Default::default()
                     },
                 );
@@ -4594,9 +4601,9 @@ mod tests {
                     .await
                     .expect("CreateBucket on an existing bucket must not wait for the bucket lifecycle lock");
                 match expected_error {
-                    Some(code) => assert_eq!(result.expect_err("duplicate or invalid request must fail").code(), &code),
+                    Some(code) => assert_eq!(result.expect_err("invalid request must fail").code(), &code),
                     None => {
-                        result.expect("the owner recreating a bucket in us-east-1 gets the idempotent success");
+                        result.expect("recreating a bucket in us-east-1 returns the idempotent success");
                     }
                 }
             }
@@ -5174,7 +5181,10 @@ mod tests {
         assert!(listings.contents[0].object.e_tag.is_none());
         assert!(listings.contents[1].object.e_tag.is_some());
         assert!(listings.contents[2].object.e_tag.is_some());
-        assert_eq!(listings.contents[3].object.e_tag, Some(to_s3s_etag("1b8a77dff5845270a8d81d86a28f38ea-2")));
+        assert_eq!(
+            listings.contents[3].object.e_tag,
+            Some(to_s3s_xml_etag("1b8a77dff5845270a8d81d86a28f38ea-2"))
+        );
         let xml = String::from_utf8(serialize_s3s_response(&listings)).expect("UTF-8 objects");
         assert!(!xml.contains(legacy_md5));
 
@@ -5202,6 +5212,168 @@ mod tests {
         }
         let xml = String::from_utf8(serialize_s3s_response(&versions)).expect("UTF-8 versions");
         assert!(!xml.contains(legacy_md5));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn put_bucket_tagging_rejects_invalid_shapes_before_storage_mutation() {
+        crate::app::gating_test_env::run_large_stack_test("bucket-tag-validation", || async {
+            use crate::app::runtime_sources::{AppContext, ServerContextSlot};
+            use crate::app::storage_api::test::ReqInfo;
+            use crate::app::storage_api::test::ecfs::FS;
+            use s3s::access::S3Access as _;
+            let ambient = crate::app::gating_test_env::shared_gating_ambient().await;
+            let store = crate::app::gating_test_env::shared_gating_ecstore().await;
+            let context = Arc::new(AppContext::new(store.clone(), ambient.iam(), ambient.kms()));
+            let slot = ServerContextSlot::new();
+            assert!(slot.install(context.clone()));
+            let fs = FS::with_server_ctx(slot.clone());
+            let usecase = DefaultBucketUsecase::with_context(Some(context));
+            let bucket = format!("tag-validation-{}", uuid::Uuid::new_v4().simple());
+            store.make_bucket(&bucket, &MakeBucketOptions::default()).await.unwrap();
+            store
+                .update_bucket_metadata_config(
+                    &bucket,
+                    BUCKET_POLICY_CONFIG,
+                    serde_json::to_vec(
+                        &serde_json::json!({"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"AWS":"*"},
+                    "Action":"s3:PutBucketTagging","Resource":format!("arn:aws:s3:::{bucket}")}]}),
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let tag = s3s::dto::Tag {
+                key: Some("team".to_owned()),
+                value: Some("storage".to_owned()),
+            };
+            for (tag_set, valid) in [
+                (vec![tag.clone()], true),
+                (
+                    vec![s3s::dto::Tag {
+                        key: Some("team".to_owned()),
+                        value: None,
+                    }],
+                    false,
+                ),
+                (vec![tag.clone(), tag], false),
+            ] {
+                let persisted = PersistedTagging {
+                    tag_set: tag_set
+                        .iter()
+                        .map(|tag| rustfs_gateway_types::cors_tagging::PersistedTag {
+                            key: tag.key.clone(),
+                            value: tag.value.clone(),
+                        })
+                        .collect(),
+                };
+                let input = PutBucketTaggingInput::builder()
+                    .bucket(bucket.clone())
+                    .tagging(s3s::dto::Tagging { tag_set })
+                    .build()
+                    .unwrap();
+                let mut req = build_request(input, Method::PUT);
+                req.extensions.insert(ReqInfo::default());
+                req.extensions.insert(slot.clone());
+                fs.put_bucket_tagging(&mut req).await.expect("permission allows tag updates");
+                let result = usecase.execute_put_bucket_tagging(req, persisted).await;
+                if valid {
+                    result.expect("valid tags are persisted");
+                } else {
+                    assert_eq!(result.unwrap_err().code(), &S3ErrorCode::InvalidTag);
+                }
+                assert_eq!(
+                    store.get_bucket_tags_for_policy(&bucket).await.unwrap(),
+                    HashMap::from([("team".to_owned(), "storage".to_owned())])
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn metadata_listings_hide_ssec_user_metadata_even_with_read_permission() {
+        let objects = [
+            ("customer-key", Some(("x-amz-server-side-encryption-customer-algorithm", "AES256"))),
+            (
+                "minio-customer-key",
+                Some((
+                    rustfs_utils::http::object_encryption_keys::MINIO_INTERNAL_ENCRYPTION_SSEC_SEALED_KEY_HEADER,
+                    "sealed-key",
+                )),
+            ),
+            ("server-key", Some(("x-amz-server-side-encryption", "AES256"))),
+            ("plain", None),
+        ]
+        .into_iter()
+        .map(|(name, encryption)| {
+            let mut metadata = HashMap::from([("project".to_owned(), "private-project".to_owned())]);
+            if let Some((key, value)) = encryption {
+                metadata.insert(key.to_owned(), value.to_owned());
+            }
+            ObjectInfo {
+                name: name.to_owned(),
+                user_defined: Arc::new(metadata),
+                ..Default::default()
+            }
+        })
+        .collect::<Vec<_>>();
+        let permissions = objects
+            .iter()
+            .map(|object| {
+                (
+                    object.name.clone(),
+                    ObjectMetadataPermissions {
+                        metadata_allowed: true,
+                        tags_allowed: true,
+                    },
+                )
+            })
+            .collect::<HashMap<_, _>>();
+        let listings = build_list_objects_v2_metadata_output(
+            ListObjectsV2Info {
+                objects: objects.clone(),
+                ..Default::default()
+            },
+            "demo-bucket",
+            &ListObjectsV2Params {
+                prefix: String::new(),
+                max_keys: 1000,
+                delimiter: None,
+                response_start_after: None,
+                start_after_for_query: None,
+                response_continuation_token: None,
+                decoded_continuation_token: None,
+            },
+            None,
+            false,
+            &permissions,
+        );
+        assert!(listings.contents[0].extension.user_metadata.is_none());
+        assert!(listings.contents[1].extension.user_metadata.is_none());
+        assert!(listings.contents[2].extension.user_metadata.is_some());
+        assert!(listings.contents[3].extension.user_metadata.is_some());
+        let versions = build_list_object_versions_metadata_output(
+            ListObjectVersionsInfo {
+                objects,
+                ..Default::default()
+            },
+            "demo-bucket",
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                max_keys: 1000,
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+            },
+            None,
+            &permissions,
+        );
+        for (index, entry) in versions.entries.iter().enumerate() {
+            let ListObjectVersionMetadataEntry::Version(_, extension) = entry else {
+                panic!("expected version");
+            };
+            assert_eq!(extension.user_metadata.is_some(), index >= 2);
+        }
     }
 
     #[test]

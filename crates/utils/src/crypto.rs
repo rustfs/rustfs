@@ -13,11 +13,76 @@
 // limitations under the License.
 
 use hex_simd::{AsOut, AsciiCase};
-use hmac::{Hmac, KeyInit, Mac};
+use hmac::Hmac;
+#[cfg(not(feature = "fips"))]
+pub use hmac::{KeyInit, Mac};
 use hyper::body::Bytes;
+#[cfg(not(feature = "fips"))]
 use sha1::Sha1;
 use sha2::{Digest, Sha256};
 use std::mem::MaybeUninit;
+
+#[cfg(not(feature = "fips"))]
+pub type HmacSha256 = Hmac<Sha256>;
+
+#[cfg(feature = "fips")]
+pub struct HmacSha256Output([u8; 32]);
+
+#[cfg(feature = "fips")]
+impl HmacSha256Output {
+    #[must_use]
+    pub fn into_bytes(self) -> hmac::digest::Output<Hmac<Sha256>> {
+        self.0.into()
+    }
+}
+
+#[cfg(feature = "fips")]
+pub trait KeyInit: Sized {
+    fn new_from_slice(key: &[u8]) -> Result<Self, hmac::digest::InvalidLength>;
+}
+
+#[cfg(feature = "fips")]
+pub trait Mac: Sized {
+    fn update(&mut self, data: &[u8]);
+    fn finalize(self) -> HmacSha256Output;
+    fn verify_slice(self, tag: &[u8]) -> Result<(), hmac::digest::MacError>;
+}
+
+#[cfg(feature = "fips")]
+#[derive(Clone)]
+pub struct HmacSha256(aws_lc_rs::hmac::Context);
+
+#[cfg(feature = "fips")]
+impl HmacSha256 {
+    pub fn new_from_slice(key: &[u8]) -> Result<Self, hmac::digest::InvalidLength> {
+        let signing_key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA256, key);
+        Ok(Self(aws_lc_rs::hmac::Context::with_key(&signing_key)))
+    }
+}
+
+#[cfg(feature = "fips")]
+impl KeyInit for HmacSha256 {
+    fn new_from_slice(key: &[u8]) -> Result<Self, hmac::digest::InvalidLength> {
+        Self::new_from_slice(key)
+    }
+}
+
+#[cfg(feature = "fips")]
+impl Mac for HmacSha256 {
+    fn update(&mut self, data: &[u8]) {
+        self.0.update(data);
+    }
+
+    fn finalize(self) -> HmacSha256Output {
+        let tag = self.0.sign();
+        HmacSha256Output(tag.as_ref().try_into().expect("HMAC-SHA256 tag is 32 bytes"))
+    }
+
+    fn verify_slice(self, tag: &[u8]) -> Result<(), hmac::digest::MacError> {
+        let computed = self.0.sign();
+        aws_lc_rs::constant_time::verify_slices_are_equal(computed.as_ref(), tag).map_err(|_| hmac::digest::MacError)
+    }
+}
 
 /// Base64 URL safe encoding without padding
 /// `base64_encode_url_safe_no_pad(input)`
@@ -84,9 +149,18 @@ pub fn is_sha256_checksum(s: &str) -> bool {
 /// A 20-byte array containing the HMAC-SHA1 hash of the input data using the provided key
 ///
 pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
-    let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
-    m.update(data.as_ref());
-    m.finalize().into_bytes().into()
+    #[cfg(feature = "fips")]
+    {
+        let signing_key = aws_lc_rs::hmac::Key::new(aws_lc_rs::hmac::HMAC_SHA1_FOR_LEGACY_USE_ONLY, key.as_ref());
+        let tag = aws_lc_rs::hmac::sign(&signing_key, data.as_ref());
+        tag.as_ref().try_into().expect("HMAC-SHA1 tag is 20 bytes")
+    }
+    #[cfg(not(feature = "fips"))]
+    {
+        let mut m = <Hmac<Sha1>>::new_from_slice(key.as_ref()).expect("operation should succeed");
+        m.update(data.as_ref());
+        m.finalize().into_bytes().into()
+    }
 }
 
 /// HMAC-SHA256 hashing
@@ -100,7 +174,7 @@ pub fn hmac_sha1(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 20] {
 /// A 32-byte array containing the HMAC-SHA256 hash of the input data using the provided key
 ///
 pub fn hmac_sha256(key: impl AsRef<[u8]>, data: impl AsRef<[u8]>) -> [u8; 32] {
-    let mut m = Hmac::<Sha256>::new_from_slice(key.as_ref()).expect("operation should succeed");
+    let mut m = HmacSha256::new_from_slice(key.as_ref()).expect("operation should succeed");
     m.update(data.as_ref());
     m.finalize().into_bytes().into()
 }
@@ -166,4 +240,21 @@ fn sha256_checksum_rejects_wrong_length_or_non_lowercase_hex() {
     assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef0"));
     assert!(!is_sha256_checksum("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdeg"));
     assert!(!is_sha256_checksum("0123456789ABCDEF0123456789abcdef0123456789abcdef0123456789abcdef"));
+}
+
+#[test]
+fn test_hmac_sha256_rfc4231() {
+    #[cfg(feature = "fips")]
+    aws_lc_rs::try_fips_mode().expect("aws-lc-rs FIPS mode must be active when `rustfs-utils/fips` is enabled");
+
+    let key = [0x0b_u8; 20];
+    let data = b"Hi There";
+    assert_eq!(hex(hmac_sha1(key, data)), "b617318655057264e28bc0b6fb378c8ef146be00");
+    let mac = hmac_sha256(key, data);
+    assert_eq!(hex(mac), "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+    let mut verifier = <HmacSha256 as KeyInit>::new_from_slice(&key).expect("valid key");
+    verifier.update(data);
+    assert!(verifier.clone().verify_slice(&mac).is_ok());
+    assert!(verifier.verify_slice(&[0_u8; 32]).is_err());
 }

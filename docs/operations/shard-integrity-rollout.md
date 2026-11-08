@@ -62,6 +62,9 @@ because object identity is unproven; that is distinct from execution progress.
 MRF likewise retains durable legacy repair obligations after physical recovery
 when no independent verification receipt can discharge them. An idle attempt
 queue does not imply that these persistent obligations have been cleared.
+
+After a qualified all-healthy Deep check, the attempt is `Completed` with an `Unknown` object outcome; it is counted in `unverified_tasks`, not `successful_tasks` or `failed_tasks`. This cumulative attempt count is distinct from the current `held_unverified_legacy` responsibility count. The scheduler reports `verification_unavailable`, and the durable obligation remains subject to the existing explicit recheck or audited operator disposition. Execution completion never supplies a missing integrity receipt.
+
 Partial-write MRF replay uses Deep verification so a protected object's repair
 can discharge its obligation after verifying the payload. This adds full-object
 read work to those background attempts, including healthy replay targets.

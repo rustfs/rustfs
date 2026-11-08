@@ -31,6 +31,7 @@ workspace = true
 
 [features]
 default = []
+fips = ["rustfs-s3-client/fips", "rustfs-utils/fips", "rustfs-tls-runtime/fips"]
 diagnostic-read-version-caller = ["rustfs-io-metrics/diagnostic-read-version-caller"]
 # Sampled wall/CPU diagnostics only; does not change the read backend.
 diagnostic-local-batch = ["rustix/time"]
@@ -202,6 +203,9 @@ libc.workspace = true
 # (backlog#1178); "thread" provides cleanup affinity; "fs" is a workspace default.
 rustix = { workspace = true, features = ["process", "fs", "thread"] }
 rustfs-madmin.workspace = true
+rustfs-signer.workspace = true
+rustfs-tls-runtime.workspace = true
+quick-xml.workspace = true
 reqwest = { workspace = true }
 aws-sdk-s3 = { workspace = true, default-features = false, features = ["sigv4a", "default-https-client", "rt-tokio"] }
 urlencoding = { workspace = true }

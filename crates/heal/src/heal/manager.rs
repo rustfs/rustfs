@@ -810,7 +810,14 @@ fn publish_heal_queue_length(queue: &PriorityHealQueue) {
 fn active_heal_for_dedup_key(active_heals: &HashMap<String, Arc<HealTask>>, key: &str) -> Option<(String, HealType)> {
     active_heals
         .iter()
-        .find(|(_, task)| PriorityHealQueue::make_dedup_key_for_scope(&task.heal_type, &task.options) == key)
+        .find(|(_, task)| {
+            PriorityHealQueue::make_dedup_key_for_owner(
+                &task.heal_type,
+                &task.options,
+                task.source,
+                task.expected_mrf_bucket_incarnation_id,
+            ) == key
+        })
         .map(|(task_id, task)| (task_id.clone(), task.heal_type.clone()))
 }
 

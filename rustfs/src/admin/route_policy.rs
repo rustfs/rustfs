@@ -18,7 +18,6 @@ use rustfs_security_governance::{
 };
 
 const ALL_ADMIN: AdminActionRef = AdminActionRef::new("AllAdminActions");
-const ADD_USER_TO_GROUP: AdminActionRef = AdminActionRef::new("AddUserToGroupAdminAction");
 const ATTACH_POLICY: AdminActionRef = AdminActionRef::new("AttachPolicyAdminAction");
 const CONFIG_UPDATE: AdminActionRef = AdminActionRef::new("ConfigUpdateAdminAction");
 const TLS_CERTIFICATE_PUBLISH: AdminActionRef = AdminActionRef::new("TLSCertificatePublishAdminAction");
@@ -187,12 +186,6 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
         RouteRiskLevel::High,
     ),
     admin(HttpMethod::Put, "/rustfs/admin/v3/set-group-status", ENABLE_GROUP, RouteRiskLevel::High),
-    admin(
-        HttpMethod::Put,
-        "/rustfs/admin/v3/update-group-members",
-        ADD_USER_TO_GROUP,
-        RouteRiskLevel::High,
-    ),
     admin(
         HttpMethod::Get,
         "/rustfs/admin/v3/temporary-account-info",
@@ -1141,19 +1134,19 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
-        "/iceberg/v1/{warehouse}/catalog/migration",
+        "/iceberg/v1/{warehouse}/catalog/directory",
         GET_TABLE_CATALOG,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Post,
-        "/iceberg/v1/{warehouse}/catalog/migration",
+        "/iceberg/v1/{warehouse}/catalog/directory",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Delete,
-        "/iceberg/v1/{warehouse}/catalog/migration",
+        "/iceberg/v1/{warehouse}/catalog/directory",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1166,6 +1159,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/iceberg/v1/{warehouse}/catalog/restore",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/export",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/import",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/iceberg/v1/{warehouse}/catalog/backup/prepare",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1449,19 +1460,19 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Get,
-        "/_iceberg/v1/{warehouse}/catalog/migration",
+        "/_iceberg/v1/{warehouse}/catalog/directory",
         GET_TABLE_CATALOG,
         RouteRiskLevel::Sensitive,
     ),
     admin(
         HttpMethod::Post,
-        "/_iceberg/v1/{warehouse}/catalog/migration",
+        "/_iceberg/v1/{warehouse}/catalog/directory",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
     admin(
         HttpMethod::Delete,
-        "/_iceberg/v1/{warehouse}/catalog/migration",
+        "/_iceberg/v1/{warehouse}/catalog/directory",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1474,6 +1485,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     admin(
         HttpMethod::Post,
         "/_iceberg/v1/{warehouse}/catalog/restore",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/export",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/import",
+        MIGRATE_TABLE_CATALOG,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Post,
+        "/_iceberg/v1/{warehouse}/catalog/backup/prepare",
         MIGRATE_TABLE_CATALOG,
         RouteRiskLevel::High,
     ),
@@ -1806,6 +1835,11 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
 ];
 
 pub const DEFERRED_ADMIN_ROUTE_POLICIES: &[DeferredAdminRoutePolicy] = &[
+    deferred(
+        HttpMethod::Put,
+        "/rustfs/admin/v3/update-group-members",
+        DeferredRoutePolicyReason::MultipleActions,
+    ),
     deferred(HttpMethod::Get, "/rustfs/admin/v3/accountinfo", DeferredRoutePolicyReason::S3Action),
     // The self-service account routes act on the caller, never on a target
     // named in the request, so they gate on possession of the credential (plus,
@@ -2127,7 +2161,7 @@ mod tests {
         let table_specs = ADMIN_ROUTE_POLICY_SPECS
             .iter()
             .filter(|spec| spec.path().starts_with("/iceberg/v1") || spec.path().starts_with("/_iceberg/v1"));
-        assert_eq!(table_specs.count(), 106);
+        assert_eq!(table_specs.count(), 112);
         assert_action(HttpMethod::Put, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Delete, "/iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
         assert_action(HttpMethod::Delete, "/_iceberg/v1/buckets/{warehouse}", SET_TABLE_BUCKET);
@@ -2306,16 +2340,22 @@ mod tests {
             "/_iceberg/v1/{warehouse}/namespaces/{namespace}/tables/{table}/maintenance/jobs/{job}/quarantine",
             RUN_TABLE_MAINTENANCE,
         );
-        assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/catalog/migration", GET_TABLE_CATALOG);
-        assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/catalog/migration", GET_TABLE_CATALOG);
-        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
-        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
-        assert_action(HttpMethod::Delete, "/iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
-        assert_action(HttpMethod::Delete, "/_iceberg/v1/{warehouse}/catalog/migration", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Get, "/iceberg/v1/{warehouse}/catalog/directory", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Delete, "/iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Get, "/_iceberg/v1/{warehouse}/catalog/directory", GET_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Delete, "/_iceberg/v1/{warehouse}/catalog/directory", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
         assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/restore", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/export", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/export", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/import", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
+        assert_action(HttpMethod::Post, "/_iceberg/v1/{warehouse}/catalog/backup/prepare", MIGRATE_TABLE_CATALOG);
         assert_action(
             HttpMethod::Post,
             "/iceberg/v1/{warehouse}/catalog/warehouse-index/backfill",

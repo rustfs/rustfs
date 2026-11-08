@@ -127,6 +127,10 @@ impl TierMutationIntentTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TierMutationIntent {
+    // Old peers deny unknown intent fields before installing a prepare block.
+    // Omit this extension for existing drivers to retain their wire checksum.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub requires_native_azure: bool,
     pub mutation_id: Uuid,
     pub revision: u64,
     pub kind: TierMutationIntentKind,
@@ -282,7 +286,8 @@ impl TierMutationIntent {
     }
 
     pub(crate) fn same_identity_as(&self, other: &Self) -> bool {
-        self.mutation_id == other.mutation_id
+        self.requires_native_azure == other.requires_native_azure
+            && self.mutation_id == other.mutation_id
             && self.kind == other.kind
             && self.old_config_etag == other.old_config_etag
             && self.candidate_digest == other.candidate_digest
@@ -854,6 +859,10 @@ fn identity_is_empty(identity: &TierDestinationId) -> bool {
     identity.iter().all(|byte| *byte == 0)
 }
 
+fn is_false(value: &bool) -> bool {
+    !value
+}
+
 fn digest_is_empty(digest: &TierMutationDigest) -> bool {
     digest.iter().all(|byte| *byte == 0)
 }
@@ -869,6 +878,7 @@ mod tests {
 
     fn prepared_intent() -> TierMutationIntent {
         TierMutationIntent {
+            requires_native_azure: false,
             mutation_id: Uuid::new_v4(),
             revision: 1,
             kind: TierMutationIntentKind::Edit,
@@ -894,6 +904,49 @@ mod tests {
         let shard = tier_mutation_mutex_shard_index(mutation_id);
         assert!(shard < TIER_MUTATION_MUTEX_SHARDS);
         assert_eq!(shard, tier_mutation_mutex_shard_index(mutation_id));
+    }
+
+    #[test]
+    fn native_azure_requirement_is_identity_bound_and_rejected_by_the_previous_wire_reader() {
+        // Preserve the previous strict wire shape as an independent reader.
+        #[derive(Serialize, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyIntent {
+            mutation_id: Uuid,
+            revision: u64,
+            kind: TierMutationIntentKind,
+            state: TierMutationIntentState,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            old_config_etag: Option<String>,
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            committed_config_etag: Option<String>,
+            candidate_digest: TierMutationDigest,
+            affected_targets: Vec<TierMutationIntentTarget>,
+            expires_at_unix_nanos: i64,
+        }
+        let legacy = prepared_intent();
+        let legacy_bytes = serde_json::to_vec(&legacy).expect("legacy intent should encode");
+        let old_reader: LegacyIntent =
+            serde_json::from_slice(&legacy_bytes).expect("ordinary mutations remain readable by old peers");
+        assert_eq!(
+            serde_json::to_vec(&old_reader).expect("old encoding"),
+            legacy_bytes,
+            "ordinary mutation checksums must stay unchanged"
+        );
+
+        let mut native = legacy.clone();
+        native.requires_native_azure = true;
+        let native_bytes = serde_json::to_vec(&native).expect("native intent should encode");
+        assert!(
+            serde_json::from_slice::<LegacyIntent>(&native_bytes).is_err(),
+            "an old peer must reject native Azure before prepare"
+        );
+        assert!(!legacy.same_identity_as(&native), "an abort cannot drop the native-driver requirement");
+        let encoded = native.encode().expect("native durable intent should encode");
+        assert_eq!(
+            TierMutationIntent::decode(native.mutation_id, &encoded).expect("new peer should decode"),
+            native
+        );
     }
 
     #[tokio::test]

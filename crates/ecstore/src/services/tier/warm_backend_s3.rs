@@ -352,7 +352,7 @@ fn transition_candidate_metadata(info: ObjectInfo) -> HashMap<String, String> {
     metadata
 }
 
-fn transition_candidate_metadata_matches(
+pub(super) fn transition_candidate_metadata_matches(
     metadata: &HashMap<String, String>,
     identity: TransitionCandidateIdentity,
 ) -> Result<bool, std::io::Error> {

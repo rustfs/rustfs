@@ -76,6 +76,12 @@ impl AdminRequest {
         self.envelope.remote_addr()
     }
 
+    /// The client address for policy evaluation: the verified proxy client
+    /// when one is recorded, otherwise the connection peer.
+    pub(crate) fn policy_source_addr(&self) -> Option<SocketAddr> {
+        self.envelope.policy_source_addr()
+    }
+
     pub(crate) fn client_info(&self) -> Option<&ClientInfo> {
         self.envelope.client_info()
     }

@@ -110,6 +110,9 @@ where
             ftps_required = self.config.ftps_required,
             "FTPS server starting"
         );
+        if self.config.tls_enabled && self.config.cert_dir.is_some() {
+            rustfs_tls_runtime::ensure_crypto_provider().map_err(|err| FtpsInitError::InvalidConfig(err.to_string()))?;
+        }
         let (reload_shutdown_tx, reload_shutdown_rx) = watch::channel(false);
 
         let storage_clone = self.storage.clone();
@@ -118,7 +121,7 @@ where
             Arc::new(ConnectionUserDetailProvider),
         )
         .authenticator(Arc::new(ConnectionAuthenticator {
-            require_data_tls: self.config.tls_enabled && self.config.ftps_required,
+            require_data_tls: self.config.tls_enabled && (self.config.ftps_required || self.config.ca_file.is_some()),
         }));
 
         // Configure passive ports for data connections
@@ -190,16 +193,12 @@ where
                     reload_shutdown_rx.clone(),
                 );
 
-                // Build ServerConfig with SNI support
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-                let server_config = rustls::ServerConfig::builder()
-                    .with_no_client_auth()
-                    .with_cert_resolver(resolver);
+                let server_config = crate::common::tls::server_config(resolver, self.config.ca_file.as_deref())
+                    .map_err(|error| FtpsInitError::InvalidConfig(format!("Invalid client CA configuration: {error}")))?;
 
                 server_builder = server_builder.ftps_manual::<std::path::PathBuf>(Arc::new(server_config));
 
-                if self.config.ftps_required {
+                if self.config.ftps_required || self.config.ca_file.is_some() {
                     debug!(
                         event = EVENT_FTPS_TLS_STATE,
                         component = LOG_COMPONENT_PROTOCOLS,
@@ -209,7 +208,7 @@ where
                     );
                     server_builder = server_builder.ftps_required(FtpsRequired::All, FtpsRequired::All);
                 }
-            } else if self.config.ftps_required {
+            } else if self.config.ftps_required || self.config.ca_file.is_some() {
                 return Err(FtpsInitError::InvalidConfig(
                     "FTPS required but certificate directory not provided".into(),
                 ));

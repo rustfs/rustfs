@@ -2809,17 +2809,22 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
             true
         }
         Err(e) => {
-            error!(
-                event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
-                component = LOG_COMPONENT_ECSTORE,
-                subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
-                bucket = %bucket,
-                arn = %dobj.target_arn,
-                object = %dobj.delete_object.object_name,
-                operation = "apply_replication_delete_state",
-                error = %e,
-                "Replication target operation failed"
-            );
+            // A batch purge or another worker may have removed this version
+            // already. Remote failures still control the final outcome below.
+            let source_already_purged = is_version_purge && (is_err_object_not_found(&e) || is_err_version_not_found(&e));
+            if !source_already_purged {
+                error!(
+                    event = EVENT_RESYNC_TARGET_OPERATION_FAILED,
+                    component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_REPLICATION_RESYNC,
+                    bucket = %bucket,
+                    arn = %dobj.target_arn,
+                    object = %dobj.delete_object.object_name,
+                    operation = "apply_replication_delete_state",
+                    error = %e,
+                    "Replication target operation failed"
+                );
+            }
             send_event(EventArgs {
                 event_name,
                 bucket_name: bucket.clone(),
@@ -2832,7 +2837,7 @@ pub(crate) async fn replicate_delete_with_outcome<S: ReplicationStorage>(
                 },
                 ..Default::default()
             });
-            false
+            source_already_purged
         }
     };
 
@@ -3010,7 +3015,7 @@ const DELETE_MARKER_PURGE_WATCH_INTERVAL: TokioDuration = TokioDuration::from_se
 /// If the marker disappears (deleted before or while the replica landed),
 /// purge the replicated marker from the targets, retrying failed targets on
 /// later rounds. When the window drains with targets still dirty, persist the
-/// purge intent as a durable MRF entry so the next startup replays it through
+/// purge intent as a durable MRF entry so the next MRF replay pass re-drives it through
 /// `purge_stale_delete_marker_targets`.
 async fn watch_and_purge_source_delete_marker<S: ReplicationStorage>(
     bucket: String,
@@ -3101,7 +3106,7 @@ async fn enqueue_delete_marker_purge_mrf(dobj: &DeletedObjectReplicationInfo, fa
 /// Heal callers retry for the full watch window because the startup MRF
 /// processor runs before bucket metadata (and thus target clients) finishes
 /// initializing — the first pass can see `target_client_missing` and a later
-/// round resolves the client; the replay loop is serial and startup-only, so
+/// round resolves the client; replay passes are serial background work, so
 /// blocking it for up to the window per dirty entry is acceptable. Live
 /// callers run on replication workers where a down target would pin a worker
 /// for the whole window, so they attempt once and lean on the durable intent
@@ -6605,6 +6610,7 @@ mod tests {
             health_check_duration: std::time::Duration::from_secs(5),
             replicate_sync: false,
             client: Arc::new(aws_sdk_s3::Client::from_conf(config)),
+            timeouts: Default::default(),
         })
     }
 

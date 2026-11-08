@@ -23,7 +23,7 @@
 //! layers", row 7).
 //! Removed by: T2.12 (rustfs/backlog#2771).
 
-use super::is_xml_response;
+use super::{is_xml_compat_body, is_xml_response};
 use crate::server::hybrid::HybridBody;
 use crate::server::{
     ADMIN_PREFIX, MINIO_ADMIN_PREFIX, MINIO_ADMIN_V3_PREFIX, RPC_PREFIX, RUSTFS_ADMIN_PREFIX, console_prefix, has_path_prefix,
@@ -85,6 +85,9 @@ where
             let (parts, body) = response.into_parts();
 
             let response = match body {
+                HybridBody::Rest { rest_body } if !is_xml_compat_body(&rest_body) => {
+                    Response::from_parts(parts, HybridBody::Rest { rest_body })
+                }
                 HybridBody::Rest { rest_body } => {
                     let rest_body = fix_object_attributes_etag_in_xml(rest_body).await.map_err(Into::into)?;
 

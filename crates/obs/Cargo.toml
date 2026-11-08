@@ -166,6 +166,7 @@ libc = { workspace = true }
 
 
 [dev-dependencies]
+opentelemetry_sdk = { workspace = true, features = ["testing"] }
 tempfile = { workspace = true }
 temp-env = { workspace = true }
 log.workspace = true

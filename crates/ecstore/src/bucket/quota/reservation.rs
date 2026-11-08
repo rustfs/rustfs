@@ -19,7 +19,7 @@ use crate::data_usage::compute_bucket_usage;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::disk::{DiskAPI, error::DiskError};
 use crate::error::{Result, StorageError, is_err_object_not_found, is_err_version_not_found};
-use crate::object_api::{ObjectInfo, ObjectOptions, QuotaAdmission};
+use crate::object_api::{ObjectInfo, ObjectLockConfigSnapshot, ObjectOptions, QuotaAdmission};
 use crate::set_disk::{SetDisks, get_lock_acquire_timeout};
 use crate::storage_api_contracts::namespace::NamespaceLocking;
 use crate::storage_api_contracts::{list::ListOperations as _, object::ObjectOperations};
@@ -28,7 +28,7 @@ use futures::{StreamExt, stream};
 use rustfs_lock::NamespaceLockGuard;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
@@ -36,6 +36,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 const QUOTA_LEDGER_FORMAT_VERSION: u8 = 1;
+const RECONCILE_RETRY_SECONDS: i64 = 30;
+const EVENT_QUOTA_RECONCILIATION: &str = "quota_reconciliation";
 const MAX_ORPHANS_REAPED_PER_WRITE: usize = 64;
 const MAX_ORPHAN_PROBES_PER_WRITE: usize = 128;
 const ORPHAN_PROBE_CONCURRENCY: usize = 32;
@@ -96,6 +98,10 @@ struct QuotaLedger {
     version: u8,
     bucket_incarnation: Uuid,
     quota_revision_unix_nanos: i128,
+    /// Changes on every durable write, including zero-growth reservations.
+    /// Missing on an older writer's output, which invalidates a concurrent scan.
+    #[serde(default)]
+    writer_revision: Uuid,
     accounted_usage: u64,
     reservations: BTreeMap<Uuid, PersistedReservation>,
     #[serde(default)]
@@ -110,6 +116,7 @@ impl QuotaLedger {
             version: QUOTA_LEDGER_FORMAT_VERSION,
             bucket_incarnation,
             quota_revision_unix_nanos: quota_revision.unix_timestamp_nanos(),
+            writer_revision: Uuid::nil(),
             accounted_usage,
             reservations: BTreeMap::new(),
             reconcile_required: false,
@@ -485,22 +492,23 @@ impl QuotaContext {
             let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_data.ledger_object).await?;
             let ledger_guard = Arc::new(ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?);
             fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &ledger_data.ledger_object, None).await?;
-            let mut ledger = load_current_ledger_locked(
-                Arc::clone(&store),
-                &ledger_data.bucket,
-                &ledger_data.ledger_object,
-                bucket_incarnation,
-                quota_revision,
-            )
-            .await?;
-
+            let mut ledger =
+                load_current_ledger_locked(Arc::clone(&store), &ledger_data.ledger_object, bucket_incarnation, quota_revision)
+                    .await?;
+            let job = ReconcileJob::new(Arc::clone(&store), ledger_data.bucket.clone(), bucket_incarnation, quota_revision);
+            let Some(mut ledger) = ledger.take() else {
+                // Bootstrap has no authoritative usage yet. Release every
+                // request-owned fence by returning; the worker owns no request.
+                job.schedule();
+                return Err(StorageError::SlowDown);
+            };
             let growth = reservation.growth();
-            let mut current_usage = ledger.admitted_usage()?;
-            let mut expected_usage = current_usage.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
-            if growth > 0 && expected_usage > quota_limit && growth <= quota_limit && ledger.should_reconcile_after_denial() {
-                reconcile_exact(&store, &ledger_data.bucket, &mut ledger).await?;
-                current_usage = ledger.admitted_usage()?;
-                expected_usage = current_usage.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
+            let current_usage = ledger.admitted_usage()?;
+            let expected_usage = current_usage.checked_add(growth).ok_or(StorageError::PartMissingOrCorrupt)?;
+            if ledger.reconcile_required
+                || (growth > 0 && expected_usage > quota_limit && growth <= quota_limit && ledger.should_reconcile_after_denial())
+            {
+                job.schedule();
             }
             if growth > 0 && expected_usage > quota_limit {
                 return Err(StorageError::QuotaExceeded {
@@ -518,7 +526,7 @@ impl QuotaContext {
                 });
             }
             ledger.reserve(operation_id, reservation)?;
-            save_ledger_locked(Arc::clone(&store), &ledger_data.ledger_object, &ledger, &ledger_guard).await?;
+            save_ledger_locked(Arc::clone(&store), &ledger_data.ledger_object, &mut ledger, &ledger_guard).await?;
 
             Ok(QuotaReservation {
                 ledger: Some(ReservationLedgerData::Single(ledger_data)),
@@ -878,7 +886,13 @@ pub(crate) async fn begin(
     }
 
     let metadata_lock_started = rustfs_io_metrics::put_stage_timer();
-    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    let metadata_guard = metadata_sys::acquire_bucket_metadata_transaction_read_lock_for_options_in(
+        ctx,
+        bucket,
+        opts,
+        "quota_context_metadata_read",
+    )
+    .await?;
     rustfs_io_metrics::record_put_object_stage_duration_from(
         rustfs_io_metrics::PUT_STAGE_PUT_OBJECT_QUOTA_BEGIN_METADATA_LOCK,
         metadata_lock_started,
@@ -1082,7 +1096,7 @@ async fn mark_commit_started(data: &ReservationLedgerData) -> Result<()> {
         fence_namespace_mutations(&data.store, RUSTFS_META_BUCKET, &data.ledger_object, None).await?;
         let mut ledger = load_ledger_locked(Arc::clone(&data.store), &data.ledger_object).await?;
         ledger.mark_commit_started(data.operation_id, &data.reservation)?;
-        save_ledger_locked(Arc::clone(&data.store), &data.ledger_object, &ledger, &ledger_guard).await
+        save_ledger_locked(Arc::clone(&data.store), &data.ledger_object, &mut ledger, &ledger_guard).await
     })
     .await
     .map_err(|err| StorageError::other_with_context("quota commit marker task failed", err))?
@@ -1113,7 +1127,7 @@ async fn settle(data: &ReservationLedgerData, committed: bool) -> Result<()> {
         } else {
             ledger.abort(operation_id, &reservation)?;
         }
-        save_ledger_locked(Arc::clone(&store), &ledger_object, &ledger, &ledger_guard).await
+        save_ledger_locked(Arc::clone(&store), &ledger_object, &mut ledger, &ledger_guard).await
     })
     .await
     .map_err(|err| StorageError::other_with_context("quota ledger settlement task failed", err))?
@@ -1121,22 +1135,15 @@ async fn settle(data: &ReservationLedgerData, committed: bool) -> Result<()> {
 
 async fn load_current_ledger_locked(
     store: Arc<ECStore>,
-    bucket: &str,
     ledger_object: &str,
     bucket_incarnation: Uuid,
     quota_revision: OffsetDateTime,
-) -> Result<QuotaLedger> {
-    match load_ledger_locked(Arc::clone(&store), ledger_object).await {
-        Ok(ledger) if ledger.matches(bucket_incarnation, quota_revision) => Ok(ledger),
-        Ok(ledger) if ledger.reservations.is_empty() && !ledger.reconcile_required => {
-            let usage = exact_bucket_usage(&store, bucket).await?;
-            Ok(QuotaLedger::new(bucket_incarnation, quota_revision, usage))
-        }
+) -> Result<Option<QuotaLedger>> {
+    match load_ledger_locked(store, ledger_object).await {
+        Ok(ledger) if ledger.matches(bucket_incarnation, quota_revision) => Ok(Some(ledger)),
+        Ok(ledger) if ledger.reservations.is_empty() => Ok(None),
         Ok(_) => Err(StorageError::PartMissingOrCorrupt),
-        Err(StorageError::ConfigNotFound) => {
-            let usage = exact_bucket_usage(&store, bucket).await?;
-            Ok(QuotaLedger::new(bucket_incarnation, quota_revision, usage))
-        }
+        Err(StorageError::ConfigNotFound) => Ok(None),
         Err(err) => Err(err),
     }
 }
@@ -1150,12 +1157,41 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
     let object = ledger_object(bucket);
     let ledger_lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
     let guard = ledger_lock.get_write_lock(get_lock_acquire_timeout()).await?;
-    match load_ledger_locked(Arc::clone(&store), &object).await {
-        Ok(ledger) if ledger.bucket_incarnation == incarnation => {}
-        Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {}
+    let ledger = match load_ledger_locked(Arc::clone(&store), &object).await {
+        Ok(ledger) if ledger.bucket_incarnation == incarnation => Some(ledger.bucket_incarnation),
+        Ok(ledger) if crate::bucket::retirement::is_retired(store.clone(), bucket, ledger.bucket_incarnation).await? => {
+            Some(ledger.bucket_incarnation)
+        }
         Ok(_) => return Err(StorageError::PreconditionFailed),
-        Err(StorageError::ConfigNotFound) => return Ok(()),
+        Err(StorageError::ConfigNotFound) => None,
         Err(error) => return Err(error),
+    };
+    // The reconciliation throttle object of the retiring incarnation goes first,
+    // so a crash after the ledger delete cannot leave it behind; the requested
+    // incarnation is cleaned even when its ledger is already gone.
+    for retired in [Some(incarnation), ledger.filter(|retired| *retired != incarnation)]
+        .into_iter()
+        .flatten()
+    {
+        let control = reconcile_control_object(&object, retired);
+        match store
+            .delete_object(
+                RUSTFS_META_BUCKET,
+                &control,
+                ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                },
+            )
+            .await
+        {
+            Ok(_) => {}
+            Err(error) if is_err_object_not_found(&error) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    if ledger.is_none() {
+        return Ok(());
     }
     if guard.is_lock_lost() {
         return Err(StorageError::NamespaceLockQuorumUnavailable {
@@ -1176,6 +1212,13 @@ pub(crate) async fn cleanup_retired_bucket_ledger(store: Arc<ECStore>, bucket: &
         Err(error) if is_err_object_not_found(&error) => Ok(()),
         Err(error) => Err(error),
     }
+}
+
+/// The reconciliation throttle object of one bucket incarnation. One object per
+/// incarnation: a quota revision change replaces the throttle instead of
+/// leaving the previous revision's object behind.
+fn reconcile_control_object(ledger_object: &str, incarnation: Uuid) -> String {
+    format!("{ledger_object}.reconcile/{incarnation}")
 }
 
 async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_object: &str) -> Result<()> {
@@ -1245,15 +1288,11 @@ async fn reap_stale_reservations(store: Arc<ECStore>, bucket: &str, ledger_objec
     for (object, target) in orphan_commit_targets {
         fence_namespace_mutations(&store, bucket, &object, target).await?;
     }
-    let mut removed = remove_orphan_reservations(&mut ledger, &orphan_ids)?;
-    if ledger.reservations.is_empty() && ledger.reconcile_required {
-        reconcile_exact(&store, bucket, &mut ledger).await?;
-        removed = true;
-    }
+    let removed = remove_orphan_reservations(&mut ledger, &orphan_ids)?;
     if !removed && !cursor_changed {
         return Ok(());
     }
-    save_ledger_locked(store, ledger_object, &ledger, &ledger_guard).await
+    save_ledger_locked(store, ledger_object, &mut ledger, &ledger_guard).await
 }
 
 fn remove_orphan_reservations(ledger: &mut QuotaLedger, operation_ids: &[Uuid]) -> Result<bool> {
@@ -1273,13 +1312,221 @@ fn remove_orphan_reservations(ledger: &mut QuotaLedger, operation_ids: &[Uuid]) 
     Ok(removed)
 }
 
-async fn reconcile_exact(store: &Arc<ECStore>, bucket: &str, ledger: &mut QuotaLedger) -> Result<()> {
-    if !ledger.reservations.is_empty() {
-        return Err(StorageError::PartMissingOrCorrupt);
+#[derive(Debug, Serialize, Deserialize)]
+struct ReconcileControl {
+    bucket_incarnation: Uuid,
+    quota_revision_unix_nanos: i128,
+    next_attempt_at: i64,
+}
+
+#[derive(Clone)]
+struct ReconcileJob {
+    store: Arc<ECStore>,
+    bucket: String,
+    bucket_incarnation: Uuid,
+    quota_revision: OffsetDateTime,
+}
+
+type ReconcileKey = (Uuid, String, Uuid, i128);
+
+fn active_reconciliations() -> &'static std::sync::Mutex<HashSet<ReconcileKey>> {
+    static ACTIVE: std::sync::OnceLock<std::sync::Mutex<HashSet<ReconcileKey>>> = std::sync::OnceLock::new();
+    ACTIVE.get_or_init(Default::default)
+}
+
+struct ActiveReconciliation(ReconcileKey);
+
+impl Drop for ActiveReconciliation {
+    fn drop(&mut self) {
+        active_reconciliations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&self.0);
     }
-    ledger.accounted_usage = exact_bucket_usage(store, bucket).await?;
-    ledger.reconcile_required = false;
-    Ok(())
+}
+
+impl ReconcileJob {
+    fn new(store: Arc<ECStore>, bucket: String, bucket_incarnation: Uuid, quota_revision: OffsetDateTime) -> Self {
+        Self {
+            store,
+            bucket,
+            bucket_incarnation,
+            quota_revision,
+        }
+    }
+
+    fn schedule(self) {
+        let key = (
+            self.store.id,
+            self.bucket.clone(),
+            self.bucket_incarnation,
+            self.quota_revision.unix_timestamp_nanos(),
+        );
+        if !active_reconciliations()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(key.clone())
+        {
+            return;
+        }
+        let owner = ActiveReconciliation(key);
+        // The owner carries no object, metadata, lifecycle or reservation guard.
+        // Cancellation of the rejected request cannot cancel its reconciliation.
+        tokio::spawn(async move {
+            let _owner = owner;
+            if let Err(error) = self.run().await {
+                warn!(event = EVENT_QUOTA_RECONCILIATION, component = LOG_COMPONENT_ECSTORE,
+                    subsystem = LOG_SUBSYSTEM_QUOTA, state = "deferred", bucket = %self.bucket,
+                    error = %error, "Quota reconciliation deferred");
+            }
+        });
+    }
+
+    fn control_object(&self) -> String {
+        reconcile_control_object(&ledger_object(&self.bucket), self.bucket_incarnation)
+    }
+
+    async fn save_control(&self, object: &str, control: &ReconcileControl, guard: &Arc<NamespaceLockGuard>) -> Result<()> {
+        if guard.is_lock_lost() {
+            return Err(StorageError::SlowDown);
+        }
+        let mut opts = ObjectOptions {
+            max_parity: true,
+            no_lock: true,
+            ..Default::default()
+        };
+        let _ = opts.set_quota_admission(0, u64::MAX);
+        opts.add_owned_write_lock(Arc::clone(guard), RUSTFS_META_BUCKET, object);
+        opts.write_completion = crate::object_api::WriteCompletion::TailDrained;
+        save_config_with_opts(Arc::clone(&self.store), object, serde_json::to_vec(control)?, &opts).await
+    }
+
+    async fn run(&self) -> Result<()> {
+        let control_object = self.control_object();
+        let lock = self.store.new_ns_lock(RUSTFS_META_BUCKET, &control_object).await?;
+        let Ok(guard) = lock.get_write_lock_quiet(Duration::from_millis(50)).await else {
+            return Ok(());
+        };
+        let guard = Arc::new(guard);
+        let now = now_unix();
+        match read_config_no_lock(Arc::clone(&self.store), &control_object).await {
+            Ok(bytes) => {
+                let control: ReconcileControl = serde_json::from_slice(&bytes)?;
+                if control.bucket_incarnation != self.bucket_incarnation {
+                    return Err(StorageError::PartMissingOrCorrupt);
+                }
+                // A previous quota revision's throttle does not apply: the new
+                // revision needs its own scan and overwrites the object below.
+                if control.quota_revision_unix_nanos == self.quota_revision.unix_timestamp_nanos()
+                    && control.next_attempt_at > now
+                {
+                    return Ok(());
+                }
+            }
+            Err(StorageError::ConfigNotFound) => {}
+            Err(error) => return Err(error),
+        }
+        fence_namespace_mutations(&self.store, RUSTFS_META_BUCKET, &control_object, None).await?;
+        let mut control = ReconcileControl {
+            bucket_incarnation: self.bucket_incarnation,
+            quota_revision_unix_nanos: self.quota_revision.unix_timestamp_nanos(),
+            next_attempt_at: now.saturating_add(RECONCILE_RETRY_SECONDS),
+        };
+        // Persist the throttle before work, including bootstrap and failed scans.
+        self.save_control(&control_object, &control, &guard).await?;
+        let result = self.scan_and_publish(&guard).await;
+        // The throttle outlives a successful scan on purpose: denied requests
+        // keep scheduling the job, and they must not rescan a full bucket more
+        // than once per interval. A scan refused because the bucket generation
+        // or its quota no longer matches writes nothing back: the retirement
+        // cleanup may already have removed this object.
+        if !matches!(result, Err(StorageError::PreconditionFailed)) {
+            control.next_attempt_at = now_unix().saturating_add(RECONCILE_RETRY_SECONDS);
+            self.save_control(&control_object, &control, &guard).await?;
+        }
+        result
+    }
+
+    /// Take a short authoritative configuration snapshot without recursively
+    /// acquiring a reader behind a queued metadata/lifecycle writer.
+    async fn configuration_snapshot(&self) -> Result<Arc<ObjectLockConfigSnapshot>> {
+        let snapshot = self.store.object_lock_config_snapshot_for_single_put(&self.bucket).await?;
+        let guard = snapshot
+            .metadata_transaction_guard_for(self.store.id, &self.bucket, Some(self.bucket_incarnation))
+            .ok_or(StorageError::PreconditionFailed)?;
+        let opts = ObjectOptions {
+            expected_bucket_incarnation_id: Some(self.bucket_incarnation),
+            object_lock_config_snapshot: Some(Arc::clone(&snapshot)),
+            ..Default::default()
+        };
+        let (quota, incarnation, revision) =
+            metadata_sys::get_quota_config_and_incarnation_from_disk_for_options_in(&self.store.ctx, &self.bucket, &opts, &guard)
+                .await?;
+        if incarnation != self.bucket_incarnation
+            || revision != self.quota_revision
+            || !quota.as_ref().is_some_and(|quota| {
+                quota.uses_durable_reservations() && quota.reservation_protocol != Some(QUOTA_RESERVATION_PROTOCOL_V2)
+            })
+        {
+            return Err(StorageError::PreconditionFailed);
+        }
+        Ok(snapshot)
+    }
+
+    async fn scan_and_publish(&self, owner: &NamespaceLockGuard) -> Result<()> {
+        let ledger_object = ledger_object(&self.bucket);
+        let expected_revision = {
+            // Lock order: reconcile owner, lifecycle, metadata, ledger.
+            // Request paths never wait for the reconcile owner.
+            let _configuration = self.configuration_snapshot().await?;
+            let lock = self.store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_object).await?;
+            let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await?);
+            match load_ledger_locked(Arc::clone(&self.store), &ledger_object).await {
+                Ok(mut ledger) => {
+                    if !ledger.reservations.is_empty() {
+                        return Ok(());
+                    }
+                    // Seed a non-nil token even for a legacy ledger. An old
+                    // node drops this field on write and cannot pass the CAS.
+                    fence_namespace_mutations(&self.store, RUSTFS_META_BUCKET, &ledger_object, None).await?;
+                    save_ledger_locked(Arc::clone(&self.store), &ledger_object, &mut ledger, &guard).await?;
+                    Some(ledger.writer_revision)
+                }
+                Err(StorageError::ConfigNotFound) => None,
+                Err(error) => return Err(error),
+            }
+        };
+        #[cfg(test)]
+        tests::pause_reconciliation(&self.bucket, tests::ReconcilePauseStage::BeforeScan).await?;
+        // Only the independent reconcile owner is held during this whole-bucket
+        // walk. Concurrent reserve/settle/reap writes invalidate its result.
+        let usage = exact_bucket_usage(&self.store, &self.bucket).await?;
+        #[cfg(test)]
+        tests::pause_reconciliation(&self.bucket, tests::ReconcilePauseStage::BeforePublish).await?;
+        let configuration = self.configuration_snapshot().await?;
+        let lock = self.store.new_ns_lock(RUSTFS_META_BUCKET, &ledger_object).await?;
+        let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await?);
+        let unchanged = match load_ledger_locked(Arc::clone(&self.store), &ledger_object).await {
+            Ok(ledger) => {
+                expected_revision == Some(ledger.writer_revision)
+                    && !ledger.writer_revision.is_nil()
+                    && ledger.reservations.is_empty()
+            }
+            Err(StorageError::ConfigNotFound) => expected_revision.is_none(),
+            Err(error) => return Err(error),
+        };
+        if !unchanged {
+            return Ok(());
+        }
+        if owner.is_lock_lost()
+            || !configuration.is_valid_for_destructive_put(self.store.id, &self.bucket, self.bucket_incarnation)
+        {
+            return Err(StorageError::SlowDown);
+        }
+        fence_namespace_mutations(&self.store, RUSTFS_META_BUCKET, &ledger_object, None).await?;
+        let mut ledger = QuotaLedger::new(self.bucket_incarnation, self.quota_revision, usage);
+        save_ledger_locked(Arc::clone(&self.store), &ledger_object, &mut ledger, &guard).await
+    }
 }
 
 async fn exact_bucket_usage(store: &Arc<ECStore>, bucket: &str) -> Result<u64> {
@@ -1935,7 +2182,7 @@ async fn load_ledger_locked(store: Arc<ECStore>, ledger_object: &str) -> Result<
 async fn save_ledger_locked(
     store: Arc<ECStore>,
     ledger_object: &str,
-    ledger: &QuotaLedger,
+    ledger: &mut QuotaLedger,
     ledger_guard: &Arc<NamespaceLockGuard>,
 ) -> Result<()> {
     if ledger_guard.is_lock_lost() {
@@ -1959,7 +2206,69 @@ async fn save_ledger_locked(
     let _ = opts.set_quota_admission(0, u64::MAX);
     opts.add_owned_write_lock(Arc::clone(ledger_guard), RUSTFS_META_BUCKET, ledger_object);
     opts.write_completion = crate::object_api::WriteCompletion::TailDrained;
+    ledger.writer_revision = Uuid::new_v4();
     save_config_with_opts(store, ledger_object, serde_json::to_vec(ledger)?, &opts).await
+}
+
+/// Advance the persisted reconciliation retry deadline for deterministic fixtures.
+/// The production reaper, ownership fence, scan and compare-and-swap still run.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn retry_quota_reconciliation_for_test(store: Arc<ECStore>, bucket: &str) -> Result<()> {
+    let (_, incarnation, revision) = store.bucket_quota_and_incarnation_from_disk(bucket).await?;
+    let job = ReconcileJob::new(Arc::clone(&store), bucket.to_owned(), incarnation, revision);
+    let key = (store.id, bucket.to_owned(), incarnation, revision.unix_timestamp_nanos());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let active = active_reconciliations()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(&key);
+            if !active {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map_err(|_| StorageError::SlowDown)?;
+    reap_stale_reservations(Arc::clone(&store), bucket, &ledger_object(bucket)).await?;
+    let object = job.control_object();
+    {
+        let lock = store.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+        let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await?);
+        match read_config_no_lock(Arc::clone(&store), &object).await {
+            Ok(bytes) => {
+                let mut control: ReconcileControl = serde_json::from_slice(&bytes)?;
+                control.next_attempt_at = 0;
+                fence_namespace_mutations(&store, RUSTFS_META_BUCKET, &object, None).await?;
+                job.save_control(&object, &control, &guard).await?;
+            }
+            Err(StorageError::ConfigNotFound) => {}
+            Err(error) => return Err(error),
+        }
+    }
+    job.run().await
+}
+
+/// Bootstrap a test bucket through the real background reconciliation path.
+/// Fixtures call this after enabling V1 quota, before issuing writes whose
+/// contract is independent of the initial retryable admission response.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn initialize_quota_ledger_for_test(store: Arc<ECStore>, bucket: &str) -> Result<()> {
+    let (quota, incarnation, revision) = store.bucket_quota_and_incarnation_from_disk(bucket).await?;
+    if !quota
+        .as_ref()
+        .is_some_and(|quota| quota.uses_durable_reservations() && !quota.uses_sharded_reservations())
+    {
+        return Ok(());
+    }
+    ReconcileJob::new(Arc::clone(&store), bucket.to_owned(), incarnation, revision)
+        .run()
+        .await?;
+    match load_current_ledger_locked(store, &ledger_object(bucket), incarnation, revision).await? {
+        Some(_) => Ok(()),
+        None => Err(StorageError::SlowDown),
+    }
 }
 
 #[cfg(any(test, feature = "test-util"))]
@@ -2002,6 +2311,437 @@ mod tests {
     use super::*;
     use crate::storage_api_contracts::bucket::{BucketOperations as _, MakeBucketOptions};
     use serial_test::serial;
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    pub(super) enum ReconcilePauseStage {
+        BeforeScan,
+        BeforePublish,
+    }
+
+    struct ReconcilePause {
+        bucket: String,
+        stage: ReconcilePauseStage,
+        armed: std::sync::atomic::AtomicBool,
+        scans: std::sync::atomic::AtomicUsize,
+        fail_scan: std::sync::atomic::AtomicBool,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    static RECONCILE_PAUSE: std::sync::Mutex<Option<Arc<ReconcilePause>>> = std::sync::Mutex::new(None);
+
+    struct ReconcilePauseGuard(Arc<ReconcilePause>);
+
+    impl ReconcilePauseGuard {
+        fn install(bucket: &str, stage: ReconcilePauseStage) -> Self {
+            let pause = Arc::new(ReconcilePause {
+                bucket: bucket.to_owned(),
+                stage,
+                armed: true.into(),
+                scans: 0.into(),
+                fail_scan: false.into(),
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            *RECONCILE_PAUSE.lock().expect("reconcile hooks") = Some(Arc::clone(&pause));
+            Self(pause)
+        }
+
+        async fn reached(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.0.reached.notified())
+                .await
+                .expect("reconciliation reached barrier");
+        }
+    }
+
+    impl Drop for ReconcilePauseGuard {
+        fn drop(&mut self) {
+            self.0.release.notify_one();
+            let mut hook = RECONCILE_PAUSE.lock().expect("reconcile hooks");
+            if hook.as_ref().is_some_and(|hook| Arc::ptr_eq(hook, &self.0)) {
+                *hook = None;
+            }
+        }
+    }
+
+    pub(super) async fn pause_reconciliation(bucket: &str, stage: ReconcilePauseStage) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        let hook = RECONCILE_PAUSE
+            .lock()
+            .expect("reconcile hooks")
+            .as_ref()
+            .filter(|hook| hook.bucket == bucket)
+            .cloned();
+        if let Some(hook) = hook {
+            if stage == ReconcilePauseStage::BeforeScan {
+                hook.scans.fetch_add(1, Ordering::SeqCst);
+            }
+            if stage == hook.stage && hook.armed.swap(false, Ordering::SeqCst) {
+                hook.reached.notify_one();
+                hook.release.notified().await;
+            }
+            if stage == ReconcilePauseStage::BeforeScan && hook.fail_scan.load(Ordering::SeqCst) {
+                return Err(StorageError::other("injected quota usage failure"));
+            }
+        }
+        Ok(())
+    }
+
+    async fn reconciliation_fixture(limit: u64) -> (Vec<tempfile::TempDir>, ReconcileJob) {
+        use crate::object_api::PutObjReader;
+        use crate::storage_api_contracts::object::ObjectIO;
+        let (directories, store) = metadata_sys::test_support::isolated_store_over_temp_disks().await;
+        metadata_sys::init_bucket_metadata_sys(Arc::clone(&store), Vec::new()).await;
+        crate::services::notification_sys::install_cross_pool_fence_fleet_proof_for_test();
+        let bucket = format!("quota-reconcile-{}", Uuid::new_v4().simple());
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("bucket");
+        let mut seed = PutObjReader::from_vec(vec![1; 10]);
+        store
+            .put_object(&bucket, "seed", &mut seed, &ObjectOptions::default())
+            .await
+            .expect("existing usage");
+        store
+            .update_bucket_metadata_config(
+                &bucket,
+                "quota.json",
+                serde_json::to_vec(&super::super::BucketQuota::new(Some(limit))).expect("quota JSON"),
+            )
+            .await
+            .expect("enable quota");
+        let (_, incarnation, revision) = store
+            .bucket_quota_and_incarnation_from_disk(&bucket)
+            .await
+            .expect("quota identity");
+        (directories, ReconcileJob::new(store, bucket, incarnation, revision))
+    }
+
+    async fn quota_reservation(job: &ReconcileJob, old: u64, new: u64) -> Result<QuotaReservation> {
+        begin(&job.store.ctx, &job.bucket, "candidate", &ObjectOptions::default(), 0, 0)
+            .await?
+            .reserve(old, new)
+            .await
+    }
+
+    async fn read_test_ledger(job: &ReconcileJob) -> QuotaLedger {
+        load_ledger_locked(Arc::clone(&job.store), &ledger_object(&job.bucket))
+            .await
+            .expect("ledger")
+    }
+
+    async fn drain_reconciliation_scheduler(job: &ReconcileJob) {
+        let key = (
+            job.store.id,
+            job.bucket.clone(),
+            job.bucket_incarnation,
+            job.quota_revision.unix_timestamp_nanos(),
+        );
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while active_reconciliations().lock().expect("active workers").contains(&key) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("owned reconciliation finished");
+    }
+
+    async fn expire_reconciliation_backoff(job: &ReconcileJob) {
+        drain_reconciliation_scheduler(job).await;
+        let object = job.control_object();
+        let lock = job.store.new_ns_lock(RUSTFS_META_BUCKET, &object).await.expect("owner lock");
+        let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await.expect("owner guard"));
+        // No control object exists before the first scan took the owner lock,
+        // or after a retirement cleanup; there is nothing to expire then.
+        let Ok(bytes) = read_config_no_lock(Arc::clone(&job.store), &object).await else {
+            return;
+        };
+        let mut control: ReconcileControl = serde_json::from_slice(&bytes).expect("control JSON");
+        control.next_attempt_at = 0;
+        fence_namespace_mutations(&job.store, RUSTFS_META_BUCKET, &object, None)
+            .await
+            .expect("control fence");
+        job.save_control(&object, &control, &guard).await.expect("advance test clock");
+    }
+
+    async fn wait_for_reconcile_owner(job: &ReconcileJob) {
+        let object = job.control_object();
+        let lock = job.store.new_ns_lock(RUSTFS_META_BUCKET, &object).await.expect("owner lock");
+        let _guard = tokio::time::timeout(Duration::from_secs(10), lock.get_write_lock(get_lock_acquire_timeout()))
+            .await
+            .expect("worker finished")
+            .expect("owner guard");
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_reconciliation_bootstrap_is_single_flight_without_request_guards() {
+        use std::sync::atomic::Ordering;
+        let (_directories, job) = reconciliation_fixture(10).await;
+        let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforeScan);
+        assert!(
+            matches!(quota_reservation(&job, 0, 1).await, Err(StorageError::SlowDown)),
+            "unknown usage cannot admit a reservation"
+        );
+        pause.reached().await;
+        assert!(
+            matches!(
+                load_ledger_locked(Arc::clone(&job.store), &ledger_object(&job.bucket)).await,
+                Err(StorageError::ConfigNotFound)
+            ),
+            "bootstrap must not publish zero usage"
+        );
+        assert!(matches!(quota_reservation(&job, 0, 1).await, Err(StorageError::SlowDown)));
+        // Bypass the local scheduler, exercising the cross-node ownership boundary.
+        tokio::time::timeout(Duration::from_secs(2), job.run())
+            .await
+            .expect("contender must not wait for a scan")
+            .expect("another owner is active");
+        let lifecycle = tokio::time::timeout(Duration::from_secs(2), job.store.acquire_bucket_lifecycle_write_lock(&job.bucket))
+            .await
+            .expect("scan does not retain lifecycle readers")
+            .expect("lifecycle writer");
+        let metadata = tokio::time::timeout(
+            Duration::from_secs(2),
+            metadata_sys::acquire_bucket_metadata_transaction_lock_in(&job.store.ctx, &job.bucket),
+        )
+        .await
+        .expect("scan does not retain metadata readers")
+        .expect("metadata writer");
+        drop(metadata);
+        drop(lifecycle);
+        pause.0.release.notify_one();
+        wait_for_reconcile_owner(&job).await;
+        let ledger = read_test_ledger(&job).await;
+        assert_eq!(ledger.accounted_usage, 10);
+        assert!(ledger.reservations.is_empty());
+        assert!(!ledger.writer_revision.is_nil());
+        for _ in 0..3 {
+            assert!(matches!(quota_reservation(&job, 0, 1).await, Err(StorageError::QuotaExceeded { .. })));
+            job.run().await.expect("persisted cooldown");
+        }
+        drain_reconciliation_scheduler(&job).await;
+        assert_eq!(
+            pause.0.scans.load(Ordering::SeqCst),
+            1,
+            "denied requests cannot repeatedly scan a full bucket"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_reconciliation_rejects_concurrent_zero_growth_settle_reap_and_legacy_writes() {
+        let (_directories, job) = reconciliation_fixture(100).await;
+        job.run().await.expect("bootstrap");
+        for mutation in ["abort", "commit", "reap", "legacy"] {
+            expire_reconciliation_backoff(&job).await;
+            let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforePublish);
+            let worker = tokio::spawn({
+                let job = job.clone();
+                async move { job.run().await }
+            });
+            pause.reached().await;
+            let initial = read_test_ledger(&job).await.writer_revision;
+            if mutation == "legacy" {
+                let object = ledger_object(&job.bucket);
+                let lock = job.store.new_ns_lock(RUSTFS_META_BUCKET, &object).await.expect("ledger lock");
+                let guard = Arc::new(lock.get_write_lock(get_lock_acquire_timeout()).await.expect("ledger writer"));
+                let mut document = serde_json::to_value(read_test_ledger(&job).await).expect("ledger JSON");
+                document.as_object_mut().expect("ledger map").remove("writer_revision");
+                fence_namespace_mutations(&job.store, RUSTFS_META_BUCKET, &object, None)
+                    .await
+                    .expect("ledger fence");
+                let mut opts = ObjectOptions {
+                    max_parity: true,
+                    no_lock: true,
+                    ..Default::default()
+                };
+                let _ = opts.set_quota_admission(0, u64::MAX);
+                opts.add_owned_write_lock(Arc::clone(&guard), RUSTFS_META_BUCKET, &object);
+                opts.write_completion = crate::object_api::WriteCompletion::TailDrained;
+                save_config_with_opts(
+                    Arc::clone(&job.store),
+                    &object,
+                    serde_json::to_vec(&document).expect("old node JSON"),
+                    &opts,
+                )
+                .await
+                .expect("old node drops new field");
+            } else {
+                let mut reservation = quota_reservation(&job, 10, 10)
+                    .await
+                    .expect("zero-growth admission while scanning");
+                let reserved = read_test_ledger(&job).await.writer_revision;
+                assert_ne!(reserved, initial, "even zero-growth reserve must invalidate a scan");
+                reservation.mark_commit_started().await.expect("commit marker");
+                assert_ne!(read_test_ledger(&job).await.writer_revision, reserved);
+                match mutation {
+                    "abort" => reservation.abort().await,
+                    "commit" => reservation.commit().await,
+                    "reap" => {
+                        reservation.defer_after_fence();
+                        reap_stale_reservations(Arc::clone(&job.store), &job.bucket, &ledger_object(&job.bucket))
+                            .await
+                            .expect("reap orphan");
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            let written = read_test_ledger(&job).await;
+            assert!(written.reservations.is_empty());
+            assert_ne!(written.writer_revision, initial);
+            pause.0.release.notify_one();
+            worker.await.expect("worker join").expect("stale scan discarded");
+            let current = read_test_ledger(&job).await;
+            assert_eq!(
+                current.writer_revision, written.writer_revision,
+                "{mutation}: stale usage must not replace a concurrent writer"
+            );
+            assert_eq!(current.accounted_usage, written.accounted_usage);
+        }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_reconciliation_failure_is_throttled_and_deletions_eventually_reclaim_usage() {
+        use std::sync::atomic::Ordering;
+        let (_directories, job) = reconciliation_fixture(10).await;
+        let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforeScan);
+        pause.0.fail_scan.store(true, Ordering::SeqCst);
+        pause.0.release.notify_one();
+        assert!(job.run().await.is_err());
+        assert!(matches!(
+            load_ledger_locked(Arc::clone(&job.store), &ledger_object(&job.bucket)).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        job.run().await.expect("failure cooldown");
+        assert_eq!(pause.0.scans.load(Ordering::SeqCst), 1);
+        pause.0.fail_scan.store(false, Ordering::SeqCst);
+        expire_reconciliation_backoff(&job).await;
+        job.run().await.expect("recover after failure");
+        assert_eq!(read_test_ledger(&job).await.accounted_usage, 10);
+        job.store
+            .delete_object(&job.bucket, "seed", ObjectOptions::default())
+            .await
+            .expect("delete stored usage");
+        assert!(
+            matches!(quota_reservation(&job, 0, 1).await, Err(StorageError::QuotaExceeded { .. })),
+            "stale usage remains conservative during cooldown"
+        );
+        expire_reconciliation_backoff(&job).await;
+        job.run().await.expect("refresh deleted usage");
+        assert_eq!(read_test_ledger(&job).await.accounted_usage, 0);
+        quota_reservation(&job, 0, 1)
+            .await
+            .expect("delete must not leave bucket permanently full")
+            .abort()
+            .await;
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_reconciliation_survives_waiter_cancellation_and_rechecks_configuration() {
+        let (_directories, job) = reconciliation_fixture(100).await;
+        let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforePublish);
+        let caller = tokio::spawn({
+            let job = job.clone();
+            async move {
+                job.schedule();
+                std::future::pending::<()>().await
+            }
+        });
+        pause.reached().await;
+        caller.abort();
+        assert!(caller.await.expect_err("cancel caller").is_cancelled());
+        job.store
+            .update_bucket_metadata_config(
+                &job.bucket,
+                "quota.json",
+                serde_json::to_vec(&super::super::BucketQuota::new(Some(200))).expect("updated quota"),
+            )
+            .await
+            .expect("quota changes while scanning");
+        pause.0.release.notify_one();
+        wait_for_reconcile_owner(&job).await;
+        assert!(
+            matches!(
+                load_ledger_locked(Arc::clone(&job.store), &ledger_object(&job.bucket)).await,
+                Err(StorageError::ConfigNotFound)
+            ),
+            "old config cannot publish bootstrap usage"
+        );
+        drop(pause);
+        let (_, incarnation, revision) = job
+            .store
+            .bucket_quota_and_incarnation_from_disk(&job.bucket)
+            .await
+            .expect("current configuration");
+        let current = ReconcileJob::new(Arc::clone(&job.store), job.bucket.clone(), incarnation, revision);
+        let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforeScan);
+        let caller = tokio::spawn({
+            let job = current.clone();
+            async move {
+                job.schedule();
+                std::future::pending::<()>().await
+            }
+        });
+        pause.reached().await;
+        caller.abort();
+        assert!(caller.await.expect_err("cancel new caller").is_cancelled());
+        pause.0.release.notify_one();
+        wait_for_reconcile_owner(&current).await;
+        assert!(
+            read_test_ledger(&current).await.matches(incarnation, revision),
+            "owned scan publishes after its waiter is canceled"
+        );
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quota_reconciliation_cannot_publish_into_recreated_bucket() {
+        use crate::storage_api_contracts::bucket::DeleteBucketOptions;
+        let (_directories, job) = reconciliation_fixture(100).await;
+        let pause = ReconcilePauseGuard::install(&job.bucket, ReconcilePauseStage::BeforePublish);
+        let worker = tokio::spawn({
+            let job = job.clone();
+            async move { job.run().await }
+        });
+        pause.reached().await;
+        job.store
+            .delete_object(&job.bucket, "seed", ObjectOptions::default())
+            .await
+            .expect("empty old bucket");
+        job.store
+            .delete_bucket(&job.bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("retire bucket while scan is paused");
+        job.store
+            .make_bucket(&job.bucket, &MakeBucketOptions::default())
+            .await
+            .expect("replacement bucket");
+        job.store
+            .update_bucket_metadata_config(
+                &job.bucket,
+                "quota.json",
+                serde_json::to_vec(&super::super::BucketQuota::new(Some(100))).expect("new quota"),
+            )
+            .await
+            .expect("replacement quota");
+        pause.0.release.notify_one();
+        assert!(worker.await.expect("old worker join").is_err(), "old incarnation must not publish");
+        assert!(matches!(
+            load_ledger_locked(Arc::clone(&job.store), &ledger_object(&job.bucket)).await,
+            Err(StorageError::ConfigNotFound)
+        ));
+        drop(pause);
+        initialize_quota_ledger_for_test(Arc::clone(&job.store), &job.bucket)
+            .await
+            .expect("replacement can bootstrap independently");
+        let replacement = read_test_ledger(&job).await;
+        assert_ne!(replacement.bucket_incarnation, job.bucket_incarnation);
+        assert_eq!(replacement.accounted_usage, 0);
+    }
 
     fn ledger(accounted_usage: u64) -> QuotaLedger {
         QuotaLedger::new(Uuid::new_v4(), OffsetDateTime::now_utc(), accounted_usage)
@@ -2088,10 +2828,24 @@ mod tests {
         crate::config::com::save_config(Arc::clone(&store), &ledger_path, serde_json::to_vec(&stale).expect("encode ledger"))
             .await
             .expect("persist crash-left reservation fixture");
+        // A throttled reconciliation of the old generation left its control object behind.
+        let stale_control =
+            ReconcileJob::new(Arc::clone(&store), bucket.clone(), old_incarnation, OffsetDateTime::now_utc()).control_object();
+        let control = ReconcileControl {
+            bucket_incarnation: old_incarnation,
+            quota_revision_unix_nanos: 0,
+            next_attempt_at: i64::MAX,
+        };
+        crate::config::com::save_config(
+            Arc::clone(&store),
+            &stale_control,
+            serde_json::to_vec(&control).expect("encode control"),
+        )
+        .await
+        .expect("persist stale reconciliation control");
 
         assert!(matches!(
-            load_current_ledger_locked(Arc::clone(&store), &bucket, &ledger_path, new_incarnation, OffsetDateTime::now_utc())
-                .await,
+            load_current_ledger_locked(Arc::clone(&store), &ledger_path, new_incarnation, OffsetDateTime::now_utc()).await,
             Err(StorageError::PartMissingOrCorrupt)
         ));
         assert!(matches!(
@@ -2108,11 +2862,34 @@ mod tests {
             load_ledger_locked(Arc::clone(&store), &ledger_path).await,
             Err(StorageError::ConfigNotFound)
         ));
+        assert!(
+            matches!(
+                read_config_no_lock(Arc::clone(&store), &stale_control).await,
+                Err(StorageError::ConfigNotFound)
+            ),
+            "the retired generation's reconciliation control object goes with its ledger"
+        );
+        // A control object written back after the ledger was already gone (a scan
+        // that was mid-flight during retirement) is removed by the next cleanup.
+        crate::config::com::save_config(
+            Arc::clone(&store),
+            &stale_control,
+            serde_json::to_vec(&control).expect("encode control"),
+        )
+        .await
+        .expect("persist late reconciliation control");
+        cleanup_retired_bucket_ledger(Arc::clone(&store), &bucket, old_incarnation)
+            .await
+            .expect("cleanup without a ledger still removes the generation's control object");
+        assert!(matches!(
+            read_config_no_lock(Arc::clone(&store), &stale_control).await,
+            Err(StorageError::ConfigNotFound)
+        ));
         let replacement =
-            load_current_ledger_locked(Arc::clone(&store), &bucket, &ledger_path, new_incarnation, OffsetDateTime::now_utc())
+            load_current_ledger_locked(Arc::clone(&store), &ledger_path, new_incarnation, OffsetDateTime::now_utc())
                 .await
                 .expect("new quota admission must not inherit a fresh stale reservation");
-        assert!(replacement.reservations.is_empty());
+        assert!(replacement.is_none(), "replacement must await authoritative bootstrap before admission");
     }
 
     #[test]

@@ -14,6 +14,7 @@
 
 use crate::error::{HealErrorClass, classify_heal_error};
 use crate::heal::{
+    pacing::HealPageRate,
     progress::{HealProgress, add_bytes, increment_counter},
     resume::{
         CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, ReplacementTargetIdentity, ResumeManager,
@@ -128,12 +129,12 @@ pub struct ErasureSetHealer {
     replacement_target_identities: Option<Arc<[ReplacementTargetIdentity]>>,
     replacement_execution: Option<Arc<super::storage::ReplacementExecution>>,
     work_parent: Option<super::manager::HealWork>,
-    mainline_pacer: Option<Arc<super::pacing::MainlinePacer>>,
+    mainline_pacer: Option<super::pacing::ForegroundPacing>,
 }
 
 async fn acquire_page_permit(
     semaphore: Arc<Semaphore>,
-    pacer: Option<&super::pacing::MainlinePacer>,
+    rate: &HealPageRate,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<tokio::sync::OwnedSemaphorePermit> {
     let acquire = || async {
@@ -146,18 +147,16 @@ async fn acquire_page_permit(
     let mut paid_pause = false;
     loop {
         let permit = acquire().await?;
-        if let Some(pacer) = pacer {
-            // Keep the real permit on the low-pressure path. Every acquisition
-            // gets a fresh decision, including a waiter that queued a second
-            // time. One completed pause is a bounded minimum-progress grant.
-            match pacer.admission_decision() {
-                super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
-                    drop(permit);
-                    paid_pause = pacer.wait_after_admission(cancel, pressure).await?;
-                    continue;
-                }
-                _ => {}
+        // Keep the real permit on the low-pressure path. Every acquisition
+        // gets a fresh decision, including a waiter that queued a second
+        // time. One completed pause is a bounded minimum-progress grant.
+        match rate.admission_decision() {
+            super::pacing::PacingDecision::Wait(pressure) if !paid_pause => {
+                drop(permit);
+                paid_pause = rate.wait_after_admission(cancel, pressure).await?;
+                continue;
             }
+            _ => {}
         }
         return Ok(permit);
     }
@@ -166,7 +165,7 @@ async fn acquire_page_permit(
 #[cfg(test)]
 mod mainline_pacing_tests {
     use super::*;
-    use crate::heal::pacing::{MainlinePacer, TestPressure};
+    use crate::heal::pacing::{ForegroundPacing, HealPageRate, TestPressure};
     use rustfs_concurrency::WorkloadClass;
     use std::sync::atomic::Ordering;
     use tokio_util::sync::CancellationToken;
@@ -180,15 +179,15 @@ mod mainline_pacing_tests {
             .await
             .expect("existing object owns capacity");
         let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
-        let pacer = Arc::new(
-            MainlinePacer::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer"),
-        );
+        let pacer =
+            ForegroundPacing::new(provider.clone(), 80, 80, Duration::from_millis(250), HealRequestSource::Admin).expect("pacer");
+        let rate = Arc::new(HealPageRate::new(1, Some(pacer)));
         let cancel = CancellationToken::new();
         let waiting = tokio::spawn({
             let semaphore = semaphore.clone();
-            let pacer = pacer.clone();
+            let rate = rate.clone();
             let cancel = cancel.clone();
-            async move { acquire_page_permit(semaphore, Some(&pacer), &cancel).await }
+            async move { acquire_page_permit(semaphore, &rate, &cancel).await }
         });
         tokio::task::yield_now().await;
         provider.active.store(100, Ordering::SeqCst);
@@ -200,12 +199,13 @@ mod mainline_pacing_tests {
         assert_eq!(semaphore.available_permits(), 1);
         let deadline = tokio::time::timeout(
             Duration::from_millis(10),
-            acquire_page_permit(semaphore.clone(), Some(&pacer), &CancellationToken::new()),
+            acquire_page_permit(semaphore.clone(), &rate, &CancellationToken::new()),
         )
         .await;
         assert!(deadline.is_err());
         assert_eq!(semaphore.available_permits(), 1, "deadline must release all permits");
-        let permit = acquire_page_permit(semaphore.clone(), None, &CancellationToken::new())
+        let unpaced = HealPageRate::new(1, None);
+        let permit = acquire_page_permit(semaphore.clone(), &unpaced, &CancellationToken::new())
             .await
             .expect("unpaced admission");
         assert_eq!(semaphore.available_permits(), 0, "disabling pacing cannot disable the hard cap");
@@ -221,10 +221,11 @@ mod mainline_pacing_tests {
             let occupied = semaphore.clone().acquire_owned().await.expect("queue both waiters");
             let provider = Arc::new(TestPressure::new(WorkloadClass::ForegroundRead, 0));
             let pause = Duration::from_millis(250);
-            let pacer = MainlinePacer::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer");
+            let pacer = ForegroundPacing::new(provider.clone(), 80, 80, pause, HealRequestSource::Admin).expect("pacer");
+            let rate = HealPageRate::new(1, Some(pacer));
             let cancel = CancellationToken::new();
-            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
-            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), Some(&pacer), &cancel));
+            let mut first = Box::pin(acquire_page_permit(semaphore.clone(), &rate, &cancel));
+            let mut second = Box::pin(acquire_page_permit(semaphore.clone(), &rate, &cancel));
             assert!(futures::poll!(first.as_mut()).is_pending());
             assert!(futures::poll!(second.as_mut()).is_pending());
             drop(occupied);
@@ -329,6 +330,20 @@ impl ErasureSetHealer {
         }
     }
 
+    /// Page fan-out for one whole erasure-set pass (stable across buckets).
+    fn pass_page_concurrency_limit(&self) -> usize {
+        if self.source == HealRequestSource::AutoHeal && self.replacement_task_id.is_some() && self.heal_opts.no_lock {
+            // Versions of the same object must not race without its namespace lock.
+            1
+        } else {
+            Self::effective_heal_page_object_concurrency_for_source(
+                self.source,
+                self.heal_opts.scan_mode,
+                self.replacement_task_id.is_some(),
+            )
+        }
+    }
+
     /// Map the shared heal error class onto this healer's per-object actions.
     ///
     /// `classify_heal_error` is the only classifier; this adapter decides what
@@ -373,7 +388,7 @@ impl ErasureSetHealer {
         }
     }
 
-    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<Arc<super::pacing::MainlinePacer>>) -> Self {
+    pub(crate) fn with_mainline_pacer(mut self, pacer: Option<super::pacing::ForegroundPacing>) -> Self {
         self.mainline_pacer = pacer;
         self
     }
@@ -453,7 +468,16 @@ impl ErasureSetHealer {
         let task_id = self.get_or_create_task_id(set_disk_id).await?;
 
         // 2. initialize or resume resume state
-        let (resume_manager, checkpoint_manager) = self.initialize_resume_state(&task_id, set_disk_id, buckets).await?;
+        let (resume_manager, mut checkpoint_manager) = self.initialize_resume_state(&task_id, set_disk_id, buckets).await?;
+        let replacement_buckets = if self.replacement_task_id.is_some() {
+            let current = resume_manager.prepare_replacement_bucket_pass(self.storage.as_ref()).await?;
+            // Preparation may have durably rewound the companion checkpoint.
+            checkpoint_manager = CheckpointManager::load_from_disk(self.disk.clone(), &task_id).await?;
+            Some(current)
+        } else {
+            None
+        };
+        let buckets = replacement_buckets.as_deref().unwrap_or(buckets);
 
         let admin_buckets = if self.admin_task.is_some() {
             Some(
@@ -464,12 +488,7 @@ impl ErasureSetHealer {
             None
         };
         let buckets = admin_buckets.as_deref().unwrap_or(buckets);
-        if checkpoint_manager
-            .get_checkpoint()
-            .await
-            .admin
-            .is_some_and(|admin| admin.completed)
-        {
+        if checkpoint_manager.admin_completed().await {
             self.initialize_progress(buckets, &resume_manager.get_state().await).await;
             return Ok(());
         }
@@ -479,6 +498,12 @@ impl ErasureSetHealer {
             .execute_heal_with_resume(buckets, set_disk_id, &resume_manager, &checkpoint_manager)
             .await;
 
+        // A cancelled or timed-out pass keeps its control classification: the
+        // namespace check runs only for completed or storage-failed passes so a
+        // concurrent bucket deletion cannot reclassify a stop as a failure.
+        if self.replacement_task_id.is_some() && !matches!(result, Err(Error::TaskCancelled | Error::TaskTimeout)) {
+            resume_manager.verify_replacement_bucket_pass(self.storage.as_ref()).await?;
+        }
         result?;
         self.verify_replacement_identity_fence("completion").await?;
 
@@ -490,14 +515,7 @@ impl ErasureSetHealer {
         }
 
         if self.admin_task.is_some() {
-            let mut admin = checkpoint_manager
-                .get_checkpoint()
-                .await
-                .admin
-                .ok_or_else(|| Error::InvalidCheckpoint("Missing administrator outcome at completion".to_string()))?;
-            admin.completed = true;
-            admin.outcome.finish(None);
-            checkpoint_manager.set_admin(admin).await?;
+            checkpoint_manager.complete_admin().await?;
         } else {
             checkpoint_manager.cleanup().await?;
             resume_manager.cleanup().await?;
@@ -718,7 +736,10 @@ impl ErasureSetHealer {
             }
             return Err(Error::DanglingDeleteDeferred { retry_not_before });
         }
-        let checkpoint = checkpoint_manager.get_checkpoint().await;
+        // One rate controller for the whole pass: SlowDown cool-down and page
+        // fan-out persist across buckets instead of resetting at each one.
+        let page_rate = Arc::new(HealPageRate::new(self.pass_page_concurrency_limit(), self.mainline_pacer.clone()));
+        let (current_bucket_index, current_object_index) = checkpoint_manager.resume_position().await;
 
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -726,14 +747,17 @@ impl ErasureSetHealer {
             component = LOG_COMPONENT_HEAL,
             subsystem = LOG_SUBSYSTEM_ERASURE_HEALER,
             set_disk_id,
-            current_bucket_index = checkpoint.current_bucket_index,
-            current_object_index = checkpoint.current_object_index,
+            current_bucket_index,
+            current_object_index,
             state = "resuming",
             "Erasure set resumed"
         );
 
         // 2. initialize progress
         self.initialize_progress(buckets, &state).await;
+        // Snapshot before any baseline write: set_progress_baseline overwrites
+        // the saved generation, which would hide a real generation mismatch.
+        let checkpoint = checkpoint_manager.progress_snapshot().await;
         let (baseline_known, baseline_count, baseline_size, baseline_generation) = {
             let baseline = self.progress.read().await;
             (
@@ -760,17 +784,7 @@ impl ErasureSetHealer {
         let mut successful_objects = state.successful_objects;
         let mut failed_objects = state.failed_objects;
         let mut skipped_objects = state.skipped_objects;
-        let checkpoint_has_progress = checkpoint.baseline_known
-            || checkpoint.successful_objects > 0
-            || checkpoint.failed_object_count > 0
-            || checkpoint.skipped_object_count > 0
-            || checkpoint.skipped_new_versions > 0
-            || checkpoint.skipped_ilm_expired > 0
-            || checkpoint.processed_bytes > 0
-            || checkpoint.total_objects > 0
-            || checkpoint.total_bytes > 0
-            || checkpoint.baseline_generation.is_some()
-            || checkpoint.counter_unknown;
+        let checkpoint_has_progress = checkpoint.has_progress();
         let checkpoint_generation_mismatch = checkpoint.baseline_known && checkpoint.baseline_generation != baseline_generation;
         let mut restored_counter_unknown = state.counter_unknown || checkpoint.counter_unknown;
         if checkpoint_has_progress {
@@ -854,6 +868,7 @@ impl ErasureSetHealer {
                     resume_manager,
                     checkpoint_manager,
                     state.start_time,
+                    &page_rate,
                 )
                 .await;
 
@@ -967,9 +982,16 @@ impl ErasureSetHealer {
                 // Recheck even resumed buckets: their user-object cursor does not
                 // prove that the replacement holds the internal bucket records.
                 for bucket in buckets {
-                    self.storage
-                        .heal_replacement_bucket_metadata(bucket, &self.heal_opts, targets)
-                        .await?;
+                    if self.replacement_task_id.is_some() {
+                        let expected = resume_manager.replacement_bucket_incarnation(bucket).await?;
+                        self.storage
+                            .heal_replacement_bucket_metadata_at_incarnation(bucket, expected, &self.heal_opts, targets)
+                            .await?;
+                    } else {
+                        self.storage
+                            .heal_replacement_bucket_metadata(bucket, &self.heal_opts, targets)
+                            .await?;
+                    }
                 }
             }
             self.heal_replacement_pool_metadata(
@@ -1019,15 +1041,16 @@ impl ErasureSetHealer {
         // never hot-retried in place here.
         if failed_objects > 0 || skipped_objects > 0 || failed_buckets > 0 {
             if self.replacement_task_id.is_some() {
+                resume_manager.verify_replacement_bucket_pass(self.storage.as_ref()).await?;
                 let state = resume_manager.get_state().await;
-                let checkpoint = checkpoint_manager.get_checkpoint().await;
+                let (grace_objects, retry_not_before, counter_unknown) = checkpoint_manager.dangling_delete_grace().await;
                 if state.can_retry()
                     && failed_objects == 0
                     && failed_buckets == 0
                     && skipped_objects > 0
-                    && skipped_objects == checkpoint.dangling_delete_grace_objects
-                    && !checkpoint.counter_unknown
-                    && let Some(retry_not_before) = checkpoint.dangling_delete_retry_not_before
+                    && skipped_objects == grace_objects
+                    && !counter_unknown
+                    && let Some(retry_not_before) = retry_not_before
                 {
                     // Publish the generation's rewind and wait first. If the
                     // checkpoint reset is interrupted, initialization reapplies
@@ -1167,14 +1190,9 @@ impl ErasureSetHealer {
 
         let object_key = format!("{RUSTFS_META_BUCKET}/{POOL_META_NAME}");
         let checkpoint_key = compose_key(&object_key, None);
-        let checkpoint = checkpoint_manager.get_checkpoint().await;
-        if checkpoint.processed_objects.contains(&checkpoint_key)
-            || checkpoint.failed_objects.contains(&checkpoint_key)
-            || checkpoint.skipped_objects.contains(&checkpoint_key)
-        {
+        if checkpoint_manager.is_object_settled(&checkpoint_key).await {
             return Ok(());
         }
-        drop(checkpoint);
 
         self.verify_replacement_identity_fence("pool metadata").await?;
         resume_manager
@@ -1428,7 +1446,7 @@ impl ErasureSetHealer {
 
     /// Heal one bucket's ordinary objects and report unresolved delete recovery separately.
     #[allow(clippy::too_many_arguments)]
-    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager), fields(bucket = %bucket, bucket_index = bucket_index))]
+    #[tracing::instrument(skip(self, current_object_index, processed_objects, successful_objects, failed_objects, skipped_objects, resume_manager, checkpoint_manager, page_rate), fields(bucket = %bucket, bucket_index = bucket_index))]
     async fn heal_bucket_with_resume(
         &self,
         bucket: &str,
@@ -1442,6 +1460,7 @@ impl ErasureSetHealer {
         resume_manager: &ResumeManager,
         checkpoint_manager: &CheckpointManager,
         started_at_secs: u64,
+        page_rate: &Arc<HealPageRate>,
     ) -> Result<bool> {
         debug!(
             target: "rustfs::heal::erasure_healer",
@@ -1456,7 +1475,11 @@ impl ErasureSetHealer {
             "Erasure set bucket started"
         );
 
-        let incarnation = self.admin_bucket_incarnation(checkpoint_manager, bucket).await?;
+        let incarnation = if self.replacement_task_id.is_some() {
+            Some(resume_manager.replacement_bucket_incarnation(bucket).await?)
+        } else {
+            self.admin_bucket_incarnation(checkpoint_manager, bucket).await?
+        };
         let unresolved_delete_recovery = self.heal_admin_bucket_delete_recovery(bucket, incarnation).await?;
         if unresolved_delete_recovery && !self.heal_opts.dry_run {
             resume_manager.set_delete_recovery_rescan_pending(true).await?;
@@ -1491,17 +1514,6 @@ impl ErasureSetHealer {
         // detects a non-advancing cursor even though next_marker embeds a
         // transient cache id that changes between identical pages.
         let mut previous_page_last: Option<(String, Option<String>)> = None;
-        let page_concurrency_limit =
-            if self.source == HealRequestSource::AutoHeal && self.replacement_task_id.is_some() && self.heal_opts.no_lock {
-                // Versions of the same object must not race without its namespace lock.
-                1
-            } else {
-                Self::effective_heal_page_object_concurrency_for_source(
-                    self.source,
-                    self.heal_opts.scan_mode,
-                    self.replacement_task_id.is_some(),
-                )
-            };
         let in_flight = Arc::new(AtomicUsize::new(0));
         // Per-bucket sample caps for per-object warn! lines: a flapping rebuild
         // disk can fail/skip hundreds of thousands of versions in one sweep, so
@@ -1523,9 +1535,7 @@ impl ErasureSetHealer {
         let include_lifecycle_object_info = lifecycle_expiry_context.is_some();
 
         loop {
-            if let Some(pacer) = &self.mainline_pacer {
-                pacer.wait(&self.cancel_token).await?;
-            }
+            page_rate.wait_before_page(&self.cancel_token).await?;
             self.verify_replacement_identity_fence("page scan").await?;
             if let Some(expected) = incarnation {
                 self.storage.validate_bucket_incarnation(bucket, Some(expected)).await?;
@@ -1547,9 +1557,8 @@ impl ErasureSetHealer {
                     .await?
             };
             let page_is_empty = objects.is_empty();
-            let checkpoint = checkpoint_manager.get_checkpoint().await;
             let page_resume_index = *current_object_index;
-            let semaphore = Arc::new(Semaphore::new(page_concurrency_limit));
+            let semaphore = Arc::new(Semaphore::new(page_rate.effective_concurrency()));
             let mut page_tasks = FuturesUnordered::new();
             let mut completed_in_page = 0usize;
 
@@ -1563,10 +1572,7 @@ impl ErasureSetHealer {
 
                 // Per-version dedup identity — the single canonical key.
                 let key = compose_key(&item.name, item.version_id.as_deref());
-                if checkpoint.processed_objects.contains(&key)
-                    || checkpoint.failed_objects.contains(&key)
-                    || checkpoint.skipped_objects.contains(&key)
-                {
+                if checkpoint_manager.is_object_settled(&key).await {
                     continue;
                 }
 
@@ -1724,7 +1730,7 @@ impl ErasureSetHealer {
                 let target_endpoints = self.target_endpoints.clone();
                 let replacement_commit_evidence_required = self.replacement_task_id.is_some();
                 let retry_replacement = replacement_commit_evidence_required && self.source == HealRequestSource::AutoHeal;
-                let mainline_pacer = self.mainline_pacer.clone();
+                let page_rate = page_rate.clone();
 
                 let admin_identity = self.admin_identity(bucket, &object_name, version_id.as_deref(), incarnation);
                 let admin_task_id = self.admin_task.as_ref().map(|task| task.id.clone());
@@ -1736,14 +1742,15 @@ impl ErasureSetHealer {
                     .map(|_| (dedup_key.clone(), object_name.clone(), version_id.clone()));
                 let work = async move {
                     let mut retries = 0;
+                    let mut saw_slow_down = false;
                     let mut admin_identity = admin_identity;
                     let mut admin_task_id = admin_task_id;
                     loop {
-                        let permit = acquire_page_permit(semaphore.clone(), mainline_pacer.as_deref(), &cancel_token).await;
+                        let permit = acquire_page_permit(semaphore.clone(), &page_rate, &cancel_token).await;
 
                         let permit = match permit {
                             Ok(permit) => permit,
-                            Err(err) => return (dedup_key, object_name, version_id, (0, Err(err)), None),
+                            Err(err) => return (dedup_key, object_name, version_id, (0, Err(err), saw_slow_down), None),
                         };
 
                         let in_flight_guard = PageConcurrencyGuard::new(in_flight.clone(), set_label.clone());
@@ -1751,7 +1758,8 @@ impl ErasureSetHealer {
                         if let (Some(identity), Some(task_id)) = (admin_identity.take(), admin_task_id.take()) {
                             let (result, canonical) =
                                 admin::heal_object(storage.as_ref(), &heal_opts, identity, &task_id, &cancel_token).await;
-                            return (dedup_key, object_name, version_id, result, canonical);
+                            let saw_slow_down = saw_slow_down || matches!(&result.1, Err(err) if err.is_slow_down());
+                            return (dedup_key, object_name, version_id, (result.0, result.1, saw_slow_down), canonical);
                         }
 
                         // Always go through heal_object. Genuine absence flows through
@@ -1763,15 +1771,20 @@ impl ErasureSetHealer {
                             (0, Err(Error::TaskCancelled))
                         } else {
                             let result = if replacement_object {
-                                storage
-                                    .heal_object_with_task_cancel(
-                                        &bucket_name,
-                                        &object_name,
-                                        version_id.as_deref(),
-                                        &heal_opts,
-                                        &cancel_token,
-                                    )
-                                    .await
+                                match incarnation {
+                                    Some(expected) => storage
+                                        .heal_replacement_object_at_incarnation(
+                                            &bucket_name,
+                                            &object_name,
+                                            version_id.as_deref(),
+                                            expected,
+                                            &heal_opts,
+                                            &cancel_token,
+                                        )
+                                        .await
+                                        .map(|result| (result.item, result.error)),
+                                    None => Err(Error::ReplacementNamespaceChanged),
+                                }
                             } else {
                                 storage
                                     .heal_object(&bucket_name, &object_name, version_id.as_deref(), &heal_opts)
@@ -1853,18 +1866,23 @@ impl ErasureSetHealer {
 
                         drop(in_flight_guard);
                         drop(permit);
+                        if matches!(&result.1, Err(err) if err.is_slow_down()) {
+                            saw_slow_down = true;
+                        }
                         if retry_replacement
                             && retries < REPLACEMENT_OBJECT_MAX_RETRIES
                             && matches!(&result.1, Err(Error::TransientSkip { .. }))
                         {
                             retries += 1;
                             tokio::select! {
-                                _ = cancel_token.cancelled() => return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled)), None),
+                                _ = cancel_token.cancelled() => {
+                                    return (dedup_key, object_name, version_id, (0, Err(Error::TaskCancelled), saw_slow_down), None);
+                                }
                                 _ = tokio::time::sleep(Duration::from_millis(250 * u64::from(retries))) => {}
                             }
                             continue;
                         }
-                        return (dedup_key, object_name, version_id, result, None);
+                        return (dedup_key, object_name, version_id, (result.0, result.1, saw_slow_down), None);
                     }
                 };
                 page_tasks.push(async move {
@@ -1875,7 +1893,7 @@ impl ErasureSetHealer {
                         };
                         match result {
                             Ok(result) => result,
-                            Err(error) => (key, object, version, (0, Err(error)), None),
+                            Err(error) => (key, object, version, (0, Err(error), false), None),
                         }
                     } else {
                         work.await
@@ -1884,7 +1902,16 @@ impl ErasureSetHealer {
             }
 
             while let Some((key, object, version_id, result, canonical)) = page_tasks.next().await {
-                let (object_size, result) = result;
+                let (object_size, result, saw_slow_down) = result;
+                // Exactly one rate observation per finished object, including
+                // SlowDown that later succeeded on a replacement retry.
+                page_rate.observe_object_outcome(
+                    &match &result {
+                        Ok(_) => Ok(true),
+                        Err(err) => Err(err),
+                    },
+                    saw_slow_down,
+                );
                 let mut telemetry_unknown = false;
                 let checkpoint_outcome = match result {
                     Ok(true) => {
@@ -2482,6 +2509,7 @@ mod resume_loop_tests {
     use super::{
         ErasureSetHealer, NANOS_PER_SECOND, NEW_VERSION_SKIP_GRACE_SECS, should_skip_new_version, target_outcomes_complete,
     };
+    use crate::heal::pacing::HealPageRate;
     use crate::heal::progress::HealProgress;
     use crate::heal::resume::{
         CheckpointManager, CheckpointObjectOutcome, CheckpointObjectOutcomeRecord, RESUME_CHECKPOINT_FILE,
@@ -2642,6 +2670,7 @@ mod resume_loop_tests {
     struct FakeStorage {
         admin_disk: Mutex<Option<DiskStore>>,
         bucket_discovery_incomplete: AtomicBool,
+        bucket_discovery_error: Mutex<Option<EcstoreError>>,
         bucket_discovery_scopes: Mutex<Vec<Option<crate::heal::storage_api::storage::DiskSetSelector>>>,
         bucket_pages: Mutex<HashMap<String, Page>>,
         incarnations: Mutex<HashMap<String, uuid::Uuid>>,
@@ -2732,6 +2761,9 @@ mod resume_loop_tests {
             self.bucket_discovery_scopes.lock().expect("discovery scopes").push(selector);
             if self.bucket_discovery_incomplete.load(Ordering::SeqCst) {
                 return Err(Error::BucketDiscoveryIncomplete);
+            }
+            if let Some(error) = self.bucket_discovery_error.lock().expect("discovery failure").clone() {
+                return Err(Error::Storage(error));
             }
             self.list_buckets().await
         }
@@ -2909,6 +2941,16 @@ mod resume_loop_tests {
             }
             Ok(())
         }
+        async fn heal_replacement_bucket_metadata_at_incarnation(
+            &self,
+            bucket: &str,
+            expected: uuid::Uuid,
+            opts: &HealOpts,
+            targets: &[String],
+        ) -> Result<()> {
+            self.validate_bucket_incarnation(bucket, Some(expected)).await?;
+            self.heal_replacement_bucket_metadata(bucket, opts, targets).await
+        }
         async fn replacement_targets_have_version(
             &self,
             _bucket: &str,
@@ -3025,6 +3067,16 @@ mod resume_loop_tests {
         let temp = TempDir::new().unwrap();
         let disk = make_disk(&temp).await;
         let storage = Arc::new(FakeStorage::default());
+        if !target_endpoints.is_empty() {
+            storage.bucket_pages.lock().expect("replacement inventory").insert(
+                "b".to_string(),
+                Page {
+                    items: Vec::new(),
+                    next: None,
+                    truncated: false,
+                },
+            );
+        }
         let task_id = ResumeUtils::generate_task_id();
         let healer = ErasureSetHealer::new(
             storage.clone(),
@@ -3044,7 +3096,17 @@ mod resume_loop_tests {
         )
         .await
         .unwrap();
-        let checkpoint = CheckpointManager::new(disk, task_id.clone()).await.unwrap();
+        if !healer.target_endpoints.is_empty() {
+            resume
+                .prepare_replacement_bucket_pass(storage.as_ref())
+                .await
+                .expect("replacement fixture identity admission");
+        }
+        let checkpoint = if CheckpointManager::has_checkpoint(&disk, &task_id).await {
+            CheckpointManager::load_from_disk(disk, &task_id).await.unwrap()
+        } else {
+            CheckpointManager::new(disk, task_id.clone()).await.unwrap()
+        };
         Env {
             healer,
             storage,
@@ -3063,6 +3125,7 @@ mod resume_loop_tests {
         let mut successful = 0u64;
         let mut failed = 0u64;
         let mut skipped = 0u64;
+        let page_rate = Arc::new(HealPageRate::new(env.healer.pass_page_concurrency_limit(), None));
         let result = env
             .healer
             .heal_bucket_with_resume(
@@ -3077,9 +3140,64 @@ mod resume_loop_tests {
                 &env.resume,
                 &env.checkpoint,
                 state.start_time,
+                &page_rate,
             )
             .await;
         (processed, successful, failed, skipped, result.map(|_| ()))
+    }
+
+    #[tokio::test]
+    async fn replacement_bucket_pass_rejects_incomplete_inventory_without_reusing_or_clearing_progress() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        env.resume
+            .set_resume_cursor(Some("held-cursor".to_string()))
+            .await
+            .expect("cursor before discovery failure");
+        env.checkpoint
+            .add_processed_object("held-key".to_string())
+            .await
+            .expect("dedup before discovery failure");
+        // Model a page whose dedup identities must survive until cursor
+        // publication. complete_page deliberately prunes that identity set.
+        env.checkpoint
+            .advance_page(0, 7)
+            .await
+            .expect("persist the retained page identities");
+        let before = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .expect("durable checkpoint before discovery failure")
+            .get_checkpoint()
+            .await;
+        assert_eq!(before.current_object_index, 7);
+        assert!(before.processed_objects.contains("held-key"));
+        let state = env.resume.get_state().await;
+        env.storage.bucket_discovery_incomplete.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            env.resume.prepare_replacement_bucket_pass(env.storage.as_ref()).await,
+            Err(Error::BucketDiscoveryIncomplete)
+        ));
+        assert_eq!(env.resume.get_state().await, state, "partial discovery must never publish a fresh plan");
+        let checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+            .await
+            .expect("durable checkpoint")
+            .get_checkpoint()
+            .await;
+        assert_eq!(checkpoint.current_object_index, 7);
+        assert!(checkpoint.processed_objects.contains("held-key"));
+        env.storage.bucket_discovery_incomplete.store(false, Ordering::SeqCst);
+        *env.storage.bucket_discovery_error.lock().expect("inject quorum failure") =
+            Some(EcstoreError::InsufficientReadQuorum("bucket".to_string(), "inventory".to_string()));
+        assert!(matches!(
+            env.resume.prepare_replacement_bucket_pass(env.storage.as_ref()).await,
+            Err(Error::Storage(EcstoreError::InsufficientReadQuorum(..)))
+        ));
+        assert_eq!(env.resume.get_state().await, state, "quorum failure is not an empty namespace");
+        *env.storage.bucket_discovery_error.lock().expect("restore inventory") = None;
+        env.resume
+            .prepare_replacement_bucket_pass(env.storage.as_ref())
+            .await
+            .expect("unchanged complete inventory resumes existing pass");
+        assert_eq!(env.resume.get_state().await.resume_cursor.as_deref(), Some("held-cursor"));
     }
 
     #[tokio::test]
@@ -3144,6 +3262,7 @@ mod resume_loop_tests {
         let mut skipped = 0;
         let started_at = env.resume.get_state().await.start_time;
 
+        let page_rate = Arc::new(HealPageRate::new(healer.pass_page_concurrency_limit(), None));
         let error = healer
             .heal_bucket_with_resume(
                 "b",
@@ -3157,6 +3276,7 @@ mod resume_loop_tests {
                 &env.resume,
                 &env.checkpoint,
                 started_at,
+                &page_rate,
             )
             .await
             .expect_err("a remounted target must not begin a new page scan");
@@ -3480,6 +3600,85 @@ mod resume_loop_tests {
         );
         assert_eq!(env.storage.calls(), vec![(POOL_META_NAME.to_string(), None)]);
         drop(checkpoint);
+    }
+
+    #[tokio::test]
+    async fn replacement_cancellation_keeps_its_classification_when_the_namespace_changes() {
+        let env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
+        let replacement_task_id = ResumeUtils::generate_task_id();
+        ResumeManager::new_replacement_intent(
+            env.healer.disk.clone(),
+            replacement_task_id.clone(),
+            "pool_0_set_0".to_string(),
+            vec!["b".to_string()],
+            vec!["replacement-a".to_string()],
+            vec![crate::heal::resume::ReplacementTargetIdentity {
+                endpoint: "replacement-a".to_string(),
+                canonical_path: "/mnt/replacement-a".to_string(),
+                physical_device_ids: vec!["device-a".to_string()],
+                filesystem_identity: "1:2:3".to_string(),
+            }],
+        )
+        .await
+        .expect("replacement intent should persist");
+        env.storage.set_page(
+            None,
+            Page {
+                items: vec![item("retry", None, false)],
+                next: None,
+                truncated: false,
+            },
+        );
+        env.storage.set_outcome("retry", None, HealOutcome::Transient);
+        let healer = ErasureSetHealer::new(
+            env.storage.clone(),
+            Arc::new(RwLock::new(HealProgress::new())),
+            CancellationToken::new(),
+            env.healer.disk.clone(),
+            HealOpts::default(),
+            HealRequestSource::AutoHeal,
+        )
+        .with_replacement_targets(vec!["replacement-a".to_string()], Some(replacement_task_id.clone()));
+        let cancel = healer.cancel_token.clone();
+        let observe = async {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = env.storage.heal_started.notified();
+                    if !env.storage.calls().is_empty() {
+                        break;
+                    }
+                    notified.await;
+                }
+            })
+            .await
+            .expect("the replacement object repair must start");
+            // The only bucket is recreated while the operator cancels the pass.
+            env.storage
+                .incarnations
+                .lock()
+                .expect("incarnations")
+                .insert("b".to_string(), uuid::Uuid::from_u128(7));
+            cancel.cancel();
+        };
+
+        let buckets = ["b".to_string()];
+        let (result, ()) = tokio::join!(healer.heal_erasure_set(&buckets, "pool_0_set_0"), observe);
+
+        assert!(
+            matches!(result, Err(Error::TaskCancelled)),
+            "a cancelled pass keeps its control classification: {result:?}"
+        );
+        let manager = ResumeManager::load_replacement_intent(env.healer.disk.clone(), &replacement_task_id)
+            .await
+            .expect("cancelled replacement intent must remain");
+        assert!(
+            matches!(
+                manager.verify_replacement_bucket_pass(env.storage.as_ref()).await,
+                Err(Error::ReplacementNamespaceChanged)
+            ),
+            "the fixture must have changed the recorded bucket identity"
+        );
+        assert!(!manager.get_state().await.completed);
     }
 
     #[tokio::test]
@@ -4055,7 +4254,7 @@ mod resume_loop_tests {
                 (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
             ],
             async {
-                let mut env = make_env().await;
+                let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
                 env.healer.source = HealRequestSource::AutoHeal;
                 env.healer = env
                     .healer
@@ -4110,7 +4309,7 @@ mod resume_loop_tests {
                 (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
             ],
             async {
-                let mut env = make_env().await;
+                let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
                 env.healer.source = HealRequestSource::AutoHeal;
                 env.healer.heal_opts.no_lock = true;
                 env.healer = env
@@ -4167,7 +4366,7 @@ mod resume_loop_tests {
 
     #[tokio::test]
     async fn auto_replacement_retries_a_transient_object_before_rewinding_the_scan() {
-        let mut env = make_env().await;
+        let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
         env.healer.source = HealRequestSource::AutoHeal;
         env.healer = env
             .healer
@@ -4199,7 +4398,7 @@ mod resume_loop_tests {
                 (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("1")),
             ],
             async {
-                let mut env = make_env().await;
+                let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
                 env.healer.source = HealRequestSource::AutoHeal;
                 env.healer = env
                     .healer
@@ -4231,7 +4430,7 @@ mod resume_loop_tests {
 
     #[tokio::test]
     async fn auto_replacement_cancellation_interrupts_object_retry() {
-        let mut env = make_env().await;
+        let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
         env.healer.source = HealRequestSource::AutoHeal;
         env.healer = env
             .healer
@@ -4247,14 +4446,18 @@ mod resume_loop_tests {
         env.storage.set_outcome("retry", None, HealOutcome::Transient);
         let cancel = env.healer.cancel_token.clone();
         let observe = async {
-            loop {
-                let notified = env.storage.heal_started.notified();
-                if !env.storage.calls().is_empty() {
-                    break;
+            let started = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    let notified = env.storage.heal_started.notified();
+                    if !env.storage.calls().is_empty() {
+                        break;
+                    }
+                    notified.await;
                 }
-                notified.await;
-            }
+            })
+            .await;
             cancel.cancel();
+            started.expect("replacement object retry must start");
         };
 
         let ((_, successful, _, _, result), ()) = tokio::join!(run(&env), observe);
@@ -4272,7 +4475,7 @@ mod resume_loop_tests {
                 (rustfs_config::ENV_HEAL_PAGE_OBJECT_CONCURRENCY, Some("2")),
             ],
             async {
-                let mut env = make_env().await;
+                let mut env = make_env_with_targets(vec!["replacement-a".to_string()]).await;
                 env.healer.source = HealRequestSource::AutoHeal;
                 let execution = crate::heal::storage::ReplacementExecution::for_test(Vec::new(), Vec::new());
                 env.healer = env

@@ -128,7 +128,7 @@ async fn authenticate_admin(req: &AdminRequest) -> S3Result<()> {
     let (cred, owner) =
         check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-    let remote_addr = req.remote_addr();
+    let remote_addr = req.policy_source_addr();
     validate_admin_request(
         req.headers(),
         &cred,

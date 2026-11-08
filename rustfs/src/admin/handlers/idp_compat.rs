@@ -976,7 +976,15 @@ async fn authorize(req: &AdminRequest, action: AdminAction) -> S3Result<(StoredC
 }
 
 async fn authorize_action(req: &AdminRequest, cred: &StoredCredentials, owner: bool, action: AdminAction) -> S3Result<()> {
-    validate_admin_request(req.headers(), cred, owner, false, vec![Action::AdminAction(action)], req.remote_addr()).await
+    validate_admin_request(
+        req.headers(),
+        cred,
+        owner,
+        false,
+        vec![Action::AdminAction(action)],
+        req.policy_source_addr(),
+    )
+    .await
 }
 
 fn json_response<T: Serialize>(path: &str, secret_key: &str, status: StatusCode, payload: &T) -> S3Result<AdminResponse> {

@@ -1,7 +1,7 @@
 # S3 Tables Support Matrix
 
 **Use this when:** writing a release note, README claim, or client-compatibility statement about RustFS S3 Tables / Iceberg REST Catalog, or deciding whether a feature is supported, preview, or not claimed.
-**Source of truth:** the table-catalog handlers under `rustfs/src/admin/handlers/table_catalog/`; the conformance scripts and their README in `scripts/table-catalog/`; the durable-backing cutover procedure in [docs/operations/s3-tables-cutover-runbook.md](../operations/s3-tables-cutover-runbook.md).
+**Source of truth:** the table-catalog handlers under `rustfs/src/admin/handlers/table_catalog/`; the conformance scripts and their README in `scripts/table-catalog/`; and the object catalog backup/restore contracts exercised by the focused server tests.
 
 RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on top of the RustFS S3 data plane. It does not claim parity with the AWS S3 Tables control-plane API or with vendor-specific Iceberg catalog extensions.
 
@@ -26,7 +26,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | `/_iceberg/v1` | Supported compatibility alias | MinIO AIStor-style alias; smoke profile defaults to signing name `s3tables`. |
 | S3 object data plane | Supported | Data, metadata, manifest, and delete files are ordinary S3 objects with table-aware policy checks on warehouse paths. |
 | S3 table-bucket listings | Supported | `ListObjects`, `ListObjectsV2`, `ListObjectVersions`, metadata-list extensions, and multipart-upload listings omit warehouse objects unless the caller has `admin:GetTableMetadata` for that table, and always omit internal `.rustfs-table` keys. Protected cursors are encrypted with a key derived from the cluster root credentials, so rotating those credentials invalidates cursors already issued. |
-| Object-backed warehouse-index recovery | Supported with bounded request fallback | Data-plane requests repair or verify a missing warehouse-prefix index against bounded pages totaling at most 4,096 catalog objects. Larger catalogs fail closed with a retryable service error and require `POST /iceberg/v1/{warehouse}/catalog/warehouse-index/backfill` with `admin:MigrateTableCatalog` instead of allowing one S3 request to trigger an unbounded scan. |
+| Object-backed warehouse-index recovery | Supported with bounded request fallback | Data-plane requests repair or verify a missing warehouse-prefix index by listing the catalog prefix. Only table entries count toward the 4,096-object limit, so maintenance reports and other per-table objects cannot exhaust it; the listing itself is bounded to 64 pages plus one page per table entry already listed, and after each page the cursor skips the rest of the maintenance subtree the page ended in, so a report flood under one table costs a bounded number of pages. Larger catalogs fail closed with a retryable service error and require operator backfill. An optional table-entry directory (see Maintenance Matrix) answers these lookups without the prefix listing. |
 | Table bucket enablement | Supported | A regular bucket is enabled for catalog use and addressed as the REST catalog warehouse. |
 | Catalog-vended table credentials | Automated when enabled | Disabled by default. LoadTable vends credentials only when `X-Iceberg-Access-Delegation` contains the exact `vended-credentials` token; the dedicated credentials endpoint uses the same issuer path. |
 | AWS S3 Tables endpoint shape | Profile generator | Generates the AWS catalog URI and warehouse ARN shape for migration docs. API parity not claimed. |
@@ -38,7 +38,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 | Client or engine | Status | Claim |
 |---|---|---|
-| PyIceberg | Automated | Namespace and table create, append, exact-row reload/scan, metadata-location, refs, views, namespace properties, rename identity and credential negotiation. The smoke discovers the server backing and checks maintenance configuration, scheduler/worker dry-run, diagnostics and export on both backings. Direct metadata maintenance is checked as unsupported on durable-strong. Optional vended credentials include an exact-prefix data-plane scope check. |
+| PyIceberg | Automated | Namespace and table create, append, exact-row reload/scan, metadata-location, refs, views, namespace properties, rename identity, maintenance, diagnostics, export, and credential negotiation against the object catalog. Optional vended credentials include an exact-prefix data-plane scope check. |
 | Spark Iceberg REST catalog | Manual/live harness | Pinned package inputs, catalog properties, atomic CTAS SQL through staged create, expected `row_count=2`, and a CI opt-in gate for create/refresh/count/cleanup. Live execution and commit-conflict probing remain manual unless enabled in the runner. |
 | Trino Iceberg REST catalog | Manual/live harness | Catalog properties and a read-only `SELECT COUNT(*)` against a PyIceberg- or Spark-created table. Write compatibility not claimed. |
 | DuckDB Iceberg 1.5.5 | Automated | `duckdb_smoke.py` covers metadata-location read, single-table create/insert/update/delete/merge, schema evolution, snapshots, concurrent writers, drop, PyIceberg cross-read, and both signing profiles. Purge-on-drop and format v3 are verified fail-closed. Two-table mode runs without claiming cross-table atomicity. AWS `ENDPOINT_TYPE S3_TABLES`, staged-create client integration, and vended-credential integration are not claimed. |
@@ -51,7 +51,7 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 | Area | Status | Claim |
 |---|---|---|
 | Live conformance evidence | Automated for PyIceberg and DuckDB | `engine_compatibility.py --print-live-evidence-schema` defines the evidence schema and promotion boundaries; both smoke scripts write validated evidence records via `--live-evidence-output`. |
-| Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records commands, evidence, pass criteria, and fail-closed signals for conformance, cutover, maintenance, recovery, permissions, credential vending, and claim governance. |
+| Production operations guide | Generated harness | `engine_compatibility.py --print-operations-guide` records commands, evidence, pass criteria, and fail-closed signals for conformance, object catalog backup/restore, maintenance, recovery, permissions, credential vending, and claim governance. |
 | Vendor compatibility gap audit | Generated harness | `engine_compatibility.py --print-vendor-audit` records provider URLs, path and warehouse shapes, auth models, validation categories, and not-claimed boundaries for the four vendor profiles. |
 | Client claim promotion | Automated for scoped clients | PyIceberg and DuckDB claims are bounded by their smoke entrypoints and recorded versions; Spark needs recorded live evidence; Trino stays read-only; Snowflake and vendor profiles stay reference-only. |
 
@@ -59,20 +59,24 @@ RustFS S3 Tables is an Iceberg REST Catalog and table-bucket implementation on t
 
 | Area | Status | Covered behavior |
 |---|---|---|
-| Catalog config | Supported | `GET /v1/config` advertises defaults and only the supported OpenAPI REST paths in `endpoints`; RustFS extensions (administration, maintenance, migration, diagnostics, refs, metadata-location) are not presented as standard endpoints. |
-| Table bucket discovery | Supported | `PUT` / `GET /v1/buckets/{warehouse}` enable and inspect table bucket state. `DELETE` disables an empty catalog while preserving objects; discovery includes `disable-supported`. Namespaces, retained resources, staged metadata, and migration fences prevent disablement. |
+| Catalog config | Supported | `GET /v1/config` advertises defaults and only the supported OpenAPI REST paths in `endpoints`; RustFS extensions (administration, maintenance, backup/restore, diagnostics, refs, metadata-location) are not presented as standard endpoints. |
+| Table bucket discovery | Supported | `PUT` / `GET /v1/buckets/{warehouse}` enable and inspect table bucket state. `DELETE` disables an empty catalog while preserving objects; discovery includes `disable-supported`. Namespaces, retained resources, staged metadata, and publication fences prevent disablement. |
 | Namespaces | Supported | Create, list, load, exists, drop on both prefixes; `pageSize`/`pageToken` pagination with context-bound tokens; identifiers limited to 512 ASCII characters. |
 | Tables | Supported | Direct and staged create, register, list, load, exists, rename, commit, metadata-location get/update, and drop on both prefixes. Staged create is stateless until an `assert-create` commit atomically publishes the initial metadata and table entry. Rename uses a bucket-scoped persistent fence, recoverable intent, and conditional publication; the source name is reusable only via an ETag-conditional tombstone replacement. Commit identifiers must match the URL; unknown requirements/updates fail as bad requests; register overwrite, purge-on-drop, and v3-only encryption-key updates return an explicit unsupported-operation response. |
 | Commit CAS | Supported | Single-table commits validate base metadata, version token, referenced object existence, warehouse scope, and Iceberg requirements before advancing the pointer; external metadata transitions preserve monotonic assignment watermarks and immutable retained definitions. `idempotency-key-lifetime` is not advertised; mutation-wide `Idempotency-Key` semantics are unsupported. |
-| Commit recovery | Supported | Commit log, idempotency lookup, diagnostics, and recovery routes expose and repair finalization gaps without moving the pointer. |
+| Commit recovery | Supported | Commit log, idempotency lookup, diagnostics, and recovery routes expose and repair finalization gaps without moving the pointer. Object-backed recovery reports a staged request as SUPERSEDED only when a reachable finalized same-base winner proves it lost CAS and its idempotency binding is intact. The original staged receipt is retained; its old request still conflicts. The winning history must be retained with the losing receipt; missing or contradictory history requires manual review. |
 | Snapshot refs | Supported | List, create/replace, delete via commits; `main` is protected; refs with explicit retention need forced delete. |
 | Iceberg views | Supported | Create, list, load, replace, exists, drop with view-scoped authorization; only view format version 1. |
-| LoadTable and table credentials endpoint | Supported | Vending only on negotiated `vended-credentials`; one temporary session scoped to the warehouse prefix and current metadata location; missing credential permission falls back to metadata-only with an explicit reason; responses carry `Cache-Control: no-store, private`. |
-| Catalog diagnostics and export | Supported | Object-backed and durable-strong stores expose recovery state, consistency, backing manifest, WAL state, migration target, single-active-writer policy, and scale validation matrix. Durable-strong responses also identify the snapshot path, ETag, and format version; diagnostics re-check the snapshot observation before returning and use zero-file retention until strong maintenance configuration is persisted. |
-| Durable catalog backup and restore | Preview / controlled | Durable-strong only. `POST /iceberg/v1/{warehouse}/catalog/backup` seals a table-bucket snapshot behind the publication and migration fences, records catalog/object watermarks, and stores an immutable backup artifact. `POST /iceberg/v1/{warehouse}/catalog/restore` verifies those watermarks, requires an explicit replacement decision for an existing target, applies the catalog snapshot with ETag-CAS, and leaves a recoverable restore intent if maintenance-state finalization fails. It does not copy data files or claim automatic cross-region failover. |
+| LoadTable and table credentials endpoint | Supported | Vending only on negotiated `vended-credentials`; one temporary session scoped to the warehouse prefix and current metadata location; missing credential permission falls back to metadata-only with an explicit reason; vended storage sessions cannot authenticate Catalog requests; responses carry `Cache-Control: no-store, private`. |
+| Catalog diagnostics and export | Supported | Object catalog state exposes recovery, consistency, commit-log, idempotency, maintenance, single-active-writer policy, and scale validation information. |
+| Catalog backup and restore | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/backup` creates object-catalog artifact v2 with catalog/current table metadata and an inventory of current/direct `metadata-log` history, current view metadata, manifest lists/manifests, live data/delete files, and table/partition statistics. References up to 16 MiB use size/SHA-256; larger references require the captured size/ETag. Proven superseded requests retain their original staged records and any idempotency indexes with their winning history; missing or contradictory proof blocks backup and restore. External payloads are not packaged. `POST /iceberg/v1/{warehouse}/catalog/restore` applies objects conditionally; keep the target closed to clients until restore and recovery verification finish. Per-object CAS does not establish bucket-wide atomic publication or crash isolation. |
+| Catalog backup artifact transfer | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/backup/export` takes strict `{"backup-id":"..."}` JSON and returns saved artifact bytes; `POST /iceberg/v1/{warehouse}/catalog/backup/import` accepts the raw artifact. Artifact transfer is limited to 64 MiB and does not publish catalog or prepare external objects. Existing object-catalog v1 bytes and their legacy catalog/current-table-metadata contract remain unchanged. |
+| Catalog backup object preparation | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/backup/prepare` takes strict `{"backup-id":"...","object":"...","data-base64":"..."}` with standard padded Base64, up to 16 MiB decoded and 24 MiB JSON. It conditionally creates one v2-listed object within its validated table/view scope, returning `PREPARED` or `ALREADY_PRESENT`; identical bytes are idempotent and different existing bytes are never overwritten. Preparation does not publish catalog state. |
 | Catalog import and rollback | Supported | Import/register and online rollback go through validation and commit paths. Online rollback accepts only forward-safe targets; restoring an older target that lowers watermarks is an offline disaster-recovery operation with all writers stopped. |
 | External catalog bridge | Supported operator path | Operator-supplied metadata pointer sync/import. Vendor SDK polling and policy mirroring not claimed. |
 | Multi-table transactions | Not claimed | Single-table commit atomicity only. |
+
+Backup extensions require a table-enabled warehouse and `admin:MigrateTableCatalog`; export, import, and prepare also accept `/_iceberg/v1`. Restore and disaster-recovery rollback require all writers and maintenance workers stopped and the target closed to clients until recovery verification finishes. Every serving/background node must understand persistent restore controls; otherwise keep those nodes/workers out of the target service until then. `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` confirms publication-fence deployment, not restore-control version compatibility; no restore isolation guarantee is claimed for a mixed old/new fleet.
 
 ## Data Plane And Credential Matrix
 
@@ -95,41 +99,40 @@ their warehouse prefixes.
 
 ## Maintenance Matrix
 
-Object-backed and durable-strong catalogs support the configuration, scheduler,
-worker, job inspection, heartbeat, and quarantine endpoints. Durable-strong
-maintenance resolves table identity from the authoritative catalog snapshot;
-recoverable job and configuration records remain separate objects. The worker
-performs metadata and unreferenced-object cleanup without changing the catalog
-pointer. The direct `/maintenance/metadata` endpoint, including snapshot
-expiration and compaction plan/commit, remains object-backed only. A configured
+The object catalog supports the configuration, scheduler, worker, job
+inspection, heartbeat, and quarantine endpoints. Recoverable job and
+configuration records remain separate objects. The worker performs metadata and
+unreferenced-object cleanup without changing the catalog pointer. The direct
+`/maintenance/metadata` endpoint supports safe planning; snapshot expiration
+and compaction commits remain explicit controlled operations. A configured
 `background-enabled` table still requires explicit worker ticks. The standalone
 server has opt-in, allowlisted periodic queue admission; see the
 [scheduler runbook](../operations/s3-tables-maintenance-scheduler.md).
 
-Renamed tables retain their original metadata paths. Durable-strong scheduling
-and cleanup fail closed with a conflict if another table shares a scanned
+Renamed tables retain their original metadata paths. Object catalog scheduling,
+planning, and cleanup fail closed with a conflict if another table shares a scanned
 metadata or warehouse directory, including a recreated source name after rename.
-Such tables require disjoint cleanup roots before maintenance can run; enabling
-deletion does not override this ownership check.
+The object backing rechecks this ownership inventory under the bucket publication
+fence before every delete pass; the inventory reads every table entry in the bucket,
+so maintenance cost grows with the table count. Such tables require disjoint cleanup
+roots before maintenance can run; enabling deletion does not override this ownership
+check.
 
-Durable-strong rename preserves maintenance configuration, job identifiers,
-current/latest aliases, history, audit events, and quarantine state. A persisted
-rename intent protects sidecar migration across interruption: the source remains
-authoritative until the catalog CAS succeeds, and the destination records are
-ready before publication. Retry the same rename to finish pending recovery.
-Backup, restore, register, drop, and subsequent rename operations recover a
-pending migration before proceeding. Complete pending rename recovery before
-rolling back to a version that does not understand maintenance migration intents.
+Object catalog rename uses a persisted intent and publication fences. Recovery of an
+interrupted rename and recovery of a partially applied catalog restore are separate
+contracts; a successful rename test does not establish restore crash isolation.
 
-Durable-strong scheduler reports read an observational history set, not an atomic
-snapshot of all maintenance jobs. They fix at most 4096 history-object names
-under the publication read fence, scan those objects outside the fence, and
-refresh the selected 10-job audit window, effective configuration, and current
-job under a final read fence. Exceeding the history budget fails closed with an
-unavailable response; retrying does not remove that size limit. A listed object
-that disappears during the scan also returns unavailable; retry after concurrent
-rename or maintenance activity has settled. No history object is silently omitted
-when a rename removes its old path.
+Object-backed create, register, and commit publication share one preparation deadline, `RUSTFS_TABLE_CATALOG_PUBLICATION_PREPARATION_TIMEOUT_SECS` (default 30, never below the object lock-acquire timeout, capped at 86,400). Migration and bucket-lock queueing, reference HEAD validation, ownership inventories, metadata parsing, and snapshot preparation consume that same interval; repeated preparation does not renew it. A create writes its initial metadata file before registration without ending the deadline; when registration then fails before any catalog write may have begun, including on expiry, the handler removes that file, so the worst outcome of an expired create is a small orphan under a root no table owns, left by a crash or failed delete between the write and the removal. Expiry before a possible durable catalog write returns HTTP 503 and releases the preparation locks; a valid large operation that cannot finish within the interval keeps failing on retry until the interval is raised. Once a catalog write may have begun, this deadline no longer cancels that transaction. Individual PUT completion and persisted commit/rename recovery retain their existing cancellation guarantees. This is a preparation limit, not a hard bound on disk I/O or the durable tail. A rename that the client abandons mid-flight completes or recovers on a detached task, so the bucket's `active_rename_id` is always cleared.
+
+Compaction commits hold inputs to a 512 MiB stored and decoded budget per rewrite group, validate the footer (including the row-group count the decoder would reserve for) and every page header before decoding a page (a recursive or over-deep Iceberg manifest Avro schema and a Parquet page that exceeds its budget are refused with HTTP 400), and run one compaction per node at a time; a concurrent request receives HTTP 503. The planner packs each rewrite group to the smaller of `max-rewrite-bytes-per-job` and that 512 MiB stored-input ceiling, so a larger configured value is accepted but yields several groups; a group whose stored inputs still exceed the ceiling at commit time (for example a plan produced by an older release) is refused with HTTP 400 naming the ceiling before any group's output is written (every group of the plan is checked first).
+
+Object-backed commit publication identifies every catalog object it validated by the storage layer's write-unique body revision and rechecks only that identity under the bucket publication fence. Objects without such a revision (bytes the publication itself wrote before the fence, existence-only observations, and objects whose storage metadata reports no body revision) are "legacy" bytes: they are re-read and compared by SHA-256 under the fence, within a total budget of twice the maximum admin request body size (2 MiB) per publication. A publication whose legacy bytes exceed that budget fails with HTTP 503 and the message `legacy catalog objects exceed the publication validation budget; rewrite the referenced objects and retry`; rewriting the referenced metadata, manifest-list and manifest objects on the current release gives them a body revision, after which the same commit can be retried.
+
+### Table-entry directory
+
+An optional per-bucket directory of table entries under `.rustfs.sys` answers data-plane index-miss lookups without listing the catalog prefix. It is off by default: `RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX=true` and `RUSTFS_TABLE_CATALOG_DIRECTORY_INDEX_FLEET_CONFIRMED=true` on every node, then `POST /iceberg/v1/{warehouse}/catalog/directory` (`admin:MigrateTableCatalog`) advances a backfill of 128 catalog objects per call until the directory reports `Ready`; `GET` reports the phase and `DELETE` rolls the directory back. Entry writers add a directory candidate only while the directory exists, and the backfill covers earlier entries. The directory state occupies the backing-migration fence object: nodes without this feature answer catalog mutations on that bucket with a parse error until they are upgraded, which is what the fleet-confirmed flag attests, and restores require disabling the directory first. Object catalog backups exclude the derived directory state and candidates. Re-enable the directory after a restore to rebuild it from the restored entries.
+
+
 
 | Capability | Status | Claim |
 |---|---|---|
@@ -150,7 +153,7 @@ when a rename removes its old path.
 | Built-in periodic scheduler | Preview / queue-only | Default off; allowlisted, paged admission with jitter, per-pass quotas, current-job checks, and cooperative drain. Workers and failed/expired-job recovery remain operator-triggered; no automatic execution or hard per-table I/O deadline. |
 | Delete-file or row-level compaction execution | Not claimed | Manual-review maintenance item. |
 
-## Recovery And Strong Backing Matrix
+## Recovery And Object Backing Matrix
 
 | Area | Status | Claim |
 |---|---|---|
@@ -158,26 +161,21 @@ when a rename removes its old path.
 | Idempotent retry | Supported | Repeated commit IDs return the finalized result or surface recoverable finalization gaps. |
 | Commit publication fencing | Supported with rolling-upgrade gate | Exact object guards protect referenced files during publication. Set `RUSTFS_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED=true` only after every serving node supports table and table-bucket fences. In scalable mode, warehouse prefixes must not overlap and enablement, first publication, drop, and relocation are serialized by the table-bucket fence. |
 | Post-CAS finalization recovery | Supported | Repairs stale or missing idempotency indexes without changing the pointer. |
-| Catalog export | Supported | Table state, commit recovery state, and backing migration information. Durable-strong export is sourced from the linearizable snapshot rather than object marker files and includes the snapshot identity needed for a later backup operation. |
-| Strong backing state transfer | Supported | Object-backed catalog state is materialized into the durable strong snapshot deterministically, ETag-CAS protected, idempotent after interrupted finalization, and validated through the restart decoder before publication; conflicts between inactive explicit namespaces and active descendants fail closed. Hydration requires a stable non-empty ETag, caps the snapshot at 64 MiB, and rejects disappearance or format-version rollback after observation. Configured durable-strong mode rejects a missing snapshot on first access; only object-backed migration may initialize an empty target. |
-| Durable backing migration preflight | Supported | `GET /iceberg/v1/{warehouse}/catalog/migration` (and the alias) reports inventory, recovery blockers, prefix-index readiness, identifier collisions, fence state, target agreement, and per-bucket cutover readiness. |
-| Durable backing migration execution | Preview / controlled | `POST /iceberg/v1/{warehouse}/catalog/migration` fences registry changes, acquires a persistent per-bucket write fence, drains in-flight mutations, materializes the snapshot, and reports `ready_to_enable_durable_strong`. `DELETE` cancels only while the target has not advanced. Both mutations require `admin:MigrateTableCatalog`. Procedure: [s3-tables-cutover-runbook.md](../operations/s3-tables-cutover-runbook.md). |
-| Strong snapshot rolling compatibility | Supported | Reads snapshot versions 1 and 2; writes version 1 by default and version 2 only after both `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2` and `RUSTFS_TABLE_CATALOG_STRONG_SNAPSHOT_V2_FLEET_CONFIRMED` are set. A process rejects a lower format after observing a higher one; once v2 is fleet-confirmed, data-plane resolution fails closed until the persisted snapshot is v2. |
-| Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal`; the controlled catalog backup/restore path additionally requires referenced table objects to remain available and does not provide cross-region object replication. |
+| Catalog export | Supported | Table state, current metadata pointer, commit recovery state, idempotency state, maintenance state, and object catalog manifest. |
+| Disaster recovery rehearsal | Manual/live harness | `failure_coverage.py --print-disaster-recovery-rehearsal`; controlled object catalog backup/restore requires referenced table objects to remain available and does not provide cross-region object replication. |
 | Scale and fault rehearsal | Manual/live harness | `failure_coverage.py --print-scale-fault-rehearsal`. |
-| Durable strong snapshot backing cutover | Preview / controlled | `RUSTFS_TABLE_CATALOG_BACKING=durable-strong` only after every table bucket reports `SNAPSHOT_MATERIALIZED` and `ready_to_enable_durable_strong: true`. No separate external KV/WAL service is claimed; the legacy `STRONG_KV_WAL` and `CUT_OVER_LINEARIZABLE_READS` labels in v1 manifests are wire-compatibility labels, not claims. |
 | Single active writer region | Supported policy | Diagnostics publish single-active-writer semantics and read-only replica limits. |
 | Active-active multi-region writes | Not claimed | A table must not accept independent concurrent writers in multiple regions. |
 
 ## Production Failure Coverage
 
-Failure probes prove RustFS does not silently advance table state on failure. Tracked cases: stale commit token or base metadata returns a conflict without advancing the pointer; missing metadata, manifest, data, or delete objects fail closed before commit or maintenance; concurrent writers produce one CAS winner and retryable conflicts; catalog and S3 permission denials prevent data-plane bypass; stale maintenance plans fail closed before deletion or commit; post-CAS finalization gaps are visible and safely recoverable; external catalog sync conflicts leave pointer, token, and generation unchanged; backing migration stays blocked until WAL and recovery replay are clean.
+Failure probes prove RustFS does not silently advance table state on failure. Tracked cases: stale commit token or base metadata returns a conflict without advancing the pointer; missing metadata, manifest, data, or delete objects fail closed before commit, backup, restore, or maintenance; concurrent writers produce one CAS winner and retryable conflicts; catalog and S3 permission denials prevent data-plane bypass; stale maintenance plans fail closed before deletion or commit; post-CAS finalization gaps are visible and safely recoverable; external catalog sync conflicts leave pointer, token, and generation unchanged; object backup/restore stays blocked until recovery and referenced-object validation are clean.
 
 Do not promote a failure case from live probe or load test to an automated claim until the exact RustFS build, client version, and expected response shape are recorded.
 
 ## Unsupported Or Not Claimed
 
-Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; automatic maintenance execution and failed/expired-job recovery; durable-strong snapshot-expiration and compaction plan/commit; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark or Trino. DuckDB single-table UPDATE/DELETE/MERGE has its own automated smoke coverage as listed above; this does not establish other engines' DML compatibility.
+Full AWS S3 Tables control-plane parity; full MinIO AIStor private extensions; full Cloudflare R2 Data Catalog or Alibaba OSS Tables interoperability; automatic maintenance execution and failed/expired-job recovery; active-active multi-region writes; multi-table transactions; no-long-term-data-credential bootstrap; online vendor SDK polling; external catalog policy mirroring; delete-file rewrite or row-level compaction execution; built-in SQL execution; Delta Lake or Hudi; end-to-end SQL row-level DML validation through Spark or Trino. DuckDB single-table UPDATE/DELETE/MERGE has its own automated smoke coverage as listed above; this does not establish other engines' DML compatibility.
 
 ## Verification
 
@@ -194,6 +192,5 @@ Any stronger vendor or engine claim needs a repeatable live harness, the exact c
 ## Related
 
 - [Table catalog conformance scripts](../../scripts/table-catalog/README.md)
-- [Durable backing cutover runbook](../operations/s3-tables-cutover-runbook.md)
 - [Admin route action snapshot](admin-route-action-snapshot.md)
 - [Runtime capability contracts](runtime-capability-contracts.md)

@@ -193,7 +193,11 @@ pub mod bucket {
             OBJECT_LOCK_CONFIG, UnreadableBucketConfig, is_unreadable_config_error, load_bucket_metadata,
             table_catalog_path_hash, unreadable_config_refusal,
         };
-        pub use crate::bucket::metadata::{BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+        pub use crate::bucket::metadata::{
+            BUCKET_DURABILITY_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE,
+            SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
+        };
+        pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, is_swift_bucket_metadata_tag_key, validate_tag_set_entries};
     }
 
     pub mod config_parse_mode {
@@ -211,19 +215,20 @@ pub mod bucket {
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
             BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
-            ObjectLockConfigState, acquire_bucket_metadata_transaction_lock,
+            ObjectLockConfigState, ScannerBucketIncarnationReadGuard, acquire_bucket_metadata_transaction_lock,
             acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
-            capture_bucket_metadata_incarnation, delete, delete_if_incarnation, delete_if_incarnation_at,
-            delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy, get_bucket_policy_raw,
-            get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
+            acquire_scanner_bucket_incarnation_read_fence, capture_bucket_metadata_incarnation, delete, delete_if_incarnation,
+            delete_if_incarnation_at, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
+            get_bucket_policy_raw, get_bucket_targets_config, get_config_from_disk, get_cors_config, get_durability_config,
             get_global_bucket_metadata_sys, get_lifecycle_config, get_logging_config, get_notification_config,
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
-            get_request_payment_config, get_sse_config, get_tagging_config, get_versioning_config, get_website_config,
-            init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
+            get_request_payment_config, get_s3_tagging_config, get_sse_config, get_tagging_config, get_versioning_config,
+            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
             remove_bucket_metadata_if_absent, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
             update_config_with, update_if_incarnation, update_if_incarnation_at, update_quota_if_incarnation,
-            update_quota_if_incarnation_at, update_under_transaction_lock, update_under_transaction_lock_at,
+            update_quota_if_incarnation_at, update_s3_tagging_config, update_under_transaction_lock,
+            update_under_transaction_lock_at,
         };
         #[cfg(feature = "test-util")]
         pub use crate::bucket::metadata_sys::{ConfigWriteLockProbe, test_support};
@@ -334,7 +339,7 @@ pub mod bucket {
         pub use crate::bucket::utils::{
             BucketConfigXml, BucketConfigXmlError, check_bucket_and_object_names, check_list_objs_args,
             check_object_name_for_length_and_slash, check_valid_bucket_name_strict, deserialize, has_bad_path_component,
-            is_meta_bucketname, is_valid_object_prefix, serialize,
+            has_xml_invalid_control_characters, is_meta_bucketname, is_valid_object_prefix, serialize,
         };
     }
 
@@ -451,11 +456,18 @@ pub mod data_usage {
 pub mod disk {
     pub use crate::cluster::rpc::background_pipe::{BackgroundPipeReader, BackgroundPipeWriter, background_pipe};
     pub use crate::cluster::rpc::background_reader_stream::BackgroundReaderStream;
+    pub use crate::disk::BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION;
     pub use crate::disk::background_memory::BackgroundEncodeBuffer;
     pub use crate::disk::disk_store::get_object_disk_read_timeout;
+    #[cfg(feature = "test-util")]
+    pub use crate::disk::disk_store::wait_for_multipart_index_bootstrap;
     pub use crate::disk::local::{ReplacementExecutionLease, ScanGuard};
     #[cfg(feature = "test-util")]
     pub use crate::disk::local::{local_durability_modes, set_local_rename_data_fail_after_metadata_commit};
+    pub use crate::disk::multipart_index::{
+        MULTIPART_INDEX_RPC_MAX_BYTES, MULTIPART_INDEX_RPC_MAX_REQUEST_BYTES, MultipartIndexPage, MultipartIndexRpcReply,
+        MultipartIndexRpcRequest,
+    };
     pub use crate::disk::multipart_source::{
         MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartAbortCertificate, MultipartAbortProof, MultipartAbortProofKind,
         MultipartAbortRound, MultipartSourceOperation, MultipartSourcePhase, MultipartSourceRequest, MultipartSourceResponse,
@@ -468,13 +480,15 @@ pub mod disk {
     pub use crate::disk::os::{LocalPublicationPause, LocalPublicationStage};
     pub use crate::disk::{
         BATCH_READ_VERSION_MAX_ITEMS, BUCKET_META_PREFIX, BatchReadVersionItem, BatchReadVersionReq, BatchReadVersionResp,
-        CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration, CurrentDeleteTransition,
+        BoundedDeleteRecoveryDiscovery, BoundedDeleteRecoveryInspection, BoundedDeleteRecoverySettlement,
+        BoundedDeleteRecoverySettlementReply, CheckPartsResp, ConditionalFileUpdate, CurrentDeleteGeneration,
+        CurrentDeleteTransition, DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES, DELETE_RECOVERY_MAX_INSPECTION_ENTRIES,
         DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
         DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DeleteRecoveryState,
         Disk, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation, DiskOption, DiskStore, FileInfoVersions, FileReader, FileWriter,
-        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEALING_MARKER_PATH, NsScannerOpenRequest, OldCurrentSize,
-        POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup, PoolMetaNativeInspection,
-        PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+        GuardedDeleteVersionsPayload, GuardedFileInfoVersions, HEAL_REPLACEMENT_RECOVERY_DIR, HEALING_MARKER_PATH,
+        NsScannerOpenRequest, OldCurrentSize, POOL_META_NATIVE_CAS_METADATA_SUFFIX, PartTransactionAction, PoolMetaNativeBackup,
+        PoolMetaNativeInspection, PoolMetaNativeObject, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
         QUOTA_MUTATION_FENCE_METADATA_SUFFIX, RUSTFS_META_BUCKET, RUSTFS_META_MULTIPART_BUCKET, RUSTFS_META_TMP_BUCKET,
         ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, STORAGE_FORMAT_FILE, SnapshotLeaseToken,
         UpdateMetadataOpts, VolumeInfo, WalkDirOptions, is_quota_mutation_fence_path, new_disk,
@@ -619,7 +633,7 @@ pub mod rebalance {
 pub mod rio {
     pub use crate::io_support::rio::{
         DecryptReader, DynReader, EncryptReader, HardLimitReader, HashReader, ReadStream, Reader, WriteEncryption, WritePlan,
-        boxed_reader, compression_metadata_value, wrap_reader,
+        boxed_reader, compression_metadata_value, validate_compression_scheme, wrap_reader,
     };
 }
 
@@ -656,7 +670,9 @@ pub mod set_disk {
 
     #[cfg(feature = "test-util")]
     pub mod test_util {
-        pub use crate::bucket::quota::reservation::fail_next_quota_ledger_save_for_test;
+        pub use crate::bucket::quota::reservation::{
+            fail_next_quota_ledger_save_for_test, initialize_quota_ledger_for_test, retry_quota_reconciliation_for_test,
+        };
         pub use crate::set_disk::ConditionalReadBenchmarkMetadataGuard;
         pub use crate::set_disk::{MultipartCommitBarrier, MultipartCommitPause, PutObjectCommitBarrier, PutObjectCommitPause};
 

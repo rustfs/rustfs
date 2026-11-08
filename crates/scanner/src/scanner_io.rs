@@ -18,9 +18,9 @@ use crate::scanner_budget::ScannerCycleBudget;
 use crate::scanner_folder::{ScannerBucketPrefixScanScope, ScannerItem, scan_data_folder_scoped};
 use crate::sleeper::SCANNER_SLEEPER;
 use crate::{
-    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageCache, DataUsageCacheInfo, DataUsageCachePrepareOutcome,
-    DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo, DataUsageScanPlanDigest, DataUsageSnapshotSetState,
-    ScannerError, SizeSummary, TierStats,
+    DATA_USAGE_CACHE_NAME, DATA_USAGE_ROOT, DataUsageBucketServiceLedger, DataUsageCache, DataUsageCacheInfo,
+    DataUsageCachePrepareOutcome, DataUsageCacheSource, DataUsageEntry, DataUsageEntryInfo, DataUsageInfo,
+    DataUsageScanPlanDigest, DataUsageSnapshotSetState, ScannerError, SizeSummary, TierStats,
 };
 use bytes::Bytes;
 use futures::future::join_all;
@@ -2026,10 +2026,10 @@ pub use dirty_usage::{
     ScannerDirtyUsageSnapshot, ScannerDirtyUsageState, ScannerDurableDirtyUsageReplayEntry, ScannerDurableDirtyUsageReplayError,
     ScannerDurableDirtyUsageReplayRecord, ScannerDurableDirtyUsageReplayScope, acknowledge_dirty_usage_generation,
     acknowledge_scoped_dirty_usage, clear_dirty_usage_bucket, encode_durable_dirty_usage_producer_replay_record,
-    record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer, record_dirty_usage_bucket_from_producers,
-    record_dirty_usage_object, record_dirty_usage_object_from_producer, record_scanner_maintenance_change,
-    record_status_class_mutation, replay_durable_dirty_usage_producer_record, scanner_activity_epoch,
-    scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
+    probe_scoped_dirty_usage, record_dirty_usage_bucket, record_dirty_usage_bucket_from_producer,
+    record_dirty_usage_bucket_from_producers, record_dirty_usage_object, record_dirty_usage_object_from_producer,
+    record_scanner_maintenance_change, record_status_class_mutation, replay_durable_dirty_usage_producer_record,
+    scanner_activity_epoch, scanner_dirty_usage_bucket_generation, scanner_dirty_usage_snapshot, scanner_dirty_usage_state,
     scanner_maintenance_generation, set_scanner_dirty_usage_clear_observer, set_scanner_dirty_usage_mutation_observer,
 };
 #[cfg(test)]

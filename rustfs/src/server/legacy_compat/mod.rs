@@ -76,6 +76,7 @@ pub(super) use empty_body_content_length_compat::is_empty_body_console_path;
 pub(super) use object_attributes_etag_fix::is_object_attributes_request;
 
 use http::HeaderMap;
+use http_body::Body;
 use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
@@ -99,6 +100,14 @@ fn xml_escape(value: &str) -> String {
         }
     }
     escaped
+}
+
+pub(crate) const MAX_XML_COMPAT_BODY_BYTES: u64 = 1024 * 1024;
+
+fn is_xml_compat_body<B: Body>(body: &B) -> bool {
+    body.size_hint()
+        .upper()
+        .is_some_and(|length| length <= MAX_XML_COMPAT_BODY_BYTES)
 }
 
 fn is_xml_response(headers: &HeaderMap) -> bool {

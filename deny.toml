@@ -40,10 +40,6 @@ allow-git = [
     # dependencies while the engine crates move off s3s (rustfs/backlog#2745).
     # owner: rustfs-maintainers  review: 2027-01
     "https://github.com/rustfs/gateway",
-    # Upstream OIDC/OAuth2 crypto migrations, pinned to reviewed PR commits.
-    # owner: rustfs-maintainers  review: 2026-10
-    "https://github.com/ramosbugs/openidconnect-rs",
-    "https://github.com/ramosbugs/oauth2-rs",
     # Completion ownership patch fixed to rustfs/uring#20.
     # owner: overtrue  review: 2026-10
     "https://github.com/rustfs/uring.git",
@@ -100,4 +96,8 @@ exceptions = [
     # transitively via `bzip2`. Not on a hot path.
     # owner: rustfs-maintainers  review: 2026-07
     { allow = ["bzip2-1.0.6"], crate = "libbz2-rs-sys" },
+    # `aws-lc-fips-sys` declares ISC, Apache-2.0, and the OpenSSL license for
+    # the FIPS-validated AWS-LC module when the optional `fips` feature is enabled.
+    # owner: rustfs-maintainers  review: 2026-10
+    { allow = ["OpenSSL"], crate = "aws-lc-fips-sys" },
 ]

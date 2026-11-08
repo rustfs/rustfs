@@ -51,6 +51,25 @@ async fn replacement_env() -> Env {
     )
     .await
     .expect("replacement intent should persist before scanning");
+    env.resume
+        .prepare_replacement_bucket_pass(env.storage.as_ref())
+        .await
+        .expect("the new replacement generation must admit its bucket identities before direct execution");
+    // Admission durably resets the companion checkpoint. Reload its current
+    // revision instead of retaining the previous generation's CAS instance.
+    env.checkpoint = CheckpointManager::load_from_disk(env.healer.disk.clone(), &env.task_id)
+        .await
+        .expect("reload the admitted replacement pass checkpoint");
+    assert_eq!(
+        env.resume
+            .replacement_bucket_incarnation("b")
+            .await
+            .expect("the fixture bucket must belong to the replacement pass"),
+        env.storage
+            .admit_bucket_incarnation("b")
+            .await
+            .expect("fixture bucket identity")
+    );
     env.healer = ErasureSetHealer::new(
         env.storage.clone(),
         Arc::new(RwLock::new(HealProgress::new())),

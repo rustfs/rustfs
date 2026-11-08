@@ -136,6 +136,8 @@ pub static SCANNER_SLEEPER: LazyLock<DynamicSleeper> = LazyLock::new(|| {
 /// `elapsed_work_time * factor`, clamped to `[MIN_SLEEP, max_sleep]`.
 /// Folder walkers accumulate proportional object waits without the per-object
 /// floor, paying bounded batches and the final bucket tail.
+/// Their work measurement excludes disk-budget and node-admission waits so
+/// foreground protection does not become an additional proportional delay.
 /// For folder-level gaps, [`sleep_folder`] uses `MIN_SLEEP * factor`,
 /// clamped only by `max_sleep`. All sleeps are gated on [`SCANNER_IDLE_MODE`];
 /// the per-disk background I/O budget bound with [`DynamicSleeper::for_disk`]

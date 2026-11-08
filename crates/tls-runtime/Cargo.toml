@@ -29,6 +29,7 @@ workspace = true
 
 [features]
 default = []
+fips = ["rustls/fips"]
 hotpath = ["hotpath/hotpath", "hotpath/tokio", "rustfs-common/hotpath", "rustfs-config/hotpath"]
 hotpath-alloc = ["hotpath", "hotpath/hotpath-alloc", "rustfs-common/hotpath-alloc", "rustfs-config/hotpath-alloc"]
 hotpath-cpu = ["hotpath", "hotpath/hotpath-cpu", "rustfs-common/hotpath-cpu", "rustfs-config/hotpath-cpu"]

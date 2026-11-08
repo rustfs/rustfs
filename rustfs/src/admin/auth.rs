@@ -282,7 +282,8 @@ pub async fn authorize_admin_envelope(req: &RequestEnvelope, actions: Vec<Action
     };
 
     let (cred, owner) = authenticate_envelope_credentials(input_cred).await?;
-    validate_admin_request(req.headers(), &cred, owner, false, actions, req.remote_addr()).await?;
+    // Policy conditions see the verified proxy client, never the raw peer.
+    validate_admin_request(req.headers(), &cred, owner, false, actions, req.policy_source_addr()).await?;
 
     Ok(cred)
 }
@@ -521,6 +522,157 @@ mod tests {
             &rustfs_s3_types::S3ErrorCode::AccessDenied,
             "admin gate rejection must map to the AccessDenied S3 error code"
         );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn admin_and_sts_handlers_use_verified_client_ip_and_bucket_scope() {
+        crate::app::gating_test_env::run_large_stack_test("admin-client-conditions", || async {
+            use crate::admin::operation::Operation;
+            use crate::admin::operation::test_support::TestRequest;
+            use crate::admin::runtime_sources::{AppContext, IamInterface, KmsInterface, publish_test_app_context};
+            use crate::shared_types::RemoteAddr;
+            use rustfs_iam::store::object::ObjectStore;
+            use rustfs_madmin::{AccountStatus, AddOrUpdateUserReq};
+            use std::sync::Arc;
+            struct ReadyIam(Arc<rustfs_iam::sys::IamSys<ObjectStore>>);
+            impl IamInterface for ReadyIam {
+                fn handle(&self) -> Arc<rustfs_iam::sys::IamSys<ObjectStore>> {
+                    self.0.clone()
+                }
+                fn is_ready(&self) -> bool {
+                    true
+                }
+            }
+            struct TestKms;
+            impl KmsInterface for TestKms {
+                fn handle(&self) -> Arc<rustfs_kms::KmsServiceManager> {
+                    Arc::new(rustfs_kms::KmsServiceManager::new())
+                }
+            }
+            let previous = crate::runtime_sources::current_app_context();
+            let (_directory, _paths, store) = crate::app::gating_test_env::isolated_multi_pool_ecstore().await;
+            ObjectStore::new(store.clone())
+                .save_iam_config(
+                    serde_json::json!({"version": 1}),
+                    format!("{}/format.json", *rustfs_iam::store::object::IAM_CONFIG_PREFIX),
+                )
+                .await
+                .unwrap();
+            let iam = rustfs_iam::build_iam_sys(store.clone()).await.unwrap();
+            for (key, document) in [
+                (
+                    "proxy-admin",
+                    serde_json::json!({"Version":"2012-10-17","Statement":[
+                        {"Effect":"Allow","Action":"admin:*"},
+                        {"Effect":"Allow","Action":"sts:AssumeRole"},
+                        {"Effect":"Deny","Action":"admin:*","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}},
+                        {"Effect":"Deny","Action":"sts:AssumeRole","Condition":{"NotIpAddress":{"aws:SourceIp":"10.0.0.0/8"}}}
+                    ]}),
+                ),
+                (
+                    "scoped-usage",
+                    serde_json::json!({"Version":"2012-10-17","Statement":[
+                        {"Effect":"Allow","Action":"s3:ListBucket","Resource":"arn:aws:s3:::usage-allowed"},
+                        {"Effect":"Deny","Action":"s3:ListBucket","NotResource":"arn:aws:s3:::usage-allowed"}
+                    ]}),
+                ),
+            ] {
+                iam.create_user(
+                    key,
+                    &AddOrUpdateUserReq {
+                        secret_key: "test-user-secret".to_owned(),
+                        policy: None,
+                        status: AccountStatus::Enabled,
+                    },
+                )
+                .await
+                .unwrap();
+                iam.set_policy(key, Policy::parse_config(&serde_json::to_vec(&document).unwrap()).unwrap())
+                    .await
+                    .unwrap();
+                iam.policy_db_set(key, UserType::Reg, false, key).await.unwrap();
+            }
+            let context = Arc::new(AppContext::new(store, Arc::new(ReadyIam(iam)), Arc::new(TestKms)));
+            assert!(context.publish_action_credentials(rustfs_credentials::Credentials {
+                access_key: "proxy-test-root".to_owned(),
+                secret_key: "proxy-root-secret".to_owned(),
+                status: "on".to_owned(),
+                ..Default::default()
+            }));
+            publish_test_app_context(context);
+            let request = |key: &str, client_ip: Option<&str>, method: http::Method, uri: &str, body: &str| {
+                let mut builder = TestRequest::new(method, uri)
+                    .extension(Some(RemoteAddr("10.1.2.3:4567".parse().unwrap())))
+                    .header("x-forwarded-for", "10.1.2.3")
+                    .header("x-real-ip", "10.1.2.3")
+                    .credentials(key, "test-user-secret", None)
+                    .body(body.to_owned());
+                if let Some(ip) = client_ip {
+                    builder =
+                        builder.extension(rustfs_trusted_proxies::ClientInfo::direct(format!("{ip}:7890").parse().unwrap()));
+                }
+                builder.build()
+            };
+            for (client, allowed) in [(Some("203.0.113.17"), false), (Some("10.8.7.6"), true), (None, true)] {
+                let req = request("proxy-admin", client, http::Method::GET, "/", "");
+                assert_eq!(req.policy_source_addr().unwrap().port(), 4567);
+                let result = authorize_admin_envelope(req.envelope(), vec![admin_action()]).await;
+                if allowed {
+                    result.expect("verified private client is allowed");
+                } else {
+                    assert_eq!(result.unwrap_err().code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+                let req = request(
+                    "proxy-admin",
+                    client,
+                    http::Method::POST,
+                    "/",
+                    "Action=AssumeRole&Version=invalid-version",
+                );
+                let error = crate::admin::handlers::sts::AssumeRoleHandle {}
+                    .call(req, matchit::Params::new())
+                    .await
+                    .unwrap_err();
+                if allowed {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+                    assert_eq!(
+                        error.message(),
+                        Some("not support version"),
+                        "only an authorized caller reaches version validation"
+                    );
+                } else {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+                let response = crate::admin::handlers::is_admin::IsAdminHandler {}
+                    .call(request("proxy-admin", client, http::Method::GET, "/", ""), matchit::Params::new())
+                    .await
+                    .unwrap();
+                let (_status, _headers, mut body) = response.into_parts();
+                let json: serde_json::Value = serde_json::from_slice(&body.store_all_limited(4096).await.unwrap()).unwrap();
+                assert_eq!(json["is_admin"], allowed);
+            }
+            let mut routes = matchit::Router::new();
+            routes.insert("/usage/{bucket}", ()).unwrap();
+            for (bucket, allowed) in [("usage-allowed", true), ("usage-secret", false)] {
+                let path = format!("/usage/{bucket}");
+                let matched = routes.at(&path).unwrap();
+                let req = request("scoped-usage", None, http::Method::GET, &format!("{path}?unexpected=1"), "");
+                let error = crate::admin::handlers::usage_prefix::BucketPrefixUsageHandler {}
+                    .call(req, matched.params)
+                    .await
+                    .unwrap_err();
+                if allowed {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::InvalidArgument);
+                    assert_eq!(error.message(), Some("unknown query parameter: unexpected"));
+                } else {
+                    assert_eq!(error.code(), &rustfs_s3_types::S3ErrorCode::AccessDenied);
+                }
+            }
+            if let Some(previous) = previous {
+                publish_test_app_context(previous);
+            }
+        });
     }
 
     /// Owner (root/admin) credential is authorized for an admin action.

@@ -220,6 +220,126 @@ SH
         self.assertNotIn("        continue-on-error: true", self.publish)
         self.assertNotIn("          overwrite: true", upload)
 
+    def dispatch_shell(self):
+        step = self.steps["Dispatch nightly candidate to auto-testing"]
+        start = step.index("        run: |") + 1
+        return "\n".join(line[10:] for line in step[start:] if not line.strip() or line.startswith("          "))
+
+    def candidate_manifest(self, **overrides):
+        digest = overrides.pop("package_sha256", self.digest)
+        workflow_sha = overrides.pop("workflow_sha", self.sha)
+        manifest = {
+            "schema": 2,
+            "workflow_sha": workflow_sha,
+            "source_ref": "main",
+            "source_sha": self.sha,
+            "build_run_id": 12345,
+            "build_run_attempt": 1,
+            "package_sha256": digest,
+            "package_url": f"https://dl.rustfs.com/artifacts/rustfs/packages/nightly/runs/12345/1/{digest}/rustfs.deb",
+        }
+        manifest.update(overrides)
+        return manifest
+
+    def run_dispatch(self, manifest=None, **overrides):
+        manifest = self.candidate_manifest() if manifest is None else manifest
+        candidate = self.root / "candidate.json"
+        candidate.write_text(json.dumps(manifest))
+        shim = self.root / "dispatch-curl.sh"
+        shim.write_text(r'''curl() {
+  printf '%s\0' "$@" > "$FAKE_CURL_ARGS"
+  local outfile="" data=""
+  local args=("$@")
+  local i=0
+  while [[ $i -lt ${#args[@]} ]]; do
+    case "${args[$i]}" in
+      -o) outfile="${args[$((i+1))]}"; i=$((i+2));;
+      --data-binary)
+        data="${args[$((i+1))]}"
+        cp "${data#@}" "$FAKE_DISPATCH_BODY"
+        i=$((i+2));;
+      *) i=$((i+1));;
+    esac
+  done
+  [[ "$FAKE_DISPATCH_STATUS" != "curl-failure" ]] || return 28
+  if [[ -n "$outfile" ]]; then printf '%s' "$FAKE_DISPATCH_RESPONSE" > "$outfile"; fi
+  printf '%s' "$FAKE_DISPATCH_STATUS"
+}
+''')
+        env = dict(os.environ, BASH_ENV=str(shim), CANDIDATE_FILE=str(candidate), DEB_DATE="2026-09-06",
+                   SOURCE_REPO="rustfs/rustfs", DISPATCH_TOKEN="test-dispatch-token", RUNNER_TEMP=str(self.root),
+                   GITHUB_RUN_ID="12345", GITHUB_RUN_ATTEMPT="1", GITHUB_SHA=manifest["workflow_sha"],
+                   FAKE_CURL_ARGS=str(self.root / "curl-args"), FAKE_DISPATCH_BODY=str(self.root / "dispatch-body.json"),
+                   FAKE_DISPATCH_STATUS="204", FAKE_DISPATCH_RESPONSE="")
+        env.update(overrides)
+        return subprocess.run(["bash", "--noprofile", "--norc", "-e", "-o", "pipefail", "-c", self.dispatch_shell()],
+                              cwd=self.root, env=env, capture_output=True, text=True)
+
+    def test_dispatch_follows_release_publish_without_blocking_vault_lanes(self):
+        names = list(self.steps)
+        self.assertLess(names.index("Publish packages to auto-testing release assets"), names.index("Dispatch nightly candidate to auto-testing"))
+        step = "\n".join(self.steps["Dispatch nightly candidate to auto-testing"])
+        self.assertIn("        if: ${{ steps.publish.outputs.candidate_file != '' }}", step)
+        self.assertIn("          DISPATCH_TOKEN: ${{ secrets.AUTO_TESTING_DISPATCH_TOKEN }}", step)
+        self.assertNotIn("secrets.GITHUB_TOKEN", step)
+        self.assertNotIn("github.token", step)
+        self.assertNotIn("continue-on-error", step)
+        self.assertIn("https://api.github.com/repos/rustfs/auto-testing/dispatches", step)
+        self.assertIn("nightly-candidate-ready", step)
+        lines = WORKFLOW.read_text().splitlines()
+        for lane in ("kms-vault-lane", "kms-vault-ha-failover"):
+            job = yaml_block(lines, lane, 2)
+            needs = next(line for line in job if line.strip().startswith("needs:"))
+            self.assertEqual(needs.strip(), "needs: resolve-source")
+            self.assertNotIn("Dispatch nightly candidate", "\n".join(job))
+        alert = "\n".join(yaml_block(lines, "alert-on-failure", 2))
+        self.assertIn("needs: [build, kms-vault-lane, kms-vault-ha-failover]", alert)
+        chain = (ROOT / ".github/workflows/rustfs-functional-chain.yml").read_text()
+        self.assertIn('workflows: ["Nightly GNU Build"]', chain)
+        self.assertIn("types: [completed]", chain)
+
+    def test_dispatch_sends_schema2_candidate_without_the_token(self):
+        result = self.run_dispatch()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        body = json.loads((self.root / "dispatch-body.json").read_text())
+        self.assertEqual(body["event_type"], "nightly-candidate-ready")
+        payload = body["client_payload"]
+        self.assertLessEqual(len(payload), 10)
+        self.assertEqual(set(payload), {"event_type", "source_repo", "latest_alias_url", "auto_testing_release", "channel", "deb_date", "nightly_workflow", "candidate"})
+        self.assertEqual(payload["candidate"], self.candidate_manifest())
+        self.assertEqual(payload["latest_alias_url"], "https://dl.rustfs.com/artifacts/rustfs/packages/nightly/rustfs-nightly-latest.deb")
+        self.assertEqual(payload["auto_testing_release"], "https://github.com/rustfs/auto-testing/releases/tag/nightly")
+        self.assertEqual(payload["channel"], "nightly")
+        self.assertEqual(payload["deb_date"], "2026-09-06")
+        self.assertEqual(payload["nightly_workflow"], ".github/workflows/nightly-gnu.yml")
+        self.assertEqual(payload["source_repo"], "rustfs/rustfs")
+        validate_manifest(payload["candidate"], {"id": 12345, "run_attempt": 1, "head_sha": self.sha})
+        args = (self.root / "curl-args").read_bytes().split(b"\0")
+        self.assertIn(b"https://api.github.com/repos/rustfs/auto-testing/dispatches", args)
+        self.assertIn(b"Authorization: Bearer test-dispatch-token", args)
+        self.assertNotIn("test-dispatch-token", json.dumps(body))
+        self.assertIn("dispatched nightly-candidate-ready", result.stdout)
+
+    def test_dispatch_failure_stops_before_treating_the_candidate_as_notified(self):
+        for status, response in (("422", '{"message":"No more than 10 properties are allowed"}'), ("500", "unavailable"), ("curl-failure", "")):
+            with self.subTest(status=status):
+                result = self.run_dispatch(FAKE_DISPATCH_STATUS=status, FAKE_DISPATCH_RESPONSE=response)
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("repository_dispatch", result.stderr)
+                if response:
+                    self.assertIn(response, result.stderr)
+                self.assertNotIn("dispatched nightly-candidate-ready", result.stdout)
+        for marker in ("curl-args", "dispatch-body.json"):
+            (self.root / marker).unlink(missing_ok=True)
+        missing = self.run_dispatch(DISPATCH_TOKEN="")
+        self.assertNotEqual(missing.returncode, 0)
+        self.assertIn("AUTO_TESTING_DISPATCH_TOKEN is required", missing.stderr)
+        self.assertFalse((self.root / "curl-args").exists())
+        rejected = self.run_dispatch(manifest=self.candidate_manifest(extra="nope"))
+        self.assertNotEqual(rejected.returncode, 0, rejected.stdout)
+        self.assertIn("nightly-candidate-ready contract", rejected.stderr)
+        self.assertFalse((self.root / "dispatch-body.json").exists())
+
 
 class ValidationPackageTests(unittest.TestCase):
     def setUp(self):

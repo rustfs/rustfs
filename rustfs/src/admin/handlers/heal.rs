@@ -1474,7 +1474,7 @@ async fn authenticate_heal_admin_request(req: &AdminRequest) -> S3Result<String>
         owner,
         false,
         vec![Action::AdminAction(AdminAction::HealAdminAction)],
-        req.remote_addr(),
+        req.policy_source_addr(),
     )
     .await?;
     Ok(cred.access_key)

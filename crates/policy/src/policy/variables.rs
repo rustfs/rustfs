@@ -259,35 +259,11 @@ async fn resolve_aws_variables_with_depth(pattern: &str, resolver: &dyn PolicyVa
     if depth >= 10 {
         return vec![pattern.to_string()];
     }
-    let mut results = vec![pattern.to_string()];
-
-    let mut changed = true;
-    let max_iterations = 10; // Prevent infinite loops
-    let mut iteration = 0;
-
-    while changed && iteration < max_iterations {
-        changed = false;
-        iteration += 1;
-
-        let mut new_results = Vec::new();
-        for result in &results {
-            let resolved = resolve_single_pass(result, resolver, depth).await;
-            if resolved.len() > 1 || (resolved.len() == 1 && &resolved[0] != result) {
-                changed = true;
-            }
-            new_results.extend(resolved);
-        }
-
-        // Remove duplicates while preserving order
-        results.clear();
-        let mut seen = std::collections::HashSet::new();
-        for result in new_results {
-            if seen.insert(result.clone()) {
-                results.push(result);
-            }
-        }
-    }
-
+    // Values from credentials and claims are data, not policy source. Expanding
+    // substituted placeholders again allows attacker-controlled exponential growth.
+    let mut results = resolve_single_pass(pattern, resolver, depth).await;
+    let mut seen = std::collections::HashSet::new();
+    results.retain(|result| seen.insert(result.clone()));
     results
 }
 
@@ -370,8 +346,8 @@ async fn resolve_single_pass(pattern: &str, resolver: &dyn PolicyVariableResolve
                             let suffix = &results[i].0[end_pos + 1..];
 
                             for value in values {
-                                // Resume after the substitution; a generated placeholder
-                                // belongs to the next bounded pass, not this one.
+                                // Resume after the substitution; generated placeholders
+                                // are literal data and must never be expanded.
                                 new_results.push((format!("{prefix}{value}{suffix}"), actual_pos + value.len()));
                             }
 
@@ -445,8 +421,20 @@ mod tests {
             calls: AtomicUsize::new(0),
         };
         let result = resolve_aws_variables("${aws:AccountId}{aws:username}", &resolver).await;
-        assert!(resolver.calls.load(Ordering::Relaxed) <= 10);
-        assert_eq!(result, vec!["${aws:AccountId}{aws:username}".to_string()]);
+        assert_eq!(resolver.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(result, vec!["$${aws:username}".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn substituted_account_id_placeholders_are_literal() {
+        let account = "${aws:AccountId}".repeat(2);
+        let resolver = VariableResolver::new(VariableContext {
+            account_id: Some(account.clone()),
+            username: Some("alice".to_string()),
+            ..Default::default()
+        });
+        let result = resolve_aws_variables("prefix/${aws:AccountId}/${aws:username}", &resolver).await;
+        assert_eq!(result, vec![format!("prefix/{account}/alice")]);
     }
 
     #[tokio::test]

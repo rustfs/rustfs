@@ -94,6 +94,14 @@ pub(crate) fn object_store_from_envelope(envelope: &RequestEnvelope) -> Option<A
 /// server has not finished startup yet, returning its ambient global context
 /// could select a different server, so this fails closed. Only requests with
 /// no slot retain the legacy ambient fallback.
+/// [`object_store_from_envelope`] for handlers still on the s3s request.
+pub(crate) fn object_store_from_req<B>(req: &s3s::S3Request<B>) -> Option<Arc<ECStore>> {
+    match req.extensions.get::<Arc<ServerContextSlot>>() {
+        Some(slot) => slot.installed_object_store(),
+        None => current_object_store_handle(),
+    }
+}
+
 pub(crate) fn app_context_from_extensions(extensions: &http::Extensions) -> Option<Arc<AppContext>> {
     match extensions.get::<Arc<ServerContextSlot>>() {
         Some(slot) => slot.installed_app_context(),

@@ -397,7 +397,7 @@ impl Operation for SetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request(
             req.headers(),
             &cred,
@@ -540,7 +540,7 @@ impl Operation for GetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
@@ -609,7 +609,7 @@ impl Operation for ClearBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request(
             req.headers(),
             &cred,
@@ -728,7 +728,7 @@ impl Operation for GetBucketQuotaStatsHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
@@ -797,7 +797,7 @@ impl Operation for CheckBucketQuotaHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request_with_bucket(
             req.headers(),
             &cred,
@@ -892,7 +892,7 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
-        let remote_addr = req.remote_addr();
+        let remote_addr = req.policy_source_addr();
         validate_admin_request(
             req.headers(),
             &cred,

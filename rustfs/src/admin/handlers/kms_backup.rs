@@ -919,7 +919,7 @@ async fn authorize(
     let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
 
     audit.gate_admin(
-        validate_admin_request(req.headers(), &cred, owner, false, actions, req.remote_addr()).await,
+        validate_admin_request(req.headers(), &cred, owner, false, actions, req.policy_source_addr()).await,
         operation,
         None,
     )?;

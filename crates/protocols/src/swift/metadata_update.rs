@@ -43,14 +43,9 @@ const CONTAINER_META_HEADER_PREFIX: &str = "x-container-meta-";
 /// Request header prefix removing a container metadata item.
 const CONTAINER_META_REMOVE_HEADER_PREFIX: &str = "x-remove-container-meta-";
 
-/// Bucket-tag namespace holding account metadata items.
-pub(crate) const ACCOUNT_META_TAG_PREFIX: &str = "swift-account-meta-";
-/// Bucket-tag namespace holding container metadata items.
-///
-/// Deliberately narrower than the `swift-` tags around it: the container ACL
-/// (`swift-acl-*`) and versioning (`swift-versions-location`) tags share this
-/// tag set and must survive a metadata POST.
-pub(crate) const CONTAINER_META_TAG_PREFIX: &str = "swift-meta-";
+pub(crate) use super::storage_api::tagging::{
+    SWIFT_ACCOUNT_META_TAG_PREFIX as ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX as CONTAINER_META_TAG_PREFIX,
+};
 
 /// The metadata changes carried by one account or container POST.
 ///

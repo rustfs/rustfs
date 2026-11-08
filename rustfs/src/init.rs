@@ -1252,7 +1252,8 @@ pub async fn init_webdav_system(
         let (shutdown_tx, shutdown_rx) = tokio::sync::broadcast::channel(1);
 
         let task_handle = tokio::spawn(async move {
-            if let Err(e) = server.start(shutdown_rx).await {
+            let result = server.start(shutdown_rx).await;
+            if let Err(e) = &result {
                 error!(
                     target: "rustfs::init",
                     event = EVENT_PROTOCOL_SERVER_STATE,
@@ -1273,6 +1274,7 @@ pub async fn init_webdav_system(
                 state = "stopped",
                 "Protocol server stopped"
             );
+            result
         });
 
         info!(
@@ -1286,7 +1288,7 @@ pub async fn init_webdav_system(
             tls_enabled,
             "Protocol runtime started"
         );
-        Ok(Some(ShutdownHandle::new(shutdown_tx, task_handle)))
+        Ok(Some(ShutdownHandle::new_webdav(shutdown_tx, task_handle)))
     }
 }
 

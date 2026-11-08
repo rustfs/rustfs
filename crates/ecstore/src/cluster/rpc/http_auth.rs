@@ -32,7 +32,6 @@ use crate::storage_api_contracts::internode::{
     PUT_FILE_AUTH_TRAILER_MAGIC, PUT_FILE_CAPABILITY_VERSION,
 };
 
-use hmac::{Hmac, KeyInit, Mac};
 use http::uri::Authority;
 use http::{HeaderMap, HeaderValue, Method, Uri};
 #[cfg(test)]
@@ -47,6 +46,7 @@ use rustfs_io_metrics::internode_metrics::{
     global_internode_metrics,
 };
 use rustfs_object_data_cache::{MemoryBasis, resolve_effective_memory};
+use rustfs_utils::crypto::{HmacSha256, KeyInit, Mac};
 use rustfs_utils::get_env_bool;
 use sha2::Digest as _;
 use sha2::Sha256;
@@ -57,8 +57,6 @@ use std::time::{Duration, Instant};
 use time::OffsetDateTime;
 use tracing::{error, info, warn};
 use uuid::Uuid;
-
-type HmacSha256 = Hmac<Sha256>;
 
 const SIGNATURE_HEADER: &str = "x-rustfs-signature";
 pub const RPC_BACKGROUND_ADMISSION_HEADER: &str = "x-rustfs-rpc-background-admission";
@@ -368,10 +366,84 @@ fn resolve_replay_cache_capacity() -> usize {
     decision.capacity
 }
 
+const RPC_NONCE_EXPIRATIONS_PER_PAGE: usize = 1_024;
+
+struct RpcNonceExpiration {
+    nonce: Uuid,
+    expiry_offset_ns: u32,
+    valid_until_offset_secs: i32,
+}
+
+struct RpcNonceExpirationPage {
+    expires_at: Instant,
+    valid_until: i64,
+    entries: VecDeque<RpcNonceExpiration>,
+}
+
+#[derive(Default)]
+struct RpcNonceExpirations {
+    pages: VecDeque<RpcNonceExpirationPage>,
+}
+
+impl RpcNonceExpirations {
+    fn push_back(&mut self, expires_at: Instant, valid_until: i64, nonce: Uuid) {
+        // Use exact offsets and start another page if either offset is too large.
+        // Fully drained pages can be freed while newer nonces are still valid.
+        if let Some(page) = self.pages.back_mut()
+            && page.entries.len() < RPC_NONCE_EXPIRATIONS_PER_PAGE
+            && let Some(offset) = expires_at.checked_duration_since(page.expires_at)
+            && let Ok(expiry_offset_ns) = u32::try_from(offset.as_nanos())
+            && let Some(offset) = valid_until.checked_sub(page.valid_until)
+            && let Ok(valid_until_offset_secs) = i32::try_from(offset)
+        {
+            page.entries.push_back(RpcNonceExpiration {
+                nonce,
+                expiry_offset_ns,
+                valid_until_offset_secs,
+            });
+        } else {
+            self.pages.push_back(RpcNonceExpirationPage {
+                expires_at,
+                valid_until,
+                entries: VecDeque::from([RpcNonceExpiration {
+                    nonce,
+                    expiry_offset_ns: 0,
+                    valid_until_offset_secs: 0,
+                }]),
+            });
+        }
+    }
+
+    fn pop_expired(&mut self, now: Instant, wall_time: i64) -> Option<Uuid> {
+        let page = self.pages.front_mut()?;
+        let entry = page.entries.front()?;
+        let elapsed = now.checked_duration_since(page.expires_at)?;
+        let valid_until = page.valid_until + i64::from(entry.valid_until_offset_secs);
+        if elapsed <= Duration::from_nanos(u64::from(entry.expiry_offset_ns)) || wall_time <= valid_until {
+            return None;
+        }
+
+        let nonce = entry.nonce;
+        page.entries.pop_front();
+        if page.entries.is_empty() {
+            self.pages.pop_front();
+            if self.pages.is_empty() {
+                self.pages.shrink_to_fit();
+            }
+        }
+        Some(nonce)
+    }
+
+    #[cfg(test)]
+    fn capacity(&self) -> usize {
+        self.pages.iter().map(|page| page.entries.capacity()).sum()
+    }
+}
+
 #[derive(Default)]
 struct RpcNonceCache {
     nonces: HashSet<Uuid>,
-    expirations: VecDeque<(Instant, i64, Uuid)>,
+    expirations: RpcNonceExpirations,
     max_wall_time: i64,
 }
 
@@ -427,15 +499,12 @@ fn publish_nonce_cache_metrics(metrics: Option<RpcNonceCacheMetrics<'_>>) {
 impl RpcNonceCache {
     fn remove_expired(&mut self, now: Instant, wall_time: i64) -> usize {
         let mut removed = 0;
-        while matches!(
-            self.expirations.front(),
-            Some((expires_at, valid_until, _)) if *expires_at < now && *valid_until < wall_time
-        ) {
-            let Some((_, _, nonce)) = self.expirations.pop_front() else {
-                break;
-            };
+        while let Some(nonce) = self.expirations.pop_expired(now, wall_time) {
             self.nonces.remove(&nonce);
             removed += 1;
+        }
+        if removed > 0 && self.nonces.is_empty() {
+            self.nonces.shrink_to_fit();
         }
         removed
     }
@@ -470,7 +539,7 @@ impl RpcNonceCache {
         }
         self.nonces.insert(record.nonce);
         self.expirations
-            .push_back((record.expires_at, record.signed_at.saturating_add(SIGNATURE_VALID_DURATION), record.nonce));
+            .push_back(record.expires_at, record.signed_at.saturating_add(SIGNATURE_VALID_DURATION), record.nonce);
         (
             Ok(()),
             Some(RpcNonceCacheMetrics {
@@ -1590,7 +1659,13 @@ fn verify_tonic_replay_scope_signature(audience: &str, path: &str, headers: &Hea
     if boot_epoch != tonic_rpc_boot_epoch() {
         return Err(std::io::Error::other("RPC boot epoch is stale"));
     }
-    check_and_record_tonic_nonce(nonce, signed_at, path)
+    check_and_record_tonic_nonce(nonce, signed_at, path)?;
+    // A body-bound request also carries a usable v2 signature. Consume both
+    // nonces so stripping the replay-scope headers cannot authorize it again.
+    if content_sha256 != UNSIGNED_PAYLOAD {
+        verify_tonic_rpc_signature_with_strictness(audience, path, headers, true)?;
+    }
+    Ok(())
 }
 
 /// Verify gRPC authentication, preferring v2 without downgrade on malformed v2 metadata.
@@ -2582,6 +2657,43 @@ mod tests {
     }
 
     #[test]
+    fn replay_scope_consumes_the_body_bound_v2_nonce() {
+        ensure_test_rpc_secret();
+        let audience = "node-a:9000";
+        let path = "/node_service.NodeService/RecoverDeleteTransaction";
+        let digest = "a".repeat(64);
+        for v3_first in [true, false] {
+            let mut headers =
+                gen_tonic_signature_headers(audience, "node_service.NodeService", "RecoverDeleteTransaction", Some(&digest))
+                    .expect("body-bound v2 headers should build");
+            let timestamp = headers[TIMESTAMP_HEADER].to_str().expect("timestamp").to_string();
+            headers.extend(
+                gen_tonic_replay_scope_headers(audience, path, &timestamp, &digest, tonic_rpc_boot_epoch())
+                    .expect("replay-scope headers should build"),
+            );
+            let mut downgraded = headers.clone();
+            for header in [
+                RPC_REPLAY_SCOPE_VERSION_HEADER,
+                RPC_REPLAY_SCOPE_SIGNATURE_HEADER,
+                RPC_REPLAY_SCOPE_NONCE_HEADER,
+                RPC_BOOT_EPOCH_HEADER,
+            ] {
+                downgraded.remove(header);
+            }
+            let (first, replay) = if v3_first {
+                (&headers, &downgraded)
+            } else {
+                (&downgraded, &headers)
+            };
+            verify_tonic_rpc_signature_with_policy(audience, path, first, true, false, false)
+                .expect("the first delivery must be accepted");
+            let error = verify_tonic_rpc_signature_with_policy(audience, path, replay, true, false, false)
+                .expect_err("a mutation cannot replay through the other signature generation");
+            assert_eq!(error.to_string(), "RPC request replay detected");
+        }
+    }
+
+    #[test]
     fn replay_scope_rejects_partial_metadata_and_stale_epoch_without_fallback() {
         ensure_test_rpc_secret();
         let path = "/node_service.NodeService/Ping";
@@ -3135,6 +3247,51 @@ mod tests {
             .expect("expired nonce should release capacity");
         assert!(!cache.nonces.contains(&nonce_a));
         assert!(cache.nonces.contains(&nonce_b));
+    }
+
+    #[test]
+    fn nonce_cache_releases_expiration_storage_after_a_burst() {
+        let start = Instant::now();
+        let expiry = start + REPLAY_CACHE_RETENTION;
+        let mut cache = RpcNonceCache::default();
+
+        for nonce in 1..=4_096 {
+            let record = test_nonce_record(Uuid::from_u128(nonce), 100, start, 100, expiry, 4_096);
+            cache.check_and_record(record).0.expect("first use of nonce");
+        }
+        assert!(cache.expirations.capacity() >= 4_096);
+        assert_eq!(cache.remove_expired(expiry, 701), 0);
+        assert_eq!(cache.remove_expired(expiry + Duration::from_nanos(1), 400), 0);
+        assert_eq!(cache.remove_expired(expiry + Duration::from_nanos(1), 701), 4_096);
+        assert!(cache.nonces.is_empty());
+        assert_eq!(cache.nonces.capacity(), 0);
+        assert_eq!(cache.expirations.capacity(), 0, "expired entries must release their expiration storage");
+    }
+
+    #[test]
+    fn nonce_expirations_preserve_exact_deadlines_across_pages() {
+        let expiry = Instant::now();
+        let first = Uuid::from_u128(1);
+        let second = Uuid::from_u128(2);
+        let third = Uuid::from_u128(3);
+        let fourth = Uuid::from_u128(4);
+        let mut queue = super::RpcNonceExpirations::default();
+        let next = expiry + Duration::from_nanos(1);
+        let later = expiry + Duration::from_secs(5);
+
+        queue.push_back(expiry, 501, first);
+        queue.push_back(next, 500, second);
+        queue.push_back(later, 505, third);
+        queue.push_back(later, i64::MAX, fourth);
+        assert_eq!(queue.pages.len(), 3);
+        assert_eq!(queue.pop_expired(next, 501), None);
+        assert_eq!(queue.pop_expired(next, 502), Some(first));
+        assert_eq!(queue.pop_expired(next, 502), None);
+        assert_eq!(queue.pop_expired(later, 502), Some(second));
+        assert_eq!(queue.pages.len(), 2);
+        assert_eq!(queue.pop_expired(later, 506), None);
+        assert_eq!(queue.pop_expired(later + Duration::from_nanos(1), 506), Some(third));
+        assert_eq!(queue.pop_expired(later + Duration::from_nanos(1), i64::MAX), None);
     }
 
     #[test]

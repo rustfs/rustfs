@@ -1636,20 +1636,53 @@ async fn hot_window_with_old_followers(
     let mixed_initial_physical = if mixed { json!(converged_shards(&run)?) } else { Value::Null };
     let scheduler_config = run.assert_default_cadence().await?;
     let baseline = run.quiet_baseline().await?;
-    let leader = run.leader().await?;
-    let leader_pid = run.pid(leader)?;
+    // A leader-lock refresh gap during old-binary replacement can make
+    // `leader()` briefly observe a different node. Poll until the coordinator
+    // is stable before comparing against the measured fleet. A persistent
+    // change to an old-binary node is a genuine election outcome and fails.
+    let (leader, leader_pid) = if mixed {
+        let expected_leader = usize::try_from(
+            mixed_fleet["leader"]
+                .as_u64()
+                .ok_or("mixed fleet omitted its measured leader")?,
+        )?;
+        let expected_pid = mixed_fleet["leader_pid"]
+            .as_u64()
+            .ok_or("mixed fleet omitted its measured leader pid")?;
+        let mut resolved = None;
+        for _ in 0..20 {
+            let candidate = run.leader().await?;
+            let candidate_pid = u64::from(run.pid(candidate)?);
+            if Some(u64::try_from(candidate)?) == mixed_fleet["leader"].as_u64() && Some(candidate_pid) == Some(expected_pid) {
+                resolved = Some((candidate, run.pid(candidate)?));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+        match resolved {
+            Some(pair) => pair,
+            None => {
+                let current = match run.leader().await {
+                    Ok(node) => Some((node, run.pid(node).ok())),
+                    Err(_) => None,
+                };
+                return Err(format!(
+                    "the hot window did not retain its measured new coordinator after stabilization \
+                     (expected node {expected_leader} pid {expected_pid}, observed {current:?})"
+                )
+                .into());
+            }
+        }
+    } else {
+        let leader = run.leader().await?;
+        (leader, run.pid(leader)?)
+    };
     let producer = (leader + 1) % 4;
     let producers = if fault.is_some() {
         vec![producer, (leader + 2) % 4]
     } else {
         vec![producer]
     };
-    if mixed
-        && (mixed_fleet["leader"].as_u64() != Some(u64::try_from(leader)?)
-            || mixed_fleet["leader_pid"].as_u64() != Some(u64::from(leader_pid)))
-    {
-        return Err("the hot window did not retain its measured new coordinator".into());
-    }
     let producer_pid = run.pid(producer)?;
     let producer_address = run.peer_address(producer);
     let [cold_a, cold_b, hot] = run.buckets.clone();

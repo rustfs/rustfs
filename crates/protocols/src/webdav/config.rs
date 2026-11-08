@@ -23,6 +23,10 @@ pub enum WebDavInitError {
     Bind(#[from] std::io::Error),
     #[error("server error: {0}")]
     Server(String),
+    #[error("WebDAV background task failed: {0}")]
+    TaskJoin(#[from] tokio::task::JoinError),
+    #[error("WebDAV connections did not drain before the shutdown deadline")]
+    ShutdownDeadline,
     #[error("invalid WebDAV configuration: {0}")]
     InvalidConfig(String),
     #[error("TLS error: {0}")]
@@ -62,6 +66,12 @@ impl WebDavConfig {
         if self.tls_enabled && self.cert_dir.is_none() {
             return Err(WebDavInitError::InvalidConfig(
                 "TLS is enabled but certificate directory is missing".to_string(),
+            ));
+        }
+
+        if self.ca_file.is_some() && (!self.tls_enabled || self.cert_dir.is_none()) {
+            return Err(WebDavInitError::InvalidConfig(
+                "A client CA requires TLS and a server certificate directory".to_owned(),
             ));
         }
 

@@ -57,6 +57,66 @@ fn scoped_scan_coverage_metadata_preserves_map_compatibility() {
     assert_eq!(decoded.scan_coverage_digest, Some(TEST_PLAN_DIGEST));
 }
 
+#[test]
+fn raw_enumeration_path_indexes_preserve_map_compatibility_and_validation() {
+    #[derive(serde::Deserialize)]
+    struct LegacyInfo {
+        name: String,
+        scan_raw_enumeration_page_index: Option<RawEnumerationPageIndex>,
+    }
+    let index_for = |parent: &str| RawEnumerationPageIndex::new(parent, 8).expect("fixture index");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            scan_progress: Some(DataUsageScanProgress {
+                started_plan: TEST_PLAN_DIGEST,
+                requested_plan: TEST_PLAN_DIGEST,
+            }),
+            scan_identity: Some(DataUsageScanIdentity {
+                version: 1,
+                bucket_incarnation: uuid::Uuid::from_u128(1),
+                set_layout: DataUsageScanPlanDigest([2; 32]),
+                publication_epoch: 1,
+                tier_registry_generation: 0,
+                scan_mode: HealScanMode::Normal,
+            }),
+            source: Some(DataUsageCacheSource::new(0, 0)),
+            scan_raw_enumeration_page_index: Some(index_for("bucket/wide")),
+            scan_raw_enumeration_path_page_indexes: vec![index_for("bucket"), index_for("other-bucket/wide")],
+            ..Default::default()
+        },
+        cache: HashMap::new(),
+    };
+    assert!(cache.validated_raw_enumeration_page_index_for_parent("bucket").is_some());
+    assert!(
+        cache
+            .validated_raw_enumeration_page_index_for_parent("other-bucket/wide")
+            .is_none(),
+        "a saved path index must stay inside its bucket"
+    );
+
+    let encoded = rmp_serde::to_vec(&cache.info).expect("path indexes should remain map encoded");
+    let legacy: LegacyInfo = rmp_serde::from_slice(&encoded).expect("old map readers should ignore the path indexes");
+    assert_eq!(legacy.name, "bucket");
+    assert_eq!(
+        legacy
+            .scan_raw_enumeration_page_index
+            .and_then(|index| index.parent().map(str::to_owned)),
+        Some("bucket/wide".to_string())
+    );
+    let decoded: DataUsageCacheInfo = rmp_serde::from_slice(&encoded).expect("new reader should restore the path indexes");
+    assert_eq!(decoded.scan_raw_enumeration_path_page_indexes.len(), 2);
+
+    cache.info.scan_raw_enumeration_path_page_indexes.clear();
+    let encoded = rmp_serde::to_vec(&cache.info).expect("empty path indexes should encode");
+    assert!(
+        !encoded
+            .windows(b"scan_raw_enumeration_path_page_indexes".len())
+            .any(|window| window == b"scan_raw_enumeration_path_page_indexes"),
+        "the default must stay absent from the map"
+    );
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CachePutRecord {
     object: String,
@@ -3161,6 +3221,200 @@ fn test_reduce_children_of_usize_underflow_saturates() {
     assert!(cache.find("bucket/large").is_some_and(|entry| !entry.compacted));
     assert!(cache.find("bucket/large/a").is_some());
     assert!(cache.find("bucket/large/b").is_some());
+}
+
+#[test]
+fn test_force_compact_flattens_wide_root_above_limit() {
+    // Regression for #8961: a bucket root with fanout between the ordinary
+    // compact limit and the old hardcoded 250_000 ceiling must shrink.
+    // Before the fix, force_compact kept one entry per prefix forever.
+    const PREFIXES: usize = 64;
+    const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES > LIMIT);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+    assert_eq!(cache.find("bucket").map(|entry| entry.children.len()), Some(PREFIXES));
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(root_entry.compacted, "wide root must flatten under force_compact");
+    assert!(root_entry.children.is_empty(), "flattened root must drop per-prefix children");
+    assert_eq!((root_entry.objects, root_entry.size), (PREFIXES, PREFIXES));
+    assert_eq!(cache.cache.len(), 1, "prefix leaves must be released after root flatten");
+}
+
+#[test]
+fn test_force_compact_keeps_narrow_root_children() {
+    const PREFIXES: usize = 4;
+    const LIMIT: usize = 16;
+    const {
+        assert!(PREFIXES < LIMIT);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(
+        &root,
+        &None,
+        &DataUsageEntry {
+            objects: PREFIXES,
+            ..Default::default()
+        },
+    );
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(LIMIT);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted);
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_retains_wide_root_children() {
+    // Interrupted sweeps pass the emergency FORCE ceiling into force_compact so
+    // a resume frontier under a 10k–250k-wide root stays addressable.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
+
+    let root = hash_path("bucket");
+    let mut cache = DataUsageCache {
+        info: DataUsageCacheInfo {
+            name: "bucket".to_string(),
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    cache.force_compact(INTERRUPTED_CEILING);
+
+    let root_entry = cache.find("bucket").expect("root retained");
+    assert!(!root_entry.compacted, "interrupted ceiling must not flatten a 64-wide root");
+    assert_eq!(root_entry.children.len(), PREFIXES);
+    assert_eq!(cache.cache.len(), PREFIXES + 1);
+    // Sanity: the ordinary completion limit would have flattened this layout.
+    let mut completed = cache.clone();
+    completed.force_compact(ORDINARY_LIMIT);
+    assert!(
+        completed.find("bucket").is_some_and(|entry| entry.compacted),
+        "ordinary limit still flattens the same wide root after completion"
+    );
+}
+
+#[test]
+fn test_force_compact_interrupted_ceiling_seals_reloaded_frontier() {
+    // The interrupted call runs before seal_scan_frontier. Flattening at the
+    // ordinary limit deletes the child that frontier names, so a saved cache
+    // reloads with no resume position and the next cycle replays finished prefixes.
+    const PREFIXES: usize = 64;
+    const ORDINARY_LIMIT: usize = 16;
+    const INTERRUPTED_CEILING: usize = 250_000;
+    const {
+        assert!(PREFIXES > ORDINARY_LIMIT);
+        assert!(PREFIXES < INTERRUPTED_CEILING);
+    }
+    let frontier = format!("bucket/prefix-{:04}", PREFIXES / 2);
+
+    let mut cache = DataUsageCache::default();
+    cache.prepare_bucket_checkpoint("bucket", 8, 1, DataUsageCacheSource::new(0, 0), TEST_PLAN_DIGEST, valid_scan_identity());
+    let root = hash_path("bucket");
+    cache.replace_hashed(&root, &None, &DataUsageEntry::default());
+    for index in 0..PREFIXES {
+        let child = hash_path(&format!("bucket/prefix-{index:04}"));
+        cache.replace_hashed(
+            &child,
+            &Some(root.clone()),
+            &DataUsageEntry {
+                objects: 1,
+                size: 1,
+                compacted: true,
+                ..Default::default()
+            },
+        );
+    }
+
+    let mut interrupted = cache.clone();
+    interrupted.force_compact(INTERRUPTED_CEILING);
+    assert!(interrupted.find(&frontier).is_some(), "interrupted ceiling must keep the frontier child");
+    interrupted
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal frontier after interrupted compaction");
+    let encoded = rmp_serde::to_vec(&interrupted).expect("partial cache should encode");
+    let reloaded: DataUsageCache = rmp_serde::from_slice(&encoded).expect("partial cache should reload");
+    assert_eq!(reloaded.validated_scan_frontier(), Some(frontier.as_str()));
+    assert!(reloaded.find(&frontier).is_some(), "reloaded frontier child must stay addressable");
+
+    cache.force_compact(ORDINARY_LIMIT);
+    assert!(cache.find(&frontier).is_none(), "ordinary limit removes the frontier child");
+    cache
+        .seal_scan_frontier(Some(&frontier))
+        .expect("seal after a completed flatten");
+    assert!(
+        cache.validated_scan_frontier().is_none(),
+        "a flattened root cannot seal the removed frontier child"
+    );
 }
 
 #[tokio::test]

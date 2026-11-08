@@ -55,6 +55,20 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 use uuid::Uuid;
 
+/// Join the local disk's actual bootstrap worker for deterministic coverage tests.
+/// Completion may mean legacy fallback after a failed scan; callers must assert
+/// the expected index result separately. Remote disks have no local worker.
+#[cfg(any(test, feature = "test-util"))]
+pub async fn wait_for_multipart_index_bootstrap(disk: &crate::disk::DiskStore) -> Result<()> {
+    match disk.as_ref() {
+        crate::disk::Disk::Local(local) => {
+            local.disk.wait_for_multipart_index_bootstrap().await;
+            Ok(())
+        }
+        crate::disk::Disk::Remote(_) => Err(DiskError::MethodNotAllowed),
+    }
+}
+
 /// Disk health status constants
 const DISK_HEALTH_OK: u32 = 0;
 const DISK_HEALTH_FAULTY: u32 = 1;
@@ -853,6 +867,8 @@ pub(crate) struct DiskHealthMetricEpoch {
     fallback_operation_metrics: StdRwLock<HashMap<&'static str, Arc<DiskOperationMetrics>>>,
     #[cfg(test)]
     multipart_cleanup_observer: std::sync::Mutex<Option<std::sync::Weak<ScopedMultipartCleanupCompletions>>>,
+    #[cfg(test)]
+    operation_timeout_override: std::sync::Mutex<Option<Duration>>,
     /// Caller API operations currently executing through the disk health wrapper.
     api_waiting: AtomicU32,
     /// Operations rejected because the disk was unavailable for the caller.
@@ -880,6 +896,8 @@ impl Default for DiskHealthMetricEpoch {
             fallback_operation_metrics: StdRwLock::new(HashMap::new()),
             #[cfg(test)]
             multipart_cleanup_observer: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            operation_timeout_override: std::sync::Mutex::new(None),
             api_waiting: AtomicU32::new(0),
             total_errors_availability: AtomicU64::new(0),
             total_errors_timeout: AtomicU64::new(0),
@@ -1573,6 +1591,20 @@ impl Default for DiskHealthTracker {
     }
 }
 
+#[cfg(test)]
+#[derive(Debug)]
+pub(crate) struct ScopedDiskOperationTimeout {
+    metrics: Arc<DiskHealthMetricEpoch>,
+    previous: Option<Duration>,
+}
+
+#[cfg(test)]
+impl Drop for ScopedDiskOperationTimeout {
+    fn drop(&mut self) {
+        *self.metrics.operation_timeout_override.lock().expect("test timeout lock") = self.previous;
+    }
+}
+
 /// LocalDiskWrapper wraps a DiskStore with health tracking capabilities.
 /// This is similar to Go's xlStorageDiskIDCheck.
 #[derive(Debug, Clone)]
@@ -1912,6 +1944,23 @@ impl LocalDiskWrapper {
     #[cfg(test)]
     pub fn health_check_enabled_for_test(&self) -> bool {
         self.health_check
+    }
+
+    #[cfg(test)]
+    pub(crate) fn override_operation_timeout_for_test(&self, timeout: Duration) -> ScopedDiskOperationTimeout {
+        assert!(!timeout.is_zero(), "fault injection needs a positive timeout");
+        // The metrics epoch follows this drive across clones and reconnects.
+        // Its scoped override cannot shorten unrelated healthy drives' I/O.
+        let previous = self
+            .metrics
+            .operation_timeout_override
+            .lock()
+            .expect("test timeout lock")
+            .replace(timeout);
+        ScopedDiskOperationTimeout {
+            metrics: Arc::clone(&self.metrics),
+            previous,
+        }
     }
 
     /// Enable health monitoring after disk creation.
@@ -2398,12 +2447,17 @@ impl LocalDiskWrapper {
         .await
     }
 
+    pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        self.disk.has_clean_active_multipart_source(upload_or_part_path, part_path)
+    }
+
     pub(crate) async fn try_publish_prepared_delete_local(
         &self,
         volume: &str,
         object: &str,
         transaction: uuid::Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<Option<(crate::disk::DeleteRecoveryJournal, bool, bool)>> {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
@@ -2411,7 +2465,7 @@ impl LocalDiskWrapper {
             || {
                 Box::pin(async {
                     self.disk
-                        .try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                        .try_publish_prepared_delete_local_with_budget(volume, object, transaction, namespace_owner, work_budget)
                         .await
                 })
             },
@@ -2427,6 +2481,7 @@ impl LocalDiskWrapper {
         transaction: uuid::Uuid,
         journal: &crate::disk::DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<bool> {
         self.track_disk_health_mutation(
             "settle_delete_transaction",
@@ -2434,7 +2489,14 @@ impl LocalDiskWrapper {
             || {
                 Box::pin(async {
                     self.disk
-                        .try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
+                        .try_finish_and_finalize_prepared_delete_local_with_budget(
+                            volume,
+                            object,
+                            transaction,
+                            journal,
+                            namespace_owner,
+                            work_budget,
+                        )
                         .await
                 })
             },
@@ -2634,6 +2696,13 @@ impl LocalDiskWrapper {
             }
             return result;
         }
+        #[cfg(test)]
+        let timeout_duration = self
+            .metrics
+            .operation_timeout_override
+            .lock()
+            .expect("test timeout lock")
+            .map_or(timeout_duration, |injected| timeout_duration.min(injected));
         // Execute the operation with timeout
         let result = tokio::time::timeout(timeout_duration, operation).await;
 
@@ -2682,6 +2751,18 @@ impl LocalDiskWrapper {
 
 #[async_trait::async_trait]
 impl DiskAPI for LocalDiskWrapper {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<crate::disk::multipart_index::MultipartIndexPage> {
+        if self.health.is_faulty() {
+            return Err(DiskError::FaultyDisk);
+        }
+        self.check_disk_stale().await?;
+        self.disk.list_multipart_index_roots(bucket, marker).await
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
         // The local implementation shares this binary's capability. Availability
         // and disk identity remain mutation checks and write-quorum inputs.
@@ -2735,6 +2816,62 @@ impl DiskAPI for LocalDiskWrapper {
         )
         .await
     }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryDiscovery> {
+        self.track_disk_health_with_op(
+            "discover_delete_transactions",
+            || async {
+                self.disk
+                    .discover_delete_transactions_bounded(volume, object, max_entries)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: uuid::Uuid,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryInspection> {
+        self.track_disk_health_with_op(
+            "inspect_delete_transaction",
+            || async {
+                self.disk
+                    .inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            },
+            get_max_timeout_duration(),
+        )
+        .await
+    }
+
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: crate::disk::BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<crate::disk::BoundedDeleteRecoverySettlementReply> {
+        self.track_disk_health_mutation(
+            "settle_delete_transaction",
+            DiskMetricMutation::Delete,
+            || async {
+                self.disk
+                    .settle_delete_transaction_bounded(volume, request, namespace_owner)
+                    .await
+            },
+            crate::disk::get_delete_recovery_timeout()?,
+        )
+        .await
+    }
+
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -3712,7 +3849,11 @@ mod tests {
         assert!(futures::poll!(&mut operation).is_pending());
         time::advance(SLOW_DISK_OPERATION_THRESHOLD - Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut operation).is_pending());
-        assert!(logs.contents().is_empty(), "normal disk latency should not warn");
+        assert!(
+            !logs.contents().contains("disk_operation_slow") && !logs.contents().contains("WARN"),
+            "normal disk latency should not warn: {}",
+            logs.contents()
+        );
         time::advance(Duration::from_millis(1)).await;
         assert!(futures::poll!(&mut operation).is_pending());
         let warning = logs.contents();
@@ -6047,6 +6188,67 @@ mod tests {
         assert_eq!(health.runtime_state(), RuntimeDriveHealthState::Online);
         assert!(!health.is_faulty());
         assert!(health.offline_duration().is_none());
+    }
+
+    #[tokio::test]
+    async fn scoped_operation_timeout_is_per_disk_and_preserves_caller_policy() {
+        let directories = [
+            tempfile::tempdir().expect("faulted drive"),
+            tempfile::tempdir().expect("healthy drive"),
+        ];
+        let mut wrappers = Vec::new();
+        for directory in &directories {
+            let endpoint = Endpoint::try_from(directory.path().to_str().expect("UTF-8 drive path")).expect("drive endpoint");
+            let disk = Arc::new(LocalDisk::new(&endpoint, false).await.expect("local drive"));
+            wrappers.push(LocalDiskWrapper::new(disk, false));
+        }
+        let reconnected = LocalDiskWrapper::new_with_reconnect_state(
+            Arc::clone(&wrappers[0].disk),
+            false,
+            Some(wrappers[0].health_tracker_epoch_for_reconnect()),
+        );
+        let scope = wrappers[0].override_operation_timeout_for_test(Duration::from_secs(1));
+        tokio::time::pause();
+        let operation = || async {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            Ok(())
+        };
+        let (faulted, healthy) = tokio::join!(
+            reconnected.track_disk_health_with_op_and_timeout_action(
+                "read_metadata",
+                operation,
+                Duration::from_secs(3),
+                TimeoutHealthAction::IgnoreFailure,
+            ),
+            wrappers[1].track_disk_health_with_op_and_timeout_action(
+                "read_metadata",
+                operation,
+                Duration::from_secs(3),
+                TimeoutHealthAction::IgnoreFailure,
+            ),
+        );
+        assert_eq!(faulted.expect_err("only the selected drive must time out"), DiskError::Timeout);
+        healthy.expect("healthy drive keeps its caller's deadline");
+        let shorter_started = tokio::time::Instant::now();
+        let shorter = wrappers[0]
+            .track_disk_health_with_op_and_timeout_action(
+                "read_metadata",
+                operation,
+                Duration::from_millis(500),
+                TimeoutHealthAction::IgnoreFailure,
+            )
+            .await;
+        assert_eq!(shorter.expect_err("fault injection cannot extend a caller deadline"), DiskError::Timeout);
+        assert!(shorter_started.elapsed() < Duration::from_secs(1));
+        wrappers[0]
+            .track_disk_health_with_op("read_metadata", operation, Duration::ZERO)
+            .await
+            .expect("explicit unbounded physical ownership cannot acquire a test deadline");
+        drop(scope);
+        reconnected
+            .track_disk_health_with_op("read_metadata", operation, Duration::from_secs(3))
+            .await
+            .expect("dropping the scope restores reconnected callers' deadlines");
     }
 
     #[tokio::test]

@@ -42,6 +42,7 @@ serde_urlencoded.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }
 base64-simd.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 # The signer is generic over the body; its tests sign requests carrying the

@@ -16,6 +16,7 @@
 
 use super::veeam_sosapi;
 use super::*;
+use crate::app::storage_api::object_usecase::access::replication_proxy_allowed;
 use crate::app::storage_api::object_usecase::object_cache::{
     GetObjectReadCondition, GetObjectReadMetadata, evaluate_read_preconditions, has_read_preconditions,
     with_get_object_read_condition,
@@ -669,45 +670,243 @@ impl GetObjectBodyLifecycle {
     }
 }
 
-pin_project! {
-    // Keep the disk-read admission permit tied to the response body. This is
-    // intentionally conservative backpressure: a streaming GET should occupy a
-    // read slot until the client drains or drops the body.
-    struct DiskReadPermitReader<R> {
-        #[pin]
-        inner: R,
-        disk_permit: Option<GetObjectDiskPermit>,
-    }
+// Bound downstream inactivity without imposing a fixed limit on large downloads.
+// The floor also caps the watchdog's timer arithmetic.
+const GET_DISK_READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+/// Seconds a GET body may make no progress before its disk-read admission is
+/// released and the stream fails; a paused client within this window resumes
+/// normally. Never below the floor above or twice the disk read timeout.
+const ENV_GET_DISK_READ_IDLE_TIMEOUT_SECS: &str = "RUSTFS_GET_DISK_READ_IDLE_TIMEOUT_SECS";
+const DEFAULT_GET_DISK_READ_IDLE_TIMEOUT_SECS: u64 = 120;
+
+fn configured_get_disk_read_idle_timeout() -> Duration {
+    Duration::from_secs(rustfs_utils::get_env_u64(
+        ENV_GET_DISK_READ_IDLE_TIMEOUT_SECS,
+        DEFAULT_GET_DISK_READ_IDLE_TIMEOUT_SECS,
+    ))
+    .max(GET_DISK_READ_IDLE_TIMEOUT)
+}
+const GET_DISK_READ_MIN_WINDOW_BYTES: usize = 64 * 1024;
+
+struct DiskReadLease<R> {
+    reader: Option<Pin<Box<R>>>,
+    permit: Option<GetObjectDiskPermit>,
+    pending: bool,
+    pending_capacity: usize,
+    closed: bool,
+    expired: bool,
+    abandoned: tokio_util::sync::CancellationToken,
+    last_progress: tokio::time::Instant,
+    window_start: tokio::time::Instant,
+    window_bytes: usize,
+    idle_timeout: Duration,
+    progress_window: Duration,
+    waker: Option<std::task::Waker>,
 }
 
-impl<R> DiskReadPermitReader<R> {
-    fn new(inner: R, disk_permit: GetObjectDiskPermit) -> Self {
-        Self {
-            inner,
-            disk_permit: Some(disk_permit),
+impl<R> DiskReadLease<R> {
+    fn check_deadline(&mut self, now: tokio::time::Instant) {
+        if now.saturating_duration_since(self.last_progress) >= self.idle_timeout {
+            self.expired = true;
+        }
+        if now.saturating_duration_since(self.window_start) >= self.progress_window {
+            if self.window_bytes < GET_DISK_READ_MIN_WINDOW_BYTES {
+                self.expired = true;
+            } else {
+                self.window_start = now;
+                self.window_bytes = 0;
+            }
         }
     }
+
+    fn next_check_delay(&self, now: tokio::time::Instant) -> Duration {
+        self.idle_timeout
+            .saturating_sub(now.saturating_duration_since(self.last_progress))
+            .min(
+                self.progress_window
+                    .saturating_sub(now.saturating_duration_since(self.window_start)),
+            )
+            // Keep timer arithmetic representable even for extreme operator overrides.
+            .min(GET_DISK_READ_IDLE_TIMEOUT)
+    }
 }
 
-impl<R> AsyncRead for DiskReadPermitReader<R>
-where
-    R: AsyncRead,
-{
+struct DiskReadPermitReader<R> {
+    lease: Arc<Mutex<DiskReadLease<R>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+/// Out-of-band control over a [`DiskReadPermitReader`]'s lease, for the
+/// owner that decides a submitted read is stalled rather than merely unread.
+struct DiskReadLeaseControl<R> {
+    lease: Arc<Mutex<DiskReadLease<R>>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl<R> DiskReadLeaseControl<R> {
+    /// Release the disk-read permit now, even with a read in flight. Dropping
+    /// the reader alone keeps the permit until that read completes (a cancelled
+    /// client must not widen disk concurrency); a deadline that classified the
+    /// read as stalled has already given up on its result, so the slot goes
+    /// back to the pool and the read is dropped with the reader.
+    fn abandon(&self) {
+        let waker = {
+            let mut state = self.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.closed = true;
+            state.abandoned.cancel();
+            state.pending = false;
+            state.reader.take();
+            state.permit.take();
+            state.waker.take()
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        self.changed.notify_one();
+    }
+}
+
+impl<R: AsyncRead + Send + 'static> DiskReadPermitReader<R> {
+    fn new(inner: R, disk_permit: GetObjectDiskPermit) -> Self {
+        // Leave the configured upstream stall/reopen window ahead of this
+        // downstream lease, including the high-latency drive profile.
+        let idle_timeout = get_object_disk_read_timeout()
+            .saturating_mul(2)
+            .max(configured_get_disk_read_idle_timeout());
+        Self::with_idle_timeout(inner, disk_permit, idle_timeout)
+    }
+
+    fn lease_control(&self) -> DiskReadLeaseControl<R> {
+        DiskReadLeaseControl {
+            lease: self.lease.clone(),
+            changed: self.changed.clone(),
+        }
+    }
+
+    fn with_idle_timeout(inner: R, disk_permit: GetObjectDiskPermit, idle_timeout: Duration) -> Self {
+        let now = tokio::time::Instant::now();
+        let lease = Arc::new(Mutex::new(DiskReadLease {
+            reader: Some(Box::pin(inner)),
+            permit: Some(disk_permit),
+            pending: false,
+            pending_capacity: 0,
+            closed: false,
+            expired: false,
+            abandoned: tokio_util::sync::CancellationToken::new(),
+            last_progress: now,
+            window_start: now,
+            window_bytes: 0,
+            idle_timeout,
+            progress_window: idle_timeout.saturating_mul(2),
+            waker: None,
+        }));
+        let changed = Arc::new(tokio::sync::Notify::new());
+        tokio::spawn(Self::watch(lease.clone(), changed.clone()));
+        Self { lease, changed }
+    }
+
+    async fn watch(lease: Arc<Mutex<DiskReadLease<R>>>, changed: Arc<tokio::sync::Notify>) {
+        let (reader, permit, pending_capacity, waker, abandoned) = loop {
+            let next_check = {
+                let mut state = lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                if !state.closed {
+                    state.check_deadline(tokio::time::Instant::now());
+                }
+                if state.closed || state.expired {
+                    state.closed = true;
+                    break (
+                        state.reader.take(),
+                        state.permit.take(),
+                        state.pending.then_some(state.pending_capacity),
+                        state.waker.take(),
+                        state.abandoned.clone(),
+                    );
+                }
+                state.next_check_delay(tokio::time::Instant::now())
+            };
+            tokio::select! {
+                _ = tokio::time::sleep(next_check) => {},
+                _ = changed.notified() => {},
+            }
+        };
+        if let Some(waker) = waker {
+            waker.wake();
+        }
+        if let Some(mut reader) = reader {
+            if let Some(capacity) = pending_capacity {
+                // A cancelled response must not release disk admission while a
+                // submitted read is still running. Complete just that pending
+                // read, discard its result, and never start another read.
+                let mut scratch = vec![0_u8; capacity.min(64 * 1024)];
+                let mut buffer = ReadBuf::new(&mut scratch);
+                // An explicit stalled-read timeout can retire admission even
+                // after this task has taken ownership of the pending read.
+                tokio::select! {
+                    biased;
+                    _ = abandoned.cancelled() => {},
+                    _ = std::future::poll_fn(|cx| reader.as_mut().poll_read(cx, &mut buffer)) => {},
+                }
+            }
+            drop(reader);
+        }
+        drop(permit);
+    }
+}
+
+impl<R: AsyncRead> AsyncRead for DiskReadPermitReader<R> {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
-        let this = self.project();
-        let had_capacity = buf.remaining() > 0;
+        if buf.remaining() == 0 {
+            return Poll::Ready(Ok(()));
+        }
+        let mut state = self.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !state.closed {
+            state.check_deadline(tokio::time::Instant::now());
+        }
+        if state.expired {
+            self.changed.notify_one();
+            return Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "GetObject disk-read admission expired",
+            )));
+        }
+        if state.closed {
+            return Poll::Ready(Ok(()));
+        }
+        state.waker = Some(cx.waker().clone());
         let filled_before = buf.filled().len();
-        let poll = this.inner.poll_read(cx, buf);
-        // EOF: no more disk reads can happen through this stream, so release
-        // the permit instead of holding it until the client drops the body.
-        if had_capacity
-            && matches!(poll, Poll::Ready(Ok(())))
-            && buf.filled().len() == filled_before
-            && let Some(mut disk_permit) = this.disk_permit.take()
-        {
-            disk_permit.release();
+        state.pending_capacity = buf.remaining();
+        let poll = match state.reader.as_mut() {
+            Some(reader) => reader.as_mut().poll_read(cx, buf),
+            None => return Poll::Ready(Ok(())),
+        };
+        state.pending = poll.is_pending();
+        if let Poll::Ready(result) = &poll {
+            let progress = buf.filled().len() - filled_before;
+            if result.is_err() || progress == 0 {
+                state.closed = true;
+                // The read completed, so normal EOF/error can release inline.
+                state.reader.take();
+                state.permit.take();
+                self.changed.notify_one();
+            } else {
+                state.last_progress = tokio::time::Instant::now();
+                state.window_bytes = state.window_bytes.saturating_add(progress);
+            }
         }
         poll
+    }
+}
+
+impl<R> Drop for DiskReadPermitReader<R> {
+    fn drop(&mut self) {
+        let mut state = self.lease.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.closed = true;
+        if !state.pending {
+            state.reader.take();
+            state.permit.take();
+        }
+        // The watchdog takes ownership of an outstanding read on cancellation.
+        self.changed.notify_one();
     }
 }
 
@@ -1094,10 +1293,20 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
         }
     };
     producer.mark_reader_started();
+    let GetObjectReader {
+        stream, buffered_body, ..
+    } = reader;
+    // Wrap outside the materialize future so a deadline can abandon the disk
+    // admission of a read it has classified as stalled (see `DiskReadLeaseControl`).
+    let (stream, lease_control) = match producer_io.disk_permit {
+        Some(permit) if buffered_body.is_none() => {
+            let reader = DiskReadPermitReader::new(stream, permit);
+            let control = reader.lease_control();
+            (wrap_reader(reader), Some(control))
+        }
+        _ => (wrap_reader(stream), None),
+    };
     let materialize = async move {
-        let GetObjectReader {
-            stream, buffered_body, ..
-        } = reader;
         let body = if let Some(body) = buffered_body {
             if body.len() == expected {
                 body
@@ -1108,11 +1317,6 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
                 )));
             }
         } else {
-            let stream = if let Some(permit) = producer_io.disk_permit {
-                wrap_reader(DiskReadPermitReader::new(stream, permit))
-            } else {
-                stream
-            };
             Bytes::from(
                 strict_materialize_object_body(stream, expected, GET_OBJECT_STAGE_BODY_CACHE_MATERIALIZE_READ)
                     .await
@@ -1127,6 +1331,11 @@ async fn start_cold_fill_producer<AcquireIo, AcquireIoFuture, OpenReader, OpenRe
                 result.unwrap_or(Err(StorageError::Timeout))
             }
     };
+    if matches!(materialized, Err(StorageError::Timeout))
+        && let Some(control) = &lease_control
+    {
+        control.abandon();
+    }
     let result = match materialized {
         Ok((body, reservation)) => {
             if cancellation.is_cancelled() {
@@ -2506,9 +2715,9 @@ impl DefaultObjectUsecase {
     ) -> S3Result<Option<GetObjectDiskPermit>> {
         let permit_wait_start = std::time::Instant::now();
         let permit_wait_timeout = Self::disk_permit_wait_timeout();
-        // Permits are held for the whole body transfer, so slow clients can pin
-        // all of them while disks are idle. Bound the wait on the primary pool
-        // and, on timeout, admit from a bounded degraded overflow lane. Total
+        // Active readers own admission until EOF, drop, or watchdog retirement.
+        // Bound the wait on the primary pool and, on timeout, admit from a
+        // bounded degraded overflow lane. Total
         // concurrent disk-active GETs are hard-capped at
         // `primary_cap + degraded_cap`; once that cap is reached we reject with
         // `SlowDown` instead of reading without any admission token. Never
@@ -4328,6 +4537,7 @@ impl DefaultObjectUsecase {
         // their semantics) may still be served by a remote copy.
         if let Err(err) = &prepared_read
             && matches!(*err.code(), S3ErrorCode::NoSuchKey | S3ErrorCode::NoSuchVersion)
+            && replication_proxy_allowed(&req.extensions)
         {
             // Active-active replication lag window: proxy the GET to a
             // replication target (backlog#1675 P1-5).
@@ -4905,20 +5115,36 @@ fn odm_get_output(head: &SourceHead, content_length: i64, content_range: Option<
     }
 }
 
-/// Feeds the tee primary to the client through a channel: the primary owns a
-/// `!Sync` boxed source while the response body must be `Sync`. Dropping the
-/// body ends the pump, which drops the primary and hands the remaining
-/// source bytes to the tee's drain task (`drain_on_primary_drop`).
-fn odm_inline_client_body(primary: TeePrimary) -> StreamingBlob {
+// These downstream budgets are independent of source idle progress. In
+// particular, reading a little before each idle timeout cannot retain a pull
+// slot indefinitely. Timeout drops the primary and lets the tee drain to disk.
+const ODM_INLINE_CLIENT_IDLE_BUDGET: Duration = Duration::from_secs(30);
+const ODM_INLINE_CLIENT_TOTAL_BUDGET: Duration = Duration::from_secs(120);
+/// An honest client is granted at least this rate before the total budget ends
+/// its inline body; the flat floor above still applies to small objects.
+const ODM_INLINE_CLIENT_MIN_BYTES_PER_SEC: u64 = 64 * 1024;
+
+fn odm_inline_client_total_budget(size_bytes: u64) -> Duration {
+    ODM_INLINE_CLIENT_TOTAL_BUDGET.max(Duration::from_secs(size_bytes.div_ceil(ODM_INLINE_CLIENT_MIN_BYTES_PER_SEC)))
+}
+
+/// Feeds the tee primary through a channel because its source is `!Sync`.
+/// Dropping the body or exhausting a downstream budget drops the primary and
+/// hands remaining bytes to the tee's drain task (`drain_on_primary_drop`).
+fn odm_inline_client_body(primary: TeePrimary, idle_budget: Duration, total_budget: Duration) -> StreamingBlob {
     let (tx, rx) = tokio::sync::mpsc::channel::<io::Result<Bytes>>(ODM_INLINE_CLIENT_CHANNEL_CHUNKS);
     spawn_traced(async move {
-        let mut chunks = tokio_util::io::ReaderStream::with_capacity(primary, ODM_SOURCE_BODY_CHUNK_BYTES);
-        while let Some(chunk) = chunks.next().await {
-            let failed = chunk.is_err();
-            if tx.send(chunk).await.is_err() || failed {
-                break;
+        let pump = async move {
+            let mut chunks = tokio_util::io::ReaderStream::with_capacity(primary, ODM_SOURCE_BODY_CHUNK_BYTES);
+            while let Some(chunk) = chunks.next().await {
+                let failed = chunk.is_err();
+                if !matches!(tokio::time::timeout(idle_budget, tx.send(chunk)).await, Ok(Ok(()))) || failed {
+                    break;
+                }
             }
-        }
+        };
+        // This task is scheduled independently of response body polling.
+        let _ = tokio::time::timeout(total_budget, pump).await;
     });
     StreamingBlob::wrap(ReceiverStream::new(rx))
 }
@@ -5039,7 +5265,12 @@ async fn odm_get_inline<S: OdmGetSource>(
     let (guarded, idle) = idle_guarded_body(source_body, Duration::from_millis(policy.source_timeout.idle_ms));
     let (primary, secondary) =
         tee_reader_with_options(Box::pin(tokio_util::io::StreamReader::new(guarded)), ODM_INLINE_TEE_BUFFER_BYTES, options);
-    let output = Box::new(odm_get_output(&head, content_length, content_range, odm_inline_client_body(primary)));
+    let output = Box::new(odm_get_output(
+        &head,
+        content_length,
+        content_range,
+        odm_inline_client_body(primary, ODM_INLINE_CLIENT_IDLE_BUDGET, odm_inline_client_total_budget(head.size)),
+    ));
     let commit_state = Arc::clone(state);
     let commit_key = key.to_string();
     spawn_background_with_context(request_context, async move {
@@ -5087,11 +5318,12 @@ pub(super) async fn odm_get_from_source<S: OdmGetSource>(
     if head.size > policy.inline_max_bytes {
         return odm_get_passthrough(state, source, headers, key, None, Some(PullReason::LargeObject)).await;
     }
-    let slot = match state.acquire_pull_slot(key).await {
-        Ok(slot) => slot,
-        // The bucket state was torn down under this request: serve it
-        // without queueing anything on the old state.
-        Err(_) => return odm_get_passthrough(state, source, headers, key, None, None).await,
+    let permit_budget = Duration::from_millis(policy.source_timeout.first_byte_ms).min(Duration::from_secs(1));
+    let slot = match tokio::time::timeout(permit_budget, state.acquire_pull_slot(key)).await {
+        Ok(Ok(slot)) => slot,
+        // A saturated or retired bucket state must not hold the response
+        // indefinitely. Dropping acquisition removes its singleflight entry.
+        Ok(Err(_)) | Err(_) => return odm_get_passthrough(state, source, headers, key, None, None).await,
     };
     match slot {
         PullSlot::Leader(leader) => odm_get_inline(state, source, headers, key, leader, request_context).await,
@@ -5409,6 +5641,85 @@ mod on_demand_migration_tests {
             ..Default::default()
         };
         assert!(!odm_get_may_consult_source(&proxy_marked, None));
+    }
+
+    #[tokio::test]
+    async fn odm_get_permit_wait_is_bounded_and_removes_the_abandoned_slot() {
+        let mut policy = PolicyConfig {
+            max_concurrent_pulls: 1,
+            ..Default::default()
+        };
+        policy.source_timeout.first_byte_ms = 100;
+        let rt = runtime("permit-budget", policy).await;
+        let state = rt.state("permit-budget");
+        let held = state.acquire_pull_slot("held").await.expect("occupy the only permit");
+        let data = payload(1024);
+        let source = ScriptedSource::for_object(&data);
+        let reply = tokio::time::timeout(
+            Duration::from_secs(2),
+            odm_get_from_source(&state, &source, &HeaderMap::new(), KEY, None, None),
+        )
+        .await
+        .expect("saturated inline permits must fall back to passthrough");
+        let (mut output, backfill) = served(reply);
+        assert_eq!(backfill, None);
+        assert_eq!(collect_body(&mut output).await, data);
+        assert_eq!(state.inflight_keys(), 1, "timed-out waiter must not strand a singleflight entry");
+        assert!(rt.write_back.puts().is_empty(), "fallback must not start another inline pull");
+        drop(held);
+        assert_eq!(state.inflight_keys(), 0);
+    }
+
+    #[tokio::test]
+    async fn odm_client_backpressure_and_trickle_cannot_retain_a_pull_slot() {
+        for trickle in [false, true] {
+            let rt = runtime("client-budget", PolicyConfig::default()).await;
+            let state = rt.state("client-budget");
+            let leader = match state.acquire_pull_slot(KEY).await.expect("leader") {
+                PullSlot::Leader(leader) => leader,
+                PullSlot::Follower(_) => panic!("fresh key must lead"),
+            };
+            let data = payload(4 * 1024 * 1024);
+            let head = source_head(&data);
+            let source: SourceBody = Box::pin(futures::stream::iter([Ok(Bytes::from(data.clone()))]));
+            let (guarded, idle) = idle_guarded_body(source, Duration::from_secs(5));
+            let (primary, secondary) = tee_reader_with_options(
+                Box::pin(tokio_util::io::StreamReader::new(guarded)),
+                ODM_INLINE_TEE_BUFFER_BYTES,
+                TeeOptions {
+                    drain_on_primary_drop: true,
+                    max_drain_bytes: data.len(),
+                },
+            );
+            let mut client = odm_inline_client_body(primary, Duration::from_millis(100), Duration::from_millis(250));
+            let commit_state = Arc::clone(&state);
+            let commit = tokio::spawn(async move {
+                let result = commit_inline(&commit_state, KEY, head, None, Box::pin(secondary.into_stream()), &idle).await;
+                leader.complete(result.map(|outcome| PullOutcome {
+                    etag: outcome.etag,
+                    size: outcome.size,
+                }));
+            });
+            let received = if trickle {
+                let mut received = 0;
+                // Progress is faster than the idle budget but cannot reset the absolute budget.
+                while let Some(chunk) = client.next().await {
+                    received += chunk.expect("client chunk").len();
+                    tokio::time::sleep(Duration::from_millis(40)).await;
+                }
+                received
+            } else {
+                0
+            };
+            tokio::time::timeout(Duration::from_secs(3), commit)
+                .await
+                .expect("client pacing cannot stall write-back")
+                .expect("write-back task");
+            assert_eq!(state.inflight_keys(), 0, "permit released while the unread response is still alive");
+            assert_eq!(rt.write_back.puts()[0].1, data, "drain must preserve the entire source object");
+            assert!(received < data.len(), "timed-out response must not pretend to deliver the full object");
+            drop(client);
+        }
     }
 
     #[tokio::test]
@@ -6789,6 +7100,146 @@ mod tests {
             rustfs_object_data_cache::ObjectDataCacheLookup::Miss
         ));
         producer_task.await.expect("producer task must join");
+        assert!(adapter.reserve_body(&plan).is_some(), "timeout must release the body reservation");
+        let ColdFillRole::Produce(successor) = coordinator.join(key) else {
+            panic!("timeout must release the session for a successor");
+        };
+        drop(successor);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cold_fill_watchdog_timeout_releases_pending_read_admission() {
+        let adapter = Arc::new(
+            ObjectDataCacheAdapter::new(rustfs_object_data_cache::ObjectDataCacheConfig {
+                mode: rustfs_object_data_cache::ObjectDataCacheMode::FillMaterializeEnabled,
+                max_bytes: 2 * 1024 * 1024,
+                max_memory_percent: 0,
+                max_entry_bytes: 1024 * 1024,
+                min_free_memory_percent: 0,
+                fill_concurrency_max: 1,
+                ..rustfs_object_data_cache::ObjectDataCacheConfig::default()
+            })
+            .expect("timeout cache config must be valid"),
+        );
+        let plan = adapter.plan_get(rustfs_object_data_cache::ObjectDataCacheGetRequest {
+            bucket: "timeout-bucket",
+            object: "timeout-object",
+            version_id: None,
+            etag: "timeout-etag",
+            size: 768 * 1024,
+            data_dir_u128: Some(1),
+            mod_time_unix_nanos: 1,
+            body_variant: rustfs_object_data_cache::ObjectDataCacheBodyVariant::FullObjectPlainV1,
+        });
+        let key = plan.key().cloned().expect("timeout body must be cacheable");
+        let coordinator = adapter.cold_fill_coordinator();
+        let ColdFillRole::Produce(mut producer) = coordinator.join(key.clone()) else {
+            panic!("first timeout request must produce");
+        };
+        let leader = producer.waiter();
+        let reservation = adapter.reserve_body(&plan);
+        let disk_permits = Arc::new(tokio::sync::Semaphore::new(1));
+        let disk_gate = Arc::clone(&disk_permits);
+        let readers = Arc::new(AtomicUsize::new(0));
+        let reader_count = Arc::clone(&readers);
+        // Use the real asynchronous stream contract: the submitted read stays
+        // pending until the peer is explicitly closed after the assertion.
+        struct ObservedPendingRead {
+            inner: tokio::io::DuplexStream,
+            started: Option<tokio::sync::oneshot::Sender<()>>,
+        }
+        impl AsyncRead for ObservedPendingRead {
+            fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+                if let Some(started) = self.started.take() {
+                    let _ = started.send(());
+                }
+                Pin::new(&mut self.inner).poll_read(cx, buffer)
+            }
+        }
+        let (pending_stream, pending_peer) = tokio::io::duplex(64);
+        let (first_poll, first_poll_ready) = tokio::sync::oneshot::channel();
+        let pending_stream = ObservedPendingRead {
+            inner: pending_stream,
+            started: Some(first_poll),
+        };
+        let manager = get_concurrency_manager();
+        let producer_task = tokio::spawn(start_cold_fill_producer(
+            producer,
+            reservation,
+            move || async move {
+                let permit = disk_gate
+                    .acquire_owned()
+                    .await
+                    .map_err(|_| ColdFillError::DiskAdmissionClosed)?;
+                let mut io = DefaultObjectUsecase::get_object_io_planning_without_disk(manager);
+                io.disk_permit = Some(permit.into());
+                Ok(io)
+            },
+            move || async move {
+                reader_count.fetch_add(1, AtomicOrdering::Relaxed);
+                Ok(GetObjectReader {
+                    stream: Box::new(pending_stream),
+                    object_info: ObjectInfo {
+                        size: 768 * 1024,
+                        actual_size: 768 * 1024,
+                        ..Default::default()
+                    },
+                    buffered_body: None,
+                    body_source: GetObjectBodySource::HookMissed,
+                })
+            },
+            ColdFillProducerExecution {
+                expected: 768 * 1024,
+                deadline: None,
+                adapter: Arc::clone(&adapter),
+                engine_plan: plan.clone(),
+            },
+        ));
+        first_poll_ready.await.expect("producer must submit its first read");
+        let ColdFillRole::Wait(follower) = coordinator.join(key.clone()) else {
+            panic!("second timeout request must follow");
+        };
+
+        tokio::time::advance(
+            get_object_disk_read_timeout()
+                .saturating_mul(2)
+                .max(configured_get_disk_read_idle_timeout())
+                + Duration::from_secs(1),
+        )
+        .await;
+        let (leader_result, follower_result) =
+            tokio::time::timeout(Duration::from_secs(2), async { tokio::join!(leader.wait(), follower.wait()) })
+                .await
+                .expect("typed timeout must wake all waiters");
+        assert!(matches!(
+            leader_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert!(matches!(
+            follower_result,
+            ColdFillWaitOutcome::Ready(Err(ColdFillError::Storage(StorageError::Timeout)))
+        ));
+        assert_eq!(readers.load(AtomicOrdering::Relaxed), 1);
+        producer_task.await.expect("producer task must join");
+        let replacement = tokio::time::timeout(Duration::from_secs(1), disk_permits.clone().acquire_owned()).await;
+        let released_before_pending_io = matches!(&replacement, Ok(Ok(_)));
+        drop(replacement);
+        drop(pending_peer);
+        let replacement_after_io = tokio::time::timeout(Duration::from_secs(1), disk_permits.clone().acquire_owned())
+            .await
+            .expect("control: completing pending I/O releases admission")
+            .expect("gate open");
+        drop(replacement_after_io);
+        assert!(
+            released_before_pending_io,
+            "a classified stalled read must return admission before pending I/O completes"
+        );
+        assert_eq!(coordinator.global_waiter_count_for_test(), 0);
+        assert_eq!(coordinator.active_session_count_for_test(), 0);
+        assert!(matches!(
+            adapter.lookup_body(&plan).await,
+            rustfs_object_data_cache::ObjectDataCacheLookup::Miss
+        ));
         assert!(adapter.reserve_body(&plan).is_some(), "timeout must release the body reservation");
         let ColdFillRole::Produce(successor) = coordinator.join(key) else {
             panic!("timeout must release the session for a successor");
@@ -9859,6 +10310,258 @@ mod tests {
         drop(stream);
 
         assert_eq!(GetObjectGuard::concurrent_count(), initial);
+    }
+
+    struct AdmissionReadProbe {
+        reads: Arc<AtomicUsize>,
+    }
+
+    impl AsyncRead for AdmissionReadProbe {
+        fn poll_read(self: Pin<&mut Self>, _cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            self.reads.fetch_add(1, AtomicOrdering::SeqCst);
+            buffer.initialize_unfilled().fill(42);
+            buffer.advance(buffer.remaining());
+            Poll::Ready(Ok(()))
+        }
+    }
+
+    struct PendingAdmissionRead {
+        finish: tokio::sync::oneshot::Receiver<()>,
+        started: Arc<AtomicUsize>,
+        completed: Arc<AtomicUsize>,
+        submitted: bool,
+    }
+
+    impl AsyncRead for PendingAdmissionRead {
+        fn poll_read(mut self: Pin<&mut Self>, cx: &mut Context<'_>, buffer: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+            if !self.submitted {
+                self.submitted = true;
+                self.started.fetch_add(1, AtomicOrdering::SeqCst);
+            }
+            match std::future::Future::poll(Pin::new(&mut self.finish), cx) {
+                Poll::Ready(_) => {
+                    self.completed.fetch_add(1, AtomicOrdering::SeqCst);
+                    buffer.put_slice(b"x");
+                    Poll::Ready(Ok(()))
+                }
+                Poll::Pending => Poll::Pending,
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_read_admission_expires_unpolled_and_cannot_resume_without_permit() {
+        use tokio::io::AsyncReadExt;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut reader = DiskReadPermitReader::with_idle_timeout(
+            AdmissionReadProbe { reads: reads.clone() },
+            permit.into(),
+            GET_DISK_READ_IDLE_TIMEOUT,
+        );
+        tokio::time::advance(GET_DISK_READ_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let replacement = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
+            .await
+            .expect("unpolled body must release admission independently")
+            .unwrap();
+        let mut buffer = [0_u8; 1];
+        for _ in 0..2 {
+            assert_eq!(reader.read(&mut buffer).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        }
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 0, "expired readers must never touch disk");
+        assert_eq!(semaphore.available_permits(), 0, "replacement still owns the only slot");
+        let reopens = Arc::new(AtomicUsize::new(0));
+        let count = reopens.clone();
+        let reopen: GetObjectReopen<DiskReadPermitReader<AdmissionReadProbe>> = Box::new(move |_| {
+            count.fetch_add(1, AtomicOrdering::SeqCst);
+            Box::pin(async { Err(GetObjectResumeFailure::Fatal) })
+        });
+        let resume = GetObjectResumeControl::new(
+            reopen,
+            RetryTimer::new(
+                GET_OBJECT_RESUME_MAX_ATTEMPTS,
+                Duration::from_millis(1),
+                Duration::from_millis(2),
+                rustfs_utils::retry::NO_JITTER,
+                0,
+            ),
+        );
+        let mut streaming = GetObjectStreamingReader::new(
+            reader,
+            "bucket",
+            "object",
+            "expired-admission",
+            None,
+            1024,
+            Duration::from_secs(1),
+            GetObjectBodyLifecycle::disabled(),
+            Some(resume),
+        );
+        assert_eq!(streaming.read(&mut buffer).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(
+            reopens.load(AtomicOrdering::SeqCst),
+            0,
+            "expired admission is terminal for mid-stream resume"
+        );
+        drop(streaming);
+        drop(replacement);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_read_admission_rejects_trickle_but_allows_long_progressing_downloads() {
+        use tokio::io::AsyncReadExt;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut reader = DiskReadPermitReader::with_idle_timeout(
+            AdmissionReadProbe { reads: reads.clone() },
+            permit.into(),
+            GET_DISK_READ_IDLE_TIMEOUT,
+        );
+        let mut byte = [0_u8; 1];
+        for _ in 0..6 {
+            reader.read_exact(&mut byte).await.unwrap();
+            tokio::time::advance(Duration::from_secs(10)).await;
+        }
+        let permit = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
+            .await
+            .expect("small progress cannot renew admission forever")
+            .unwrap();
+        assert_eq!(reader.read(&mut byte).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 6);
+        drop(reader);
+        let mut reader = DiskReadPermitReader::with_idle_timeout(
+            AdmissionReadProbe { reads: reads.clone() },
+            permit.into(),
+            GET_DISK_READ_IDLE_TIMEOUT,
+        );
+        let mut buffer = [0_u8; 16 * 1024];
+        // More than 30 minutes is valid: deadlines constrain inactivity and
+        // rolling progress, not the total size or lifetime of a download.
+        for _ in 0..128 {
+            reader.read_exact(&mut buffer).await.unwrap();
+            tokio::time::advance(Duration::from_secs(15)).await;
+        }
+        assert_eq!(semaphore.available_permits(), 0);
+        drop(reader);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_read_admission_retains_pending_io_until_completion_after_expiry_or_drop() {
+        use tokio::io::AsyncReadExt;
+        for cancel in [false, true] {
+            let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+            let permit = semaphore.clone().acquire_owned().await.unwrap();
+            let (finish, receiver) = tokio::sync::oneshot::channel();
+            let started = Arc::new(AtomicUsize::new(0));
+            let completed = Arc::new(AtomicUsize::new(0));
+            let mut reader = DiskReadPermitReader::with_idle_timeout(
+                PendingAdmissionRead {
+                    finish: receiver,
+                    started: started.clone(),
+                    completed: completed.clone(),
+                    submitted: false,
+                },
+                permit.into(),
+                GET_DISK_READ_IDLE_TIMEOUT,
+            );
+            let mut buffer = [0_u8; 1];
+            let mut reading = Box::pin(reader.read(&mut buffer));
+            assert!(futures::poll!(&mut reading).is_pending());
+            drop(reading);
+            assert_eq!(started.load(AtomicOrdering::SeqCst), 1);
+            if cancel {
+                drop(reader);
+            } else {
+                tokio::time::advance(GET_DISK_READ_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+                assert_eq!(reader.read(&mut buffer).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+                drop(reader);
+            }
+            tokio::task::yield_now().await;
+            assert_eq!(semaphore.available_permits(), 0, "pending disk IO still consumes admission");
+            assert_eq!(completed.load(AtomicOrdering::SeqCst), 0);
+            finish.send(()).unwrap();
+            let _replacement = tokio::time::timeout(Duration::from_secs(1), semaphore.clone().acquire_owned())
+                .await
+                .expect("the outstanding read finishes without the response being polled")
+                .unwrap();
+            assert_eq!(completed.load(AtomicOrdering::SeqCst), 1);
+            assert_eq!(started.load(AtomicOrdering::SeqCst), 1, "retirement must never submit a second read");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn disk_read_admission_preserves_configured_slow_io_window() {
+        use tokio::io::AsyncReadExt;
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let (finish, receiver) = tokio::sync::oneshot::channel();
+        let completed = Arc::new(AtomicUsize::new(0));
+        let mut reader = DiskReadPermitReader::with_idle_timeout(
+            PendingAdmissionRead {
+                finish: receiver,
+                started: Arc::default(),
+                completed: completed.clone(),
+                submitted: false,
+            },
+            permit.into(),
+            Duration::from_secs(120),
+        );
+        let mut buffer = [0_u8; 1];
+        let mut reading = Box::pin(reader.read(&mut buffer));
+        assert!(futures::poll!(&mut reading).is_pending());
+        tokio::time::advance(Duration::from_secs(45)).await;
+        assert!(
+            futures::poll!(&mut reading).is_pending(),
+            "a high-latency read must not inherit the default 30-second cutoff"
+        );
+        assert_eq!(semaphore.available_permits(), 0);
+        finish.send(()).unwrap();
+        assert_eq!(reading.await.unwrap(), 1);
+        assert_eq!(completed.load(AtomicOrdering::SeqCst), 1);
+        drop(reader);
+        assert_eq!(semaphore.available_permits(), 1);
+    }
+
+    #[tokio::test]
+    async fn disk_read_admission_unread_file_bodies_cannot_exhaust_both_lanes() {
+        use tokio::io::AsyncReadExt;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("download");
+        let payload = vec![0x5a_u8; 256 * 1024];
+        tokio::fs::write(&path, &payload).await.unwrap();
+        let manager = ConcurrencyManager::with_disk_read_caps_for_test(1, 1);
+        let mut bodies = Vec::new();
+        for _ in 0..2 {
+            let file = tokio::fs::File::open(&path).await.unwrap();
+            let permit = match manager.admit_disk_read(Duration::from_millis(1)).await.unwrap() {
+                DiskReadAdmission::Primary(permit) | DiskReadAdmission::Degraded(permit) => permit,
+                other => panic!("expected an admitted read, got {other:?}"),
+            };
+            bodies.push(DiskReadPermitReader::with_idle_timeout(file, permit.into(), GET_DISK_READ_IDLE_TIMEOUT));
+        }
+        assert!(matches!(
+            manager.admit_disk_read(Duration::from_millis(1)).await.unwrap(),
+            DiskReadAdmission::Rejected
+        ));
+        tokio::time::pause();
+        tokio::time::advance(GET_DISK_READ_IDLE_TIMEOUT + Duration::from_secs(1)).await;
+        let permit = match manager.admit_disk_read(Duration::from_secs(1)).await.unwrap() {
+            DiskReadAdmission::Primary(permit) => permit,
+            other => panic!("unread bodies must return the primary slot, got {other:?}"),
+        };
+        tokio::time::resume();
+        for body in &mut bodies {
+            assert_eq!(body.read(&mut [0_u8; 1]).await.unwrap_err().kind(), std::io::ErrorKind::TimedOut);
+        }
+        let file = tokio::fs::File::open(&path).await.unwrap();
+        let mut reader = DiskReadPermitReader::with_idle_timeout(file, permit.into(), GET_DISK_READ_IDLE_TIMEOUT);
+        let mut actual = Vec::new();
+        reader.read_to_end(&mut actual).await.unwrap();
+        assert_eq!(actual, payload, "a fresh reader must read the real file after recovery");
     }
 
     #[tokio::test]

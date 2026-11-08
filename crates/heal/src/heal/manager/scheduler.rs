@@ -34,7 +34,7 @@ pub(super) fn running_mainline_pacer(
     request: &HealRequest,
     config: &HealConfig,
     provider: &Option<WorkloadSnapshotProviderRef>,
-) -> Option<Arc<crate::heal::pacing::MainlinePacer>> {
+) -> Option<crate::heal::pacing::ForegroundPacing> {
     let pace_running = request.source == HealRequestSource::Admin
         || (request.source == HealRequestSource::AutoHeal
             && matches!(&request.heal_type, HealType::ErasureSet { .. })
@@ -43,14 +43,13 @@ pub(super) fn running_mainline_pacer(
         return None;
     }
     provider.as_ref().and_then(|provider| {
-        crate::heal::pacing::MainlinePacer::new(
+        crate::heal::pacing::ForegroundPacing::new(
             provider.clone(),
             config.mainline_read_utilization_high_percent,
             config.mainline_write_utilization_high_percent,
             config.mainline_max_sleep,
             request.source,
         )
-        .map(Arc::new)
     })
 }
 
@@ -293,6 +292,20 @@ impl HealManager {
                                 "Heal scheduler task completed"
                             );
                         }
+                        Err(e @ Error::LegacyMrfUnverified { .. }) => {
+                            warn!(
+                                target: "rustfs::heal::manager",
+                                event = EVENT_HEAL_SCHEDULER_STATE,
+                                component = LOG_COMPONENT_HEAL,
+                                subsystem = LOG_SUBSYSTEM_MANAGER,
+                                state = "verification_unavailable",
+                                task_id,
+                                heal_type = %task_type_label_for_spawn,
+                                set = %task_set_label_for_spawn,
+                                detail = %e,
+                                "Heal attempt completed without independent verification"
+                            );
+                        }
                         Err(e) => {
                             let will_retry = retry_request.is_some();
                             if will_retry {
@@ -484,6 +497,9 @@ impl HealManager {
                         // update statistics
                         let mut stats = statistics_clone.write().await;
                         match completed_status {
+                            HealTaskStatus::Completed if matches!(&result, Err(Error::LegacyMrfUnverified { .. })) => {
+                                stats.update_unverified_task_completion();
+                            }
                             HealTaskStatus::Completed => {
                                 stats.update_task_completion(true);
                                 stats.add_healed_objects(completed_progress.objects_healed, completed_progress.bytes_processed);

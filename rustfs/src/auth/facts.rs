@@ -35,9 +35,11 @@
 use crate::auth::{
     AuthType, OBJECT_CREATION_OPERATION_CONDITION, constant_time_eq, extract_string_list_claim, get_request_auth_type_with_query,
 };
+use crate::runtime_sources::current_ready_iam_handle;
 use http::header::{IF_MATCH, IF_NONE_MATCH};
 use http::{HeaderMap, HeaderName};
 use rustfs_credentials::Credentials;
+use rustfs_iam::sys::{OIDC_ISSUER_CLAIM, is_rustfs_oidc_claims};
 use rustfs_policy::policy::action::{Action, S3Action};
 use rustfs_policy::policy::{Args, is_server_derived_condition_key};
 use rustfs_trusted_proxies::ClientInfo;
@@ -224,6 +226,19 @@ impl AuthzFacts {
         }
     }
 
+    /// A listing key the query names more than once. Policy conditions must
+    /// see one value, so such a listing request is rejected.
+    pub(crate) fn duplicate_list_query_key(&self) -> Option<&str> {
+        if !is_list_action(self.action) {
+            return None;
+        }
+        self.list_query
+            .iter()
+            .enumerate()
+            .find(|(index, (key, _))| self.list_query[..*index].iter().any(|(earlier, _)| earlier == key))
+            .map(|(_, (key, _))| key.as_str())
+    }
+
     pub(crate) fn action(&self) -> Action {
         self.action
     }
@@ -264,6 +279,15 @@ pub(crate) fn list_query_pairs(raw_query: Option<&str>) -> Vec<(String, String)>
         .collect()
 }
 
+fn is_list_action(action: Action) -> bool {
+    matches!(
+        action,
+        Action::S3Action(
+            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
+        )
+    )
+}
+
 /// Adds the `s3:prefix`, `s3:delimiter` and `s3:max-keys` values of a listing
 /// request; any other action gets none of them.
 pub(crate) fn merge_list_query_conditions(
@@ -271,16 +295,15 @@ pub(crate) fn merge_list_query_conditions(
     list_query: &[(String, String)],
     conditions: &mut HashMap<String, Vec<String>>,
 ) {
-    if !matches!(
-        action,
-        Action::S3Action(
-            S3Action::ListBucketAction | S3Action::ListBucketVersionsAction | S3Action::ListBucketMultipartUploadsAction
-        )
-    ) {
+    if !is_list_action(action) {
         return;
     }
+    // The query alone names the listing: a header of the same name must not.
+    for key in LIST_QUERY_KEYS {
+        conditions.remove(key);
+    }
     for (key, value) in list_query {
-        conditions.entry(key.clone()).or_default().push(value.clone());
+        conditions.insert(key.clone(), vec![value.clone()]);
     }
 }
 
@@ -391,7 +414,9 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
     if let Some(version_id) = facts.version_id.as_deref()
         && !version_id.is_empty()
     {
-        args.insert("versionid".to_owned(), vec![version_id.to_owned()]);
+        // Policy conditions must identify the same version the storage layer
+        // resolves, whatever spelling the client used.
+        args.insert("versionid".to_owned(), vec![super::canonical_policy_version_id(version_id)]);
     }
     if let Some(signature_version) = facts.signature_version {
         args.insert("signatureversion".to_owned(), vec![signature_version.as_str().to_owned()]);
@@ -436,6 +461,16 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
                 args.insert(name.to_lowercase(), vec![value.to_owned()]);
             }
         }
+        if is_rustfs_oidc_claims(claims) {
+            args.remove("iss");
+            if let Some(issuer) = claims
+                .get(OIDC_ISSUER_CLAIM)
+                .and_then(Value::as_str)
+                .filter(|issuer| !issuer.is_empty())
+            {
+                args.insert("iss".to_owned(), vec![issuer.to_owned()]);
+            }
+        }
         let groups = extract_string_list_claim(claims, "groups");
         if !groups.is_empty() {
             args.insert("groups".to_owned(), groups);
@@ -445,10 +480,21 @@ pub(crate) fn base_conditions(principal: &AuthzPrincipal<'_>, facts: &AuthzFacts
             args.insert("roles".to_owned(), roles);
         }
     }
-    if let Some(groups) = principal.groups
-        && !args.contains_key("groups")
-    {
-        args.insert("groups".to_owned(), groups.clone());
+    // Live IAM membership joins the credential's groups, so a group policy
+    // condition sees memberships granted after the credential was issued.
+    let effective_user = if principal.username.is_empty() {
+        principal.account
+    } else {
+        principal.username
+    };
+    let live_groups = current_ready_iam_handle()
+        .map(|iam| iam.user_group_memberships(effective_user))
+        .unwrap_or_default();
+    for group in principal.groups.iter().flatten().chain(live_groups.iter()) {
+        let groups = args.entry("groups".to_owned()).or_default();
+        if !groups.contains(group) {
+            groups.push(group.clone());
+        }
     }
 
     // Every remaining header is attacker-controlled. A header must never contribute

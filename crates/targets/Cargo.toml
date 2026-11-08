@@ -13,6 +13,7 @@ documentation = "https://docs.rs/rustfs-targets/latest/rustfs_targets/"
 
 [features]
 default = []
+fips = ["rustfs-tls-runtime/fips"]
 # Exposes the builder-style `testkit::MockTarget` to downstream test suites. Never enable this
 # from a production `[dependencies]` entry; in-crate unit tests get the module via cfg(test).
 test-support = []

@@ -41,23 +41,38 @@ fn register_table_catalog_prefix_routes(r: &mut S3Router<AdminOperation>, prefix
     )?;
     r.insert(
         Method::GET,
-        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
-        AdminOperation(&GET_TABLE_CATALOG_MIGRATION_HANDLER),
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&GetTableDirectoryHandler {}),
     )?;
     r.insert(
         Method::POST,
-        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
-        AdminOperation(&MATERIALIZE_TABLE_CATALOG_MIGRATION_HANDLER),
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&AdvanceTableDirectoryHandler {}),
     )?;
     r.insert(
         Method::DELETE,
-        format!("{prefix}/{{warehouse}}/catalog/migration").as_str(),
-        AdminOperation(&CANCEL_TABLE_CATALOG_MIGRATION_HANDLER),
+        format!("{prefix}/{{warehouse}}/catalog/directory").as_str(),
+        AdminOperation(&DisableTableDirectoryHandler {}),
     )?;
     r.insert(
         Method::POST,
         format!("{prefix}/{{warehouse}}/catalog/backup").as_str(),
         AdminOperation(&CREATE_TABLE_CATALOG_BACKUP_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/backup/export").as_str(),
+        AdminOperation(&EXPORT_TABLE_CATALOG_BACKUP_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/backup/import").as_str(),
+        AdminOperation(&IMPORT_TABLE_CATALOG_BACKUP_HANDLER),
+    )?;
+    r.insert(
+        Method::POST,
+        format!("{prefix}/{{warehouse}}/catalog/backup/prepare").as_str(),
+        AdminOperation(&PREPARE_TABLE_CATALOG_BACKUP_OBJECT_HANDLER),
     )?;
     r.insert(
         Method::POST,

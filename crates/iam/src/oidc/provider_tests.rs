@@ -180,7 +180,7 @@ fn workload_metadata_rejects_duplicate_fields() {
     }
 }
 #[test]
-fn workload_verifier_preserves_algorithm_secret_and_audience_policy() {
+fn caller_supplied_tokens_cannot_be_signed_with_the_client_secret() {
     let secret = Nonce::new_random().secret().to_string();
     let mut config = build_mocked_oidc_provider_config("workload", "https://issuer.example.com");
     config.client_secret = Some(secret.clone());
@@ -195,7 +195,8 @@ fn workload_verifier_preserves_algorithm_secret_and_audience_policy() {
     let token: CoreIdToken = signed.parse().unwrap();
     for workload in [false, true] {
         for (algorithms, accepted) in [
-            (serde_json::json!(["HS256", "unsupported-future-algorithm"]), true),
+            (serde_json::json!(["RS256", "HS256"]), false),
+            (serde_json::json!(["HS256", "unsupported-future-algorithm"]), false),
             (serde_json::json!(["ES256"]), false),
             (serde_json::json!(["unsupported-future-algorithm"]), false),
         ] {
@@ -216,21 +217,6 @@ fn workload_verifier_preserves_algorithm_secret_and_audience_policy() {
                 accepted,
                 "workload={workload}, algorithms={algorithms}"
             );
-            if accepted {
-                assert!(
-                    token.claims(&metadata.verifier(&config), |_: Option<&Nonce>| Ok(())).is_err(),
-                    "additional audiences require explicit trust"
-                );
-                let mut wrong_secret = config.clone();
-                wrong_secret.client_secret = Some(Nonce::new_random().secret().to_string());
-                let verifier = metadata
-                    .verifier(&wrong_secret)
-                    .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
-                assert!(
-                    token.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_err(),
-                    "incorrect client secret must fail"
-                );
-            }
         }
     }
 }
@@ -242,7 +228,7 @@ fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
     let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let payload = serde_json::json!({
         "iss": config.config_url, "sub": "synthetic-subject", "aud": config.client_id,
-        "iat": now, "exp": now + 300,
+        "iat": now, "exp": now + 300, "nonce": "synthetic-nonce",
     });
 
     for (algorithm, name, signature_length) in [
@@ -275,22 +261,41 @@ fn configured_verifier_rejects_malformed_hmac_signature_lengths() {
                 .expect("parse configured provider metadata");
             let verifier = metadata.verifier(&config);
             assert!(
-                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                verify_id_token_claims(&valid, &verifier, |_: Option<&Nonce>| Ok(())).is_err(),
+                "caller-supplied HMAC tokens must be rejected"
+            );
+            // The authorization-code flow obtains tokens directly from the
+            // provider and still supports confidential-client verification.
+            let verifier = openidconnect::core::CoreIdTokenVerifier::new_confidential_client(
+                openidconnect::ClientId::new(config.client_id.clone()),
+                openidconnect::ClientSecret::new(secret.to_owned()),
+                metadata.issuer().clone(),
+                openidconnect::core::CoreJsonWebKeySet::new(vec![]),
+            )
+            .set_allowed_algs(vec![serde_json::from_value(serde_json::json!(name)).expect("parse signing algorithm")]);
+            assert!(
+                verify_id_token_claims(&valid, &verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
                 "valid {name} token must pass for workload={workload}"
             );
+            assert!(verify_id_token_claims(&valid, &verifier, &Nonce::new("synthetic-nonce".into())).is_ok());
+            assert!(verify_id_token_claims(&valid, &verifier, &Nonce::new("wrong-nonce".into())).is_err());
 
             for length in [1, 0, signature_length - 1, signature_length, signature_length + 1, 128] {
                 let signature = base64_simd::URL_SAFE_NO_PAD.encode_to_string(vec![0_u8; length]);
                 let malformed: CoreIdToken = format!("{signing_input}.{signature}")
                     .parse()
-                    .expect("invalid signature length must still reach cryptographic verification");
+                    .expect("invalid signature length must remain parseable before verification");
                 assert!(
-                    malformed.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_err(),
+                    verify_id_token_claims(&malformed, &verifier, |_: Option<&Nonce>| Ok(())).is_err(),
                     "{name} signature length {length} must return an error for workload={workload}"
+                );
+                assert!(
+                    verify_id_token_claims(&malformed, &verifier, &Nonce::new("synthetic-nonce".into())).is_err(),
+                    "{name} signature length {length} must return an error with a nonce for workload={workload}"
                 );
             }
             assert!(
-                valid.claims(&verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
+                verify_id_token_claims(&valid, &verifier, |_: Option<&Nonce>| Ok(())).is_ok(),
                 "invalid inputs must not prevent later valid {name} verification"
             );
         }
@@ -773,4 +778,150 @@ async fn test_validate_oidc_provider_config_returns_detailed_errors() {
     assert!(err.contains(&format!("issuer '{base}/application/o/rustfs'")));
     assert!(err.contains(&format!("issuer '{base}/application/o/rustfs/'")));
     assert!(handle.join().is_ok());
+}
+
+#[tokio::test]
+async fn jwks_refresh_is_single_flight_and_survives_request_cancellation() {
+    let (initial_key, initial_jwk) = oidc_es256_key_and_jwk("initial");
+    let (rotated_key, rotated_jwk) = oidc_es256_key_and_jwk("rotated");
+    let (wrong_key, _) = oidc_es256_key_and_jwk("wrong");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let started = Arc::new(tokio::sync::Notify::new());
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let server_requests = Arc::clone(&requests);
+    let server_started = Arc::clone(&started);
+    let Some((base, server)) = start_mock_oidc_discovery_server_with_jwks(
+        |base| (base.to_string(), format!("{base}/jwks"), "/jwks".to_string()),
+        6,
+        "ES256",
+        false,
+        move |fetch| {
+            let request = server_requests.fetch_add(1, Ordering::SeqCst);
+            if request == 2 {
+                server_started.notify_one();
+                release_rx
+                    .recv_timeout(StdDuration::from_secs(5))
+                    .expect("release refresh response");
+            }
+            serde_json::json!({"keys": [if fetch == 0 { &initial_jwk } else { &rotated_jwk }]}).to_string()
+        },
+    ) else {
+        return;
+    };
+    let mut config = build_mocked_oidc_provider_config("bounded-refresh", &base);
+    config.issuer = Some(base.clone());
+    let http = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).expect("allow test origin"));
+    let state = discover_provider(&config, &http).await.expect("initial discovery");
+    let sys = Arc::new(OidcSys {
+        configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
+        provider_runtime: ProviderRuntime::new(http, HashMap::from([(config.id.clone(), state)])),
+        state_store: OidcStateStore::new(),
+        pending_discovery: Default::default(),
+    });
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let payload = serde_json::json!({"iss": base, "sub": "user", "aud": config.client_id, "iat": now, "exp": now + 300});
+    let sign = |kid: &str, claims: &serde_json::Value, key: &EncodingKey| {
+        let mut header = Header::new(Algorithm::ES256);
+        header.kid = Some(kid.to_string());
+        jsonwebtoken::encode(&header, claims, key).expect("sign test token")
+    };
+    for (claim, value) in [
+        ("aud", serde_json::json!("wrong-audience")),
+        ("exp", serde_json::json!(now - 300)),
+    ] {
+        let mut invalid = payload.clone();
+        invalid[claim] = value;
+        assert!(
+            sys.verify_web_identity_token(&sign("initial", &invalid, &initial_key))
+                .await
+                .is_err()
+        );
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 2, "claim failures cannot refresh signing keys");
+    let invalid = sign("rotated", &payload, &wrong_key);
+    let attack = {
+        let sys = Arc::clone(&sys);
+        let invalid = invalid.clone();
+        tokio::spawn(async move { sys.verify_web_identity_token(&invalid).await })
+    };
+    tokio::time::timeout(StdDuration::from_secs(5), started.notified())
+        .await
+        .expect("refresh started");
+    attack.abort();
+    assert!(attack.await.expect_err("request canceled").is_cancelled());
+    let mut retries = Vec::new();
+    for _ in 0..16 {
+        let sys = Arc::clone(&sys);
+        let invalid = invalid.clone();
+        retries.push(tokio::spawn(async move { sys.verify_web_identity_token(&invalid).await }));
+    }
+    release_tx.send(()).expect("release provider");
+    for retry in retries {
+        assert!(
+            tokio::time::timeout(StdDuration::from_secs(5), retry)
+                .await
+                .expect("retry timeout")
+                .expect("retry join")
+                .is_err()
+        );
+    }
+    let rotated = sign("rotated", &payload, &rotated_key);
+    sys.verify_web_identity_token(&rotated)
+        .await
+        .expect("completed refresh must accept rotated keys after the original caller left");
+    assert_eq!(requests.load(Ordering::SeqCst), 4, "one discovery/JWKS pair for all rejected tokens");
+    sys.provider_runtime
+        .refresh_provider_state("independent-provider", &config)
+        .await
+        .expect("provider cooldowns must be independent");
+    assert_eq!(requests.load(Ordering::SeqCst), 6);
+    server.join().expect("mock server");
+}
+
+#[tokio::test]
+async fn jwks_refresh_cools_down_failures_and_recovers_after_the_interval() {
+    let (_, initial_jwk) = oidc_es256_key_and_jwk("initial");
+    let (_, recovered_jwk) = oidc_es256_key_and_jwk("recovered");
+    let requests = Arc::new(AtomicUsize::new(0));
+    let server_requests = Arc::clone(&requests);
+    let Some((base, server)) = start_mock_oidc_discovery_server_with_jwks(
+        |base| (base.to_string(), format!("{base}/jwks"), "/jwks".to_string()),
+        6,
+        "ES256",
+        false,
+        move |fetch| {
+            server_requests.fetch_add(1, Ordering::SeqCst);
+            match fetch {
+                0 => serde_json::json!({"keys": [initial_jwk]}).to_string(),
+                1 => "invalid JWKS".to_string(),
+                _ => serde_json::json!({"keys": [recovered_jwk]}).to_string(),
+            }
+        },
+    ) else {
+        return;
+    };
+    let mut config = build_mocked_oidc_provider_config("recovering-refresh", &base);
+    config.issuer = Some(base.clone());
+    let http = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).expect("allow test origin"));
+    let initial = discover_provider(&config, &http).await.expect("initial discovery");
+    let runtime = ProviderRuntime::new(http, HashMap::from([(config.id.clone(), initial.clone())]));
+    assert!(runtime.refresh_provider_state(&config.id, &config).await.is_err());
+    assert_eq!(requests.load(Ordering::SeqCst), 4);
+    for _ in 0..8 {
+        assert!(runtime.refresh_provider_state(&config.id, &config).await.is_err());
+    }
+    assert_eq!(requests.load(Ordering::SeqCst), 4, "completed failures also consume a bounded cooldown");
+    assert_eq!(
+        runtime.get_provider_state(&config.id).expect("cached keys").discovered_at,
+        initial.discovered_at
+    );
+    let refresh = runtime.refreshes.lock().expect("registry")[&config.id].clone();
+    refresh.lock().await.as_mut().expect("completed attempt").0 = Instant::now() - OIDC_JWKS_REFRESH_COOLDOWN;
+    runtime
+        .refresh_provider_state(&config.id, &config)
+        .await
+        .expect("retry after cooldown");
+    assert_eq!(requests.load(Ordering::SeqCst), 6);
+    assert!(runtime.get_provider_state(&config.id).expect("recovered keys").discovered_at > initial.discovered_at);
+    server.join().expect("mock server");
 }

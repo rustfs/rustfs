@@ -269,7 +269,9 @@ impl Case {
             self.query,
             self.client_info().as_ref(),
         );
-        oracle::merge_list_bucket_query_conditions(self.action, self.query, &mut conditions);
+        if oracle::merge_list_bucket_query_conditions(self.action, self.query, &mut conditions).is_err() {
+            return rejected_listing();
+        }
         conditions
     }
 
@@ -277,10 +279,29 @@ impl Case {
     fn current(&self, credentials: &Credentials, now: OffsetDateTime) -> Conditions {
         let root = root_access_key();
         let principal = AuthzPrincipal::new(credentials, &root);
-        let mut conditions = build_conditions(&principal, &self.facts(now));
+        let facts = self.facts(now);
+        // The authorization edge rejects a repeated listing key before it
+        // builds any condition.
+        if facts.duplicate_list_query_key().is_some() {
+            return rejected_listing();
+        }
+        let mut conditions = build_conditions(&principal, &facts);
         forward_secret_headers(&self.header_map(), &mut conditions);
         conditions
     }
+}
+
+/// The cases that build condition values, leaving out rejected listings.
+fn condition_cases() -> usize {
+    run_cases()
+        .iter()
+        .filter(|(_, legacy, _)| *legacy != rejected_listing())
+        .count()
+}
+
+/// The stand-in for a listing request rejected for a repeated query key.
+fn rejected_listing() -> Conditions {
+    Conditions::from([("<rejected: duplicate listing query>".to_owned(), Vec::new())])
 }
 
 /// The root access key the legacy derivation compared against.
@@ -309,7 +330,12 @@ fn run_cases() -> Vec<(Case, Conditions, Conditions)> {
             let before = OffsetDateTime::now_utc();
             let legacy = case.legacy(&credentials);
             let after = OffsetDateTime::now_utc();
-            let now = legacy_now(case.name, &legacy, before, after);
+            // A rejected listing read no clock.
+            let now = if legacy == rejected_listing() {
+                before
+            } else {
+                legacy_now(case.name, &legacy, before, after)
+            };
             let current = case.current(&credentials, now);
             (case, legacy, current)
         })
@@ -516,6 +542,9 @@ fn assert_key_matches_legacy(key: &str, min_present: usize, min_absent: usize) {
     let (mut present, mut absent) = (0, 0);
     for (case, legacy, current) in run_cases() {
         assert_eq!(current.get(key), legacy.get(key), "{}: condition key {key}", case.name);
+        if legacy == rejected_listing() {
+            continue;
+        }
         if legacy.contains_key(key) {
             present += 1;
         } else {
@@ -576,6 +605,9 @@ fn every_condition_value_matches_legacy() {
 fn facts_alone_leave_out_exactly_the_secret_headers() {
     let mut left_out = 0;
     for (case, legacy, _) in run_cases() {
+        if legacy == rejected_listing() {
+            continue;
+        }
         let credentials = credentials(case.who);
         let now = OffsetDateTime::parse(&legacy["CurrentTime"][0], &Rfc3339).expect("legacy CurrentTime");
         let root = root_access_key();
@@ -602,23 +634,23 @@ fn facts_alone_leave_out_exactly_the_secret_headers() {
 
 #[test]
 fn current_time_matches_legacy() {
-    assert_key_matches_legacy("CurrentTime", cases().len(), 0);
+    assert_key_matches_legacy("CurrentTime", condition_cases(), 0);
 }
 
 #[test]
 fn epoch_time_matches_legacy() {
-    assert_key_matches_legacy("EpochTime", cases().len(), 0);
+    assert_key_matches_legacy("EpochTime", condition_cases(), 0);
 }
 
 #[test]
 fn secure_transport_matches_legacy() {
-    assert_key_matches_legacy("SecureTransport", cases().len(), 0);
+    assert_key_matches_legacy("SecureTransport", condition_cases(), 0);
     assert_legacy_values_seen("SecureTransport", &["false", "true"]);
 }
 
 #[test]
 fn source_ip_matches_legacy() {
-    assert_key_matches_legacy("SourceIp", cases().len(), 0);
+    assert_key_matches_legacy("SourceIp", condition_cases(), 0);
     assert_legacy_values_seen(
         "SourceIp",
         &[
@@ -648,17 +680,17 @@ fn referer_matches_legacy() {
 
 #[test]
 fn userid_matches_legacy() {
-    assert_key_matches_legacy("userid", cases().len(), 0);
+    assert_key_matches_legacy("userid", condition_cases(), 0);
 }
 
 #[test]
 fn username_matches_legacy() {
-    assert_key_matches_legacy("username", cases().len(), 0);
+    assert_key_matches_legacy("username", condition_cases(), 0);
 }
 
 #[test]
 fn principal_type_matches_legacy() {
-    assert_key_matches_legacy("principaltype", cases().len(), 0);
+    assert_key_matches_legacy("principaltype", condition_cases(), 0);
     assert_legacy_values_seen("principaltype", &["Anonymous", "AssumedRole", "User"]);
 }
 

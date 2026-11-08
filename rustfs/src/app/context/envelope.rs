@@ -219,6 +219,16 @@ impl RequestEnvelope {
         self.client_info.as_ref()
     }
 
+    /// The client address for policy evaluation: the verified proxy client
+    /// when one is recorded, otherwise the connection peer (keeping its port).
+    pub fn policy_source_addr(&self) -> Option<SocketAddr> {
+        let peer = self.remote_addr;
+        self.client_info
+            .as_ref()
+            .map(|client| SocketAddr::new(client.real_ip, peer.map_or(0, |addr| addr.port())))
+            .or(peer)
+    }
+
     pub(crate) fn native_tls_transport(&self) -> Option<bool> {
         self.native_tls_transport
     }

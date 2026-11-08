@@ -5493,6 +5493,14 @@ pub async fn put_restore_opts(
     }
     // Finalization publishes completion and its expiry under the object lock.
     // The local copy-back commit must not make unfinished work eligible for expiry.
+    if let Some(expires) = oi.expires {
+        meta.insert(
+            "expires".to_string(),
+            expires
+                .format(&time::format_description::well_known::Rfc3339)
+                .map_err(std::io::Error::other)?,
+        );
+    }
     meta.insert(
         metadata_keys::RESTORE.to_string(),
         RestoreStatus {
@@ -5512,7 +5520,6 @@ pub async fn put_restore_opts(
         preserve_etag: oi.etag.clone(),
         shard_integrity_write_mode: Some(oi.shard_integrity_write_mode()),
         restore_copyback: true,
-        //expires:           oi.expires,
         ..Default::default()
     })
 }
@@ -7166,6 +7173,25 @@ mod tests {
             TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
             0,
             "tier generation lease should release after EOF"
+        );
+        let unread = get_transitioned_object_reader_with_tier_manager(
+            &object_info.bucket,
+            &object_info.name,
+            &None,
+            &HeaderMap::new(),
+            &object_info,
+            &ObjectOptions::default(),
+            &manager,
+            None,
+        )
+        .await
+        .expect("open an unread transitioned response");
+        assert_eq!(TierConfigMgr::active_operation_lease_count(&manager, &tier).await, 1);
+        drop(unread);
+        assert_eq!(
+            TierConfigMgr::active_operation_lease_count(&manager, &tier).await,
+            0,
+            "canceling an unread response must release the tier lease"
         );
     }
 

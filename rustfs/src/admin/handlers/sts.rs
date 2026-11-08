@@ -51,6 +51,7 @@ use s3s::dto::{AssumeRoleOutput, Credentials, Timestamp};
 use serde::Deserialize;
 use serde_json::Value;
 use serde_urlencoded::from_bytes;
+use std::collections::HashMap;
 use time::{Duration, OffsetDateTime};
 use tracing::{debug, error, warn};
 
@@ -77,6 +78,12 @@ fn clamp_assume_role_duration(duration_seconds: usize) -> usize {
     } else {
         duration_seconds.clamp(STS_MIN_DURATION_SECS, STS_MAX_DURATION_SECS)
     }
+}
+
+fn set_assume_role_duration_condition(conditions: &mut HashMap<String, Vec<String>>, requested: usize) -> usize {
+    let duration = clamp_assume_role_duration(requested);
+    conditions.insert("DurationSeconds".to_string(), vec![duration.to_string()]);
+    duration
 }
 
 /// Record that AssumeRole assembled its session claims without echoing any claim values.
@@ -183,7 +190,7 @@ impl Operation for AssumeRoleHandle {
 
         match body.action.as_str() {
             ASSUME_ROLE_ACTION => {
-                let remote_addr = req.remote_addr();
+                let remote_addr = req.policy_source_addr();
                 handle_assume_role(req.credentials(), req.uri(), req.headers(), remote_addr, body, store, &audit).await
             }
             ASSUME_ROLE_WITH_WEB_IDENTITY_ACTION => handle_assume_role_with_web_identity(body).await,
@@ -213,6 +220,12 @@ async fn handle_assume_role(
 
     let (cred, owner) = check_key_valid(get_session_token(uri, headers).unwrap_or_default(), user.access_key()).await?;
 
+    // The signature was verified before the request body was consumed. A fresh
+    // IAM lookup must not silently replace the secret that authenticated it.
+    if !crate::auth::constant_time_eq(&cred.secret_key, user.secret_key()) {
+        return Err(S3Error::with_message(S3ErrorCode::AccessDenied, "Access Denied"));
+    }
+
     if cred.is_temp() || cred.is_service_account() {
         return Err(s3_error!(AccessDenied, "Access Denied"));
     }
@@ -220,7 +233,8 @@ async fn handle_assume_role(
     let Ok(iam_store) = crate::admin::runtime_sources::current_ready_iam_handle() else {
         return Err(s3_error!(InvalidRequest, "iam not init"));
     };
-    let conditions = crate::auth::get_condition_values(headers, &cred, None, None, remote_addr);
+    let mut conditions = crate::auth::get_condition_values(headers, &cred, None, None, remote_addr);
+    let exp = set_assume_role_duration_condition(&mut conditions, body.duration_seconds);
     if !iam_store
         .is_allowed(&Args {
             account: &cred.access_key,
@@ -257,7 +271,7 @@ async fn handle_assume_role(
     // behaviour of every existing deployment is unchanged.
     let mfa_verified = enforce_second_factor(&cred.access_key, &body, store, audit).await?;
 
-    let mut claims = cred.claims.unwrap_or_default();
+    let mut claims = cred.claims.clone().unwrap_or_default();
 
     if mfa_verified {
         // Recorded on the session so a later policy condition can require it,
@@ -267,8 +281,6 @@ async fn handle_assume_role(
     }
 
     populate_session_policy(&mut claims, &body.policy)?;
-
-    let exp = clamp_assume_role_duration(body.duration_seconds);
 
     claims.insert(
         "exp".to_string(),
@@ -306,9 +318,9 @@ async fn handle_assume_role(
     );
 
     let updated_at = iam_store
-        .set_temp_user(&new_cred.access_key, &new_cred, None)
+        .set_temp_user_from_parent(&new_cred, &cred)
         .await
-        .map_err(|_| s3_error!(InternalError, "set_temp_user failed"))?;
+        .map_err(super::iam_error::iam_error_to_s3_error)?;
 
     let root_access_key = current_action_credentials().map(|cred| cred.access_key);
     if root_access_key.as_deref() != Some(new_cred.parent_user.as_str())
@@ -606,6 +618,40 @@ mod tests {
         assert_eq!(clamp(3600), 3600); // normal
         assert_eq!(clamp(43200), 43200); // exact max
         assert_eq!(clamp(999999), 43200); // clamped to max
+    }
+
+    #[tokio::test]
+    async fn assume_role_duration_condition_enforces_policy_after_clamping() {
+        use rustfs_policy::policy::Policy;
+        let policy = Policy::parse_config(
+            br#"{"Version":"2012-10-17","Statement":[{
+            "Effect":"Deny","Action":"sts:AssumeRole","Resource":"*",
+            "Condition":{"NumericGreaterThan":{"sts:DurationSeconds":"3600"}}
+        }]}"#,
+        )
+        .expect("duration policy");
+        for (requested, allowed) in [(0, true), (1, true), (3600, true), (3601, false), (usize::MAX, false)] {
+            let mut conditions = HashMap::from([("DurationSeconds".to_string(), vec!["1".to_string()])]);
+            let lifetime = set_assume_role_duration_condition(&mut conditions, requested);
+            assert_eq!(conditions["DurationSeconds"], [lifetime.to_string()]);
+            assert_eq!(
+                policy
+                    .is_allowed(&Args {
+                        account: "user",
+                        groups: &None,
+                        action: Action::StsAction(StsAction::AssumeRoleAction),
+                        conditions: &conditions,
+                        is_owner: false,
+                        claims: &HashMap::new(),
+                        deny_only: true,
+                        bucket: "",
+                        object: "",
+                    })
+                    .await,
+                allowed,
+                "requested={requested}"
+            );
+        }
     }
 
     #[test]

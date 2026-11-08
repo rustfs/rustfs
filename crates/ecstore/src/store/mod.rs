@@ -425,8 +425,6 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
     !is_meta_bucketname(&oi.bucket)
 }
 
-const MAX_UPLOADS_LIST: usize = 10000;
-
 mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
@@ -498,6 +496,17 @@ pub struct ECStore {
     /// Memoizes bucket-incarnation validation under continuous lifecycle
     /// read-lock coverage (see [`bucket_fence`]).
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
+}
+
+impl Drop for ECStore {
+    /// Clear the instance context's `BucketMetadataSys` when its backing store
+    /// is dropped. Without this, the shared bootstrap context retains a
+    /// `BucketMetadataSys` whose `Weak<ECStore>` is dangling after the store
+    /// goes away (e.g. between sequential test fixtures that share the
+    /// bootstrap), and the next `object_store()` call panics.
+    fn drop(&mut self) {
+        self.ctx.clear_bucket_metadata_sys_if_stale();
+    }
 }
 
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
@@ -3286,6 +3295,7 @@ mod tests {
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
         let (mut disks, errs) = init_disks(
+            &crate::runtime::global::current_ctx(),
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,
