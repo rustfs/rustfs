@@ -121,6 +121,7 @@ test-util = []
 e2e-test-hooks = []
 
 [dependencies]
+hashbrown.workspace = true
 hotpath.workspace = true
 rustfs-filemeta.workspace = true
 rustfs-utils = { workspace = true, features = ["full"] }

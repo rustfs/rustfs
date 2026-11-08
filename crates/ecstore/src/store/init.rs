@@ -676,7 +676,7 @@ impl ECStore {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers,
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::new(pool_meta_write_state),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(pool_meta_write_state),
             // Adopt the caller's context (the process bootstrap one on the
             // legacy path) so startup writes (erasure type recorded before
             // this point) and later reads share one cell.
@@ -725,7 +725,7 @@ impl ECStore {
         // Lock order is save gate -> distributed metadata writer, matching
         // runtime mutations. RPC locks are available before ECStore publication
         // and do not depend on the later fleet proof.
-        let mut startup_write_state = self.pool_meta_save_gate.lock().await;
+        let mut startup_write_state = self.pool_meta_save_gate.write().await;
         let startup_pool_meta_guard = if should_persist_pool_meta {
             let pool = self
                 .pools
