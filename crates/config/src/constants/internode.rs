@@ -184,15 +184,17 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 /// Capacity (distinct nonces) of the process-local internode RPC replay cache that enforces
 /// one-time consumption of authenticated RPC signatures.
 ///
-/// The cache retains each nonce for the ~10-minute signature freshness envelope. Once peers use
-/// replay-scoped v3 authentication, every authenticated RPC consumes one entry, so the steady
-/// state holds roughly `authenticated RPC RPS x 601s` entries. This default is the minimum floor:
-/// explicit operator values and resource-aware auto sizing both clamp upward to at least this
-/// value. Overflow fails closed — legitimate signed traffic is the only thing that can fill the
-/// cache (replays are rejected before insertion, and an attacker cannot mint valid nonces without
-/// the shared secret) — and increments
-/// `rustfs_system_network_internode_replay_cache_overflow_total`, so a sustained non-zero overflow
-/// counter means this capacity is undersized for the node's peak authenticated RPC rate.
+/// Nonces remain protected until their signed timestamp is outside the observed wall-clock
+/// validity window, including after clock rollback. Current-time signatures live about five
+/// minutes; the maximum accepted forward clock skew can extend that to ten minutes. A body-bound
+/// v3 request consumes both its v3 and compatibility-v2 nonces, so size for receiver nonce intake,
+/// not S3 request rate or CPU count.
+///
+/// Auto sizing uses 13% of effective process memory, a conservative 80-byte entry allowance, this
+/// minimum floor and a 33,554,432-entry maximum. The CPU estimate is only a fallback when memory is unknown.
+/// Explicit operator values retain the floor and bypass the automatic memory budget; measure
+/// memory headroom before raising them. Overflow fails closed and increments
+/// `rustfs_system_network_internode_replay_cache_overflow_total`.
 pub const ENV_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: &str = "RUSTFS_INTERNODE_RPC_REPLAY_CACHE_CAPACITY";
 pub const DEFAULT_INTERNODE_RPC_REPLAY_CACHE_CAPACITY: usize = 1_048_576;
 
