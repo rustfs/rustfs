@@ -2979,10 +2979,11 @@ fn build_legacy_per_part_fallback_reader(
     part_length: usize,
     part_size: usize,
     read_repair: Option<(DecodeReadRepairContext, bool)>,
-) -> Box<dyn AsyncRead + Unpin + Send + Sync> {
+) -> Box<LegacyPerPartDecodeReader> {
     let buffer = adaptive_duplex_buffer_size(part_size as i64);
-    let (read_half, mut write_half) = tokio::io::duplex(buffer);
+    let (read_half, write_half) = tokio::io::duplex(buffer);
     let decode = tokio::spawn(async move {
+        let mut write_half = GetObjectDownstreamWriter::new(write_half);
         let outcome = erasure
             .decode_with_stripe_handles_and_reopeners_with_diagnostics(
                 &mut write_half,
@@ -8906,6 +8907,42 @@ mod tests {
 
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert!(err.to_string().contains("inconsistent read source shards"));
+    }
+
+    #[tokio::test]
+    async fn legacy_per_part_output_close_retains_downstream_classification() {
+        let erasure = coding::Erasure::new(2, 2, 64);
+        let data = (0..64u8).collect::<Vec<_>>();
+        let setup =
+            setup_codec_data_blocks_first_encoded_bitrot_readers(&erasure, &data, &[0], &[], &[], HashAlgorithm::HighwayHash256)
+                .await;
+        let mut reader = build_legacy_per_part_fallback_reader(
+            erasure,
+            setup.readers,
+            setup.deferred_stripe_handles,
+            Vec::new(),
+            None,
+            0,
+            data.len(),
+            data.len(),
+            None,
+        );
+        // Closing the actual output pipe models the body consumer disappearing
+        // while retaining the executor long enough to inspect its typed result.
+        assert!(!reader.finished);
+        let (replacement, _unused) = tokio::io::duplex(1);
+        drop(std::mem::replace(&mut reader.inner, replacement));
+        let handle = reader.decode.take().expect("fallback decode task");
+        let error = handle
+            .await
+            .expect("join the fallback task")
+            .expect("closed pipe must interrupt output");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+        assert_eq!(
+            crate::diagnostics::get::classify_io_error(&error),
+            GetObjectFailureReason::DownstreamClosed,
+            "fallback output must carry the same marker as the normal GET path"
+        );
     }
 
     // backlog#879: a later multipart part that loses a shard (read quorum still
