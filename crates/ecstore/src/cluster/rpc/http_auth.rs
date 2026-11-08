@@ -135,9 +135,10 @@ const SIGNATURE_VALID_DURATION: i64 = 300; // 5 minutes
 const REPLAY_CACHE_RETENTION: Duration = Duration::from_secs(301);
 // Preserve capacity for the full validity window at maximum accepted clock skew.
 const REPLAY_CACHE_CAPACITY_WINDOW_SECS: usize = 601;
-// Include a twice-reserved handle index, one UUID per expiry slot, up to
-// 601 partially filled pages, table rounding, and allocator bookkeeping.
-const REPLAY_CACHE_ENTRY_BYTES_ESTIMATE: usize = 80;
+// Allow for Vec growth, page handles, BTree nodes and allocator bookkeeping.
+const REPLAY_CACHE_PAGE_OVERHEAD_BYTES: u64 = 512;
+const REPLAY_CACHE_DEADLINE_OVERHEAD_BYTES: u64 = 512;
+const REPLAY_CACHE_INDEX_OVERHEAD_BYTES: u64 = 1024 * 1024;
 // Keep 16 CPU / 32 GiB field nodes at the 32M cap without requiring an env override.
 const REPLAY_CACHE_AUTO_MEMORY_PERCENT: u64 = 13;
 const REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU: usize = 4096;
@@ -222,8 +223,53 @@ struct ReplayCacheCapacityDecision {
     cpu_based_capacity: usize,
 }
 
-fn saturating_usize_from_u64(value: u64) -> usize {
-    usize::try_from(value).unwrap_or(usize::MAX)
+fn replay_cache_storage_bytes_estimate(capacity: usize) -> Option<u64> {
+    if capacity == 0 {
+        return Some(0);
+    }
+    let capacity = u64::try_from(capacity).ok()?;
+    // reserve_index keeps twice the logical limit. The locked hashbrown table
+    // rounds its 7/8 load factor to a power of two; a flat per-nonce allowance
+    // misses both the available space before a jump and the cost of that jump.
+    let buckets = capacity
+        .checked_mul(2)?
+        .max(8)
+        .checked_mul(8)?
+        .div_ceil(7)
+        .checked_next_power_of_two()?;
+    let index_entry_bytes = u64::try_from(std::mem::size_of::<usize>()).ok()?.checked_add(1)?;
+    let index_bytes = buckets.checked_mul(index_entry_bytes)?;
+    // The production allocator rounds the requested buffer to a size class.
+    // Allow a quarter above the table layout, as well as fixed bookkeeping.
+    let index_bytes = index_bytes
+        .checked_add(index_bytes.div_ceil(4))?
+        .checked_add(REPLAY_CACHE_INDEX_OVERHEAD_BYTES)?;
+    let page_slots = u64::try_from(RPC_NONCE_EXPIRATIONS_PER_PAGE).ok()?;
+    let deadlines = u64::try_from(REPLAY_CACHE_CAPACITY_WINDOW_SECS).ok()?;
+    // Each live signed expiry second can retain one partially filled page.
+    // Fully expired pages are reused before any new page is allocated.
+    let pages = capacity.div_ceil(page_slots).checked_add(deadlines)?;
+    let page_bytes = page_slots
+        .checked_mul(u64::try_from(std::mem::size_of::<Uuid>()).ok()?)?
+        .checked_add(REPLAY_CACHE_PAGE_OVERHEAD_BYTES)?;
+    index_bytes
+        .checked_add(pages.checked_mul(page_bytes)?)?
+        .checked_add(deadlines.checked_mul(REPLAY_CACHE_DEADLINE_OVERHEAD_BYTES)?)
+}
+
+fn replay_cache_capacity_for_memory(memory_limit_bytes: u64) -> usize {
+    let budget = memory_limit_bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
+    let mut low = 0;
+    let mut high = REPLAY_CACHE_AUTO_MAX_CAPACITY;
+    while low < high {
+        let candidate = low + (high - low).div_ceil(2);
+        if replay_cache_storage_bytes_estimate(candidate).is_some_and(|bytes| bytes <= budget) {
+            low = candidate;
+        } else {
+            high = candidate - 1;
+        }
+    }
+    low
 }
 
 fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Option<u64>) -> (usize, usize, usize) {
@@ -232,10 +278,7 @@ fn replay_cache_capacity_from_resources(cpu_count: usize, memory_limit_bytes: Op
         .saturating_mul(REPLAY_CACHE_AUTO_RPC_RPS_PER_CPU)
         .saturating_mul(REPLAY_CACHE_CAPACITY_WINDOW_SECS);
     let memory_based_capacity = memory_limit_bytes
-        .map(|bytes| {
-            let budget = bytes.saturating_mul(REPLAY_CACHE_AUTO_MEMORY_PERCENT) / 100;
-            saturating_usize_from_u64(budget / u64::try_from(REPLAY_CACHE_ENTRY_BYTES_ESTIMATE).unwrap_or(u64::MAX))
-        })
+        .map(replay_cache_capacity_for_memory)
         .unwrap_or(REPLAY_CACHE_AUTO_MAX_CAPACITY);
     // RPC fan-out and nonce intake are not bounded by local CPU throughput.
     // Prefer the memory budget; retain the CPU estimate only when memory is unknown.
@@ -571,6 +614,11 @@ impl RpcNonceCache {
         self.max_wall_time = self.max_wall_time.max(record.wall_time);
         if self.max_wall_time.saturating_sub(record.signed_at) > SIGNATURE_VALID_DURATION {
             return (Err(std::io::Error::other("RPC request timestamp expired after clock regression")), None);
+        }
+        // Timestamp validation precedes the cache lock. Recheck the forward
+        // bound so a clock rollback in between cannot exceed 601 expiry bins.
+        if record.signed_at.saturating_sub(self.max_wall_time) > SIGNATURE_VALID_DURATION {
+            return (Err(std::io::Error::other("Request timestamp expired")), None);
         }
         // A removed signature is already outside this high-water validity
         // fence, including after wall-clock rollback. No unexpired nonce is
@@ -3213,9 +3261,9 @@ mod tests {
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
         assert_eq!(decision.memory_basis, Some(MemoryBasis::Host));
-        assert_eq!(decision.memory_based_capacity, 27_917_287);
+        assert_eq!(decision.memory_based_capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
         assert_eq!(decision.cpu_based_capacity, 19_693_568);
-        assert_eq!(decision.capacity, 27_917_287);
+        assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
 
     #[test]
@@ -3225,13 +3273,13 @@ mod tests {
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(32 * gib), Some(MemoryBasis::Host));
 
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
-        assert_eq!(decision.memory_based_capacity, 55_834_574);
+        assert_eq!(decision.memory_based_capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
         assert_eq!(decision.cpu_based_capacity, 39_387_136);
         assert_eq!(decision.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
 
         let observed_field_node =
             replay_cache_capacity_decision(rustfs_utils::EnvParseOutcome::Absent, 16, Some(31 * gib), Some(MemoryBasis::Host));
-        assert_eq!(observed_field_node.memory_based_capacity, 54_089_744);
+        assert_eq!(observed_field_node.memory_based_capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
         assert_eq!(observed_field_node.cpu_based_capacity, 39_387_136);
         assert_eq!(observed_field_node.capacity, REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
@@ -3509,9 +3557,88 @@ mod tests {
             Some(MemoryBasis::Cgroup),
         );
         assert_eq!(decision.cpu_based_capacity, 4_923_392);
-        assert_eq!(decision.capacity, 4_771_020);
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(decision.capacity, 7_340_032);
+        assert!(replay_cache_storage_bytes_estimate(decision.capacity).expect("cache layout") <= 2800 * 1024 * 1024 * 13 / 100);
         assert_eq!(decision.capacity, decision.memory_based_capacity);
         assert_eq!(decision.source, ReplayCacheCapacitySource::Auto);
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn replay_cache_auto_sizing_uses_available_field_index_space() {
+        let (capacity, _, _) = replay_cache_capacity_from_resources(2, Some(2800 * 1024 * 1024));
+        let mut cache = RpcNonceCache::default();
+        cache
+            .reserve_index(capacity)
+            .expect("field-sized receiver index should reserve");
+
+        // The 10x4 receiver exhausted 4,771,020 entries while this index still
+        // had room and process RSS stayed below 450 MiB of its 2800 MiB limit.
+        assert_eq!(capacity, cache.nonces.capacity() / 2, "automatic sizing leaves usable index space idle");
+        assert!(capacity > 4_771_020, "automatic sizing must cover the reproduced field intake");
+    }
+
+    #[test]
+    fn nonce_cache_rechecks_forward_skew_when_recording_after_clock_rollback() {
+        let now = Instant::now();
+        let mut cache = RpcNonceCache::default();
+        let nonce = Uuid::from_u128(1);
+        // A timestamp checked at wall time 1000 can reach the cache after a
+        // rollback. It must not create an expiry bucket beyond the bounded window.
+        let error = cache
+            .check_and_record(test_nonce_record(nonce, 1300, now, 600, now, 2))
+            .0
+            .expect_err("recording must recheck the forward validity bound");
+        assert_eq!(error.to_string(), "Request timestamp expired");
+        assert!(cache.nonces.is_empty());
+        assert!(cache.expirations.deadlines.is_empty());
+        cache
+            .check_and_record(test_nonce_record(nonce, 900, now, 600, now, 2))
+            .0
+            .expect("maximum valid forward skew must remain accepted");
+    }
+
+    #[test]
+    fn replay_cache_storage_estimate_covers_locked_hashbrown_layouts() {
+        for capacity in [
+            1, 7, 8, 1024, 1_048_576, 3_670_016, 3_670_017, 4_771_020, 7_340_032, 7_340_033,
+        ] {
+            let mut cache = RpcNonceCache::default();
+            cache.reserve_index(capacity).expect("test receiver index should reserve");
+            let index = u64::try_from(cache.nonces.allocation_size()).expect("index allocation should fit");
+            let uuids = u64::try_from(capacity * std::mem::size_of::<Uuid>()).expect("nonce payload should fit");
+            assert!(
+                replay_cache_storage_bytes_estimate(capacity).expect("cache layout should fit") >= index + uuids,
+                "cache budget must cover the actual index allocation and nonce payload at {capacity}"
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_pointer_width = "64")]
+    fn replay_cache_storage_estimate_covers_native_allocator_rounding() {
+        // Production no_thp allocation with 601 live expiry bins: the index
+        // requested 37,748,752 bytes but occupied a 41,943,040-byte size class.
+        let native_peak = 71_608_808;
+        assert!(replay_cache_storage_bytes_estimate(1_244_160).expect("native cache layout") >= native_peak);
+    }
+
+    #[test]
+    fn replay_cache_memory_budget_bounds_both_sides_of_capacity_jumps() {
+        for memory in [0, 128, 512, 1024, 2800, 4096, 8192, 16_384, 32_768, 524_288] {
+            let memory = memory * 1024_u64 * 1024;
+            let budget = memory * REPLAY_CACHE_AUTO_MEMORY_PERCENT / 100;
+            let capacity = replay_cache_capacity_for_memory(memory);
+            assert!(replay_cache_storage_bytes_estimate(capacity).expect("selected layout should fit") <= budget);
+            if capacity < REPLAY_CACHE_AUTO_MAX_CAPACITY {
+                assert!(
+                    replay_cache_storage_bytes_estimate(capacity + 1).expect("next layout should be representable") > budget,
+                    "the next nonce must require more than the memory budget at {memory} bytes"
+                );
+            }
+        }
+        assert_eq!(replay_cache_capacity_for_memory(u64::MAX), REPLAY_CACHE_AUTO_MAX_CAPACITY);
     }
 
     #[test]
@@ -3587,7 +3714,7 @@ mod tests {
         assert_eq!(cpu_based, 9_846_784, "the old CPU estimate cannot cover this field workload");
         assert!(capacity >= 40_000 * 301);
         assert_eq!(capacity, memory_based);
-        assert!(u64::try_from(capacity).expect("capacity") * 80 <= memory * 13 / 100);
+        assert!(replay_cache_storage_bytes_estimate(capacity).expect("bounded cache layout") <= memory * 13 / 100);
     }
 
     #[test]

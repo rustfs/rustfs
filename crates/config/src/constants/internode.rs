@@ -190,8 +190,9 @@ const _: () = assert!(!DEFAULT_INTERNODE_RPC_REPLAY_SCOPE_STRICT);
 /// v3 request consumes both its v3 and compatibility-v2 nonces, so size for receiver nonce intake,
 /// not S3 request rate or CPU count.
 ///
-/// Auto sizing uses 13% of effective process memory, a conservative 80-byte entry allowance, this
-/// minimum floor and a 33,554,432-entry maximum. The CPU estimate is only a fallback when memory is unknown.
+/// Auto sizing budgets 13% of effective process memory for the rounded handle index, UUID pages,
+/// expiry fragmentation and allocation overhead, with this minimum floor and a 33,554,432-entry
+/// maximum. The CPU estimate is only a fallback when memory is unknown.
 /// Explicit operator values retain the floor and bypass the automatic memory budget; measure
 /// memory headroom before raising them. Overflow fails closed and increments
 /// `rustfs_system_network_internode_replay_cache_overflow_total`.
