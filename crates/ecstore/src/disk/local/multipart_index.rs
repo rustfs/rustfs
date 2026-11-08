@@ -372,29 +372,32 @@ impl IndexOwner {
         #[cfg(unix)]
         {
             use rustix::fs::{Mode, OFlags, mkdirat, openat};
-            let mut directories = vec![self._identity_pin.try_clone()?];
-            for component in [".rustfs.sys", "multipart-index-v1", &sha(bucket)] {
-                let parent = directories.last().ok_or_else(|| io::Error::other("index parent missing"))?;
-                match mkdirat(parent, component, Mode::RWXU | Mode::RWXG | Mode::RWXO) {
-                    Ok(()) | Err(rustix::io::Errno::EXIST) => {}
-                    Err(error) => return Err(error.into()),
+            let open_dir = |parent: rustix::fd::BorrowedFd<'_>, component: &str| -> io::Result<rustix::fd::OwnedFd> {
+                let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+                match openat(parent, component, flags, Mode::empty()) {
+                    Ok(dir) => Ok(dir),
+                    Err(rustix::io::Errno::NOENT) => {
+                        match mkdirat(parent, component, Mode::RWXU | Mode::RWXG | Mode::RWXO) {
+                            Ok(()) | Err(rustix::io::Errno::EXIST) => {}
+                            Err(error) => return Err(error.into()),
+                        }
+                        openat(parent, component, flags, Mode::empty()).map_err(Into::into)
+                    }
+                    Err(error) => Err(error.into()),
                 }
-                let directory = openat(
-                    parent,
-                    component,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                )?;
-                directories.push(std::fs::File::from(directory));
-            }
-            let parent = directories.last().ok_or_else(|| io::Error::other("index parent missing"))?;
+            };
+            use std::os::fd::AsFd;
+            let bucket_sha = sha(bucket);
+            let sys_dir = open_dir(self._identity_pin.as_fd(), ".rustfs.sys")?;
+            let index_dir = open_dir(sys_dir.as_fd(), "multipart-index-v1")?;
+            let parent = open_dir(index_dir.as_fd(), &bucket_sha)?;
             // The index is boot-local: every start rescans the staging area
             // before serving it, so a marker lost to a crash is recreated before
             // it can be consulted. Creation is enough; no fsync of the marker or
             // its ancestors. An existing marker is touched so pruning sees the
             // new upload's age, not the previous one's.
             match openat(
-                parent,
+                &parent,
                 source_root,
                 OFlags::CREATE | OFlags::EXCL | OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
                 Mode::RUSR | Mode::WUSR,
@@ -409,7 +412,7 @@ impl IndexOwner {
                     // the previous upload's age, which only shortens the prune
                     // grace for this key; index completeness does not depend on it.
                     if let Ok(marker) =
-                        openat(parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
+                        openat(&parent, source_root, OFlags::WRONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC, Mode::empty())
                     {
                         let _ = std::fs::File::from(marker).set_modified(std::time::SystemTime::now());
                     }
@@ -430,6 +433,18 @@ impl IndexOwner {
     }
 
     fn ensure_current_root(&self) -> io::Result<()> {
+        #[cfg(unix)]
+        let current = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = std::fs::symlink_metadata(&*self.root_path)?;
+            if !metadata.is_dir() {
+                return Err(io::Error::other("multipart index physical root is not a directory"));
+            }
+            let mut inode = [0; 16];
+            inode[..8].copy_from_slice(&metadata.ino().to_le_bytes());
+            (metadata.dev(), inode)
+        };
+        #[cfg(not(unix))]
         let current = os::PublicationRoot::new(&self.root_path)?.physical_identity()?;
         if current != self.physical {
             self.disabled.store(true, Ordering::Release);

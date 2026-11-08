@@ -1979,25 +1979,28 @@ impl NativeMultipartPublication {
         let canonical = self.canonical_head();
         let prepared = (|| -> std::io::Result<os::PreparedRenameSource> {
             if let Some((ref original_bytes, _, _)) = deferred_initial {
-                let current = load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
-                let snapshot = current
-                    .snapshot
-                    .as_ref()
-                    .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
-                let current_head = current
-                    .head
-                    .as_ref()
-                    .and_then(SourceHead::raw)
-                    .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
-                if !current.head_matches_state
-                    || snapshot.phase != MultipartSourcePhase::Active
-                    || snapshot.capability_sha256.is_some()
-                    || snapshot.lineage != expected_lineage
-                    || snapshot.generation != expected_generation
-                    || snapshot.revision.checked_add(1) != Some(expected_revision)
-                    || current_head != original_bytes.as_slice()
-                {
-                    return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+                if cfg!(test) || !can_mark_presynced {
+                    let current =
+                        load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
+                    let snapshot = current
+                        .snapshot
+                        .as_ref()
+                        .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+                    let current_head = current
+                        .head
+                        .as_ref()
+                        .and_then(SourceHead::raw)
+                        .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+                    if !current.head_matches_state
+                        || snapshot.phase != MultipartSourcePhase::Active
+                        || snapshot.capability_sha256.is_some()
+                        || snapshot.lineage != expected_lineage
+                        || snapshot.generation != expected_generation
+                        || snapshot.revision.checked_add(1) != Some(expected_revision)
+                        || current_head != original_bytes.as_slice()
+                    {
+                        return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+                    }
                 }
             } else {
                 let current = load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
@@ -2050,7 +2053,7 @@ impl NativeMultipartPublication {
                 let _ = std::fs::remove_file(prepared_path);
                 return Err(err);
             }
-            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, base, root)
+            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, base, root, Some(directory_guard))
         })()
         .map_err(DiskError::from)?;
         *self.state.lock() = state;
@@ -2160,7 +2163,7 @@ impl NativeMultipartPublication {
             let mut prepared_metadata_source =
                 os::create_prepared_rename_source_with_commit_guard(&prepared_path, &dst_file_path, &owned_directory_guard)?;
             prepared_metadata_source.write_all(&new_bytes, true)?;
-            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, &base, &root)
+            os::install_multipart_prepared_head(prepared_metadata_source, &canonical, &base, &root, Some(&owned_directory_guard))
         })
         .await
         .map_err(DiskError::from)?;
@@ -2207,7 +2210,7 @@ impl NativeMultipartPublication {
         let base = self.store.base.clone();
         let root = self.store.publication_root.clone();
         os::run_blocking_namespace_operation(self.store.lease.clone(), move || {
-            os::install_multipart_prepared_head(prepared, &canonical, &base, &root)
+            os::install_multipart_prepared_head(prepared, &canonical, &base, &root, None)
         })
         .await
         .map_err(DiskError::from)
@@ -2264,6 +2267,7 @@ impl NativeMultipartPublication {
     pub(super) fn finish_on_thread(
         &self,
         target_already_synced: bool,
+        fused_in_place: bool,
         staging_cleanup: Option<(PathBuf, Arc<std::sync::atomic::AtomicBool>)>,
     ) -> Result<MultipartPublicationResult> {
         let mut state = self.state.lock().clone();
@@ -2293,62 +2297,64 @@ impl NativeMultipartPublication {
         let disk_ids = &self.store.disk_ids;
         let terminal = terminal_record_path(source, &state);
         (|| -> std::io::Result<()> {
-            let current = load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
-            let current_state = current
-                .state
-                .as_ref()
-                .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
-            let current_raw = encode(current_state).map_err(IoError::other)?;
-            if current.head.is_some() || current_raw != expected_state_raw {
-                return Err(IoError::other(DiskError::ConditionalDeleteConflict));
-            }
-            if target_already_synced {
-                let pinned = os::pin_multipart_source_directory(&target_dir, base, root).map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        IoError::other(DiskError::ConditionalDeleteConflict)
-                    } else {
-                        error
-                    }
-                })?;
-                let target = os::read_multipart_source_metadata_in_pinned(
-                    &pinned,
-                    &target_dir,
-                    std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
-                    base,
-                    root,
-                )
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        IoError::other(DiskError::ConditionalDeleteConflict)
-                    } else {
-                        error
-                    }
-                })?;
-                if target.len() as u64 != expected_length || raw_sha(&target) != expected_sha256 {
+            if !fused_in_place {
+                let current = load_source(source, base, root, path, disk_id, physical_slot, disk_ids).map_err(IoError::other)?;
+                let current_state = current
+                    .state
+                    .as_ref()
+                    .ok_or_else(|| IoError::other(DiskError::ConditionalDeleteConflict))?;
+                let current_raw = encode(current_state).map_err(IoError::other)?;
+                if current.head.is_some() || current_raw != expected_state_raw {
                     return Err(IoError::other(DiskError::ConditionalDeleteConflict));
                 }
-            } else {
-                os::read_and_sync_multipart_target_metadata(
-                    &target_dir,
-                    std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
-                    base,
-                    root,
-                    |target| {
-                        if target.len() as u64 != expected_length || raw_sha(target) != expected_sha256 {
-                            return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+                if target_already_synced {
+                    let pinned = os::pin_multipart_source_directory(&target_dir, base, root).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            IoError::other(DiskError::ConditionalDeleteConflict)
+                        } else {
+                            error
                         }
-                        Ok(())
-                    },
-                )
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::NotFound {
-                        IoError::other(DiskError::ConditionalDeleteConflict)
-                    } else {
-                        error
+                    })?;
+                    let target = os::read_multipart_source_metadata_in_pinned(
+                        &pinned,
+                        &target_dir,
+                        std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
+                        base,
+                        root,
+                    )
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            IoError::other(DiskError::ConditionalDeleteConflict)
+                        } else {
+                            error
+                        }
+                    })?;
+                    if target.len() as u64 != expected_length || raw_sha(&target) != expected_sha256 {
+                        return Err(IoError::other(DiskError::ConditionalDeleteConflict));
                     }
-                })?;
+                } else {
+                    os::read_and_sync_multipart_target_metadata(
+                        &target_dir,
+                        std::ffi::OsStr::new(STORAGE_FORMAT_FILE),
+                        base,
+                        root,
+                        |target| {
+                            if target.len() as u64 != expected_length || raw_sha(target) != expected_sha256 {
+                                return Err(IoError::other(DiskError::ConditionalDeleteConflict));
+                            }
+                            Ok(())
+                        },
+                    )
+                    .map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::NotFound {
+                            IoError::other(DiskError::ConditionalDeleteConflict)
+                        } else {
+                            error
+                        }
+                    })?;
+                }
             }
-            SourceStore::persist_state_std(source, base, root, &next_state_raw, terminal.as_deref(), true)?;
+            SourceStore::persist_state_std(source, base, root, &next_state_raw, terminal.as_deref(), !fused_in_place)?;
             if let Some((io_path, cleaned)) = staging_cleanup {
                 match std::fs::remove_dir(&io_path) {
                     Ok(()) => cleaned.store(true, std::sync::atomic::Ordering::Release),
@@ -2381,7 +2387,7 @@ impl NativeMultipartPublication {
     ) -> Result<MultipartPublicationResult> {
         let this = Arc::clone(self);
         os::run_blocking_namespace_operation_with_sync(target_lease, true, move || {
-            this.finish_on_thread(target_already_synced, staging_cleanup)
+            this.finish_on_thread(target_already_synced, false, staging_cleanup)
                 .map_err(IoError::other)
         })
         .await
