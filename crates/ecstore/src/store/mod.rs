@@ -34,7 +34,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaWriteState};
+use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaSaveGate};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -482,9 +482,11 @@ pub struct ECStore {
     ///
     /// Immutable admission proofs share authority; publication, recovery and
     /// authority changes retain exclusive access through their existing I/O.
+    /// Each writer publishes its final state on release, and health
+    /// inspection reads that committed state without acquiring the gate.
     /// Lock order: acquire `pool_meta_save_gate`, then the distributed
     /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
-    pub(crate) pool_meta_save_gate: RwLock<PoolMetaWriteState>,
+    pub(crate) pool_meta_save_gate: PoolMetaSaveGate,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -557,7 +559,6 @@ impl Default for ScannerDataMovementPauseStatus {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PoolMetaWriteGateStatus {
     pub writes_ready: bool,
-    pub check_timed_out: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
     pub pool_meta_absent: bool,
@@ -573,7 +574,6 @@ impl Default for PoolMetaWriteGateStatus {
     fn default() -> Self {
         Self {
             writes_ready: true,
-            check_timed_out: false,
             write_blocked: false,
             transaction_aborted: false,
             pool_meta_absent: false,
@@ -1938,7 +1938,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         };
@@ -2013,7 +2013,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })

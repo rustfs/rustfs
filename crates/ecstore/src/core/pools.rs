@@ -6759,21 +6759,128 @@ impl PoolMetaWriteState {
     }
 
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
-        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
+        let (Some(mut context), _) = self.write_block() else {
             return Ok(());
-        }
-        let mut context = self
-            .block_context
-            .clone()
-            .or_else(|| {
-                self.transaction_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
-            .unwrap_or_else(|| pool_metadata_error(crate::error::PoolMetadataFailure::FenceLost, "external_fence", None));
+        };
         context.operation = operation.to_owned();
         Err(Error::other(context))
+    }
+
+    /// Returns the context blocking writes and whether the shared transaction
+    /// latch was set in the same observation.
+    ///
+    /// Outcomes latch, and recovery clears, the shared abort flag together with
+    /// its failure under the failure lock. Re-reading the flag under that lock
+    /// gives inspection that does not hold the gate one consistent transition.
+    fn write_block(&self) -> (Option<crate::error::PoolMetadataError>, bool) {
+        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
+            return (None, false);
+        }
+        let failure = self
+            .transaction_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let aborted = self.aborted_transaction.load(Ordering::SeqCst);
+        if !self.write_blocked && !aborted {
+            return (None, false);
+        }
+        let context = self
+            .block_context
+            .clone()
+            .or_else(|| failure.clone())
+            .unwrap_or_else(|| pool_metadata_error(crate::error::PoolMetadataFailure::FenceLost, "external_fence", None));
+        (Some(context), aborted)
+    }
+}
+
+/// Local pool metadata authority gate.
+///
+/// Readers hold an immutable admission proof. Writers serialize publication,
+/// recovery and authority changes. Every writer publishes the state it leaves
+/// while it still owns the gate, so inspection can read the last committed
+/// authority without queueing behind metadata I/O. The published copy shares
+/// the transaction latches with the live state, so an outcome that latches a
+/// failure after its writer released the gate is visible immediately.
+#[derive(Debug)]
+pub(crate) struct PoolMetaSaveGate {
+    state: tokio::sync::RwLock<PoolMetaWriteState>,
+    published: arc_swap::ArcSwap<PoolMetaWriteState>,
+}
+
+impl Default for PoolMetaSaveGate {
+    fn default() -> Self {
+        Self::new(PoolMetaWriteState::default())
+    }
+}
+
+impl PoolMetaSaveGate {
+    pub(crate) fn new(state: PoolMetaWriteState) -> Self {
+        Self {
+            published: arc_swap::ArcSwap::from_pointee(state.clone()),
+            state: tokio::sync::RwLock::new(state),
+        }
+    }
+
+    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, PoolMetaWriteState> {
+        self.state.read().await
+    }
+
+    pub(crate) fn try_read(
+        &self,
+    ) -> std::result::Result<tokio::sync::RwLockReadGuard<'_, PoolMetaWriteState>, tokio::sync::TryLockError> {
+        self.state.try_read()
+    }
+
+    pub(crate) async fn write(&self) -> PoolMetaSaveGateWriteGuard<'_> {
+        PoolMetaSaveGateWriteGuard {
+            state: self.state.write().await,
+            published: &self.published,
+        }
+    }
+
+    pub(crate) fn try_write(&self) -> std::result::Result<PoolMetaSaveGateWriteGuard<'_>, tokio::sync::TryLockError> {
+        self.state.try_write().map(|state| PoolMetaSaveGateWriteGuard {
+            state,
+            published: &self.published,
+        })
+    }
+
+    /// Returns the authority left by the most recent writer without waiting.
+    ///
+    /// Changes an active writer makes become visible when it releases the
+    /// gate; shared transaction latches are read live.
+    pub(crate) fn published(&self) -> Arc<PoolMetaWriteState> {
+        self.published.load_full()
+    }
+}
+
+/// Exclusive authority ownership that publishes its final state on release.
+#[derive(Debug)]
+pub(crate) struct PoolMetaSaveGateWriteGuard<'a> {
+    state: tokio::sync::RwLockWriteGuard<'a, PoolMetaWriteState>,
+    published: &'a arc_swap::ArcSwap<PoolMetaWriteState>,
+}
+
+impl std::ops::Deref for PoolMetaSaveGateWriteGuard<'_> {
+    type Target = PoolMetaWriteState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for PoolMetaSaveGateWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for PoolMetaSaveGateWriteGuard<'_> {
+    fn drop(&mut self) {
+        // The tokio guard is released after this body, so publications follow
+        // writer order and a later writer can never be overwritten by an
+        // earlier one.
+        self.published.store(Arc::new(self.state.clone()));
     }
 }
 
@@ -13514,11 +13621,7 @@ impl ECStore {
     pub(crate) async fn acquire_pool_meta_object_heal_fence(
         &self,
         target_pool_indices: &[usize],
-    ) -> Result<(
-        Arc<rustfs_lock::NamespaceLockGuard>,
-        Vec<Result<()>>,
-        tokio::sync::RwLockWriteGuard<'_, PoolMetaWriteState>,
-    )> {
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, Vec<Result<()>>, PoolMetaSaveGateWriteGuard<'_>)> {
         let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
@@ -14602,27 +14705,16 @@ impl ECStore {
         self.pool_meta_write_status().await.is_ok()
     }
 
-    /// A health probe must not wait behind a metadata transaction's disk I/O.
+    /// Inspects the authority committed by the most recent writer. Health must
+    /// not queue behind metadata transaction I/O or behind a writer waiting for
+    /// readers, so this never acquires the gate.
     pub async fn pool_meta_write_gate_status(&self) -> PoolMetaWriteGateStatus {
-        let Ok(write_state) = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.read()).await
-        else {
-            return PoolMetaWriteGateStatus {
-                writes_ready: false,
-                check_timed_out: true,
-                ..PoolMetaWriteGateStatus::default()
-            };
-        };
-        let transaction_aborted = write_state.aborted_transaction.load(Ordering::SeqCst);
-        let writes_ready = !write_state.write_blocked && !transaction_aborted;
-        let failure = if writes_ready {
-            None
-        } else {
-            write_state.ensure_write_safe("pool metadata snapshot").err()
-        };
-        let context = failure.as_ref().and_then(Error::pool_metadata_failure);
+        let write_state = self.pool_meta_save_gate.published();
+        let (block, transaction_aborted) = write_state.write_block();
+        let writes_ready = block.is_none();
+        let context = block.as_ref();
         PoolMetaWriteGateStatus {
             writes_ready,
-            check_timed_out: false,
             write_blocked: write_state.write_blocked,
             transaction_aborted,
             pool_meta_absent: write_state.pool_meta_absent,
@@ -14635,12 +14727,13 @@ impl ECStore {
         }
     }
 
-    /// A health probe must not wait behind a metadata transaction's disk I/O.
+    /// Readiness view of the committed authority; see
+    /// [`Self::pool_meta_write_gate_status`]. Mutating paths must keep calling
+    /// `ensure_write_safe` under the gate instead of relying on this view.
     pub async fn pool_meta_write_status(&self) -> Result<()> {
-        let write_state = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.read())
-            .await
-            .map_err(|_| Error::Timeout)?;
-        write_state.ensure_write_safe("pool metadata readiness")
+        self.pool_meta_save_gate
+            .published()
+            .ensure_write_safe("pool metadata readiness")
     }
 
     pub(crate) async fn heal_pool_meta_replica_under_fence(
@@ -14817,15 +14910,20 @@ impl ECStore {
         candidate.transaction_failure = Arc::clone(&state.transaction_failure);
         candidate.active_transactions = Arc::clone(&state.active_transactions);
         candidate.block_started_at = Arc::clone(&state.block_started_at);
+        {
+            // Inspection reads these shared latches without the gate; clear the
+            // flag and its failure in one failure-lock section.
+            let mut failure = state
+                .transaction_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.aborted_transaction.store(false, Ordering::SeqCst);
+            *failure = None;
+        }
         *state
             .block_started_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *state
-            .transaction_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        state.aborted_transaction.store(false, Ordering::SeqCst);
         *state = candidate;
         info!(
             event = EVENT_DECOMMISSION_STATE,
@@ -25150,8 +25248,8 @@ mod tests {
             .expect("first legacy mutation should enter")
             .expect("first legacy mutation should report entry");
         assert!(
-            store.pool_meta_save_gate.try_write().is_err(),
-            "legacy target I/O must retain the local pool metadata save gate"
+            store.pool_meta_save_gate.try_read().is_err(),
+            "legacy target I/O must retain exclusive ownership of the local pool metadata save gate"
         );
         let pool_meta_lock = store.pools[0]
             .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
@@ -27712,7 +27810,6 @@ mod tests {
         assert!(store.pool_meta_writes_ready().await);
         let recovered = store.pool_meta_write_gate_status().await;
         assert!(recovered.writes_ready);
-        assert!(!recovered.check_timed_out);
         assert!(!recovered.write_blocked);
         assert!(!recovered.transaction_aborted);
         assert_eq!((recovered.reason, recovered.phase, recovered.since_unix_secs), (None, None, None));
@@ -27752,10 +27849,38 @@ mod tests {
 
         let readiness = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
             .await
-            .expect("readiness inspection must keep its bounded wait");
+            .expect("readiness inspection must not wait for the authority gate");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
             .await
-            .expect("the authority snapshot must keep its bounded wait");
+            .expect("the authority snapshot must not wait for the authority gate");
+        assert!(
+            store.pool_meta_save_gate.try_write().is_err() && !admission.is_finished(),
+            "the read-only admission must still hold its authority reader while health is sampled"
+        );
+
+        // A local writer queued behind the parked reader blocks every later
+        // gate reader. Inspection must still answer from committed authority.
+        let queued_writer = tokio::spawn({
+            let store = store.clone();
+            async move { store.save_current_pool_meta_for_test(&[0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.pool_meta_save_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the local writer must queue behind the parked reader");
+        let queued_readiness = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not queue behind a waiting writer");
+        let queued_snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .expect("the authority snapshot must not queue behind a waiting writer");
+        assert!(
+            !admission.is_finished() && !queued_writer.is_finished(),
+            "the reader must still be parked and the writer still queued while health is sampled"
+        );
 
         drop(writer);
         let (read_fence, _) = tokio::time::timeout(std::time::Duration::from_secs(10), admission)
@@ -27764,29 +27889,147 @@ mod tests {
             .expect("the admission task must not panic")
             .expect("the durable metadata must still admit its ordinary read fence");
         drop(read_fence);
+        tokio::time::timeout(std::time::Duration::from_secs(10), queued_writer)
+            .await
+            .expect("the queued writer must make progress after the reader releases")
+            .expect("the queued writer task must not panic")
+            .expect("the queued pool metadata save must commit");
 
         readiness.expect("a read-only namespace wait must not hide unchanged writable authority");
         assert!(snapshot.writes_ready, "read-only I/O must not make authority unavailable: {snapshot:?}");
-        assert!(!snapshot.check_timed_out);
+        queued_readiness.expect("a queued writer must not hide unchanged writable authority");
+        assert!(
+            queued_snapshot.writes_ready,
+            "a queued writer must not make authority unavailable: {queued_snapshot:?}"
+        );
+        store
+            .pool_meta_write_status()
+            .await
+            .expect("the committed save must leave authority writable");
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn pool_meta_readiness_is_bounded_while_save_gate_is_held() {
+    async fn pool_meta_readiness_reports_committed_authority_while_save_gate_is_held() {
         let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
-        let _state = store.pool_meta_save_gate.write().await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+        let mut state = store.pool_meta_save_gate.write().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
             .await
-            .unwrap();
-        assert!(matches!(result, Err(Error::Timeout)));
+            .expect("readiness inspection must not wait for an active writer")
+            .expect("an active writer must not hide committed writable authority");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
             .await
-            .unwrap();
-        assert!(!snapshot.writes_ready);
-        assert!(snapshot.check_timed_out);
+            .expect("the authority snapshot must not wait for an active writer");
+        assert!(snapshot.writes_ready, "{snapshot:?}");
         assert!(!snapshot.write_blocked);
         assert!(!snapshot.transaction_aborted);
         assert_eq!((snapshot.reason, snapshot.phase, snapshot.since_unix_secs), (None, None, None));
+
+        // A latch installed by the writer commits when it releases the gate.
+        state.block_writes_after_fence_loss();
+        assert!(
+            store.pool_meta_write_gate_status().await.writes_ready,
+            "inspection reports the committed authority until the writer releases the gate"
+        );
+        drop(state);
+        let blocked = store.pool_meta_write_gate_status().await;
+        assert!(!blocked.writes_ready, "{blocked:?}");
+        assert!(blocked.write_blocked);
+        assert_eq!((blocked.reason, blocked.phase), (Some("fence_lost"), Some("format_heal")));
+        let err = store
+            .pool_meta_write_status()
+            .await
+            .expect_err("a released writer latch must fail readiness closed");
+        assert_eq!(
+            err.pool_metadata_failure()
+                .expect("the readiness failure must carry pool metadata context")
+                .kind,
+            crate::error::PoolMetadataFailure::FenceLost
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_readiness_observes_outcome_latch_while_save_gate_is_held() {
+        let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let arm = {
+            let state = store.pool_meta_save_gate.write().await;
+            let mut arm = state.arm_transaction();
+            arm.phase = Some("publication");
+            arm
+        };
+        // The outcome outlives its writer while another writer owns the gate.
+        let writer = store.pool_meta_save_gate.write().await;
+        drop(arm);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .expect("the authority snapshot must not wait for an active writer");
+        assert!(!status.writes_ready, "{status:?}");
+        assert!(status.transaction_aborted);
+        assert!(!status.write_blocked);
+        assert_eq!((status.reason, status.phase), (Some("transaction_unknown"), Some("publication")));
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not wait for an active writer")
+            .expect_err("a live outcome latch must fail readiness closed while a writer is active");
+        assert_eq!(
+            err.pool_metadata_failure()
+                .expect("the readiness failure must carry pool metadata context")
+                .kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        drop(writer);
+        assert!(
+            !store.pool_meta_writes_ready().await,
+            "releasing an unrelated writer must not clear the latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_meta_save_gate_publishes_every_writer_release() {
+        let gate = PoolMetaSaveGate::default();
+        {
+            let mut state = gate.try_write().expect("an idle gate must admit a writer");
+            state.block_writes_after_fence_loss();
+            gate.published()
+                .ensure_write_safe("writer still active")
+                .expect("a writer's latch is not published before it releases the gate");
+        }
+        let err = gate
+            .published()
+            .ensure_write_safe("try_write released")
+            .expect_err("releasing a try_write guard must publish its latch");
+        let context = err
+            .pool_metadata_failure()
+            .expect("the published failure must carry pool metadata context");
+        assert_eq!(
+            (context.kind, context.phase),
+            (crate::error::PoolMetadataFailure::FenceLost, "format_heal"),
+            "the published copy must carry the writer's block context, not the external-fence fallback"
+        );
+
+        *gate.write().await = PoolMetaWriteState::default();
+        gate.published()
+            .ensure_write_safe("replacement released")
+            .expect("releasing a whole-state replacement must publish it");
+
+        // The published copy shares the replacement's live transaction latches.
+        let arm = {
+            let state = gate.write().await;
+            let mut arm = state.arm_transaction();
+            arm.phase = Some("publication");
+            arm
+        };
+        gate.published()
+            .ensure_write_safe("outcome armed")
+            .expect("an armed outcome alone must not block writes");
+        drop(arm);
+        let (block, aborted) = gate.published().write_block();
+        assert!(aborted, "an outcome latch must reach the published copy without another writer");
+        assert_eq!(
+            block.expect("the outcome latch must block writes").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
     }
 
     #[tokio::test]
@@ -27805,7 +28048,6 @@ mod tests {
         }
         let original = store.pool_meta_write_gate_status().await;
         assert!(!original.writes_ready);
-        assert!(!original.check_timed_out);
         assert!(!original.write_blocked);
         assert!(original.transaction_aborted);
         assert_eq!(original.reason, Some("transaction_unknown"));
@@ -31109,7 +31351,7 @@ mod pools_tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(cancelers),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::RwLock::new(super::PoolMetaWriteState::for_test_bootstrap()),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(super::PoolMetaWriteState::for_test_bootstrap()),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
