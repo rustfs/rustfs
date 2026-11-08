@@ -3407,7 +3407,7 @@ fn hyper_body_write_close_kind(debug: &str) -> Option<&'static str> {
 
 fn rpc_auth_failure_status(error: &std::io::Error) -> Status {
     if storage::rpc_auth_is_resource_exhausted(error) {
-        Status::resource_exhausted("RPC replay admission exhausted")
+        crate::error::rpc_replay_admission_exhausted_status()
     } else if storage::tonic_rpc_auth_failure_reason(error) == "stale_boot_epoch" {
         Status::unavailable("RPC boot epoch changed")
     } else {
@@ -7024,7 +7024,11 @@ mod tests {
             storage::RpcReplayCacheAdmissionError::MemoryBudget,
         ] {
             let error = std::io::Error::new(std::io::ErrorKind::WouldBlock, source);
-            assert_eq!(rpc_auth_failure_status(&error).code(), tonic::Code::ResourceExhausted);
+            let status = rpc_auth_failure_status(&error);
+            assert_eq!(status.code(), tonic::Code::ResourceExhausted);
+            let api = crate::error::ApiError::from(crate::storage_api::error::StorageError::from(status));
+            let response = s3s::S3Error::from(api);
+            assert_eq!(response.status_code(), Some(http::StatusCode::SERVICE_UNAVAILABLE));
         }
         for message in [
             "RPC request replay detected",
