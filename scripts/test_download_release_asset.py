@@ -62,6 +62,11 @@ else:
     def test_download_failure_preserves_destination(self):
         self.assert_failed_atomically(self.invoke(FAIL_DOWNLOAD="1"))
 
+    def test_missing_gh_fails_without_replacing_destination(self):
+        (self.root / "gh").unlink()
+        self.env["PATH"] = str(self.root)
+        self.assert_failed_atomically(self.invoke())
+
     def test_metadata_failure_preserves_destination(self):
         self.assert_failed_atomically(self.invoke(FAIL_METADATA="1"))
 

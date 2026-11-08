@@ -1149,6 +1149,10 @@ jobs:
           MC_VERSION: RELEASE.2025-08-13T08-35-41Z
           MC_SHA256: 01f866e9c5f9b87c2b09116fa5d7c06695b106242d829a8bb32990c00312e891
         run: |
+          if ! command -v gh >/dev/null 2>&1; then
+            sudo apt-get update
+            sudo apt-get install -y gh
+          fi
           MC_BINARY="mc.linux-amd64.${MC_VERSION}"
           python3 .github/actions/setup/download_release_asset.py --repository minio/mc --tag "$MC_VERSION" --asset "$MC_BINARY" --output "$RUNNER_TEMP/mc" --sha256 "$MC_SHA256"
           echo "${MC_SHA256}  $RUNNER_TEMP/mc" | sha256sum --check --status
