@@ -979,6 +979,7 @@ async fn restore_delete_rollback_with_namespace_owner(
             .insert(backup_path.clone());
         os::rename_all_with_owner(&backup_path, xl_path, object_dir, publication_root, namespace_owner.clone()).await
     };
+    let restored_backup = restored.is_ok();
     match restored {
         Ok(()) => {}
         Err(DiskError::FileNotFound) if remove_new_metadata => {
@@ -1008,6 +1009,16 @@ async fn restore_delete_rollback_with_namespace_owner(
         os::fsync_dir_with_owner(object_dir, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;
+    }
+    if restored_backup {
+        // Renaming two hardlinks to the same inode can leave the backup in place.
+        match os::remove_file_with_owner(&backup_path, namespace_owner.clone()).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == ErrorKind::NotFound => {}
+            Err(err) => return Err(to_file_error(err).into()),
+        }
+    }
+    if effective_durability(volume).syncs_commit_metadata() {
         os::fsync_dir_with_owner(&rollback_path, namespace_owner.clone())
             .await
             .map_err(to_file_error)?;
@@ -3799,6 +3810,25 @@ async fn read_dir_entries_with_walk_stall(path: &Path, count: i32, stall: Option
 const WALK_DIR_BATCH_SIZE: usize = 32;
 #[cfg(not(test))]
 const WALK_DIR_BATCH_SIZE: usize = 256;
+
+async fn read_identifier_tree_entries(path: &Path, leaf: &str, stall: Option<Duration>) -> Result<Vec<String>> {
+    let mut entries = read_dir_with_walk_stall(path.to_path_buf(), stall).await?;
+    let mut names = Vec::new();
+    loop {
+        let (next, batch, eof) = read_dir_entry_batch_with_walk_stall(entries, READ_DIR_BATCH_SIZE, stall).await?;
+        entries = next;
+        // Filter before retaining or sorting the inventory. A report flood
+        // costs directory iteration, not one retained name/metadata read per report.
+        names.extend(batch.into_iter().filter(|name| {
+            name.strip_suffix(SLASH_SEPARATOR)
+                .is_some_and(|component| component == leaf || super::is_identifier_tree_component(component))
+        }));
+        if eof {
+            return Ok(names);
+        }
+    }
+}
+
 const READ_DIR_BATCH_SIZE: usize = 512;
 
 async fn read_dir_with_walk_stall(path: PathBuf, stall: Option<Duration>) -> Result<std::fs::ReadDir> {
@@ -11767,6 +11797,14 @@ impl LocalDisk {
         W: AsyncWrite + Unpin + Send + 'a,
     {
         Box::pin(async move {
+            if opts.identifier_tree_leaf.is_some() {
+                let relative = current
+                    .strip_prefix(&opts.base_dir)
+                    .ok_or_else(|| DiskError::other("identifier-tree walk escaped its root"))?;
+                if relative.split('/').filter(|component| !component.is_empty()).count() > 512 {
+                    return Err(DiskError::other("identifier-tree walk exceeds its directory depth limit"));
+                }
+            }
             // The part of forward_to below this directory, taken before `current`
             // loses its trailing slash.
             let forward_rest = opts
@@ -11799,7 +11837,12 @@ impl LocalDisk {
             // as a single logical read in API semantics.
             let read_dir_started = rustfs_io_metrics::get_stage_metrics_enabled().then(std::time::Instant::now);
             let dir_path_abs = self.io_get_object_path(&opts.bucket, current.trim_start_matches(SLASH_SEPARATOR))?;
-            let read_dir_result = match read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await {
+            let read_dir_result = if let Some(leaf) = opts.identifier_tree_leaf.as_deref() {
+                read_identifier_tree_entries(&dir_path_abs, leaf, stall).await
+            } else {
+                read_dir_entries_with_walk_stall(&dir_path_abs, -1, stall).await
+            };
+            let read_dir_result = match read_dir_result {
                 Err(err) if err == Error::FileNotFound && !skip_access_checks(&opts.bucket) => {
                     let volume_dir = self.io_get_bucket_path(&opts.bucket)?;
                     if let Err(access_err) = cached_access(&volume_dir).await {
@@ -12096,6 +12139,16 @@ impl LocalDisk {
                     return Ok(true);
                 }
 
+                if let Some(leaf) = opts.identifier_tree_leaf.as_deref()
+                    && entry != leaf
+                {
+                    // Identifier directories can be namespaces at any depth,
+                    // including components named tables or maintenance. Their
+                    // own object metadata is outside this selected leaf scan.
+                    schedule_dir(&mut dir_stack, format!("{name}/"), true, None, true, false);
+                    continue;
+                }
+
                 let mut meta = MetaCacheEntry {
                     name,
                     ..Default::default()
@@ -12145,7 +12198,8 @@ impl LocalDisk {
                             } else {
                                 adaptive_batch_cap
                             };
-                            let batch_names = if batch_limit > 1
+                            let batch_names = if opts.identifier_tree_leaf.is_none()
+                                && batch_limit > 1
                                 && dir_objes.is_empty()
                                 && dir_stack.iter().all(|(_, _, _, scan_required, _)| !*scan_required)
                             {
@@ -12198,6 +12252,11 @@ impl LocalDisk {
                             write_metacache_obj(out, &meta).await?;
                         }
 
+                        if opts.identifier_tree_leaf.is_some() {
+                            // A dotted leaf cannot contain identifier-tree descendants.
+                            continue;
+                        }
+
                         let has_namespace_child_candidate = read.has_namespace_child_candidate;
                         let dir_to_skip: HashSet<String> = if has_namespace_child_candidate || !dir_objes.is_empty() {
                             read.data_dirs.into_iter().map(|dir| dir.to_string()).collect()
@@ -12244,6 +12303,9 @@ impl LocalDisk {
                     }
                     Err(err) => {
                         if err == Error::FileNotFound || err == Error::IsNotRegular {
+                            if opts.identifier_tree_leaf.is_some() {
+                                continue;
+                            }
                             adaptive_batch_cap = 1;
                             // NOT an object, append to stack (with slash)
                             // If dirObject, but no metadata (which is unexpected) we skip it.
@@ -15458,6 +15520,12 @@ impl DiskAPI for LocalDisk {
         super::lifecycle_test_io::observe(&opts.bucket, None);
         self.wait_for_startup_cleanup().await;
 
+        if let Some(leaf) = opts.identifier_tree_leaf.as_deref()
+            && (!opts.recursive || !opts.base_dir.ends_with('/') || !super::is_identifier_tree_leaf(leaf))
+        {
+            return Err(DiskError::other("invalid identifier-tree walk options"));
+        }
+
         // Callers that do not pin a stall budget inherit the configured default, so
         // every local walk keeps a liveness bound even when the wrapper-level total
         // timeout is skipped.
@@ -15484,7 +15552,7 @@ impl DiskAPI for LocalDisk {
 
         let mut skip_current_dir_object = false;
         let mut multipart_dir_to_skip: HashSet<String> = HashSet::new();
-        if opts.base_dir.ends_with(SLASH_SEPARATOR) {
+        if opts.identifier_tree_leaf.is_none() && opts.base_dir.ends_with(SLASH_SEPARATOR) {
             if let Ok(data) = with_walk_stall_timeout(
                 stall,
                 self.read_listing_metadata(
@@ -19721,6 +19789,55 @@ mod test {
             }
             assert_eq!(reader.limit_reached(), Some(expected_limit_reached), "limit={limit}");
         }
+    }
+
+    #[tokio::test]
+    async fn identifier_tree_walk_filters_report_batches_and_bounds_depth() {
+        let dir = tempfile::tempdir().expect("create disk fixture");
+        let root = dir.path().join("catalog/prefix");
+        fs::create_dir_all(root.join("sales"))
+            .await
+            .expect("create identifier directory");
+        fs::create_dir_all(root.join("table-entry.json"))
+            .await
+            .expect("create selected leaf");
+        for index in 0..READ_DIR_BATCH_SIZE * 3 + 1 {
+            fs::create_dir(root.join(format!("report-{index}.json")))
+                .await
+                .expect("create report directory");
+        }
+        let mut names = read_identifier_tree_entries(&root, "table-entry.json", Some(Duration::from_secs(5)))
+            .await
+            .expect("all directory batches should be filtered");
+        names.sort();
+        assert_eq!(names, ["sales/", "table-entry.json/"]);
+
+        let endpoint = Endpoint::try_from(dir.path().to_str().expect("UTF-8 fixture path")).expect("valid endpoint");
+        let disk = LocalDisk::new(&endpoint, false).await.expect("create local disk");
+        let options = WalkDirOptions {
+            bucket: "catalog".to_string(),
+            base_dir: "prefix/".to_string(),
+            recursive: true,
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            ..Default::default()
+        };
+        let mut output = Vec::new();
+        let mut writer = MetacacheWriter::new(&mut output);
+        let mut count = 0;
+        let error = disk
+            .scan_dir(
+                format!("prefix/{}", "a/".repeat(513)),
+                String::new(),
+                &options,
+                &mut writer,
+                &mut count,
+                true,
+                None,
+            )
+            .await
+            .expect_err("excessive depth must fail before filesystem I/O");
+        assert!(error.to_string().contains("directory depth limit"));
+        assert_eq!(count, 0);
     }
 
     // #4644: the stall budget bounds a single drive read, never the walk as a

@@ -527,8 +527,8 @@ mod decommission_lock_order_tests {
             rebalance_meta: tokio::sync::RwLock::new(other_store.rebalance_meta.read().await.clone()),
             decommission_cancelers: tokio::sync::RwLock::new(vec![None; other_store.pools.len()]),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(
-                other_store.pool_meta_save_gate.lock().await.independent_clone_for_test(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(
+                other_store.pool_meta_save_gate.write().await.independent_clone_for_test(),
             ),
             ctx,
             bucket_fence_registry: Arc::default(),

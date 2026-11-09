@@ -1815,43 +1815,6 @@ fn table_data_plane_index_miss_scan_rejects_catalogs_above_its_object_limit() {
 }
 
 #[test]
-fn table_data_plane_index_miss_scan_skips_only_a_table_maintenance_subtree() {
-    let prefix = "catalog/namespaces/";
-    let skip = |object: &str| maintenance_subtree_skip_cursor(prefix, &format!("{prefix}{object}"));
-    assert_eq!(
-        skip("sales/tables/orders/maintenance/hash/jobs/job.json").as_deref(),
-        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
-    );
-    assert_eq!(
-        skip("sales/tables/orders/maintenance/hash/config.json").as_deref(),
-        Some("catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}")
-    );
-    // A table or namespace literally named "maintenance" is not a subtree.
-    assert_eq!(skip("sales/tables/maintenance/table-entry.json"), None);
-    assert_eq!(skip("maintenance/tables/orders/table-entry.json"), None);
-    assert_eq!(
-        skip("maintenance/tables/maintenance/maintenance/hash/jobs/job.json").as_deref(),
-        Some("catalog/namespaces/maintenance/tables/maintenance/maintenance/\u{10ffff}")
-    );
-    // Entries, bridges, views and a bare file named maintenance never jump.
-    assert_eq!(skip("sales/tables/orders/table-entry.json"), None);
-    assert_eq!(skip("sales/tables/orders/external-catalog/bridge.json"), None);
-    assert_eq!(skip("sales/views/report/maintenance/hash/jobs/job.json"), None);
-    assert_eq!(skip("sales/tables/orders/maintenance"), None);
-    assert_eq!(skip("sales/namespace.json"), None);
-    assert_eq!(maintenance_subtree_skip_cursor(prefix, "other/sales/tables/orders/maintenance/x/y"), None);
-    // The jump lands before the entry that follows the subtree.
-    assert!(
-        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
-            < "catalog/namespaces/sales/tables/orders/table-entry.json"
-    );
-    assert!(
-        "catalog/namespaces/sales/tables/orders/maintenance/\u{10ffff}"
-            < "catalog/namespaces/sales/tables/orders0/table-entry.json"
-    );
-}
-
-#[test]
 fn catalog_lock_authority_failures_are_typed_as_unavailable() {
     for error in [
         rustfs_lock::LockError::timeout("table-publication", StdDuration::from_secs(5)),
@@ -6880,39 +6843,123 @@ async fn seed_noise_table_with_job_reports(
 
 #[tokio::test]
 async fn table_data_plane_index_miss_scan_pages_scale_with_entries_not_job_reports() {
+    let mut baseline_pages = None;
+    for reports in [0, 80] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse("sales").expect("namespace should parse");
+        let table = IdentifierSegment::parse("orders").expect("table should parse");
+        let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+        let object = "tables/table-id/data/part-00001.parquet";
+
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+            .await
+            .expect("warehouse index entry should be removed");
+        // Keep the same table inventory with and without historical job reports.
+        let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
+        for index in 0..1000 {
+            let noise_table = IdentifierSegment::parse(format!("noise-{index:04}")).expect("table should parse");
+            seed_noise_table_with_job_reports(&store, bucket, &noise_namespace, &noise_table, &format!("noise-{index}"), reports)
+                .await;
+        }
+        backend.reset_call_counts().await;
+
+        let resource = table_data_plane_resource_for_object(&store, bucket, object)
+            .await
+            .expect("job history must not exhaust the index-miss listing budget")
+            .expect("the scan must retain table-aware protection");
+        assert_eq!(resource.table, "orders");
+        let pages = backend.list_call_count().await;
+        assert!(pages > 0, "the missing index must exercise enumeration");
+        if let Some(expected) = baseline_pages {
+            assert_eq!(pages, expected, "job history must not consume ownership listing pages");
+        } else {
+            baseline_pages = Some(pages);
+        }
+    }
+}
+
+#[tokio::test]
+async fn table_entry_scan_preserves_nested_namespaces_named_like_maintenance() {
+    for name in ["sales", "sales.tables.orders.maintenance"] {
+        let backend = TestCatalogObjectBackend::default();
+        let store = ObjectTableCatalogStore::new(backend.clone());
+        let bucket = "analytics";
+        let namespace = Namespace::parse(name).expect("namespace should parse");
+        let owner = IdentifierSegment::parse("zz-owner").expect("owner should parse");
+        let current = default_table_metadata_file_path(&namespace, &owner, "00001.metadata.json");
+        seed_table_for_metadata_maintenance(&store, bucket, &namespace, &owner, current).await;
+        backend
+            .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+            .await
+            .expect("remove the owner index to exercise catalog fallback");
+        for index in 0..1000 {
+            let table = IdentifierSegment::parse(format!("table-{index:04}")).expect("table should parse");
+            seed_noise_table_with_job_reports(&store, bucket, &namespace, &table, &format!("id-{index}"), 0).await;
+        }
+        let resource = store
+            .resolve_table_data_plane_resource_for_authorization(bucket, "tables/table-id/data/part.parquet")
+            .await
+            .expect("registered table entries must remain enumerable")
+            .unwrap_or_else(|| panic!("namespace {name} lost its table owner across a page boundary"));
+        assert_eq!(resource.namespace, name);
+        assert_eq!(resource.table, "zz-owner");
+    }
+}
+
+#[tokio::test]
+async fn object_maintenance_preserves_an_owner_after_nested_namespace_page_boundary() {
     let backend = TestCatalogObjectBackend::default();
     let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").expect("namespace should parse");
     let table = IdentifierSegment::parse("orders").expect("table should parse");
-    let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
-    let object = "tables/table-id/data/part-00001.parquet";
-
-    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
+    let orphan = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
+    seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
     backend
-        .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
+        .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
+        .await;
+    backend.seed_object(bucket, &orphan, br#"{"metadata-log":[]}"#.to_vec()).await;
+    let report = store
+        .plan_table_metadata_maintenance(bucket, "sales", "orders", 0)
         .await
-        .expect("warehouse index entry should be removed");
-    // 1000 honest tables with 80 historical job reports each: ~80 pages of
-    // objects, beyond the fixed page budget on its own, yet well within one
-    // extra page per table entry.
-    let noise_namespace = Namespace::parse("noise").expect("namespace should parse");
-    for index in 0..1000 {
-        let noise_table = IdentifierSegment::parse(format!("noise-{index:04}")).expect("table should parse");
-        seed_noise_table_with_job_reports(&store, bucket, &noise_namespace, &noise_table, &format!("noise-{index}"), 80).await;
-    }
-    backend.reset_call_counts().await;
+        .expect("the unowned old metadata should initially be a cleanup candidate");
+    assert_eq!(report.deletable_metadata_locations, vec![orphan.clone()]);
 
-    let resource = table_data_plane_resource_for_object(&store, bucket, object)
+    let nested = Namespace::parse("sales.tables.orders.maintenance").expect("nested namespace should parse");
+    store
+        .create_namespace(test_namespace_entry(bucket, &nested))
         .await
-        .expect("job history must not exhaust the index-miss listing budget")
-        .expect("the scan must retain table-aware protection");
-    assert_eq!(resource.table, "orders");
-    let pages = backend.list_call_count().await;
+        .expect("nested namespace should be created");
+    for index in 0..1100 {
+        let noise = IdentifierSegment::parse(format!("table-{index:04}")).expect("table should parse");
+        seed_noise_table_with_job_reports(&store, bucket, &nested, &noise, &format!("noise-{index}"), 0).await;
+    }
+    let owner = IdentifierSegment::parse("zz-owner").expect("owner should parse");
+    let mut other = test_table_entry(bucket, &nested, &owner, orphan.clone());
+    other.table_id = "other-id".to_string();
+    other.table_uuid = "other-uuid".to_string();
+    other.warehouse_location = format!("s3://{bucket}/tables/other-id");
+    store
+        .create_table(other)
+        .await
+        .expect("another table may adopt the metadata before cleanup");
+    let deletes_before = backend.state.lock().await.delete_attempts.clone();
+    let result = store
+        .delete_table_metadata_maintenance_report(bucket, "sales", "orders", report)
+        .await;
     assert!(
-        pages > TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES && pages <= TABLE_DATA_PLANE_INDEX_MISS_SCAN_MAX_PAGES + 1001,
-        "the honest catalog needs {pages} pages: more than the fixed budget, at most one extra per entry"
+        backend
+            .object_exists(bucket, &orphan)
+            .await
+            .expect("read back the current owner's metadata")
     );
+    assert_eq!(backend.state.lock().await.delete_attempts, deletes_before);
+    assert_matches!(result, Err(TableCatalogStoreError::Conflict(message)) if message.contains("exclusive metadata"));
 }
 
 #[tokio::test]
@@ -6930,8 +6977,7 @@ async fn table_data_plane_index_miss_scan_bounds_a_job_report_flood_under_one_ta
         .delete_object(RUSTFS_META_BUCKET, &store.paths.warehouse_index_entry_path(bucket, "tables/table-id/"))
         .await
         .expect("warehouse index entry should be removed");
-    // A table-scoped principal floods one table's job history: 70 reports per
-    // page budget would have exhausted the old fixed budget bucket-wide.
+    // Historical report volume must not consume ownership pagination.
     for job in 0..70_000 {
         backend
             .seed_object(
@@ -6951,7 +6997,7 @@ async fn table_data_plane_index_miss_scan_bounds_a_job_report_flood_under_one_ta
         .expect("the scan must retain table-aware protection");
     assert_eq!(resource.table, "orders");
     let pages = backend.list_call_count().await;
-    assert!(pages <= 2, "the page that ends inside the flood skips the rest of it, not {pages} pages");
+    assert!(pages <= 2, "report history must not consume {pages} ownership pages");
 }
 
 #[tokio::test]

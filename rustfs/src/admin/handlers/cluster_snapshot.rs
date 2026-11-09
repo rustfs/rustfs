@@ -208,9 +208,7 @@ pub(crate) struct ClusterPoolMetaWriteGateView {
 
 impl From<ClusterPoolMetaWriteGateSnapshot> for ClusterPoolMetaWriteGateView {
     fn from(snapshot: ClusterPoolMetaWriteGateSnapshot) -> Self {
-        let state = if snapshot.check_timed_out {
-            "check_timeout"
-        } else if snapshot.writes_ready {
+        let state = if snapshot.writes_ready {
             "writable"
         } else if snapshot.write_blocked || snapshot.transaction_aborted {
             "blocked"
@@ -703,7 +701,6 @@ fn summarize_storage_readiness(snapshot: &ClusterReadOnlySnapshot) -> Capability
         .filter_map(|reason| match reason {
             ReadinessDegradedReason::StorageQuorumUnavailable
             | ReadinessDegradedReason::PoolMetaWriteBlocked
-            | ReadinessDegradedReason::PoolMetadataCheckTimeout
             | ReadinessDegradedReason::StorageAndIamUnavailable
             | ReadinessDegradedReason::StorageAndLockUnavailable
             | ReadinessDegradedReason::StorageIamAndLockUnavailable => Some(reason.as_str()),
@@ -1112,14 +1109,6 @@ mod tests {
 
         for (snapshot, state) in [
             (ClusterPoolMetaWriteGateSnapshot::default(), "writable"),
-            (
-                ClusterPoolMetaWriteGateSnapshot {
-                    writes_ready: false,
-                    check_timed_out: true,
-                    ..Default::default()
-                },
-                "check_timeout",
-            ),
             (
                 ClusterPoolMetaWriteGateSnapshot {
                     writes_ready: false,

@@ -108,7 +108,6 @@ pub struct ClusterListingDiagnosticsSnapshot {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClusterPoolMetaWriteGateSnapshot {
     pub writes_ready: bool,
-    pub check_timed_out: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
     pub pool_meta_absent: bool,
@@ -124,7 +123,6 @@ impl Default for ClusterPoolMetaWriteGateSnapshot {
     fn default() -> Self {
         Self {
             writes_ready: true,
-            check_timed_out: false,
             write_blocked: false,
             transaction_aborted: false,
             pool_meta_absent: false,
@@ -230,7 +228,6 @@ async fn current_pool_meta_write_gate_snapshot() -> ClusterPoolMetaWriteGateSnap
             let status = store.pool_meta_write_gate_status().await;
             ClusterPoolMetaWriteGateSnapshot {
                 writes_ready: status.writes_ready,
-                check_timed_out: status.check_timed_out,
                 write_blocked: status.write_blocked,
                 transaction_aborted: status.transaction_aborted,
                 pool_meta_absent: status.pool_meta_absent,

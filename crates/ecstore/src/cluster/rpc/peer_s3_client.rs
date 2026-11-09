@@ -18,7 +18,7 @@ use crate::cluster::rpc::client::{
     node_service_time_out_client,
 };
 use crate::cluster::rpc::set_tonic_mutation_body_digest;
-use crate::core::pools::{PoolMeta, PoolMetaWriteState};
+use crate::core::pools::{PoolMeta, PoolMetaSaveGate, PoolMetaSaveGateWriteGuard};
 use crate::disk::error::DiskError;
 use crate::disk::error::{Error, Result};
 use crate::disk::error_reduce::{BUCKET_OP_IGNORED_ERRS, is_all_buckets_not_found, reduce_write_quorum_errs};
@@ -798,12 +798,12 @@ fn try_acquire_bucket_heal_movement_guard<'a>(
 }
 
 async fn acquire_bucket_heal_write_guard<'a>(
-    gate: Option<&'a tokio::sync::Mutex<PoolMetaWriteState>>,
-) -> Result<Option<tokio::sync::MutexGuard<'a, PoolMetaWriteState>>> {
+    gate: Option<&'a PoolMetaSaveGate>,
+) -> Result<Option<PoolMetaSaveGateWriteGuard<'a>>> {
     let Some(gate) = gate else {
         return Ok(None);
     };
-    let guard = gate.lock().await;
+    let guard = gate.write().await;
     guard
         .ensure_write_safe("bucket heal cannot run while pool metadata requires recovery")
         .map_err(|e| e.narrow_to_disk().unwrap_or_else(Error::other))?;
@@ -2388,8 +2388,8 @@ mod tests {
 
     #[tokio::test]
     async fn local_bucket_heal_refuses_receiver_with_unsafe_pool_metadata() {
-        let gate = tokio::sync::Mutex::new(PoolMetaWriteState::default());
-        gate.lock().await.observe_replicas(PoolMetaReplicaState {
+        let gate = PoolMetaSaveGate::default();
+        gate.write().await.observe_replicas(PoolMetaReplicaState {
             needs_repair: true,
             repair_write_safe: false,
         });
