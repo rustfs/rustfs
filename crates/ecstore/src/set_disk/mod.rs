@@ -4608,6 +4608,19 @@ fn marker_purge_receipt_path(
 }
 
 impl SetDisks {
+    /// The first disk slot UUID is assigned when this erasure set is formatted.
+    /// It survives pool reordering and replacement of a disk in that slot.
+    pub fn persistent_set_id(&self) -> Result<Uuid> {
+        self.format
+            .erasure
+            .sets
+            .get(self.set_index)
+            .and_then(|disks| disks.first())
+            .copied()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::other("erasure set has no persistent format identity"))
+    }
+
     /// Persist a quorum DELETE receipt outside the object marker itself. The
     /// receipt is written to the metadata bucket so it survives a node restart
     /// while an inaccessible member still holds the stale marker.

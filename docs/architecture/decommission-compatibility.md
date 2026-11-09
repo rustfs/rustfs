@@ -145,6 +145,10 @@ Existing capacity-owner and mutation checks reconcile the pending intent before
 source cleanup; the replica exception does not clear an unknown intent, rewrite
 the native target, or change the scanner's committed-membership selection.
 
+Backlog membership also carries an optional `set_id`, the first disk-slot UUID from the erasure set's persisted format. This identity survives pool removal, reordering, and disk replacement; `pool_index` and `set_index` remain routing locations. Readers resolve bound members by that UUID before checking the existing commit and rollback proofs. A new pool at a removed member's old index cannot impersonate that member. New publications bind every member, while positional records remain readable and gain identities only after their existing authority is verified. Replica schema 1 is retained; 1.0.4 readers ignore the additive identity field and still use positional membership.
+
+Finish upgrading all scanner-capable nodes before changing pool membership. An older writer can replace a bound record with a positional one. If a legacy record was already stranded by pool reindexing, the missing identity cannot be guessed safely: restore the known topology in which its proof was readable, then let the updated writer bind the membership before changing it again. Do not delete or reset the backlog ledger to bypass this check. Partial writes, canceled callers, missing members, and conflicting authority remain subject to the native CAS and recovery rules above.
+
 ## MinIO Divergence Decisions
 
 Behavior that is close to MinIO but not byte-for-byte identical. Changing either decision requires an operator compatibility note and updated characterization tests.
