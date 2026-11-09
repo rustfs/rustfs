@@ -259,10 +259,8 @@ pub fn select_ec_read_quantum(block_size: usize, data_shards: usize, shard_size:
     // uses two 1 MiB frames per shard. A 4 MiB range still avoids the legacy
     // multi-megabyte stripe read while PUT avoids paying for eight hashes per
     // shard.
-    let target = if block_size <= 256 * 1024 {
+    let target = if block_size <= 1024 * 1024 {
         shard_size / 2
-    } else if block_size <= 1024 * 1024 {
-        shard_size
     } else {
         1024 * 1024
     };
@@ -410,7 +408,7 @@ mod tests {
         // layouts deliberately use coarser frames to keep PUT overhead bounded.
         assert_eq!(select_ec_read_quantum(64 * 1024, 2, 32 * 1024), Some(16 * 1024));
         assert_eq!(select_ec_read_quantum(256 * 1024, 2, 128 * 1024), Some(64 * 1024));
-        assert_eq!(select_ec_read_quantum(1024 * 1024, 2, 512 * 1024), Some(512 * 1024));
+        assert_eq!(select_ec_read_quantum(1024 * 1024, 2, 512 * 1024), Some(256 * 1024));
         assert_eq!(select_ec_read_quantum(4 * 1024 * 1024, 2, 2 * 1024 * 1024), Some(1024 * 1024));
     }
 
