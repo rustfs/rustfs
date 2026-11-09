@@ -33,6 +33,7 @@ const MAX_CONTROL_ROWS: u32 = 1_000_000;
 struct Config {
     namespace: String,
     targets: Vec<String>,
+    disk_ids: Option<Vec<Uuid>>,
     fixture_id: Uuid,
     fixture_file: PathBuf,
     duration_secs: u32,
@@ -54,6 +55,16 @@ impl Config {
                 .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-');
         if !valid_namespace || self.fixture_id.is_nil() || !(1..=64).contains(&self.targets.len()) {
             return Err(Error::new(ErrorKind::InvalidInput, "invalid test namespace, fixture ID or target count"));
+        }
+        if self
+            .disk_ids
+            .as_ref()
+            .is_some_and(|ids| ids.len() != self.targets.len() || ids.iter().any(Uuid::is_nil))
+        {
+            return Err(Error::new(
+                ErrorKind::InvalidInput,
+                "disk IDs must match every declared target and be non-nil",
+            ));
         }
         if !(1..=1800).contains(&self.duration_secs)
             || !(1..=128).contains(&self.bulk_workers)
@@ -388,7 +399,7 @@ async fn run(config_bytes: &[u8], base: &Path, secret: String) -> Result<Report>
     let path = format!("tmp/{}/grpc-bench-payload.bin", config.fixture_id);
     let mut disks = Vec::with_capacity(endpoints.len());
     let mut peers = BTreeSet::new();
-    for endpoint in endpoints {
+    for (index, endpoint) in endpoints.into_iter().enumerate() {
         peers.insert(endpoint.grid_host());
         let disk = new_disk(
             &endpoint,
@@ -399,10 +410,13 @@ async fn run(config_bytes: &[u8], base: &Path, secret: String) -> Result<Report>
         )
         .await
         .map_err(Error::other)?;
+        if let Some(ids) = &config.disk_ids {
+            disk.set_disk_id(Some(ids[index])).await.map_err(Error::other)?;
+        }
         let data = timeout(Duration::from_secs(30), disk.read_all(".rustfs.sys", &path))
             .await
             .map_err(Error::other)?
-            .map_err(|_| Error::other("ReadAll fixture preflight failed"))?;
+            .map_err(|error| Error::other(format!("ReadAll fixture preflight failed: disk_error_code={}", error.to_u32())))?;
         if data.as_ref() != payload.as_slice() {
             return Err(Error::other("ReadAll fixture preflight mismatch"));
         }
@@ -542,6 +556,7 @@ mod tests {
         Config {
             namespace: "grpc-bench-test".into(),
             targets: vec!["http://127.0.0.1:19000/data/grpc-bench-test".into()],
+            disk_ids: None,
             fixture_id: Uuid::from_u128(1),
             fixture_file: PathBuf::from("fixture.bin"),
             duration_secs: 1,
@@ -577,6 +592,17 @@ mod tests {
         assert!(!config.endpoints().expect("valid loopback test URL")[0].is_local);
         config.targets.push(config.targets[0].clone());
         assert!(config.endpoints().is_err(), "duplicate target must not inflate the inventory");
+    }
+
+    #[test]
+    fn probe_requires_a_complete_non_nil_disk_id_mapping() {
+        let mut config = config();
+        config.disk_ids = Some(vec![]);
+        assert!(config.endpoints().is_err());
+        config.disk_ids = Some(vec![Uuid::nil()]);
+        assert!(config.endpoints().is_err());
+        config.disk_ids = Some(vec![Uuid::from_u128(42)]);
+        assert!(config.endpoints().is_ok());
     }
 
     #[test]
@@ -674,6 +700,7 @@ mod tests {
         type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
         fn call(&mut self, request: tonic::Request<ReadAllRequest>) -> Self::Future {
             assert_eq!(request.get_ref().volume, ".rustfs.sys");
+            assert_eq!(request.get_ref().disk, Uuid::from_u128(42).to_string());
             assert!(request.get_ref().path.ends_with("/grpc-bench-payload.bin"));
             let data = if self.1.load(Ordering::SeqCst) {
                 bytes::Bytes::from_static(b"corrupt fixture")
@@ -785,6 +812,7 @@ mod tests {
         );
         let mut config = config();
         config.targets = vec![format!("http://{address}/data/grpc-bench-test")];
+        config.disk_ids = Some(vec![Uuid::from_u128(42)]);
         config.fixture_file = file;
         let input = serde_json::to_vec(&config).expect("probe manifest");
         let result = run(&input, directory.path(), "test-bench-rpc-secret".into()).await;
@@ -799,6 +827,7 @@ mod tests {
             )
             .await
             .map_err(Error::other)?;
+            disk.set_disk_id(Some(Uuid::from_u128(42))).await.map_err(Error::other)?;
             corrupt.store(true, Ordering::SeqCst);
             let context = Arc::new(super::Context {
                 path: format!("tmp/{}/grpc-bench-payload.bin", config.fixture_id),
