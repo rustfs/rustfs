@@ -1461,7 +1461,12 @@ impl LocalDisk {
                             }
                         }
                     }
-                    match publication_owned.finish_on_thread(sync_commit_metadata, !cfg!(test), staging_cleanup) {
+                    match publication_owned.finish_on_thread(
+                        sync_commit_metadata,
+                        !cfg!(test),
+                        staging_cleanup,
+                        Some(&directory_guard_owned),
+                    ) {
                         Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(Box::new(RenameDataResp {
                             multipart_source: Some(Box::new(result)),
                             old_data_dir: has_old_data_dir,
