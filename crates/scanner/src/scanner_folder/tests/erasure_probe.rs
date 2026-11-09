@@ -19,7 +19,9 @@ pub(in crate::scanner_folder) struct OrderedDirectory(String);
 
 impl OrderedDirectory {
     fn new(path: &std::path::Path) -> Self {
-        let path = path.to_string_lossy().into_owned();
+        // Key the probe by the cleaned form the scanner opens; on Windows a joined
+        // `C:\root\bucket/object` would otherwise never match `C:/root/bucket/object`.
+        let path = rustfs_utils::path::path_join_buf(&[&path.to_string_lossy()]);
         ORDERED_DIRECTORIES
             .lock()
             .expect("ordered directory registry")
