@@ -2533,7 +2533,17 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn native_legacy_upgrade_and_pool_reindex_preserve_backlog_authority() {
-        run_native_retirement_test(async || {
+        assert_native_legacy_upgrade_and_pool_reindex_preserve_backlog_authority(false);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn native_pool_reindex_with_failed_membership_publication_preserves_authority() {
+        assert_native_legacy_upgrade_and_pool_reindex_preserve_backlog_authority(true);
+    }
+
+    fn assert_native_legacy_upgrade_and_pool_reindex_preserve_backlog_authority(fail_publication: bool) {
+        run_native_retirement_test(async move || {
             use crate::storage_api::owner::NativeScannerPauseBacklogWriteFault;
 
             let (root, store) = native_pause_backlog_store(3, 1).await;
@@ -2616,11 +2626,33 @@ mod tests {
                 .expect("removing a middle pool and appending a new one preserves native authority");
             assert_eq!(loaded.ledger, expected);
             assert_eq!(loaded.persistence_state, "membership_repair_pending");
+            if fail_publication {
+                // Match the reported partial publication: the two existing
+                // pools reject the new commit while the replacement accepts it.
+                let faults = [0, 1].map(|pool| {
+                    NativeScannerPauseBacklogWriteFault::fail_before_write(
+                        Arc::clone(&reordered.pools[pool].disk_set[0]),
+                        "publish",
+                        2,
+                    )
+                });
+                let error = ScannerPauseBacklogController::claim(Arc::clone(&reordered), now + 120)
+                    .await
+                    .err()
+                    .expect("the incomplete publication must fail");
+                assert!(error.contains("pool 0 set 0") && error.contains("pool 1 set 0"), "{error}");
+                drop(faults);
+                let recovered = load_scanner_pause_backlog(Arc::clone(&reordered))
+                    .await
+                    .expect("partial publication after reindexing retains proven authority");
+                assert_eq!(recovered.ledger, expected);
+                assert!(recovered.durable);
+            }
             let (source, _) = native_replica_bytes(&reordered.pools[1].disk_set[0]).await;
             reordered
                 .prepare_scanner_pause_backlog_retirement_for_test(1, source.len() * 2)
                 .await
-                .expect("retire the reindexed member before any scanner writer repairs membership");
+                .expect("retire the reindexed member before a scanner writer completes the membership change");
             reordered
                 .retire_scanner_pause_backlog_for_test(1, 0)
                 .await
