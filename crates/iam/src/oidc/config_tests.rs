@@ -611,3 +611,37 @@ fn site_replication_snapshot_hashes_secret_without_exposing_config() {
     assert_eq!(hash_client_secret(None), "");
     assert_eq!(hash_client_secret(Some("")), "");
 }
+
+#[test]
+fn site_replication_snapshot_carries_claim_userinfo() {
+    let provider = |id: &str, claim_userinfo: bool| {
+        build_upsert_provider_config(
+            id,
+            OidcProviderConfigInput {
+                config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+                client_id: "client".to_string(),
+                client_secret: Some("secret".to_string()),
+                claim_userinfo,
+                ..Default::default()
+            },
+            None,
+        )
+        .expect("provider should be valid")
+    };
+    let snapshot = OidcSiteReplicationSnapshot::from_config_snapshot(&OidcConfigSnapshot::new(vec![
+        SourcedOidcProviderConfig {
+            config: provider("default", false),
+            source: OidcProviderConfigSource::Persisted,
+        },
+        SourcedOidcProviderConfig {
+            config: provider("userinfo", true),
+            source: OidcProviderConfigSource::Persisted,
+        },
+    ]));
+    let flags: Vec<(&str, bool)> = snapshot
+        .providers()
+        .iter()
+        .map(|provider| (provider.provider_id.as_str(), provider.claim_userinfo))
+        .collect();
+    assert_eq!(flags, [("default", false), ("userinfo", true)]);
+}

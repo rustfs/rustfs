@@ -320,6 +320,9 @@ pub(crate) type OidcProviderSummary = crate::federation::FederatedProviderView;
 pub struct OidcSiteReplicationProvider {
     pub provider_id: String,
     pub claim_name: String,
+    /// Whether the provider reads authorization claims from UserInfo (`claim_userinfo`);
+    /// peers compare it because it changes what `AssumeRoleWithWebIdentity` requires.
+    pub claim_userinfo: bool,
     pub role_policy: String,
     pub client_id: String,
     pub hashed_client_secret: String,
@@ -341,6 +344,7 @@ impl OidcSiteReplicationSnapshot {
                 OidcSiteReplicationProvider {
                     provider_id: config.id.clone(),
                     claim_name: config.claim_name.clone(),
+                    claim_userinfo: config.claim_userinfo,
                     role_policy: config.role_policy.clone(),
                     client_id: config.client_id.clone(),
                     hashed_client_secret: hash_client_secret(config.client_secret.as_deref()),

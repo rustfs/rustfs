@@ -2137,7 +2137,7 @@ fn open_id_settings_from_snapshot(snapshot: &rustfs_iam::oidc::OidcSiteReplicati
                 provider.provider_id.clone(),
                 OpenIDProviderSettings {
                     claim_name: provider.claim_name.clone(),
-                    claim_userinfo_enabled: false,
+                    claim_userinfo_enabled: provider.claim_userinfo,
                     role_policy: provider.role_policy.clone(),
                     client_id: provider.client_id.clone(),
                     hashed_client_secret: provider.hashed_client_secret.clone(),
@@ -11649,11 +11649,10 @@ mod tests {
 
     #[test]
     fn oidc_config_snapshot_preserves_site_replication_settings() {
+        let mut corp = oidc_snapshot_provider("corp", "client-b");
+        corp.config.claim_userinfo = true;
         let snapshot = rustfs_iam::oidc::OidcSiteReplicationSnapshot::from_config_snapshot(
-            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![
-                oidc_snapshot_provider("corp", "client-b"),
-                oidc_snapshot_provider("default", "client-a"),
-            ]),
+            &rustfs_iam::oidc::OidcConfigSnapshot::new(vec![corp, oidc_snapshot_provider("default", "client-a")]),
         );
 
         assert_eq!(
@@ -11674,7 +11673,7 @@ mod tests {
                 "Roles": {
                     "corp": {
                         "ClaimName": "groups",
-                        "ClaimUserinfoEnabled": false,
+                        "ClaimUserinfoEnabled": true,
                         "RolePolicy": "readwrite",
                         "ClientID": "client-b",
                         "HashedClientSecret": "K7gNU3sdo-OL0wNhqoVWhr3g6s1xYv72ol_pe_Unols",
