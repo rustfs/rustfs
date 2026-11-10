@@ -120,6 +120,7 @@ fn web_identity_federation_error(error: FederationError) -> S3Error {
         FederationError::TokenVerification(message) => {
             S3Error::with_message(S3ErrorCode::AccessDenied, format!("token verification failed: {message}"))
         }
+        FederationError::AccessTokenRequired(message) => S3Error::with_message(S3ErrorCode::InvalidArgument, message),
         FederationError::NoAuthorizationContext => {
             s3_error!(InvalidArgument, "no policies are available for this OIDC token")
         }
@@ -156,6 +157,12 @@ pub struct AssumeRoleRequest {
     pub policy: String,
     pub external_id: String,
     pub web_identity_token: String,
+    /// Optional OAuth access token issued together with `WebIdentityToken`.
+    ///
+    /// MinIO-compatible: a provider configured with `claim_userinfo=on` reads the
+    /// authorization claims from its UserInfo endpoint with this token, and rejects the
+    /// request without it. Ignored when `claim_userinfo` is off.
+    pub web_identity_access_token: String,
     /// The login challenge from `GET /v3/mfa/challenge`, echoed back.
     ///
     /// AWS uses `SerialNumber` to name an MFA device; RustFS has one virtual
@@ -430,14 +437,21 @@ async fn handle_assume_role_with_web_identity(body: AssumeRoleRequest) -> S3Resu
     let session = federation
         .assume_role_with_web_identity(
             &body.web_identity_token,
+            (!body.web_identity_access_token.is_empty()).then_some(body.web_identity_access_token.as_str()),
             duration,
             if body.policy.is_empty() { None } else { Some(body.policy) },
             &DefaultFederatedSessionBinding,
         )
         .await
         .map_err(|error| {
-            if let FederationError::TokenVerification(message) = &error {
-                warn!("AssumeRoleWithWebIdentity JWT verification failed: {}", message);
+            match &error {
+                FederationError::TokenVerification(message) => {
+                    warn!("AssumeRoleWithWebIdentity JWT verification failed: {}", message);
+                }
+                FederationError::AccessTokenRequired(message) => {
+                    warn!("AssumeRoleWithWebIdentity rejected: {}", message);
+                }
+                _ => {}
             }
             web_identity_federation_error(error)
         })?;
@@ -603,6 +617,18 @@ mod tests {
     }
 
     #[test]
+    fn assume_role_request_parses_web_identity_access_token() {
+        let body = b"Action=AssumeRoleWithWebIdentity&Version=2011-06-15&WebIdentityToken=jwt&WebIdentityAccessToken=at";
+        let request: AssumeRoleRequest = from_bytes(body).expect("form body parses");
+        assert_eq!(request.web_identity_token, "jwt");
+        assert_eq!(request.web_identity_access_token, "at");
+
+        let without: AssumeRoleRequest =
+            from_bytes(b"Action=AssumeRoleWithWebIdentity&Version=2011-06-15&WebIdentityToken=jwt").expect("form body parses");
+        assert!(without.web_identity_access_token.is_empty());
+    }
+
+    #[test]
     fn test_duration_clamping() {
         // Simulates the clamping logic from handle_assume_role_with_web_identity
         let clamp = |d: usize| if d > 0 { d.clamp(900, 43200) } else { 3600 };
@@ -703,6 +729,15 @@ mod tests {
                 FederationError::NoAuthorizationContext,
                 S3ErrorCode::InvalidArgument,
                 "no policies are available for this OIDC token",
+            ),
+            // A missing WebIdentityAccessToken is a request error (400), not an AccessDenied:
+            // the client has to resend with the parameter, nothing was verified against it.
+            (
+                FederationError::AccessTokenRequired(
+                    "WebIdentityAccessToken is required when claim_userinfo is enabled".to_string(),
+                ),
+                S3ErrorCode::InvalidArgument,
+                "WebIdentityAccessToken is required when claim_userinfo is enabled",
             ),
             (
                 FederationError::Binding(FederatedSessionBindingError::InvalidRequest("invalid policy".to_string())),

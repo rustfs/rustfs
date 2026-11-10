@@ -386,7 +386,7 @@ async fn workload_discovery_verification_and_rotation() {
         header.kid = Some("rotated".into());
         let token = jsonwebtoken::encode(&header, &payload, &key).unwrap();
         let (claims, provider) = sys
-            .verify_web_identity_token(&token)
+            .verify_web_identity_token(&token, None)
             .await
             .expect("rotation must retain workload discovery support");
         assert_eq!(provider, config.id);
@@ -394,7 +394,7 @@ async fn workload_discovery_verification_and_rotation() {
         assert_eq!(claims.groups, ["readonly"]);
         // Repeat after the mock exits: the verified snapshot must be cached.
         handle.join().unwrap();
-        assert!(sys.verify_web_identity_token(&token).await.is_ok());
+        assert!(sys.verify_web_identity_token(&token, None).await.is_ok());
         for (field, value, expected) in [
             ("iss", serde_json::json!("https://wrong.example.com"), "issuer"),
             ("aud", serde_json::json!("wrong-audience"), "audience"),
@@ -404,20 +404,20 @@ async fn workload_discovery_verification_and_rotation() {
             invalid[field] = value;
             let token = jsonwebtoken::encode(&header, &invalid, &key).unwrap();
             let error = sys
-                .verify_web_identity_token(&token)
+                .verify_web_identity_token(&token, None)
                 .await
                 .expect_err("invalid workload token must fail");
-            assert!(error.to_lowercase().contains(expected), "{field}: {error}");
+            assert!(error.to_string().to_lowercase().contains(expected), "{field}: {error}");
         }
         let (wrong_key, _) = oidc_es256_key_and_jwk("wrong");
         let invalid = jsonwebtoken::encode(&header, &payload, &wrong_key).unwrap();
         let error = sys
-            .verify_web_identity_token(&invalid)
+            .verify_web_identity_token(&invalid, None)
             .await
             .expect_err("wrong signature must fail");
-        assert!(error.to_lowercase().contains("signature"), "{error}");
+        assert!(error.to_string().to_lowercase().contains("signature"), "{error}");
         assert!(
-            sys.verify_web_identity_token(&token).await.is_ok(),
+            sys.verify_web_identity_token(&token, None).await.is_ok(),
             "failed refresh must preserve the cached keys"
         );
     }
@@ -832,7 +832,7 @@ async fn jwks_refresh_is_single_flight_and_survives_request_cancellation() {
         let mut invalid = payload.clone();
         invalid[claim] = value;
         assert!(
-            sys.verify_web_identity_token(&sign("initial", &invalid, &initial_key))
+            sys.verify_web_identity_token(&sign("initial", &invalid, &initial_key), None)
                 .await
                 .is_err()
         );
@@ -842,7 +842,7 @@ async fn jwks_refresh_is_single_flight_and_survives_request_cancellation() {
     let attack = {
         let sys = Arc::clone(&sys);
         let invalid = invalid.clone();
-        tokio::spawn(async move { sys.verify_web_identity_token(&invalid).await })
+        tokio::spawn(async move { sys.verify_web_identity_token(&invalid, None).await })
     };
     tokio::time::timeout(StdDuration::from_secs(5), started.notified())
         .await
@@ -853,7 +853,7 @@ async fn jwks_refresh_is_single_flight_and_survives_request_cancellation() {
     for _ in 0..16 {
         let sys = Arc::clone(&sys);
         let invalid = invalid.clone();
-        retries.push(tokio::spawn(async move { sys.verify_web_identity_token(&invalid).await }));
+        retries.push(tokio::spawn(async move { sys.verify_web_identity_token(&invalid, None).await }));
     }
     release_tx.send(()).expect("release provider");
     for retry in retries {
@@ -866,7 +866,7 @@ async fn jwks_refresh_is_single_flight_and_survives_request_cancellation() {
         );
     }
     let rotated = sign("rotated", &payload, &rotated_key);
-    sys.verify_web_identity_token(&rotated)
+    sys.verify_web_identity_token(&rotated, None)
         .await
         .expect("completed refresh must accept rotated keys after the original caller left");
     assert_eq!(requests.load(Ordering::SeqCst), 4, "one discovery/JWKS pair for all rejected tokens");

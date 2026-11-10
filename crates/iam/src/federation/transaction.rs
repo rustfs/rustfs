@@ -54,8 +54,8 @@ impl FederatedIdentityService {
         })
     }
 
-    async fn verify_identity(&self, jwt: &str) -> Result<FederatedAuthorization> {
-        Ok(self.mapper.map(self.authentication.verify_identity(jwt).await?))
+    async fn verify_identity(&self, jwt: &str, access_token: Option<&str>) -> Result<FederatedAuthorization> {
+        Ok(self.mapper.map(self.authentication.verify_identity(jwt, access_token).await?))
     }
 
     async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String> {
@@ -127,11 +127,12 @@ impl FederatedIdentityService {
     pub async fn assume_role_with_web_identity(
         &self,
         jwt: &str,
+        access_token: Option<&str>,
         duration_seconds: usize,
         session_policy: Option<String>,
         binding: &dyn FederatedSessionBinding,
     ) -> Result<FederatedSession> {
-        let authorization = self.verify_identity(jwt).await?;
+        let authorization = self.verify_identity(jwt, access_token).await?;
         if !authorization.has_authorization_context() {
             tracing::warn!(
                 event = EVENT_OIDC_DIAGNOSTICS,
@@ -206,6 +207,7 @@ mod tests {
         events: Arc<Mutex<Vec<&'static str>>>,
         authorize_calls: Mutex<Vec<(String, String, Option<String>)>>,
         logout_url_calls: Mutex<Vec<(String, String)>>,
+        verify_calls: Mutex<Vec<Option<String>>>,
         expected_logout: (&'static str, &'static str),
         listed_provider_ids: Vec<&'static str>,
         visible_provider_ids: Vec<&'static str>,
@@ -222,6 +224,7 @@ mod tests {
                 events,
                 authorize_calls: Mutex::new(Vec::new()),
                 logout_url_calls: Mutex::new(Vec::new()),
+                verify_calls: Mutex::new(Vec::new()),
                 expected_logout: (DEFAULT_OIDC_PROVIDER_ID, "id-token"),
                 listed_provider_ids: Vec::new(),
                 visible_provider_ids: Vec::new(),
@@ -309,8 +312,12 @@ mod tests {
             ))
         }
 
-        async fn verify_identity(&self, _jwt: &str) -> Result<VerifiedFederatedIdentity> {
+        async fn verify_identity(&self, _jwt: &str, access_token: Option<&str>) -> Result<VerifiedFederatedIdentity> {
             self.record("verify");
+            self.verify_calls
+                .lock()
+                .expect("verify call log should not be poisoned")
+                .push(access_token.map(ToOwned::to_owned));
             if self.failure == ProviderFailure::Verification {
                 return Err(FederationError::TokenVerification("verification failed".to_string()));
             }
@@ -481,6 +488,28 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn assume_role_passes_access_token_to_verification() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let provider = Arc::new(TestProvider::new(events.clone()));
+        let binding = Arc::new(RecordingBinding::new(events.clone()));
+        let service = standard_service(provider.clone());
+
+        service
+            .assume_role_with_web_identity("jwt", Some("access-token"), 3600, None, binding.as_ref())
+            .await
+            .expect("web identity flow should complete");
+
+        assert_eq!(
+            provider
+                .verify_calls
+                .lock()
+                .expect("verify call log should not be poisoned")
+                .as_slice(),
+            [Some("access-token".to_string())]
+        );
+    }
+
+    #[tokio::test]
     async fn callback_and_web_identity_preserve_provider_and_transaction_boundaries() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let mut provider = TestProvider::new(events.clone());
@@ -505,7 +534,7 @@ mod tests {
         events.lock().expect("event log should not be poisoned").clear();
 
         let web_identity = service
-            .assume_role_with_web_identity("jwt", 7200, Some("session-policy".to_string()), binding.as_ref())
+            .assume_role_with_web_identity("jwt", None, 7200, Some("session-policy".to_string()), binding.as_ref())
             .await
             .expect("web identity flow should complete");
         assert_eq!(web_identity.credentials.access_key, "user");
@@ -547,7 +576,7 @@ mod tests {
         events.lock().expect("event log should not be poisoned").clear();
 
         let web_identity = service
-            .assume_role_with_web_identity("jwt", 7200, Some("session-policy".to_string()), binding.as_ref())
+            .assume_role_with_web_identity("jwt", None, 7200, Some("session-policy".to_string()), binding.as_ref())
             .await
             .expect("standard web identity flow should complete");
         assert_eq!(web_identity.authorization.provider_id(), "partner");
@@ -572,7 +601,7 @@ mod tests {
         let service = standard_service(Arc::new(provider));
 
         let error = service
-            .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+            .assume_role_with_web_identity("jwt", None, 3600, None, binding.as_ref())
             .await
             .expect_err("authorization context is required");
 
@@ -590,7 +619,7 @@ mod tests {
         let service = standard_service(Arc::new(provider));
 
         let session = service
-            .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+            .assume_role_with_web_identity("jwt", None, 3600, None, binding.as_ref())
             .await
             .expect("a mapped group is an authorization context");
 
@@ -654,7 +683,7 @@ mod tests {
             let service = standard_service(Arc::new(provider));
 
             let error = service
-                .assume_role_with_web_identity("jwt", 3600, None, binding.as_ref())
+                .assume_role_with_web_identity("jwt", None, 3600, None, binding.as_ref())
                 .await
                 .expect_err("the configured failure should be returned");
 

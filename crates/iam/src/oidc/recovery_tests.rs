@@ -166,14 +166,14 @@ async fn web_identity_recovers_transport_failure_and_preserves_verification() {
         assert!(sys.has_providers());
         assert!(sys.list_visible_providers().is_empty());
         let token = idp.token(&idp.key, &idp.config.client_id);
-        assert!(adapter.verify_identity(&token).await.is_err());
+        assert!(adapter.verify_identity(&token, None).await.is_err());
 
         idp.discovery_status.store(200, Ordering::SeqCst);
         tokio::time::timeout(Duration::from_secs(5), sys.recover_failed_providers())
             .await
             .expect("recover workload discovery");
         let identity = adapter
-            .verify_identity(&token)
+            .verify_identity(&token, None)
             .await
             .expect("verify recovered workload token");
         let authorization = mapper.map(identity);
@@ -189,11 +189,16 @@ async fn web_identity_recovers_transport_failure_and_preserves_verification() {
         let (wrong_key, _) = oidc_es256_key_and_jwk("wrong");
         assert!(
             adapter
-                .verify_identity(&idp.token(&wrong_key, &idp.config.client_id))
+                .verify_identity(&idp.token(&wrong_key, &idp.config.client_id), None)
                 .await
                 .is_err()
         );
-        assert!(adapter.verify_identity(&idp.token(&idp.key, "wrong-audience")).await.is_err());
+        assert!(
+            adapter
+                .verify_identity(&idp.token(&idp.key, "wrong-audience"), None)
+                .await
+                .is_err()
+        );
     }
 }
 

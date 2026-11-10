@@ -30,6 +30,10 @@ pub enum FederationError {
     CodeExchange(String),
     #[error("{0}")]
     TokenVerification(String),
+    /// `AssumeRoleWithWebIdentity` without `WebIdentityAccessToken` against a provider that
+    /// needs it (`claim_userinfo` on): a client request error, not a failed verification.
+    #[error("{0}")]
+    AccessTokenRequired(String),
     #[error("{0}")]
     Logout(String),
     #[error("no policies are available for this OIDC token")]

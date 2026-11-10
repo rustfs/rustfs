@@ -779,9 +779,13 @@ impl OidcSys {
     /// 2. Finds the OIDC provider whose issuer matches
     /// 3. Verifies signature, issuer, audience, and expiry (nonce is skipped)
     /// 4. Extracts claims using the provider's claim configuration
-    pub(crate) async fn verify_web_identity_token(&self, jwt: &str) -> Result<(OidcClaims, String /* provider_id */), String> {
+    pub(crate) async fn verify_web_identity_token(
+        &self,
+        jwt: &str,
+        access_token: Option<&str>,
+    ) -> Result<(OidcClaims, String /* provider_id */), WebIdentityError> {
         // Decode JWT payload without verification to get the issuer claim
-        let raw_claims = decode_jwt_payload(jwt);
+        let mut raw_claims = decode_jwt_payload(jwt);
         let issuer = raw_claims
             .get("iss")
             .and_then(|v| v.as_str())
@@ -811,7 +815,7 @@ impl OidcSys {
             .set_other_audience_verifier_fn(|aud| trusted_aud(&config.other_audiences, aud));
         if let Err(e) = verify_id_token_claims(&id_token, &verifier, |_: Option<&Nonce>| Ok(())) {
             if !matches!(e, ClaimsVerificationError::SignatureVerification(_)) {
-                return Err(format!("ID token verification failed: {e}"));
+                return Err(format!("ID token verification failed: {e}").into());
             }
             state = self
                 .provider_runtime
@@ -829,6 +833,47 @@ impl OidcSys {
                 .map_err(|retry_err| format!("ID token verification failed after JWKS refresh: {retry_err}"))?;
         }
 
+        if config.claim_userinfo {
+            // MinIO parity: with claim_userinfo on, WebIdentityAccessToken is mandatory so the
+            // authorization claims can be read from UserInfo instead of the ID token.
+            let access_token = access_token.ok_or_else(|| {
+                WebIdentityError::AccessTokenRequired(format!(
+                    "WebIdentityAccessToken is required when claim_userinfo is enabled: stage=userinfo_access_token_missing, provider_id={provider_id}"
+                ))
+            })?;
+            let userinfo_endpoint = state.metadata.userinfo_endpoint().ok_or_else(|| {
+                format!(
+                    "provider metadata has no userinfo_endpoint: stage=userinfo_endpoint_missing, provider_id={provider_id}, config_url={}",
+                    config.config_url
+                )
+            })?;
+            let added = fetch_userinfo_claims(self.provider_runtime.http_client(), &userinfo_endpoint, access_token)
+                .await
+                .and_then(|userinfo| merge_userinfo_claims(&mut raw_claims, userinfo))
+                .map_err(|err| {
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "userinfo_claims_failed",
+                        provider_id = %provider_id,
+                        userinfo_endpoint = %userinfo_endpoint,
+                        error = %err,
+                        "oidc userinfo claims could not be merged for web identity"
+                    );
+                    format!("{err}, provider_id={provider_id}")
+                })?;
+            debug!(
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "userinfo_claims_merged",
+                provider_id = %provider_id,
+                added_claim_count = added,
+                "oidc userinfo claims merged into web identity claims"
+            );
+        }
+
         // Extract claims using the provider's claim configuration
         let claims = OidcClaims {
             sub: extract_string_claim(&raw_claims, "sub"),
@@ -843,6 +888,30 @@ impl OidcSys {
     /// Get a provider config by ID.
     pub(crate) fn get_provider_config(&self, id: &str) -> Option<&OidcProviderConfig> {
         self.configs.get(id).map(|provider| &provider.config)
+    }
+}
+
+/// Why `AssumeRoleWithWebIdentity` could not establish an identity from the token(s) it was given.
+#[derive(Debug)]
+pub(crate) enum WebIdentityError {
+    /// The provider has `claim_userinfo` on and the request carried no `WebIdentityAccessToken`.
+    /// Nothing was checked against the caller yet: a request error, not a denial.
+    AccessTokenRequired(String),
+    /// The ID token, the provider state or the UserInfo it required did not verify.
+    Verification(String),
+}
+
+impl std::fmt::Display for WebIdentityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AccessTokenRequired(message) | Self::Verification(message) => f.write_str(message),
+        }
+    }
+}
+
+impl From<String> for WebIdentityError {
+    fn from(message: String) -> Self {
+        Self::Verification(message)
     }
 }
 
@@ -1001,12 +1070,15 @@ impl StandardOidcAuthentication for StandardOidcAdapter {
         ))
     }
 
-    async fn verify_identity(&self, jwt: &str) -> FederationResult<VerifiedFederatedIdentity> {
-        let (claims, provider_id) = self
-            .oidc
-            .verify_web_identity_token(jwt)
-            .await
-            .map_err(FederationError::TokenVerification)?;
+    async fn verify_identity(&self, jwt: &str, access_token: Option<&str>) -> FederationResult<VerifiedFederatedIdentity> {
+        let (claims, provider_id) =
+            self.oidc
+                .verify_web_identity_token(jwt, access_token)
+                .await
+                .map_err(|error| match error {
+                    WebIdentityError::AccessTokenRequired(message) => FederationError::AccessTokenRequired(message),
+                    WebIdentityError::Verification(message) => FederationError::TokenVerification(message),
+                })?;
         Ok(verified_identity(FederatedProviderRef::new(provider_id), claims))
     }
 

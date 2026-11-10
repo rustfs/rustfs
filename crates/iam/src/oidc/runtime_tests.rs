@@ -199,7 +199,7 @@ async fn web_identity_verification_refreshes_rotated_jwks() {
     .expect("rotated OIDC token should sign");
 
     let (claims, provider_id) = sys
-        .verify_web_identity_token(&token)
+        .verify_web_identity_token(&token, None)
         .await
         .expect("verification should refresh JWKS and accept the rotated key");
     assert_eq!(provider_id, "rotating");
@@ -207,6 +207,178 @@ async fn web_identity_verification_refreshes_rotated_jwks() {
     assert_eq!(claims.groups, vec!["readwrite"]);
     handle.join().expect("rotating JWKS mock server should exit cleanly");
 }
+/// Mock IdP for the web identity (STS) flow: discovery with a `userinfo_endpoint`, JWKS, and
+/// a UserInfo endpoint that releases `eduperson_entitlement`. Fails the test on any request
+/// beyond the ones the case expects.
+/// Mock IdP for the web identity tests: serves discovery, JWKS and (when
+/// `expect_userinfo_request`) one UserInfo response, then rejects any further request.
+/// Returns the runtime, a signed ID token for it and the server task to await after the call.
+async fn web_identity_userinfo_fixture(
+    claim_userinfo: bool,
+    expect_userinfo_request: bool,
+) -> (OidcSys, String, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut config = build_mocked_oidc_provider_config("web", &format!("{base}/.well-known/openid-configuration"));
+    config.claim_userinfo = claim_userinfo;
+    config.groups_claim = if claim_userinfo {
+        "eduperson_entitlement".into()
+    } else {
+        "groups".into()
+    };
+    let (key, jwk) = oidc_es256_key_and_jwk("web");
+    let server_base = base.clone();
+    let server = tokio::spawn(async move {
+        let mut expected_paths = vec!["/.well-known/openid-configuration", "/jwks"];
+        if expect_userinfo_request {
+            expected_paths.push("/userinfo");
+        }
+        for expected_path in expected_paths {
+            let (mut stream, _) = tokio::time::timeout(StdDuration::from_secs(10), listener.accept())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {expected_path}"))
+                .unwrap();
+            let mut bytes = Vec::new();
+            loop {
+                bytes.push(stream.read_u8().await.unwrap());
+                assert!(bytes.len() < 8192);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let headers = String::from_utf8(bytes).unwrap();
+            let request_line = headers.lines().next().unwrap();
+            assert_eq!(request_line.split_whitespace().nth(1), Some(expected_path));
+            let headers_map: HashMap<_, _> = headers
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+                .collect();
+            let body = match expected_path {
+                "/.well-known/openid-configuration" => serde_json::json!({
+                    "issuer": server_base, "authorization_endpoint": format!("{server_base}/authorize"),
+                    "token_endpoint": format!("{server_base}/token"), "jwks_uri": format!("{server_base}/jwks"),
+                    "userinfo_endpoint": format!("{server_base}/userinfo"),
+                    "response_types_supported": ["code"], "subject_types_supported": ["public"],
+                    "id_token_signing_alg_values_supported": ["ES256"]
+                }),
+                "/jwks" => serde_json::json!({ "keys": [jwk] }),
+                "/userinfo" => {
+                    assert!(request_line.starts_with("GET "), "{request_line}");
+                    assert_eq!(headers_map["authorization"], "Bearer web-access-token");
+                    serde_json::json!({"sub": "web-user", "eduperson_entitlement": ["urn:a", "urn:b"]})
+                }
+                _ => unreachable!(),
+            }
+            .to_string();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "unexpected extra request to the mock IdP"
+        );
+    });
+
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+    let state = discover_provider(&config, &http_client).await.expect("discovery");
+    let sys = OidcSys {
+        configs: HashMap::from([(config.id.clone(), test_sourced_config(config.clone()))]),
+        provider_runtime: ProviderRuntime::new(http_client, HashMap::from([(config.id.clone(), state)])),
+        state_store: OidcStateStore::new(),
+        pending_discovery: Default::default(),
+    };
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+    let mut header = Header::new(Algorithm::ES256);
+    header.kid = Some("web".to_string());
+    let token = jsonwebtoken::encode(
+        &header,
+        &serde_json::json!({
+            "iss": base, "sub": "web-user", "aud": config.client_id,
+            "iat": now, "exp": now + 300, "groups": ["readwrite"]
+        }),
+        &key,
+    )
+    .unwrap();
+
+    (sys, token, server)
+}
+
+async fn run_web_identity_userinfo_case(
+    claim_userinfo: bool,
+    expect_userinfo_request: bool,
+    access_token: Option<&str>,
+) -> Result<(OidcClaims, String), WebIdentityError> {
+    let (sys, token, server) = web_identity_userinfo_fixture(claim_userinfo, expect_userinfo_request).await;
+    let result = sys.verify_web_identity_token(&token, access_token).await;
+    server.await.unwrap();
+    result
+}
+
+#[tokio::test]
+async fn web_identity_verification_fetches_userinfo_with_access_token() {
+    let (claims, provider_id) = run_web_identity_userinfo_case(true, true, Some("web-access-token"))
+        .await
+        .expect("userinfo claims should authorize the web identity");
+    assert_eq!(provider_id, "web");
+    assert_eq!(claims.sub, "web-user");
+    assert_eq!(claims.groups, ["urn:a", "urn:b"]);
+}
+
+#[tokio::test]
+async fn web_identity_verification_requires_access_token_when_userinfo_enabled() {
+    let err = run_web_identity_userinfo_case(true, false, None).await.unwrap_err();
+    assert!(
+        matches!(err, WebIdentityError::AccessTokenRequired(ref message) if message.contains("stage=userinfo_access_token_missing")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn web_identity_adapter_reports_missing_access_token_as_request_error() {
+    let (sys, token, server) = web_identity_userinfo_fixture(true, false).await;
+    let adapter = StandardOidcAdapter::new(Arc::new(sys));
+    let err = adapter.verify_identity(&token, None).await.unwrap_err();
+    server.await.unwrap();
+    assert!(
+        matches!(err, FederationError::AccessTokenRequired(ref message) if message.contains("stage=userinfo_access_token_missing")),
+        "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn web_identity_verification_ignores_access_token_when_userinfo_disabled() {
+    let (claims, _) = run_web_identity_userinfo_case(false, false, Some("web-access-token"))
+        .await
+        .expect("id token claims authorize the web identity");
+    assert_eq!(claims.groups, ["readwrite"]);
+}
+
+#[tokio::test]
+async fn web_identity_access_token_with_control_characters_is_rejected() {
+    let err = run_web_identity_userinfo_case(true, false, Some("bad\ntoken"))
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, WebIdentityError::Verification(ref message) if message.contains("stage=userinfo_access_token")),
+        "{err:?}"
+    );
+    assert!(!err.to_string().contains("stage=userinfo_access_token_missing"), "{err}");
+}
+
 #[tokio::test]
 async fn complete_provider_console_login_preserves_hidden_and_issuer_modes() {
     assert_complete_console_login(false).await;

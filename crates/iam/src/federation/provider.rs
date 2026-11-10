@@ -57,7 +57,9 @@ impl VerifiedFederatedCodeExchange {
 pub(crate) trait StandardOidcAuthentication: Send + Sync {
     async fn authorize_url(&self, provider_id: &str, redirect_uri: &str, redirect_after: Option<String>) -> Result<String>;
     async fn exchange_identity(&self, state: &str, code: &str, redirect_uri: &str) -> Result<VerifiedFederatedCodeExchange>;
-    async fn verify_identity(&self, jwt: &str) -> Result<VerifiedFederatedIdentity>;
+    /// `access_token` is the optional `WebIdentityAccessToken`; a provider with `claim_userinfo`
+    /// enabled needs it to fetch UserInfo claims and rejects the verification without it.
+    async fn verify_identity(&self, jwt: &str, access_token: Option<&str>) -> Result<VerifiedFederatedIdentity>;
     async fn create_logout_token(&self, continuation: OpaqueLogoutContinuation) -> Result<String>;
     async fn build_logout_url(&self, logout_token: &str, post_logout_redirect_uri: &str) -> Result<Option<String>>;
 }
