@@ -14,7 +14,7 @@
 
 # Nightly development artifacts and reusable immutable-candidate builds.
 # Public release writes live exclusively in release-publish.yml. Candidate callers
-# select Linux or desktop and freeze every build input before any matrix starts.
+# select Linux or desktop and pin release inputs before any matrix starts.
 
 name: Build and Release
 

@@ -295,7 +295,7 @@ class PromotionTests(unittest.TestCase):
             publish.channels(inputs(), {}, Path("candidate"), "a" * 64)
             versions.assert_called_once()
             images.assert_not_called()
-            helm.assert_not_called()
+            helm.assert_called_once()
             self.assertTrue(all(call.args[1:] == () for call in api.call_args_list))
 
     def test_prerelease_never_changes_stable_pointers(self):
@@ -309,6 +309,13 @@ class PromotionTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 publish.channels(inputs(), {}, Path("candidate"), "a" * 64)
             api.assert_not_called()
+
+    def test_incomplete_helm_publication_does_not_advance_stable_channels(self):
+        with patch.object(publish, "publish_version"), patch.object(publish, "helm", side_effect=ValueError("chart repository unavailable")), patch.object(publish, "api") as api, patch.object(publish, "images") as images:
+            with self.assertRaises(ValueError):
+                publish.channels(inputs(), {}, Path("candidate"), "a" * 64)
+            api.assert_not_called()
+            images.assert_not_called()
 
     def test_r2_retry_checks_bytes_and_uses_conditional_creation(self):
         with tempfile.TemporaryDirectory() as temp, patch.dict(os.environ, R2_BUCKET="releases"):

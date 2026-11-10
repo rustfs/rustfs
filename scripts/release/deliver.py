@@ -56,7 +56,7 @@ def package(inputs, target, output):
         executable, record = binary(inputs, target, temp / "source")
         arch, libc = target.split("-")[1:]
         build_type = "prerelease" if "-" in inputs["version"] else "release"
-        values = c.command(["bash", "scripts/release/package_versions.sh", build_type, inputs["version"], "0", arch, libc], cwd=c.ROOT)
+        values = c.command(["bash", "scripts/release/package_versions.sh", build_type, inputs["version"], "", arch, libc], cwd=c.ROOT)
         versions = dict(line.split("=", 1) for line in values.splitlines())
         # Existing package recipes operate in a private working directory.
         for name in ("scripts", "deploy"):

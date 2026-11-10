@@ -229,8 +229,10 @@ def helm(inputs, directory):
 def channels(inputs, seal, directory, manifest_sha):
     # Recheck all immutable destinations, including when resuming a failed job.
     publish_version(inputs, seal, directory, manifest_sha)
+    # The versioned Helm catalog entry must still be completed when a newer
+    # release already owns the mutable channels.
+    helm(inputs, directory)
     if "-" in inputs["version"]:
-        helm(inputs, directory)
         return
     latest = api(f"repos/{c.REPOSITORY}/releases/latest", missing=True)
     if latest and stable_key(latest["tag_name"]) > stable_key(inputs["version"]):
@@ -253,7 +255,6 @@ def channels(inputs, seal, directory, manifest_sha):
         actual = Path(temp) / "actual.json"
         subprocess.run([os.environ["OSSUTIL_BIN"], "cp", "oss://rustfs-version/latest.json", str(actual)], check=True, timeout=120)
         c.require(c.read_json(actual) == pointer, "installer pointer did not match the published release")
-    helm(inputs, directory)
 
 
 def main():
