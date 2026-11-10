@@ -4941,6 +4941,87 @@ impl ECStore {
         Ok((idx, result))
     }
 
+    /// Compare the logical revision across all pools before publishing a
+    /// namespace-only usage update to a writable pool. A suspended source is
+    /// retained for decommission to reconcile against the newer target.
+    pub(crate) async fn put_usage_snapshot_for_namespace_cleanup(
+        &self,
+        object: &str,
+        expected_revision: Option<&str>,
+        data: &mut PutObjReader,
+        namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<ObjectInfo> {
+        // The caller owns the bucket namespace and movement guards. Acquire
+        // the fixed object domain, then every physical domain in pool order.
+        let guards = self
+            .acquire_all_physical_object_write_locks("usage_namespace_cleanup", RUSTFS_META_BUCKET, object)
+            .await?;
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        for guard in &guards {
+            guard.add_namespace_lock_fence(&mut opts);
+        }
+        if let Some(guard) = namespace_guard {
+            opts.add_namespace_lock_guard(guard);
+        }
+        let source = match self
+            .get_latest_object_info_for_conditional_write(RUSTFS_META_BUCKET, object, &opts)
+            .await
+            .and_then(|(info, idx)| resolve_latest_object_access(RUSTFS_META_BUCKET, object, info, idx, &opts))
+        {
+            Ok((info, _)) => Some(info),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+            Err(err) => return Err(err),
+        };
+        if source.as_ref().and_then(|info| info.etag.as_deref()) != expected_revision {
+            return Err(StorageError::PreconditionFailed);
+        }
+        if source.as_ref().is_some_and(|info| {
+            info.version_id.is_some_and(|version| !version.is_nil()) || info.etag.as_ref().is_none_or(String::is_empty)
+        }) {
+            return Err(StorageError::other("usage cleanup requires an unversioned snapshot with a revision"));
+        }
+        let target = self.get_pool_idx_no_lock(RUSTFS_META_BUCKET, object, data.size()).await?;
+        let target_info = match self.pools[target].get_object_info(RUSTFS_META_BUCKET, object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+            Err(err) => return Err(err),
+        };
+        opts.http_preconditions = Some(match target_info.as_ref() {
+            Some(info) => crate::storage_api_contracts::object::HTTPPreconditions {
+                if_match: Some(
+                    info.etag
+                        .as_ref()
+                        .filter(|etag| !etag.is_empty())
+                        .cloned()
+                        .ok_or_else(|| StorageError::other("usage cleanup target has no revision"))?,
+                ),
+                ..Default::default()
+            },
+            None => crate::storage_api_contracts::object::HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        });
+        let latest = source
+            .iter()
+            .chain(target_info.iter())
+            .filter_map(|info| info.mod_time)
+            .fold(OffsetDateTime::now_utc(), std::cmp::max);
+        opts.mod_time = Some(
+            latest
+                .checked_add(time::Duration::nanoseconds(1))
+                .ok_or_else(|| StorageError::other("usage cleanup snapshot timestamp is exhausted"))?,
+        );
+        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        self.pools[target].put_object(RUSTFS_META_BUCKET, object, data, &opts).await
+    }
+
     #[instrument(level = "debug", skip(self, data))]
     #[hotpath::measure(impl_type = "ECStore")]
     pub(super) async fn handle_put_object(
@@ -7009,7 +7090,7 @@ mod tests {
     };
     use crate::set_disk::same_distributed_lock_domain;
     use crate::set_disk::{SetDisks, disk_call_counters};
-    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::bucket::{BucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use crate::storage_api_contracts::list::ListOperations as _;
     use bytes::Bytes;
@@ -10349,6 +10430,296 @@ mod tests {
 
     async fn multipool_version_test_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
         multipool_delete_test_store(bucket, true).await
+    }
+
+    #[tokio::test]
+    async fn create_fresh_bucket_after_canceled_decommission() {
+        let (_dirs, store) = multipool_version_test_store("canceled-decommission-existing").await;
+        let mut canceled = prepared_pool_test_status(1, false);
+        canceled.decommission = Some(PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools: vec![prepared_pool_test_status(0, false), canceled],
+            ..Default::default()
+        };
+        store
+            .handle_make_bucket("canceled-decommission-fresh", &MakeBucketOptions::default())
+            .await
+            .expect("canceled decommission must not block creation of a new bucket");
+        assert!(
+            store.scanner_data_usage_publication_blocked().await,
+            "scanner publication must remain fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_after_failed_decommission() {
+        let (_dirs, store) = multipool_version_test_store("decommission-existing-bucket").await;
+        let bucket = "decommission-new-bucket";
+        let snapshot_time = std::time::SystemTime::now() - Duration::from_secs(60);
+        let mut snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(snapshot_time),
+            scanner_cycle: Some(37),
+            scanner_epoch: Some(2),
+            buckets_count: 1,
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        snapshot.buckets_usage.insert(
+            bucket.to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                size: 42,
+                objects_count: 1,
+                versions_count: 1,
+                ..Default::default()
+            },
+        );
+        snapshot.bucket_sizes.insert(bucket.to_string(), 42);
+        snapshot.calculate_totals();
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("store a stale bucket-usage baseline before the failed decommission");
+        let (old_snapshot, usage_owner) = store
+            .get_latest_accessible_object_info_with_idx(
+                RUSTFS_META_BUCKET,
+                crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("identify the pool holding the old usage baseline");
+        let mut pool_statuses = vec![prepared_pool_test_status(0, false), prepared_pool_test_status(1, false)];
+        pool_statuses[usage_owner].decommission = Some(PoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools: pool_statuses,
+            ..Default::default()
+        };
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("a failed decommission must not block creation of an unrelated bucket");
+        store
+            .handle_get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("the created bucket must be visible");
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("load the cleaned usage baseline");
+        assert!(!usage.buckets_usage.contains_key(bucket), "the new bucket must not inherit old usage");
+        assert_eq!(usage.scanner_cycle, Some(37), "namespace cleanup must not certify a new scan");
+        assert_eq!(usage.scanner_epoch, Some(2), "namespace cleanup must preserve the scanner authority");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (_, current_owner) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("read the new snapshot authority");
+        assert_ne!(current_owner, usage_owner, "cleanup must publish to a writable pool");
+        let retained_source = store.pools[usage_owner]
+            .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("decommission retains its original source for reconciliation");
+        assert_eq!(retained_source.etag, old_snapshot.etag);
+        let stale_update = store
+            .put_usage_snapshot_for_namespace_cleanup(
+                object,
+                old_snapshot.etag.as_deref(),
+                &mut PutObjReader::from_vec(b"stale snapshot".to_vec()),
+                None,
+            )
+            .await;
+        assert!(matches!(stale_update, Err(StorageError::PreconditionFailed)));
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("a stale source CAS must not replace the writable target");
+        assert!(!usage.buckets_usage.contains_key(bucket));
+        assert!(
+            store.scanner_data_usage_publication_blocked().await,
+            "scanner publication must remain fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_create_retains_usage_cleanup_namespace_owner() {
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (_dirs, store) = multipool_version_test_store("cleanup-cancellation-existing").await;
+        let bucket = "cleanup-cancellation-new";
+        let mut snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        snapshot.buckets_usage.insert(
+            bucket.to_owned(),
+            rustfs_data_usage::BucketUsageInfo {
+                size: 42,
+                objects_count: 1,
+                versions_count: 1,
+                ..Default::default()
+            },
+        );
+        snapshot.bucket_sizes.insert(bucket.to_owned(), 42);
+        snapshot.calculate_totals();
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the stale namespace usage");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (_, source) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("find the source snapshot");
+        let mut pools = vec![prepared_pool_test_status(0, false), prepared_pool_test_status(1, false)];
+        pools[source].decommission = Some(PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools,
+            ..Default::default()
+        };
+        let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::AfterNamespace);
+        let create_store = store.clone();
+        let create = tokio::spawn(async move { create_store.handle_make_bucket(bucket, &MakeBucketOptions::default()).await });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("cleanup reaches its physical commit with the namespace held");
+        create.abort();
+        assert!(create.await.expect_err("the request waiter was canceled").is_cancelled());
+        let namespace = store
+            .new_ns_lock(bucket, bucket)
+            .await
+            .expect("open the bucket namespace lock");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), namespace.get_write_lock(Duration::from_secs(1)))
+                .await
+                .is_err(),
+            "cancellation must not release the namespace before its cleanup finishes"
+        );
+        barrier.release();
+        drop(barrier);
+        tokio::time::timeout(Duration::from_secs(10), store.handle_make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("the resumed create must not remain blocked")
+            .expect("a new request resumes after the old cleanup releases its namespace");
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("read the cleaned baseline");
+        assert!(!usage.buckets_usage.contains_key(bucket));
+        assert!(store.scanner_data_usage_publication_blocked().await);
+    }
+
+    #[tokio::test]
+    async fn usage_cleanup_rejects_an_unreadable_pool() {
+        let (_dirs, store) = multipool_version_test_store("cleanup-unreadable-pool").await;
+        let snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the usage baseline");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (before, source) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("find the baseline owner");
+        let unavailable = 1 - source;
+        for disk in store.pools[unavailable]
+            .get_disks_by_key(object)
+            .disks
+            .read()
+            .await
+            .iter()
+            .flatten()
+        {
+            disk.close().await.expect("stop disk health monitoring");
+            disk.force_offline_for_test();
+        }
+        let update = store
+            .put_usage_snapshot_for_namespace_cleanup(
+                object,
+                before.etag.as_deref(),
+                &mut PutObjReader::from_vec(b"unproven authority".to_vec()),
+                None,
+            )
+            .await;
+        assert!(update.is_err(), "an unreadable pool may hold a newer snapshot");
+        let after = store.pools[source]
+            .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("the readable baseline remains intact");
+        assert_eq!(after.etag, before.etag);
+    }
+
+    #[tokio::test]
+    async fn usage_cleanup_rejects_namespace_loss_before_physical_commit() {
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
+
+        let (_dirs, store) = multipool_version_test_store("cleanup-fence-existing").await;
+        let snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the protected baseline");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (before, _) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("read the baseline revision");
+        let ttl = Duration::from_secs(60);
+        let namespace = NamespaceLock::new("usage-cleanup-commit-fence".to_owned(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("cleanup-fence-existing", ""), LockType::Exclusive, "usage-cleanup")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            namespace
+                .acquire_guard(&request)
+                .await
+                .expect("acquire the namespace lease")
+                .expect("namespace lease is available"),
+        );
+        let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::AfterNamespace);
+        let update_store = store.clone();
+        let update_guard = guard.clone();
+        let revision = before.etag.clone();
+        let update = tokio::spawn(async move {
+            let _movement = update_store
+                .data_usage_namespace_cleanup_guard()
+                .await
+                .expect("admit the namespace-only update");
+            update_store
+                .put_usage_snapshot_for_namespace_cleanup(
+                    object,
+                    revision.as_deref(),
+                    &mut PutObjReader::from_vec(b"must not commit".to_vec()),
+                    Some(update_guard.as_ref()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("the update reaches its commit barrier");
+        tokio::time::pause();
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        assert!(guard.is_lock_lost(), "the parent namespace lease has expired");
+        tokio::time::resume();
+        barrier.release();
+        assert!(update.await.expect("the cleanup task completes").is_err());
+        let (after, _) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("the original baseline remains readable");
+        assert_eq!(after.etag, before.etag, "a lost namespace lease must fence the physical write");
     }
 
     async fn multipool_delete_test_store(bucket: &str, versioned: bool) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {

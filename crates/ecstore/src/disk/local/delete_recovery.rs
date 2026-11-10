@@ -1829,7 +1829,9 @@ impl LocalDisk {
     ) -> Result<DeleteRecoveryInspection> {
         self.reject_multipart_delete_recovery_mutation(volume, object)?;
         if let Ok(root) = self.io_get_object_path(volume, object) {
-            let _ = take_prepared_delete_receipt(&root.join(transaction.to_string()));
+            let tx_dir = root.join(transaction.to_string());
+            let _ = take_prepared_delete_receipt(&tx_dir);
+            let _ = take_published_delete_receipt(&tx_dir);
         }
 
         let (mut observed, mut has_data_dir_work) = self
@@ -2493,8 +2495,8 @@ impl LocalDisk {
                     Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Ok(None)),
                     Err(err) => return Err(err),
                 };
-                type PreparedDeleteTuple = (Option<Uuid>, Option<Vec<u8>>, Vec<u8>, DeleteRecoveryJournal, bool);
-                let (old_dir, target, journal_raw, journal, sole_transaction) =
+                type PreparedDeleteTuple = (Option<Uuid>, Option<Vec<u8>>, Vec<u8>, DeleteRecoveryJournal, bool, bool, bool);
+                let (old_dir, target, journal_raw, journal, sole_transaction, destination_missing, old_data_dir_present) =
                     match (|| -> Result<Option<PreparedDeleteTuple>> {
                         let mut meta = FileMeta::load(&buf)?;
                         let mut deleted_headers: Vec<_> = meta
@@ -2529,7 +2531,11 @@ impl LocalDisk {
                         let target = (!meta.versions.is_empty()).then(|| meta.marshal_msg()).transpose()?;
                         let mut predecessors = BTreeSet::new();
                         let mut sole_transaction = true;
+                        let mut destination_exists = false;
+                        let mut old_data_dir_exists = false;
+                        let mut scanned_file_path = false;
                         if let Ok(entries) = std::fs::read_dir(&file_path) {
+                            scanned_file_path = true;
                             for (visited, entry) in
                                 recovery_entries(entries, recovery_scope.as_ref().map(|scope| scope.budget.as_ref())).enumerate()
                             {
@@ -2542,12 +2548,18 @@ impl LocalDisk {
                                     sole_transaction = false;
                                     continue;
                                 };
-                                let Some(id) = Uuid::parse_str(name_str).ok().filter(|id| !id.is_nil() && *id != transaction)
-                                else {
+                                let Some(id) = Uuid::parse_str(name_str).ok().filter(|id| !id.is_nil()) else {
                                     continue;
                                 };
+                                if id == transaction {
+                                    destination_exists = true;
+                                    continue;
+                                }
                                 if !entry.file_type().map_err(to_file_error)?.is_dir() {
                                     return Err(DiskError::InvalidPath);
+                                }
+                                if old_dir == Some(id) && name_str == id.hyphenated().to_string() {
+                                    old_data_dir_exists = true;
                                 }
                                 let dir_path = entry.path();
                                 let prepared = regular_bytes(&dir_path.join(PREPARED))?;
@@ -2607,7 +2619,15 @@ impl LocalDisk {
                             predecessors: predecessors.into_iter().collect(),
                         };
                         let raw = journal_bytes(&journal)?;
-                        Ok(Some((old_dir, target, raw, journal, sole_transaction)))
+                        Ok(Some((
+                            old_dir,
+                            target,
+                            raw,
+                            journal,
+                            sole_transaction,
+                            scanned_file_path && !destination_exists,
+                            scanned_file_path && old_data_dir_exists,
+                        )))
                     })() {
                         Ok(Some(tuple)) => tuple,
                         Ok(None) => return Ok(Ok(None)),
@@ -2641,16 +2661,18 @@ impl LocalDisk {
                 if sync {
                     os::fsync_dir_std(&staged_dir)?;
                 }
-                match std::fs::symlink_metadata(&destination) {
-                    Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir(&destination) {
-                        Ok(()) => {}
+                if !destination_missing {
+                    match std::fs::symlink_metadata(&destination) {
+                        Ok(metadata) if metadata.is_dir() => match std::fs::remove_dir(&destination) {
+                            Ok(()) => {}
+                            Err(err) if err.kind() == ErrorKind::NotFound => {}
+                            Err(err) if is_dir_not_empty_error(&err) => return Ok(Err(DiskError::OutdatedXLMeta)),
+                            Err(err) => return Err(err),
+                        },
+                        Ok(_) => return Ok(Err(DiskError::OutdatedXLMeta)),
                         Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) if is_dir_not_empty_error(&err) => return Ok(Err(DiskError::OutdatedXLMeta)),
                         Err(err) => return Err(err),
-                    },
-                    Ok(_) => return Ok(Err(DiskError::OutdatedXLMeta)),
-                    Err(err) if err.kind() == ErrorKind::NotFound => {}
-                    Err(err) => return Err(err),
+                    }
                 }
                 let staged_dir = staged.keep();
                 os::record_native_publication(&destination);
@@ -2658,7 +2680,9 @@ impl LocalDisk {
                     let _ = std::fs::remove_dir_all(&staged_dir);
                     return Err(err);
                 }
-                let old_data_path = old_dir.map(|uuid| file_path.join(uuid.to_string())).filter(|p| p.is_dir());
+                let old_data_path = old_dir
+                    .map(|uuid| file_path.join(uuid.to_string()))
+                    .filter(|p| old_data_dir_present || p.is_dir());
                 if sync && let Err(err) = os::fsync_dir_std(&file_path) {
                     let _ = std::fs::remove_dir_all(&destination);
                     return Err(err);
@@ -2687,9 +2711,16 @@ impl LocalDisk {
                     // A provisional head must stay outside the published recovery transaction.
                     let target_in_rollback = destination.join(TARGET);
                     let linked_xl = staging_root.join(format!("delete-xl-{transaction}"));
-                    let _ = std::fs::remove_file(&linked_xl);
                     os::record_native_publication(&xl_path);
-                    let write_res = if std::fs::hard_link(&target_in_rollback, &linked_xl).is_ok() {
+                    let linked = match std::fs::hard_link(&target_in_rollback, &linked_xl) {
+                        Ok(()) => true,
+                        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+                            let _ = std::fs::remove_file(&linked_xl);
+                            std::fs::hard_link(&target_in_rollback, &linked_xl).is_ok()
+                        }
+                        Err(_) => false,
+                    };
+                    let write_res = if linked {
                         let rename_res = std::fs::rename(&linked_xl, &xl_path);
                         if rename_res.is_err() {
                             let _ = std::fs::remove_file(&linked_xl);
@@ -3047,14 +3078,19 @@ impl LocalDisk {
         }
 
         let data_dirs = journal.data_dirs.clone();
+        let has_original = journal.original_digest.is_some();
         let has_target = journal.target_digest.is_some();
         let journal_for_receipt = cached_journal_raw.is_none().then(|| journal.clone());
         let lease = os::acquire_namespace_mutation_lease_with_owner(&receipt_path, owner).await;
-        let prune_paths: Vec<_> = rollback
-            .ancestors()
-            .take_while(|dir| *dir != bucket_path.as_path() && dir.starts_with(&bucket_path))
-            .map(Path::to_path_buf)
-            .collect();
+        let prune_paths: Vec<_> = if has_target {
+            vec![rollback.clone()]
+        } else {
+            rollback
+                .ancestors()
+                .take_while(|dir| *dir != bucket_path.as_path() && dir.starts_with(&bucket_path))
+                .map(Path::to_path_buf)
+                .collect()
+        };
 
         let res = os::run_blocking_namespace_operation_with_sync(lease, sync, move || -> std::io::Result<()> {
             let persist_receipt = |finished: bool| -> std::io::Result<()> {
@@ -3136,23 +3172,53 @@ impl LocalDisk {
             if had_physical_data_dirs && sync && root.is_dir() {
                 os::fsync_dir_std(&root)?;
             }
-            for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
-                if let Err(err) = ignore_not_found(std::fs::remove_file(rollback.join(name))) {
+            let fast_cleanup = cached_journal_raw.is_some();
+            if fast_cleanup {
+                let backup_or_marker = if has_original {
+                    Some(STORAGE_FORMAT_FILE_BACKUP)
+                } else if has_target {
+                    Some(DELETE_MARKER_ROLLBACK_FILE)
+                } else {
+                    None
+                };
+                if let Some(name) = backup_or_marker
+                    && let Err(err) = ignore_not_found(std::fs::remove_file(rollback.join(name)))
+                {
                     if has_target || had_physical_data_dirs {
                         let _ = persist_receipt(true);
                     }
                     return Err(err);
                 }
-            }
-            for name in [PREPARED, TARGET, FINISHED] {
-                let path = rollback.join(name);
-                #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-                os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
-                if let Err(err) = ignore_not_found(std::fs::remove_file(path)) {
-                    if has_target || had_physical_data_dirs {
-                        let _ = persist_receipt(true);
+                for name in [PREPARED, FINISHED].into_iter().chain(has_target.then_some(TARGET)) {
+                    let path = rollback.join(name);
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
+                    if let Err(err) = ignore_not_found(std::fs::remove_file(path)) {
+                        if has_target || had_physical_data_dirs {
+                            let _ = persist_receipt(true);
+                        }
+                        return Err(err);
                     }
-                    return Err(err);
+                }
+            } else {
+                for name in [STORAGE_FORMAT_FILE_BACKUP, DELETE_MARKER_ROLLBACK_FILE] {
+                    if let Err(err) = ignore_not_found(std::fs::remove_file(rollback.join(name))) {
+                        if has_target || had_physical_data_dirs {
+                            let _ = persist_receipt(true);
+                        }
+                        return Err(err);
+                    }
+                }
+                for name in [PREPARED, TARGET, FINISHED] {
+                    let path = rollback.join(name);
+                    #[cfg(all(any(test, feature = "test-util"), not(windows)))]
+                    os::prepared_publication_test_hooks::run(os::prepared_publication_test_hooks::Stage::Remove, &path);
+                    if let Err(err) = ignore_not_found(std::fs::remove_file(path)) {
+                        if has_target || had_physical_data_dirs {
+                            let _ = persist_receipt(true);
+                        }
+                        return Err(err);
+                    }
                 }
             }
             if sync && let Err(err) = os::fsync_dir_std(&rollback) {
