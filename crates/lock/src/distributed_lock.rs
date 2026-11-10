@@ -68,6 +68,84 @@ enum LockAcquireFailureKind {
     UnrecoverableQuorum,
 }
 
+#[derive(PartialEq, Eq)]
+struct BatchLockPeerDiagnostics {
+    peer_index: usize,
+    granted_keys: usize,
+    failed_response_keys: usize,
+    missing_response_keys: usize,
+    call_failed_keys: usize,
+    extra_responses: usize,
+    call_error_kind: Option<&'static str>,
+    elapsed_ms: u128,
+}
+
+impl std::fmt::Debug for BatchLockPeerDiagnostics {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BatchLockPeerDiagnostics")
+            .field("peer_index", &self.peer_index)
+            .field("granted_keys", &self.granted_keys)
+            .field("failed_response_keys", &self.failed_response_keys)
+            .field("missing_response_keys", &self.missing_response_keys)
+            .field("call_failed_keys", &self.call_failed_keys)
+            .field("extra_responses", &self.extra_responses)
+            .field("call_error_kind", &self.call_error_kind)
+            .field("elapsed_ms", &self.elapsed_ms)
+            .finish()
+    }
+}
+
+impl BatchLockPeerDiagnostics {
+    fn from_response(peer_index: usize, key_count: usize, response: &Result<Vec<LockResponse>>, elapsed: Duration) -> Self {
+        let mut diagnostics = Self {
+            peer_index,
+            granted_keys: 0,
+            failed_response_keys: 0,
+            missing_response_keys: 0,
+            call_failed_keys: 0,
+            extra_responses: 0,
+            call_error_kind: None,
+            elapsed_ms: elapsed.as_millis(),
+        };
+        match response {
+            Ok(responses) => {
+                for response in responses.iter().take(key_count) {
+                    if response.success {
+                        diagnostics.granted_keys += 1;
+                    } else {
+                        // Legacy response errors have already lost their source;
+                        // a failed response is not proof of contention or an RPC timeout.
+                        diagnostics.failed_response_keys += 1;
+                    }
+                }
+                diagnostics.missing_response_keys = key_count.saturating_sub(responses.len());
+                diagnostics.extra_responses = responses.len().saturating_sub(key_count);
+            }
+            Err(error) => {
+                diagnostics.call_failed_keys = key_count;
+                diagnostics.call_error_kind = Some(match error {
+                    LockError::Timeout { .. } => "timeout",
+                    LockError::ResourceNotFound { .. } => "resource_not_found",
+                    LockError::PermissionDenied { .. } => "permission_denied",
+                    LockError::Network { .. } => "network",
+                    LockError::Internal { .. } => "internal",
+                    LockError::AlreadyLocked { .. } => "already_locked",
+                    LockError::InvalidHandle { .. } => "invalid_handle",
+                    LockError::Configuration { .. } => "configuration",
+                    LockError::Serialization { .. } => "serialization",
+                    LockError::Deserialization { .. } => "deserialization",
+                    LockError::InsufficientNodes { .. } => "insufficient_nodes",
+                    LockError::QuorumNotReached { .. } => "quorum_not_reached",
+                    LockError::QueueFull { .. } => "queue_full",
+                    LockError::NotOwner { .. } => "not_owner",
+                });
+            }
+        }
+        diagnostics
+    }
+}
+
 /// Generate a new aggregate lock ID for multiple client locks
 fn generate_aggregate_lock_id(resource: &ObjectKey) -> LockId {
     LockId {
@@ -786,48 +864,48 @@ impl DistributedLock {
         // failure for every key that still needed that client's vote.
         let rounds = join_all(self.clients.iter().map(|client| {
             let requests = requests.clone();
-            async move { client.acquire_locks_batch(&requests).await }
+            async move {
+                let peer_started = Instant::now();
+                let response = client.acquire_locks_batch(&requests).await;
+                (response, peer_started.elapsed())
+            }
         }))
         .await;
+        let acquire_elapsed = attempt_started.elapsed();
+        let peer_outcomes = rounds
+            .iter()
+            .enumerate()
+            .map(|(peer_index, (response, elapsed))| {
+                BatchLockPeerDiagnostics::from_response(peer_index, resources.len(), response, *elapsed)
+            })
+            .collect::<Vec<_>>();
 
         let mut results: Vec<Result<DistributedLockGuard>> = Vec::with_capacity(resources.len());
         let mut orphaned_entries: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
+        // Index is achieved votes; value is the number of keys with that vote count.
+        let mut keys_by_achieved_votes = vec![0usize; self.clients.len() + 1];
+        let mut failed_keys = 0usize;
         for (key_idx, resource) in resources.iter().enumerate() {
             let mut entries: Vec<HeldLockEntry> = Vec::new();
-            let mut failure: Option<String> = None;
             for (client_idx, client) in self.clients.iter().enumerate() {
-                match &rounds[client_idx] {
-                    Ok(responses) => match responses.get(key_idx) {
-                        Some(response) if response.success => {
-                            let lock_id = response
-                                .lock_info
-                                .as_ref()
-                                .map(|info| info.id.clone())
-                                .unwrap_or_else(|| LockId::new_unique(resource));
-                            entries.push(HeldLockEntry {
-                                lock_id,
-                                client: client.clone(),
-                                valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
-                            });
-                        }
-                        Some(response) => {
-                            failure.get_or_insert_with(|| {
-                                response
-                                    .error
-                                    .clone()
-                                    .unwrap_or_else(|| "distributed lock acquisition failed".to_string())
-                            });
-                        }
-                        None => {
-                            failure.get_or_insert_with(|| "client returned incomplete batch lock response".to_string());
-                        }
-                    },
-                    Err(err) => {
-                        failure.get_or_insert_with(|| err.to_string());
-                    }
+                if let Ok(responses) = &rounds[client_idx].0
+                    && let Some(response) = responses.get(key_idx)
+                    && response.success
+                {
+                    let lock_id = response
+                        .lock_info
+                        .as_ref()
+                        .map(|info| info.id.clone())
+                        .unwrap_or_else(|| LockId::new_unique(resource));
+                    entries.push(HeldLockEntry {
+                        lock_id,
+                        client: client.clone(),
+                        valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
+                    });
                 }
             }
 
+            keys_by_achieved_votes[entries.len()] += 1;
             if entries.len() >= required_quorum {
                 let heartbeat = LockHeartbeatConfig {
                     ttl,
@@ -844,15 +922,50 @@ impl DistributedLock {
                 )));
             } else {
                 let achieved = entries.len();
+                failed_keys += 1;
                 orphaned_entries.extend(entries.iter().map(HeldLockEntry::release_entry));
-                if let Some(error) = failure {
-                    tracing::debug!(resource = %resource, owner, required_quorum, achieved, "batch lock acquire failed: {error}");
-                }
                 results.push(Err(LockError::QuorumNotReached {
                     required: required_quorum,
                     achieved,
                 }));
             }
+        }
+
+        if failed_keys > 0 {
+            warn!(
+                event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                component = LOG_COMPONENT_LOCK,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                state = "batch_quorum_failed",
+                round = 1,
+                key_count = resources.len(),
+                peer_count = self.clients.len(),
+                required_quorum,
+                successful_keys = resources.len() - failed_keys,
+                failed_keys,
+                ?keys_by_achieved_votes,
+                ?peer_outcomes,
+                rollback_grants = orphaned_entries.len(),
+                acquire_ms = acquire_elapsed.as_millis(),
+                "Namespace batch lock acquisition did not reach quorum for all keys"
+            );
+        } else {
+            debug!(
+                event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                component = LOG_COMPONENT_LOCK,
+                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                state = "batch_completed",
+                round = 1,
+                key_count = resources.len(),
+                peer_count = self.clients.len(),
+                required_quorum,
+                successful_keys = resources.len(),
+                failed_keys,
+                ?keys_by_achieved_votes,
+                ?peer_outcomes,
+                acquire_ms = acquire_elapsed.as_millis(),
+                "Namespace batch lock acquisition completed"
+            );
         }
 
         // One bounded synchronous pass so the caller cannot race these
@@ -1654,9 +1767,9 @@ fn record_lock_held_release(lock_type: LockType) {
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF, LOCK_ACQUIRE_SPARE_HEDGES,
-        LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS, UNLOCK_RETRY_BACKOFF,
-        is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
+        BatchLockPeerDiagnostics, DEFERRED_UNLOCK_BACKOFF, DistributedLock, LOCK_ACQUIRE_RETRY_INITIAL_BACKOFF,
+        LOCK_ACQUIRE_SPARE_HEDGES, LOCK_PEER_ACQUIRE_TIMEOUT, LockAcquireFailureKind, LockLostSignal, UNLOCK_RETRY_ATTEMPTS,
+        UNLOCK_RETRY_BACKOFF, is_definitive_lock_contention, is_remote_lock_rpc_failure, should_warn_lock_failure,
     };
     use crate::{
         GlobalLockManager, LocalClient, LockCleanupOutcome, LockError, LockId, LockInfo, LockRequest, LockResponse, LockStats,
@@ -4025,6 +4138,65 @@ mod tests {
         drop(delayed_a_active);
 
         drop(guard);
+    }
+
+    #[test]
+    fn batch_peer_diagnostics_preserves_response_failure_and_missing_counts() {
+        let success = LockResponse {
+            success: true,
+            lock_info: None,
+            error: None,
+            wait_time: Duration::ZERO,
+            position_in_queue: None,
+        };
+        let responses = Ok(vec![
+            success.clone(),
+            LockResponse::failure("Remote lock RPC timed out", Duration::ZERO),
+            success,
+        ]);
+        assert_eq!(
+            BatchLockPeerDiagnostics::from_response(2, 4, &responses, Duration::from_millis(17)),
+            BatchLockPeerDiagnostics {
+                peer_index: 2,
+                granted_keys: 2,
+                failed_response_keys: 1,
+                missing_response_keys: 1,
+                call_failed_keys: 0,
+                extra_responses: 0,
+                call_error_kind: None,
+                elapsed_ms: 17,
+            },
+            "failed legacy responses and missing entries must remain distinct without guessing their cause"
+        );
+        let extra = BatchLockPeerDiagnostics::from_response(0, 1, &responses, Duration::ZERO);
+        assert_eq!(extra.granted_keys, 1, "out-of-range responses cannot add valid grant votes");
+        assert_eq!(extra.failed_response_keys, 0);
+        assert_eq!(extra.missing_response_keys, 0);
+        assert_eq!(extra.extra_responses, 2, "extra peer entries must remain visible");
+    }
+
+    #[test]
+    fn batch_peer_diagnostics_counts_all_keys_for_a_typed_call_failure() {
+        for (error, expected_kind) in [
+            (LockError::timeout("peer", Duration::from_secs(3)), "timeout"),
+            (LockError::internal("Remote lock RPC timed out"), "internal"),
+            (LockError::permission_denied("request rejected"), "permission_denied"),
+        ] {
+            assert_eq!(
+                BatchLockPeerDiagnostics::from_response(1, 1000, &Err(error), Duration::from_secs(3)),
+                BatchLockPeerDiagnostics {
+                    peer_index: 1,
+                    granted_keys: 0,
+                    failed_response_keys: 0,
+                    missing_response_keys: 0,
+                    call_failed_keys: 1000,
+                    extra_responses: 0,
+                    call_error_kind: Some(expected_kind),
+                    elapsed_ms: 3000,
+                },
+                "one failed peer call affects every requested key, and only its typed variant identifies the cause"
+            );
+        }
     }
 
     /// Per-object scripted client: grants only the named objects and records
