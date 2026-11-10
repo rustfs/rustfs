@@ -435,6 +435,10 @@ class ImageWorkflowTests(unittest.TestCase):
 
 
 class HelmWorkflowTests(unittest.TestCase):
+    def test_installation_versions_match_candidate_chart_versions(self):
+        subprocess.run(["bash", "scripts/test_helm_chart_version.sh"], cwd=ROOT,
+                       check=True, capture_output=True, text=True, timeout=15)
+
     def test_chart_is_sealed_before_publish_and_does_not_push(self):
         value = workflow("helm-package.yml")
         self.assertEqual(set(value["on"]), {"workflow_call"})
