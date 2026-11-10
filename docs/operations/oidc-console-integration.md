@@ -40,13 +40,15 @@ Every provider key can be set as `RUSTFS_IDENTITY_OPENID_<KEY>` in the process e
 | `role_policy` | `RUSTFS_IDENTITY_OPENID_ROLE_POLICY` | One fixed policy for every login from this provider. Connectivity testing only. |
 | `display_name` | `RUSTFS_IDENTITY_OPENID_DISPLAY_NAME` | Login button label. |
 | `hide_from_ui` | `RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI` | Hides the provider from `/oidc/providers`. Required (`on`) for STS workload issuers whose discovery document omits `authorization_endpoint`; see [workload provider requirements](oidc-provider-requirements.md#sts-workload-providers). Complete hidden providers still support direct Console login. |
+| `claim_userinfo` | `RUSTFS_IDENTITY_OPENID_CLAIM_USERINFO` | `on` fetches the UserInfo endpoint after the ID token is verified and merges the claims the ID token lacks (the ID token wins on shared keys; any UserInfo failure fails the login). For identity proxies that release group or entitlement claims only through UserInfo. STS clients must then send `WebIdentityAccessToken`. Default `off`. |
+| `claim_value_pattern`, `claim_value_replacement` | `RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_PATTERN`, `RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT` | Regular-expression rewrite applied to every `groups_claim`, `roles_claim` and `claim_name` value before `claim_prefix` and policy lookup: the first match is replaced (`$1`, `${name}` capture groups), values that do not match pass through unchanged, an empty result drops the value. Both keys must be set together; an invalid pattern fails validation and the provider does not load. |
 
 Process-level settings (environment only, never suffixed per provider):
 
 | Variable | Purpose |
 | --- | --- |
 | `RUSTFS_BROWSER_REDIRECT_URL` | Public browser origin used for callback generation, Console success redirects, and logout fallback. |
-| `RUSTFS_OUTBOUND_ALLOW_ORIGINS` | Exact `scheme://host[:port]` origins RustFS may contact for discovery, JWKS, and token requests when the IdP resolves to a private, loopback, or container-network address. See [outbound-connection-policy.md](outbound-connection-policy.md). |
+| `RUSTFS_OUTBOUND_ALLOW_ORIGINS` | Exact `scheme://host[:port]` origins RustFS may contact for discovery, JWKS, token, and UserInfo requests when the IdP resolves to a private, loopback, or container-network address. See [outbound-connection-policy.md](outbound-connection-policy.md). |
 | `RUSTFS_CONSOLE_OIDC_SESSION_DURATION` | Credential lifetime in seconds for Console credentials issued by this callback, for every provider. Default `3600`. Values that are missing, not a positive integer, or zero keep the default; values above `604800` (7 days) are clamped to `604800` with a warning. The same value also sets how long the Console logout token stays valid, so RP-initiated logout keeps working for the whole session. Note that `RUSTFS_CONSOLE_AUTH_TIMEOUT` does not control this: it is the Console HTTP request timeout. |
 
 Named providers: to use provider id `<id>`, suffix every provider env var with `_<id>` (for example `RUSTFS_IDENTITY_OPENID_CLIENT_ID_keycloak`) and register the callback `/rustfs/admin/v3/oidc/callback/<id>`. Suffix scanning is `parse_single_provider` in `crates/iam/src/oidc/config.rs`.
@@ -96,7 +98,7 @@ Behind a reverse proxy or load balancer, set `RUSTFS_BROWSER_REDIRECT_URL` and k
 
 ## Policy mapping
 
-Claim values are used verbatim as policy names (after `claim_prefix`, if any). Names must satisfy `is_safe_claim_policy_name` in `crates/iam/src/sys.rs`: ASCII letters, digits, `_`, `-`, `:`, `.` only, so a value containing `/` (for example Keycloak's full group path `/consoleAdmin`) never matches. Built-in policies:
+Claim values are used as policy names after the optional `claim_value_pattern` rewrite and `claim_prefix` (see [Entitlements released only through UserInfo](#entitlements-released-only-through-userinfo) for the rewrite). Names must satisfy `is_safe_claim_policy_name` in `crates/iam/src/sys.rs`: ASCII letters, digits, `_`, `-`, `:`, `.` only, so a value containing `/` (for example Keycloak's full group path `/consoleAdmin`) never matches. Built-in policies:
 
 | Policy | Grants |
 | --- | --- |
@@ -107,6 +109,21 @@ Claim values are used verbatim as policy names (after `claim_prefix`, if any). N
 | `diagnostics` | Diagnostic admin access. |
 
 For first-contact testing only, `RUSTFS_IDENTITY_OPENID_ROLE_POLICY=consoleAdmin` grants every login full access; remove it before production.
+
+## Entitlements released only through UserInfo
+
+Some identity proxies, community AAI proxies in front of several identity providers among them, differ from a plain Keycloak in two ways: the authorization claim (`eduperson_entitlement` in this example) is released only through the UserInfo endpoint, and its values are URNs such as `urn:mace:example.org:group:demo-project:role=member#aai.example.org`, which contain `=` and `#` and therefore cannot be policy names. Two provider settings cover this:
+
+```bash
+export RUSTFS_IDENTITY_OPENID_CLAIM_USERINFO=on
+export RUSTFS_IDENTITY_OPENID_GROUPS_CLAIM=eduperson_entitlement
+export RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_PATTERN='^urn:mace:example\.org:group:([^:#]+):role=([^#]+)#aai\.example\.org$'
+export RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT='$1:$2'
+```
+
+- `claim_userinfo=on` makes RustFS call the discovered `userinfo_endpoint` with the access token after the ID token is verified, and merge the claims the ID token lacks. UserInfo must answer `application/json` with a `sub` equal to the ID token `sub`; any failure (egress policy, HTTP status, content type, `sub`) fails the login instead of continuing with fewer claims. The ID token wins on a key present in both.
+- `claim_value_pattern` / `claim_value_replacement` rewrite each value before `claim_prefix` and policy lookup. With the pattern above the entitlement becomes `demo-project:member`; create a policy with exactly that name. Values that do not match (other entitlements) pass through unchanged and are ignored because no policy carries their name. Route the entitlements through `groups_claim`, not `claim_name`: values from `groups_claim` with no matching policy are ignored, while every `claim_name` value must resolve or the login is rejected.
+- S3 clients that obtain credentials through `AssumeRoleWithWebIdentity` must send the access token as `WebIdentityAccessToken` next to `WebIdentityToken` (MinIO-compatible). With `claim_userinfo=on`, a request without it is rejected with `400 InvalidArgument` and the message `WebIdentityAccessToken is required when claim_userinfo is enabled`.
 
 ## Validation
 

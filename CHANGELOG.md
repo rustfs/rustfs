@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Identity
+
+- OIDC providers gain three opt-in settings, defaults unchanged. `claim_userinfo=on` (`RUSTFS_IDENTITY_OPENID_CLAIM_USERINFO`) fetches the provider's UserInfo endpoint after the ID token is verified and merges the claims the ID token does not carry, for identity proxies that release group or entitlement claims only through UserInfo (MinIO `claim_userinfo` parity; the ID token wins on shared keys, and any UserInfo failure fails the login). `claim_value_pattern` and `claim_value_replacement` (`RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_PATTERN` / `_REPLACEMENT`) rewrite `groups_claim`, `roles_claim` and `claim_name` values with a regular expression before policy mapping, so URN values with `=` or `#` can map to policy-safe names. `AssumeRoleWithWebIdentity` accepts `WebIdentityAccessToken` (MinIO-compatible) and requires it when the provider has `claim_userinfo=on` (`400 InvalidArgument` without it). See `docs/operations/oidc-console-integration.md`.
+
 ### Deployment
 
 - Existing volumes created by older root-running container images must be writable by the non-root runtime identity before upgrading. The default container UID/GID is `10001:10001`; stop the affected instances, verify host mount paths, and for ordinary bind mounts run `sudo chown -R 10001:10001 /actual/data /actual/logs` on each RustFS data/log mount. Account for ACLs, NFS, Kubernetes, and rootless UID mappings. Image-build ownership changes do not migrate mounted data. See the Docker Quick Start in [README.md](README.md).
