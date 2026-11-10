@@ -17,6 +17,7 @@
 use super::*;
 use crate::app::storage_api::object_usecase::DeleteObjectCondition;
 use s3s::dto::ObjectIdentifier;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 async fn authorize_recursive_delete<T>(
@@ -81,6 +82,19 @@ async fn authorize_recursive_delete<T>(
     result
 }
 
+// XML body keys bypass s3s's URL-path normalization. Match its private slash
+// normalizer without URL-decoding or resolving dot segments in client keys.
+fn normalize_delete_object_key(key: &str) -> Cow<'_, str> {
+    if !key.starts_with('/') {
+        return Cow::Borrowed(key);
+    }
+    let mut normalized = key.split('/').filter(|part| !part.is_empty()).collect::<Vec<_>>().join("/");
+    if key.ends_with('/') {
+        normalized.push('/');
+    }
+    Cow::Owned(normalized)
+}
+
 fn successful_delete_audit_objects(
     delete: &s3s::dto::Delete,
     successful_results: impl IntoIterator<Item = bool>,
@@ -90,7 +104,9 @@ fn successful_delete_audit_objects(
         .iter()
         .zip(successful_results)
         .filter(|(_, successful)| *successful)
-        .map(|(requested, _)| AuditObjectVersion::new(requested.key.clone(), requested.version_id.clone()))
+        .map(|(requested, _)| {
+            AuditObjectVersion::new(normalize_delete_object_key(&requested.key).into_owned(), requested.version_id.clone())
+        })
         .collect()
 }
 
@@ -590,7 +606,10 @@ impl DefaultObjectUsecase {
         // Per-key denials are audited once per denied action, in aggregate, after the loop.
         let mut bulk_denials = crate::storage::access::BulkDenialAudit::start(&mut req)?;
         for (idx, obj_id) in delete.objects.iter().enumerate() {
-            if let Err(err) = validate_object_key(&obj_id.key, "DeleteObjects") {
+            // Authorization and every storage side effect must address the same
+            // normalized object; retain the request key only for response entries.
+            let key = normalize_delete_object_key(&obj_id.key);
+            if let Err(err) = validate_object_key(&key, "DeleteObjects") {
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some(err.code().as_str().to_string()),
                     key: Some(obj_id.key.clone()),
@@ -623,7 +642,7 @@ impl DefaultObjectUsecase {
             {
                 let req_info = req_info_mut(&mut req)?;
                 req_info.bucket = Some(bucket.clone());
-                req_info.object = Some(obj_id.key.clone());
+                req_info.object = Some(key.to_string());
                 req_info.version_id = version_id.clone();
             }
 
@@ -670,7 +689,7 @@ impl DefaultObjectUsecase {
                 }
             }
 
-            if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {
+            if let Err(err) = validate_table_catalog_object_mutation(&bucket, &key).await {
                 delete_results[idx].error = Some(s3s::dto::Error {
                     code: Some("InvalidRequest".to_string()),
                     key: Some(obj_id.key.clone()),
@@ -680,9 +699,9 @@ impl DefaultObjectUsecase {
                 continue;
             }
 
-            let synthetic_version_id = delete_condition.is_none() && version_id.is_none() && is_dir_object(&obj_id.key);
+            let synthetic_version_id = delete_condition.is_none() && version_id.is_none() && is_dir_object(&key);
             let object = ObjectToDelete {
-                object_name: obj_id.key.clone(),
+                object_name: key.into_owned(),
                 version_id: version_uuid,
                 delete_condition,
                 synthetic_version_id,
@@ -910,15 +929,16 @@ impl DefaultObjectUsecase {
         let deleted = (!delete.quiet.unwrap_or_default()).then(|| {
             delete_results
                 .iter()
-                .filter_map(|result| result.delete_object.as_ref().map(|object| (result, object)))
-                .map(|(result, object)| DeletedObject {
+                .enumerate()
+                .filter_map(|(idx, result)| result.delete_object.as_ref().map(|object| (idx, result, object)))
+                .map(|(idx, result, object)| DeletedObject {
                     delete_marker: { if object.delete_marker { Some(true) } else { None } },
                     delete_marker_version_id: delete_marker_response_version_id(
                         object.delete_marker_version_id,
                         object.delete_marker && result.version_suspended && result.requested_version_id.is_none(),
                         result.synthetic_version_id,
                     ),
-                    key: Some(object.object_name.clone()),
+                    key: Some(delete.objects[idx].key.clone()),
                     version_id: delete_entry_response_version_id(
                         object.version_id,
                         object.delete_marker,
@@ -936,7 +956,12 @@ impl DefaultObjectUsecase {
 
         let errors = delete_results
             .iter()
-            .filter_map(|v| v.error.clone())
+            .enumerate()
+            .filter_map(|(idx, result)| {
+                let mut error = result.error.clone()?;
+                error.key = Some(delete.objects[idx].key.clone());
+                Some(error)
+            })
             .collect::<Vec<s3s::dto::Error>>();
         let output = DeleteObjectsOutput {
             deleted,
@@ -2819,10 +2844,56 @@ mod tests {
     }
 
     #[test]
+    fn delete_objects_key_normalization_matches_s3s_path_keys() {
+        use s3s::path::{
+            parse_path_style_with_validation_and_normalization, parse_virtual_hosted_style_with_validation_and_normalization,
+        };
+        use s3s::validation::AwsNameValidation;
+
+        for key in [
+            "plain",
+            "/a/b",
+            "//a/b",
+            "/dir///sub//file",
+            "/dir///",
+            "/",
+            "///",
+            "dir//file",
+            "/literal%2F+名",
+            "/dir/../file",
+            "/dir/./file",
+            "/dir\\file",
+            "/a\0b",
+        ] {
+            let normalized = normalize_delete_object_key(key);
+            let path = parse_path_style_with_validation_and_normalization(
+                &format!("/test-bucket/{key}"),
+                &AwsNameValidation::new(),
+                true,
+            )
+            .expect("path-style key should parse before storage validation");
+            let virtual_host = parse_virtual_hosted_style_with_validation_and_normalization(
+                Some("test-bucket"),
+                &format!("/{key}"),
+                &AwsNameValidation::new(),
+                true,
+            )
+            .expect("virtual-hosted key should parse before storage validation");
+            assert_eq!(Some(normalized.as_ref()), path.get_object_key(), "path-style mismatch for {key:?}");
+            assert_eq!(
+                Some(normalized.as_ref()),
+                virtual_host.get_object_key(),
+                "virtual-hosted mismatch for {key:?}"
+            );
+        }
+        assert_eq!(normalize_delete_object_key(""), "");
+    }
+
+    #[test]
     fn delete_objects_audit_details_include_only_successful_request_entries() {
         let requested = vec![
             ObjectIdentifier {
-                key: "first-key".to_string(),
+                key: "/first-key".to_string(),
                 version_id: None,
                 ..Default::default()
             },
@@ -2832,7 +2903,7 @@ mod tests {
                 ..Default::default()
             },
             ObjectIdentifier {
-                key: "versioned-key".to_string(),
+                key: "//versioned-key".to_string(),
                 version_id: Some("requested-version".to_string()),
                 ..Default::default()
             },
