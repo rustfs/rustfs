@@ -33,7 +33,7 @@ use std::time::Duration;
 use tokio::sync::Notify;
 use tokio::task::{JoinHandle, JoinSet};
 use tokio::time::Instant;
-use tracing::{debug, warn};
+use tracing::{Instrument as _, debug, warn};
 use uuid::Uuid;
 
 const EVENT_DISTRIBUTED_LOCK_CLEANUP: &str = "distributed_lock_cleanup";
@@ -355,6 +355,31 @@ impl Drop for LockAcquireRound {
     }
 }
 
+/// Keep completed grants and every unconsumed batch reply owned across cancellation.
+struct LockBatchAcquireRound {
+    pending: JoinSet<LockBatchAcquireTaskResult>,
+    grants: Vec<Vec<HeldLockEntry>>,
+    clients: Arc<[Arc<dyn LockClient>]>,
+    requests: Arc<[LockRequest]>,
+    span: tracing::Span,
+}
+
+impl Drop for LockBatchAcquireRound {
+    fn drop(&mut self) {
+        let _span = self.span.enter();
+        let entries = self.grants.iter().flatten().map(HeldLockEntry::release_entry).collect();
+        DistributedLock::spawn_release_cleanup(entries, "distributed_lock_cancelled_batch_acquisition");
+        if !self.pending.is_empty() {
+            DistributedLock::spawn_pending_batch_cleanup(
+                std::mem::take(&mut self.pending),
+                self.clients.clone(),
+                self.requests.clone(),
+                "distributed_lock_cancelled_batch_acquisition_cleanup",
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct LockHeartbeatConfig {
     ttl: Duration,
@@ -623,6 +648,7 @@ pub struct DistributedLock {
 }
 
 type LockAcquireTaskResult = (usize, Result<LockResponse>);
+type LockBatchAcquireTaskResult = (usize, Result<Vec<LockResponse>>, Duration);
 
 struct LockAcquireQuorumResult {
     response: LockResponse,
@@ -821,17 +847,17 @@ impl DistributedLock {
     /// round: one [`LockClient::acquire_locks_batch`] RPC per client instead of
     /// one quorum round-trip per key. Returns one guard or error per resource.
     ///
-    /// Bulk operations (S3 `DeleteObjects`) are the only multi-key write-lock
-    /// holders, and their keys are independent. Per-key outcomes are
-    /// deadlock-free without any serial fallback: the wire call is a single
-    /// round per client and every lock server orders concurrent batches by the
-    /// same global (shard, key) order, so no acquirer can hold one key while
-    /// waiting for another. A key that fails to reach quorum releases its
-    /// partial grants (awaited) before its error is returned.
+    /// Each key reaches quorum independently. A key that fails to reach quorum
+    /// makes one synchronous cleanup pass for its partial grants before its
+    /// error is returned; unconfirmed cleanup continues with bounded retries.
     ///
     /// Guards keep the same TTL heartbeat and lock-lost semantics as
     /// [`Self::acquire_guard`]. Contention is waited out server-side up to
     /// `timeout` (each request carries it), matching the single-key path.
+    ///
+    /// Cancelling the caller transfers completed grants and unconsumed replies
+    /// to background cleanup without aborting peer acquisitions. Runtime shutdown
+    /// or exhausted cleanup retries may still leave grants until their leases expire.
     pub async fn acquire_guard_batch(
         &self,
         resources: &[ObjectKey],
@@ -851,7 +877,7 @@ impl DistributedLock {
 
         let required_quorum = self.required_quorum(LockType::Exclusive);
         let attempt_started = Instant::now();
-        let requests: Vec<LockRequest> = resources
+        let requests: Arc<[LockRequest]> = resources
             .iter()
             .map(|resource| {
                 LockRequest::new(resource.clone(), LockType::Exclusive, owner)
@@ -859,26 +885,66 @@ impl DistributedLock {
                     .with_ttl(ttl)
             })
             .collect();
+        let mut round = LockBatchAcquireRound {
+            pending: JoinSet::new(),
+            grants: vec![Vec::new(); resources.len()],
+            clients: self.clients.clone(),
+            requests,
+            span: tracing::Span::current(),
+        };
 
         // One batched round per client; a client-level failure is a per-key
         // failure for every key that still needed that client's vote.
-        let rounds = join_all(self.clients.iter().map(|client| {
-            let requests = requests.clone();
-            async move {
-                let peer_started = Instant::now();
-                let response = client.acquire_locks_batch(&requests).await;
-                (response, peer_started.elapsed())
+        for (peer_index, client) in self.clients.iter().enumerate() {
+            let client = client.clone();
+            let requests = round.requests.clone();
+            round.pending.spawn(
+                async move {
+                    let peer_started = Instant::now();
+                    let response = client.acquire_locks_batch(&requests).await;
+                    (peer_index, response, peer_started.elapsed())
+                }
+                .in_current_span(),
+            );
+        }
+        let mut peer_outcomes = Vec::with_capacity(self.clients.len());
+        let valid_until = attempt_started.checked_add(ttl).unwrap_or(attempt_started);
+        while let Some(join_result) = round.pending.join_next().await {
+            match join_result {
+                Ok((peer_index, response, elapsed)) => {
+                    peer_outcomes.push(BatchLockPeerDiagnostics::from_response(peer_index, resources.len(), &response, elapsed));
+                    if let Ok(responses) = response
+                        && let Some(client) = round.clients.get(peer_index)
+                    {
+                        for ((request, grants), response) in round.requests.iter().zip(&mut round.grants).zip(responses) {
+                            if response.success {
+                                let lock_id = response
+                                    .lock_info
+                                    .map(|info| info.id)
+                                    .unwrap_or_else(|| request.lock_id.clone());
+                                grants.push(HeldLockEntry {
+                                    lock_id,
+                                    client: client.clone(),
+                                    valid_until,
+                                });
+                            }
+                        }
+                    }
+                }
+                Err(error) => {
+                    warn!(
+                        event = EVENT_NAMESPACE_LOCK_ACQUIRE,
+                        component = LOG_COMPONENT_LOCK,
+                        subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                        state = "batch_task_failed",
+                        failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                        "Namespace batch lock peer task failed"
+                    );
+                }
             }
-        }))
-        .await;
+        }
         let acquire_elapsed = attempt_started.elapsed();
-        let peer_outcomes = rounds
-            .iter()
-            .enumerate()
-            .map(|(peer_index, (response, elapsed))| {
-                BatchLockPeerDiagnostics::from_response(peer_index, resources.len(), response, *elapsed)
-            })
-            .collect::<Vec<_>>();
+        peer_outcomes.sort_unstable_by_key(|outcome| outcome.peer_index);
 
         let mut results: Vec<Result<DistributedLockGuard>> = Vec::with_capacity(resources.len());
         let mut orphaned_entries: Vec<(LockId, Arc<dyn LockClient>)> = Vec::new();
@@ -886,24 +952,7 @@ impl DistributedLock {
         let mut keys_by_achieved_votes = vec![0usize; self.clients.len() + 1];
         let mut failed_keys = 0usize;
         for (key_idx, resource) in resources.iter().enumerate() {
-            let mut entries: Vec<HeldLockEntry> = Vec::new();
-            for (client_idx, client) in self.clients.iter().enumerate() {
-                if let Ok(responses) = &rounds[client_idx].0
-                    && let Some(response) = responses.get(key_idx)
-                    && response.success
-                {
-                    let lock_id = response
-                        .lock_info
-                        .as_ref()
-                        .map(|info| info.id.clone())
-                        .unwrap_or_else(|| LockId::new_unique(resource));
-                    entries.push(HeldLockEntry {
-                        lock_id,
-                        client: client.clone(),
-                        valid_until: attempt_started.checked_add(ttl).unwrap_or(attempt_started),
-                    });
-                }
-            }
+            let entries = std::mem::take(&mut round.grants[key_idx]);
 
             keys_by_achieved_votes[entries.len()] += 1;
             if entries.len() >= required_quorum {
@@ -973,7 +1022,20 @@ impl DistributedLock {
         // keeps retrying in the background instead of parking the request
         // on the deferred unlock schedule.
         if !orphaned_entries.is_empty() {
-            Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").await;
+            let cleanup = tokio::spawn(
+                Self::release_entries_bounded(orphaned_entries, "distributed_lock_batch_quorum_rollback").in_current_span(),
+            );
+            if let Err(error) = cleanup.await {
+                warn!(
+                    event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                    component = LOG_COMPONENT_LOCK,
+                    subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                    state = "task_failed",
+                    context = "distributed_lock_batch_quorum_rollback",
+                    failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                    "Batch grant rollback cleanup task failed"
+                );
+            }
         }
         results
     }
@@ -1179,6 +1241,7 @@ impl DistributedLock {
     }
 
     fn spawn_cleanup(cleanup: impl std::future::Future<Output = ()> + Send + 'static, context: &'static str) {
+        let cleanup = cleanup.in_current_span();
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let join_handle = handle.spawn(cleanup);
             drop(join_handle);
@@ -1198,6 +1261,81 @@ impl DistributedLock {
             ),
         });
         drop(join_handle);
+    }
+
+    fn spawn_pending_batch_cleanup(
+        mut pending: JoinSet<LockBatchAcquireTaskResult>,
+        clients: Arc<[Arc<dyn LockClient>]>,
+        requests: Arc<[LockRequest]>,
+        context: &'static str,
+    ) {
+        Self::spawn_cleanup(
+            async move {
+                let mut releases = JoinSet::new();
+                while let Some(join_result) = pending.join_next().await {
+                    match join_result {
+                        Ok((peer_index, response, elapsed)) => {
+                            let peer_outcome =
+                                BatchLockPeerDiagnostics::from_response(peer_index, requests.len(), &response, elapsed);
+                            debug!(
+                                event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                                component = LOG_COMPONENT_LOCK,
+                                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                                state = "batch_reply_completed",
+                                context,
+                                ?peer_outcome,
+                                "Cancelled batch lock reply retained for cleanup"
+                            );
+                            if let Ok(responses) = response
+                                && let Some(client) = clients.get(peer_index)
+                            {
+                                let entries = requests
+                                    .iter()
+                                    .zip(responses)
+                                    .filter(|(_, response)| response.success)
+                                    .map(|(request, response)| {
+                                        let lock_id = response
+                                            .lock_info
+                                            .map(|info| info.id)
+                                            .unwrap_or_else(|| request.lock_id.clone());
+                                        (lock_id, client.clone())
+                                    })
+                                    .collect::<Vec<_>>();
+                                if !entries.is_empty() {
+                                    // A slow cleanup must not block another peer's completed grants.
+                                    releases.spawn(Self::release_entries(entries, context).in_current_span());
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            warn!(
+                                event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                                component = LOG_COMPONENT_LOCK,
+                                subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                                state = "task_failed",
+                                context,
+                                failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                                "Pending batch lock acquisition task failed"
+                            );
+                        }
+                    }
+                }
+                while let Some(result) = releases.join_next().await {
+                    if let Err(error) = result {
+                        warn!(
+                            event = EVENT_DISTRIBUTED_LOCK_CLEANUP,
+                            component = LOG_COMPONENT_LOCK,
+                            subsystem = LOG_SUBSYSTEM_NAMESPACE,
+                            state = "task_failed",
+                            context,
+                            failure = if error.is_cancelled() { "cancelled" } else { "panicked" },
+                            "Pending batch grant release cleanup task failed"
+                        );
+                    }
+                }
+            },
+            context,
+        );
     }
 
     fn spawn_pending_cleanup(
@@ -1763,6 +1901,9 @@ fn record_lock_held_release(lock_type: LockType) {
         LockType::Exclusive => record_write_lock_held_release(),
     }
 }
+
+#[cfg(test)]
+mod batch_acquire_tests;
 
 #[cfg(test)]
 mod tests {
