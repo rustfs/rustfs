@@ -8,6 +8,8 @@ collection:
 
 ## Operations
 
+- [Candidate release pipeline](operations/release-pipeline.md): frozen inputs, staged acceptance, immutable publication and recovery.
+
 - [Sampled local batch CPU diagnostics](operations/local-batch-cpu-diagnostics.md) — default-off request-correlated allocation and worker wall/CPU diagnosis.
 
 - [Retained MRF responsibilities](operations/mrf-responsibilities.md) — unknown bucket identities, bounded probes, and unreadable checkpoint recovery.
