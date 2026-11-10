@@ -17701,6 +17701,16 @@ impl ECStore {
     }
 
     #[cfg(feature = "test-util")]
+    pub async fn complete_scanner_pause_backlog_retirement_for_test(&self, source_pool_index: usize) -> Result<()> {
+        // Native backlog fixtures use bounded capacity inputs rather than the
+        // host filesystem's unrelated usage. Keep the real ILM completion gate.
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_index).await?;
+        self.persist_decommission_durable_ilm_manifest_for_run(source_pool_index, &run_token)
+            .await?;
+        self.complete_decommission(source_pool_index).await
+    }
+
+    #[cfg(feature = "test-util")]
     pub async fn retire_scanner_pause_backlog_for_test(
         self: &Arc<Self>,
         source_pool_index: usize,

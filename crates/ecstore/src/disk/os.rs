@@ -611,6 +611,10 @@ pub(crate) mod prepare_rename_test_hooks {
         }
     }
 
+    pub(crate) fn has_after_component_opened() -> bool {
+        !AFTER_COMPONENT_OPENED.lock().is_empty()
+    }
+
     /// Hooks keyed by a directory component name, run before a Windows
     /// directory pin retries a transient sharing conflict on it.
     #[cfg(windows)]
@@ -3804,7 +3808,7 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-    {
+    if prepared_publication_test_hooks::has_any_hooks() {
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
         if let Some(check) = precondition {
@@ -7198,6 +7202,39 @@ pub(crate) fn pin_multipart_source_directory(
     }
 }
 
+fn same_parent_commit_guard(
+    parent: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+) -> io::Result<RenameCommitGuard> {
+    #[cfg(target_os = "linux")]
+    if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+        let dir = &directory_guard.directories.source;
+        return Ok(RenameCommitGuard {
+            directories: Arc::new(LinuxCommitDirectories {
+                root: directory_guard.directories.root.clone(),
+                source_path: parent.to_path_buf(),
+                destination_path: parent.to_path_buf(),
+                source: LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                },
+                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                }),
+                destination_base: base.to_path_buf(),
+            }),
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = directory_guard;
+    prepare_rename_commit_guard(parent, parent, base, publication_root)
+}
+
 /// A small control record always gets its own inode and an atomic replacement.
 /// The caller owns the upload SourceRW and keeps its namespace lease alive.
 pub(crate) fn replace_multipart_source_metadata(
@@ -7206,10 +7243,20 @@ pub(crate) fn replace_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
+    replace_multipart_source_metadata_with_guard(path, bytes, base, publication_root, None)
+}
+
+pub(crate) fn replace_multipart_source_metadata_with_guard(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
     let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
     prepared.write_all(bytes, true)?;
@@ -7458,37 +7505,9 @@ pub(crate) fn install_multipart_prepared_head(
     if original_path.parent() != Some(parent) || original_path == canonical_head {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
-    #[cfg(target_os = "linux")]
-    let guard = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
-        let dir = &directory_guard.directories.source;
-        RenameCommitGuard {
-            directories: Arc::new(LinuxCommitDirectories {
-                root: directory_guard.directories.root.clone(),
-                source_path: parent.to_path_buf(),
-                destination_path: parent.to_path_buf(),
-                source: LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                },
-                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                }),
-                destination_base: base.to_path_buf(),
-            }),
-        }
-    } else {
-        prepare_rename_commit_guard(parent, parent, base, publication_root)?
-    };
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    #[cfg(not(target_os = "linux"))]
-    let guard = {
-        let _ = directory_guard;
-        prepare_rename_commit_guard(parent, parent, base, publication_root)?
-    };
+    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;
@@ -7790,8 +7809,7 @@ pub(crate) fn hardlink_multipart_source_files(
     }
     #[cfg(unix)]
     {
-        use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
-        use std::os::unix::fs::MetadataExt;
+        use rustix::fs::{AtFlags, FileType, linkat, statat, unlinkat};
         #[cfg(test)]
         let source_path = source.to_path_buf();
         #[cfg(test)]
@@ -7806,20 +7824,26 @@ pub(crate) fn hardlink_multipart_source_files(
             .ok_or_else(|| io::Error::other("missing multipart attempt directory"))?;
         #[cfg(test)]
         prepared_publication_test_hooks::run_hardlink_destination(&source_path, &destination_path);
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         for name in names {
             if cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "multipart staging cancelled"));
             }
-            let original = std::fs::File::from(openat(source, name.as_str(), flags, Mode::empty())?);
-            let expected = original.metadata()?;
-            if !expected.is_file() {
+            let expected = statat(source, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            let expected_type = FileType::from_raw_mode(expected.st_mode);
+            if expected_type.is_symlink() {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            if !expected_type.is_file() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard is not a regular file"));
             }
             linkat(source, name.as_str(), destination, name.as_str(), AtFlags::empty())?;
-            let linked = std::fs::File::from(openat(destination, name.as_str(), flags, Mode::empty())?);
-            let actual = linked.metadata()?;
-            if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            let actual = statat(destination, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            if !FileType::from_raw_mode(actual.st_mode).is_file()
+                || actual.st_dev != expected.st_dev
+                || actual.st_ino != expected.st_ino
+                || actual.st_size != expected.st_size
+                || actual.st_mtime != expected.st_mtime
+            {
                 let _ = unlinkat(destination, name.as_str(), AtFlags::empty());
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard changed during staging"));
             }
@@ -8240,7 +8264,37 @@ pub(crate) fn mkdir_all_below_existing_base_std(
         let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         let mode = Mode::RWXU | Mode::RWXG | Mode::RWXO;
         #[cfg(target_os = "linux")]
-        let base = publication_root.open_directory(base_dir)?.into();
+        let base = {
+            use rustix::fs::{ResolveFlags, openat2};
+            use std::os::fd::AsFd;
+
+            let owned_base = (base_dir != publication_root.io_path.as_path() && base_dir != publication_root.path.as_path())
+                .then(|| publication_root.open_directory(base_dir).map(std::os::fd::OwnedFd::from))
+                .transpose()?;
+            #[cfg(test)]
+            let has_hook = prepare_rename_test_hooks::has_after_component_opened();
+            #[cfg(not(test))]
+            let has_hook = false;
+            if !has_hook {
+                let base_fd = owned_base
+                    .as_ref()
+                    .map_or_else(|| publication_root.directory.as_fd(), AsFd::as_fd);
+                let target = if relative.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    relative
+                };
+                match openat2(base_fd, target, flags, Mode::empty(), ResolveFlags::BENEATH | ResolveFlags::NO_SYMLINKS) {
+                    Ok(leaf) => return Ok(vec![leaf]),
+                    Err(Errno::NOENT | Errno::NOSYS) => {}
+                    Err(err) => return Err(err.into()),
+                }
+            }
+            match owned_base {
+                Some(base) => base,
+                None => publication_root.open_directory(base_dir)?.into(),
+            }
+        };
         #[cfg(not(target_os = "linux"))]
         let base = {
             // The configured endpoint is trusted; every component beneath it

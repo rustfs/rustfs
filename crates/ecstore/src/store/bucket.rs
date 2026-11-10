@@ -443,6 +443,7 @@ impl ECStore {
                 },
                 other => StorageError::Lock(other),
             })?;
+        let ns_guard = Arc::new(ns_guard);
 
         let recover = Box::pin(async {
             self.ensure_bucket_volume_absent_on_all_sets(bucket).await?;
@@ -930,15 +931,16 @@ impl ECStore {
         Ok(())
     }
 
-    async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) -> Result<()> {
-        run_bucket_usage_cleanup(guard, bucket, async {
-            crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, guard).await?;
+    async fn cleanup_bucket_usage(&self, bucket: &str, guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>) -> Result<()> {
+        let namespace_guard = guard.map(Arc::as_ref);
+        run_bucket_usage_cleanup(namespace_guard, bucket, async {
+            crate::data_usage::prepare_bucket_usage_for_namespace_change(bucket, namespace_guard).await?;
             crate::data_usage::remove_bucket_usage_from_backend_with_guard_fenced(self, bucket, guard).await
         })
         .await
     }
 
-    async fn cleanup_bucket_usage_best_effort(&self, bucket: &str, guard: Option<&rustfs_lock::NamespaceLockGuard>) {
+    async fn cleanup_bucket_usage_best_effort(&self, bucket: &str, guard: Option<&Arc<rustfs_lock::NamespaceLockGuard>>) {
         if let Err(err) = self.cleanup_bucket_usage(bucket, guard).await {
             warn!(
                 bucket = %bucket,
@@ -1029,6 +1031,7 @@ impl ECStore {
         } else {
             None
         };
+        let ns_guard = ns_guard.map(Arc::new);
 
         let existing_bucket_info = match self.get_bucket_info_from_sets(bucket, &BucketOptions::default()).await {
             Ok(info) => Some(info),
@@ -1146,7 +1149,7 @@ impl ECStore {
             metadata_sys::set_new_bucket_metadata_intent_in(&self.ctx, meta.clone()).await?;
             if bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
                 || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-                || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
+                || ns_guard.as_deref().is_some_and(|guard| guard.is_lock_lost())
             {
                 return Err(Error::other(format!("bucket metadata creation intent lock was lost: {bucket}")));
             }
@@ -1162,7 +1165,7 @@ impl ECStore {
 
         if let Err(err) = await_bucket_lifecycle_operation(
             bucket_lifecycle_guard.as_ref(),
-            ns_guard.as_ref(),
+            ns_guard.as_deref(),
             bucket,
             "physical bucket creation",
             await_bucket_namespace_operation(
@@ -1191,9 +1194,9 @@ impl ECStore {
             {
                 warn!("best-effort bucket heal after BucketExists failed: {heal_err}");
             }
-            if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_ref().is_none_or(|guard| !guard.is_lock_lost()) {
+            if confirmed_missing && !is_err_bucket_exists(&err) && ns_guard.as_deref().is_none_or(|guard| !guard.is_lock_lost()) {
                 error!("make bucket failed: {err}");
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
+                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_deref())
                     .await;
             }
             return Err(err);
@@ -1214,10 +1217,10 @@ impl ECStore {
         .await;
         let metadata_lock_lost = bucket_lifecycle_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
             || metadata_transaction_guard.as_ref().is_some_and(|guard| guard.is_lock_lost())
-            || ns_guard.as_ref().is_some_and(|guard| guard.is_lock_lost());
+            || ns_guard.as_deref().is_some_and(|guard| guard.is_lock_lost());
         if let Err(err) = metadata_result {
             if !metadata_lock_lost {
-                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_ref())
+                self.rollback_failed_bucket_creation(bucket, bucket_lifecycle_guard.as_ref(), ns_guard.as_deref())
                     .await;
             }
             return Err(err);
@@ -1580,6 +1583,7 @@ impl ECStore {
         } else {
             None
         };
+        let ns_guard = ns_guard.map(Arc::new);
 
         let sr_mark_delete = opts.srdelete_op == SRBucketDeleteOp::MarkDelete;
         let sr_purge = opts.srdelete_op == SRBucketDeleteOp::Purge;
@@ -1615,7 +1619,7 @@ impl ECStore {
                 crate::bucket::metadata_sys::get_object_lock_config_and_incarnation_from_disk_with_guard_in(
                     &self.ctx,
                     bucket,
-                    Some(ns_guard.as_ref().unwrap_or(&guard)),
+                    Some(ns_guard.as_deref().unwrap_or(&guard)),
                 )
                 .await?;
             match state {
@@ -1641,7 +1645,7 @@ impl ECStore {
         if sr_mark_delete {
             await_bucket_lifecycle_operation(
                 bucket_lifecycle_guard.as_ref(),
-                ns_guard.as_ref(),
+                ns_guard.as_deref(),
                 bucket,
                 "bucket delete marker creation",
                 await_bucket_namespace_operation(
@@ -1680,7 +1684,7 @@ impl ECStore {
                 object_lock_metadata_guard.as_ref().map(|(guard, _)| guard),
                 bucket,
                 "Object Lock configuration fence during bucket deletion",
-                run_physical_bucket_deletion(ns_guard.as_ref(), bucket, async {
+                run_physical_bucket_deletion(ns_guard.as_deref(), bucket, async {
                     self.delete_bucket_on_sets(bucket, &delete_opts)
                         .await
                         .map_err(|err| to_object_err(err, vec![bucket]))
@@ -1709,12 +1713,12 @@ impl ECStore {
             if let Some(guard) = bucket_lifecycle_guard.as_ref() {
                 record_opts.add_bucket_lifecycle_lock_guard(guard);
             }
-            if let Some(guard) = ns_guard.as_ref() {
+            if let Some(guard) = ns_guard.as_deref() {
                 record_opts.add_namespace_lock_guard(guard);
             }
             await_bucket_lifecycle_operation(
                 bucket_lifecycle_guard.as_ref(),
-                ns_guard.as_ref(),
+                ns_guard.as_deref(),
                 bucket,
                 "bucket retirement publication",
                 crate::bucket::retirement::commit_retirement(store.clone(), bucket, incarnation, &record_opts),
@@ -1724,7 +1728,7 @@ impl ECStore {
             // V1 ledger must not block quota admission after same-name recreation.
             await_bucket_lifecycle_operation(
                 bucket_lifecycle_guard.as_ref(),
-                ns_guard.as_ref(),
+                ns_guard.as_deref(),
                 bucket,
                 "retired bucket quota ledger cleanup",
                 crate::bucket::quota::reservation::cleanup_retired_bucket_ledger(store, bucket, incarnation),
@@ -1735,7 +1739,7 @@ impl ECStore {
         self.cleanup_bucket_usage_best_effort(bucket, ns_guard.as_ref()).await;
 
         if let Err(err) = self
-            .cleanup_deleted_bucket_metadata(bucket, sr_purge, ns_guard.as_ref())
+            .cleanup_deleted_bucket_metadata(bucket, sr_purge, ns_guard.as_deref())
             .await
         {
             warn!(

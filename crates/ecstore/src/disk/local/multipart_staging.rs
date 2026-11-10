@@ -455,8 +455,11 @@ impl LocalDisk {
                     }
                     let meta_name = format!("part.{}.meta", part.number);
                     let actual = if let Some(cached_part) =
-                        super::multipart_source_state::get_active_multipart_source_part(&source_object, part.number)
-                    {
+                        super::multipart_source_state::get_active_multipart_source_part_with_head(
+                            &source_object,
+                            part.number,
+                            from_active_cache,
+                        ) {
                         cached_part
                     } else {
                         if pinned_source_data.is_none() {
