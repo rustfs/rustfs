@@ -10058,6 +10058,7 @@ dependencies = [
  "qrcode-rs",
  "rand 0.10.3",
  "rcgen",
+ "regex",
  "reqwest",
  "rustfs-config",
  "rustfs-credentials",

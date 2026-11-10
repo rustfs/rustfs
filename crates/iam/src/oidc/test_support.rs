@@ -70,6 +70,9 @@ pub fn test_config(id: &str) -> OidcProviderConfig {
         email_claim: "email".to_string(),
         username_claim: "preferred_username".to_string(),
         hide_from_ui: false,
+        claim_userinfo: false,
+        claim_value_pattern: String::new(),
+        claim_value_replacement: String::new(),
     }
 }
 
@@ -129,6 +132,9 @@ pub(super) fn build_mocked_oidc_provider_config(id: &str, config_url: &str) -> O
         email_claim: "email".to_string(),
         username_claim: "username".to_string(),
         hide_from_ui: false,
+        claim_userinfo: false,
+        claim_value_pattern: String::new(),
+        claim_value_replacement: String::new(),
     }
 }
 #[cfg(test)]

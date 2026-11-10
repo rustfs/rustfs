@@ -30,6 +30,14 @@ pub const OIDC_ROLES_CLAIM: &str = "roles_claim";
 pub const OIDC_EMAIL_CLAIM: &str = "email_claim";
 pub const OIDC_USERNAME_CLAIM: &str = "username_claim";
 pub const OIDC_HIDE_FROM_UI: &str = "hide_from_ui";
+/// `on` fetches the provider's UserInfo endpoint after ID token verification and merges
+/// claims the ID token does not carry (MinIO `claim_userinfo` parity). Default `off`.
+pub const OIDC_CLAIM_USERINFO: &str = "claim_userinfo";
+/// Regular expression applied to every `groups_claim`, `roles_claim` and `claim_name` value;
+/// matching values are rewritten with [`OIDC_CLAIM_VALUE_REPLACEMENT`] before policy mapping.
+pub const OIDC_CLAIM_VALUE_PATTERN: &str = "claim_value_pattern";
+/// Replacement for [`OIDC_CLAIM_VALUE_PATTERN`] matches (`$1`, `${name}` capture syntax).
+pub const OIDC_CLAIM_VALUE_REPLACEMENT: &str = "claim_value_replacement";
 
 // Environment variable names for OIDC
 pub const ENV_IDENTITY_OPENID_ENABLE: &str = "RUSTFS_IDENTITY_OPENID_ENABLE";
@@ -50,9 +58,12 @@ pub const ENV_IDENTITY_OPENID_ROLES_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_ROLES_
 pub const ENV_IDENTITY_OPENID_EMAIL_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_EMAIL_CLAIM";
 pub const ENV_IDENTITY_OPENID_USERNAME_CLAIM: &str = "RUSTFS_IDENTITY_OPENID_USERNAME_CLAIM";
 pub const ENV_IDENTITY_OPENID_HIDE_FROM_UI: &str = "RUSTFS_IDENTITY_OPENID_HIDE_FROM_UI";
+pub const ENV_IDENTITY_OPENID_CLAIM_USERINFO: &str = "RUSTFS_IDENTITY_OPENID_CLAIM_USERINFO";
+pub const ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN: &str = "RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_PATTERN";
+pub const ENV_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT: &str = "RUSTFS_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT";
 
 /// List of all environment variable keys for an OIDC provider.
-pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 18] = &[
+pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 21] = &[
     ENV_IDENTITY_OPENID_ENABLE,
     ENV_IDENTITY_OPENID_CONFIG_URL,
     ENV_IDENTITY_OPENID_ISSUER,
@@ -71,6 +82,9 @@ pub const ENV_IDENTITY_OPENID_KEYS: &[&str; 18] = &[
     ENV_IDENTITY_OPENID_EMAIL_CLAIM,
     ENV_IDENTITY_OPENID_USERNAME_CLAIM,
     ENV_IDENTITY_OPENID_HIDE_FROM_UI,
+    ENV_IDENTITY_OPENID_CLAIM_USERINFO,
+    ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN,
+    ENV_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT,
 ];
 
 /// A list of all valid configuration keys for an OIDC provider.
@@ -93,6 +107,9 @@ pub const IDENTITY_OPENID_KEYS: &[&str] = &[
     OIDC_EMAIL_CLAIM,
     OIDC_USERNAME_CLAIM,
     OIDC_HIDE_FROM_UI,
+    OIDC_CLAIM_USERINFO,
+    OIDC_CLAIM_VALUE_PATTERN,
+    OIDC_CLAIM_VALUE_REPLACEMENT,
     crate::COMMENT_KEY,
 ];
 

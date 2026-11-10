@@ -63,6 +63,127 @@ fn test_parse_single_provider_reads_issuer() {
     );
 }
 #[test]
+fn test_parse_single_provider_reads_userinfo_and_value_mapping() {
+    temp_env::with_vars(
+        [
+            (
+                ENV_IDENTITY_OPENID_CONFIG_URL,
+                Some("https://idp.example.com/realms/app/.well-known/openid-configuration"),
+            ),
+            (ENV_IDENTITY_OPENID_CLIENT_ID, Some("console")),
+            (ENV_IDENTITY_OPENID_CLAIM_USERINFO, Some("on")),
+            (ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN, Some("^urn:x:([^#]+)#egi$")),
+            (ENV_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT, Some("egi:$1")),
+        ],
+        || {
+            let config = parse_single_provider("", "default").expect("provider config should parse");
+
+            assert!(config.claim_userinfo);
+            assert_eq!(config.claim_value_pattern, "^urn:x:([^#]+)#egi$");
+            assert_eq!(config.claim_value_replacement, "egi:$1");
+        },
+    );
+}
+#[test]
+fn test_parse_single_provider_skips_invalid_claim_value_mapping() {
+    let base_vars = [
+        (
+            ENV_IDENTITY_OPENID_CONFIG_URL,
+            Some("https://idp.example.com/realms/app/.well-known/openid-configuration"),
+        ),
+        (ENV_IDENTITY_OPENID_CLIENT_ID, Some("console")),
+    ];
+
+    let mut invalid_pattern = base_vars.to_vec();
+    invalid_pattern.push((ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN, Some("(")));
+    invalid_pattern.push((ENV_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT, Some("x")));
+    temp_env::with_vars(invalid_pattern, || {
+        assert!(parse_single_provider("", "default").is_none(), "invalid pattern must not load");
+    });
+
+    let mut pattern_only = base_vars.to_vec();
+    pattern_only.push((ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN, Some("^a$")));
+    temp_env::with_vars(pattern_only, || {
+        assert!(
+            parse_single_provider("", "default").is_none(),
+            "pattern without replacement must not load"
+        );
+    });
+}
+#[test]
+fn test_parse_persisted_provider_reads_userinfo_and_value_mapping() {
+    let mut cfg = ServerConfig::new();
+    let mut kvs = KVS(vec![rustfs_config::server_config::KV {
+        key: OIDC_CONFIG_URL.to_string(),
+        value: String::new(),
+        hidden_if_empty: false,
+    }]);
+    kvs.insert(
+        OIDC_CONFIG_URL.to_string(),
+        "https://example.com/.well-known/openid-configuration".to_string(),
+    );
+    kvs.insert(OIDC_CLIENT_ID.to_string(), "console".to_string());
+    kvs.insert(OIDC_CLAIM_USERINFO.to_string(), EnableState::On.to_string());
+    kvs.insert(OIDC_CLAIM_VALUE_PATTERN.to_string(), "^urn:x:([^#]+)#egi$".to_string());
+    kvs.insert(OIDC_CLAIM_VALUE_REPLACEMENT.to_string(), "egi:$1".to_string());
+
+    cfg.0
+        .entry(IDENTITY_OPENID_SUB_SYS.to_string())
+        .or_default()
+        .insert(DEFAULT_DELIMITER.to_string(), kvs);
+
+    let parsed = parse_persisted_configs(&cfg);
+    assert_eq!(parsed.len(), 1);
+    assert!(parsed[0].claim_userinfo);
+    assert_eq!(parsed[0].claim_value_pattern, "^urn:x:([^#]+)#egi$");
+    assert_eq!(parsed[0].claim_value_replacement, "egi:$1");
+}
+#[test]
+fn test_userinfo_and_value_mapping_defaults_are_off_and_empty() {
+    let config = OidcProviderConfigInput::default();
+    assert!(!config.claim_userinfo);
+    assert!(config.claim_value_pattern.is_empty());
+    assert!(config.claim_value_replacement.is_empty());
+}
+#[test]
+fn config_input_rejects_invalid_claim_value_pattern() {
+    let input = OidcProviderConfigInput {
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        claim_value_pattern: "(".to_string(),
+        claim_value_replacement: "x".to_string(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_upsert_provider_config("default", input, None),
+        Err(OidcConfigError::ClaimValuePatternInvalid(_))
+    ));
+}
+#[test]
+fn config_input_rejects_pattern_without_replacement() {
+    let pattern_only = OidcProviderConfigInput {
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        claim_value_pattern: "^a$".to_string(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_upsert_provider_config("default", pattern_only, None),
+        Err(OidcConfigError::ClaimValueMappingIncomplete)
+    ));
+
+    let replacement_only = OidcProviderConfigInput {
+        config_url: "https://example.com/.well-known/openid-configuration".to_string(),
+        client_id: "client".to_string(),
+        claim_value_replacement: "x".to_string(),
+        ..Default::default()
+    };
+    assert!(matches!(
+        build_upsert_provider_config("default", replacement_only, None),
+        Err(OidcConfigError::ClaimValueMappingIncomplete)
+    ));
+}
+#[test]
 fn test_parse_persisted_provider_config() {
     let mut cfg = ServerConfig::new();
     let mut kvs = KVS(vec![
@@ -320,12 +441,18 @@ fn test_oidc_provider_config_defaults() {
         email_claim: "email".to_string(),
         username_claim: "preferred_username".to_string(),
         hide_from_ui: false,
+        claim_userinfo: false,
+        claim_value_pattern: String::new(),
+        claim_value_replacement: String::new(),
     };
 
     assert_eq!(config.id, "test");
     assert!(config.enabled);
     assert_eq!(config.scopes.len(), 3);
     assert!(config.redirect_uri_dynamic);
+    assert!(!config.claim_userinfo);
+    assert!(config.claim_value_pattern.is_empty());
+    assert!(config.claim_value_replacement.is_empty());
 }
 
 #[test]
@@ -416,6 +543,9 @@ fn persisted_config_codec_keeps_instance_keys_and_fields() {
             client_id: "client".to_string(),
             client_secret: Some("secret".to_string()),
             hide_from_ui: true,
+            claim_userinfo: true,
+            claim_value_pattern: "^urn:x:([^#]+)#egi$".to_string(),
+            claim_value_replacement: "egi:$1".to_string(),
             ..Default::default()
         },
         None,
@@ -430,7 +560,15 @@ fn persisted_config_codec_keeps_instance_keys_and_fields() {
         .expect("default provider KVS should exist");
     assert_eq!(default.get(OIDC_ISSUER), "https://issuer.example.com");
     assert_eq!(default.get(OIDC_HIDE_FROM_UI), EnableState::On.to_string());
+    assert_eq!(default.get(OIDC_CLAIM_USERINFO), EnableState::On.to_string());
+    assert_eq!(default.get(OIDC_CLAIM_VALUE_PATTERN), "^urn:x:([^#]+)#egi$");
+    assert_eq!(default.get(OIDC_CLAIM_VALUE_REPLACEMENT), "egi:$1");
     assert_eq!(persisted_provider_secret(&config, "default").as_deref(), Some("secret"));
+    let reparsed = parse_persisted_configs(&config);
+    assert_eq!(reparsed.len(), 1);
+    assert!(reparsed[0].claim_userinfo);
+    assert_eq!(reparsed[0].claim_value_pattern, "^urn:x:([^#]+)#egi$");
+    assert_eq!(reparsed[0].claim_value_replacement, "egi:$1");
 
     provider.hide_from_ui = false;
     upsert_persisted_provider_config(&mut config, &provider);

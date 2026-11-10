@@ -11509,6 +11509,9 @@ mod tests {
                 email_claim: "email".to_string(),
                 username_claim: "username".to_string(),
                 hide_from_ui: false,
+                claim_userinfo: false,
+                claim_value_pattern: String::new(),
+                claim_value_replacement: String::new(),
             },
             source: rustfs_iam::oidc::OidcProviderConfigSource::Persisted,
         }

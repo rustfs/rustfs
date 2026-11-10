@@ -106,6 +106,7 @@ moka = { workspace = true, features = ["future"] }
 openidconnect = { workspace = true, default-features = false, features = ["accept-rfc3339-timestamps"] }
 http = { workspace = true }
 url = { workspace = true }
+regex = { workspace = true }
 
 # Two-factor authentication (crates/iam/src/mfa)
 data-encoding = { workspace = true }

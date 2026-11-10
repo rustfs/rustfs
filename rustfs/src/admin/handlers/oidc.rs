@@ -179,6 +179,9 @@ struct OidcConfigView {
     email_claim: String,
     username_claim: String,
     hide_from_ui: bool,
+    claim_userinfo: bool,
+    claim_value_pattern: String,
+    claim_value_replacement: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -251,6 +254,9 @@ impl Operation for GetOidcConfigHandler {
                 email_claim: provider.config.email_claim.clone(),
                 username_claim: provider.config.username_claim,
                 hide_from_ui: provider.config.hide_from_ui,
+                claim_userinfo: provider.config.claim_userinfo,
+                claim_value_pattern: provider.config.claim_value_pattern,
+                claim_value_replacement: provider.config.claim_value_replacement,
             })
             .collect();
 

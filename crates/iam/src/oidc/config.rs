@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::fmt;
-use tracing::warn;
+use tracing::{error, warn};
 use url::Url;
 
 pub(super) const REDACTED_SECRET: &str = "***redacted***";
@@ -55,6 +55,12 @@ pub struct OidcProviderConfig {
     pub email_claim: String,
     pub username_claim: String,
     pub hide_from_ui: bool,
+    /// Fetch the UserInfo endpoint after ID token verification and merge missing claims.
+    pub claim_userinfo: bool,
+    /// Regex applied to authorization claim values before policy mapping (empty: no mapping).
+    pub claim_value_pattern: String,
+    /// Replacement for `claim_value_pattern` matches (`$1`, `${name}`).
+    pub claim_value_replacement: String,
 }
 
 #[derive(Deserialize)]
@@ -78,6 +84,9 @@ pub struct OidcProviderConfigInput {
     pub email_claim: String,
     pub username_claim: String,
     pub hide_from_ui: bool,
+    pub claim_userinfo: bool,
+    pub claim_value_pattern: String,
+    pub claim_value_replacement: String,
 }
 
 impl Default for OidcProviderConfigInput {
@@ -101,6 +110,9 @@ impl Default for OidcProviderConfigInput {
             email_claim: OIDC_DEFAULT_EMAIL_CLAIM.to_string(),
             username_claim: OIDC_DEFAULT_USERNAME_CLAIM.to_string(),
             hide_from_ui: false,
+            claim_userinfo: false,
+            claim_value_pattern: String::new(),
+            claim_value_replacement: String::new(),
         }
     }
 }
@@ -127,6 +139,9 @@ pub struct OidcProviderValidationInput {
     pub email_claim: String,
     pub username_claim: String,
     pub hide_from_ui: bool,
+    pub claim_userinfo: bool,
+    pub claim_value_pattern: String,
+    pub claim_value_replacement: String,
 }
 
 impl Default for OidcProviderValidationInput {
@@ -152,6 +167,9 @@ impl Default for OidcProviderValidationInput {
             email_claim: input.email_claim,
             username_claim: input.username_claim,
             hide_from_ui: input.hide_from_ui,
+            claim_userinfo: input.claim_userinfo,
+            claim_value_pattern: input.claim_value_pattern,
+            claim_value_replacement: input.claim_value_replacement,
         }
     }
 }
@@ -182,6 +200,9 @@ impl From<OidcProviderValidationInput> for (String, OidcProviderConfigInput) {
             email_claim: input.email_claim,
             username_claim: input.username_claim,
             hide_from_ui: input.hide_from_ui,
+            claim_userinfo: input.claim_userinfo,
+            claim_value_pattern: input.claim_value_pattern,
+            claim_value_replacement: input.claim_value_replacement,
         };
         (provider_id, config)
     }
@@ -203,6 +224,10 @@ pub enum OidcConfigError {
     RedirectUriRequired,
     #[error("scopes must include openid")]
     OpenidScopeRequired,
+    #[error("claim_value_pattern is not a valid regular expression: {0}")]
+    ClaimValuePatternInvalid(String),
+    #[error("claim_value_pattern and claim_value_replacement must be set together")]
+    ClaimValueMappingIncomplete,
     #[error("{0} must be an absolute http/https URL")]
     InvalidAbsoluteUrl(&'static str),
     #[error("{field} is not allowed: {source}")]
@@ -235,6 +260,9 @@ impl fmt::Debug for OidcProviderConfig {
             .field("email_claim", &self.email_claim)
             .field("username_claim", &self.username_claim)
             .field("hide_from_ui", &self.hide_from_ui)
+            .field("claim_userinfo", &self.claim_userinfo)
+            .field("claim_value_pattern", &self.claim_value_pattern)
+            .field("claim_value_replacement", &self.claim_value_replacement)
             .finish()
     }
 }
@@ -409,7 +437,22 @@ fn normalize_provider_config(mut config: OidcProviderConfig) -> OidcProviderConf
     config.roles_claim = or_default(&config.roles_claim, OIDC_DEFAULT_ROLES_CLAIM);
     config.email_claim = or_default(&config.email_claim, OIDC_DEFAULT_EMAIL_CLAIM);
     config.username_claim = or_default(&config.username_claim, OIDC_DEFAULT_USERNAME_CLAIM);
+    config.claim_value_pattern = config.claim_value_pattern.trim().to_string();
+    config.claim_value_replacement = config.claim_value_replacement.trim().to_string();
     config
+}
+
+/// `claim_value_pattern` and `claim_value_replacement` are either both empty (no mapping) or
+/// both set with a pattern the `regex` crate accepts. Checked for every config source so a
+/// provider never loads with a mapping that cannot run.
+pub(super) fn validate_claim_value_mapping(pattern: &str, replacement: &str) -> Result<(), OidcConfigError> {
+    match (pattern.is_empty(), replacement.is_empty()) {
+        (true, true) => Ok(()),
+        (false, false) => regex::Regex::new(pattern)
+            .map(|_| ())
+            .map_err(|err| OidcConfigError::ClaimValuePatternInvalid(err.to_string())),
+        _ => Err(OidcConfigError::ClaimValueMappingIncomplete),
+    }
 }
 
 fn validate_provider_config_fields(config: &OidcProviderConfig) -> Result<(), OidcConfigError> {
@@ -435,6 +478,7 @@ fn validate_provider_config_fields(config: &OidcProviderConfig) -> Result<(), Oi
     if !config.scopes.iter().any(|scope| scope == "openid") {
         return Err(OidcConfigError::OpenidScopeRequired);
     }
+    validate_claim_value_mapping(&config.claim_value_pattern, &config.claim_value_replacement)?;
     Ok(())
 }
 
@@ -467,6 +511,9 @@ fn build_provider_config(
         email_claim: input.email_claim,
         username_claim: input.username_claim,
         hide_from_ui: input.hide_from_ui,
+        claim_userinfo: input.claim_userinfo,
+        claim_value_pattern: input.claim_value_pattern,
+        claim_value_replacement: input.claim_value_replacement,
     });
     validate_provider_config_fields(&config)?;
     Ok(config)
@@ -548,6 +595,17 @@ pub fn upsert_persisted_provider_config(config: &mut ServerConfig, provider: &Oi
             EnableState::Off.to_string()
         },
     );
+    set_kvs_value(
+        &mut kvs,
+        OIDC_CLAIM_USERINFO,
+        if provider.claim_userinfo {
+            EnableState::On.to_string()
+        } else {
+            EnableState::Off.to_string()
+        },
+    );
+    set_kvs_value(&mut kvs, OIDC_CLAIM_VALUE_PATTERN, provider.claim_value_pattern.clone());
+    set_kvs_value(&mut kvs, OIDC_CLAIM_VALUE_REPLACEMENT, provider.claim_value_replacement.clone());
     config
         .0
         .entry(IDENTITY_OPENID_SUB_SYS.to_string())
@@ -724,6 +782,22 @@ pub(super) fn parse_single_provider(env_suffix: &str, id: &str) -> Option<OidcPr
         if v.is_empty() { None } else { Some(v) }
     };
     let hide_from_ui = parse_enable_state(&get_env(ENV_IDENTITY_OPENID_HIDE_FROM_UI), false, false);
+    let claim_userinfo = parse_enable_state(&get_env(ENV_IDENTITY_OPENID_CLAIM_USERINFO), false, false);
+    let claim_value_pattern = get_env(ENV_IDENTITY_OPENID_CLAIM_VALUE_PATTERN).trim().to_string();
+    let claim_value_replacement = get_env(ENV_IDENTITY_OPENID_CLAIM_VALUE_REPLACEMENT).trim().to_string();
+    if let Err(err) = validate_claim_value_mapping(&claim_value_pattern, &claim_value_replacement) {
+        error!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            result = "claim_value_mapping_invalid",
+            provider_id = %id,
+            source = "env",
+            error = %err,
+            "oidc provider not loaded: claim value mapping is invalid"
+        );
+        return None;
+    }
 
     Some(OidcProviderConfig {
         id: id.to_string(),
@@ -745,6 +819,9 @@ pub(super) fn parse_single_provider(env_suffix: &str, id: &str) -> Option<OidcPr
         email_claim,
         username_claim,
         hide_from_ui,
+        claim_userinfo,
+        claim_value_pattern,
+        claim_value_replacement,
     })
 }
 
@@ -792,6 +869,22 @@ pub(super) fn parse_single_persisted_provider(kvs: &KVS, id: &str) -> Option<Oid
     let redirect_uri = kvs.lookup(OIDC_REDIRECT_URI).filter(|v| !v.is_empty());
     let client_secret = kvs.lookup(OIDC_CLIENT_SECRET).filter(|v| !v.is_empty());
     let hide_from_ui = parse_enable_state(&kvs.lookup(OIDC_HIDE_FROM_UI).unwrap_or_default(), false, false);
+    let claim_userinfo = parse_enable_state(&kvs.lookup(OIDC_CLAIM_USERINFO).unwrap_or_default(), false, false);
+    let claim_value_pattern = kvs.get(OIDC_CLAIM_VALUE_PATTERN).trim().to_string();
+    let claim_value_replacement = kvs.get(OIDC_CLAIM_VALUE_REPLACEMENT).trim().to_string();
+    if let Err(err) = validate_claim_value_mapping(&claim_value_pattern, &claim_value_replacement) {
+        error!(
+            event = EVENT_OIDC_DIAGNOSTICS,
+            component = LOG_COMPONENT_IAM,
+            subsystem = LOG_SUBSYSTEM_OIDC,
+            result = "claim_value_mapping_invalid",
+            provider_id = %id,
+            source = "persisted",
+            error = %err,
+            "oidc provider not loaded: claim value mapping is invalid"
+        );
+        return None;
+    }
 
     Some(OidcProviderConfig {
         id: id.to_string(),
@@ -813,6 +906,9 @@ pub(super) fn parse_single_persisted_provider(kvs: &KVS, id: &str) -> Option<Oid
         email_claim,
         username_claim,
         hide_from_ui,
+        claim_userinfo,
+        claim_value_pattern,
+        claim_value_replacement,
     })
 }
 
