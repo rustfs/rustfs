@@ -1062,6 +1062,31 @@ fn prepare_cycle_for_usage_floor_bootstrap(
     }
 }
 
+/// Overwrite an unreadable usage floor with a bootstrap marker using the
+/// file's current revision for CAS. A successful publish leaves a
+/// `BootstrapPending` floor that the normal load path picks up on retry.
+/// Returns `Err` when the floor is not even readable (transient I/O) so the
+/// caller keeps the supervisor-retry behavior instead of rebuilding.
+async fn rebuild_unreadable_usage_floor(
+    storeapi: Arc<impl ScannerObjectIO + ScannerConfigObjectDelete>,
+) -> Result<(), ScannerError> {
+    let Some(expected_epoch) = scanner_publication_epoch(storeapi.clone()).await else {
+        return Err(ScannerError::Other("scanner usage floor rebuild is blocked by data movement".to_string()));
+    };
+    let (_data, revision) = read_config_with_revision(storeapi.clone(), DATA_USAGE_OBJ_NAME_PATH.as_str())
+        .await
+        .map_err(|err| ScannerError::Other(format!("scanner usage floor revision unreadable for rebuild: {err}")))?;
+    publish_scanner_usage_bootstrap_primary(
+        storeapi,
+        &revision,
+        expected_epoch,
+        None,
+        ScannerUsageBootstrapPublishContext::Recovery,
+        || true,
+    )
+    .await
+}
+
 pub async fn init_data_scanner(ctx: CancellationToken, storeapi: Arc<ECStore>) {
     init_data_scanner_with_storage(ctx, storeapi, ScannerRuntimeGuard::new()).await;
 }
@@ -3090,6 +3115,27 @@ where
             Err(err) => usage_floor_result = Err(err),
         }
     }
+    // backlog#2918: after dual-corruption recovery has been attempted an
+    // unreadable floor is no longer a quota proof. Report the failure, then
+    // rebuild through a CAS overwrite before giving up. Transient I/O errors
+    // fail the rebuild and fall through to the supervisor-retry stop below.
+    if usage_floor_result.is_err() {
+        let error = usage_floor_result.as_ref().unwrap_err().to_string();
+        error!(
+            target: "rustfs::scanner",
+            event = EVENT_SCANNER_PERSIST_STATE,
+            component = LOG_COMPONENT_SCANNER,
+            subsystem = LOG_SUBSYSTEM_RUNTIME,
+            path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
+            state = "usage_floor_load_failed",
+            error = %error,
+            "Scanner usage floor is unreadable after recovery; attempting rebuild"
+        );
+        record_scanner_usage_floor_failure(error);
+        if rebuild_unreadable_usage_floor(storeapi.clone()).await.is_ok() {
+            usage_floor_result = persisted_usage_floor_for_startup(storeapi.clone(), true).await;
+        }
+    }
     let (usage_floor, usage_floor_startup) = match usage_floor_result {
         Ok(result) => result,
         Err(err) => {
@@ -3102,7 +3148,7 @@ where
                 path = %DATA_USAGE_OBJ_NAME_PATH.as_str(),
                 state = "usage_floor_load_failed",
                 error = %err,
-                "Scanner stopped because the persisted usage floor could not be loaded"
+                "Scanner usage floor could not be loaded or rebuilt; stopping leader iteration for supervisor retry"
             );
             record_scanner_usage_floor_failure(error.clone());
             global_metrics().set_cycle(None).await;
@@ -3378,6 +3424,7 @@ where
         runtime_config_generation_seen = scanner_runtime_config_generation();
     }
 
+    let mut maintenance_wait_deadline: Option<Instant> = None;
     loop {
         if ctx.is_cancelled() {
             break;
@@ -3440,6 +3487,10 @@ where
             convergence_retry_interval = Some(pause_backlog_delay.max(Duration::from_secs(1)));
         }
         wait_plan = usage_bootstrap_rebuild.wait_plan(wait_plan, convergence_retry_interval);
+        let wait_started = Instant::now();
+        let wait_deadline = maintenance_wait_deadline
+            .map_or(wait_started + wait_plan.delay, |deadline| deadline.min(wait_started + wait_plan.delay));
+        wait_plan.delay = wait_deadline.saturating_duration_since(wait_started);
         let dirty_generation_before_wait = dirty_usage_generation();
         let dirty_usage_pending_before_wait = dirty_usage_buckets_pending();
         let maintenance_generation_before_wait = scanner_maintenance_generation();
@@ -3513,6 +3564,7 @@ where
                 break;
             }
             ScannerCycleWakeReason::RuntimeConfig => {
+                maintenance_wait_deadline = None;
                 runtime_config_generation_seen = scanner_runtime_config_generation();
                 maintenance_generation_seen = None;
                 scanner_activity_seen = None;
@@ -3520,6 +3572,7 @@ where
                 continue;
             }
             ScannerCycleWakeReason::MaintenanceConfig => {
+                maintenance_wait_deadline = Some(wait_deadline);
                 maintenance_generation_seen = None;
                 scanner_activity_seen = None;
                 clean_idle_backoff.reset();
@@ -3538,6 +3591,7 @@ where
             | ScannerCycleWakeReason::ClusterActivityUnavailable
             | ScannerCycleWakeReason::Recovery => {}
         }
+        maintenance_wait_deadline = None;
 
         if wake_reason == ScannerCycleWakeReason::DirtyUsage {
             debug!(

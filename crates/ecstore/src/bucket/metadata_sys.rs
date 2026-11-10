@@ -22,6 +22,7 @@ use super::target::BucketTargets;
 use crate::bucket::bucket_target_sys::BucketTargetSys;
 use crate::bucket::metadata::{load_bucket_metadata_parse, load_bucket_metadata_parse_with_presence};
 use crate::bucket::utils::is_meta_bucketname;
+use crate::diagnostics::object_lock::ObjectLockAttempt;
 use crate::disk::RUSTFS_META_BUCKET;
 use crate::error::{Error, Result, is_err_bucket_not_found, is_err_strict_volume_not_found};
 use crate::object_api::ObjectOptions;
@@ -599,7 +600,9 @@ pub(crate) async fn get_bucket_incarnation_id_for_options_in(
     }
     let sys = bucket_metadata_sys_of(ctx)?;
     let sys = sys.read().await.clone();
-    let guard = acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts).await?;
+    let guard =
+        acquire_bucket_metadata_transaction_read_lock_for_options_in(ctx, bucket, opts, "bucket_incarnation_options_read")
+            .await?;
     sys.get_bucket_incarnation_id_under_transaction_lock(bucket, &guard).await
 }
 
@@ -683,6 +686,7 @@ pub(crate) async fn update_validated_in<F>(
     bucket: &str,
     config_file: &str,
     data: Vec<u8>,
+    expected_incarnation_id: Option<Uuid>,
     validate: F,
 ) -> Result<OffsetDateTime>
 where
@@ -690,7 +694,7 @@ where
 {
     Box::pin(async {
         let sys = require_bucket_metadata_sys_in(ctx)?;
-        let guard = acquire_config_write_guard(sys.clone(), bucket).await?;
+        let guard = acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id).await?;
         validate()?;
         update_under_config_write_guard(sys, &guard, config_file, data, None).await
     })
@@ -865,6 +869,30 @@ impl BucketMetadataMutationGuard {
     }
 }
 
+/// Read-only scanner authority for one bucket incarnation.
+///
+/// Lock order is bucket lifecycle (read), then metadata transaction (read).
+/// This guard cannot authorize a configuration mutation or scanner ACK write.
+pub struct ScannerBucketIncarnationReadGuard {
+    bucket: String,
+    incarnation_id: Uuid,
+    lifecycle_guard: rustfs_lock::NamespaceLockGuard,
+    transaction_guard: rustfs_lock::NamespaceLockGuard,
+}
+
+impl ScannerBucketIncarnationReadGuard {
+    /// Returns the verified identity while both read fences remain valid.
+    ///
+    /// # Errors
+    /// Returns an error if either lock has lost its lease.
+    pub fn checked_bucket_incarnation(&self) -> Result<(&str, Uuid)> {
+        if self.lifecycle_guard.is_lock_lost() || self.transaction_guard.is_lock_lost() {
+            return Err(Error::other("scanner bucket incarnation read lock was lost"));
+        }
+        Ok((&self.bucket, self.incarnation_id))
+    }
+}
+
 async fn acquire_config_write_guard(sys: Arc<RwLock<BucketMetadataSys>>, bucket: &str) -> Result<BucketMetadataMutationGuard> {
     acquire_config_write_guard_for_incarnation(sys, bucket, None).await
 }
@@ -889,6 +917,68 @@ pub async fn acquire_scanner_bucket_incarnation_fence(
         return Err(Error::other("scanner bucket incarnation owner does not match"));
     }
     acquire_config_write_guard_with_migration(sys, bucket, Some(expected_incarnation_id), false).await
+}
+
+/// Validate scanner read authority without serializing compatible metadata readers.
+///
+/// The returned guard retains both read locks. It never migrates metadata or
+/// creates an incarnation; mutation callers must use the exclusive scanner fence.
+///
+/// # Errors
+/// Returns an error for invalid bucket/owner identities, unavailable locks or
+/// storage, absent incarnation metadata, or a deleted/recreated bucket.
+pub async fn acquire_scanner_bucket_incarnation_read_fence(
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+    expected_owner_id: Uuid,
+) -> Result<ScannerBucketIncarnationReadGuard> {
+    acquire_scanner_bucket_incarnation_read_fence_with_sys(
+        get_bucket_metadata_sys()?,
+        bucket,
+        expected_incarnation_id,
+        expected_owner_id,
+    )
+    .await
+}
+
+async fn acquire_scanner_bucket_incarnation_read_fence_with_sys(
+    sys: Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    expected_incarnation_id: Uuid,
+    expected_owner_id: Uuid,
+) -> Result<ScannerBucketIncarnationReadGuard> {
+    super::utils::check_valid_bucket_name(bucket)?;
+    let metadata_sys = sys.read().await.clone();
+    if expected_owner_id.is_nil() || metadata_sys.object_store().id != expected_owner_id || expected_incarnation_id.is_nil() {
+        return Err(Error::other("scanner bucket incarnation owner does not match"));
+    }
+    let lifecycle_guard = metadata_sys.object_store().acquire_bucket_lifecycle_read_lock(bucket).await?;
+    let transaction_guard = await_bucket_namespace_operation(
+        Some(&lifecycle_guard),
+        bucket,
+        "scanner incarnation read transaction lock acquisition",
+        acquire_metadata_transaction_guard(
+            metadata_sys.object_store(),
+            bucket,
+            "scanner_incarnation_probe",
+            rustfs_lock::LockType::Shared,
+        ),
+    )
+    .await?;
+    let incarnation_id = validate_bucket_metadata_guard_incarnation(
+        &metadata_sys,
+        bucket,
+        Some(expected_incarnation_id),
+        &lifecycle_guard,
+        &transaction_guard,
+    )
+    .await?;
+    Ok(ScannerBucketIncarnationReadGuard {
+        bucket: bucket.to_owned(),
+        incarnation_id,
+        lifecycle_guard,
+        transaction_guard,
+    })
 }
 
 async fn acquire_config_write_guard_with_migration(
@@ -916,15 +1006,47 @@ async fn acquire_config_write_guard_with_migration(
         Some(&lifecycle_guard),
         bucket,
         "bucket config transaction lock acquisition",
-        acquire_transaction_lock_with_sys(&sys, bucket),
+        acquire_transaction_lock_with_sys_for_purpose(
+            &sys,
+            bucket,
+            if migrate {
+                "bucket_config_update"
+            } else {
+                "scanner_incarnation_validation"
+            },
+        ),
     )
     .await?;
+    let current_incarnation_id = validate_bucket_metadata_guard_incarnation(
+        &metadata_sys,
+        bucket,
+        expected_incarnation_id,
+        &lifecycle_guard,
+        &transaction_guard,
+    )
+    .await?;
+
+    Ok(BucketMetadataMutationGuard {
+        bucket: bucket.to_string(),
+        incarnation_id: current_incarnation_id,
+        lifecycle_guard,
+        transaction_guard,
+    })
+}
+
+async fn validate_bucket_metadata_guard_incarnation(
+    metadata_sys: &BucketMetadataSys,
+    bucket: &str,
+    expected_incarnation_id: Option<Uuid>,
+    lifecycle_guard: &rustfs_lock::NamespaceLockGuard,
+    transaction_guard: &rustfs_lock::NamespaceLockGuard,
+) -> Result<Uuid> {
     await_bucket_namespace_operation(
-        Some(&lifecycle_guard),
+        Some(lifecycle_guard),
         bucket,
         "bucket config existence validation",
         await_bucket_namespace_operation(
-            Some(&transaction_guard),
+            Some(transaction_guard),
             bucket,
             "bucket config existence transaction validation",
             async {
@@ -942,11 +1064,11 @@ async fn acquire_config_write_guard_with_migration(
     )
     .await?;
     let current_incarnation_id = await_bucket_namespace_operation(
-        Some(&lifecycle_guard),
+        Some(lifecycle_guard),
         bucket,
         "bucket config incarnation validation",
         await_bucket_namespace_operation(
-            Some(&transaction_guard),
+            Some(transaction_guard),
             bucket,
             "bucket config incarnation transaction validation",
             load_bucket_incarnation(metadata_sys.object_store(), bucket),
@@ -959,12 +1081,7 @@ async fn acquire_config_write_guard_with_migration(
         return Err(Error::BucketNotFound(bucket.to_string()));
     }
 
-    Ok(BucketMetadataMutationGuard {
-        bucket: bucket.to_string(),
-        incarnation_id: current_incarnation_id,
-        lifecycle_guard,
-        transaction_guard,
-    })
+    Ok(current_incarnation_id)
 }
 
 /// Rewrite one config file while the caller already holds this bucket's
@@ -1176,8 +1293,20 @@ pub async fn update_config_with<F>(bucket: &str, config_file: &str, mutate: F) -
 where
     F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
 {
+    update_config_with_expected(bucket, config_file, None, mutate).await
+}
+
+async fn update_config_with_expected<F>(
+    bucket: &str,
+    config_file: &str,
+    expected_incarnation_id: Option<Uuid>,
+    mutate: F,
+) -> Result<OffsetDateTime>
+where
+    F: FnOnce(&BucketMetadata) -> Result<Vec<u8>> + Send,
+{
     let sys = get_bucket_metadata_sys()?;
-    let guard = Box::pin(acquire_config_write_guard(sys.clone(), bucket)).await?;
+    let guard = Box::pin(acquire_config_write_guard_for_incarnation(sys.clone(), bucket, expected_incarnation_id)).await?;
     guard.ensure_valid(bucket)?;
     let metadata_sys = sys.read().await.clone();
     let updated = await_bucket_namespace_operation(
@@ -1194,6 +1323,70 @@ where
     .await?;
     guard.ensure_valid(bucket)?;
     Ok(updated)
+}
+
+fn swift_manages_bucket_tags(tagging: &Tagging) -> bool {
+    tagging
+        .tag_set
+        .iter()
+        .any(|tag| tag.key.as_deref() == Some(super::metadata::SWIFT_TAGGING_MARKER) && tag.value.as_deref() == Some("1"))
+}
+
+/// Read the S3 tag set while keeping Swift's internal tags private.
+pub async fn get_s3_tagging_config(bucket: &str) -> Result<(Tagging, OffsetDateTime)> {
+    let (mut tagging, updated) = get_tagging_config(bucket).await?;
+    if swift_manages_bucket_tags(&tagging) {
+        tagging.tag_set.retain(|tag| {
+            !tag.key
+                .as_deref()
+                .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+        });
+    }
+    Ok((tagging, updated))
+}
+
+/// Replace or clear S3 tags atomically while retaining Swift metadata.
+///
+/// The expected incarnation, when present, is checked under the bucket
+/// lifecycle and metadata guards. A failed write leaves the previous config
+/// intact. Repeated writes replace the same S3 set.
+pub async fn update_s3_tagging_config(
+    bucket: &str,
+    tagging: Option<Tagging>,
+    expected_incarnation_id: Option<Uuid>,
+) -> Result<OffsetDateTime> {
+    let tags = tagging.map(|tagging| tagging.tag_set).unwrap_or_default();
+    let invalid = |message: &str| Error::InvalidArgument(bucket.to_owned(), String::new(), message.to_owned());
+    if tags.len() > super::metadata::MAX_BUCKET_TAGS {
+        return Err(invalid("Cannot have more than 50 tags per bucket"));
+    }
+    super::metadata::validate_tag_set_entries(&tags).map_err(invalid)?;
+    update_config_with_expected(bucket, BUCKET_TAGGING_CONFIG, expected_incarnation_id, |metadata| {
+        let mut merged = metadata.tagging_config.clone().unwrap_or_default();
+        if swift_manages_bucket_tags(&merged) {
+            if tags.iter().any(|tag| {
+                tag.key
+                    .as_deref()
+                    .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+            }) {
+                return Err(invalid("Tag key is reserved for Swift metadata on this bucket"));
+            }
+            merged.tag_set.retain(|tag| {
+                tag.key
+                    .as_deref()
+                    .is_some_and(super::metadata::is_swift_bucket_metadata_tag_key)
+            });
+        } else {
+            merged.tag_set.clear();
+        }
+        merged.tag_set.extend(tags);
+        if merged.tag_set.is_empty() {
+            Ok(Vec::new())
+        } else {
+            super::utils::serialize(&merged).map_err(Error::other)
+        }
+    })
+    .await
 }
 
 /// Acquire a bucket's metadata transaction lock, held across a whole
@@ -1235,12 +1428,17 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in(
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
 ) -> Result<rustfs_lock::NamespaceLockGuard> {
+    acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, "bucket_metadata_read").await
+}
+
+pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+    ctx: &crate::runtime::instance::InstanceContext,
+    bucket: &str,
+    op: &'static str,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
     let sys = bucket_metadata_sys_of(ctx)?;
     let api = sys.read().await.object_store();
-    let lock = api
-        .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-        .await?;
-    Ok(lock.get_read_lock(crate::set_disk::get_lock_acquire_timeout()).await?)
+    acquire_metadata_transaction_guard(api, bucket, op, rustfs_lock::LockType::Shared).await
 }
 
 /// Readers already holding an Object Lock snapshot must share its guard:
@@ -1249,6 +1447,7 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in
     ctx: &crate::runtime::instance::InstanceContext,
     bucket: &str,
     opts: &ObjectOptions,
+    op: &'static str,
 ) -> Result<Arc<rustfs_lock::NamespaceLockGuard>> {
     if let Some(snapshot) = opts.object_lock_config_snapshot.as_ref() {
         let store = object_store_in(ctx).await?;
@@ -1258,12 +1457,22 @@ pub(crate) async fn acquire_bucket_metadata_transaction_read_lock_for_options_in
                 Error::other("Object Lock snapshot does not hold a valid metadata transaction fence for this bucket")
             });
     }
-    Ok(Arc::new(acquire_bucket_metadata_transaction_read_lock_in(ctx, bucket).await?))
+    Ok(Arc::new(
+        acquire_bucket_metadata_transaction_read_lock_in_for_purpose(ctx, bucket, op).await?,
+    ))
 }
 
 async fn acquire_transaction_lock_with_sys(
     sys: &Arc<RwLock<BucketMetadataSys>>,
     bucket: &str,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
+    acquire_transaction_lock_with_sys_for_purpose(sys, bucket, "bucket_metadata_transaction_write").await
+}
+
+async fn acquire_transaction_lock_with_sys_for_purpose(
+    sys: &Arc<RwLock<BucketMetadataSys>>,
+    bucket: &str,
+    op: &'static str,
 ) -> Result<rustfs_lock::NamespaceLockGuard> {
     // Resolve the store under a short-lived read guard: this runs before the
     // write guard in `acquire_config_write_guards`, and must not still hold a
@@ -1272,12 +1481,22 @@ async fn acquire_transaction_lock_with_sys(
     let lock = api
         .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
         .await?;
-    let acquire = lock.get_write_lock(crate::set_disk::get_lock_acquire_timeout());
+    let timeout = crate::set_disk::get_lock_acquire_timeout();
+    let mut attempt = ObjectLockAttempt::start(
+        op,
+        RUSTFS_META_BUCKET,
+        &bucket_metadata_transaction_lock_key(bucket),
+        None,
+        &lock,
+        "write",
+        timeout,
+    );
+    let acquire = lock.get_write_lock(timeout);
     #[cfg(any(test, feature = "test-util"))]
     {
         tokio::pin!(acquire);
         let mut notified = false;
-        let guard = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
+        let result = futures::future::poll_fn(|cx| match std::future::Future::poll(acquire.as_mut(), cx) {
             std::task::Poll::Pending => {
                 if !notified {
                     notify_config_write_lock_attempt(bucket);
@@ -1287,11 +1506,38 @@ async fn acquire_transaction_lock_with_sys(
             }
             std::task::Poll::Ready(result) => std::task::Poll::Ready(result),
         })
-        .await?;
-        Ok(guard)
+        .await;
+        attempt.observe_acquisition(&result);
+        Ok(result?)
     }
     #[cfg(not(any(test, feature = "test-util")))]
-    Ok(acquire.await?)
+    {
+        let result = acquire.await;
+        attempt.observe_acquisition(&result);
+        Ok(result?)
+    }
+}
+
+pub(crate) async fn acquire_metadata_transaction_guard(
+    api: Arc<ECStore>,
+    bucket: &str,
+    op: &'static str,
+    lock_type: rustfs_lock::LockType,
+) -> Result<rustfs_lock::NamespaceLockGuard> {
+    let object = bucket_metadata_transaction_lock_key(bucket);
+    let lock = api.new_ns_lock(RUSTFS_META_BUCKET, &object).await?;
+    let timeout = crate::set_disk::get_lock_acquire_timeout();
+    let mode = match lock_type {
+        rustfs_lock::LockType::Shared => "read",
+        rustfs_lock::LockType::Exclusive => "write",
+    };
+    let mut attempt = ObjectLockAttempt::start(op, RUSTFS_META_BUCKET, &object, None, &lock, mode, timeout);
+    let result = match lock_type {
+        rustfs_lock::LockType::Shared => lock.get_read_lock(timeout).await,
+        rustfs_lock::LockType::Exclusive => lock.get_write_lock(timeout).await,
+    };
+    attempt.observe_acquisition(&result);
+    Ok(result?)
 }
 
 /// The lock resource name is deliberately still the `bucket-targets` one it
@@ -1899,6 +2145,15 @@ impl BucketMetadataSys {
 
     fn object_store_if_live(&self) -> Option<Arc<ECStore>> {
         self.api.upgrade()
+    }
+
+    /// Whether the backing `ECStore` has been dropped.
+    ///
+    /// Used by `InstanceContext::clear_bucket_metadata_sys_if_stale` during
+    /// `ECStore::drop` so a shared bootstrap context does not retain a
+    /// `BucketMetadataSys` whose weak handle is dangling.
+    pub(crate) fn is_store_stale(&self) -> bool {
+        self.api.upgrade().is_none()
     }
 
     fn metadata_publish_lock(&self, bucket: &str) -> Arc<Mutex<MetadataPublishLockState>> {
@@ -2784,13 +3039,13 @@ impl BucketMetadataSys {
     }
 
     async fn find_bucket_incarnation_id_from_disk(&self, bucket: &str) -> Result<Option<Uuid>> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let _transaction_guard = transaction_lock
-            .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let _transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_incarnation_disk_read",
+            rustfs_lock::LockType::Shared,
+        )
+        .await?;
         self.find_bucket_incarnation_id_under_transaction_lock(bucket, &_transaction_guard)
             .await
     }
@@ -2866,13 +3121,13 @@ impl BucketMetadataSys {
     /// revalidated at write quorum, so a stale snapshot can neither revert an
     /// acknowledged configuration update nor outlive a delete/recreate.
     async fn migrate_bucket_creation_commit(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let transaction_guard = transaction_lock
-            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_creation_commit_migration",
+            rustfs_lock::LockType::Exclusive,
+        )
+        .await?;
         let namespace_lock = self.object_store().new_ns_lock(bucket, bucket).await?;
         let namespace_guard = namespace_lock
             .get_read_lock(crate::set_disk::get_lock_acquire_timeout())
@@ -2922,13 +3177,13 @@ impl BucketMetadataSys {
     }
 
     async fn migrate_legacy_metadata(&self, bucket: &str) -> Result<BucketMetadataAuthority> {
-        let transaction_lock = self
-            .object_store()
-            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
-            .await?;
-        let _transaction_guard = transaction_lock
-            .get_write_lock(crate::set_disk::get_lock_acquire_timeout())
-            .await?;
+        let _transaction_guard = acquire_metadata_transaction_guard(
+            self.object_store(),
+            bucket,
+            "bucket_metadata_legacy_migration",
+            rustfs_lock::LockType::Exclusive,
+        )
+        .await?;
 
         let authority = self
             .load_authoritative_metadata_from_disk_under_transaction_lock(bucket)
@@ -3418,7 +3673,7 @@ mod tests {
         ),
         (
             BUCKET_TAGGING_CONFIG,
-            r#"<Tagging><TagSet><Tag><Key>environment</Key><Value>测试-🦀</Value></Tag></TagSet></Tagging>"#.as_bytes(),
+            r#"<Tagging><TagSet><Tag><Key>environment</Key><Value>测试-rust</Value></Tag></TagSet></Tagging>"#.as_bytes(),
         ),
         (BUCKET_REPLICATION_CONFIG, NEW_WRITER_REPLICATION_XML),
         (
@@ -3967,6 +4222,12 @@ mod tests {
                 .await
                 .is_err()
         );
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, Uuid::new_v4(), store.id)
+                .await
+                .is_err(),
+            "read-only scanner validation must not migrate an absent incarnation"
+        );
         assert!(load_bucket_incarnation(store, bucket).await.expect("read sidecar").is_none());
         assert!(
             sys.read()
@@ -4020,6 +4281,128 @@ mod tests {
             acquire_config_write_guard_with_migration(sys, bucket, Some(new), false)
                 .await
                 .is_ok()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial]
+    async fn scanner_incarnation_read_fence_shares_reads_and_blocks_mutations() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let sys = bucket_metadata_sys_of(&store.ctx).expect("metadata owner");
+        let bucket = "scanner-read-fence";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("bucket incarnation");
+        let guard = acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+            .await
+            .expect("read-only scanner fence");
+        assert_eq!(guard.checked_bucket_incarnation().expect("valid read fences"), (bucket, incarnation));
+
+        let transaction_lock = store
+            .new_ns_lock(RUSTFS_META_BUCKET, &bucket_metadata_transaction_lock_key(bucket))
+            .await
+            .expect("metadata transaction namespace");
+        assert!(
+            transaction_lock.get_write_lock(Duration::from_millis(20)).await.is_err(),
+            "scanner read authority must exclude metadata writers"
+        );
+        let lifecycle_lock = store
+            .new_ns_lock(bucket, crate::storage_api_contracts::bucket::BUCKET_LIFECYCLE_LOCK_OBJECT)
+            .await
+            .expect("bucket lifecycle namespace");
+        assert!(
+            lifecycle_lock.get_write_lock(Duration::from_millis(20)).await.is_err(),
+            "scanner read authority must exclude delete and recreation"
+        );
+        let another = timeout(
+            Duration::from_secs(1),
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id),
+        )
+        .await
+        .expect("scanner readers must not serialize")
+        .expect("second read-only scanner fence");
+        let compatible = timeout(
+            Duration::from_secs(1),
+            acquire_bucket_metadata_transaction_read_lock_in(&store.ctx, bucket),
+        )
+        .await
+        .expect("metadata readers must remain compatible")
+        .expect("metadata transaction reader");
+        drop(compatible);
+        drop(another);
+
+        let mut mutation = Box::pin(acquire_config_write_guard_with_migration(sys.clone(), bucket, Some(incarnation), false));
+        assert!(matches!(futures::poll!(&mut mutation), std::task::Poll::Pending));
+        let mut deletion = Box::pin(store.acquire_bucket_lifecycle_write_lock(bucket));
+        assert!(matches!(futures::poll!(&mut deletion), std::task::Poll::Pending));
+        drop(deletion);
+        drop(guard);
+        let mutation = timeout(Duration::from_secs(1), mutation)
+            .await
+            .expect("metadata mutation must progress after scanner read release")
+            .expect("exclusive mutation fence");
+        drop(mutation);
+        let lifecycle = timeout(Duration::from_secs(1), store.acquire_bucket_lifecycle_write_lock(bucket))
+            .await
+            .expect("bucket delete fence must progress after readers release")
+            .expect("exclusive lifecycle fence");
+        drop(lifecycle);
+
+        for (owner, expected) in [
+            (Uuid::new_v4(), incarnation),
+            (Uuid::nil(), incarnation),
+            (store.id, Uuid::nil()),
+        ] {
+            assert!(
+                acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, expected, owner)
+                    .await
+                    .is_err(),
+                "invalid owner or nil incarnation must not receive authority"
+            );
+        }
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, Uuid::new_v4(), store.id)
+                .await
+                .is_err(),
+            "a stale incarnation must not receive authority"
+        );
+        store
+            .delete_bucket(bucket, &DeleteBucketOptions::default())
+            .await
+            .expect("delete bucket");
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+                .await
+                .is_err(),
+            "deleted bucket must not receive authority"
+        );
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("recreate bucket");
+        let replacement = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("replacement incarnation");
+        assert_ne!(replacement, incarnation);
+        assert!(
+            acquire_scanner_bucket_incarnation_read_fence_with_sys(sys.clone(), bucket, incarnation, store.id)
+                .await
+                .is_err(),
+            "recreation must reject the previous scanner identity"
+        );
+        let guard = acquire_scanner_bucket_incarnation_read_fence_with_sys(sys, bucket, replacement, store.id)
+            .await
+            .expect("replacement read-only scanner fence");
+        assert_eq!(
+            guard.checked_bucket_incarnation().expect("replacement remains fenced"),
+            (bucket, replacement)
         );
     }
 
@@ -4546,8 +4929,13 @@ mod tests {
             std::fs::create_dir_all(dir.path().join(bucket)).expect("bucket volume should be created");
         }
         let mut bm = BucketMetadata::new(bucket);
-        bm.update_config(config_file, raw.to_vec())
-            .expect("raw config should be stored");
+        if config_file == crate::bucket::metadata::BUCKET_TAGGING_CONFIG {
+            // Model legacy persisted corruption without passing the write-time validator.
+            bm.tagging_config_xml = raw.to_vec();
+        } else {
+            bm.update_config(config_file, raw.to_vec())
+                .expect("raw config should be stored");
+        }
         sys.persist_new_and_set(bm).await.expect("initial metadata should persist");
     }
 
@@ -5202,6 +5590,61 @@ mod tests {
 
     #[tokio::test]
     #[serial]
+    async fn validated_config_update_rejects_a_different_bucket_incarnation() {
+        let (_dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        let bucket = "catalog-cleanup-incarnation";
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        let incarnation = store
+            .bucket_incarnation_id_from_disk(bucket)
+            .await
+            .expect("read bucket incarnation");
+        let called = std::sync::atomic::AtomicBool::new(false);
+        let result = store
+            .update_bucket_metadata_config_for_incarnation_validated(
+                bucket,
+                "quota.json",
+                br#"{"quota":1}"#.to_vec(),
+                Uuid::new_v4(),
+                || {
+                    called.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                },
+            )
+            .await;
+        assert!(matches!(result, Err(Error::BucketNotFound(name)) if name == bucket));
+        assert!(
+            !called.load(std::sync::atomic::Ordering::SeqCst),
+            "incarnation must be checked before the external fence"
+        );
+        let (metadata, _) = get_config_from_disk_with_presence_in(&store.ctx, bucket)
+            .await
+            .expect("read unchanged bucket metadata");
+        assert!(
+            metadata.quota_config_json.is_empty(),
+            "a stale cleanup must not modify the replacement bucket"
+        );
+        store
+            .update_bucket_metadata_config_for_incarnation_validated(
+                bucket,
+                "quota.json",
+                br#"{"quota":1}"#.to_vec(),
+                incarnation,
+                || Ok(()),
+            )
+            .await
+            .expect("the current incarnation permits the validated update");
+        let (metadata, _) = get_config_from_disk_with_presence_in(&store.ctx, bucket)
+            .await
+            .expect("read updated bucket metadata");
+        assert_eq!(metadata.quota_config_json, br#"{"quota":1}"#);
+    }
+
+    #[tokio::test]
+    #[serial]
     async fn quota_admission_rejects_stale_cached_no_quota() {
         let (_dirs, store) = isolated_store_over_temp_disks().await;
         init_bucket_metadata_sys(store.clone(), Vec::new()).await;
@@ -5673,7 +6116,8 @@ mod tests {
         // update only needs one interleaving to show up.
         const ROUNDS: usize = 8;
         for round in 0..ROUNDS {
-            let tagging = format!("<Tagging><Round>{round}</Round></Tagging>").into_bytes();
+            let tagging =
+                format!("<Tagging><TagSet><Tag><Key>round</Key><Value>{round}</Value></Tag></TagSet></Tagging>").into_bytes();
             let policy = format!(r#"{{"Version":"2012-10-17","Round":{round}}}"#).into_bytes();
 
             let start = Arc::new(tokio::sync::Barrier::new(2));
@@ -5746,7 +6190,7 @@ mod tests {
 
         let blocked = tokio::spawn({
             let node_b = node_b.clone();
-            async move { update_with_sys(node_b, bucket, BUCKET_TAGGING_CONFIG, b"<Tagging/>".to_vec()).await }
+            async move { update_with_sys(node_b, bucket, BUCKET_TAGGING_CONFIG, b"<Tagging><TagSet/></Tagging>".to_vec()).await }
         });
 
         // Long enough for the write to have finished had it not waited: the

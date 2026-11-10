@@ -37,7 +37,7 @@ use std::task::{Context, Poll};
 use std::time::Duration;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{Mutex as StdMutex, OnceLock},
+    sync::OnceLock,
     time::Instant,
 };
 use tokio::sync::Mutex;
@@ -75,9 +75,11 @@ fn startup_runtime_readiness_max_wait() -> Duration {
         Duration::from_secs(secs)
     }
 }
+const EVENT_STARTUP_RUNTIME_READINESS: &str = "startup_runtime_readiness";
+const LOG_COMPONENT_SERVER: &str = "server";
+const LOG_SUBSYSTEM_READINESS: &str = "readiness";
 const METRIC_RUNTIME_READINESS_READY: &str = "rustfs_runtime_readiness_ready";
 const METRIC_RUNTIME_READINESS_DEGRADED_TOTAL: &str = "rustfs_runtime_readiness_degraded_total";
-const METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL: &str = "rustfs_pool_metadata_check_timeouts_total";
 
 pub use crate::shared_types::{
     DependencyReadiness, DependencyReadinessReport, MissingReadinessDrive, ReadinessDegradedReason, StorageReadinessDetails,
@@ -290,66 +292,6 @@ struct StorageWriteReadinessStatus {
     pool_metadata_reason: Option<ReadinessDegradedReason>,
 }
 
-#[derive(Debug, Clone, Copy, Default)]
-struct NodePoolMetadataReadinessCache {
-    entry: Option<NodePoolMetadataReadinessCacheEntry>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct NodePoolMetadataReadinessCacheEntry {
-    cached_at: Instant,
-    observed_at: Instant,
-    status: StorageWriteReadinessStatus,
-}
-
-impl NodePoolMetadataReadinessCache {
-    fn observe(
-        &mut self,
-        observed: StorageWriteReadinessStatus,
-        observed_at: Instant,
-        now: Instant,
-        ttl: Duration,
-    ) -> StorageWriteReadinessStatus {
-        if ttl.is_zero() {
-            self.entry = None;
-            return observed;
-        }
-
-        if observed.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetadataCheckTimeout) {
-            let Some(previous) = self.entry else {
-                return observed;
-            };
-            if now.saturating_duration_since(previous.cached_at) > ttl {
-                return observed;
-            }
-
-            // A confirmed write block must never be hidden by a later timeout.
-            if previous.status.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetaWriteBlocked) {
-                return previous.status;
-            }
-
-            // A transient inspection outage is diagnostic, not proof that the
-            // writer became unsafe. Keep the last confirmed writable state.
-            if previous.status.ready {
-                return StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                };
-            }
-            return observed;
-        }
-
-        if self.entry.is_none_or(|entry| entry.observed_at <= observed_at) {
-            self.entry = Some(NodePoolMetadataReadinessCacheEntry {
-                cached_at: now,
-                observed_at,
-                status: observed,
-            });
-        }
-        observed
-    }
-}
-
 fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWriteReadinessStatus {
     match result {
         Ok(()) => StorageWriteReadinessStatus {
@@ -357,13 +299,9 @@ fn pool_metadata_write_readiness(result: Result<(), StorageError>) -> StorageWri
             pool_metadata_reason: None,
         },
         Err(error) => {
-            let pool_metadata_reason = if error.pool_metadata_failure().is_some() {
-                Some(ReadinessDegradedReason::PoolMetaWriteBlocked)
-            } else if matches!(error, StorageError::Timeout) {
-                Some(ReadinessDegradedReason::PoolMetadataCheckTimeout)
-            } else {
-                None
-            };
+            let pool_metadata_reason = error
+                .pool_metadata_failure()
+                .map(|_| ReadinessDegradedReason::PoolMetaWriteBlocked);
             StorageWriteReadinessStatus {
                 ready: false,
                 pool_metadata_reason,
@@ -429,11 +367,6 @@ fn health_cluster_timeout() -> Duration {
         )
         .max(1),
     )
-}
-
-fn node_pool_metadata_readiness_cache() -> &'static StdMutex<NodePoolMetadataReadinessCache> {
-    static CACHE: OnceLock<StdMutex<NodePoolMetadataReadinessCache>> = OnceLock::new();
-    CACHE.get_or_init(|| StdMutex::new(NodePoolMetadataReadinessCache::default()))
 }
 
 fn storage_readiness_cache() -> &'static Mutex<Option<StorageReadinessCacheEntry>> {
@@ -538,26 +471,6 @@ async fn update_storage_readiness_cache(status: StorageWriteReadinessStatus) {
         captured_at: Instant::now(),
         status,
     });
-}
-
-fn apply_node_pool_metadata_timeout_policy(
-    observed: StorageWriteReadinessStatus,
-    observed_at: Instant,
-) -> StorageWriteReadinessStatus {
-    if observed.pool_metadata_reason == Some(ReadinessDegradedReason::PoolMetadataCheckTimeout) {
-        counter!(METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL).increment(1);
-    }
-    let mut cache = node_pool_metadata_readiness_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    cache.observe(observed, observed_at, Instant::now(), health_readiness_cache_ttl())
-}
-
-#[cfg(test)]
-fn reset_node_pool_metadata_readiness_cache() {
-    *node_pool_metadata_readiness_cache()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = NodePoolMetadataReadinessCache::default();
 }
 
 async fn load_cached_lock_quorum_status() -> Option<LockQuorumObservation> {
@@ -852,9 +765,6 @@ fn record_readiness_report(report: &DependencyReadinessReport) {
         && report.readiness.peer_health_ready;
     gauge!(METRIC_RUNTIME_READINESS_READY).set(if ready { 1.0 } else { 0.0 });
     for reason in &report.degraded_reasons {
-        if ready && *reason == ReadinessDegradedReason::PoolMetadataCheckTimeout {
-            continue;
-        }
         counter!(METRIC_RUNTIME_READINESS_DEGRADED_TOTAL, "reason" => reason.as_str()).increment(1);
     }
 }
@@ -941,7 +851,7 @@ pub async fn collect_node_readiness_report() -> DependencyReadinessReport {
     let mut storage_check_timed_out = false;
     if let Some(store) = runtime_sources::current_object_store_handle() {
         let pool_metadata_status = store.pool_meta_write_status().await;
-        storage = apply_node_pool_metadata_timeout_policy(pool_metadata_write_readiness(pool_metadata_status), Instant::now());
+        storage = pool_metadata_write_readiness(pool_metadata_status);
         match node_storage_snapshot(store.as_ref(), &lock_observation.online_hosts).await {
             Ok((info, unavailable_drives, missing_drives)) => {
                 details.unavailable_drives = unavailable_drives;
@@ -1273,6 +1183,15 @@ async fn collect_lock_quorum_observation_uncached() -> LockQuorumObservation {
     }
 }
 
+/// Wait for local runtime dependencies without exceeding the observation budget.
+///
+/// The budget covers both observations and polling sleeps. An immediately ready
+/// observation can succeed with a zero budget. Cancellation drops the in-flight
+/// observation; only success invokes `on_ready`.
+///
+/// # Errors
+/// Returns an error on expiry, retaining the last completed observation when
+/// available. The readiness callback is never invoked after a timeout.
 pub async fn wait_for_runtime_readiness_with<F, Fut, ReadyFn>(
     max_wait: Duration,
     poll_interval: Duration,
@@ -1285,35 +1204,60 @@ where
     ReadyFn: FnMut(DependencyReadiness),
 {
     let startup_deadline = tokio::time::Instant::now() + max_wait;
-
-    loop {
-        let readiness = load_readiness().await;
-        if readiness.storage_ready && readiness.iam_ready && readiness.lock_quorum_ready && readiness.peer_health_ready {
-            on_ready(readiness);
-            return Ok(());
-        }
-
-        if tokio::time::Instant::now() >= startup_deadline {
-            let reason = format!(
-                "startup readiness timed out after {}s: storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
-                max_wait.as_secs(),
-                readiness.storage_ready,
-                readiness.iam_ready,
-                readiness.lock_quorum_ready,
-                readiness.peer_health_ready
+    let mut last_readiness = None;
+    let result = tokio::time::timeout_at(startup_deadline, async {
+        loop {
+            // Tokio timeouts poll the observation first. Keep the initial
+            // zero-budget observation, but start no later one at expiry.
+            if last_readiness.is_some() && tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            let readiness = load_readiness().await;
+            last_readiness = Some(readiness);
+            if readiness.storage_ready
+                && readiness.iam_ready
+                && readiness.lock_quorum_ready
+                && readiness.peer_health_ready
+                && (max_wait.is_zero() || tokio::time::Instant::now() < startup_deadline)
+            {
+                return Some(readiness);
+            }
+            if tokio::time::Instant::now() >= startup_deadline {
+                return None;
+            }
+            info!(
+                event = EVENT_STARTUP_RUNTIME_READINESS,
+                component = LOG_COMPONENT_SERVER,
+                subsystem = LOG_SUBSYSTEM_READINESS,
+                state = "waiting",
+                storage_ready = readiness.storage_ready,
+                iam_ready = readiness.iam_ready,
+                lock_quorum_ready = readiness.lock_quorum_ready,
+                peer_health_ready = readiness.peer_health_ready,
+                "Runtime node readiness has not been reached yet; delaying ready state publication"
             );
-            return Err(std::io::Error::other(reason));
+            tokio::time::sleep(poll_interval).await;
         }
-
-        info!(
-            target: "rustfs::server::readiness",
-            storage_ready = readiness.storage_ready,
-            iam_ready = readiness.iam_ready,
-            lock_quorum_ready = readiness.lock_quorum_ready,
-            peer_health_ready = readiness.peer_health_ready,
-            "Runtime node readiness has not been reached yet; delaying ready state publication"
-        );
-        tokio::time::sleep(poll_interval).await;
+    })
+    .await;
+    match result {
+        Ok(Some(readiness)) => {
+            on_ready(readiness);
+            Ok(())
+        }
+        Ok(None) | Err(_) => {
+            let detail = match last_readiness {
+                Some(readiness) => format!(
+                    "storage_ready={}, iam_ready={}, lock_quorum_ready={}, peer_health_ready={}",
+                    readiness.storage_ready, readiness.iam_ready, readiness.lock_quorum_ready, readiness.peer_health_ready
+                ),
+                None => "no readiness observation completed".to_string(),
+            };
+            Err(std::io::Error::other(format!(
+                "startup readiness timed out after {}s: {detail}",
+                max_wait.as_secs()
+            )))
+        }
     }
 }
 
@@ -1618,6 +1562,7 @@ mod tests {
     /// predicate counts node-2's drive online, then publish.
     #[tokio::test(start_paused = true)]
     async fn restarted_node_stays_unready_until_survivor_counts_its_drive_online() {
+        use futures::StreamExt;
         use peer_readmission::{
             PeerDriveView, PeerProbe, ReadmissionOutcome, UNREACHABLE_PEER_GRACE, host_drive_observations, readmission_plan,
             wait_for_peer_readmission_with,
@@ -1654,8 +1599,8 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
 
         let gate = async {
-            let outcome =
-                wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || async {
+            let outcome = wait_for_peer_readmission_with(&plan, deadline, Duration::from_secs(1), UNREACHABLE_PEER_GRACE, || {
+                futures::stream::once(async {
                     let mut online_hosts = HashSet::from(["node-0:9000".to_string(), "node-1:9000".to_string()]);
                     if survivor_reaches_restarted.load(Ordering::SeqCst) {
                         online_hosts.insert("node-2:9000".to_string());
@@ -1677,7 +1622,9 @@ mod tests {
                     );
                     HashMap::from([("node-0:9000".to_string(), view.clone()), ("node-1:9000".to_string(), view)])
                 })
-                .await;
+                .flat_map(futures::stream::iter)
+            })
+            .await;
             readiness.mark_stage(rustfs_common::SystemStage::FullReady);
             outcome
         };
@@ -1977,6 +1924,150 @@ mod tests {
         assert!(result.is_ok(), "all runtime dependencies should publish readiness");
         assert!(readiness.is_ready());
         assert_eq!(state_manager.current_state(), ServiceState::Ready);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_cancels_a_suspended_observation() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct ObservationDrop(Arc<AtomicUsize>);
+        impl Drop for ObservationDrop {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let guard = ObservationDrop(Arc::clone(&dropped));
+                async move {
+                    let _guard = guard;
+                    std::future::pending::<DependencyReadiness>().await
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds a suspended dependency observation")
+            .expect_err("no dependency observation completed");
+        assert!(err.to_string().contains("no readiness observation completed"));
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_bounds_the_poll_sleep() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        let wait = wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(30),
+            || {
+                polls.fetch_add(1, Ordering::SeqCst);
+                future::ready(DependencyReadiness::default())
+            },
+            |_| panic!("an unready observation must never publish"),
+        );
+        let err = tokio::time::timeout(Duration::from_secs(3), wait)
+            .await
+            .expect("startup budget bounds the poll sleep")
+            .expect_err("unready observation");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 1, "expiry must not start another observation");
+        assert!(err.to_string().contains("lock_quorum_ready=false"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_publishes_once_before_the_deadline() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) > 0;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect("dependencies recovered before expiry");
+        assert_eq!(started.elapsed(), Duration::from_secs(1));
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_starts_no_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let polls = AtomicUsize::new(0);
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || {
+                let ready = polls.fetch_add(1, Ordering::SeqCst) >= 2;
+                future::ready(DependencyReadiness {
+                    storage_ready: ready,
+                    iam_ready: ready,
+                    lock_quorum_ready: ready,
+                    peer_health_ready: ready,
+                })
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("expiry must prevent a third observation even when immediately ready");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(polls.load(Ordering::SeqCst), 2);
+        assert_eq!(published.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn wait_for_runtime_readiness_does_not_publish_an_observation_at_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let published = AtomicUsize::new(0);
+        let started = tokio::time::Instant::now();
+        wait_for_runtime_readiness_with(
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            || async {
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                DependencyReadiness {
+                    storage_ready: true,
+                    iam_ready: true,
+                    lock_quorum_ready: true,
+                    peer_health_ready: true,
+                }
+            },
+            |_| {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        )
+        .await
+        .expect_err("an observation completing at the deadline must not publish");
+        assert_eq!(started.elapsed(), Duration::from_secs(2));
+        assert_eq!(published.load(Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -2743,7 +2834,7 @@ mod tests {
     }
 
     #[test]
-    fn pool_metadata_observation_distinguishes_block_timeout_and_unavailable() {
+    fn pool_metadata_observation_distinguishes_block_and_unavailable() {
         let blocked = blocked_pool_metadata_status();
         assert!(!blocked.ready);
         assert_eq!(blocked.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetaWriteBlocked));
@@ -2751,227 +2842,76 @@ mod tests {
         let writable = pool_metadata_write_readiness(Ok(()));
         assert!(writable.ready);
         assert_eq!(writable.pool_metadata_reason, None);
-        let timed_out = pool_metadata_write_readiness(Err(StorageError::Timeout));
-        assert!(!timed_out.ready);
-        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
         let unavailable = pool_metadata_write_readiness(Err(StorageError::other("pool metadata writes remain blocked")));
         assert!(!unavailable.ready);
         assert_eq!(
             unavailable.pool_metadata_reason, None,
             "error text alone must not be interpreted as a typed write block"
         );
+    }
 
-        let readiness = DependencyReadiness {
-            storage_ready: false,
+    #[test]
+    fn readiness_report_records_ready_gauge_and_degraded_reasons() {
+        let record = |report: DependencyReadinessReport| {
+            let recorder = DebuggingRecorder::new();
+            let snapshotter = recorder.snapshotter();
+            metrics::with_local_recorder(&recorder, || record_readiness_report(&report));
+            snapshotter.snapshot().into_vec()
+        };
+        let ready = DependencyReadiness {
+            storage_ready: true,
             iam_ready: true,
             lock_quorum_ready: true,
             peer_health_ready: true,
         };
-        let report = dependency_readiness_report_from_write_status(readiness, timed_out);
-        assert!(!report.readiness.storage_ready, "inspection timeout must remain fail-closed");
-        assert_eq!(report.degraded_reasons, vec![ReadinessDegradedReason::PoolMetadataCheckTimeout]);
-        assert_eq!(report.degraded_reasons[0].as_str(), "pool_metadata_check_timeout");
-    }
 
-    #[test]
-    #[serial]
-    fn sticky_pool_metadata_timeout_uses_dedicated_metric_without_degraded_count() {
-        reset_node_pool_metadata_readiness_cache();
-        let recorder = DebuggingRecorder::new();
-        let snapshotter = recorder.snapshotter();
-
-        metrics::with_local_recorder(&recorder, || {
-            with_var(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"), || {
-                let writable = StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: None,
-                };
-                assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-                let sticky = apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: false,
-                        pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                    },
-                    Instant::now(),
-                );
-                assert!(sticky.ready);
-                record_readiness_report(&DependencyReadinessReport {
-                    readiness: DependencyReadiness {
-                        storage_ready: true,
-                        iam_ready: true,
-                        lock_quorum_ready: true,
-                        peer_health_ready: true,
-                    },
-                    degraded_reasons: vec![ReadinessDegradedReason::PoolMetadataCheckTimeout],
-                    storage_details: None,
-                });
-            });
+        let entries = record(DependencyReadinessReport {
+            readiness: ready,
+            degraded_reasons: Vec::new(),
+            storage_details: None,
         });
-        reset_node_pool_metadata_readiness_cache();
-
-        let entries = snapshotter.snapshot().into_vec();
-        let ready = entries.iter().find_map(|(composite, _, _, value)| {
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
             (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
         });
-        assert!(matches!(ready, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0));
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 1.0),
+            "a ready report must set the readiness gauge: {gauge:?}"
+        );
+        assert!(
+            entries
+                .iter()
+                .all(|(composite, _, _, _)| composite.key().name() != METRIC_RUNTIME_READINESS_DEGRADED_TOTAL),
+            "a ready report without reasons must not count degradation"
+        );
 
+        let entries = record(DependencyReadinessReport {
+            readiness: DependencyReadiness {
+                storage_ready: false,
+                ..ready
+            },
+            degraded_reasons: vec![ReadinessDegradedReason::PoolMetaWriteBlocked],
+            storage_details: None,
+        });
+        let gauge = entries.iter().find_map(|(composite, _, _, value)| {
+            (composite.kind() == MetricKind::Gauge && composite.key().name() == METRIC_RUNTIME_READINESS_READY).then_some(value)
+        });
+        assert!(
+            matches!(gauge, Some(DebugValue::Gauge(value)) if value.into_inner() == 0.0),
+            "a degraded report must clear the readiness gauge: {gauge:?}"
+        );
         let degraded = entries.iter().find_map(|(composite, _, _, value)| {
             (composite.kind() == MetricKind::Counter
                 && composite.key().name() == METRIC_RUNTIME_READINESS_DEGRADED_TOTAL
                 && composite
                     .key()
                     .labels()
-                    .any(|label| label.key() == "reason" && label.value() == "pool_metadata_check_timeout"))
+                    .any(|label| label.key() == "reason" && label.value() == "pool_meta_write_blocked"))
             .then_some(value)
         });
-        assert!(degraded.is_none());
-
-        let timeout = entries.iter().find_map(|(composite, _, _, value)| {
-            (composite.kind() == MetricKind::Counter && composite.key().name() == METRIC_POOL_METADATA_CHECK_TIMEOUT_TOTAL)
-                .then_some(value)
-        });
-        assert!(matches!(timeout, Some(DebugValue::Counter(1))));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_preserves_recent_writable_observation() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let writable = StorageWriteReadinessStatus {
-                ready: true,
-                pool_metadata_reason: None,
-            };
-            assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert!(timed_out.ready);
-            assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_fails_closed_with_empty_cache() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert!(!timed_out.ready);
-            assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[test]
-    fn node_pool_metadata_timeout_fails_closed_after_cache_ttl() {
-        let mut cache = NodePoolMetadataReadinessCache::default();
-        let observed_at = Instant::now();
-        let ttl = Duration::from_secs(60);
-        let writable = StorageWriteReadinessStatus {
-            ready: true,
-            pool_metadata_reason: None,
-        };
-        assert_eq!(cache.observe(writable, observed_at, observed_at, ttl), writable);
-
-        let timed_out = cache.observe(
-            StorageWriteReadinessStatus {
-                ready: false,
-                pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-            },
-            observed_at + Duration::from_secs(61),
-            observed_at + Duration::from_secs(61),
-            ttl,
+        assert!(
+            matches!(degraded, Some(DebugValue::Counter(1))),
+            "each degraded reason must be counted once: {degraded:?}"
         );
-
-        assert!(!timed_out.ready);
-        assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_never_hides_confirmed_block() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let blocked = StorageWriteReadinessStatus {
-                ready: false,
-                pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetaWriteBlocked),
-            };
-            let newer_observation = Instant::now();
-            assert_eq!(apply_node_pool_metadata_timeout_policy(blocked, newer_observation), blocked);
-            assert_eq!(
-                apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: true,
-                        pool_metadata_reason: None,
-                    },
-                    newer_observation
-                        .checked_sub(Duration::from_secs(1))
-                        .expect("test instant has elapsed time"),
-                ),
-                StorageWriteReadinessStatus {
-                    ready: true,
-                    pool_metadata_reason: None,
-                }
-            );
-
-            let timed_out = apply_node_pool_metadata_timeout_policy(
-                StorageWriteReadinessStatus {
-                    ready: false,
-                    pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                },
-                Instant::now(),
-            );
-
-            assert_eq!(timed_out, blocked);
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
-    }
-
-    #[tokio::test]
-    #[serial]
-    async fn node_pool_metadata_timeout_fails_closed_without_fresh_observation() {
-        reset_node_pool_metadata_readiness_cache();
-        async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("60000"))], async {
-            let writable = StorageWriteReadinessStatus {
-                ready: true,
-                pool_metadata_reason: None,
-            };
-            assert_eq!(apply_node_pool_metadata_timeout_policy(writable, Instant::now()), writable);
-
-            async_with_vars([(rustfs_config::ENV_HEALTH_READINESS_CACHE_TTL_MS, Some("0"))], async {
-                let timed_out = apply_node_pool_metadata_timeout_policy(
-                    StorageWriteReadinessStatus {
-                        ready: false,
-                        pool_metadata_reason: Some(ReadinessDegradedReason::PoolMetadataCheckTimeout),
-                    },
-                    Instant::now(),
-                );
-
-                assert!(!timed_out.ready);
-                assert_eq!(timed_out.pool_metadata_reason, Some(ReadinessDegradedReason::PoolMetadataCheckTimeout));
-            })
-            .await;
-        })
-        .await;
-        reset_node_pool_metadata_readiness_cache();
     }
 
     #[test]

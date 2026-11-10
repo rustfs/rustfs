@@ -3506,6 +3506,7 @@ mod tests {
                 replication_decision: String::new(),
                 checksum: None,
                 multipart_completion_replayed: false,
+                backfilled_old_current_size: None,
             }
         }
     }

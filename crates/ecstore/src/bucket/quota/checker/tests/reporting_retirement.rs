@@ -119,6 +119,21 @@ async fn durable_quota_reporting_retires_degraded_floors_without_changing_ledger
             // Exercise the real storage entry point before testing the new
             // reporting semantics: the same ledger must admit and refuse
             // these writes even when a scanner floor claims a million bytes.
+            if protocol == 1 {
+                let mut bootstrap = PutObjReader::from_vec(vec![0x5a; 512]);
+                assert!(
+                    matches!(
+                        store
+                            .put_object(&bucket, "bootstrap", &mut bootstrap, &ObjectOptions::default())
+                            .await,
+                        Err(StorageError::SlowDown)
+                    ),
+                    "a missing authoritative ledger must not admit a write from scanner reporting"
+                );
+                crate::bucket::quota::reservation::retry_quota_reconciliation_for_test(store.clone(), &bucket)
+                    .await
+                    .expect("bootstrap authoritative usage through the production worker");
+            }
             let mut too_large = PutObjReader::from_vec(vec![0x5a; 8192]);
             assert!(
                 matches!(

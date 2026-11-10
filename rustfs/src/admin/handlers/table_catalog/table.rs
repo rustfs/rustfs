@@ -56,6 +56,25 @@ impl Operation for RestRenameTableHandler {
         ensure_table_bucket_enabled_from_extensions(&req.extensions, &warehouse).await?;
 
         let store = table_catalog_store_from_extensions(&req.extensions)?;
+        rename_table_response(store, warehouse, source_namespace, source_table, destination_namespace, destination_table).await?;
+        Ok(empty_response(StatusCode::NO_CONTENT))
+    }
+}
+
+// Authorization has completed before ownership moves to the mutation task. A
+// disconnected request must not strand the persisted bucket-wide rename fence.
+pub(super) async fn rename_table_response<S>(
+    store: S,
+    warehouse: String,
+    source_namespace: crate::table_catalog::Namespace,
+    source_table: crate::table_catalog::IdentifierSegment,
+    destination_namespace: crate::table_catalog::Namespace,
+    destination_table: crate::table_catalog::IdentifierSegment,
+) -> S3Result<()>
+where
+    S: crate::table_catalog::TableCatalogStore + Send + 'static,
+{
+    crate::admin::handlers::supervise_admin_mutation("table rename", async move {
         store
             .rename_table(
                 &warehouse,
@@ -65,9 +84,9 @@ impl Operation for RestRenameTableHandler {
                 destination_table.as_str(),
             )
             .await
-            .map_err(catalog_store_error)?;
-        Ok(empty_response(StatusCode::NO_CONTENT))
-    }
+            .map_err(catalog_store_error)
+    })
+    .await
 }
 
 pub struct RestCreateTableHandler {}

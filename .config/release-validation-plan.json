@@ -1,0 +1,77 @@
+{
+  "schema_version": 1,
+  "plan_id": "rustfs-release-validation",
+  "description": "Versioned certification plan for every public RustFS release exit (rustfs/backlog#2662, R01). preview, prerelease and stable all require this explicit plan. Scripts/release/release_gate.py fail-closes publication on any missing, duplicate, stale, substituted or non-PASS required item.",
+  "release_types": ["preview", "prerelease", "stable"],
+  "targets": [
+    {"os": "linux", "arch": "x86_64", "abi": "musl"},
+    {"os": "linux", "arch": "aarch64", "abi": "musl"},
+    {"os": "linux", "arch": "x86_64", "abi": "gnu"},
+    {"os": "linux", "arch": "aarch64", "abi": "gnu"},
+    {"os": "macos", "arch": "aarch64", "abi": "none"},
+    {"os": "windows", "arch": "x86_64", "abi": "msvc"}
+  ],
+  "targets_basis": "Platform matrix of .github/workflows/build.yml (prepare-platform-matrix). gnu and macOS targets build with the pyroscope feature; musl and Windows targets build with no extra features.",
+  "features": ["pyroscope"],
+  "trusted_workflows": [
+    {"repository": "rustfs/s3chaos", "workflow_id": "release-gate.yml"}
+  ],
+  "trusted_workflows_basis": "The shared evidence envelope producer lives in rustfs/s3chaos (G01, fault/release_gate.rs) and its plan/live split workflow is .github/workflows/release-gate.yml there. Only results from these identities may enter a release certification; PR-uploaded JSON never gains release authority. R02 must extend this list when additional verifier workflows land, never widen it to untrusted sources.",
+  "lanes": [
+    {
+      "lane": "identity",
+      "harness_repository": "rustfs/s3chaos",
+      "harness_sha": "9a48f55c1d6d58ce63a8fb1ea7317e024f32f11d",
+      "harness_basis": "Fixed G01 evidence-envelope producer revision (rustfs/s3chaos PR #102 head recorded in rustfs/backlog#2658). R02 re-pins this when the live verifier ships.",
+      "timeout_seconds": 1800,
+      "environment_capabilities": ["process-exec"],
+      "cases": ["artifact-identity", "startup"],
+      "applies_to": {
+        "release_types": ["preview", "prerelease", "stable"],
+        "platforms": "all"
+      },
+      "applies_basis": "Artifact identity and startup checks are mandatory for every release type, preview included, on every shipped target (rustfs/backlog#2662 frozen design item 5)."
+    },
+    {
+      "lane": "upgrade",
+      "harness_repository": "rustfs/s3chaos",
+      "harness_sha": "9a48f55c1d6d58ce63a8fb1ea7317e024f32f11d",
+      "harness_basis": "Same fixed envelope producer as the identity lane; the workflow SHA and the product build SHA are bound separately and need not be equal.",
+      "timeout_seconds": 5400,
+      "environment_capabilities": ["process-exec", "previous-release-artifact"],
+      "cases": [
+        "direct-upgrade",
+        "mixed-version-upgrade",
+        "bucket-config-upgrade",
+        "bucket-config-rollback",
+        "multipart-layout-upgrade",
+        "multipart-layout-baseline"
+      ],
+      "cases_basis": "Case IDs of the pinned previous-release matrix in .github/workflows/e2e-upgrade.yml (source.version/asset/sha256 and the case list mapped there).",
+      "applies_to": {
+        "release_types": ["prerelease", "stable"],
+        "platforms": [{"os": "linux", "arch": "x86_64", "abi": "gnu"}]
+      },
+      "applies_basis": "preview releases use the pre-declared smaller set (identity lane only). The upgrade lane is only exercised on linux-x86_64-gnu, the platform of the pinned source assets."
+    }
+  ],
+  "upgrade_sources": {
+    "basis": "Exactly the two previous-release sources pinned in .github/workflows/e2e-upgrade.yml are exercised today (source.version / source.asset / source.sha256). No other N-1/N-2 compatibility is claimed, and these digests are not inferred from tags.",
+    "sources": [
+      {
+        "version": "1.0.1",
+        "role": "N-1",
+        "artifact_name": "rustfs-linux-x86_64-gnu-v1.0.1.zip",
+        "artifact_sha256": "9742e183cb0dfb0d48fa909797af572fe47b7f827569036baa4156e0d3958ee5"
+      },
+      {
+        "version": "1.0.0-rc.5",
+        "role": "N-2",
+        "artifact_name": "rustfs-linux-x86_64-gnu-v1.0.0-rc.5.zip",
+        "artifact_sha256": "3ee8df71e8edcfada533be452c4135868f697bc515460ae97b027313eade7a3d"
+      }
+    ],
+    "rollback_supported": false,
+    "rollback_basis": "Only the bucket-config-rollback case (rollback_to_previous_release_reads_current_bucket_metadata) is exercised. Full data-plane rollback is not certified and is never a default claim."
+  }
+}

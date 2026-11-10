@@ -56,6 +56,17 @@ pub(super) fn dot_entries() -> Vec<File> {
     ]
 }
 
+/// Client-visible S3 key for an SFTP sub-directory.
+///
+/// `object_key` is the parsed prefix without a trailing slash. The
+/// returned key ends in `/` so the storage layer can encode it to the
+/// reserved directory marker. Callers must not encode the key first:
+/// `validate_object_key` rejects any client key that already contains
+/// the marker suffix.
+fn directory_client_key(object_key: &str) -> String {
+    format!("{object_key}/")
+}
+
 fn directory_listing_input(
     bucket: &str,
     prefix: &str,
@@ -300,19 +311,19 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
         Ok(())
     }
 
-    /// MKDIR for a sub-directory path: write a zero-byte object at
-    /// encode_dir_object(prefix + "/"). The encoding maps "foo/" to
-    /// "foo__XLDIR__", which matches the RustFS marker convention used
-    /// by the S3, Swift, and WebDAV backends.
+    /// MKDIR for a sub-directory path: write a zero-byte object at the
+    /// client-visible directory key (`foo/`). Storage encodes that key to
+    /// the on-disk marker `foo__XLDIR__` after the S3 client-key boundary.
+    /// The encoded suffix is reserved, so PutObject must not be given it.
     pub(super) async fn mkdir_subdir_marker(&self, bucket: &str, object_key: &str) -> Result<(), SftpError> {
-        let marker_key = path::encode_dir_object(&format!("{object_key}/"));
-        self.authorize(&S3Action::PutObject, bucket, Some(&marker_key)).await?;
+        let dir_key = directory_client_key(object_key);
+        self.authorize(&S3Action::PutObject, bucket, Some(&dir_key)).await?;
 
         let body = stream::once(async { Ok::<Bytes, std::io::Error>(Bytes::new()) });
         let streaming = StreamingBlob::wrap(body);
         let input = PutObjectInput::builder()
             .bucket(bucket.to_string())
-            .key(marker_key.clone())
+            .key(dir_key)
             .content_length(Some(0))
             .body(Some(streaming))
             .build()
@@ -333,15 +344,14 @@ impl<S: StorageBackend + Send + Sync + 'static> SftpDriver<S> {
     }
 
     /// RMDIR for a sub-directory path: validate no objects under the
-    /// prefix, then authorise and delete the __XLDIR__ marker that
-    /// represents the directory.
+    /// prefix, then authorise and delete the trailing-slash directory key.
+    /// Storage encodes that key to the on-disk marker.
     pub(super) async fn rmdir_subdir_marker(&self, bucket: &str, object_key: &str) -> Result<(), SftpError> {
-        let prefix = format!("{object_key}/");
-        self.validate_directory_empty(bucket, &prefix).await?;
+        let dir_key = directory_client_key(object_key);
+        self.validate_directory_empty(bucket, &dir_key).await?;
 
-        let marker_key = path::encode_dir_object(&prefix);
-        self.authorize(&S3Action::DeleteObject, bucket, Some(&marker_key)).await?;
-        self.run_backend("delete_object", self.storage.delete_object(bucket, &marker_key, self.credentials()))
+        self.authorize(&S3Action::DeleteObject, bucket, Some(&dir_key)).await?;
+        self.run_backend("delete_object", self.storage.delete_object(bucket, &dir_key, self.credentials()))
             .await?;
         Ok(())
     }
@@ -836,5 +846,96 @@ mod tests {
             captured.contains("SFTP READDIR failed"),
             "error-level event must carry the SFTP READDIR failed message, captured: {captured}"
         );
+    }
+
+    #[tokio::test]
+    async fn mkdir_subdir_puts_trailing_slash_client_key() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let authorized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&authorized);
+
+        let status = with_test_auth_override(
+            move |action, bucket, key| {
+                record
+                    .lock()
+                    .expect("auth log")
+                    .push((action.as_str(), bucket.to_string(), key.map(str::to_string)));
+                true
+            },
+            driver.mkdir(1, "/bucket/photos/2024".to_string(), russh_sftp::protocol::FileAttributes::default()),
+        )
+        .await
+        .expect("mkdir of an ordinary directory");
+
+        assert!(matches!(status.status_code, StatusCode::Ok));
+        let calls = backend.put_object_calls();
+        assert_eq!(calls.len(), 1, "mkdir must issue one PutObject");
+        assert_eq!(calls[0].bucket, "bucket");
+        assert_eq!(calls[0].key, "photos/2024/");
+        assert!(
+            !calls[0].key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX),
+            "the client key must not carry the reserved directory-marker suffix"
+        );
+        let auth = authorized.lock().expect("auth log");
+        assert_eq!(
+            auth.as_slice(),
+            [("s3:PutObject", "bucket".to_string(), Some("photos/2024/".to_string()))]
+        );
+    }
+
+    #[tokio::test]
+    async fn rmdir_subdir_deletes_trailing_slash_client_key() {
+        let backend = Arc::new(DummyBackend::new());
+        backend.queue_delete_object_ok();
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let authorized = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&authorized);
+
+        let status = with_test_auth_override(
+            move |action, bucket, key| {
+                record
+                    .lock()
+                    .expect("auth log")
+                    .push((action.as_str(), bucket.to_string(), key.map(str::to_string)));
+                true
+            },
+            driver.rmdir(2, "/bucket/photos/2024".to_string()),
+        )
+        .await
+        .expect("rmdir of an empty directory");
+
+        assert!(matches!(status.status_code, StatusCode::Ok));
+        let calls = backend.delete_object_calls();
+        assert_eq!(calls.len(), 1, "rmdir must issue one DeleteObject");
+        assert_eq!(calls[0].bucket, "bucket");
+        assert_eq!(calls[0].key, "photos/2024/");
+        assert!(
+            !calls[0].key.contains(rustfs_utils::path::GLOBAL_DIR_SUFFIX),
+            "the client key must not carry the reserved directory-marker suffix"
+        );
+        let auth = authorized.lock().expect("auth log");
+        assert_eq!(
+            auth.as_slice(),
+            [
+                ("s3:ListBucket", "bucket".to_string(), Some("photos/2024/".to_string())),
+                ("s3:DeleteObject", "bucket".to_string(), Some("photos/2024/".to_string())),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn mkdir_rejects_reserved_directory_marker_before_put() {
+        let backend = Arc::new(DummyBackend::new());
+        let mut driver = build_driver(Arc::clone(&backend), TEST_PART_SIZE);
+        let path = format!("/bucket/sub{}", rustfs_utils::path::GLOBAL_DIR_SUFFIX);
+
+        let err = driver
+            .mkdir(3, path, russh_sftp::protocol::FileAttributes::default())
+            .await
+            .expect_err("a client path containing the reserved marker must be rejected");
+
+        assert_eq!(StatusCode::from(err), StatusCode::BadMessage);
+        assert!(backend.put_object_calls().is_empty(), "rejection must happen before PutObject");
     }
 }

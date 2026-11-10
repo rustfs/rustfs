@@ -305,6 +305,8 @@ where
         args: &WebhookArgs,
         resolver: impl reqwest::dns::Resolve + 'static,
     ) -> Result<Client, TargetError> {
+        #[cfg(feature = "fips")]
+        super::ensure_rustls_provider_installed()?;
         let mut client_builder = Client::builder()
             .no_proxy()
             .dns_resolver(resolver)
@@ -534,10 +536,9 @@ where
         })?;
 
         let status = resp.status();
-        // Drain the response body so the underlying connection is returned to the
-        // pool and can be reused (keep-alive) instead of being closed mid-stream
-        // (backlog#983). The body content is not needed for delivery accounting.
-        let _ = resp.bytes().await;
+        // Reuse connections for ordinary replies without collecting an
+        // endpoint-controlled body. Delivery accounting only depends on status.
+        drain_webhook_response(resp).await;
         let result = classify_delivery_status(status);
         if result.is_ok() {
             debug!(
@@ -552,6 +553,24 @@ where
             self.delivery_counters.record_success();
         }
         result
+    }
+}
+
+const WEBHOOK_RESPONSE_DRAIN_LIMIT: usize = 64 * 1024;
+
+async fn drain_webhook_response(mut response: reqwest::Response) {
+    if response
+        .content_length()
+        .is_some_and(|length| length > WEBHOOK_RESPONSE_DRAIN_LIMIT as u64)
+    {
+        return;
+    }
+    let mut remaining = WEBHOOK_RESPONSE_DRAIN_LIMIT;
+    while let Ok(Some(chunk)) = response.chunk().await {
+        let Some(rest) = remaining.checked_sub(chunk.len()) else {
+            return;
+        };
+        remaining = rest;
     }
 }
 
@@ -784,6 +803,41 @@ mod tests {
     use url::Url;
     use url::form_urlencoded;
 
+    #[tokio::test]
+    async fn webhook_response_drain_stops_at_the_byte_limit() {
+        for (headers, body) in [
+            ("Content-Length: 65537", Vec::new()),
+            ("Transfer-Encoding: chunked", format!("10001\r\n{}\r\n", "x".repeat(65537)).into_bytes()),
+            ("Transfer-Encoding: chunked", b"2\r\nok\r\n0\r\n\r\n".to_vec()),
+        ] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind response server");
+            let address = listener.local_addr().expect("server address");
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.expect("accept request");
+                let mut request = [0; 1024];
+                assert!(stream.read(&mut request).await.expect("read request") > 0);
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\n{headers}\r\n\r\n").as_bytes())
+                    .await
+                    .expect("write headers");
+                let _ = stream.write_all(&body).await;
+                // No EOF: an oversized response must be abandoned without waiting
+                // for its remainder, while a complete small chunked reply drains.
+                std::future::pending::<()>().await;
+            });
+            let client = reqwest::Client::builder().no_proxy().build().expect("direct test client");
+            let response = client
+                .get(format!("http://{address}/"))
+                .send()
+                .await
+                .expect("receive response headers");
+            tokio::time::timeout(std::time::Duration::from_secs(2), super::drain_webhook_response(response))
+                .await
+                .expect("bounded drain must finish without waiting for peer EOF");
+            server.abort();
+        }
+    }
+
     #[derive(Clone)]
     struct StaticResolver(IpAddr);
 
@@ -846,6 +900,51 @@ mod tests {
             skip_tls_verify: false,
             target_type: TargetType::NotifyEvent,
         }
+    }
+
+    #[test]
+    fn webhook_provider_policy_isolated() {
+        const CHILD: &str = "RUSTFS_TEST_WEBHOOK_PROVIDER_POLICY";
+        if std::env::var_os(CHILD).is_some() {
+            if cfg!(feature = "fips") {
+                let mut provider = rustfs_tls_runtime::default_crypto_provider();
+                provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+                provider.install_default().expect("install incompatible host provider");
+            } else {
+                assert!(rustls::crypto::CryptoProvider::get_default().is_none());
+            }
+            let args = WebhookArgs {
+                skip_tls_verify: true,
+                ..base_args()
+            };
+            let result = WebhookTarget::<serde_json::Value>::build_http_client_with_resolver(
+                &args,
+                StaticResolver("127.0.0.1".parse().expect("loopback IP")),
+            );
+            if cfg!(feature = "fips") {
+                let error = result.expect_err("FIPS webhook must reject the incompatible provider");
+                assert!(error.to_string().contains("process-wide rustls crypto provider"));
+            } else {
+                result.expect("default webhook client should build");
+                assert!(
+                    rustls::crypto::CryptoProvider::get_default().is_none(),
+                    "building a default webhook must not install a process-wide provider"
+                );
+            }
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("webhook_provider_policy_isolated")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated webhook provider test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     async fn http_status_url(status: u16) -> Url {

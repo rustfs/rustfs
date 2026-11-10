@@ -110,6 +110,7 @@ pub enum StorageErrorCode {
     ConditionalDeleteConflict,
     GuardedDeleteUnsupported,
     DeleteRecoveryLegacyAmbiguous,
+    DeleteRecoveryWorkLimit,
 }
 
 impl StorageErrorCode {
@@ -202,6 +203,7 @@ impl StorageErrorCode {
             Self::ConditionalDeleteConflict => 0x57,
             Self::GuardedDeleteUnsupported => 0x58,
             Self::DeleteRecoveryLegacyAmbiguous => 0x59,
+            Self::DeleteRecoveryWorkLimit => 0x5A,
         }
     }
 
@@ -294,6 +296,7 @@ impl StorageErrorCode {
             0x57 => Some(Self::ConditionalDeleteConflict),
             0x58 => Some(Self::GuardedDeleteUnsupported),
             0x59 => Some(Self::DeleteRecoveryLegacyAmbiguous),
+            0x5A => Some(Self::DeleteRecoveryWorkLimit),
             _ => None,
         }
     }
@@ -394,6 +397,7 @@ mod tests {
         (StorageErrorCode::ConditionalDeleteConflict, 0x57),
         (StorageErrorCode::GuardedDeleteUnsupported, 0x58),
         (StorageErrorCode::DeleteRecoveryLegacyAmbiguous, 0x59),
+        (StorageErrorCode::DeleteRecoveryWorkLimit, 0x5A),
     ];
 
     #[test]

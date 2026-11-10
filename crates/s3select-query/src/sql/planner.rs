@@ -90,6 +90,28 @@ impl<'a, S: ContextProviderExtension + Send + Sync + 'a> SqlPlanner<'a, S> {
     }
 }
 
+pub(crate) fn validate_expanded_projection_width(statement: &ExtStatement, source_columns: usize) -> QueryResult<()> {
+    let ExtStatement::SqlStatement(statement) = statement;
+    let Statement::Query(query) = statement.as_ref() else {
+        return Ok(());
+    };
+    let SetExpr::Select(select) = query.body.as_ref() else {
+        return Ok(());
+    };
+    let width = select.projection.iter().try_fold(0usize, |width, item| {
+        let columns = if matches!(item, SelectItem::Wildcard(_) | SelectItem::QualifiedWildcard(..)) {
+            source_columns
+        } else {
+            1
+        };
+        width.checked_add(columns)
+    });
+    if width.is_none_or(|width| width > rustfs_s3select_api::query::session::MAX_SELECT_COLUMNS) {
+        return Err(unsupported_structure("S3 Select expanded projection exceeds 1024 columns"));
+    }
+    Ok(())
+}
+
 fn classify_planner_error(error: datafusion::common::DataFusionError) -> QueryError {
     if matches!(
         &error,
@@ -414,6 +436,9 @@ fn implicit_source_alias(source_path: &[JsonPathSegment]) -> Ident {
 }
 
 fn prepare_select(select: &mut Select) -> QueryResult<JsonSource> {
+    if select.projection.len() > rustfs_s3select_api::query::session::MAX_SELECT_COLUMNS {
+        return Err(unsupported_structure("S3 Select projection exceeds 1024 columns"));
+    }
     if !select.optimizer_hints.is_empty()
         || select.distinct.is_some()
         || select.select_modifiers.is_some()

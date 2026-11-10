@@ -75,7 +75,7 @@ pub struct AppContext {
     buffer_config: Arc<dyn BufferConfigInterface>,
     object_data_cache: Arc<ObjectDataCacheAdapter>,
     object_traffic_health: Arc<ObjectTrafficHealth>,
-    table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime,
+    table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache,
 }
 
 impl AppContext {
@@ -126,7 +126,7 @@ impl AppContext {
             buffer_config: default_buffer_config_interface(),
             object_data_cache,
             object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
-            table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime::default(),
+            table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache::default(),
         }
     }
 
@@ -146,10 +146,9 @@ impl AppContext {
         Arc::clone(&self.object_traffic_health)
     }
 
-    pub(crate) fn table_catalog_strong_runtime(&self) -> crate::table_catalog::StrongTableCatalogRuntime {
-        self.table_catalog_strong_runtime.clone()
+    pub(crate) fn table_catalog_registration_cache(&self) -> crate::table_catalog::TableCatalogRegistrationCache {
+        self.table_catalog_registration_cache.clone()
     }
-
     pub fn iam(&self) -> Arc<dyn IamInterface> {
         self.iam.clone()
     }
@@ -359,7 +358,7 @@ impl AppContext {
             buffer_config: interfaces.buffer_config,
             object_data_cache: ObjectDataCacheAdapter::disabled_arc(),
             object_traffic_health: Arc::new(ObjectTrafficHealth::from_env()),
-            table_catalog_strong_runtime: crate::table_catalog::StrongTableCatalogRuntime::default(),
+            table_catalog_registration_cache: crate::table_catalog::TableCatalogRegistrationCache::default(),
         }
     }
 

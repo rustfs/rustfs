@@ -94,3 +94,12 @@ pub(crate) mod scanner_peer_bucket {
     pub(crate) use ecstore_erasure::{ReedSolomonEncoder, calc_shard_size};
     pub(crate) use ecstore_rpc::PeerRestClient;
 }
+
+/// Storage handles used to seed a pre-validation bucket record while the fixture server is stopped.
+#[cfg(test)]
+pub(crate) mod bucket_tag_fixture {
+    pub(crate) use rustfs_ecstore::api::bucket::metadata::load_bucket_metadata;
+    pub(crate) use rustfs_ecstore::api::layout::{DisksLayout, EndpointServerPools};
+    pub(crate) use rustfs_ecstore::api::runtime::InstanceContext;
+    pub(crate) use rustfs_ecstore::api::storage::{ECStore, init_local_disks_with_instance_ctx};
+}

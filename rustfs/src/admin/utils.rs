@@ -19,6 +19,14 @@ use s3s::header::CONTENT_TYPE;
 use s3s::{Body, S3Error, S3ErrorCode, S3Response, S3Result, s3_error};
 use serde::Serialize;
 use std::collections::HashMap;
+use tokio::sync::Semaphore;
+
+// Each compatible request can run two 64 MiB derivations. Keep both CPU and
+// memory bounded without occupying runtime workers or queueing unbounded jobs.
+static ADMIN_DECRYPT_PERMITS: Semaphore = Semaphore::const_new(2);
+/// How long a compat admin request queues for a decryption slot before it is
+/// told to retry; a burst of a few requests completes instead of failing.
+const ADMIN_DECRYPT_WAIT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Returns `true` if `s` contains any whitespace character.
 ///
@@ -45,9 +53,22 @@ pub(crate) async fn read_compatible_admin_body(
         .map_err(|e| s3_error!(InvalidRequest, "failed to read request body: {}", e))?;
 
     if is_compat_admin_request(path) {
-        decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
-            .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
-            .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        let permit = ADMIN_DECRYPT_PERMITS.acquire();
+        let permit = tokio::time::timeout(ADMIN_DECRYPT_WAIT, permit)
+            .await
+            .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?
+            .map_err(|_| s3_error!(SlowDown, "Admin payload decryption is busy"))?;
+        let secret_key = secret_key.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // Cancellation of the request must not release admission while the
+            // non-cancellable derivation is still running.
+            let _permit = permit;
+            decrypt_stream_io(secret_key.as_bytes(), body.as_ref())
+                .or_else(|_| decrypt_data(secret_key.as_bytes(), body.as_ref()))
+                .map_err(|e| s3_error!(InvalidRequest, "failed to decrypt MinIO admin payload: {}", e))
+        })
+        .await
+        .map_err(|_| s3_error!(InternalError, "Admin payload decryption failed"))?
     } else {
         Ok(body.to_vec())
     }
@@ -155,6 +176,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial(admin_decrypt)]
     async fn reads_legacy_compat_payload_as_fallback() {
         let payload = b"{\"ok\":true}".to_vec();
         let encrypted = encrypt_data(b"secret", &payload).expect("encrypt payload");
@@ -164,6 +186,71 @@ mod tests {
             .expect("decode payload");
 
         assert_eq!(decoded, payload);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(admin_decrypt)]
+    async fn compatible_admin_decryption_rejects_excess_work_without_blocking_native_requests() {
+        let permits = ADMIN_DECRYPT_PERMITS
+            .acquire_many(2)
+            .await
+            .expect("reserve decryption capacity");
+        let error = read_compatible_admin_body(Body::from(vec![0; 64]), 1024, "/minio/admin/v3/add-user", "secret")
+            .await
+            .expect_err("excess KDF work must not queue");
+        assert_eq!(error.code(), &S3ErrorCode::SlowDown);
+        let plain = read_compatible_admin_body(Body::from(String::from("{}")), 1024, "/rustfs/admin/v3/add-user", "secret")
+            .await
+            .expect("native admin does not use KDF capacity");
+        assert_eq!(plain, b"{}");
+        drop(permits);
+        let encrypted = encrypt_stream_io(b"secret", b"{}").expect("encrypt compatible request");
+        assert_eq!(
+            read_compatible_admin_body(Body::from(encrypted), 1024, "/minio/admin/v3/add-user", "secret")
+                .await
+                .expect("capacity returns after work finishes"),
+            b"{}"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(admin_decrypt)]
+    fn cancelled_admin_decryption_keeps_capacity_until_blocking_work_finishes() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("build single-worker runtime");
+        runtime.block_on(async {
+            let (release, wait) = std::sync::mpsc::channel();
+            let blocker = tokio::task::spawn_blocking(move || wait.recv().expect("release blocker"));
+            let request = tokio::spawn(read_compatible_admin_body(
+                Body::from(vec![0; 64]),
+                1024,
+                "/minio/admin/v3/add-user",
+                "secret",
+            ));
+            tokio::task::yield_now().await;
+            assert_eq!(
+                ADMIN_DECRYPT_PERMITS.available_permits(),
+                1,
+                "decryption was queued off the runtime worker"
+            );
+            request.abort();
+            assert!(request.await.expect_err("request cancelled").is_cancelled());
+            assert_eq!(
+                ADMIN_DECRYPT_PERMITS.available_permits(),
+                1,
+                "cancellation must not release queued work admission"
+            );
+            release.send(()).expect("unblock worker");
+            blocker.await.expect("blocking task finished");
+            let all = ADMIN_DECRYPT_PERMITS
+                .acquire_many(2)
+                .await
+                .expect("decryption finished and released capacity");
+            drop(all);
+        });
     }
 
     async fn body_bytes(mut body: Body) -> Vec<u8> {

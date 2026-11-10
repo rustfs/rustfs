@@ -39,7 +39,7 @@
 use crate::cleaner::types::FileMatchMode;
 use crate::config::OtelConfig;
 use crate::global::set_observability_metric_enabled;
-use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter};
+use crate::telemetry::filter::{build_env_filter, pyroscope_log_filter, s3s_log_filter};
 use crate::telemetry::guard::{OtelGuard, ProfilingAgent};
 use crate::telemetry::local::{build_json_log_layer, spawn_cleanup_task};
 use crate::telemetry::recorder::{Recorder, install_process_global_recorder};
@@ -91,6 +91,17 @@ const LOCAL_BATCH_DURATION_HISTOGRAM_METRICS: &[&str] = &[
 const LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
     0.0000001, 0.00000025, 0.0000005, 0.000001, 0.0000025, 0.000005, 0.00001, 0.000025, 0.00005, 0.0001, 0.00025, 0.0005, 0.001,
     0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0,
+];
+
+const OBJECT_LOCK_DURATION_HISTOGRAM_METRICS: &[&str] = &[
+    "rustfs_object_lock_diag_acquire_duration_seconds",
+    "rustfs_object_lock_diag_hold_duration_seconds",
+];
+
+// Resolve millisecond acquisitions without losing long-held delete and recovery locks.
+const OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS: &[f64] = &[
+    0.0001, 0.00025, 0.0005, 0.00075, 0.001, 0.0015, 0.002, 0.003, 0.004, 0.005, 0.0075, 0.01, 0.015, 0.02, 0.03, 0.05, 0.075,
+    0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 15.0, 20.0, 30.0, 60.0, 120.0,
 ];
 
 const DEFAULT_OTLP_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -296,6 +307,7 @@ pub(super) fn init_observability_http(
     tracing_subscriber::registry()
         .with(filter)
         .with(pyroscope_log_filter())
+        .with(s3s_log_filter())
         .with(ErrorLayer::default())
         .with(file_layer_opt)
         .with(stdout_layer_opt)
@@ -475,7 +487,7 @@ fn build_meter_provider(
                         .with_interval(Duration::from_secs(meter_interval))
                         .build(),
                 )
-                .with_view(get_object_duration_histogram_view);
+                .with_view(duration_histogram_view);
             if use_stdout {
                 b.with_reader(create_periodic_reader(meter_interval))
             } else {
@@ -490,8 +502,8 @@ fn build_meter_provider(
     Ok(Some(provider))
 }
 
-fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
-    let boundaries = get_object_duration_histogram_buckets(instrument.name())?;
+fn duration_histogram_view(instrument: &Instrument) -> Option<Stream> {
+    let boundaries = duration_histogram_buckets(instrument.name())?;
 
     Stream::builder()
         .with_aggregation(Aggregation::ExplicitBucketHistogram {
@@ -502,11 +514,13 @@ fn get_object_duration_histogram_view(instrument: &Instrument) -> Option<Stream>
         .ok()
 }
 
-fn get_object_duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
+fn duration_histogram_buckets(name: &str) -> Option<&'static [f64]> {
     if LOCAL_BATCH_DURATION_HISTOGRAM_METRICS.contains(&name) {
         Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS)
     } else if GET_OBJECT_DURATION_HISTOGRAM_METRICS.contains(&name) {
         Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS)
+    } else if OBJECT_LOCK_DURATION_HISTOGRAM_METRICS.contains(&name) {
+        Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS)
     } else {
         None
     }
@@ -1111,23 +1125,84 @@ mod tests {
     }
 
     #[test]
-    fn test_get_object_duration_histogram_metric_match_is_scoped() {
+    fn test_duration_histogram_metric_match_is_scoped() {
         for name in [
             "rustfs_io_get_object_stage_duration_seconds",
             "rustfs_io_get_object_request_duration_seconds",
         ] {
-            assert_eq!(get_object_duration_histogram_buckets(name), Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS));
+            assert_eq!(duration_histogram_buckets(name), Some(GET_OBJECT_DURATION_HISTOGRAM_BUCKETS));
         }
         for name in LOCAL_BATCH_DURATION_HISTOGRAM_METRICS {
-            assert_eq!(get_object_duration_histogram_buckets(name), Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS));
+            assert_eq!(duration_histogram_buckets(name), Some(LOCAL_BATCH_DURATION_HISTOGRAM_BUCKETS));
+        }
+        for name in OBJECT_LOCK_DURATION_HISTOGRAM_METRICS {
+            assert_eq!(duration_histogram_buckets(name), Some(OBJECT_LOCK_DURATION_HISTOGRAM_BUCKETS));
         }
         for name in [
             "rustfs_io_put_object_request_duration_seconds",
             "rustfs_io_get_object_response_size_bytes",
             "rustfs_io_get_object_local_batch_shards",
+            "rustfs_object_lock_diag_slow_acquire_total",
+            "rustfs_object_lock_diag_acquire_duration_seconds_bucket",
         ] {
-            assert!(get_object_duration_histogram_buckets(name).is_none());
+            assert!(duration_histogram_buckets(name).is_none());
         }
+    }
+
+    #[test]
+    fn object_lock_histograms_export_millisecond_and_long_hold_buckets() {
+        use metrics::Recorder as _;
+        use opentelemetry_sdk::metrics::{
+            InMemoryMetricExporter,
+            data::{AggregatedMetrics, MetricData},
+        };
+
+        let exporter = InMemoryMetricExporter::default();
+        let reader = PeriodicReader::builder(exporter.clone())
+            .with_interval(Duration::from_secs(60))
+            .build();
+        let (provider, recorder) = Recorder::builder("lock-histogram-test")
+            .with_meter_provider(|builder| builder.with_reader(reader).with_view(duration_histogram_view))
+            .build();
+        let metadata = metrics::Metadata::new(module_path!(), metrics::Level::INFO, None);
+
+        for (name, observations) in [
+            (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[0], [0.002, 0.004, 0.012]),
+            (OBJECT_LOCK_DURATION_HISTOGRAM_METRICS[1], [0.002, 12.9, 31.0]),
+        ] {
+            let histogram = recorder.register_histogram(&metrics::Key::from_name(name), &metadata);
+            for seconds in observations {
+                histogram.record(seconds);
+            }
+        }
+        provider.force_flush().expect("export lock duration observations");
+        let exported = exporter.get_finished_metrics().expect("read exported lock histograms");
+        let mut checked = 0;
+        for metric in exported
+            .iter()
+            .flat_map(|resource| resource.scope_metrics())
+            .flat_map(|scope| scope.metrics())
+        {
+            let expected = match metric.name() {
+                "rustfs_object_lock_diag_acquire_duration_seconds" => [(0.002, 1), (0.004, 1), (0.015, 1)],
+                "rustfs_object_lock_diag_hold_duration_seconds" => [(0.002, 1), (15.0, 1), (60.0, 1)],
+                _ => continue,
+            };
+            let AggregatedMetrics::F64(MetricData::Histogram(histogram)) = metric.data() else {
+                panic!("lock duration must export as an f64 histogram");
+            };
+            let points: Vec<_> = histogram.data_points().collect();
+            assert_eq!(points.len(), 1, "one time series for each lock duration instrument");
+            let point = points[0];
+            assert_eq!(point.count(), 3, "all observations reach the exporter");
+            let counts: Vec<_> = point.bucket_counts().collect();
+            assert_eq!(counts.last(), Some(&0), "observations do not fall into the overflow bucket");
+            let occupied: Vec<_> = point.bounds().zip(counts).filter(|(_, count)| *count != 0).collect();
+            assert_eq!(occupied, expected, "seconds remain distinct at millisecond and long-hold scales");
+            checked += 1;
+        }
+        assert_eq!(checked, 2, "both acquisition and hold histograms were exported");
+        provider.shutdown().expect("stop lock histogram test provider");
     }
 
     #[test]
@@ -1196,6 +1271,7 @@ mod tests {
         let subscriber = tracing_subscriber::registry()
             .with(env_filter)
             .with(pyroscope_log_filter())
+            .with(s3s_log_filter())
             .with(
                 tracing_subscriber::fmt::layer()
                     .with_ansi(false)
@@ -1219,6 +1295,7 @@ mod tests {
             tracing_subscriber::registry()
                 .with(build_env_filter("info", None))
                 .with(pyroscope_log_filter())
+                .with(s3s_log_filter())
                 .with(tracing_subscriber::fmt::layer().with_ansi(false).without_time())
                 .try_init()
                 .expect("install isolated LogTracer subscriber");

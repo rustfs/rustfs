@@ -324,6 +324,63 @@ impl FileMeta {
         true
     }
 
+    pub(crate) fn buffers_match_strict(self_buf: &[u8], other_buf: &[u8]) -> bool {
+        let Ok((s_meta, _)) = Self::parse_validated_xl_envelope(self_buf) else {
+            return false;
+        };
+        let Ok((o_meta, _)) = Self::parse_validated_xl_envelope(other_buf) else {
+            return false;
+        };
+
+        if s_meta.is_empty() || o_meta.is_empty() {
+            return s_meta.is_empty() && o_meta.is_empty();
+        }
+
+        let Ok((s_len, s_header_ver, _s_meta_ver, s_meta)) = Self::decode_validated_xl_headers(s_meta) else {
+            return false;
+        };
+        let Ok((o_len, o_header_ver, _o_meta_ver, o_meta)) = Self::decode_validated_xl_headers(o_meta) else {
+            return false;
+        };
+
+        if s_len != o_len {
+            return false;
+        }
+
+        let mut s_cur: Cursor<&[u8]> = Cursor::new(s_meta);
+        let mut o_cur: Cursor<&[u8]> = Cursor::new(o_meta);
+        for _ in 0..s_len {
+            let Ok((s_header_raw, _)) = Self::read_next_raw_slices(s_meta, &mut s_cur) else {
+                return false;
+            };
+            let Ok((o_header_raw, _)) = Self::read_next_raw_slices(o_meta, &mut o_cur) else {
+                return false;
+            };
+            if s_header_ver == XL_HEADER_VERSION
+                && o_header_ver == XL_HEADER_VERSION
+                && s_header_raw.len() == 38
+                && o_header_raw.len() == 38
+                && s_header_raw == o_header_raw
+                && parse_canonical_v3_header_fields(s_header_raw).is_some()
+            {
+                continue;
+            }
+            let mut s_header = FileMetaVersionHeader::default();
+            if s_header.unmarshal_v(s_header_ver, s_header_raw).is_err() {
+                return false;
+            }
+            let mut o_header = FileMetaVersionHeader::default();
+            if o_header.unmarshal_v(o_header_ver, o_header_raw).is_err() {
+                return false;
+            }
+            if !Self::headers_match_strict(&s_header, &o_header) {
+                return false;
+            }
+        }
+
+        true
+    }
+
     #[inline]
     fn header_matches_canonical_v3_raw_strict(s_header: &FileMetaVersionHeader, buf: &[u8]) -> Option<bool> {
         if buf.len() != 38 {
@@ -623,6 +680,49 @@ impl FileMeta {
         } else {
             false
         }
+    }
+
+    pub fn bytes_count_toward_listing_limit(buf: &[u8]) -> bool {
+        let Ok((meta, _inline_buf)) = Self::parse_validated_xl_envelope(buf) else {
+            return true;
+        };
+        if meta.is_empty() {
+            return false;
+        }
+        let Ok((versions_len, header_ver, _meta_ver, meta)) = Self::decode_validated_xl_headers(meta) else {
+            return true;
+        };
+        if versions_len == 0 {
+            return false;
+        }
+        let mut cur = Cursor::new(meta);
+        let mut selected: Option<(FileMetaVersionHeader, &[u8])> = None;
+        let mut any_non_hidden = false;
+        for _ in 0..versions_len {
+            let Ok((header, ver_meta)) = Self::read_next_shallow_slice(meta, &mut cur, header_ver) else {
+                return true;
+            };
+            if header.version_type != VersionType::Delete && !header.free_version() {
+                any_non_hidden = true;
+            }
+            if selected.is_some() {
+                continue;
+            }
+            if header.free_version() && header.version_id.is_some_and(|id| !id.is_nil()) {
+                continue;
+            }
+            selected = Some((header, ver_meta));
+        }
+        let Some((header, ver_meta)) = selected else {
+            return false;
+        };
+        if !header.free_version() && header.version_type != VersionType::Delete {
+            return true;
+        }
+        if !any_non_hidden {
+            return false;
+        }
+        FileMetaVersion::decode_fileinfo_from_slice(ver_meta, "", "", true, false).is_err()
     }
 
     #[hotpath::measure(impl_type = "FileMeta")]

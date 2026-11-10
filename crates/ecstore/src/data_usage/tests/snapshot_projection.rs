@@ -21,6 +21,7 @@ fn scalar_projection_borrows_snapshot_and_preserves_unknown_and_zero() {
     info.buckets_usage.insert("empty".to_string(), BucketUsageInfo::default());
     let cache = Some(CachedDataUsageSnapshot {
         info: Some(info),
+        last_load_failed: false,
         loaded_at,
         degraded_baseline: HashMap::new(),
     });
@@ -66,6 +67,7 @@ fn projection_is_skipped_for_missing_failed_expired_or_invalidated_snapshots() {
 
     cache = Some(CachedDataUsageSnapshot {
         info: Some(data_usage_info_for_test("known", 1, 42, SystemTime::UNIX_EPOCH)),
+        last_load_failed: false,
         loaded_at,
         degraded_baseline: HashMap::new(),
     });
@@ -126,6 +128,33 @@ fn projected_publication_moves_bucket_maps_into_cache() {
     assert_eq!(
         cached.buckets_usage.get_key_value("known").expect("cached bucket").0.as_ptr(),
         original_key
+    );
+
+    let failure = cache_data_usage_snapshot_result(
+        &mut cache,
+        Err(Error::ErasureReadQuorum),
+        tokio::time::Instant::now(),
+        1,
+        1,
+        |_: &DataUsageInfo| -> u64 { panic!("a failed load must not project its retained snapshot") },
+    )
+    .expect("matching refresh generation");
+    assert!(matches!(failure, Err(Error::ErasureReadQuorum)));
+    let retained = cache
+        .as_ref()
+        .expect("negative cache")
+        .info
+        .as_ref()
+        .expect("last good ordering proof");
+    assert_eq!(
+        retained
+            .buckets_usage
+            .get_key_value("known")
+            .expect("retained bucket")
+            .0
+            .as_ptr(),
+        original_key,
+        "a failed load must retain the snapshot without copying its bucket maps"
     );
 }
 

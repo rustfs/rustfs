@@ -1,0 +1,92 @@
+{
+  "schema_version": 1,
+  "plan_id": "testdata-release-gate",
+  "description": "Contract fixtures for scripts/release/release_gate.py (rustfs/backlog#2662). Rehearsal data only: these files are never product release evidence and cannot certify a real candidate.",
+  "release_types": [
+    "preview",
+    "prerelease",
+    "stable"
+  ],
+  "targets": [
+    {
+      "os": "linux",
+      "arch": "x86_64",
+      "abi": "gnu"
+    },
+    {
+      "os": "linux",
+      "arch": "aarch64",
+      "abi": "gnu"
+    }
+  ],
+  "features": [
+    "pyroscope"
+  ],
+  "trusted_workflows": [
+    {
+      "repository": "rustfs/s3chaos",
+      "workflow_id": "release-gate.yml"
+    }
+  ],
+  "lanes": [
+    {
+      "lane": "identity",
+      "harness_repository": "rustfs/s3chaos",
+      "harness_sha": "1111111111111111111111111111111111111111",
+      "timeout_seconds": 1800,
+      "environment_capabilities": [
+        "process-exec"
+      ],
+      "cases": [
+        "artifact-identity"
+      ],
+      "applies_to": {
+        "release_types": [
+          "preview",
+          "prerelease",
+          "stable"
+        ],
+        "platforms": "all"
+      }
+    },
+    {
+      "lane": "upgrade",
+      "harness_repository": "rustfs/s3chaos",
+      "harness_sha": "2222222222222222222222222222222222222222",
+      "timeout_seconds": 3600,
+      "environment_capabilities": [
+        "process-exec",
+        "previous-release-artifact"
+      ],
+      "cases": [
+        "upgrade-smoke"
+      ],
+      "applies_to": {
+        "release_types": [
+          "prerelease",
+          "stable"
+        ],
+        "platforms": [
+          {
+            "os": "linux",
+            "arch": "x86_64",
+            "abi": "gnu"
+          }
+        ]
+      }
+    }
+  ],
+  "upgrade_sources": {
+    "basis": "Fixture-only synthetic source. Product plans must cite the real pinned digests of the exercised upgrade sources and must not invent compatibility.",
+    "sources": [
+      {
+        "version": "0.0.1",
+        "role": "N-1",
+        "artifact_name": "fixture-upgrade-source.zip",
+        "artifact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    ],
+    "rollback_supported": false,
+    "rollback_basis": "The fixture certifies no rollback support; rollback is never a default claim."
+  }
+}

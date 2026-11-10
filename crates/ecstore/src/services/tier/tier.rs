@@ -37,7 +37,6 @@ use std::{
     time::Duration,
 };
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 use tokio::{
     select,
     sync::{Notify, RwLock},
@@ -94,6 +93,7 @@ use super::{
         delete_tier_mutation_intent_record_if_current, list_tier_coordinator_mutation_intent_records,
         list_tier_mutation_intent_records, load_tier_coordinator_mutation_intent_record_with_etag,
         load_tier_mutation_intent_record_with_etag, save_tier_coordinator_mutation_intent_record_if_absent,
+        save_tier_mutation_intent_record_if_current,
     },
     warm_backend::WarmBackendImpl,
 };
@@ -328,6 +328,7 @@ pub const TIER_CONFIG_VERSION: u16 = 2;
 const EXTERNAL_TIER_TYPE_UNSUPPORTED: i32 = 0;
 const EXTERNAL_TIER_TYPE_S3: i32 = 1;
 const EXTERNAL_TIER_TYPE_AZURE: i32 = 2;
+const EXTERNAL_TIER_AZURE_BLOB_ENDPOINT_SENTINEL: &str = "rustfs-azure-blob-v1:";
 const EXTERNAL_TIER_TYPE_GCS: i32 = 3;
 const EXTERNAL_TIER_TYPE_MINIO: i32 = 4;
 const EXTERNAL_TIER_VERSION_WASABI_V1: &str = "rustfs-wasabi-v1";
@@ -620,7 +621,11 @@ struct CommittedMutationRecoveryPlan {
 
 impl TierMutationRecoverySnapshot {
     fn requires_config_lock(&self) -> bool {
-        self.has_committed_mutation_blocks || self.intents.iter().any(|recovered| recovered.has_coordinator_record)
+        self.has_committed_mutation_blocks
+            || self.intents.iter().any(|recovered| {
+                recovered.has_coordinator_record
+                    || (recovered.has_peer_record && recovered.intent.state == TierMutationIntentState::Prepared)
+            })
     }
 
     fn allowance(&self) -> MutationBlockAllowance {
@@ -2148,6 +2153,7 @@ fn build_coordinator_tier_mutation_intent(
         return Ok(None);
     }
     Ok(Some(TierMutationIntent {
+        requires_native_azure: candidate.tiers.values().any(TierConfig::is_native_azure),
         mutation_id: uuid::Uuid::new_v4(),
         revision: 1,
         kind,
@@ -2516,11 +2522,11 @@ fn tier_backend_identity(config: &TierConfig) -> io::Result<TierDestinationId> {
         }),
         TierType::Azure => config.azure.as_ref().map(|value| {
             (
-                "azure",
+                if config.is_native_azure() { "azure-blob-v1" } else { "azure" },
                 value.endpoint.as_str(),
                 value.bucket.as_str(),
                 value.prefix.as_str(),
-                value.region.as_str(),
+                if config.is_native_azure() { "" } else { value.region.as_str() },
                 value.access_key.as_str(),
             )
         }),
@@ -2593,7 +2599,7 @@ fn normalized_tier_prefix<'a>(tier_type: &TierType, prefix: &'a str) -> &'a str 
 }
 
 fn tier_exact_get_delete(config: &TierConfig) -> bool {
-    ProviderVersionCapabilities::for_tier_type(&config.tier_type.as_lowercase()).exact_get_delete
+    config.is_native_azure() || ProviderVersionCapabilities::for_tier_type(&config.tier_type.as_lowercase()).exact_get_delete
 }
 
 struct TierDriverGeneration {
@@ -3131,7 +3137,15 @@ fn to_external_tier_config(name: &str, tier: &TierConfig) -> io::Result<External
                 .ok_or_else(|| io::Error::other("tier config missing azure backend payload"))?;
             out.tier_type = EXTERNAL_TIER_TYPE_AZURE;
             out.azure = Some(ExternalTierAzure {
-                endpoint: az.endpoint.clone(),
+                // Keep the v2 Azure payload readable and rewriteable by older
+                // servers, but make their S3 constructor reject its endpoint.
+                // An unknown numeric type would discard the Azure payload on
+                // an unrelated configuration rewrite by an older server.
+                endpoint: if tier.is_native_azure() {
+                    format!("{EXTERNAL_TIER_AZURE_BLOB_ENDPOINT_SENTINEL}{}", az.endpoint)
+                } else {
+                    az.endpoint.clone()
+                },
                 account_name: az.access_key.clone(),
                 account_key: az.secret_key.clone(),
                 bucket: az.bucket.clone(),
@@ -3290,6 +3304,15 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
         ..Default::default()
     };
 
+    let azure_blob = ext.version == super::tier_config::AZURE_BLOB_TIER_VERSION;
+    let native_endpoint = ext
+        .azure
+        .as_ref()
+        .is_some_and(|azure| azure.endpoint.starts_with(EXTERNAL_TIER_AZURE_BLOB_ENDPOINT_SENTINEL));
+    if azure_blob != native_endpoint || azure_blob && (ext.tier_type != EXTERNAL_TIER_TYPE_AZURE || ext.tier_type_hint.is_some())
+    {
+        return Err(io::Error::other("native Azure Blob tier has inconsistent protocol discriminators"));
+    }
     let wasabi_hint = ext.tier_type_hint.as_deref() == Some("wasabi");
     let wasabi_version = ext.version == EXTERNAL_TIER_VERSION_WASABI_V1;
     if wasabi_hint && !wasabi_version {
@@ -3310,7 +3333,9 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
             cfg.name
         )));
     }
-    let tier_type = if wasabi_version {
+    let tier_type = if azure_blob {
+        TierType::Azure
+    } else if wasabi_version {
         TierType::Wasabi
     } else {
         tier_type_from_hint(ext.tier_type_hint.as_deref()).unwrap_or(match ext.tier_type {
@@ -3388,7 +3413,15 @@ fn from_external_tier_config(name: String, ext: ExternalTierConfig) -> io::Resul
                 .ok_or_else(|| io::Error::other(format!("tier config '{}' missing azure backend payload", cfg.name)))?;
             cfg.azure = Some(crate::services::tier::tier_config::TierAzure {
                 name: cfg.name.clone(),
-                endpoint: az.endpoint.clone(),
+                endpoint: if azure_blob {
+                    az.endpoint
+                        .strip_prefix(EXTERNAL_TIER_AZURE_BLOB_ENDPOINT_SENTINEL)
+                        .filter(|endpoint| !endpoint.is_empty())
+                        .ok_or_else(|| io::Error::other("native Azure Blob endpoint marker is missing"))?
+                        .to_string()
+                } else {
+                    az.endpoint.clone()
+                },
                 access_key: az.account_name.clone(),
                 secret_key: az.account_key.clone(),
                 bucket: az.bucket.clone(),
@@ -3559,6 +3592,9 @@ impl TierConfigMgr {
     }
 
     pub fn unmarshal(data: &[u8]) -> std::result::Result<TierConfigMgr, std::io::Error> {
+        if data.starts_with(&TIER_CONFIG_FORMAT.to_le_bytes()) {
+            return decode_external_tiering_config_blob(data);
+        }
         let mut cfg: TierConfigMgr = serde_json::from_slice(data)?;
         for (name, tier) in &mut cfg.tiers {
             if matches!(&tier.tier_type, TierType::Wasabi) {
@@ -3576,6 +3612,11 @@ impl TierConfigMgr {
     }
 
     pub fn marshal(&self) -> std::result::Result<Bytes, std::io::Error> {
+        // The legacy JSON shape omits the driver protocol version. Native
+        // Azure must retain the binary discriminator even through this helper.
+        if self.tiers.values().any(TierConfig::is_native_azure) {
+            return encode_external_tiering_config_blob(self);
+        }
         let data = serde_json::to_vec(&self)?;
         let mut data = Bytes::from(data);
 
@@ -3609,6 +3650,17 @@ impl TierConfigMgr {
         deadline: Option<Instant>,
     ) -> std::result::Result<(), AdminError> {
         normalize_s3_gcs_add_tier_name(&mut tier_config)?;
+        if tier_config.tier_type == TierType::Azure {
+            tier_config.version = super::tier_config::AZURE_BLOB_TIER_VERSION.to_string();
+            if let Some(azure) = tier_config.azure.as_mut() {
+                if azure.storage_class.eq_ignore_ascii_case("STANDARD") {
+                    azure.storage_class.clear();
+                }
+                if azure.endpoint.is_empty() {
+                    azure.endpoint = format!("https://{}.blob.core.windows.net", azure.access_key);
+                }
+            }
+        }
         self.ensure_generation_is_idle(&tier_config.name)?;
         let tier_name = tier_config.name.clone();
         if tier_name != tier_name.to_uppercase() {
@@ -5055,6 +5107,9 @@ impl TierConfigMgr {
 
             Self::reconcile_terminal_dual_prefix_mutation_intents(api.clone(), &mut snapshot).await?;
             Self::recover_prepared_coordinator_mutation_intents(api.clone(), &mut snapshot.coordinator_intents).await?;
+            if config_lock.is_some() {
+                Self::recover_expired_peer_only_prepares(api.clone(), &snapshot).await?;
+            }
 
             snapshot = Self::load_and_reconcile_mutation_recovery_snapshot(handle, api.clone(), true).await?;
             if snapshot.requires_config_lock() && config_lock.is_none() {
@@ -5453,6 +5508,58 @@ impl TierConfigMgr {
             })?;
             marker = Some(next_marker);
         }
+    }
+
+    async fn recover_expired_peer_only_prepares<S>(api: Arc<S>, snapshot: &TierMutationRecoverySnapshot) -> io::Result<()>
+    where
+        S: EcstoreObjectIO,
+    {
+        let now = i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).unwrap_or(i64::MAX);
+        let orphaned = snapshot
+            .intents
+            .iter()
+            .filter(|recovered| {
+                recovered.has_peer_record
+                    && !recovered.has_coordinator_record
+                    && recovered.intent.state == TierMutationIntentState::Prepared
+                    && Self::tier_mutation_tombstone_retention_elapsed(&recovered.intent, now)
+            })
+            .map(|recovered| recovered.intent.clone())
+            .collect::<Vec<_>>();
+        if orphaned.is_empty() {
+            return Ok(());
+        }
+
+        // The caller holds the tier-config namespace lock. Only the exact
+        // persisted candidate proves a commit; an old or different config
+        // leaves the peer fence intact.
+        let loaded = load_tier_config_for_recovery(api.clone()).await?;
+        let Some(config_etag) = loaded.etag else {
+            return Ok(());
+        };
+        for intent in orphaned {
+            if loaded.persisted_digest != Some(intent.candidate_digest) {
+                continue;
+            }
+            let _mutation_guard = acquire_tier_mutation_mutex(intent.mutation_id).await;
+            let (mut current, record_etag) =
+                match load_tier_mutation_intent_record_with_etag(api.clone(), intent.mutation_id).await {
+                    Ok(record) => record,
+                    Err(Error::ConfigNotFound) => continue,
+                    Err(err) => return Err(tier_mutation_replay_error(err)),
+                };
+            if current != intent {
+                continue;
+            }
+            current
+                .advance(TierMutationIntentState::Committed, Some(config_etag.clone()))
+                .map_err(io::Error::other)?;
+            match save_tier_mutation_intent_record_if_current(api.clone(), &current, &record_etag).await {
+                Ok(()) | Err(Error::PreconditionFailed) => {}
+                Err(err) => return Err(tier_mutation_replay_error(err)),
+            }
+        }
+        Ok(())
     }
 
     async fn recover_prepared_coordinator_mutation_intents<S>(api: Arc<S>, intents: &mut [TierMutationIntent]) -> io::Result<()>
@@ -8183,7 +8290,7 @@ mod tests {
         }
 
         async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> io::Result<ReadCloser> {
-            Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+            Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
         }
 
         async fn remove(&self, _object: &str, _rv: &str) -> io::Result<()> {
@@ -8248,7 +8355,7 @@ mod tests {
             _opts: WarmBackendGetOpts,
         ) -> std::result::Result<ReadCloser, std::io::Error> {
             if self.healthy {
-                Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+                Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
             } else {
                 Err(std::io::Error::other("mock get failed"))
             }
@@ -9537,6 +9644,98 @@ mod tests {
         assert_eq!(az.sp_auth.client_secret, "secret");
     }
 
+    #[tokio::test]
+    async fn native_azure_add_preserves_protocol_through_restart_and_requires_peer_support() {
+        let mut manager = empty_mgr();
+        let mut tier = build_azure_tier("account");
+        let name = tier.name.clone();
+        let azure = tier.azure.as_mut().expect("Azure payload should exist");
+        azure.endpoint.clear();
+        azure.storage_class = "STANDARD".to_string();
+        azure.secret_key = base64_simd::STANDARD.encode_to_string([7; 32]);
+        TIER_DRIVER_TEST_FACTORY
+            .scope(healthy_driver_factory(), manager.add(tier, true))
+            .await
+            .expect("current Console Azure payload should be admitted");
+        let created = &manager.tiers[&name];
+        assert!(created.is_native_azure());
+        assert!(tier_exact_get_delete(created));
+        let azure = created.azure.as_ref().expect("Azure payload should survive");
+        assert_eq!(azure.endpoint, "https://account.blob.core.windows.net");
+        assert!(azure.storage_class.is_empty());
+
+        let bytes = manager
+            .marshal()
+            .expect("native configuration should serialize without losing its protocol");
+        let external: ExternalTierConfigMgr =
+            rmp_serde::from_slice(&bytes[4..]).expect("native config should use the binary shape");
+        assert_eq!(external.tiers[&name].tier_type, EXTERNAL_TIER_TYPE_AZURE);
+        let stored = external.tiers[&name]
+            .azure
+            .as_ref()
+            .expect("native storage keeps the existing Azure payload");
+        assert_eq!(stored.endpoint, "rustfs-azure-blob-v1:https://account.blob.core.windows.net");
+        let legacy_backend_config = crate::services::tier::tier_config::TierAzure {
+            endpoint: stored.endpoint.clone(),
+            access_key: stored.account_name.clone(),
+            secret_key: stored.account_key.clone(),
+            bucket: stored.bucket.clone(),
+            ..Default::default()
+        };
+        assert!(
+            crate::services::tier::warm_backend_azure::WarmBackendAzure::new(&legacy_backend_config, &name)
+                .await
+                .is_err(),
+            "the unchanged legacy S3 constructor must reject the native endpoint before any request"
+        );
+        assert!(
+            external.tiers[&name].tier_type_hint.is_none(),
+            "the protocol marker must not be overridden by an extended provider hint"
+        );
+        let restarted = TierConfigMgr::unmarshal(&bytes).expect("native configuration should reload");
+        assert!(restarted.tiers[&name].is_native_azure());
+        assert_eq!(
+            tier_backend_identity(created).expect("created identity"),
+            tier_backend_identity(&restarted.tiers[&name]).expect("reloaded identity")
+        );
+        let targets = vec![TierMutationIntentTarget {
+            tier_name: name,
+            old_backend_identity: None,
+            new_backend_identity: Some(tier_backend_identity(created).expect("native destination identity")),
+        }];
+        let intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &manager, targets)
+            .expect("native intent should build")
+            .expect("native Add must use peer prepare");
+        assert!(intent.requires_native_azure);
+    }
+
+    #[test]
+    fn native_azure_protocol_is_distinct_from_legacy_and_rejects_corrupt_discriminators() {
+        let legacy = build_azure_tier("account");
+        let mut native = legacy.clone_with_credentials();
+        native.version = super::super::tier_config::AZURE_BLOB_TIER_VERSION.to_string();
+        assert_ne!(
+            tier_backend_identity(&legacy).expect("legacy identity"),
+            tier_backend_identity(&native).expect("native identity"),
+            "native Blob must never acquire a legacy S3 destination's cleanup authority"
+        );
+        let stored = to_external_tier_config(&legacy.name, &legacy).expect("legacy encoding");
+        assert_eq!(stored.tier_type, EXTERNAL_TIER_TYPE_AZURE);
+        let decoded = from_external_tier_config(legacy.name, stored).expect("legacy decoding");
+        assert!(!decoded.is_native_azure());
+        assert!(!tier_exact_get_delete(&decoded));
+        let stored = to_external_tier_config(&native.name, &native).expect("native encoding");
+        for mutate in [
+            |config: &mut ExternalTierConfig| config.version = "v1".to_string(),
+            |config: &mut ExternalTierConfig| config.tier_type = EXTERNAL_TIER_TYPE_S3,
+            |config: &mut ExternalTierConfig| config.tier_type_hint = Some("azure".to_string()),
+        ] {
+            let mut corrupt = stored.clone();
+            mutate(&mut corrupt);
+            assert!(from_external_tier_config(native.name.clone(), corrupt).is_err());
+        }
+    }
+
     #[test]
     fn test_external_blob_gcs_writer_stays_raw_for_v2_old_readers() {
         const RAW_JSON: &str = r#"{"type":"service_account","project_id":"tier-௿"}"#;
@@ -9895,7 +10094,7 @@ mod tests {
         }
 
         async fn get(&self, _object: &str, _rv: &str, _opts: WarmBackendGetOpts) -> io::Result<ReadCloser> {
-            Ok(BufReader::new(Cursor::new(b"RustFS".to_vec())))
+            Ok(ReadCloser::new(Cursor::new(b"RustFS".to_vec())))
         }
 
         async fn remove(&self, _object: &str, _rv: &str) -> io::Result<()> {
@@ -9945,6 +10144,7 @@ mod tests {
 
     fn prepared_remove_intent(tier_name: &str, mutation_id: uuid::Uuid) -> TierMutationIntent {
         TierMutationIntent {
+            requires_native_azure: false,
             mutation_id,
             revision: 1,
             kind: TierMutationIntentKind::Remove,
@@ -13237,6 +13437,208 @@ mod tests {
             &[format!("peer-a:commit:{mutation_id}:etag-new")],
             "only the claimed reload should fan out committed replay"
         );
+    }
+
+    #[tokio::test]
+    async fn reload_recovers_expired_peer_only_prepare_for_persisted_add() {
+        use crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record;
+
+        let store = Arc::new(CasConfigStore::default());
+        let previous = empty_mgr();
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        let targets = build_tier_mutation_affected_targets(
+            TierMutationIntentKind::Add,
+            HashSet::from(["COLD-A".to_string()]),
+            &previous,
+            &candidate,
+        )
+        .expect("added tier should have a target");
+        let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+            .expect("intent should build")
+            .expect("add should require an intent");
+        intent.expires_at_unix_nanos = 1;
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("candidate should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("peer prepare should persist without a coordinator record");
+
+        let manager = TierConfigMgr::new();
+        TIER_MUTATION_TEST_PEERS
+            .scope(Vec::new(), async {
+                TIER_DRIVER_TEST_FACTORY
+                    .scope(healthy_driver_factory(), async {
+                        TierConfigMgr::reload_handle_with(&manager, store.clone())
+                            .await
+                            .expect("matching saved candidate should recover");
+                        TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+                            .await
+                            .expect("recovered tier should be readable");
+                    })
+                    .await;
+            })
+            .await;
+        assert!(
+            TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("peer scan should succeed")
+                .iter()
+                .all(|record| record.state != TierMutationIntentState::Prepared),
+            "the orphaned prepare must no longer block later reloads"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_keeps_peer_only_prepare_without_commit_proof() {
+        use crate::services::tier::tier_mutation_intent::{
+            save_tier_mutation_intent_record, tier_mutation_intent_record_object_name,
+        };
+
+        for case in [
+            "unexpired",
+            "recently_expired",
+            "different_candidate",
+            "missing_config",
+            "concurrent_change",
+        ] {
+            let store = Arc::new(CasConfigStore::default());
+            let previous = empty_mgr();
+            let mut candidate = empty_mgr();
+            candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+            let targets = build_tier_mutation_affected_targets(
+                TierMutationIntentKind::Add,
+                HashSet::from(["COLD-A".to_string()]),
+                &previous,
+                &candidate,
+            )
+            .expect("added tier should have a target");
+            let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+                .expect("intent should build")
+                .expect("add should require an intent");
+            intent.expires_at_unix_nanos = match case {
+                "unexpired" => tier_mutation_intent_expiry_unix_nanos(),
+                "recently_expired" => {
+                    i64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos()).expect("test clock should fit")
+                        - 1_000_000_000
+                }
+                _ => 1,
+            };
+            if case == "different_candidate" {
+                intent.candidate_digest = [0x51; 32];
+            }
+            if case != "missing_config" {
+                candidate
+                    .save_tiering_config_if_current(store.clone(), None)
+                    .await
+                    .expect("candidate should persist");
+            }
+            save_tier_mutation_intent_record(store.clone(), &intent)
+                .await
+                .expect("peer prepare should persist");
+            let expected = if case == "concurrent_change" {
+                let mut changed = intent.clone();
+                changed.candidate_digest = [0x52; 32];
+                let object = tier_mutation_intent_record_object_name(intent.mutation_id).expect("record path should build");
+                store
+                    .rewrite_on_next_if_match(object, changed.encode().expect("changed intent should encode"))
+                    .await;
+                changed
+            } else {
+                intent
+            };
+
+            let manager = TierConfigMgr::new();
+            TIER_MUTATION_TEST_PEERS
+                .scope(Vec::new(), async {
+                    TierConfigMgr::reload_handle_with(&manager, store.clone())
+                        .await
+                        .expect("unproven prepare should remain fenced");
+                })
+                .await;
+            let error = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+                Ok(_) => panic!("{case}: unproven prepare must block reads"),
+                Err(error) => error,
+            };
+            assert!(error.message.contains("being replaced"), "{case}: {error}");
+            let records = TierConfigMgr::load_tier_mutation_intents(store)
+                .await
+                .expect("peer scan should succeed");
+            assert_eq!(records, vec![expected], "{case}: prepared evidence must remain unchanged");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_only_prepare_recovery_retains_fence_until_peer_commit_succeeds() {
+        use crate::services::tier::tier_mutation_intent::save_tier_mutation_intent_record;
+
+        let store = Arc::new(CasConfigStore::default());
+        let previous = empty_mgr();
+        let mut candidate = empty_mgr();
+        candidate.tiers.insert("COLD-A".to_string(), build_rustfs_tier("COLD-A"));
+        let targets = build_tier_mutation_affected_targets(
+            TierMutationIntentKind::Add,
+            HashSet::from(["COLD-A".to_string()]),
+            &previous,
+            &candidate,
+        )
+        .expect("added tier should have a target");
+        let mut intent = build_coordinator_tier_mutation_intent(TierMutationIntentKind::Add, None, &candidate, targets)
+            .expect("intent should build")
+            .expect("add should require an intent");
+        intent.expires_at_unix_nanos = 1;
+        candidate
+            .save_tiering_config_if_current(store.clone(), None)
+            .await
+            .expect("candidate should persist");
+        save_tier_mutation_intent_record(store.clone(), &intent)
+            .await
+            .expect("peer prepare should persist");
+
+        let manager = TierConfigMgr::new();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        TIER_MUTATION_TEST_PEERS
+            .scope(vec![FakeTierMutationPeer::boxed("peer-a", calls.clone(), Err("offline"))], async {
+                TierConfigMgr::reload_handle_with(&manager, store.clone())
+                    .await
+                    .expect_err("failed peer commit must leave recovery incomplete");
+            })
+            .await;
+        let retained = TierConfigMgr::load_tier_mutation_intents(store.clone())
+            .await
+            .expect("peer scan should succeed");
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, TierMutationIntentState::Committed);
+        let error = match TierConfigMgr::acquire_operation_lease(&manager, "COLD-A").await {
+            Ok(_) => panic!("failed peer commit must retain the fence"),
+            Err(error) => error,
+        };
+        assert!(error.message.contains("being replaced"), "{error}");
+
+        TIER_MUTATION_TEST_PEERS
+            .scope(
+                vec![FakeTierMutationPeer::boxed(
+                    "peer-a",
+                    calls.clone(),
+                    Ok(PeerTierMutationState::Committed),
+                )],
+                async {
+                    TIER_DRIVER_TEST_FACTORY
+                        .scope(healthy_driver_factory(), async {
+                            TierConfigMgr::reload_handle_with(&manager, store.clone())
+                                .await
+                                .expect("peer commit retry should recover");
+                            TierConfigMgr::acquire_operation_lease(&manager, "COLD-A")
+                                .await
+                                .expect("tier should be readable after the retry");
+                        })
+                        .await;
+                },
+            )
+            .await;
+        assert_eq!(lock_unpoisoned(&calls).len(), 2, "recovery should retry the peer commit");
     }
 
     #[tokio::test]

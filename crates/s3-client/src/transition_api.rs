@@ -68,7 +68,6 @@ use s3s::dto::ReplicationStatus;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use std::error::Error as StdError;
-use std::io::Cursor;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::task::{Context, Poll};
@@ -79,9 +78,8 @@ use std::{
 };
 use time::Duration;
 use time::OffsetDateTime;
-use tokio::io::BufReader;
 use tokio::io::{AsyncRead, AsyncReadExt};
-use tracing::{debug, error, trace, warn};
+use tracing::{error, trace, warn};
 use url::{Url, form_urlencoded};
 use uuid::Uuid;
 
@@ -156,7 +154,7 @@ where
 
 async fn collect_response_body_inner<B>(
     body: B,
-    limit: Option<usize>,
+    limit: usize,
     idle_timeout: Option<StdDuration>,
 ) -> Result<Vec<u8>, std::io::Error>
 where
@@ -169,7 +167,7 @@ where
         let Some(new_len) = body_vec.len().checked_add(data.len()) else {
             return Err(response_body_exceeds_limit_error());
         };
-        if limit.is_some_and(|limit| new_len > limit) {
+        if new_len > limit {
             return Err(response_body_exceeds_limit_error());
         }
         body_vec.extend_from_slice(&data);
@@ -182,7 +180,22 @@ where
     B: Body<Data = Bytes>,
     B::Error: Into<Box<dyn StdError + Send + Sync>>,
 {
-    collect_response_body_inner(body, Some(limit), None).await
+    collect_response_body_inner(body, limit, None).await
+}
+
+/// Keep the remote body with its reader; idle and range errors surface while reading.
+pub(crate) fn response_body_reader(body: Incoming, limit: Option<usize>, idle_timeout: StdDuration) -> ReadCloser {
+    let stream = futures::stream::try_unfold((Box::pin(body), 0_usize), move |(mut body, received)| async move {
+        let Some(data) = next_response_body_data(body.as_mut(), Some(idle_timeout)).await? else {
+            return Ok::<_, std::io::Error>(None);
+        };
+        let received = received
+            .checked_add(data.len())
+            .filter(|size| limit.is_none_or(|limit| *size <= limit))
+            .ok_or_else(response_body_exceeds_limit_error)?;
+        Ok(Some((data, (body, received))))
+    });
+    ReadCloser::new(tokio_util::io::StreamReader::new(Box::pin(stream)))
 }
 
 const C_UNKNOWN: i32 = -1;
@@ -217,9 +230,9 @@ fn signer_error_to_io_error(scope: &str, error: rustfs_signer::SignV4Error) -> s
     signer_error::signer_error_to_io_error(scope, error)
 }
 
-/// Streaming object body handed to the client by the storage engine. The
-/// client only ever reads it to completion, so the engine-side reader type
-/// (e.g. ecstore's `GetObjectReader`) stays behind this boxed `AsyncRead`.
+/// Streaming object body shared by the client and storage engine. The concrete
+/// reader (e.g. ecstore's `GetObjectReader` or a remote response body) stays
+/// behind this boxed `AsyncRead`.
 pub struct ObjectReader(Box<dyn AsyncRead + Send + Sync + Unpin>);
 
 impl ObjectReader {
@@ -255,7 +268,8 @@ pub enum ReaderImpl {
     ObjectBody(ObjectReader),
 }
 
-pub type ReadCloser = BufReader<Cursor<Vec<u8>>>;
+/// Remote object reader. Dropping it releases the response body without collecting it.
+pub type ReadCloser = ObjectReader;
 
 #[derive(Debug)]
 pub struct TransitionClient {
@@ -448,16 +462,7 @@ impl TransitionClient {
         tier_type: &str,
         timeouts: TransitionClientTimeouts,
     ) -> Result<TransitionClient, std::io::Error> {
-        if rustls::crypto::CryptoProvider::get_default().is_none() {
-            // No default provider is set yet; try to install aws-lc-rs.
-            // `install_default` can only fail if another thread races us and installs a provider
-            // between our check and this call, which is still safe to ignore.
-            if rustls::crypto::aws_lc_rs::default_provider().install_default().is_err() {
-                debug!("rustls crypto provider was installed concurrently, skipping aws-lc-rs install");
-            }
-        } else {
-            debug!("rustls crypto provider already installed, skipping aws-lc-rs install");
-        }
+        rustfs_tls_runtime::ensure_crypto_provider().map_err(std::io::Error::other)?;
 
         let endpoint_url = get_endpoint_url(endpoint, opts.secure)?;
         let timeouts = timeouts.validate()?;
@@ -823,15 +828,7 @@ impl TransitionClient {
         B: Body<Data = Bytes>,
         B::Error: Into<Box<dyn StdError + Send + Sync>>,
     {
-        collect_response_body_inner(body, Some(limit), Some(self.timeouts.response_body_idle_timeout)).await
-    }
-
-    pub async fn collect_response_body_unbounded<B>(&self, body: B) -> Result<Vec<u8>, std::io::Error>
-    where
-        B: Body<Data = Bytes>,
-        B::Error: Into<Box<dyn StdError + Send + Sync>>,
-    {
-        collect_response_body_inner(body, None, Some(self.timeouts.response_body_idle_timeout)).await
+        collect_response_body_inner(body, limit, Some(self.timeouts.response_body_idle_timeout)).await
     }
 
     async fn new_request(
@@ -1785,7 +1782,7 @@ mod tests {
 
         let err = tokio::time::timeout(
             StdDuration::from_millis(200),
-            collect_response_body_inner(body, Some(1), Some(StdDuration::from_millis(50))),
+            collect_response_body_inner(body, 1, Some(StdDuration::from_millis(50))),
         )
         .await
         .expect("the collector should enforce its own body idle timeout")
@@ -1862,21 +1859,36 @@ mod tests {
         assert!(outcome.is_ok(), "TLS config creation should not panic");
     }
 
-    /// Installing the rustls crypto provider when one is already set must not panic or return
-    /// an error that surfaces to callers (the race-safe `get_default` check guards the install).
+    #[cfg(feature = "fips")]
     #[test]
-    fn provider_install_is_idempotent() {
-        // Install once (may already be set by another test in this binary — that's fine).
-        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-        // A second install attempt on an already-set provider must not panic.
-        let outcome = std::panic::catch_unwind(|| {
-            if rustls::crypto::CryptoProvider::get_default().is_none() {
-                let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-            }
-            // If a default is already present, the branch above is simply skipped.
-        });
-        assert!(outcome.is_ok(), "provider install guard must not panic when a provider is already set");
+    fn fips_transition_rejects_incompatible_host_provider() {
+        const CHILD: &str = "RUSTFS_TEST_TRANSITION_FIPS_PROVIDER";
+        if std::env::var_os(CHILD).is_some() {
+            let mut provider = rustfs_tls_runtime::default_crypto_provider();
+            provider.kx_groups = vec![rustls::crypto::aws_lc_rs::kx_group::X25519];
+            provider.install_default().expect("install incompatible host provider");
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime");
+            let error = runtime
+                .block_on(super::TransitionClient::new("127.0.0.1:0", super::Options::default(), ""))
+                .expect_err("transition client must reject the incompatible provider");
+            assert!(error.to_string().contains("process-wide rustls crypto provider"));
+            return;
+        }
+        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
+            .arg("fips_transition_rejects_incompatible_host_provider")
+            .arg("--nocapture")
+            .env(CHILD, "1")
+            .output()
+            .expect("start isolated transition TLS test");
+        assert!(
+            output.status.success(),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
 
     #[test]

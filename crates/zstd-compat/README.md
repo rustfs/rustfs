@@ -6,6 +6,6 @@ This private package satisfies the version constraints of Avro, Arrow IPC, Parqu
 
 The fixed implementation closes RUSTSEC-2026-0391, RUSTSEC-2026-0398, and RUSTSEC-2026-0403. A successful advisory scan alone is insufficient evidence: cargo-deny skips local path packages. The dependency-graph test therefore requires this adapter's sole runtime dependency to be the exact fixed registry implementation and rejects vulnerable registry codec versions. Security tests exercise abandoned stream contexts, malformed legacy frames, and seekable offsets past EOF. Consumer tests retain zstandard support in all four upstream formats.
 
-Run `cargo nextest run --locked -p zstd@0.13.3` for the focused tests. The seekable feature is enabled by a test-only dependency to cover the optional vulnerable API without enabling it in production.
+Run `cargo nextest run --locked -p zstd@0.13.4` for the focused tests. The seekable feature is enabled by a test-only dependency to cover the optional vulnerable API without enabling it in production.
 
 Remove this package and the root Cargo patch when all consumers accept the fixed zstd release line directly. The cleanup marker is registered in the architecture compatibility register.

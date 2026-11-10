@@ -256,6 +256,128 @@ pub const BUCKET_POLICY_CONFIG: &str = "policy.json";
 pub const BUCKET_NOTIFICATION_CONFIG: &str = "notification.xml";
 pub const BUCKET_LIFECYCLE_CONFIG: &str = "lifecycle.xml";
 pub const BUCKET_SSECONFIG: &str = "bucket-encryption.xml";
+/// Validate tag entries supplied to the S3 API.
+pub fn validate_tag_set_entries(tag_set: &[s3s::dto::Tag]) -> std::result::Result<(), &'static str> {
+    validate_tag_entries(tag_set, validate_s3_tag_entry)
+}
+
+fn validate_tag_entries(
+    tag_set: &[s3s::dto::Tag],
+    mut validate_entry: impl FnMut(&str, &str) -> std::result::Result<(), &'static str>,
+) -> std::result::Result<(), &'static str> {
+    let mut keys = std::collections::HashSet::with_capacity(tag_set.len());
+    for tag in tag_set {
+        let key = tag
+            .key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+            .ok_or("Tag key cannot be empty")?;
+        let value = tag.value.as_deref().ok_or("Tag value cannot be null")?;
+        validate_entry(key, value)?;
+        if !keys.insert(key) {
+            return Err("Cannot provide multiple Tags with the same key");
+        }
+    }
+    Ok(())
+}
+
+fn validate_s3_tag_entry(key: &str, value: &str) -> std::result::Result<(), &'static str> {
+    fn is_valid_tag_text(value: &str) -> bool {
+        static VALID_TAG_TEXT: std::sync::OnceLock<std::result::Result<regex::Regex, regex::Error>> = std::sync::OnceLock::new();
+        VALID_TAG_TEXT
+            .get_or_init(|| regex::Regex::new(r"^[\p{L}\p{N}\p{Z}+\-=._:/@]*$"))
+            .as_ref()
+            .is_ok_and(|pattern| pattern.is_match(value))
+    }
+    if key.encode_utf16().count() > 128 || !is_valid_tag_text(key) {
+        return Err("The TagKey you have provided is invalid");
+    }
+    if value.encode_utf16().count() > 256 || !is_valid_tag_text(value) {
+        return Err("The TagValue you have provided is invalid");
+    }
+    Ok(())
+}
+
+pub const MAX_BUCKET_TAGS: usize = 50;
+
+/// Maximum number of metadata headers on a Swift resource.
+pub const MAX_SWIFT_METADATA_COUNT: usize = 90;
+/// Maximum byte length of a Swift metadata value.
+pub const MAX_SWIFT_METADATA_VALUE_SIZE: usize = 256;
+
+/// Prefix for Swift account metadata persisted in tagging.xml.
+pub const SWIFT_ACCOUNT_META_TAG_PREFIX: &str = "swift-account-meta-";
+/// Prefix for Swift container metadata persisted in tagging.xml.
+pub const SWIFT_CONTAINER_META_TAG_PREFIX: &str = "swift-meta-";
+
+/// Marks a bucket whose shared tag config contains Swift-owned metadata.
+/// The key cannot be supplied through S3's tag alphabet.
+pub const SWIFT_TAGGING_MARKER: &str = "!rustfs-swift-metadata";
+
+/// Whether a persisted tag belongs to Swift's internal metadata namespace.
+pub fn is_swift_bucket_metadata_tag_key(key: &str) -> bool {
+    matches!(
+        key,
+        "swift-acl-read" | "swift-acl-write" | "swift-versions-location" | SWIFT_TAGGING_MARKER
+    ) || key.starts_with(SWIFT_ACCOUNT_META_TAG_PREFIX)
+        || key.starts_with(SWIFT_CONTAINER_META_TAG_PREFIX)
+}
+
+fn validate_persisted_bucket_tags(tags: &[s3s::dto::Tag]) -> std::result::Result<(), &'static str> {
+    const SWIFT_ACL_MAX_BYTES: usize = 8192;
+    const SWIFT_META_NAME_MAX_BYTES: usize = 128;
+    const MAX_PERSISTED_TAGS: usize = MAX_BUCKET_TAGS + 2 * MAX_SWIFT_METADATA_COUNT + 4;
+    if tags.len() > MAX_PERSISTED_TAGS {
+        return Err("Too many persisted bucket tags");
+    }
+
+    // Swift stores ACLs, versioning and metadata in the same XML as S3 tags.
+    // Only those known keys may carry values outside the S3 tag alphabet.
+    let mut account_metadata = 0;
+    let mut container_metadata = 0;
+    let mut s3_tags = 0;
+    validate_tag_entries(tags, |key, value| {
+        let swift_metadata = key
+            .strip_prefix(SWIFT_ACCOUNT_META_TAG_PREFIX)
+            .map(|name| (name, &mut account_metadata))
+            .or_else(|| {
+                key.strip_prefix(SWIFT_CONTAINER_META_TAG_PREFIX)
+                    .map(|name| (name, &mut container_metadata))
+            });
+        if let Some((name, count)) = swift_metadata
+            && name.len() <= SWIFT_META_NAME_MAX_BYTES
+            && http::HeaderName::from_bytes(name.as_bytes()).is_ok()
+            && value.len() <= MAX_SWIFT_METADATA_VALUE_SIZE
+            && http::HeaderValue::from_str(value).is_ok()
+        {
+            *count += 1;
+            if *count > MAX_SWIFT_METADATA_COUNT {
+                return Err("Too many Swift metadata tags");
+            }
+            return Ok(());
+        }
+
+        if key == SWIFT_TAGGING_MARKER && value == "1" {
+            return Ok(());
+        }
+
+        let valid_swift_header = match key {
+            "swift-acl-read" | "swift-acl-write" => value.len() <= SWIFT_ACL_MAX_BYTES,
+            "swift-versions-location" => value.len() <= 256 && !value.is_empty() && !value.contains('/'),
+            _ => false,
+        };
+        if valid_swift_header && http::HeaderValue::from_str(value).is_ok() {
+            return Ok(());
+        }
+
+        s3_tags += 1;
+        if s3_tags > MAX_BUCKET_TAGS {
+            return Err("Cannot have more than 50 tags per bucket");
+        }
+        validate_s3_tag_entry(key, value)
+    })
+}
+
 pub const BUCKET_TAGGING_CONFIG: &str = "tagging.xml";
 pub const BUCKET_QUOTA_CONFIG_FILE: &str = "quota.json";
 pub const OBJECT_LOCK_CONFIG: &str = "object-lock.xml";
@@ -990,6 +1112,13 @@ impl BucketMetadata {
                 self.encryption_config_updated_at = updated;
             }
             BUCKET_TAGGING_CONFIG => {
+                if !data.is_empty() {
+                    let tagging = deserialize::<Tagging>(&data).map_err(|_| {
+                        Error::InvalidArgument(self.name.clone(), String::new(), "Invalid bucket tagging XML".to_owned())
+                    })?;
+                    validate_persisted_bucket_tags(&tagging.tag_set)
+                        .map_err(|message| Error::InvalidArgument(self.name.clone(), String::new(), message.to_owned()))?;
+                }
                 self.tagging_config_xml = data;
                 // Drop the parsed form (like lifecycle above) so clearing the
                 // payload can't leave stale parsed tags to be cached.
@@ -1781,9 +1910,68 @@ mod test {
         assert_eq!(metadata.bucket_incarnation_id, incarnation);
     }
 
+    #[test]
+    fn persisted_bucket_tags_keep_separate_s3_and_swift_limits() {
+        use s3s::dto::Tag;
+
+        let tag = |key: String, value: &str| Tag {
+            key: Some(key),
+            value: Some(value.to_owned()),
+        };
+        let acl = tag("swift-acl-read".to_owned(), ".r:*,AUTH_other");
+        assert_eq!(
+            validate_tag_set_entries(std::slice::from_ref(&acl)),
+            Err("The TagValue you have provided is invalid")
+        );
+
+        let mut tags = vec![acl.clone()];
+        tags.extend((0..MAX_BUCKET_TAGS).map(|i| tag(format!("team-{i}"), "blue")));
+        tags.extend((0..MAX_SWIFT_METADATA_COUNT).map(|i| tag(format!("{SWIFT_CONTAINER_META_TAG_PREFIX}item!{i}"), "a,b")));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Ok(()));
+
+        tags.push(tag(format!("{SWIFT_CONTAINER_META_TAG_PREFIX}overflow"), "a,b"));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Err("Too many Swift metadata tags"));
+        tags.pop();
+
+        tags.push(acl);
+        assert_eq!(
+            validate_persisted_bucket_tags(&tags),
+            Err("Cannot provide multiple Tags with the same key")
+        );
+        tags.pop();
+
+        tags[0].value = Some(".r:*,".repeat(1700));
+        assert_eq!(validate_persisted_bucket_tags(&tags), Err("The TagValue you have provided is invalid"));
+    }
+
     /// backlog#2292: a replicated config is stamped with the source
     /// `updated_at` it was given, not the local clock, while the plain
     /// `update_config` entry keeps stamping the local clock.
+    #[test]
+    fn bucket_tag_updates_reject_unreadable_shapes_without_replacing_metadata() {
+        let mut metadata = BucketMetadata::new("validated-tags");
+        let valid = br#"<Tagging><TagSet><Tag><Key>team</Key><Value></Value></Tag></TagSet></Tagging>"#.to_vec();
+        metadata
+            .update_config(BUCKET_TAGGING_CONFIG, valid.clone())
+            .expect("empty value is valid");
+        let updated = metadata.tagging_config_updated_at;
+        for invalid in [
+            "<Tagging><TagSet><Tag><Key>team</Key></Tag></TagSet></Tagging>".to_owned(),
+            "<Tagging><TagSet><Tag><Key></Key><Value>x</Value></Tag></TagSet></Tagging>".to_owned(),
+            "<Tagging><TagSet><Tag><Key>team</Key><Value>x</Value></Tag><Tag><Key>team</Key><Value>y</Value></Tag></TagSet></Tagging>".to_owned(),
+            format!("<Tagging><TagSet>{}</TagSet></Tagging>", (0..51).map(|i| format!("<Tag><Key>k{i}</Key><Value>v</Value></Tag>")).collect::<String>()),
+        ] {
+            assert!(metadata.update_config_at(BUCKET_TAGGING_CONFIG, invalid.into_bytes(), updated + time::Duration::hours(1)).is_err());
+            assert_eq!(metadata.tagging_config_xml, valid);
+            assert_eq!(metadata.tagging_config_updated_at, updated);
+        }
+        metadata.tagging_config_xml = b"legacy corrupt tags".to_vec();
+        metadata
+            .update_config(BUCKET_TAGGING_CONFIG, Vec::new())
+            .expect("deletion repairs legacy corruption");
+        assert!(metadata.tagging_config_xml.is_empty());
+    }
+
     #[test]
     fn update_config_at_stamps_the_given_time_and_update_config_stamps_now() {
         let source_time = OffsetDateTime::now_utc() - time::Duration::hours(3);

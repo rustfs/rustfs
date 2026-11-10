@@ -43,6 +43,7 @@ rustfs-utils = { workspace = true, features = ["full"] }
 s3s = { workspace = true, features = ["minio"] }
 base64-simd.workspace = true
 thiserror.workspace = true
+url.workspace = true
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true, features = ["fmt"] }

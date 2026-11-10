@@ -25,7 +25,8 @@
 
 use super::harness::{
     DistCluster, DistLayout, TestResult, cluster_admin, cluster_admin_ok, decommission_status_json, get_object_bytes,
-    payload_for, put_object, s3_probe_client, s3_probe_error_code, sha256_hex, unique_bucket, wait_until,
+    payload_for, put_object, rebalance_complete, rebalance_status_json, s3_probe_client, s3_probe_error_code, sha256_hex,
+    unique_bucket, wait_until,
 };
 use crate::chaos::{VersionShardCensus, census_object_version_on_disk};
 use crate::common::{FAST_DATA_USAGE_SCANNER_ENV, RustFSTestClusterEnvironment};
@@ -47,6 +48,7 @@ use tokio::time::{Instant, sleep};
 use uuid::Uuid;
 
 pub(crate) const MOVEMENT_BARRIER_DIR_ENV: &str = "RUSTFS_E2E_DATA_MOVEMENT_BARRIER_DIR";
+pub(crate) const STAGE_AFTER_ENTRY_ADMISSION: &str = "after_entry_admission";
 pub(crate) const STAGE_BEFORE_TARGET_COMMIT: &str = "before_target_commit";
 pub(crate) const STAGE_BEFORE_SOURCE_CLEANUP: &str = "before_source_cleanup";
 pub(crate) const STAGE_AFTER_RESPONSIBILITY_PERSISTED: &str = "after_responsibility_persisted";
@@ -1166,8 +1168,21 @@ pub(crate) async fn clear_decommission(cluster: &RustFSTestClusterEnvironment, p
     .await
 }
 
-pub(crate) async fn stop_rebalance(cluster: &RustFSTestClusterEnvironment) -> TestResult<String> {
-    cluster_admin_ok(cluster, Method::POST, "/rustfs/admin/v3/rebalance/stop", None).await
+pub(crate) async fn stop_rebalance(cluster: &RustFSTestClusterEnvironment, expected_id: &str) -> TestResult<String> {
+    let path = "/rustfs/admin/v3/rebalance/stop";
+    let (status, response) = cluster_admin(cluster, Method::POST, path, None).await?;
+    if status.is_success() {
+        return Ok(response);
+    }
+    // The run can finish between the active observation and the stop request.
+    // Only completion of that same run makes a not-started response acceptable.
+    if status == StatusCode::NOT_FOUND
+        && response.contains("<Code>NoSuchResource</Code>")
+        && rebalance_complete(&rebalance_status_json(cluster).await?, expected_id)?
+    {
+        return Ok(response);
+    }
+    Err(format!("POST {path} failed: {status} {response}").into())
 }
 
 pub(crate) fn decommission_pool_entry(status: &Value, pool_id: usize) -> TestResult<Value> {
@@ -1584,6 +1599,129 @@ pub(crate) async fn assert_every_node_serves(dist: &DistCluster, bucket: &str, l
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const REBALANCE_NOT_STARTED: &str =
+        "<Error><Code>NoSuchResource</Code><Message>pool rebalance is not started</Message></Error>";
+
+    async fn mock_rebalance_stop(
+        stop_status: StatusCode,
+        stop_body: &str,
+        run_status: Value,
+    ) -> TestResult<(TestResult<String>, Vec<String>)> {
+        use bytes::Bytes;
+        use http_body_util::Full;
+        use hyper::service::service_fn;
+        use hyper_util::rt::TokioIo;
+        use tokio::net::TcpListener;
+        use tokio::sync::mpsc;
+        use tokio::task::JoinSet;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let mut cluster = RustFSTestClusterEnvironment::new(1).await?;
+        cluster.nodes[0].url = format!("http://{}", listener.local_addr()?);
+        let stop_body = stop_body.to_string();
+        let (requests_tx, mut requests_rx) = mpsc::unbounded_channel();
+        let mut server = JoinSet::new();
+        server.spawn(async move {
+            loop {
+                let (stream, _) = match listener.accept().await {
+                    Ok(connection) => connection,
+                    Err(error) => return Err::<(), Box<dyn std::error::Error + Send + Sync>>(error.into()),
+                };
+                let stop_body = stop_body.clone();
+                let run_status = run_status.clone();
+                let requests_tx = requests_tx.clone();
+                let handler = service_fn(move |request: hyper::Request<hyper::body::Incoming>| {
+                    let route = format!("{} {}", request.method(), request.uri().path());
+                    requests_tx.send(route.clone()).expect("record mock admin request");
+                    let (status, body) = match route.as_str() {
+                        "POST /rustfs/admin/v3/rebalance/stop" => (stop_status, stop_body.clone()),
+                        "GET /rustfs/admin/v3/rebalance/status" => (StatusCode::OK, run_status.to_string()),
+                        _ => (StatusCode::BAD_REQUEST, "unexpected admin request".to_string()),
+                    };
+                    async move { http::Response::builder().status(status).body(Full::new(Bytes::from(body))) }
+                });
+                hyper::server::conn::http1::Builder::new()
+                    .keep_alive(false)
+                    .serve_connection(TokioIo::new(stream), handler)
+                    .await?;
+            }
+        });
+        let outcome = tokio::time::timeout(Duration::from_secs(5), stop_rebalance(&cluster, "run-1")).await?;
+        server.abort_all();
+        let requests = std::iter::from_fn(|| requests_rx.try_recv().ok()).collect();
+        Ok((outcome, requests))
+    }
+
+    fn completed_rebalance() -> Value {
+        serde_json::json!({
+            "id": "run-1",
+            "pools": [
+                { "id": 0, "status": "Completed", "progress": { "versions": 113 } },
+                { "id": 1, "status": "None" }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn rebalance_stop_success_does_not_query_completion() -> TestResult {
+        let (outcome, requests) = mock_rebalance_stop(StatusCode::OK, "", Value::Null).await?;
+        assert_eq!(outcome?, "");
+        assert_eq!(requests, ["POST /rustfs/admin/v3/rebalance/stop"]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebalance_stop_accepts_completed_run_after_not_started_response() -> TestResult {
+        let (outcome, requests) =
+            mock_rebalance_stop(StatusCode::NOT_FOUND, REBALANCE_NOT_STARTED, completed_rebalance()).await?;
+        outcome?;
+        assert_eq!(
+            requests,
+            [
+                "POST /rustfs/admin/v3/rebalance/stop",
+                "GET /rustfs/admin/v3/rebalance/status"
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebalance_stop_rejects_unproven_completion_and_other_errors() -> TestResult {
+        let complete = completed_rebalance();
+        let mut invalid = vec![Value::Null];
+        for (pointer, value) in [
+            ("/id", serde_json::json!("run-2")),
+            ("/pools/0/status", serde_json::json!("Started")),
+            ("/pools/0/status", serde_json::json!("Failed")),
+            ("/pools/0/status", serde_json::json!("Stopped")),
+            ("/pools/0/progress/versions", serde_json::json!(0)),
+        ] {
+            let mut status = complete.clone();
+            *status.pointer_mut(pointer).expect("completion fixture field") = value;
+            invalid.push(status);
+        }
+        let mut pending = complete.clone();
+        pending["stopPropagation"] = serde_json::json!({ "pendingTerminalReload": true });
+        invalid.push(pending);
+        let mut failed = complete.clone();
+        failed["pools"][0]["lastError"] = serde_json::json!("migration failed");
+        invalid.push(failed);
+        for status in invalid {
+            let (outcome, _) = mock_rebalance_stop(StatusCode::NOT_FOUND, REBALANCE_NOT_STARTED, status.clone()).await?;
+            assert!(outcome.is_err(), "unproven completion accepted: {status}");
+        }
+        for (code, body) in [
+            (StatusCode::FORBIDDEN, REBALANCE_NOT_STARTED),
+            (StatusCode::INTERNAL_SERVER_ERROR, REBALANCE_NOT_STARTED),
+            (StatusCode::NOT_FOUND, "<Error><Code>NoSuchBucket</Code></Error>"),
+        ] {
+            let (outcome, requests) = mock_rebalance_stop(code, body, complete.clone()).await?;
+            assert!(outcome.is_err(), "unrelated error accepted: {code} {body}");
+            assert_eq!(requests, ["POST /rustfs/admin/v3/rebalance/stop"]);
+        }
+        Ok(())
+    }
 
     #[test]
     fn version_ids_normalize_null_spellings() {

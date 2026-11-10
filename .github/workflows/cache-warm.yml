@@ -96,7 +96,7 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
-  # Readers: test-and-lint (workspace and ILM), build-rustfs-debug-binary,
+  # Readers: workspace-lint-and-build, workspace-tests (workspace and ILM), build-rustfs-debug-binary,
   # e2e-tests, e2e-full.
   warm-ci-dev:
     name: Warm ci-dev
@@ -146,7 +146,7 @@ jobs:
           if-no-files-found: error
 
       # --all-targets covers the test binaries nextest builds, including
-      # e2e_test, which test-and-lint's own run excludes. The second build adds
+      # e2e_test, which the workspace run excludes. The second build adds
       # the e2e-test-hooks feature resolution that build-rustfs-debug-binary uses
       # and that no lint lane enables.
       - name: Build ci-dev superset

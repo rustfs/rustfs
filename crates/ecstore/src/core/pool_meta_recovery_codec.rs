@@ -315,7 +315,7 @@ pub(super) async fn encode_inline_pool_meta_replicas(
         .encode_with_shard_integrity(
             Cursor::new(Bytes::copy_from_slice(canonical)),
             &mut writers,
-            raw.len(),
+            crate::erasure::coding::encode::ShardWritePolicy::object(raw.len()),
             1,
             IntegrityEncodeMode::Inline(canonical.len()),
             protected,

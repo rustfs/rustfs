@@ -522,16 +522,29 @@ async fn pause_prefix_delete_after_journal_prepare(bucket: &str, prefix: &str) {
     }
 }
 
-async fn delete_prefix_with_tier_delete_journal(
+// Construct only the selected operation off the caller's poll frame. A plain prefix
+// delete must not carry the journal state machine into the nested per-disk delete.
+#[inline(never)]
+fn delete_prefix_with_tier_delete_journal<'a>(
+    store: &'a ECStore,
+    bucket: &'a str,
+    object: &'a str,
+    opts: &'a ObjectOptions,
+    tier_journal_api: Option<&'a Arc<ECStore>>,
+) -> futures::future::BoxFuture<'a, Result<()>> {
+    match tier_journal_api {
+        Some(api) => Box::pin(delete_prefix_with_active_tier_journal(store, bucket, object, opts, api)),
+        None => Box::pin(store.delete_prefix(bucket, object, opts)),
+    }
+}
+
+async fn delete_prefix_with_active_tier_journal(
     store: &ECStore,
     bucket: &str,
     object: &str,
     opts: &ObjectOptions,
-    tier_journal_api: Option<&Arc<ECStore>>,
+    api: &Arc<ECStore>,
 ) -> Result<()> {
-    let Some(api) = tier_journal_api else {
-        return store.delete_prefix(bucket, object, opts).await;
-    };
     let PreparedPrefixTierDelete {
         dispatch,
         chunk_parent_active,
@@ -1352,8 +1365,8 @@ impl RestoreWorkerGuard {
     }
 }
 
-impl Drop for ObjectLockDiagGuard {
-    fn drop(&mut self) {
+impl ObjectLockDiagGuard {
+    fn record_hold_diag(&self) {
         if !self.enabled || self.guard.as_ref().is_released() {
             return;
         }
@@ -1378,8 +1391,14 @@ impl Drop for ObjectLockDiagGuard {
     }
 }
 
+impl Drop for ObjectLockDiagGuard {
+    fn drop(&mut self) {
+        self.record_hold_diag();
+    }
+}
+
 /// A failure to preserve one object generation for a SelectObjectContent read.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, Copy, thiserror::Error)]
 #[non_exhaustive]
 pub enum SnapshotConsistencyError {
     #[error("namespace locking is disabled for SelectObjectContent")]
@@ -1493,9 +1512,11 @@ impl SelectObjectSnapshotLease {
     }
 }
 
-/// Opaque, lock-backed object generation used by SelectObjectContent.
+/// Opaque object generation used by SelectObjectContent. Each range reacquires
+/// short namespace read fences and rejects changed read semantics before opening
+/// its generation-bound reader. An idle snapshot never blocks object mutations.
 pub struct SelectObjectSnapshot {
-    pool: Arc<Sets>,
+    store: Arc<ECStore>,
     bucket: String,
     object: String,
     headers: HeaderMap,
@@ -1503,7 +1524,7 @@ pub struct SelectObjectSnapshot {
     object_info: ObjectInfo,
     logical_size: u64,
     read_semantics_identity: [u8; 32],
-    first_metadata: ParkingMutex<Option<crate::set_disk::PreparedGetObjectMetadata>>,
+    failure: ParkingMutex<Option<SnapshotConsistencyError>>,
     lease: Arc<SelectObjectSnapshotLease>,
 }
 
@@ -1536,6 +1557,9 @@ impl SelectObjectSnapshot {
     }
 
     pub fn ensure_valid(&self) -> std::result::Result<(), SnapshotConsistencyError> {
+        if let Some(failure) = *self.failure.lock() {
+            return Err(failure);
+        }
         self.lease.check()
     }
 
@@ -1549,38 +1573,72 @@ impl SelectObjectSnapshot {
         &self,
         range: Option<HTTPRangeSpec>,
     ) -> std::result::Result<GetObjectReader, SelectObjectSnapshotReadError> {
-        self.lease.check()?;
-        let first_metadata = self.first_metadata.lock().take();
-        let metadata = match first_metadata {
-            Some(metadata) => metadata,
-            None => {
-                self.pool
-                    .prepare_get_object_reader_metadata(&self.bucket, &self.object, &self.opts)
-                    .await?
-            }
-        };
-        self.lease.check()?;
+        let result = self.open_generation_reader(range).await;
+        if let Err(SelectObjectSnapshotReadError::Consistency(failure)) = &result {
+            *self.failure.lock() = Some(*failure);
+        }
+        result
+    }
+
+    async fn open_generation_reader(
+        &self,
+        range: Option<HTTPRangeSpec>,
+    ) -> std::result::Result<GetObjectReader, SelectObjectSnapshotReadError> {
+        self.ensure_valid()?;
+        if self.store.ctx.lock_manager().is_disabled() {
+            return Err(SnapshotConsistencyError::LockingDisabled.into());
+        }
+        let mut opts = self.opts.clone();
+        opts.no_lock = false;
+        let guards = self
+            .store
+            .acquire_all_object_read_locks("select_object_range", &self.bucket, &self.object, &mut opts)
+            .await?;
+        let pin_lease = SelectObjectSnapshotLease::new(guards);
+        pin_lease.check()?;
+        #[cfg(test)]
+        tests::pause_select_range_after_lock(&self.bucket, &self.object).await;
+        // Re-select across all pools, including on the first range. Metadata
+        // captured during prepare is no longer protected after that call returns.
+        let (metadata, pool) = self
+            .store
+            .prepare_select_object_metadata(&self.bucket, &self.object, &opts)
+            .await
+            .map_err(|error| {
+                if is_err_object_not_found(&error)
+                    || is_err_version_not_found(&error)
+                    || matches!(&error, StorageError::BucketNotFound(_) | StorageError::VolumeNotFound)
+                {
+                    SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged)
+                } else {
+                    SelectObjectSnapshotReadError::Storage(error)
+                }
+            })?;
+        pin_lease.check()?;
         if metadata.read_semantics_identity() != self.read_semantics_identity {
             return Err(SnapshotConsistencyError::ObjectChanged.into());
         }
-
-        let mut reader =
-            crate::object_api::without_get_object_body_cache_hook(self.pool.get_object_reader_with_prepared_metadata(
-                &self.bucket,
-                &self.object,
-                range,
-                self.headers.clone(),
-                &self.opts,
-                metadata,
-            ))
-            .await?;
-        self.lease.check()?;
+        let mut reader = crate::object_api::without_get_object_body_cache_hook(pool.get_object_reader_with_prepared_metadata(
+            &self.bucket,
+            &self.object,
+            range,
+            self.headers.clone(),
+            &opts,
+            metadata,
+        ))
+        .await?;
+        pin_lease.check()?;
+        self.ensure_valid()?;
         reader.body_source = crate::object_api::GetObjectBodySource::HookMissed;
         reader.stream = Box::new(SelectObjectSnapshotReader {
             inner: reader.stream,
             lock_loss_wake: SelectObjectSnapshotLockLossWake::new(self.lease.subscribe_lock_loss()),
             lease: Arc::clone(&self.lease),
         });
+        // Streaming/lazy readers retain old FileInfo, inline bytes and data_dir
+        // paths, never a current-key lookup. Cleanup can fail the read, but may
+        // not select replacement bytes. This is independent of GET's lock knob.
+        drop(pin_lease);
         Ok(reader)
     }
 }
@@ -3160,7 +3218,12 @@ impl ECStore {
     pub async fn object_lock_config_snapshot(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
         let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_admission_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision) =
             get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
@@ -3177,10 +3240,15 @@ impl ECStore {
         )))
     }
 
-    async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
+    pub(crate) async fn object_lock_config_snapshot_for_single_put(&self, bucket: &str) -> Result<Arc<ObjectLockConfigSnapshot>> {
         check_valid_bucket_name(bucket)?;
         let lifecycle_guard = self.acquire_bucket_lifecycle_read_lock(bucket).await?;
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_snapshot_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision, quota_res) =
             get_object_lock_and_quota_config_from_disk_with_guard_in(&self.ctx, bucket, Some(&lifecycle_guard)).await?;
         if lifecycle_guard.is_lock_lost() || metadata_guard.is_lock_lost() {
@@ -3209,7 +3277,12 @@ impl ECStore {
         if lifecycle_fence.is_lock_lost() {
             return Err(Error::other("bucket lifecycle lock was lost before loading the Object Lock snapshot"));
         }
-        let metadata_guard = acquire_bucket_metadata_transaction_read_lock_in(&self.ctx, bucket).await?;
+        let metadata_guard = crate::bucket::metadata_sys::acquire_bucket_metadata_transaction_read_lock_in_for_purpose(
+            &self.ctx,
+            bucket,
+            "object_lock_completion_metadata_read",
+        )
+        .await?;
         let (state, bucket_incarnation_id, config_revision) =
             get_object_lock_config_and_incarnation_from_disk_with_guard_in(&self.ctx, bucket, Some(&metadata_guard)).await?;
         if lifecycle_fence.is_lock_lost() || metadata_guard.is_lock_lost() {
@@ -3226,13 +3299,46 @@ impl ECStore {
         )))
     }
 
-    /// Resolves a GET's object identity without constructing its body reader.
-    ///
-    /// This is an additive two-stage counterpart to `get_object_reader`. The
-    /// existing method remains the compatibility path for callers that do not
-    /// need a pre-reader decision point.
-    pub async fn prepare_select_object_snapshot(
+    /// Selects authoritative metadata across all pools under the caller's locks.
+    async fn prepare_select_object_metadata(
         &self,
+        bucket: &str,
+        object: &str,
+        opts: &ObjectOptions,
+    ) -> Result<(crate::set_disk::PreparedGetObjectMetadata, Arc<Sets>)> {
+        // Acquiring the namespace locks marks ordinary GETs cache-safe. A
+        // SELECT generation check must instead consult the disks: another node
+        // (or another SetDisks owner) can commit without invalidating this cache.
+        let mut opts = opts.clone();
+        opts.metadata_cache_safe = false;
+        Ok(if self.single_pool() {
+            let pool = Arc::clone(&self.pools[0]);
+            let metadata = pool.prepare_get_object_reader_metadata(bucket, object, &opts).await?;
+            (metadata, pool)
+        } else {
+            // Keep the large multi-pool selection future off the caller stack.
+            // Debug builds otherwise exceed the common 2 MiB worker stack.
+            Box::pin(async {
+                let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, object, &opts).await?;
+                let pool = self.pools.get(pool_idx).cloned().ok_or_else(|| {
+                    StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
+                })?;
+                Ok::<_, StorageError>((metadata, pool))
+            })
+            .await?
+        })
+    }
+
+    /// Captures the initial generation for a SelectObjectContent query under short namespace locks.
+    ///
+    /// Each range, including the first, reacquires these locks, revalidates the
+    /// initial read semantics, and constructs a generation-bound reader before
+    /// releasing them. Concurrent mutation may cause a consistency or storage
+    /// error; callers must propagate it instead of reporting successful query completion.
+    /// Cancelling preparation or a range open drops its guards. Returned snapshots
+    /// and readers never retain namespace locks while waiting for client input.
+    pub async fn prepare_select_object_snapshot(
+        self: &Arc<Self>,
         bucket: &str,
         object: &str,
         headers: &HeaderMap,
@@ -3254,22 +3360,7 @@ impl ECStore {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
 
-        let (mut metadata, pool) = if self.single_pool() {
-            let pool = Arc::clone(&self.pools[0]);
-            let metadata = pool.prepare_get_object_reader_metadata(bucket, &object, &opts).await?;
-            (metadata, pool)
-        } else {
-            // Keep the large multi-pool selection future off the caller stack.
-            // Debug builds otherwise exceed the common 2 MiB worker stack.
-            Box::pin(async {
-                let (metadata, pool_idx) = self.prepare_latest_object_metadata_with_idx(bucket, &object, &opts).await?;
-                let pool = self.pools.get(pool_idx).cloned().ok_or_else(|| {
-                    StorageError::other(format!("resolved SelectObjectContent pool index {pool_idx} is out of bounds"))
-                })?;
-                Ok::<_, StorageError>((metadata, pool))
-            })
-            .await?
-        };
+        let (mut metadata, _pool) = self.prepare_select_object_metadata(bucket, &object, &opts).await?;
         if read_lock_guards.iter().any(ObjectLockDiagGuard::is_lock_lost) {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
@@ -3286,8 +3377,12 @@ impl ECStore {
             return Err(SnapshotConsistencyError::LockLost.into());
         }
 
+        // Snapshot identity survives, but preparation metadata and all namespace
+        // fences are released before a caller can wait on client backpressure.
+        drop(metadata);
+        drop(read_lock_guards);
         Ok(SelectObjectSnapshot {
-            pool,
+            store: Arc::clone(self),
             bucket: bucket.to_owned(),
             object,
             headers: rustfs_utils::http::project_ssec_transport_headers(headers),
@@ -3295,8 +3390,8 @@ impl ECStore {
             object_info,
             logical_size,
             read_semantics_identity,
-            first_metadata: ParkingMutex::new(Some(metadata)),
-            lease: Arc::new(SelectObjectSnapshotLease::new(read_lock_guards)),
+            failure: ParkingMutex::new(None),
+            lease: Arc::new(SelectObjectSnapshotLease::new(Vec::new())),
         })
     }
 
@@ -3467,22 +3562,53 @@ impl ECStore {
         }
     }
 
+    /// Acquire the per-object write locks a bulk delete needs before any
+    /// mutation, one batched lock round for the whole key set. Bulk delete is
+    /// the only multi-key write-lock holder, and the batched round is
+    /// deadlock-free by construction (one `lock_batch` RPC per lock client,
+    /// global key order at each server), so no optimistic wave or serial
+    /// fallback is needed. Outcomes are per key: a locked-out key fails alone
+    /// and the rest of the batch proceeds.
     async fn acquire_delete_objects_write_locks(
         &self,
         bucket: &str,
         objects: &[ObjectToDelete],
         opts: &mut ObjectOptions,
-    ) -> Result<Vec<ObjectLockDiagGuard>> {
+    ) -> Result<(Vec<ObjectLockDiagGuard>, HashMap<String, StorageError>)> {
         if opts.no_lock || objects.is_empty() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), HashMap::new()));
         }
 
         let object_names = sorted_unique_delete_object_names(objects);
-        // Lock order: encoded object names are acquired in ascending order, then
-        // the set-layer calls receive no_lock so they do not reacquire them.
+        let acquired = self.pools[0].disk_set[0]
+            .acquire_object_write_locks_batch(bucket, &object_names, get_lock_acquire_timeout())
+            .await;
+
+        let diag_enabled = is_object_lock_diag_enabled();
         let mut guards = Vec::with_capacity(object_names.len());
-        for object in object_names {
-            guards.push(self.acquire_object_write_lock("delete_objects", bucket, object).await?);
+        let mut failures = HashMap::new();
+        for (object, result) in object_names.iter().zip(acquired) {
+            match result {
+                Ok(guard) => {
+                    #[cfg(any(test, feature = "test-util"))]
+                    notify_delete_namespace_pending(bucket);
+                    guards.push(
+                        ObjectLockDiagGuard::new(
+                            guard,
+                            diag_enabled,
+                            "delete_objects",
+                            diag_enabled.then(|| bucket.to_string()),
+                            diag_enabled.then(|| (*object).to_string()),
+                            diag_enabled.then(|| self.pools[0].disk_set[0].locker_owner.clone()),
+                            ObjectLockDiagMode::Write,
+                        )
+                        .with_write_key(bucket, object),
+                    );
+                }
+                Err(error) => {
+                    failures.insert((*object).to_owned(), error);
+                }
+            }
         }
         opts.no_lock = true;
         for signal in guards.iter().filter_map(ObjectLockDiagGuard::lock_lost_signal) {
@@ -3490,7 +3616,7 @@ impl ECStore {
         }
         opts.ensure_namespace_lock_fence();
 
-        Ok(guards)
+        Ok((guards, failures))
     }
 
     pub(super) async fn acquire_object_read_lock_if_needed(
@@ -4672,6 +4798,12 @@ impl ECStore {
             opts.expected_bucket_incarnation_id = Some(self.bucket_incarnation_id(bucket).await?);
         }
         if opts.overwrites_existing_version() && !is_meta_bucketname(bucket) {
+            if opts.object_lock_config_snapshot.is_none() && !opts.no_lock && !opts.data_movement {
+                // The request body is client-paced. Acquire configuration and
+                // lifecycle guards in SetDisks only once its staging has finished.
+                opts.defer_put_object_lock_snapshot = true;
+                return Ok((object, opts));
+            }
             let expected_incarnation_id = opts
                 .expected_bucket_incarnation_id
                 .ok_or_else(|| Error::other("destructive PUT is missing its bucket incarnation"))?;
@@ -4803,6 +4935,87 @@ impl ECStore {
             list_objects::observe_scanner_namespace_mutations(bucket, 1);
         }
         Ok((idx, result))
+    }
+
+    /// Compare the logical revision across all pools before publishing a
+    /// namespace-only usage update to a writable pool. A suspended source is
+    /// retained for decommission to reconcile against the newer target.
+    pub(crate) async fn put_usage_snapshot_for_namespace_cleanup(
+        &self,
+        object: &str,
+        expected_revision: Option<&str>,
+        data: &mut PutObjReader,
+        namespace_guard: Option<&rustfs_lock::NamespaceLockGuard>,
+    ) -> Result<ObjectInfo> {
+        // The caller owns the bucket namespace and movement guards. Acquire
+        // the fixed object domain, then every physical domain in pool order.
+        let guards = self
+            .acquire_all_physical_object_write_locks("usage_namespace_cleanup", RUSTFS_META_BUCKET, object)
+            .await?;
+        let mut opts = ObjectOptions {
+            no_lock: true,
+            max_parity: true,
+            write_completion: crate::object_api::WriteCompletion::TailDrained,
+            suppress_read_repair: true,
+            ..Default::default()
+        };
+        for guard in &guards {
+            guard.add_namespace_lock_fence(&mut opts);
+        }
+        if let Some(guard) = namespace_guard {
+            opts.add_namespace_lock_guard(guard);
+        }
+        let source = match self
+            .get_latest_object_info_for_conditional_write(RUSTFS_META_BUCKET, object, &opts)
+            .await
+            .and_then(|(info, idx)| resolve_latest_object_access(RUSTFS_META_BUCKET, object, info, idx, &opts))
+        {
+            Ok((info, _)) => Some(info),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+            Err(err) => return Err(err),
+        };
+        if source.as_ref().and_then(|info| info.etag.as_deref()) != expected_revision {
+            return Err(StorageError::PreconditionFailed);
+        }
+        if source.as_ref().is_some_and(|info| {
+            info.version_id.is_some_and(|version| !version.is_nil()) || info.etag.as_ref().is_none_or(String::is_empty)
+        }) {
+            return Err(StorageError::other("usage cleanup requires an unversioned snapshot with a revision"));
+        }
+        let target = self.get_pool_idx_no_lock(RUSTFS_META_BUCKET, object, data.size()).await?;
+        let target_info = match self.pools[target].get_object_info(RUSTFS_META_BUCKET, object, &opts).await {
+            Ok(info) => Some(info),
+            Err(err) if is_err_object_not_found(&err) || is_err_version_not_found(&err) => None,
+            Err(err) => return Err(err),
+        };
+        opts.http_preconditions = Some(match target_info.as_ref() {
+            Some(info) => crate::storage_api_contracts::object::HTTPPreconditions {
+                if_match: Some(
+                    info.etag
+                        .as_ref()
+                        .filter(|etag| !etag.is_empty())
+                        .cloned()
+                        .ok_or_else(|| StorageError::other("usage cleanup target has no revision"))?,
+                ),
+                ..Default::default()
+            },
+            None => crate::storage_api_contracts::object::HTTPPreconditions {
+                if_none_match: Some("*".to_string()),
+                ..Default::default()
+            },
+        });
+        let latest = source
+            .iter()
+            .chain(target_info.iter())
+            .filter_map(|info| info.mod_time)
+            .fold(OffsetDateTime::now_utc(), std::cmp::max);
+        opts.mod_time = Some(
+            latest
+                .checked_add(time::Duration::nanoseconds(1))
+                .ok_or_else(|| StorageError::other("usage cleanup snapshot timestamp is exhausted"))?,
+        );
+        opts.decommission_capacity_admission = crate::bucket::metadata_sys::object_store_if_initialized_in(&self.ctx).await;
+        self.pools[target].put_object(RUSTFS_META_BUCKET, object, data, &opts).await
     }
 
     #[instrument(level = "debug", skip(self, data))]
@@ -5322,6 +5535,12 @@ impl ECStore {
     ) -> Result<ObjectInfo> {
         Box::pin(async move {
             let mut opts = opts;
+            if opts.delete_recovery_work_budget.is_none() {
+                // Reservations are taken up front per disk, so size the request
+                // budget for every drive the delete can fan out to.
+                let disks = self.pools.iter().map(|pool| pool.set_count * pool.set_drive_count).sum();
+                opts.delete_recovery_work_budget = Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::for_disks(disks)));
+            }
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
             let result = self
                 .handle_delete_object_with_journal_inner_boxed(bucket, object, opts, tier_journal_api)
@@ -5637,13 +5856,11 @@ impl ECStore {
         }
 
         if self.single_pool()
-            && !creates_latest_marker
             && !opts.data_movement
             && opts.http_preconditions.is_none()
             && !opts.replication_request
-            && !opts.versioned
             && !opts.version_suspended
-            && opts.version_id.is_none()
+            && !opts.delete_marker
             && !self.is_suspended(0).await
             && !self.is_pool_rebalancing(0).await
         {
@@ -5655,6 +5872,10 @@ impl ECStore {
                 .await
             {
                 Ok(mut res) => {
+                    #[cfg(test)]
+                    if creates_latest_marker {
+                        pause_versioned_delete_marker_after_commit(bucket, object).await;
+                    }
                     res.name = decode_dir_object(res.name.as_str());
                     return Ok(res);
                 }
@@ -5879,6 +6100,12 @@ impl ECStore {
                 return (deleted, errors, accounting);
             }
             let mut opts = opts;
+            if opts.delete_recovery_work_budget.is_none() {
+                // Reservations are taken up front per disk, so size the request
+                // budget for every drive the delete can fan out to.
+                let disks = self.pools.iter().map(|pool| pool.set_count * pool.set_drive_count).sum();
+                opts.delete_recovery_work_budget = Some(Arc::new(crate::object_api::DeleteRecoveryWorkBudget::for_disks(disks)));
+            }
             let receipt_sink = install_tier_free_version_receipt_sink(&mut opts);
             let (valid_deleted, valid_errors, valid_accounting) = self
                 .handle_delete_objects_with_journal_and_accounting_inner(bucket, valid_objects, opts, tier_journal_api)
@@ -6163,10 +6390,21 @@ impl ECStore {
         if current_bucket_incarnation_id.is_some() {
             pause_delete_after_object_lock_snapshot(bucket).await;
         }
-        let _object_lock_guards = Arc::new(match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
-            Ok(guards) => guards,
-            Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
-        });
+        let (object_lock_guards, object_lock_failures) =
+            match self.acquire_delete_objects_write_locks(bucket, &objects, &mut opts).await {
+                Ok(result) => result,
+                Err(err) => return return_batch_delete_lock_error_with_accounting(objects.as_slice(), err),
+            };
+        // Lock outcomes are per key: a locked-out key fails alone and the rest
+        // of the batch proceeds, matching the set layer's per-key lock errors.
+        if !object_lock_failures.is_empty() {
+            for (index, object) in objects.iter().enumerate() {
+                if let Some(error) = object_lock_failures.get(&object.object_name) {
+                    del_errs[index] = Some(error.clone());
+                }
+            }
+        }
+        let _object_lock_guards = Arc::new(object_lock_guards);
         opts.delete_mutation_owner = Some(Arc::new((opts.delete_mutation_owner.take(), _object_lock_guards.clone())));
         #[cfg(any(test, feature = "test-util"))]
         if !_object_lock_guards.is_empty() {
@@ -6286,8 +6524,11 @@ impl ECStore {
         inject_conditional_delete_post_admission_mutations(self, bucket).await;
 
         if !has_conditions {
-            let indices = (0..objects.len()).collect::<Vec<_>>();
-            (del_objects, del_errs, accounting) = self
+            // Keys whose write lock failed are already reported in `del_errs`;
+            // the phase only runs for the keys this batch actually holds, and
+            // only its outcomes replace the outer per-key state.
+            let indices = (0..objects.len()).filter(|idx| del_errs[*idx].is_none()).collect::<Vec<_>>();
+            let (phase_deleted, mut phase_errors, mut phase_accounting) = self
                 .run_batch_delete_phase(
                     bucket,
                     &objects,
@@ -6299,6 +6540,11 @@ impl ECStore {
                     },
                 )
                 .await;
+            for idx in indices {
+                del_objects[idx] = phase_deleted[idx].clone();
+                del_errs[idx] = phase_errors[idx].take();
+                accounting[idx] = phase_accounting[idx].take();
+            }
         } else {
             let mut conditional_actions = HashMap::with_capacity(objects.len());
             let mut conditional_indices = Vec::with_capacity(objects.len());
@@ -6840,7 +7086,7 @@ mod tests {
     };
     use crate::set_disk::same_distributed_lock_domain;
     use crate::set_disk::{SetDisks, disk_call_counters};
-    use crate::storage_api_contracts::bucket::MakeBucketOptions;
+    use crate::storage_api_contracts::bucket::{BucketOptions, MakeBucketOptions};
     use crate::storage_api_contracts::lifecycle::TransitionedObject;
     use crate::storage_api_contracts::list::ListOperations as _;
     use bytes::Bytes;
@@ -9838,7 +10084,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx: crate::runtime::instance::bootstrap_ctx(),
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -9930,7 +10176,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: std::sync::Arc::default(),
         }
@@ -10180,6 +10426,296 @@ mod tests {
 
     async fn multipool_version_test_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
         multipool_delete_test_store(bucket, true).await
+    }
+
+    #[tokio::test]
+    async fn create_fresh_bucket_after_canceled_decommission() {
+        let (_dirs, store) = multipool_version_test_store("canceled-decommission-existing").await;
+        let mut canceled = prepared_pool_test_status(1, false);
+        canceled.decommission = Some(PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools: vec![prepared_pool_test_status(0, false), canceled],
+            ..Default::default()
+        };
+        store
+            .handle_make_bucket("canceled-decommission-fresh", &MakeBucketOptions::default())
+            .await
+            .expect("canceled decommission must not block creation of a new bucket");
+        assert!(
+            store.scanner_data_usage_publication_blocked().await,
+            "scanner publication must remain fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_bucket_after_failed_decommission() {
+        let (_dirs, store) = multipool_version_test_store("decommission-existing-bucket").await;
+        let bucket = "decommission-new-bucket";
+        let snapshot_time = std::time::SystemTime::now() - Duration::from_secs(60);
+        let mut snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(snapshot_time),
+            scanner_cycle: Some(37),
+            scanner_epoch: Some(2),
+            buckets_count: 1,
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        snapshot.buckets_usage.insert(
+            bucket.to_string(),
+            rustfs_data_usage::BucketUsageInfo {
+                size: 42,
+                objects_count: 1,
+                versions_count: 1,
+                ..Default::default()
+            },
+        );
+        snapshot.bucket_sizes.insert(bucket.to_string(), 42);
+        snapshot.calculate_totals();
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("store a stale bucket-usage baseline before the failed decommission");
+        let (old_snapshot, usage_owner) = store
+            .get_latest_accessible_object_info_with_idx(
+                RUSTFS_META_BUCKET,
+                crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str(),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("identify the pool holding the old usage baseline");
+        let mut pool_statuses = vec![prepared_pool_test_status(0, false), prepared_pool_test_status(1, false)];
+        pool_statuses[usage_owner].decommission = Some(PoolDecommissionInfo {
+            failed: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools: pool_statuses,
+            ..Default::default()
+        };
+        store
+            .handle_make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("a failed decommission must not block creation of an unrelated bucket");
+        store
+            .handle_get_bucket_info(bucket, &BucketOptions::default())
+            .await
+            .expect("the created bucket must be visible");
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("load the cleaned usage baseline");
+        assert!(!usage.buckets_usage.contains_key(bucket), "the new bucket must not inherit old usage");
+        assert_eq!(usage.scanner_cycle, Some(37), "namespace cleanup must not certify a new scan");
+        assert_eq!(usage.scanner_epoch, Some(2), "namespace cleanup must preserve the scanner authority");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (_, current_owner) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("read the new snapshot authority");
+        assert_ne!(current_owner, usage_owner, "cleanup must publish to a writable pool");
+        let retained_source = store.pools[usage_owner]
+            .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("decommission retains its original source for reconciliation");
+        assert_eq!(retained_source.etag, old_snapshot.etag);
+        let stale_update = store
+            .put_usage_snapshot_for_namespace_cleanup(
+                object,
+                old_snapshot.etag.as_deref(),
+                &mut PutObjReader::from_vec(b"stale snapshot".to_vec()),
+                None,
+            )
+            .await;
+        assert!(matches!(stale_update, Err(StorageError::PreconditionFailed)));
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("a stale source CAS must not replace the writable target");
+        assert!(!usage.buckets_usage.contains_key(bucket));
+        assert!(
+            store.scanner_data_usage_publication_blocked().await,
+            "scanner publication must remain fenced"
+        );
+    }
+
+    #[tokio::test]
+    async fn canceled_create_retains_usage_cleanup_namespace_owner() {
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+
+        let (_dirs, store) = multipool_version_test_store("cleanup-cancellation-existing").await;
+        let bucket = "cleanup-cancellation-new";
+        let mut snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        snapshot.buckets_usage.insert(
+            bucket.to_owned(),
+            rustfs_data_usage::BucketUsageInfo {
+                size: 42,
+                objects_count: 1,
+                versions_count: 1,
+                ..Default::default()
+            },
+        );
+        snapshot.bucket_sizes.insert(bucket.to_owned(), 42);
+        snapshot.calculate_totals();
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the stale namespace usage");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (_, source) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("find the source snapshot");
+        let mut pools = vec![prepared_pool_test_status(0, false), prepared_pool_test_status(1, false)];
+        pools[source].decommission = Some(PoolDecommissionInfo {
+            canceled: true,
+            ..Default::default()
+        });
+        *store.pool_meta.write().await = PoolMeta {
+            pools,
+            ..Default::default()
+        };
+        let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::AfterNamespace);
+        let create_store = store.clone();
+        let create = tokio::spawn(async move { create_store.handle_make_bucket(bucket, &MakeBucketOptions::default()).await });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("cleanup reaches its physical commit with the namespace held");
+        create.abort();
+        assert!(create.await.expect_err("the request waiter was canceled").is_cancelled());
+        let namespace = store
+            .new_ns_lock(bucket, bucket)
+            .await
+            .expect("open the bucket namespace lock");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), namespace.get_write_lock(Duration::from_secs(1)))
+                .await
+                .is_err(),
+            "cancellation must not release the namespace before its cleanup finishes"
+        );
+        barrier.release();
+        drop(barrier);
+        tokio::time::timeout(Duration::from_secs(10), store.handle_make_bucket(bucket, &MakeBucketOptions::default()))
+            .await
+            .expect("the resumed create must not remain blocked")
+            .expect("a new request resumes after the old cleanup releases its namespace");
+        let usage = crate::data_usage::load_data_usage_from_backend(store.clone())
+            .await
+            .expect("read the cleaned baseline");
+        assert!(!usage.buckets_usage.contains_key(bucket));
+        assert!(store.scanner_data_usage_publication_blocked().await);
+    }
+
+    #[tokio::test]
+    async fn usage_cleanup_rejects_an_unreadable_pool() {
+        let (_dirs, store) = multipool_version_test_store("cleanup-unreadable-pool").await;
+        let snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the usage baseline");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (before, source) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("find the baseline owner");
+        let unavailable = 1 - source;
+        for disk in store.pools[unavailable]
+            .get_disks_by_key(object)
+            .disks
+            .read()
+            .await
+            .iter()
+            .flatten()
+        {
+            disk.close().await.expect("stop disk health monitoring");
+            disk.force_offline_for_test();
+        }
+        let update = store
+            .put_usage_snapshot_for_namespace_cleanup(
+                object,
+                before.etag.as_deref(),
+                &mut PutObjReader::from_vec(b"unproven authority".to_vec()),
+                None,
+            )
+            .await;
+        assert!(update.is_err(), "an unreadable pool may hold a newer snapshot");
+        let after = store.pools[source]
+            .get_object_info(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("the readable baseline remains intact");
+        assert_eq!(after.etag, before.etag);
+    }
+
+    #[tokio::test]
+    async fn usage_cleanup_rejects_namespace_loss_before_physical_commit() {
+        use crate::set_disk::{PutObjectCommitBarrier, PutObjectCommitPause};
+        use rustfs_lock::{LocalClient, LockRequest, LockType, NamespaceLock, ObjectKey};
+
+        let (_dirs, store) = multipool_version_test_store("cleanup-fence-existing").await;
+        let snapshot = rustfs_data_usage::DataUsageInfo {
+            last_update: Some(std::time::SystemTime::now()),
+            usage_snapshot_complete: true,
+            ..Default::default()
+        };
+        crate::data_usage::store_data_usage_in_backend(snapshot, store.clone())
+            .await
+            .expect("seed the protected baseline");
+        let object = crate::data_usage::DATA_USAGE_OBJ_NAME_PATH.as_str();
+        let (before, _) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("read the baseline revision");
+        let ttl = Duration::from_secs(60);
+        let namespace = NamespaceLock::new("usage-cleanup-commit-fence".to_owned(), Arc::new(LocalClient::new()));
+        let request = LockRequest::new(ObjectKey::new("cleanup-fence-existing", ""), LockType::Exclusive, "usage-cleanup")
+            .with_acquire_timeout(Duration::from_secs(1))
+            .with_ttl(ttl)
+            .with_refresh_interval(ttl);
+        let guard = Arc::new(
+            namespace
+                .acquire_guard(&request)
+                .await
+                .expect("acquire the namespace lease")
+                .expect("namespace lease is available"),
+        );
+        let barrier = PutObjectCommitBarrier::install(RUSTFS_META_BUCKET, object, PutObjectCommitPause::AfterNamespace);
+        let update_store = store.clone();
+        let update_guard = guard.clone();
+        let revision = before.etag.clone();
+        let update = tokio::spawn(async move {
+            let _movement = update_store
+                .data_usage_namespace_cleanup_guard()
+                .await
+                .expect("admit the namespace-only update");
+            update_store
+                .put_usage_snapshot_for_namespace_cleanup(
+                    object,
+                    revision.as_deref(),
+                    &mut PutObjReader::from_vec(b"must not commit".to_vec()),
+                    Some(update_guard.as_ref()),
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), barrier.wait_until_paused())
+            .await
+            .expect("the update reaches its commit barrier");
+        tokio::time::pause();
+        tokio::time::advance(ttl + Duration::from_millis(1)).await;
+        assert!(guard.is_lock_lost(), "the parent namespace lease has expired");
+        tokio::time::resume();
+        barrier.release();
+        assert!(update.await.expect("the cleanup task completes").is_err());
+        let (after, _) = store
+            .get_latest_accessible_object_info_with_idx(RUSTFS_META_BUCKET, object, &ObjectOptions::default())
+            .await
+            .expect("the original baseline remains readable");
+        assert_eq!(after.etag, before.etag, "a lost namespace lease must fence the physical write");
     }
 
     async fn multipool_delete_test_store(bucket: &str, versioned: bool) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
@@ -11890,6 +12426,63 @@ mod tests {
         assert!(other.is_empty());
     }
 
+    struct SelectRangeLockBarrier {
+        bucket: String,
+        object: String,
+        reached: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    type SelectRangeBarriers = ParkingMutex<HashMap<(String, String), Arc<SelectRangeLockBarrier>>>;
+
+    fn select_range_barriers() -> &'static SelectRangeBarriers {
+        static BARRIERS: std::sync::OnceLock<SelectRangeBarriers> = std::sync::OnceLock::new();
+        BARRIERS.get_or_init(Default::default)
+    }
+
+    struct SelectRangeBarrierGuard(Arc<SelectRangeLockBarrier>);
+
+    impl SelectRangeBarrierGuard {
+        fn install(bucket: &str, object: &str) -> Self {
+            let barrier = Arc::new(SelectRangeLockBarrier {
+                bucket: bucket.to_owned(),
+                object: object.to_owned(),
+                reached: tokio::sync::Notify::new(),
+                release: tokio::sync::Notify::new(),
+            });
+            select_range_barriers()
+                .lock()
+                .insert((bucket.to_owned(), object.to_owned()), Arc::clone(&barrier));
+            Self(barrier)
+        }
+
+        async fn wait(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.0.reached.notified())
+                .await
+                .expect("range acquired its namespace locks");
+        }
+    }
+
+    impl Drop for SelectRangeBarrierGuard {
+        fn drop(&mut self) {
+            select_range_barriers()
+                .lock()
+                .remove(&(self.0.bucket.clone(), self.0.object.clone()));
+            self.0.release.notify_one();
+        }
+    }
+
+    pub(super) async fn pause_select_range_after_lock(bucket: &str, object: &str) {
+        let barrier = select_range_barriers()
+            .lock()
+            .get(&(bucket.to_owned(), object.to_owned()))
+            .cloned();
+        if let Some(barrier) = barrier {
+            barrier.reached.notify_one();
+            barrier.release.notified().await;
+        }
+    }
+
     async fn assert_prepared_reader_blocks_writer(store: &ECStore, bucket: &str, object: &str) {
         assert_pool_writer_is_blocked(store, 0, bucket, object).await;
     }
@@ -12030,76 +12623,175 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn select_snapshot_holds_namespace_lock_independent_of_get_optimization() {
-        temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true"))], async {
-            let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-            let store = new_prepared_reader_test_store(&[set_disks]).await;
-            let bucket = "select-snapshot-lock-lifetime";
-            let object = "object.bin";
-            let payload = b"select-snapshot-lock-lifetime-payload-".repeat(40_000);
-            let put_opts = ObjectOptions {
-                no_lock: true,
-                ..Default::default()
-            };
+    async fn select_snapshot_releases_namespace_locks_independent_of_get_optimization() {
+        for optimization in ["true", "false"] {
+            temp_env::async_with_vars([(rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some(optimization))], async {
+                let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
+                let store = Arc::new(new_prepared_reader_test_store(&[set_disks]).await);
+                let bucket = "select-snapshot-lock-lifetime";
+                let object = "object.bin";
+                let payload = b"select-snapshot-lock-lifetime-payload-".repeat(40_000);
+                let put_opts = ObjectOptions {
+                    no_lock: true,
+                    ..Default::default()
+                };
 
-            store.pools[0]
-                .make_bucket(bucket, &MakeBucketOptions::default())
-                .await
-                .expect("bucket should be created");
-            let mut put_reader = PutObjReader::from_vec(payload.clone());
-            store.pools[0]
-                .put_object(bucket, object, &mut put_reader, &put_opts)
-                .await
-                .expect("object should be written");
+                store.pools[0]
+                    .make_bucket(bucket, &MakeBucketOptions::default())
+                    .await
+                    .expect("bucket should be created");
+                let mut put_reader = PutObjReader::from_vec(payload.clone());
+                store.pools[0]
+                    .put_object(bucket, object, &mut put_reader, &put_opts)
+                    .await
+                    .expect("object should be written");
 
-            use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
-            let mut request_headers = HeaderMap::new();
-            request_headers.insert(SSEC_ALGORITHM_HEADER, "AES256".parse().expect("valid SSE-C algorithm header"));
-            request_headers.insert(SSEC_KEY_HEADER, "secret-key".parse().expect("valid SSE-C key header"));
-            request_headers.insert(SSEC_KEY_MD5_HEADER, "key-md5".parse().expect("valid SSE-C key digest header"));
-            request_headers.insert("authorization", "credential".parse().expect("valid authorization header"));
-            let snapshot = store
-                .prepare_select_object_snapshot(bucket, object, &request_headers, &ObjectOptions::default())
-                .await
-                .expect("SelectObjectContent snapshot should be prepared");
-            assert_eq!(snapshot.headers.len(), 3);
-            assert_eq!(snapshot.headers.get(SSEC_ALGORITHM_HEADER), request_headers.get(SSEC_ALGORITHM_HEADER));
-            assert_eq!(snapshot.headers.get(SSEC_KEY_HEADER), request_headers.get(SSEC_KEY_HEADER));
-            assert_eq!(snapshot.headers.get(SSEC_KEY_MD5_HEADER), request_headers.get(SSEC_KEY_MD5_HEADER));
-            assert!(snapshot.headers.get("authorization").is_none());
-            assert!(snapshot.headers.values().all(http::HeaderValue::is_sensitive));
-            assert!(!format!("{:?}", snapshot.headers).contains("secret-key"));
-            assert_eq!(
-                snapshot.logical_size(),
-                u64::try_from(payload.len()).expect("test payload length should fit in u64")
-            );
-            assert_eq!(
-                snapshot.object_info().size,
-                i64::try_from(payload.len()).expect("test payload length should fit in i64")
-            );
-            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+                use rustfs_utils::http::headers::{SSEC_ALGORITHM_HEADER, SSEC_KEY_HEADER, SSEC_KEY_MD5_HEADER};
+                let mut request_headers = HeaderMap::new();
+                request_headers.insert(SSEC_ALGORITHM_HEADER, "AES256".parse().expect("valid SSE-C algorithm header"));
+                request_headers.insert(SSEC_KEY_HEADER, "secret-key".parse().expect("valid SSE-C key header"));
+                request_headers.insert(SSEC_KEY_MD5_HEADER, "key-md5".parse().expect("valid SSE-C key digest header"));
+                request_headers.insert("authorization", "credential".parse().expect("valid authorization header"));
+                let snapshot = store
+                    .prepare_select_object_snapshot(bucket, object, &request_headers, &ObjectOptions::default())
+                    .await
+                    .expect("SelectObjectContent snapshot should be prepared");
+                assert_eq!(snapshot.headers.len(), 3);
+                assert_eq!(snapshot.headers.get(SSEC_ALGORITHM_HEADER), request_headers.get(SSEC_ALGORITHM_HEADER));
+                assert_eq!(snapshot.headers.get(SSEC_KEY_HEADER), request_headers.get(SSEC_KEY_HEADER));
+                assert_eq!(snapshot.headers.get(SSEC_KEY_MD5_HEADER), request_headers.get(SSEC_KEY_MD5_HEADER));
+                assert!(snapshot.headers.get("authorization").is_none());
+                assert!(snapshot.headers.values().all(http::HeaderValue::is_sensitive));
+                assert!(!format!("{:?}", snapshot.headers).contains("secret-key"));
+                assert_eq!(
+                    snapshot.logical_size(),
+                    u64::try_from(payload.len()).expect("test payload length should fit in u64")
+                );
+                assert_eq!(
+                    snapshot.object_info().size,
+                    i64::try_from(payload.len()).expect("test payload length should fit in i64")
+                );
+                drop(acquire_prepared_reader_writer(&store, bucket, object).await);
 
-            let mut reader = snapshot.open_reader(None).await.expect("snapshot reader should open");
-            let mut restored = Vec::new();
-            reader
-                .stream
-                .read_to_end(&mut restored)
-                .await
-                .expect("snapshot body should stream");
-            assert_eq!(restored, payload);
-            drop(reader);
-            assert_prepared_reader_blocks_writer(&store, bucket, object).await;
+                let mut reader = snapshot.open_reader(None).await.expect("snapshot reader should open");
+                let mut restored = Vec::new();
+                reader
+                    .stream
+                    .read_to_end(&mut restored)
+                    .await
+                    .expect("snapshot body should stream");
+                assert_eq!(restored, payload);
+                drop(reader);
+                drop(acquire_prepared_reader_writer(&store, bucket, object).await);
 
-            drop(snapshot);
-            drop(acquire_prepared_reader_writer(&store, bucket, object).await);
-        })
+                let mut unread = snapshot.open_reader(None).await.expect("unread SELECT range");
+                let mut replacement = PutObjReader::from_vec(vec![b'z'; payload.len()]);
+                tokio::time::timeout(
+                    Duration::from_secs(10),
+                    store.pools[0].put_object(bucket, object, &mut replacement, &ObjectOptions::default()),
+                )
+                .await
+                .expect("unread SELECT cannot block an overwrite")
+                .expect("overwrite");
+                let mut old_bytes = Vec::new();
+                match unread.stream.read_to_end(&mut old_bytes).await {
+                    Ok(_) => assert_eq!(old_bytes, payload, "an opened range must never switch generations"),
+                    Err(_) => assert!(payload.starts_with(&old_bytes), "failed reads may emit only original bytes"),
+                }
+                assert!(matches!(
+                    snapshot.open_reader(None).await,
+                    Err(SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged))
+                ));
+                assert!(
+                    snapshot.ensure_valid().is_err(),
+                    "consistency failure prevents successful terminal events"
+                );
+                drop(snapshot);
+                drop(acquire_prepared_reader_writer(&store, bucket, object).await);
+            })
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial(body_cache_hook)]
+    async fn select_snapshot_lazy_multipart_reader_never_switches_to_replacement_parts() {
+        use crate::storage_api_contracts::multipart::{CompletePart, MultipartOperations};
+        temp_env::async_with_vars(
+            [
+                ("RUSTFS_GET_CODEC_STREAMING_ENABLE", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_BODY_COMPAT_CONFIRMED", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_HEADER_COMPAT_CONFIRMED", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_ROLLOUT", Some("on")),
+                ("RUSTFS_GET_CODEC_STREAMING_MULTIPART_ENABLE", Some("true")),
+                ("RUSTFS_GET_CODEC_STREAMING_MIN_SIZE", Some("1")),
+                (rustfs_config::ENV_OBJECT_LOCK_OPTIMIZATION_ENABLE, Some("true")),
+            ],
+            async {
+                let (_dirs, set) = make_local_set_disks(4, 2).await;
+                let store = Arc::new(new_prepared_reader_test_store(&[Arc::clone(&set)]).await);
+                let bucket = "select-lazy-multipart-generation";
+                let object = "multipart.bin";
+                set.make_bucket(bucket, &MakeBucketOptions::default()).await.expect("bucket");
+                let opts = ObjectOptions::default();
+                let upload = set.new_multipart_upload(bucket, object, &opts).await.expect("upload");
+                let mut expected = Vec::new();
+                let mut parts = Vec::new();
+                for (number, length, byte) in [(1, 5 * 1024 * 1024, b'a'), (2, 1024, b'b')] {
+                    let bytes = vec![byte; length];
+                    expected.extend_from_slice(&bytes);
+                    let mut body = PutObjReader::from_vec(bytes);
+                    let part = set
+                        .put_object_part(bucket, object, &upload.upload_id, number, &mut body, &opts)
+                        .await
+                        .expect("part");
+                    parts.push(CompletePart {
+                        part_num: number,
+                        etag: part.etag,
+                        ..Default::default()
+                    });
+                }
+                Arc::clone(&set)
+                    .complete_multipart_upload(bucket, object, &upload.upload_id, parts, &opts)
+                    .await
+                    .expect("complete upload");
+                let snapshot = store
+                    .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &opts)
+                    .await
+                    .expect("snapshot");
+                crate::set_disk::reset_test_get_object_reader_path();
+                let mut reader = snapshot.open_reader(None).await.expect("lazy multipart reader");
+                assert_eq!(
+                    crate::set_disk::test_get_object_reader_path_id(),
+                    5,
+                    "exercise codec streaming rather than a materialized read"
+                );
+                let mut first = [0u8; 1];
+                reader.stream.read_exact(&mut first).await.expect("first original byte");
+                assert_eq!(first, [b'a']);
+                let mut replacement = PutObjReader::from_vec(vec![b'z'; expected.len()]);
+                tokio::time::timeout(Duration::from_secs(10), set.put_object(bucket, object, &mut replacement, &opts))
+                    .await
+                    .expect("unread parts cannot block overwrite")
+                    .expect("overwrite");
+                let mut body = first.to_vec();
+                match reader.stream.read_to_end(&mut body).await {
+                    Ok(_) => assert_eq!(body, expected, "all successful bytes belong to the original MPU"),
+                    Err(_) => assert!(expected.starts_with(&body), "even a failed stream cannot contain replacement bytes"),
+                }
+                assert!(matches!(
+                    snapshot.open_reader(None).await,
+                    Err(SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged))
+                ));
+            },
+        )
         .await;
     }
 
     #[tokio::test]
     async fn select_snapshot_identity_compares_encoded_directory_object_key() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let store = Arc::new(new_prepared_reader_test_store(&[set_disks]).await);
         let bucket = "select-snapshot-directory-identity";
         let source_object = "source.bin";
 
@@ -12133,9 +12825,9 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn select_snapshot_reuses_initial_metadata_fanout_for_first_reader() {
+    async fn select_snapshot_revalidates_initial_metadata_before_first_reader() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[set_disks]).await;
+        let store = Arc::new(new_prepared_reader_test_store(&[set_disks]).await);
         let bucket = "select-snapshot-initial-metadata";
         let object = "initial-metadata.bin";
         let payload = b"select snapshot initial metadata".repeat(4_000);
@@ -12168,8 +12860,8 @@ mod tests {
         let mut reader = snapshot.open_reader(None).await.expect("first snapshot reader should open");
         assert_eq!(
             calls.total(disk_call_counters::KIND_READ_VERSION),
-            4,
-            "first reader should consume the metadata captured during preparation"
+            8,
+            "first reader must revalidate metadata after preparation released its locks"
         );
         let mut restored = Vec::new();
         reader
@@ -12184,7 +12876,7 @@ mod tests {
     #[serial_test::serial(body_cache_hook)]
     async fn select_snapshot_rejects_identity_change_before_second_reader() {
         let (_dirs, set_disks) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[Arc::clone(&set_disks)]).await;
+        let store = Arc::new(new_prepared_reader_test_store(&[Arc::clone(&set_disks)]).await);
         let bucket = "select-snapshot-identity-change";
         let object = "identity-change.bin";
         let no_lock_opts = ObjectOptions {
@@ -12201,7 +12893,7 @@ mod tests {
             .put_object(bucket, object, &mut initial_reader, &no_lock_opts)
             .await
             .expect("initial generation should be written");
-        let mut snapshot = store
+        let snapshot = store
             .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
             .await
             .expect("snapshot should be prepared");
@@ -12211,13 +12903,12 @@ mod tests {
                 .await
                 .expect("first snapshot reader should consume captured metadata"),
         );
-        snapshot.opts.metadata_cache_safe = false;
 
         let mut replacement_reader = PutObjReader::from_vec(b"replacement generation".to_vec());
         set_disks
-            .put_object(bucket, object, &mut replacement_reader, &no_lock_opts)
+            .put_object(bucket, object, &mut replacement_reader, &ObjectOptions::default())
             .await
-            .expect("test-only no-lock write should replace the object");
+            .expect("normal writer should replace the object while the snapshot is idle");
         let error = match snapshot.open_reader(None).await {
             Ok(_) => panic!("a later reader must reject the replacement generation"),
             Err(error) => error,
@@ -12234,7 +12925,8 @@ mod tests {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_first_dirs, first_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
         let (_second_dirs, second_set) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
-        let store = new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await;
+        let store =
+            Arc::new(new_prepared_reader_test_store_with_ctx(&[Arc::clone(&first_set), Arc::clone(&second_set)], ctx).await);
         let bucket = "select-snapshot-latest-delete-marker";
         let object = "versioned-object.bin";
         let versioned_opts = ObjectOptions {
@@ -12287,7 +12979,7 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(storage_class_env)]
-    async fn select_snapshot_blocks_store_delete_for_object_in_nonzero_set() {
+    async fn select_snapshot_allows_store_delete_for_object_in_nonzero_set() {
         let ctx = Arc::new(crate::runtime::instance::InstanceContext::new());
         let (_dirs, sets) = make_local_two_set_sets_with_ctx(Arc::clone(&ctx)).await;
         ctx.update_erasure_type(SetupType::DistErasure).await;
@@ -12327,37 +13019,35 @@ mod tests {
             sets.disk_set[1].lockers.clone(),
             2,
         );
-        let writer_error = hashed_set_writer
+        let writer_guard = hashed_set_writer
             .get_write_lock(
                 rustfs_lock::ObjectKey::new(bucket, object.as_str()),
                 "competing-hashed-set-writer",
                 Duration::from_millis(50),
             )
             .await
-            .expect_err("Select must hold the nonzero hashed-set read lock");
-        assert!(matches!(writer_error, rustfs_lock::LockError::Timeout { .. }));
+            .expect("idle Select must release the nonzero hashed-set read lock");
+        drop(writer_guard);
         let barrier = DeleteAfterObjectLockSnapshotBarrier::install(bucket);
         let delete_store = Arc::clone(&store);
         let delete_object = object.clone();
-        let mut delete = tokio::spawn(async move {
+        let delete = tokio::spawn(async move {
             delete_store
                 .delete_object(bucket, &delete_object, ObjectOptions::default())
                 .await
         });
         barrier.wait_until_paused().await;
         barrier.release();
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut delete).await.is_err(),
-            "store DELETE must wait for the fixed-domain Select read lock"
-        );
-
-        drop(snapshot);
         let deleted = tokio::time::timeout(Duration::from_secs(10), delete)
             .await
-            .expect("DELETE should resume after the snapshot is dropped")
+            .expect("DELETE should complete while the snapshot remains alive")
             .expect("DELETE task should not panic")
             .expect("DELETE should complete");
         assert_eq!(deleted.name, object);
+        assert!(matches!(
+            snapshot.open_reader(None).await,
+            Err(SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged))
+        ));
     }
 
     #[tokio::test]
@@ -12367,7 +13057,7 @@ mod tests {
             rustfs_lock::GlobalLockManager::Disabled(rustfs_lock::DisabledLockManager::new()),
         )));
         let (_dirs, set_disks) = make_local_set_disks_with_ctx(4, 2, Arc::clone(&ctx)).await;
-        let store = new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await;
+        let store = Arc::new(new_prepared_reader_test_store_with_ctx(&[set_disks], ctx).await);
         let bucket = "select-snapshot-lock-disabled";
         let object = "object.bin";
         let mut put_reader = PutObjReader::from_vec(b"payload".to_vec());
@@ -12479,11 +13169,11 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial(body_cache_hook)]
-    async fn select_snapshot_reuses_metadata_across_three_pools() {
+    async fn select_snapshot_revalidates_metadata_across_three_pools() {
         let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
         let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
         let (_third_dirs, third_set) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[first_set, second_set, third_set]).await;
+        let store = Arc::new(new_prepared_reader_test_store(&[first_set, second_set, third_set]).await);
         let bucket = "select-snapshot-three-pools";
         let object = "object.bin";
         let payload = b"select-snapshot-three-pool-payload-".repeat(40_000);
@@ -12515,8 +13205,8 @@ mod tests {
         let mut reader = snapshot.open_reader(None).await.expect("snapshot body reader should open");
         assert_eq!(
             calls.total(disk_call_counters::KIND_READ_VERSION),
-            metadata_calls,
-            "SelectObjectContent must consume the prepared winner without a second fanout"
+            metadata_calls * 2,
+            "each range must select the authoritative winner across all pools"
         );
         let mut restored = Vec::new();
         reader
@@ -12525,6 +13215,18 @@ mod tests {
             .await
             .expect("snapshot body should stream");
         assert_eq!(restored, payload);
+
+        // A later authoritative winner can be in a different pool. Reopening
+        // only the initially selected pool would silently keep stale metadata.
+        let mut replacement = PutObjReader::from_vec(b"new-pool-winner".to_vec());
+        store.pools[0]
+            .put_object(bucket, object, &mut replacement, &ObjectOptions::default())
+            .await
+            .expect("normal overwrite in another pool");
+        assert!(matches!(
+            snapshot.open_reader(None).await,
+            Err(SelectObjectSnapshotReadError::Consistency(SnapshotConsistencyError::ObjectChanged))
+        ));
     }
 
     #[tokio::test]
@@ -12841,7 +13543,7 @@ mod tests {
     async fn select_snapshot_locks_the_hashed_set_in_every_pool() {
         let (_first_dirs, first_set) = make_local_set_disks(4, 2).await;
         let (_second_dirs, second_set) = make_local_set_disks(4, 2).await;
-        let store = new_prepared_reader_test_store(&[first_set, second_set]).await;
+        let store = Arc::new(new_prepared_reader_test_store(&[first_set, second_set]).await);
         let bucket = "select-snapshot-all-pools";
         let object = "object.bin";
         let payload = b"second-pool-snapshot".to_vec();
@@ -12865,10 +13567,21 @@ mod tests {
             .prepare_select_object_snapshot(bucket, object, &HeaderMap::new(), &ObjectOptions::default())
             .await
             .expect("snapshot should resolve the second-pool object");
+        drop(acquire_pool_writer(&store, 0, bucket, object).await);
+        drop(acquire_pool_writer(&store, 1, bucket, object).await);
+        let snapshot = Arc::new(snapshot);
+        let barrier = SelectRangeBarrierGuard::install(bucket, object);
+        let opening = tokio::spawn({
+            let snapshot = Arc::clone(&snapshot);
+            async move { snapshot.open_reader(None).await }
+        });
+        barrier.wait().await;
         assert_pool_writer_is_blocked(&store, 0, bucket, object).await;
         assert_pool_writer_is_blocked(&store, 1, bucket, object).await;
-
-        let mut reader = snapshot.open_reader(None).await.expect("snapshot reader should open");
+        drop(barrier);
+        let mut reader = opening.await.expect("range task").expect("range opens");
+        drop(acquire_pool_writer(&store, 0, bucket, object).await);
+        drop(acquire_pool_writer(&store, 1, bucket, object).await);
         let mut restored = Vec::new();
         reader
             .stream
@@ -12942,11 +13655,12 @@ mod tests {
         ];
         let mut opts = ObjectOptions::default();
 
-        let guards = store
+        let (guards, failures) = store
             .acquire_delete_objects_write_locks("bucket", &objects, &mut opts)
             .await
             .expect("delete object locks should be acquired");
 
+        assert!(failures.is_empty(), "uncontended keys must all lock: {failures:?}");
         assert_eq!(guards.len(), 2, "duplicate object names should share one namespace lock");
         assert!(opts.no_lock, "set layer should not reacquire locks already held by ECStore");
         assert!(
@@ -13576,5 +14290,131 @@ mod missing_key_delete_quorum_tests {
                 .expect("physical cleanup must eventually release the exact-key guard");
         })
         .await;
+    }
+}
+
+/// The bulk-delete lock rounds are batched and per key: one `lock_batch` wave
+/// per lock layer replaces one quorum round-trip per key, a locked-out key
+/// fails alone, and the rest of the batch proceeds (rustfs/backlog#3146).
+#[cfg(test)]
+mod batch_delete_lock_tests {
+    use super::*;
+    use crate::bucket::metadata_sys::{init_bucket_metadata_sys, test_support::isolated_store_over_temp_disks};
+    use crate::storage_api_contracts::bucket::{BucketOperations, MakeBucketOptions};
+
+    async fn seeded_store(bucket: &str) -> (Vec<tempfile::TempDir>, Arc<ECStore>) {
+        let (dirs, store) = isolated_store_over_temp_disks().await;
+        init_bucket_metadata_sys(store.clone(), Vec::new()).await;
+        store
+            .make_bucket(bucket, &MakeBucketOptions::default())
+            .await
+            .expect("fixture bucket");
+        for key in ["a-object", "b-object"] {
+            let mut reader = PutObjReader::from_vec(vec![0x53; 4096]);
+            store
+                .put_object(
+                    bucket,
+                    key,
+                    &mut reader,
+                    &ObjectOptions {
+                        write_completion: crate::object_api::WriteCompletion::TailDrained,
+                        ..Default::default()
+                    },
+                )
+                .await
+                .expect("seed object");
+        }
+        (dirs, store)
+    }
+
+    fn two_key_batch() -> Vec<ObjectToDelete> {
+        ["b-object", "a-object"]
+            .into_iter()
+            .map(|object_name| ObjectToDelete {
+                object_name: object_name.to_owned(),
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn uncontended_batch_deletes_every_key() {
+        let (_dirs, store) = seeded_store("lock-batch-success").await;
+
+        let (deleted, errors, _) = store
+            .delete_objects_with_tier_delete_journal_and_accounting(
+                "lock-batch-success",
+                two_key_batch(),
+                ObjectOptions::default(),
+            )
+            .await;
+        assert!(errors.iter().all(Option::is_none), "batch outcome: {errors:?}");
+        assert_eq!(deleted.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn contended_key_fails_alone_and_the_rest_of_the_batch_proceeds() {
+        let (_dirs, store) = seeded_store("lock-batch-partial").await;
+
+        // Hold one key's write lock: the batched round must fail that key
+        // alone (per-key outcome) while the other key still deletes.
+        let held = store
+            .acquire_object_write_lock("delete_objects", "lock-batch-partial", "a-object")
+            .await
+            .expect("hold contended key");
+        let (deleted, errors, _) = tokio::time::timeout(
+            Duration::from_secs(30),
+            store.delete_objects_with_tier_delete_journal_and_accounting(
+                "lock-batch-partial",
+                two_key_batch(),
+                ObjectOptions::default(),
+            ),
+        )
+        .await
+        .expect("per-key lock outcomes must not block the whole batch");
+
+        assert!(errors[1].is_some(), "contended a-object must fail alone: {errors:?}");
+        assert!(errors[0].is_none(), "b-object must proceed: {errors:?}");
+        assert!(deleted[1].object_name.is_empty(), "failed key must not report success");
+        assert_eq!(deleted[0].object_name, "b-object");
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn overlapping_batches_reach_per_key_order_without_deadlock() {
+        let (_dirs, store) = seeded_store("lock-batch-overlap").await;
+
+        let first = store.clone();
+        let second = store.clone();
+        let run = |store: Arc<ECStore>| {
+            tokio::spawn(async move {
+                store
+                    .delete_objects_with_tier_delete_journal_and_accounting(
+                        "lock-batch-overlap",
+                        two_key_batch(),
+                        ObjectOptions::default(),
+                    )
+                    .await
+            })
+        };
+        let first = run(first);
+        let second = run(second);
+
+        // Whatever mix of per-key lock outcomes the overlap produces, both
+        // batches must finish: the batched round is deadlock-free by
+        // construction (global key order at each lock server).
+        for batch in [first, second] {
+            let (_, errors, _) = tokio::time::timeout(Duration::from_secs(30), batch)
+                .await
+                .expect("overlapping batches must not deadlock")
+                .expect("delete task");
+            for error in errors.iter().flatten() {
+                let message = error.to_string();
+                assert!(
+                    message.contains("lock") || message.contains("Lock") || message.contains("namespace"),
+                    "overlap may only surface lock outcomes: {message}"
+                );
+            }
+        }
     }
 }

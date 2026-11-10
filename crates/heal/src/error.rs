@@ -58,7 +58,7 @@ pub enum Error {
     TaskExecutionFailed { message: String },
 
     /// Only the qualified MRF Deep check may produce this terminal result.
-    #[error("Heal task execution failed: Missing exact storage proof for durable MRF repair {target}")]
+    #[error("Independent verification unavailable for legacy object {target}; durable MRF responsibility retained")]
     LegacyMrfUnverified { target: String },
 
     #[error("Replacement failure could not be persisted: {failure}; persistence error: {persistence}")]
@@ -76,6 +76,9 @@ pub enum Error {
 
     #[error("Replacement target is not ready: {0}")]
     ReplacementTargetNotReady(String),
+
+    #[error("Replacement bucket namespace changed; a fresh identity-bound pass is required")]
+    ReplacementNamespaceChanged,
 
     #[error("replacement recovery retry budget exhausted")]
     ReplacementRetryBudgetExhausted,
@@ -126,6 +129,23 @@ impl Error {
     /// Create a transient skip error for retryable background heal checks.
     pub fn transient_skip(message: impl Into<String>) -> Self {
         Error::TransientSkip { message: message.into() }
+    }
+
+    /// S3 `SlowDown` ("Please reduce your request rate") is a rate signal.
+    /// Callers must cut their own concurrency instead of retrying at full speed.
+    pub(crate) fn is_slow_down(&self) -> bool {
+        match self {
+            Error::Storage(error) => matches!(
+                error,
+                EcstoreError::SlowDown | EcstoreError::TooManyOpenFiles | EcstoreError::DeleteRecoveryWorkLimit
+            ),
+            Error::Disk(error) => matches!(error, DiskError::TooManyOpenFiles),
+            Error::TransientSkip { message } | Error::Other(message) | Error::TaskExecutionFailed { message } => {
+                message.contains("Please reduce your request rate")
+            }
+            Error::Io(error) => error.kind() == std::io::ErrorKind::WouldBlock,
+            _ => false,
+        }
     }
 
     /// Whether a heal operation can be retried without changing its inputs.
@@ -215,9 +235,10 @@ pub(crate) fn classify_heal_error(error: &Error) -> HealErrorClass {
         Error::DanglingDeleteDeferred { retry_not_before } => HealErrorClass::DanglingGrace {
             retry_not_before: Some(*retry_not_before),
         },
-        Error::ReplacementTargetNotReady(_) | Error::TransientSkip { .. } | Error::BucketDiscoveryIncomplete => {
-            HealErrorClass::Transient
-        }
+        Error::ReplacementTargetNotReady(_)
+        | Error::ReplacementNamespaceChanged
+        | Error::TransientSkip { .. }
+        | Error::BucketDiscoveryIncomplete => HealErrorClass::Transient,
         Error::LegacyMrfUnverified { .. } => HealErrorClass::Permanent,
         Error::Storage(error) => classify_storage_error(error),
         Error::Disk(error) => classify_disk_error(error),
@@ -271,6 +292,7 @@ pub(crate) fn classify_storage_error(error: &EcstoreError) -> HealErrorClass {
         | EcstoreError::FaultyDisk
         | EcstoreError::FaultyRemoteDisk
         | EcstoreError::SlowDown
+        | EcstoreError::DeleteRecoveryWorkLimit
         | EcstoreError::OperationCanceled
         | EcstoreError::RemoteClientUnavailable(_) => HealErrorClass::Transient,
         _ if error.is_quorum_error() => HealErrorClass::Transient,
@@ -448,6 +470,22 @@ impl From<Error> for std::io::Error {
 mod tests {
     use super::Error;
     use crate::heal::{DiskError, EcstoreError};
+
+    #[test]
+    fn slow_down_is_a_rate_signal_across_wrapped_shapes() {
+        assert!(Error::Storage(EcstoreError::SlowDown).is_slow_down());
+        assert!(Error::Storage(EcstoreError::TooManyOpenFiles).is_slow_down());
+        assert!(Error::Disk(DiskError::TooManyOpenFiles).is_slow_down());
+        assert!(Error::transient_skip("Please reduce your request rate").is_slow_down());
+        assert!(
+            Error::TaskExecutionFailed {
+                message: "Failed to recreate missing object b/o: Storage error: Please reduce your request rate".to_owned(),
+            }
+            .is_slow_down()
+        );
+        assert!(!Error::Storage(EcstoreError::FileNotFound).is_slow_down());
+        assert!(!Error::transient_skip("DiskNotFound").is_slow_down());
+    }
 
     #[test]
     fn pool_metadata_failures_keep_their_typed_recovery_classification() {

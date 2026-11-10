@@ -20,7 +20,7 @@ const ARN_PARTITION_RUSTFS: &str = "rustfs";
 const ARN_SERVICE_IAM: &str = "iam";
 const ARN_RESOURCE_TYPE_ROLE: &str = "role";
 
-#[derive(Debug, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct ARN {
     pub partition: String,
     pub service: String,

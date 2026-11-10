@@ -29,8 +29,9 @@ use super::storage_api::object_usecase::access::{
 #[cfg(test)]
 use super::storage_api::object_usecase::bucket::quota::BucketQuota;
 use super::storage_api::object_usecase::bucket::quota::checker::QuotaChecker;
+use super::storage_api::object_usecase::bucket::replication::ReplicationState;
 #[cfg(test)]
-use super::storage_api::object_usecase::bucket::replication::{ReplicationState, replication_statuses_map};
+use super::storage_api::object_usecase::bucket::replication::replication_statuses_map;
 use super::storage_api::object_usecase::bucket::{
     VersioningConfigExt as _,
     lifecycle::{
@@ -49,10 +50,11 @@ use super::storage_api::object_usecase::bucket::{
     replication::{
         DeleteReplicationConfigSnapshot, REPLICATE_INCOMING_DELETE, ReplicationStatusType, commit_force_delete_intent,
         delete_replication_state_from_config, delete_replication_version_id, deleted_object_has_pending_replication_delete,
-        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, load_delete_config_snapshot,
-        must_replicate_object, persist_force_delete_intent, record_replication_proxy, schedule_object_replication,
-        schedule_replication_delete, schedule_replication_deletes, set_deleted_object_replication_state,
-        should_schedule_delete_replication, should_use_existing_delete_replication_info,
+        force_delete_target_set, get_read_proxy_targets, has_active_delete_rule, has_site_replication_shaped_rule,
+        load_delete_config_snapshot, must_replicate_object, persist_force_delete_intent, record_replication_proxy,
+        replica_delete_fanout_state_from_config, schedule_object_replication, schedule_replication_delete,
+        schedule_replication_deletes, set_deleted_object_replication_state, should_schedule_delete_replication,
+        should_use_existing_delete_replication_info,
     },
     tagging::decode_tags,
     validate_restore_request,
@@ -79,7 +81,9 @@ use super::storage_api::object_usecase::error::{
     Error as EcstoreError, StorageError, is_err_bucket_not_found, is_err_object_not_found, is_err_version_not_found,
 };
 use super::storage_api::object_usecase::head_prefix::{head_prefix_not_found_message, probe_prefix_has_children};
-use super::storage_api::object_usecase::helper::{OperationHelper, build_event_resp_elements, spawn_background_with_context};
+use super::storage_api::object_usecase::helper::{
+    OperationHelper, build_event_resp_elements, run_owned_mutation, spawn_background_with_context,
+};
 use super::storage_api::object_usecase::io::{DynReader, HashReader, WritePlan, compression_metadata_value, wrap_reader};
 #[cfg(test)]
 use super::storage_api::object_usecase::object_cache::GetObjectBodySource;
@@ -114,8 +118,9 @@ pub(crate) use super::storage_api::object_usecase::{
 use super::storage_api::object_usecase::{ECStore, OldCurrentSize};
 use super::storage_api::object_usecase::{
     RFC1123, check_preconditions, parse_object_lock_legal_hold, parse_object_lock_retention, parse_part_number_i32_to_usize,
-    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_object_key,
-    validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read, wrap_response_with_cors,
+    remove_object_lock_metadata_for_copy, strip_managed_encryption_metadata, validate_bucket_exists, validate_new_object_key,
+    validate_object_key, validate_sse_headers_for_read, validate_sse_headers_for_write, validate_ssec_for_read,
+    wrap_response_with_cors,
 };
 use crate::app::runtime_sources::{
     AppContext, current_app_context, current_notify_interface_for_context, current_object_data_cache_for_context,
@@ -181,7 +186,7 @@ use s3s::dto::{
     WebsiteRedirectLocation,
 };
 use s3s::header::X_AMZ_RESTORE;
-use s3s::stream::{ByteStream, DynByteStream, RemainingLength};
+use s3s::stream::{ByteStream, RemainingLength};
 use s3s::{S3Error, S3ErrorCode, S3Request, S3Response, S3Result, s3_error};
 
 fn object_s3_error(code: S3ErrorCode, message: impl Into<std::borrow::Cow<'static, str>>) -> S3Error {
@@ -234,7 +239,7 @@ pub(crate) use self::on_demand_migration_put::*;
 #[cfg(test)]
 pub(crate) use self::put::PollCountingBody;
 use self::put::*;
-pub(crate) use self::put::{guard_put_object_body_read_timeout, put_object_body_read_timeout, reject_oversize_single_upload};
+pub(crate) use self::put::{previous_current_size_from_backfill, put_object_body_read_timeout, reject_oversize_single_upload};
 #[cfg(test)]
 pub(crate) use self::restore::RestoreStatusCommitBarrier;
 pub(crate) use self::shared::*;

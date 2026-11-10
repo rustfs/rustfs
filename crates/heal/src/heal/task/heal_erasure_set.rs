@@ -247,7 +247,12 @@ impl HealTask {
             *self.replacement_resume_disk.write().await = Some(disk.clone());
             let state = manager.get_state().await;
             self.replacement_start_retry_count.store(state.retry_count, Ordering::Release);
-            buckets = state.replacement_buckets;
+            buckets = if state.completed {
+                state.replacement_buckets
+            } else {
+                self.await_with_control(manager.prepare_replacement_bucket_pass(self.storage.as_ref()))
+                    .await?
+            };
             Some((disk, manager, identities))
         } else {
             None
@@ -478,14 +483,31 @@ impl HealTask {
                 self.verify_replacement_identity_fence(expected_identities, &set_disk_id, "bucket prepass")
                     .await?;
             }
+            let expected = if let Some((_, manager, _)) = replacement_resume.as_ref() {
+                Some(manager.replacement_bucket_incarnation(bucket).await?)
+            } else {
+                None
+            };
             let heal_result = self
-                .await_with_control(self.storage.heal_bucket(bucket, &bucket_heal_opts))
+                .await_with_control(async {
+                    match expected {
+                        Some(id) => self.storage.heal_bucket_at_incarnation(bucket, id, &bucket_heal_opts).await,
+                        None => self.storage.heal_bucket(bucket, &bucket_heal_opts).await,
+                    }
+                })
                 .await;
             match heal_result {
                 Ok(result) => {
                     self.record_result_item(result).await;
                 }
                 Err(err) => {
+                    // Cancellation and timeout keep their classification; only
+                    // a storage failure may be reclassified as a namespace change.
+                    if let Some((_, manager, _)) = replacement_resume.as_ref()
+                        && !matches!(err, Error::TaskCancelled | Error::TaskTimeout)
+                    {
+                        manager.verify_replacement_bucket_pass(self.storage.as_ref()).await?;
+                    }
                     warn!(
                         target: "rustfs::heal::task",
                         event = EVENT_HEAL_ERASURE_SET_RESULT,
@@ -505,7 +527,7 @@ impl HealTask {
             if let Some(result) = self
                 .await_with_control(
                     self.storage
-                        .recover_delete_transactions(bucket, None, None, &bucket_heal_opts),
+                        .recover_delete_transactions(bucket, None, expected, &bucket_heal_opts),
                 )
                 .await?
             {

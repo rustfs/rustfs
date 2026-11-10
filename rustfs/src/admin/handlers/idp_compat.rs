@@ -48,7 +48,7 @@ use crate::admin::router::{AdminOperation, Operation, S3Router};
 use crate::admin::runtime_sources::{current_app_context, current_ready_iam_handle, current_server_config_for_context};
 use crate::admin::utils::is_compat_admin_request;
 use crate::auth::{check_key_valid, get_session_token};
-use crate::server::{ADMIN_PREFIX, RemoteAddr};
+use crate::server::ADMIN_PREFIX;
 use http::StatusCode;
 use hyper::Method;
 use matchit::Params;
@@ -981,7 +981,7 @@ async fn authorize_action(req: &S3Request<Body>, cred: &StoredCredentials, owner
         owner,
         false,
         vec![Action::AdminAction(action)],
-        req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+        crate::admin::auth::policy_source_addr(&req.extensions),
     )
     .await
 }

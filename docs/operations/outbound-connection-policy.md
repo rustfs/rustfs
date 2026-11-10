@@ -22,7 +22,7 @@ RustFS validates every operator-configured outbound destination to close a serve
 | On-demand migration sources | Literal check, relaxed | Same guard and same escape hatch as replication targets (see below) |
 | Site replication peers | Literal check | `rustfs/src/site_replication/mod.rs` |
 | Self-hosted tiering warm backends (S3, MinIO, RustFS) | Literal check, relaxed | `validate_outbound_url_allow_private` allows private storage addresses except known IPv6 metadata addresses; RustFS retains its own debug-only loopback exception |
-| Cloud tiering warm backends (Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`; Wasabi additionally requires its canonical provider endpoint before using the S3 constructor |
+| Cloud tiering warm backends (Azure, GCS, Aliyun, Tencent, Huawei, R2) | Literal check | `crates/ecstore/src/services/tier/warm_backend.rs` `validate_endpoint`, or the direct literal check in `warm_backend_azure_blob.rs` for native Azure; Wasabi additionally requires its canonical provider endpoint before using the S3 constructor |
 | Keystone `auth_url` | Literal check | `crates/keystone/src/config.rs` |
 
 The allowlist affects only the "Full policy" rows. A literal-check subsystem rejects a hostname that is itself a restricted IP literal, does not re-check what a hostname resolves to, and cannot be widened by `RUSTFS_OUTBOUND_ALLOW_ORIGINS`.

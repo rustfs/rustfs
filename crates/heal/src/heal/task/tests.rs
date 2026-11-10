@@ -1056,6 +1056,7 @@ async fn automatic_replacement_uses_target_scoped_format() {
     let temp = TempDir::new().expect("temporary resume disk directory should be created");
     let disk = make_resume_disk(&temp).await;
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         resume_disk: Mutex::new(Some(disk.clone())),
         ..Default::default()
@@ -1264,6 +1265,7 @@ async fn automatic_replacement_rejects_a_new_identity_after_format() {
     let first_identity = replacement_identity("replacement-a", "device-a", "filesystem-a");
     let second_identity = replacement_identity("replacement-a", "device-b", "filesystem-b");
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([
             vec![first_identity.clone()],
@@ -1330,6 +1332,7 @@ async fn automatic_replacement_reuses_an_existing_non_target_resume_anchor() {
     .await
     .expect("existing intent should be stored on the non-target anchor");
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_resume_disk: Mutex::new(Some(anchor.clone())),
         ..Default::default()
@@ -1658,6 +1661,7 @@ async fn verified_recovery_keeps_state_when_marker_clear_fails() {
 struct MockStorage {
     retry_test_pages: Option<Vec<Vec<HealListItem>>>,
     retry_test_delays: HashMap<String, Duration>,
+    retry_test_success_delays: HashMap<String, Duration>,
     retry_test_listing_delays: Mutex<VecDeque<Duration>>,
     retry_test_events: Mutex<Vec<String>>,
     listed: Mutex<bool>,
@@ -2657,6 +2661,9 @@ impl HealStorageAPI for MockStorage {
         if object == "object-dir/" {
             return Ok((HealResultItem::default(), Some(Error::Disk(DiskError::FileNotFound))));
         }
+        if let Some(delay) = self.retry_test_success_delays.get(object) {
+            tokio::time::sleep(*delay).await;
+        }
         self.healed_objects.lock().unwrap().push(object.to_string());
         if let Some(bucket_incarnation_id) = self.bucket_incarnation_after_object_heal.lock().unwrap().take() {
             *self.bucket_incarnation_id.lock().unwrap() = Some(bucket_incarnation_id);
@@ -2998,6 +3005,7 @@ async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_pers
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
         replacement_execution_fixture: Mutex::new(Some(execution)),
@@ -3012,7 +3020,9 @@ async fn replacement_dropped_waiter_keeps_executor_until_format_and_failure_pers
         let task = task.clone();
         async move { task.execute().await }
     });
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("owned format I/O must start");
     waiter.abort();
     assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
     task.cancel_token.cancel();
@@ -3122,6 +3132,7 @@ async fn replacement_format_failures_keep_the_durable_budget_across_new_executor
     request.heal_endpoints = vec!["replacement-a".to_string()];
     for _attempt in 1..=3 {
         let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
             replacement_target_identities_ready: Mutex::new(true),
             resume_disk: Mutex::new(Some(disk.clone())),
             format_error: Mutex::new(Some(Error::other("injected format failure"))),
@@ -3275,6 +3286,29 @@ async fn durable_mrf_unverified_object_names_cannot_change_retry_classification(
 }
 
 #[tokio::test]
+async fn mrf_legacy_verification_pending_is_a_completed_unverified_attempt() {
+    let (task, _) = mrf_task_for_item("legacy-pending", healthy_legacy_heal_item());
+    let error = task.execute().await.expect_err("unverified result must retain MRF ownership");
+    assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
+    assert!(!error.is_recoverable_heal());
+    assert_eq!(task.get_status().await, HealTaskStatus::Completed);
+    let outcome = task.get_outcome().await;
+    assert_eq!(outcome.execution, HealExecutionOutcome::Completed);
+    assert_eq!(outcome.counters.unknown, 1);
+    assert_eq!(outcome.counters.failed, 0);
+    assert_eq!(outcome.counters.healed, 0);
+    assert_eq!(outcome.counters.unchanged, 0);
+    assert!(matches!(outcome.objects[0].disposition, HealObjectDisposition::Unknown));
+    let (status, detail) = outcome.legacy_status("finished", None);
+    assert_eq!(status, "finished");
+    assert!(
+        detail
+            .expect("visible unverified result")
+            .contains("authoritative storage proof is unavailable")
+    );
+}
+
+#[tokio::test]
 async fn mrf_legacy_object_names_cannot_change_retry_classification() {
     for object in [
         "ordinary",
@@ -3293,7 +3327,9 @@ async fn mrf_legacy_object_names_cannot_change_retry_classification() {
         assert!(matches!(error, Error::LegacyMrfUnverified { .. }));
         assert_eq!(
             error.to_string(),
-            format!("Heal task execution failed: Missing exact storage proof for durable MRF repair bucket-a/{object}")
+            format!(
+                "Independent verification unavailable for legacy object bucket-a/{object}; durable MRF responsibility retained"
+            )
         );
     }
 }
@@ -3351,11 +3387,14 @@ async fn mrf_legacy_pause_requires_storage_owned_healthy_deep_result() {
         let outcome = task.get_outcome().await;
         assert_eq!(outcome.counters.healed, 0);
         if case == "qualified" {
+            assert_eq!(task.get_status().await, HealTaskStatus::Completed);
             assert_eq!(outcome.counters.unknown, 1);
             assert_eq!(outcome.objects[0].detail.as_deref(), Some("updated diagnostic wording"));
             let opts = storage.object_heal_opts.lock().expect("storage options");
             assert_eq!(opts.len(), 1);
             assert_eq!(opts[0].scan_mode, HealScanMode::Deep);
+        } else {
+            assert!(matches!(task.get_status().await, HealTaskStatus::Failed { .. }), "case={case}");
         }
     }
 }
@@ -3375,8 +3414,65 @@ async fn durable_mrf_heal_rejects_a_recreated_bucket_before_storage_heal() {
 
     let result = task.heal_object("bucket", "object", None).await;
 
-    assert!(matches!(result, Err(Error::TaskExecutionFailed { .. })));
+    assert!(matches!(
+        result,
+        Err(Error::StaleBucketIncarnation { expected: Some(id), .. }) if id == original_incarnation
+    ));
     assert!(storage.heal_object_calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_mrf_stale_incarnation_object_name_cannot_change_retry_classification() {
+    for object in ["timed out", "network error", "ordinary"] {
+        let original_incarnation = Uuid::new_v4();
+        let recreated_incarnation = Uuid::new_v4();
+        let storage = Arc::new(MockStorage {
+            bucket_incarnation_id: Mutex::new(Some(recreated_incarnation)),
+            ..Default::default()
+        });
+        let mut request = HealRequest::object("bucket".to_owned(), object.to_owned(), None);
+        request.source = HealRequestSource::Mrf;
+        request.expected_mrf_bucket_incarnation_id = Some(original_incarnation);
+        request.options.pool_index = Some(0);
+        request.options.set_index = Some(1);
+        let task = HealTask::from_request(request, storage.clone());
+
+        let error = task
+            .execute()
+            .await
+            .expect_err("a recreated bucket must reject the old MRF responsibility");
+        assert!(
+            !error.is_recoverable_heal(),
+            "user-controlled object names must not make a stale incarnation retryable: {object}"
+        );
+        assert!(
+            matches!(
+                &error,
+                Error::StaleBucketIncarnation { bucket, expected }
+                    if bucket == "bucket" && *expected == Some(original_incarnation)
+            ),
+            "the failure must retain the original bucket incarnation: {error:?}"
+        );
+        assert!(
+            matches!(crate::error::classify_heal_error(&error), crate::error::HealErrorClass::Aborted),
+            "stale responsibility must be classified independently of the object name"
+        );
+        assert!(
+            storage.heal_object_calls.lock().expect("object heal calls").is_empty(),
+            "an old responsibility must not reach storage repair in the recreated bucket"
+        );
+        let outcome = task.get_outcome().await;
+        assert_eq!(outcome.counters.healed, 0, "a stale task cannot claim a repair");
+        assert!(
+            outcome.objects.iter().all(|item| !matches!(
+                &item.disposition,
+                HealObjectDisposition::Repaired
+                    | HealObjectDisposition::VerifiedHealthy
+                    | HealObjectDisposition::AuthoritativelyAbsent
+            )),
+            "the stale task must not produce a positive repair proof"
+        );
+    }
 }
 
 #[tokio::test(start_paused = true)]
@@ -5626,6 +5722,7 @@ async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_
     let entered = Arc::new(tokio::sync::Notify::new());
     let release = Arc::new(tokio::sync::Notify::new());
     let storage = Arc::new(MockStorage {
+        bucket_incarnation_id: Mutex::new(Some(Uuid::from_u128(1))),
         replacement_target_identities_ready: Mutex::new(true),
         replacement_target_identity_sequences: Mutex::new(VecDeque::from([vec![identity.clone()], vec![identity]])),
         replacement_execution_fixture: Mutex::new(Some(execution)),
@@ -5642,7 +5739,9 @@ async fn replacement_owned_executor_keeps_manager_drain_pending_through_failure_
         let task = task.clone();
         async move { task.execute_owned(Some(parent)).await }
     });
-    entered.notified().await;
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("owned format I/O must start");
     waiter.abort();
     assert!(waiter.await.expect_err("waiter aborted").is_cancelled());
     task.cancel_token.cancel();

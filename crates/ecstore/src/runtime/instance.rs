@@ -58,7 +58,7 @@ use std::sync::{
     Arc, OnceLock,
     atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
 };
-use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, RwLock};
+use tokio::sync::{Mutex, Notify, OnceCell, OwnedRwLockReadGuard, OwnedSemaphorePermit, RwLock, Semaphore};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
@@ -187,6 +187,38 @@ impl DecommissionCountLedger {
     }
 }
 
+#[derive(Debug)]
+struct ListReadBudget {
+    permits: Arc<Semaphore>,
+    capacity: usize,
+}
+
+impl ListReadBudget {
+    fn new(capacity: usize) -> Self {
+        let capacity = capacity
+            .min(Semaphore::MAX_PERMITS)
+            .min(usize::try_from(u32::MAX).unwrap_or(usize::MAX));
+        Self {
+            permits: Arc::new(Semaphore::new(capacity)),
+            capacity,
+        }
+    }
+
+    async fn acquire(&self, fanout: usize) -> Result<Option<Arc<OwnedSemaphorePermit>>, tokio::sync::AcquireError> {
+        if self.capacity == 0 {
+            return Ok(None);
+        }
+        // A single walk must remain admissible even when the topology exceeds
+        // the configured budget. Tokio accepts at most u32::MAX in one grant.
+        let weight = u32::try_from(fanout.max(1).min(self.capacity)).unwrap_or(u32::MAX);
+        self.permits
+            .clone()
+            .acquire_many_owned(weight)
+            .await
+            .map(|permit| Some(Arc::new(permit)))
+    }
+}
+
 /// Runtime state owned by a single `ECStore` instance.
 ///
 /// This is intentionally minimal in the first migration slice; subsequent
@@ -201,6 +233,7 @@ pub struct InstanceContext {
     /// drift out of sync). Stored as one value so the three predicates can
     /// never observe a torn intermediate state.
     erasure_kind: RwLock<SetupType>,
+    list_read_budget: OnceLock<ListReadBudget>,
     /// This instance's namespace lock manager (Phase 5 Slice 3, backlog#939).
     ///
     /// Owned per-instance so two instances no longer share a lock namespace
@@ -354,6 +387,24 @@ impl InstanceContext {
         Self::with_lock_manager(Arc::new(GlobalLockManager::new()))
     }
 
+    /// Bound native listing fanout independently of GET body permits. A walk
+    /// keeps its shared grant until all of its disk producers have terminated.
+    /// Acquire before creating the merge channels or taking object locks.
+    pub(crate) async fn acquire_list_read_budget(
+        &self,
+        fanout: usize,
+    ) -> Result<Option<Arc<OwnedSemaphorePermit>>, tokio::sync::AcquireError> {
+        self.list_read_budget
+            .get_or_init(|| {
+                ListReadBudget::new(rustfs_utils::get_env_usize(
+                    rustfs_config::ENV_OBJECT_MAX_CONCURRENT_DISK_READS,
+                    rustfs_config::DEFAULT_OBJECT_MAX_CONCURRENT_DISK_READS,
+                ))
+            })
+            .acquire(fanout)
+            .await
+    }
+
     /// Build a context bound to a specific lock manager.
     ///
     /// [`bootstrap_ctx`] uses this to alias the process-global lock manager so
@@ -362,6 +413,7 @@ impl InstanceContext {
     fn with_lock_manager(lock_manager: Arc<GlobalLockManager>) -> Self {
         Self {
             erasure_kind: RwLock::new(SetupType::Unknown),
+            list_read_budget: OnceLock::new(),
             lock_manager,
             region: OnceLock::new(),
             deployment_id: OnceLock::new(),
@@ -941,6 +993,32 @@ impl InstanceContext {
             .clone()
     }
 
+    /// Remove the `BucketMetadataSys` when its backing `ECStore` is gone.
+    ///
+    /// Called from `ECStore::drop`. When test fixtures share the bootstrap
+    /// context, the `BucketMetadataSys` stores a `Weak<ECStore>` to prevent a
+    /// reference cycle; once the store drops the weak is dangling and any
+    /// `object_store()` call panics. Clearing the slot here lets the next
+    /// fixture install a fresh `BucketMetadataSys` without hitting the stale one.
+    pub fn clear_bucket_metadata_sys_if_stale(&self) {
+        let mut guard = self.bucket_metadata_sys.lock().expect("bucket_metadata_sys lock poisoned");
+        if let Some(sys) = guard.as_ref() {
+            // `read()` may block briefly; the async RwLock is acceptable here
+            // because Drop is sync and the lock is held only long enough to
+            // check the weak reference.
+            let is_stale = {
+                let s = sys.try_read();
+                match s {
+                    Ok(s) => s.is_store_stale(),
+                    Err(_) => true, // contended: treat as stale-safe to clear
+                }
+            };
+            if is_stale {
+                *guard = None;
+            }
+        }
+    }
+
     /// Set this instance's background-services cancellation token (once).
     pub fn init_background_cancel_token(&self, token: CancellationToken) -> Result<(), CancellationToken> {
         self.background_cancel_token.set(token)
@@ -1084,6 +1162,85 @@ pub fn bootstrap_ctx() -> Arc<InstanceContext> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn list_read_budget_weights_and_clamps_fanout() {
+        let budget = ListReadBudget::new(8);
+        let first = budget.acquire(3).await.expect("first walk").expect("bounded grant");
+        assert_eq!(budget.permits.available_permits(), 5);
+        let mut blocked = std::pin::pin!(budget.acquire(6));
+        assert!(futures::poll!(&mut blocked).is_pending());
+        drop(first);
+        let second = blocked.await.expect("queued walk").expect("bounded grant");
+        assert_eq!(budget.permits.available_permits(), 2);
+        drop(second);
+        let oversized = budget
+            .acquire(usize::MAX)
+            .await
+            .expect("oversized walk")
+            .expect("bounded grant");
+        assert_eq!(budget.permits.available_permits(), 0);
+        drop(oversized);
+        assert_eq!(budget.permits.available_permits(), 8);
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_zero_preserves_unbounded_configuration() {
+        let budget = ListReadBudget::new(0);
+        assert!(budget.acquire(usize::MAX).await.expect("disabled budget").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_cancelled_waiter_returns_partial_grant() {
+        let budget = ListReadBudget::new(4);
+        let held = budget.acquire(3).await.expect("first walk");
+        {
+            let mut waiter = std::pin::pin!(budget.acquire(4));
+            assert!(futures::poll!(&mut waiter).is_pending());
+        }
+        assert_eq!(budget.permits.available_permits(), 1);
+        drop(held);
+        assert!(budget.acquire(4).await.expect("next walk").is_some());
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_shared_grant_survives_parent_drop() {
+        let budget = ListReadBudget::new(4);
+        let parent = budget.acquire(4).await.expect("first walk").expect("bounded grant");
+        let producer = parent.clone();
+        drop(parent);
+        assert_eq!(budget.permits.available_permits(), 0);
+        drop(producer);
+        assert_eq!(budget.permits.available_permits(), 4);
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_is_shared_by_context_and_isolated_between_instances() {
+        let first = Arc::new(InstanceContext::new());
+        first.list_read_budget.set(ListReadBudget::new(4)).expect("fresh context");
+        let same = first.clone();
+        let other = InstanceContext::new();
+        other.list_read_budget.set(ListReadBudget::new(4)).expect("fresh context");
+        let held = first.acquire_list_read_budget(4).await.expect("first context");
+        let mut waiter = std::pin::pin!(same.acquire_list_read_budget(1));
+        assert!(futures::poll!(&mut waiter).is_pending());
+        assert!(
+            other
+                .acquire_list_read_budget(4)
+                .await
+                .expect("independent context")
+                .is_some()
+        );
+        drop(held);
+        assert!(waiter.await.expect("shared context resumed").is_some());
+    }
+
+    #[test]
+    fn list_read_budget_extreme_configuration_is_bounded_without_panicking() {
+        let budget = ListReadBudget::new(usize::MAX);
+        assert!(budget.capacity <= Semaphore::MAX_PERMITS);
+        assert!(u32::try_from(budget.capacity).is_ok());
+    }
 
     #[test]
     fn decommission_count_ledger_bounds_retained_entries() {

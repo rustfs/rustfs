@@ -23,7 +23,6 @@ use crate::{
         utils::{encode_compatible_admin_payload, has_space_be, read_compatible_admin_body},
     },
     auth::{check_key_valid, constant_time_eq, get_session_token},
-    server::RemoteAddr,
 };
 use http::{HeaderMap, StatusCode};
 use matchit::Params;
@@ -31,7 +30,7 @@ use rustfs_config::{MAX_ADMIN_REQUEST_BODY_SIZE, MAX_IAM_IMPORT_EXPANDED_SIZE, M
 use rustfs_credentials::Credentials;
 use rustfs_iam::{
     store::{GroupInfo, MappedPolicy, UserType},
-    sys::{NewServiceAccountOpts, UpdateServiceAccountOpts},
+    sys::{NewServiceAccountOpts, SITE_REPLICATOR_SERVICE_ACCOUNT, UpdateServiceAccountOpts},
 };
 use rustfs_madmin::{
     AccountStatus, AddOrUpdateUserReq, IAMEntities, IAMErrEntities, IAMErrEntity, IAMErrPolicyEntity, SITE_REPL_API_VERSION,
@@ -196,6 +195,19 @@ fn imported_service_account_parent_scope_failure(
     })
 }
 
+fn retain_exportable_service_accounts(accounts: &mut HashMap<String, rustfs_policy::auth::UserIdentity>) {
+    accounts.retain(|key, account| {
+        key != SITE_REPLICATOR_SERVICE_ACCOUNT && account.credentials.access_key != SITE_REPLICATOR_SERVICE_ACCOUNT
+    });
+}
+
+fn imported_service_account_reserved_failure(access_key: &str) -> Option<IAMErrEntity> {
+    (access_key == SITE_REPLICATOR_SERVICE_ACCOUNT).then(|| IAMErrEntity {
+        name: access_key.to_owned(),
+        error: "service account name is reserved for site replication".to_owned(),
+    })
+}
+
 fn imported_service_account_access_key_failure(entry_access_key: &str, payload_access_key: &str) -> Option<IAMErrEntity> {
     (entry_access_key != payload_access_key).then(|| IAMErrEntity {
         name: entry_access_key.to_string(),
@@ -208,6 +220,7 @@ pub struct AddUser {}
 fn map_add_user_create_error(err: rustfs_iam::error::Error) -> S3Error {
     match err {
         rustfs_iam::error::Error::AccessKeyAlreadyExists => iam_error_to_s3_error(err),
+        rustfs_iam::error::Error::IAMActionNotAllowed => S3Error::new(S3ErrorCode::AccessDenied),
         err => S3Error::with_message(S3ErrorCode::InternalError, format!("failed to create user: {err}")),
     }
 }
@@ -243,7 +256,7 @@ impl Operation for AddUser {
         // let body_bytes = decrypt_data(input_cred.secret_key.expose().as_bytes(), &body)
         //     .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidArgument, format!("decrypt_data err {}", e)))?;
 
-        let args: AddOrUpdateUserReq = serde_json::from_slice(&body)
+        let mut args: AddOrUpdateUserReq = serde_json::from_slice(&body)
             .map_err(|e| S3Error::with_message(S3ErrorCode::InvalidRequest, format!("invalid JSON: {e}")))?;
 
         if args.secret_key.is_empty() {
@@ -261,7 +274,7 @@ impl Operation for AddUser {
         };
 
         if let Some(user) = iam_store.get_user(ak).await {
-            if (user.credentials.is_temp() || user.credentials.is_service_account()) && cred.parent_user == ak {
+            if user.credentials.is_temp() || user.credentials.is_service_account() {
                 return Err(s3_error!(InvalidArgument, "cannot create a user with a service account access key"));
             }
         } else if has_space_be(ak) {
@@ -306,11 +319,22 @@ impl Operation for AddUser {
             owner,
             check_deny_only,
             vec![Action::AdminAction(AdminAction::CreateUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
-        let updated_at = iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?;
+        let updated_at = if check_deny_only {
+            let (updated_at, status, _) = iam_store
+                .change_own_secret_key(ak, input_cred.secret_key.expose(), &args.secret_key)
+                .await
+                .map_err(map_add_user_create_error)?;
+            args.status = status;
+            // A self-service secret rotation does not change policy attachment.
+            args.policy = None;
+            updated_at
+        } else {
+            iam_store.create_user(ak, &args).await.map_err(map_add_user_create_error)?
+        };
 
         if let Err(err) = site_replication_iam_change_hook(SRIAMItem {
             r#type: "iam-user".to_string(),
@@ -619,7 +643,7 @@ impl Operation for GetUserInfo {
             owner,
             check_deny_only,
             vec![Action::AdminAction(AdminAction::GetUserAdminAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
@@ -749,12 +773,9 @@ impl Operation for ExportIam {
                         .await
                         .map_err(|e| S3Error::with_message(S3ErrorCode::InternalError, e.to_string()))?;
 
+                    retain_exportable_service_accounts(&mut service_accounts);
                     let mut svc_accts: HashMap<String, SRSvcAccCreate> = HashMap::new();
                     for (k, acc) in service_accounts {
-                        if k == "siteReplicatorSvcAcc" {
-                            continue;
-                        }
-
                         let claims = iam_store
                             .get_claims_for_svc_acc(&acc.credentials.access_key)
                             .await
@@ -904,7 +925,7 @@ impl Operation for ImportIam {
             owner,
             false,
             vec![Action::AdminAction(AdminAction::ImportIAMAction)],
-            req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0)),
+            crate::admin::auth::policy_source_addr(&req.extensions),
         )
         .await?;
 
@@ -1087,6 +1108,11 @@ impl Operation for ImportIam {
 
                     if has_space_be(&ak) {
                         return Err(s3_error!(InvalidArgument, "has space be {ak}"));
+                    }
+
+                    if let Some(err) = imported_service_account_reserved_failure(&ak) {
+                        failed.service_accounts.push(err);
+                        continue;
                     }
 
                     if let Some(err) = imported_service_account_access_key_failure(&ak, &req.access_key) {
@@ -1461,6 +1487,74 @@ mod tests {
                 "{call} must map through iam_error_to_s3_error so a missing user is 404 NoSuchResource, not 500 InternalError"
             );
         }
+    }
+
+    #[test]
+    fn iam_export_excludes_site_replicator_credentials() {
+        let mut accounts = HashMap::from([
+            (
+                "site-replicator-0".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "site-replicator-0".to_owned(),
+                    secret_key: "replicator-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "ordinary-service".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "ordinary-service".to_owned(),
+                    secret_key: "ordinary-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+            (
+                "mismatched-entry".to_owned(),
+                rustfs_policy::auth::UserIdentity::new(Credentials {
+                    access_key: "site-replicator-0".to_owned(),
+                    secret_key: "aliased-replicator-secret".to_owned(),
+                    ..Default::default()
+                }),
+            ),
+        ]);
+        super::retain_exportable_service_accounts(&mut accounts);
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts["ordinary-service"].credentials.secret_key, "ordinary-secret");
+        let exported = serde_json::to_string(&accounts).expect("serialize selected export records");
+        assert!(!exported.contains("replicator"));
+    }
+
+    #[test]
+    fn iam_archives_preserve_the_reserved_site_replicator_identity() {
+        let failure = super::imported_service_account_reserved_failure(rustfs_iam::sys::SITE_REPLICATOR_SERVICE_ACCOUNT)
+            .expect("the site replicator must never be replaced by an IAM import");
+        assert_eq!(failure.name, "site-replicator-0");
+        assert_eq!(failure.error, "service account name is reserved for site replication");
+        assert!(super::imported_service_account_reserved_failure("ordinary-service-account").is_none());
+        let source = include_str!("user.rs")
+            .split("\n#[cfg(test)]\n")
+            .next()
+            .expect("production source");
+        let export = source_block(source, "impl Operation for ExportIam");
+        let guard = export
+            .find("retain_exportable_service_accounts(&mut service_accounts)")
+            .expect("export uses the canonical reserved identity");
+        assert!(
+            guard
+                < export
+                    .find("let svc_acc_create_req = SRSvcAccCreate")
+                    .expect("exported credentials")
+        );
+        let import = source_block(source, "impl Operation for ImportIam");
+        let guard = import
+            .find("imported_service_account_reserved_failure(&ak)")
+            .expect("import rejects the reserved identity");
+        assert!(
+            guard
+                < import
+                    .find(".delete_service_account(&ak")
+                    .expect("replacement deletes the original account")
+        );
     }
 
     #[test]

@@ -27,6 +27,7 @@ mod io_admission;
 #[cfg(test)]
 pub(crate) mod lifecycle_test_io;
 pub mod local;
+pub mod multipart_index;
 pub mod multipart_source;
 pub mod os;
 
@@ -52,6 +53,10 @@ pub const RUSTFS_META_MULTIPART_BUCKET: &str = ".rustfs.sys/multipart";
 pub const RUSTFS_META_TMP_BUCKET: &str = ".rustfs.sys/tmp";
 pub const RUSTFS_META_TMP_DELETED_BUCKET: &str = ".rustfs.sys/tmp/.trash";
 pub const BUCKET_META_PREFIX: &str = "buckets";
+/// Directory under `BUCKET_META_PREFIX` that holds drive-replacement heal
+/// intents, seals and recovery proofs. It shares the bucket-metadata root with
+/// a user bucket of the same name, so bucket deletion must leave it in place.
+pub const HEAL_REPLACEMENT_RECOVERY_DIR: &str = "ahm-replacement";
 pub const FORMAT_CONFIG_FILE: &str = "format.json";
 /// Per-disk marker present while an erasure-set heal is rebuilding this disk.
 /// `LocalDisk::disk_info` reports `healing = true` while the file exists.
@@ -401,16 +406,24 @@ impl Disk {
         }
     }
 
+    pub(crate) fn has_clean_active_multipart_source(&self, upload_or_part_path: &str, part_path: bool) -> bool {
+        match self {
+            Self::Local(disk) => disk.has_clean_active_multipart_source(upload_or_part_path, part_path),
+            Self::Remote(_) => false,
+        }
+    }
+
     pub(crate) async fn try_publish_prepared_delete_local(
         &self,
         volume: &str,
         object: &str,
         transaction: Uuid,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<Option<(DeleteRecoveryJournal, bool, bool)>> {
         match self {
             Self::Local(disk) => {
-                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner)
+                disk.try_publish_prepared_delete_local(volume, object, transaction, namespace_owner, work_budget)
                     .await
             }
             Self::Remote(_) => Ok(None),
@@ -424,11 +437,19 @@ impl Disk {
         transaction: Uuid,
         journal: &DeleteRecoveryJournal,
         namespace_owner: Option<Arc<dyn Send + Sync>>,
+        work_budget: Option<Arc<crate::object_api::DeleteRecoveryWorkBudget>>,
     ) -> Result<bool> {
         match self {
             Self::Local(disk) => {
-                disk.try_finish_and_finalize_prepared_delete_local(volume, object, transaction, journal, namespace_owner)
-                    .await
+                disk.try_finish_and_finalize_prepared_delete_local(
+                    volume,
+                    object,
+                    transaction,
+                    journal,
+                    namespace_owner,
+                    work_budget,
+                )
+                .await
             }
             Self::Remote(_) => Ok(false),
         }
@@ -505,6 +526,17 @@ impl Disk {
 
 #[async_trait::async_trait]
 impl DiskAPI for Disk {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        match self {
+            Self::Local(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+            Self::Remote(disk) => disk.list_multipart_index_roots(bucket, marker).await,
+        }
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
         match self {
             Self::Local(disk) => disk.supports_guarded_delete_versions().await,
@@ -548,6 +580,17 @@ impl DiskAPI for Disk {
             Self::Remote(disk) => disk.has_delete_transaction_evidence(volume, object).await,
         }
     }
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        match self {
+            Self::Local(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+            Self::Remote(disk) => disk.discover_delete_transactions_bounded(volume, object, max_entries).await,
+        }
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -558,6 +601,35 @@ impl DiskAPI for Disk {
         match self {
             Self::Local(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
             Self::Remote(disk) => disk.discover_delete_transactions(volume, object, cursor, limit).await,
+        }
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: BoundedDeleteRecoverySettlement,
+        namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        match self {
+            Self::Local(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+            Self::Remote(disk) => disk.settle_delete_transaction_bounded(volume, request, namespace_owner).await,
+        }
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        match self {
+            Self::Local(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
+            Self::Remote(disk) => {
+                disk.inspect_delete_transaction_bounded(volume, object, transaction, max_entries)
+                    .await
+            }
         }
     }
     async fn inspect_delete_transaction(
@@ -1506,6 +1578,15 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
     fn host_name(&self) -> String;
     fn endpoint(&self) -> Endpoint;
     async fn close(&self) -> Result<()>;
+    /// Return candidates only while this disk maintains complete boot-local coverage.
+    /// Unsupported or unready disks must never return an authoritative empty page.
+    async fn list_multipart_index_roots(
+        &self,
+        _bucket: &str,
+        _marker: Option<&str>,
+    ) -> Result<multipart_index::MultipartIndexPage> {
+        Err(DiskError::MethodNotAllowed)
+    }
     async fn get_disk_id(&self) -> Result<Option<Uuid>>;
     async fn set_disk_id(&self, id: Option<Uuid>) -> Result<()>;
 
@@ -1682,6 +1763,35 @@ pub trait DiskAPI: Debug + Send + Sync + 'static {
         _limit: u32,
     ) -> Result<DeleteRecoveryPage> {
         Err(DiskError::MethodNotAllowed)
+    }
+    /// Bounded foreground inventory owns all traversal state until return or cancellation.
+    /// An implementation without the bounded protocol is an unsupported participant
+    /// (the same verdict a remote peer without it receives); callers must never fall
+    /// back to paginated discovery.
+    async fn discover_delete_transactions_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryDiscovery> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _object: &str,
+        _transaction: Uuid,
+        _max_entries: u32,
+    ) -> Result<BoundedDeleteRecoveryInspection> {
+        Err(DiskError::UnsupportedDisk)
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        _volume: &str,
+        _request: BoundedDeleteRecoverySettlement,
+        _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<BoundedDeleteRecoverySettlementReply> {
+        Err(DiskError::UnsupportedDisk)
     }
     /// A read-only capability check; unsupported implementations must fail closed.
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
@@ -2015,10 +2125,19 @@ pub struct GuardedFileInfoVersions {
 pub struct GuardedDeleteVersionsPayload {
     pub versions: Vec<GuardedFileInfoVersions>,
     pub opts: DeleteOptions,
+    // The strict legacy decoder rejects this field before applying any change.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bounded_recovery_protocol: Option<u32>,
 }
 
 impl GuardedDeleteVersionsPayload {
     pub fn validate(&self) -> Result<()> {
+        if self
+            .bounded_recovery_protocol
+            .is_some_and(|version| version != BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION)
+        {
+            return Err(DiskError::UnsupportedDisk);
+        }
         validate_delete_recovery_options(&self.opts)?;
         if self.versions.is_empty()
             || self.versions.len() > 1000
@@ -2068,6 +2187,13 @@ pub struct WalkDirOptions {
     #[serde(default)]
     pub skip_hidden_prefix_check: bool,
 
+    /// Bound hidden metadata read while proving a non-recursive prefix visible.
+    #[serde(default)]
+    pub hidden_entry_budget: usize,
+    /// A prefix whose visibility was not established before the preceding cut.
+    #[serde(default)]
+    pub pending_prefix: Option<String>,
+
     // ReportNotFound will return errFileNotFound if all disks reports the BaseDir cannot be found.
     pub report_notfound: bool,
 
@@ -2096,6 +2222,36 @@ pub struct WalkDirOptions {
     // Override the remote stream stall timeout for long background walks.
     #[serde(default)]
     pub stall_timeout_ms: Option<u64>,
+
+    /// Select this leaf below identifier-like directory components. The root is
+    /// `base_dir`; unrelated object metadata must not be read or returned.
+    /// Older peers ignore this additive field, so consumers must also filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identifier_tree_leaf: Option<String>,
+}
+
+pub(crate) fn is_identifier_tree_component(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+pub(crate) fn is_identifier_tree_leaf(value: &str) -> bool {
+    value.len() <= 255
+        && value.contains('.')
+        && !matches!(value, "." | "..")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+}
+
+pub(crate) fn identifier_tree_leaf_matches(prefix: &str, leaf: &str, object: &str) -> bool {
+    let Some(relative) = object.strip_prefix(prefix) else {
+        return false;
+    };
+    let mut components = relative.split('/');
+    components.next_back() == Some(leaf) && components.all(is_identifier_tree_component)
 }
 
 impl WalkDirOptions {
@@ -2189,6 +2345,9 @@ pub struct DeleteOptions {
     pub delete_recovery_bucket_incarnation: Option<Uuid>,
     #[serde(default)]
     pub recoverable_delete: bool,
+    /// Transport requirement for preparing a delete that will use bounded settlement.
+    #[serde(skip)]
+    pub requires_bounded_delete_recovery: bool,
     /// Reclaim only plain erasure-part leaves, preserving every other entry.
     /// Keep `recursive` false so an older peer cannot widen this operation.
     #[serde(default)]
@@ -2196,6 +2355,8 @@ pub struct DeleteOptions {
 }
 
 pub const DELETE_RECOVERY_PROTOCOL_VERSION: u32 = 1;
+/// Accepted only for prepare RPCs. Legacy peers must refuse before staging a delete.
+pub const BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION: u32 = 2;
 pub(crate) fn get_delete_recovery_timeout() -> Result<std::time::Duration> {
     let value = std::env::var("RUSTFS_DELETE_RECOVERY_TIMEOUT_SECS");
     match value {
@@ -2400,9 +2561,62 @@ pub enum DeleteRecoveryAction {
     AdoptCommit { authority: Box<DeleteRecoveryJournal> },
 }
 
+/// A complete inventory or a work-limit refusal. No public discovery cursor is allocated.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryDiscovery {
+    pub transactions: Vec<DeleteTransactionId>,
+    pub visited: u32,
+    pub complete: bool,
+}
+
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlement {
+    pub object: String,
+    pub transaction: Uuid,
+    pub expected_fingerprint: DeleteRecoveryDigest,
+    pub action: DeleteRecoveryAction,
+    pub max_entries: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum DeleteRecoverySettlementOutcome {
+    Inspected(Box<DeleteRecoveryInspection>),
+    ReceiptPublishedInspectionDeferred,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoverySettlementReply {
+    pub outcome: DeleteRecoverySettlementOutcome,
+    pub visited: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BoundedDeleteRecoveryInspection {
+    pub inspection: DeleteRecoveryInspection,
+    pub visited: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum DeleteRecoveryRpcOperation {
+    SettleBounded(BoundedDeleteRecoverySettlement),
+    InspectBounded {
+        object: String,
+        transaction: Uuid,
+        max_entries: u32,
+    },
+    DiscoverBounded {
+        object: String,
+        max_entries: u32,
+    },
     InspectOrphanDataDir {
         path: String,
     },
@@ -2440,7 +2654,11 @@ impl DeleteRecoveryRpcOperation {
     /// Full metadata application and adoption share the existing mutation envelope.
     pub fn max_wire_payload_bytes(&self) -> usize {
         match self {
-            Self::ApplyVersion { .. }
+            Self::SettleBounded(BoundedDeleteRecoverySettlement {
+                action: DeleteRecoveryAction::AdoptCommit { .. },
+                ..
+            })
+            | Self::ApplyVersion { .. }
             | Self::ApplyVersions { .. }
             | Self::Settle {
                 action: DeleteRecoveryAction::AdoptCommit { .. },
@@ -2456,8 +2674,11 @@ impl DeleteRecoveryRpcOperation {
 pub enum DeleteRecoveryRpcReply {
     OrphanDataDir { plain: bool },
     Discovered(DeleteRecoveryPage),
+    DiscoveredBounded(BoundedDeleteRecoveryDiscovery),
     Inspected(DeleteRecoveryInspection),
+    InspectedBounded(BoundedDeleteRecoveryInspection),
     Settled(DeleteRecoveryInspection),
+    SettledBounded(BoundedDeleteRecoverySettlementReply),
     AppliedVersion,
     AppliedVersions(Vec<Option<u32>>),
     Evidence { present: bool },
@@ -2732,6 +2953,7 @@ mod tests {
         insert_str(&mut fi.metadata, SUFFIX_TRANSITION_TIER_DESTINATION_ID, "ab".repeat(32));
         let generation = CurrentDeleteGeneration::from_file_info(&fi).expect("capture complete remote identity");
         let payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: vec![GuardedFileInfoVersions {
                 group: FileInfoVersions {
                     name: "object".into(),
@@ -2786,6 +3008,7 @@ mod tests {
             expected_current: CurrentDeleteGeneration::Absent,
         };
         let mut payload = GuardedDeleteVersionsPayload {
+            bounded_recovery_protocol: None,
             versions: vec![group],
             opts: DeleteOptions {
                 old_data_dir: Some(Uuid::new_v4()),
@@ -2797,6 +3020,25 @@ mod tests {
         let decoded: GuardedDeleteVersionsPayload =
             rustfs_protos::decode_delete_recovery_payload(&encoded).expect("decode guarded batch");
         decoded.validate().expect("round-trip guarded batch remains valid");
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyGuardedDeletePayload {
+            #[serde(rename = "versions")]
+            _versions: Vec<GuardedFileInfoVersions>,
+            #[serde(rename = "opts")]
+            _opts: DeleteOptions,
+        }
+        rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&encoded)
+            .expect("legacy reader accepts legacy prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION);
+        let bounded = rmp_serde::to_vec_named(&payload).expect("serialize bounded guarded prepare");
+        assert!(rustfs_protos::decode_delete_recovery_payload::<LegacyGuardedDeletePayload>(&bounded).is_err());
+        let bounded: GuardedDeleteVersionsPayload =
+            rustfs_protos::decode_delete_recovery_payload(&bounded).expect("current reader accepts bounded prepare");
+        bounded.validate().expect("valid bounded guarded prepare");
+        payload.bounded_recovery_protocol = Some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION + 1);
+        assert_eq!(payload.validate(), Err(DiskError::UnsupportedDisk));
+        payload.bounded_recovery_protocol = None;
         let mut trailing = encoded;
         trailing.push(0xc0);
         assert!(rustfs_protos::decode_delete_recovery_payload::<GuardedDeleteVersionsPayload>(&trailing).is_err());
@@ -2935,6 +3177,8 @@ mod tests {
             recursive: true,
             incl_deleted: false,
             skip_hidden_prefix_check: false,
+            hidden_entry_budget: 0,
+            pending_prefix: None,
             report_notfound: false,
             filter_prefix: Some("prefix_".to_string()),
             forward_to: Some("object/path".to_string()),
@@ -2943,6 +3187,7 @@ mod tests {
             skip_total_timeout: false,
             timeout_ms: Some(10_000),
             stall_timeout_ms: Some(20_000),
+            identifier_tree_leaf: None,
         };
 
         assert_eq!(opts.bucket, "test-bucket");
@@ -2977,6 +3222,69 @@ mod tests {
         assert!(!decoded.skip_hidden_prefix_check);
     }
 
+    #[test]
+    fn identifier_tree_leaf_selection_preserves_nested_identifier_directories() {
+        let prefix = "catalog/namespaces/";
+        let leaf = "table-entry.json";
+        for relative in [
+            "sales/tables/orders/table-entry.json",
+            "sales/tables/orders/maintenance/tables/owner/table-entry.json",
+            "maintenance/tables/tables/table-entry.json",
+        ] {
+            assert!(identifier_tree_leaf_matches(prefix, leaf, &format!("{prefix}{relative}")));
+        }
+        for relative in [
+            "sales/tables/orders/not-table-entry.json",
+            "sales/tables/orders/table-entry.json/child",
+            "sales/report.json/tables/owner/table-entry.json",
+            "sales//tables/owner/table-entry.json",
+            "sales/../tables/owner/table-entry.json",
+        ] {
+            assert!(!identifier_tree_leaf_matches(prefix, leaf, &format!("{prefix}{relative}")));
+        }
+        assert!(!identifier_tree_leaf_matches(prefix, leaf, "other/sales/tables/orders/table-entry.json"));
+        assert!(is_identifier_tree_leaf(leaf));
+        for invalid in ["", ".", "..", "table-entry", "table/entry.json", "table\\entry.json"] {
+            assert!(!is_identifier_tree_leaf(invalid), "invalid selector {invalid}");
+        }
+    }
+
+    #[test]
+    fn identifier_tree_walk_options_are_additive_on_json_and_messagepack_maps() {
+        #[derive(serde::Deserialize)]
+        struct LegacyView {
+            bucket: String,
+            base_dir: String,
+            recursive: bool,
+        }
+        let options = WalkDirOptions {
+            bucket: "catalog".to_string(),
+            base_dir: "namespaces/".to_string(),
+            recursive: true,
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_vec(&options).expect("encode current HTTP options");
+        let messagepack = rmp_serde::to_vec_named(&options).expect("encode legacy RPC map");
+        for old in [
+            serde_json::from_slice::<LegacyView>(&json).expect("old JSON readers ignore the additive field"),
+            rmp_serde::from_slice::<LegacyView>(&messagepack).expect("old MessagePack readers ignore the additive field"),
+        ] {
+            assert_eq!(old.bucket, options.bucket);
+            assert_eq!(old.base_dir, options.base_dir);
+            assert!(old.recursive);
+        }
+        let mut old = serde_json::to_value(&options).expect("encode legacy options");
+        old.as_object_mut().expect("options are a map").remove("identifier_tree_leaf");
+        let from_json: WalkDirOptions = serde_json::from_value(old.clone()).expect("decode old HTTP options");
+        let from_messagepack: WalkDirOptions =
+            rmp_serde::from_slice(&rmp_serde::to_vec_named(&old).expect("encode old RPC map")).expect("decode old RPC map");
+        assert!(from_json.identifier_tree_leaf.is_none());
+        assert!(from_messagepack.identifier_tree_leaf.is_none());
+        assert_eq!(from_json.base_dir, options.base_dir);
+        assert_eq!(from_messagepack.base_dir, options.base_dir);
+    }
+
     /// Test DeleteOptions structure
     #[test]
     fn test_delete_options() {
@@ -2989,8 +3297,14 @@ mod tests {
             expected_delete_marker: None,
             delete_recovery_bucket_incarnation: None,
             recoverable_delete: false,
+            requires_bounded_delete_recovery: true,
             orphan_data_dir: false,
         };
+
+        let wire = serde_json::to_value(&opts).expect("encode legacy wire options");
+        assert!(wire.get("requires_bounded_delete_recovery").is_none());
+        let decoded: DeleteOptions = serde_json::from_value(wire).expect("decode legacy wire options");
+        assert!(!decoded.requires_bounded_delete_recovery);
 
         assert!(opts.recursive);
         assert!(!opts.immediate);

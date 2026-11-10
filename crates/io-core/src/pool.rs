@@ -83,7 +83,10 @@ struct PoolTier {
     /// Queue of available buffers for reuse
     available_buffers: Mutex<Vec<BytesMut>>,
     /// Metrics for tracking this tier
-    metrics: Mutex<Option<Arc<BytesPoolMetrics>>>,
+    metrics: Arc<BytesPoolMetrics>,
+    /// Serialize acquisitions before taking buffers so a slow recorder does not
+    /// accumulate allocated buffers behind hit-rate publication.
+    acquire_metrics_lock: Mutex<()>,
     /// Total acquisitions for this tier
     tier_total_acquires: AtomicU64,
     /// Total hits for this tier
@@ -185,16 +188,10 @@ impl BytesPool {
     /// ```
     pub fn with_config(config: BytesPoolConfig) -> Self {
         let metrics = Arc::new(BytesPoolMetrics::default());
-        let small_pool = Arc::new(PoolTier::new(config.small_size, config.small_max, "small"));
-        let medium_pool = Arc::new(PoolTier::new(config.medium_size, config.medium_max, "medium"));
-        let large_pool = Arc::new(PoolTier::new(config.large_size, config.large_max, "large"));
-        let xlarge_pool = Arc::new(PoolTier::new(config.xlarge_size, config.xlarge_max, "xlarge"));
-
-        // Set metrics reference in all tiers
-        small_pool.set_metrics(Arc::clone(&metrics));
-        medium_pool.set_metrics(Arc::clone(&metrics));
-        large_pool.set_metrics(Arc::clone(&metrics));
-        xlarge_pool.set_metrics(Arc::clone(&metrics));
+        let small_pool = Arc::new(PoolTier::new(config.small_size, config.small_max, "small", Arc::clone(&metrics)));
+        let medium_pool = Arc::new(PoolTier::new(config.medium_size, config.medium_max, "medium", Arc::clone(&metrics)));
+        let large_pool = Arc::new(PoolTier::new(config.large_size, config.large_max, "large", Arc::clone(&metrics)));
+        let xlarge_pool = Arc::new(PoolTier::new(config.xlarge_size, config.xlarge_max, "xlarge", Arc::clone(&metrics)));
 
         Self {
             small_pool,
@@ -225,7 +222,7 @@ impl BytesPool {
     /// ```
     pub async fn acquire_buffer(&self, size: usize) -> PooledBuffer {
         let tier = self.select_tier(size);
-        let mut buffer = tier.acquire_buffer(size, &self.metrics).await;
+        let mut buffer = tier.acquire_buffer(size).await;
         if buffer._permit.is_some() {
             buffer.tier = Some(Arc::clone(tier));
         }
@@ -252,7 +249,7 @@ impl BytesPool {
     /// ```
     pub fn try_acquire_buffer(&self, size: usize) -> Option<PooledBuffer> {
         let tier = self.select_tier(size);
-        let mut buffer = tier.try_acquire_buffer(size, &self.metrics)?;
+        let mut buffer = tier.try_acquire_buffer(size)?;
         // Set tier reference for return on drop
         buffer.tier = Some(Arc::clone(tier));
         Some(buffer)
@@ -290,43 +287,38 @@ impl BytesPool {
 }
 
 impl PoolTier {
-    fn new(buffer_size: usize, max_buffers: usize, name: &'static str) -> Self {
+    fn new(buffer_size: usize, max_buffers: usize, name: &'static str, metrics: Arc<BytesPoolMetrics>) -> Self {
         Self {
             buffer_size,
             max_buffers,
             semaphore: Arc::new(Semaphore::new(max_buffers)),
             name,
             available_buffers: Mutex::new(Vec::new()),
-            metrics: Mutex::new(None),
+            metrics,
+            acquire_metrics_lock: Mutex::new(()),
             tier_total_acquires: AtomicU64::new(0),
             tier_pool_hits: AtomicU64::new(0),
             tier_current_allocated_bytes: AtomicU64::new(0),
         }
     }
 
-    fn set_metrics(&self, metrics: Arc<BytesPoolMetrics>) {
-        *self.metrics.lock().unwrap_or_else(|e| e.into_inner()) = Some(metrics);
-    }
-
-    fn take_or_allocate_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> (BytesMut, bool) {
+    fn take_or_allocate_buffer(&self, size: usize) -> (BytesMut, bool) {
+        let pool_metrics = &self.metrics;
         let buffer_opt = {
             let mut available = self.available_buffers.lock().unwrap_or_else(|e| e.into_inner());
-            available.pop()
+            let buffer = available.pop();
+            if buffer.is_some() {
+                pool_metrics.available_buffers.fetch_sub(1, Ordering::Relaxed);
+            }
+            buffer
         };
         let was_reused = buffer_opt.is_some();
-        if was_reused {
-            // A reused buffer leaves the available pool. `return_buffer` does a
-            // matching `fetch_add(1)` on push, so without this the
-            // `available_buffers` gauge only ever grows and never reflects the real
-            // pool size (backlog#806).
-            pool_metrics.available_buffers.fetch_sub(1, Ordering::Relaxed);
-        }
 
         let buffer = if let Some(mut buf) = buffer_opt {
             let previous_capacity = buf.capacity();
             buf.clear();
             if previous_capacity < size {
-                buf.reserve(size - previous_capacity);
+                buf.reserve(size);
             }
             let current_capacity = buf.capacity();
             if current_capacity > previous_capacity {
@@ -353,7 +345,10 @@ impl PoolTier {
         (buffer, was_reused)
     }
 
-    fn record_acquire_metrics(&self, pool_metrics: &BytesPoolMetrics, buffer_capacity: usize, was_reused: bool) {
+    fn record_acquire_metrics(&self, buffer_capacity: usize, was_reused: bool) {
+        let pool_metrics = &self.metrics;
+        pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
+        self.tier_total_acquires.fetch_add(1, Ordering::Relaxed);
         rustfs_io_metrics::record_bytes_pool_acquire(self.name, buffer_capacity, was_reused);
 
         if was_reused {
@@ -374,7 +369,7 @@ impl PoolTier {
         rustfs_io_metrics::record_bytes_pool_allocated(self.name, self.tier_current_allocated_bytes.load(Ordering::Relaxed));
     }
 
-    async fn acquire_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> PooledBuffer {
+    async fn acquire_buffer(&self, size: usize) -> PooledBuffer {
         // Acquire semaphore permit (owned for storage in PooledBuffer)
         let permit = match Arc::clone(&self.semaphore).acquire_owned().await {
             Ok(p) => p,
@@ -388,17 +383,10 @@ impl PoolTier {
             }
         };
 
-        // Use the pool's shared metrics for recording
-        let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-        let _metrics = _metrics_lock.as_ref().expect("operation should succeed");
-
-        // Record acquisition
-        pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
-        self.tier_total_acquires.fetch_add(1, Ordering::Relaxed);
-
-        let (buffer, was_reused) = self.take_or_allocate_buffer(size, pool_metrics);
+        let _guard = self.acquire_metrics_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, was_reused) = self.take_or_allocate_buffer(size);
         let buffer_capacity = buffer.capacity();
-        self.record_acquire_metrics(pool_metrics, buffer_capacity, was_reused);
+        self.record_acquire_metrics(buffer_capacity, was_reused);
 
         PooledBuffer {
             buffer: ManuallyDrop::new(buffer),
@@ -407,21 +395,14 @@ impl PoolTier {
         }
     }
 
-    fn try_acquire_buffer(&self, size: usize, pool_metrics: &BytesPoolMetrics) -> Option<PooledBuffer> {
+    fn try_acquire_buffer(&self, size: usize) -> Option<PooledBuffer> {
         // Try to acquire permit without blocking
         let permit = Arc::clone(&self.semaphore).try_acquire_owned().ok()?;
 
-        // Use the pool's shared metrics for recording
-        let _metrics_lock = self.metrics.lock().unwrap_or_else(|e| e.into_inner());
-        let _metrics = _metrics_lock.as_ref().expect("operation should succeed");
-
-        // Record acquisition
-        pool_metrics.total_acquires.fetch_add(1, Ordering::Relaxed);
-        self.tier_total_acquires.fetch_add(1, Ordering::Relaxed);
-
-        let (buffer, was_reused) = self.take_or_allocate_buffer(size, pool_metrics);
+        let _guard = self.acquire_metrics_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let (buffer, was_reused) = self.take_or_allocate_buffer(size);
         let buffer_capacity = buffer.capacity();
-        self.record_acquire_metrics(pool_metrics, buffer_capacity, was_reused);
+        self.record_acquire_metrics(buffer_capacity, was_reused);
 
         Some(PooledBuffer {
             buffer: ManuallyDrop::new(buffer),
@@ -430,7 +411,7 @@ impl PoolTier {
         })
     }
 
-    /// Return a buffer to the pool for reuse without ever blocking the caller.
+    /// Return a buffer to the pool for reuse without waiting for the queue lock.
     fn return_buffer(&self, buffer: BytesMut) {
         let mut buffer = Some(buffer);
 
@@ -438,11 +419,7 @@ impl PoolTier {
             && available.len() < self.max_buffers
         {
             available.push(buffer.take().expect("buffer should be present until returned"));
-            if let Ok(metrics) = self.metrics.try_lock()
-                && let Some(metrics) = metrics.as_ref()
-            {
-                metrics.available_buffers.fetch_add(1, Ordering::Relaxed);
-            }
+            self.metrics.available_buffers.fetch_add(1, Ordering::Relaxed);
         }
 
         if let Some(buffer) = buffer {
@@ -452,18 +429,27 @@ impl PoolTier {
                     Some(current.saturating_sub(released_bytes))
                 })
                 .ok();
-            if let Ok(metrics) = self.metrics.try_lock()
-                && let Some(metrics) = metrics.as_ref()
-            {
-                metrics
-                    .current_allocated_bytes
-                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                        Some(current.saturating_sub(released_bytes))
-                    })
-                    .ok();
-            }
+            self.metrics
+                .current_allocated_bytes
+                .try_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+                    Some(current.saturating_sub(released_bytes))
+                })
+                .ok();
         }
         rustfs_io_metrics::record_bytes_pool_allocated(self.name, self.tier_current_allocated_bytes.load(Ordering::Relaxed));
+    }
+}
+
+impl PooledBuffer {
+    /// A buffer outside the pool: it holds no permit and is never returned to
+    /// a tier. Callers use it when the pool is at capacity but the request
+    /// must not be refused.
+    pub fn unpooled(size: usize) -> Self {
+        Self {
+            buffer: ManuallyDrop::new(BytesMut::with_capacity(size)),
+            tier: None,
+            _permit: None,
+        }
     }
 }
 
@@ -549,6 +535,44 @@ mod tests {
         let pool = BytesPool::new_tiered();
         let buffer = pool.acquire_buffer(2048).await;
         assert!(buffer.capacity() >= 2048);
+    }
+
+    #[tokio::test]
+    async fn reused_buffer_satisfies_larger_async_request() {
+        let pool = BytesPool::with_config(BytesPoolConfig {
+            small_max: 1,
+            ..Default::default()
+        });
+        let mut first = pool.acquire_buffer(32 * 1024).await;
+        first.extend_from_slice(b"previous contents");
+        assert!(first.capacity() < 48 * 1024, "fixture must require buffer growth");
+        drop(first);
+
+        let reused = pool.acquire_buffer(48 * 1024).await;
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= 48 * 1024);
+        assert_eq!(pool.metrics().pool_hits.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            pool.metrics().current_allocated_bytes.load(Ordering::Relaxed),
+            u64::try_from(reused.capacity()).expect("buffer capacity fits in metrics")
+        );
+    }
+
+    #[test]
+    fn reused_buffer_satisfies_larger_try_request() {
+        let pool = BytesPool::with_config(BytesPoolConfig {
+            small_max: 1,
+            ..Default::default()
+        });
+        let mut first = pool.try_acquire_buffer(32 * 1024).expect("first buffer is available");
+        first.extend_from_slice(b"previous contents");
+        assert!(first.capacity() < 48 * 1024, "fixture must require buffer growth");
+        drop(first);
+
+        let reused = pool.try_acquire_buffer(48 * 1024).expect("returned buffer is available");
+        assert!(reused.is_empty());
+        assert!(reused.capacity() >= 48 * 1024);
+        assert_eq!(pool.metrics().pool_hits.load(Ordering::Relaxed), 1);
     }
 
     #[tokio::test]

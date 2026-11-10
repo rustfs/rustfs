@@ -368,6 +368,18 @@ pub(crate) async fn site_replication_deployment_ids() -> S3Result<HashSet<String
     Ok(state.peers.values().map(|peer| peer.deployment_id.clone()).collect())
 }
 
+/// Deployment ids of the remote peers this site's reconciler derives a
+/// `site-repl-<id>` rule for; empty when site replication is not enabled.
+/// Read on the replica-delete path so only rules naming a current peer are
+/// treated as reconciler-owned.
+pub(crate) async fn site_replication_remote_peer_deployment_ids() -> S3Result<HashSet<String>> {
+    let state = load_site_replication_state().await?;
+    if !state.enabled() {
+        return Ok(HashSet::new());
+    }
+    Ok(remote_peer_deployment_ids(&state, &current_local_runtime_peer(&state)))
+}
+
 pub(crate) async fn load_site_replication_state_no_lock(store: Arc<ECStore>) -> S3Result<SiteReplicationState> {
     match read_config_no_lock(store, SITE_REPLICATION_STATE_PATH).await {
         Ok(data) => parse_site_replication_state(&data),

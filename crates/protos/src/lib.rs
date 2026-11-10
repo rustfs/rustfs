@@ -4090,3 +4090,63 @@ mod tests {
         evict_failed_connection_with_log_level(addr, ConnectionEvictionLogLevel::Debug).await;
     }
 }
+
+#[cfg(test)]
+mod lock_release_tests {
+    use super::proto_gen::node_service::{GenerallyLockResponse, GenerallyLockResult, LockReleaseStatus};
+    use prost::Message;
+
+    /// The release response schema before structured outcomes were added.
+    #[derive(Clone, PartialEq, Message)]
+    struct LegacyReleaseResponse {
+        #[prost(bool, tag = "1")]
+        success: bool,
+        #[prost(string, optional, tag = "2")]
+        error_info: Option<String>,
+        #[prost(string, optional, tag = "3")]
+        lock_info: Option<String>,
+    }
+
+    #[test]
+    fn legacy_release_response_does_not_confirm_absence() {
+        let legacy = LegacyReleaseResponse {
+            success: false,
+            error_info: Some("lock not found for release".to_string()),
+            lock_info: None,
+        };
+        let encoded = legacy.encode_to_vec();
+        let response = GenerallyLockResponse::decode(encoded.as_slice()).expect("decode legacy release response");
+        let result = GenerallyLockResult::decode(encoded.as_slice()).expect("decode legacy batch entry");
+        assert!(!response.success);
+        assert_eq!(response.error_info, legacy.error_info);
+        assert_eq!(response.release_status(), LockReleaseStatus::Unspecified);
+        assert_eq!(result.release_status(), LockReleaseStatus::Unspecified);
+    }
+
+    #[test]
+    fn structured_release_results_preserve_legacy_success_and_failure() {
+        for (status, success, error) in [
+            (LockReleaseStatus::Released, true, None),
+            (LockReleaseStatus::AlreadyAbsent, false, Some("lock not found for release".to_string())),
+        ] {
+            let response = GenerallyLockResponse {
+                success,
+                error_info: error.clone(),
+                lock_info: None,
+                release_status: status.into(),
+            };
+            let result = GenerallyLockResult {
+                success,
+                error_info: error.clone(),
+                lock_info: None,
+                release_status: status.into(),
+            };
+            for encoded in [response.encode_to_vec(), result.encode_to_vec()] {
+                let legacy = LegacyReleaseResponse::decode(encoded.as_slice()).expect("old peer ignores additive outcome");
+                assert_eq!(legacy.success, success);
+                assert_eq!(legacy.error_info, error);
+                assert!(legacy.lock_info.is_none());
+            }
+        }
+    }
+}

@@ -32,6 +32,8 @@ updates:
       - "overtrue"
       - "majinghe"
     ignore:
+      - dependency-name: "pulsar"
+        versions: [ "6.9.x" ]
       - dependency-name: "object_store"
         versions: [ "0.13.x" ]
       - dependency-name: "libunftp"

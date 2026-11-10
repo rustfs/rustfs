@@ -14,9 +14,300 @@
 
 use blake2::Blake2b512;
 use highway::{HighwayHash, HighwayHasher, Key};
-use md5::Md5;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::hint::black_box;
+
+const MD5_INITIAL_STATE: [u32; 4] = [0x6745_2301, 0xefcd_ab89, 0x98ba_dcfe, 0x1032_5476];
+
+const MD5_RC: [u32; 64] = [
+    0xd76a_a478,
+    0xe8c7_b756,
+    0x2420_70db,
+    0xc1bd_ceee,
+    0xf57c_0faf,
+    0x4787_c62a,
+    0xa830_4613,
+    0xfd46_9501,
+    0x6980_98d8,
+    0x8b44_f7af,
+    0xffff_5bb1,
+    0x895c_d7be,
+    0x6b90_1122,
+    0xfd98_7193,
+    0xa679_438e,
+    0x49b4_0821,
+    0xf61e_2562,
+    0xc040_b340,
+    0x265e_5a51,
+    0xe9b6_c7aa,
+    0xd62f_105d,
+    0x0244_1453,
+    0xd8a1_e681,
+    0xe7d3_fbc8,
+    0x21e1_cde6,
+    0xc337_07d6,
+    0xf4d5_0d87,
+    0x455a_14ed,
+    0xa9e3_e905,
+    0xfcef_a3f8,
+    0x676f_02d9,
+    0x8d2a_4c8a,
+    0xfffa_3942,
+    0x8771_f681,
+    0x6d9d_6122,
+    0xfde5_380c,
+    0xa4be_ea44,
+    0x4bde_cfa9,
+    0xf6bb_4b60,
+    0xbebf_bc70,
+    0x289b_7ec6,
+    0xeaa1_27fa,
+    0xd4ef_3085,
+    0x0488_1d05,
+    0xd9d4_d039,
+    0xe6db_99e5,
+    0x1fa2_7cf8,
+    0xc4ac_5665,
+    0xf429_2244,
+    0x432a_ff97,
+    0xab94_23a7,
+    0xfc93_a039,
+    0x655b_59c3,
+    0x8f0c_cc92,
+    0xffef_f47d,
+    0x8584_5dd1,
+    0x6fa8_7e4f,
+    0xfe2c_e6e0,
+    0xa301_4314,
+    0x4e08_11a1,
+    0xf753_7e82,
+    0xbd3a_f235,
+    0x2ad7_d2bb,
+    0xeb86_d391,
+];
+
+#[inline(always)]
+fn md5_op_f(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
+    // Keep `w + m + c` off the `x` critical dependency path from the previous round.
+    let base = black_box(w.wrapping_add(m).wrapping_add(c));
+    let f = z ^ (x & (y ^ z));
+    base.wrapping_add(f).rotate_left(s).wrapping_add(x)
+}
+
+#[inline(always)]
+fn md5_op_g(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
+    let base = black_box(w.wrapping_add(m).wrapping_add(c)).wrapping_add(y & !z);
+    base.wrapping_add(x & z).rotate_left(s).wrapping_add(x)
+}
+
+#[inline(always)]
+fn md5_op_h(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
+    let base = black_box(w.wrapping_add(m).wrapping_add(c));
+    base.wrapping_add(x ^ (y ^ z)).rotate_left(s).wrapping_add(x)
+}
+
+#[inline(always)]
+fn md5_op_i(w: u32, x: u32, y: u32, z: u32, m: u32, c: u32, s: u32) -> u32 {
+    let base = black_box(w.wrapping_add(m).wrapping_add(c));
+    base.wrapping_add(y ^ (x | !z)).rotate_left(s).wrapping_add(x)
+}
+
+#[inline(always)]
+fn md5_word(words: &[[u8; 4]], idx: usize) -> u32 {
+    u32::from_le_bytes(words[idx])
+}
+
+#[inline]
+pub fn compress_md5_blocks(state: &mut [u32; 4], blocks: &[[u8; 64]]) {
+    let [mut a, mut b, mut c, mut d] = *state;
+    for block in blocks {
+        let words = block.as_chunks::<4>().0;
+        let aa = a;
+        let bb = b;
+        let cc = c;
+        let dd = d;
+
+        a = md5_op_f(a, b, c, d, md5_word(words, 0), MD5_RC[0], 7);
+        d = md5_op_f(d, a, b, c, md5_word(words, 1), MD5_RC[1], 12);
+        c = md5_op_f(c, d, a, b, md5_word(words, 2), MD5_RC[2], 17);
+        b = md5_op_f(b, c, d, a, md5_word(words, 3), MD5_RC[3], 22);
+        a = md5_op_f(a, b, c, d, md5_word(words, 4), MD5_RC[4], 7);
+        d = md5_op_f(d, a, b, c, md5_word(words, 5), MD5_RC[5], 12);
+        c = md5_op_f(c, d, a, b, md5_word(words, 6), MD5_RC[6], 17);
+        b = md5_op_f(b, c, d, a, md5_word(words, 7), MD5_RC[7], 22);
+        a = md5_op_f(a, b, c, d, md5_word(words, 8), MD5_RC[8], 7);
+        d = md5_op_f(d, a, b, c, md5_word(words, 9), MD5_RC[9], 12);
+        c = md5_op_f(c, d, a, b, md5_word(words, 10), MD5_RC[10], 17);
+        b = md5_op_f(b, c, d, a, md5_word(words, 11), MD5_RC[11], 22);
+        a = md5_op_f(a, b, c, d, md5_word(words, 12), MD5_RC[12], 7);
+        d = md5_op_f(d, a, b, c, md5_word(words, 13), MD5_RC[13], 12);
+        c = md5_op_f(c, d, a, b, md5_word(words, 14), MD5_RC[14], 17);
+        b = md5_op_f(b, c, d, a, md5_word(words, 15), MD5_RC[15], 22);
+
+        a = md5_op_g(a, b, c, d, md5_word(words, 1), MD5_RC[16], 5);
+        d = md5_op_g(d, a, b, c, md5_word(words, 6), MD5_RC[17], 9);
+        c = md5_op_g(c, d, a, b, md5_word(words, 11), MD5_RC[18], 14);
+        b = md5_op_g(b, c, d, a, md5_word(words, 0), MD5_RC[19], 20);
+        a = md5_op_g(a, b, c, d, md5_word(words, 5), MD5_RC[20], 5);
+        d = md5_op_g(d, a, b, c, md5_word(words, 10), MD5_RC[21], 9);
+        c = md5_op_g(c, d, a, b, md5_word(words, 15), MD5_RC[22], 14);
+        b = md5_op_g(b, c, d, a, md5_word(words, 4), MD5_RC[23], 20);
+        a = md5_op_g(a, b, c, d, md5_word(words, 9), MD5_RC[24], 5);
+        d = md5_op_g(d, a, b, c, md5_word(words, 14), MD5_RC[25], 9);
+        c = md5_op_g(c, d, a, b, md5_word(words, 3), MD5_RC[26], 14);
+        b = md5_op_g(b, c, d, a, md5_word(words, 8), MD5_RC[27], 20);
+        a = md5_op_g(a, b, c, d, md5_word(words, 13), MD5_RC[28], 5);
+        d = md5_op_g(d, a, b, c, md5_word(words, 2), MD5_RC[29], 9);
+        c = md5_op_g(c, d, a, b, md5_word(words, 7), MD5_RC[30], 14);
+        b = md5_op_g(b, c, d, a, md5_word(words, 12), MD5_RC[31], 20);
+
+        a = md5_op_h(a, b, c, d, md5_word(words, 5), MD5_RC[32], 4);
+        d = md5_op_h(d, a, b, c, md5_word(words, 8), MD5_RC[33], 11);
+        c = md5_op_h(c, d, a, b, md5_word(words, 11), MD5_RC[34], 16);
+        b = md5_op_h(b, c, d, a, md5_word(words, 14), MD5_RC[35], 23);
+        a = md5_op_h(a, b, c, d, md5_word(words, 1), MD5_RC[36], 4);
+        d = md5_op_h(d, a, b, c, md5_word(words, 4), MD5_RC[37], 11);
+        c = md5_op_h(c, d, a, b, md5_word(words, 7), MD5_RC[38], 16);
+        b = md5_op_h(b, c, d, a, md5_word(words, 10), MD5_RC[39], 23);
+        a = md5_op_h(a, b, c, d, md5_word(words, 13), MD5_RC[40], 4);
+        d = md5_op_h(d, a, b, c, md5_word(words, 0), MD5_RC[41], 11);
+        c = md5_op_h(c, d, a, b, md5_word(words, 3), MD5_RC[42], 16);
+        b = md5_op_h(b, c, d, a, md5_word(words, 6), MD5_RC[43], 23);
+        a = md5_op_h(a, b, c, d, md5_word(words, 9), MD5_RC[44], 4);
+        d = md5_op_h(d, a, b, c, md5_word(words, 12), MD5_RC[45], 11);
+        c = md5_op_h(c, d, a, b, md5_word(words, 15), MD5_RC[46], 16);
+        b = md5_op_h(b, c, d, a, md5_word(words, 2), MD5_RC[47], 23);
+
+        a = md5_op_i(a, b, c, d, md5_word(words, 0), MD5_RC[48], 6);
+        d = md5_op_i(d, a, b, c, md5_word(words, 7), MD5_RC[49], 10);
+        c = md5_op_i(c, d, a, b, md5_word(words, 14), MD5_RC[50], 15);
+        b = md5_op_i(b, c, d, a, md5_word(words, 5), MD5_RC[51], 21);
+        a = md5_op_i(a, b, c, d, md5_word(words, 12), MD5_RC[52], 6);
+        d = md5_op_i(d, a, b, c, md5_word(words, 3), MD5_RC[53], 10);
+        c = md5_op_i(c, d, a, b, md5_word(words, 10), MD5_RC[54], 15);
+        b = md5_op_i(b, c, d, a, md5_word(words, 1), MD5_RC[55], 21);
+        a = md5_op_i(a, b, c, d, md5_word(words, 8), MD5_RC[56], 6);
+        d = md5_op_i(d, a, b, c, md5_word(words, 15), MD5_RC[57], 10);
+        c = md5_op_i(c, d, a, b, md5_word(words, 6), MD5_RC[58], 15);
+        b = md5_op_i(b, c, d, a, md5_word(words, 13), MD5_RC[59], 21);
+        a = md5_op_i(a, b, c, d, md5_word(words, 4), MD5_RC[60], 6);
+        d = md5_op_i(d, a, b, c, md5_word(words, 11), MD5_RC[61], 10);
+        c = md5_op_i(c, d, a, b, md5_word(words, 2), MD5_RC[62], 15);
+        b = md5_op_i(b, c, d, a, md5_word(words, 9), MD5_RC[63], 21);
+
+        a = a.wrapping_add(aa);
+        b = b.wrapping_add(bb);
+        c = c.wrapping_add(cc);
+        d = d.wrapping_add(dd);
+    }
+    *state = [a, b, c, d];
+}
+
+#[inline]
+fn finalize_md5_state(mut state: [u32; 4], tail: &[u8], total_bytes: u64) -> [u8; 16] {
+    debug_assert!(tail.len() < 64);
+    let mut pad = [0u8; 128];
+    pad[..tail.len()].copy_from_slice(tail);
+    pad[tail.len()] = 0x80;
+    let bit_len = total_bytes.wrapping_mul(8).to_le_bytes();
+    if tail.len() < 56 {
+        pad[56..64].copy_from_slice(&bit_len);
+        compress_md5_blocks(&mut state, pad[..64].as_chunks::<64>().0);
+    } else {
+        pad[120..128].copy_from_slice(&bit_len);
+        compress_md5_blocks(&mut state, pad.as_chunks::<64>().0);
+    }
+    let mut out = [0u8; 16];
+    out[0..4].copy_from_slice(&state[0].to_le_bytes());
+    out[4..8].copy_from_slice(&state[1].to_le_bytes());
+    out[8..12].copy_from_slice(&state[2].to_le_bytes());
+    out[12..16].copy_from_slice(&state[3].to_le_bytes());
+    out
+}
+
+/// Streaming MD5 hasher using critical-path ILP reassociation and direct slice chunking.
+#[derive(Clone, Debug)]
+pub struct FastMd5 {
+    state: [u32; 4],
+    buf: [u8; 64],
+    buf_len: usize,
+    total_bytes: u64,
+}
+
+impl Default for FastMd5 {
+    #[inline]
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl FastMd5 {
+    #[inline]
+    pub const fn new() -> Self {
+        Self {
+            state: MD5_INITIAL_STATE,
+            buf: [0u8; 64],
+            buf_len: 0,
+            total_bytes: 0,
+        }
+    }
+
+    #[inline]
+    pub fn reset(&mut self) {
+        self.state = MD5_INITIAL_STATE;
+        self.buf_len = 0;
+        self.total_bytes = 0;
+    }
+
+    #[inline]
+    pub fn update(&mut self, mut data: &[u8]) {
+        if data.is_empty() {
+            return;
+        }
+        self.total_bytes = self.total_bytes.wrapping_add(data.len() as u64);
+        if self.buf_len > 0 {
+            let need = 64 - self.buf_len;
+            if data.len() < need {
+                self.buf[self.buf_len..self.buf_len + data.len()].copy_from_slice(data);
+                self.buf_len += data.len();
+                return;
+            }
+            self.buf[self.buf_len..64].copy_from_slice(&data[..need]);
+            compress_md5_blocks(&mut self.state, std::slice::from_ref(&self.buf));
+            self.buf_len = 0;
+            data = &data[need..];
+        }
+        let (blocks, remainder) = data.as_chunks::<64>();
+        if !blocks.is_empty() {
+            compress_md5_blocks(&mut self.state, blocks);
+        }
+        if !remainder.is_empty() {
+            self.buf[..remainder.len()].copy_from_slice(remainder);
+            self.buf_len = remainder.len();
+        }
+    }
+
+    #[inline]
+    pub fn finalize_bytes(&self) -> [u8; 16] {
+        finalize_md5_state(self.state, &self.buf[..self.buf_len], self.total_bytes)
+    }
+
+    #[inline]
+    pub fn finalize(self) -> [u8; 16] {
+        self.finalize_bytes()
+    }
+
+    #[inline]
+    pub fn digest(data: &[u8]) -> [u8; 16] {
+        let mut state = MD5_INITIAL_STATE;
+        let (blocks, remainder) = data.as_chunks::<64>();
+        if !blocks.is_empty() {
+            compress_md5_blocks(&mut state, blocks);
+        }
+        finalize_md5_state(state, remainder, data.len() as u64)
+    }
+}
 
 /// Magic HH-256 key: HH-256 hash of first 100 decimals of π as utf-8 with zero key.
 const MAGIC_HIGHWAY_HASH256_KEY: [u8; 32] = [
@@ -113,7 +404,7 @@ impl HashAlgorithm {
     #[inline]
     pub fn hash_encode(&self, data: &[u8]) -> impl AsRef<[u8]> {
         match self {
-            HashAlgorithm::Md5 => HashEncoded::Md5(Md5::digest(data).into()),
+            HashAlgorithm::Md5 => HashEncoded::Md5(FastMd5::digest(data)),
             HashAlgorithm::HighwayHash256 => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
                 hasher.append(data);
@@ -148,11 +439,11 @@ impl HashAlgorithm {
     {
         match self {
             HashAlgorithm::Md5 => {
-                let mut hasher = Md5::new();
+                let mut hasher = FastMd5::new();
                 for slice in slices {
                     hasher.update(slice);
                 }
-                HashEncoded::Md5(hasher.finalize().into())
+                HashEncoded::Md5(hasher.finalize_bytes())
             }
             HashAlgorithm::HighwayHash256 => {
                 let mut hasher = HighwayHasher::new(MAGIC_HIGHWAY_HASH256_PARSED_KEY);
@@ -423,5 +714,25 @@ mod tests {
         let blake_hash1 = HashAlgorithm::BLAKE2b512.hash_encode(data1);
         let blake_hash2 = HashAlgorithm::BLAKE2b512.hash_encode(data2);
         assert_ne!(blake_hash1.as_ref(), blake_hash2.as_ref());
+    }
+
+    #[test]
+    fn fast_md5_matches_reference_across_boundaries_and_chunkings() {
+        use md5::{Digest as _, Md5};
+
+        for len in (0..=260).chain([511, 512, 513, 1024, 4096, 8193]) {
+            let data = generate_compat_test_data(len);
+            let expected: [u8; 16] = Md5::digest(&data).into();
+            assert_eq!(FastMd5::digest(&data), expected, "FastMd5::digest mismatch at len={len}");
+
+            for step in [1usize, 3, 7, 16, 31, 55, 56, 63, 64, 65, 128] {
+                let mut fast = FastMd5::new();
+                for chunk in data.chunks(step) {
+                    fast.update(chunk);
+                }
+                assert_eq!(fast.finalize_bytes(), expected, "FastMd5 streaming mismatch at len={len}, step={step}");
+                assert_eq!(fast.finalize(), expected, "FastMd5 repeated finalize mismatch at len={len}, step={step}");
+            }
+        }
     }
 }

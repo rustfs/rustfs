@@ -566,6 +566,74 @@ pub trait ListOperations: Send + Sync + fmt::Debug {
     ) -> Result<(), Self::Error>;
 }
 
+/// Quorum-backed enumeration for decisions that require proving object absence.
+///
+/// Consumers must drain the result stream and await successful completion before
+/// trusting the scan. An error or cancellation can follow partial results and
+/// leaves absence unproven. Callers coordinate concurrent mutations separately;
+/// this capability does not provide a snapshot or retain a mutation lock.
+#[async_trait::async_trait]
+pub trait AuthoritativeListOperations: ListOperations {
+    /// A bounded, authoritative page of an unversioned internal namespace.
+    /// Unlike ordinary S3 listing, uncertainty or a versioned/deleted entry is
+    /// an error. A nontruncated result proves EOF; truncated results resume at
+    /// their last returned key. This does not weaken full-walk absence checks.
+    /// Cancellation drops the scan workers and publishes no persistent cursor.
+    ///
+    /// # Errors
+    /// Returns an error for an invalid page size, unreadable metadata, insufficient
+    /// read quorum, or a producer cut that has no safe continuation key.
+    async fn list_unversioned_objects_authoritative(
+        self: Arc<Self>,
+        bucket: &str,
+        prefix: &str,
+        marker: Option<String>,
+        max_keys: i32,
+    ) -> Result<Self::ListObjectVersionsInfo, Self::Error>;
+
+    /// Enumerate an exact dotted leaf below identifier-like directory components
+    /// containing ASCII letters, digits, `_` or `-`. Noncandidate object metadata
+    /// is outside the scan. Namespace components may occur at any depth; reserved
+    /// words do not identify a subtree that can be skipped.
+    ///
+    /// Returned keys retain the quorum, unversioned, EOF and cancellation
+    /// guarantees of `list_unversioned_objects_authoritative`. Older peers may
+    /// perform extra I/O; the coordinator must filter their extra rows before
+    /// resolving metadata. Callers fence concurrent mutations separately.
+    ///
+    /// # Errors
+    /// Rejects an invalid directory prefix/leaf, invalid page size, uncertain
+    /// matching metadata, versioned entries or insufficient read quorum. Backends
+    /// without this capability return Unsupported; ordinary listing is not a fallback.
+    async fn list_identifier_tree_leaves_authoritative(
+        self: Arc<Self>,
+        _bucket: &str,
+        _prefix: &str,
+        _leaf: &str,
+        _marker: Option<String>,
+        _max_keys: i32,
+    ) -> Result<Self::ListObjectVersionsInfo, Self::Error>
+    where
+        Self::Error: From<std::io::Error>,
+    {
+        Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "authoritative identifier-tree listing is not supported").into())
+    }
+
+    /// Resolves every set at its version read quorum, including reserved prefixes.
+    ///
+    /// # Errors
+    /// Returns an error when a set cannot establish quorum, metadata cannot be
+    /// resolved, or enumeration is interrupted. Retry starts a new scan.
+    async fn walk_authoritative(
+        self: Arc<Self>,
+        rx: Self::WalkCancellation,
+        bucket: &str,
+        prefix: &str,
+        result: Self::WalkResultSender,
+        opts: Self::WalkOptions,
+    ) -> Result<(), Self::Error>;
+}
+
 #[async_trait::async_trait]
 #[allow(clippy::too_many_arguments)]
 pub trait MultipartOperations: Send + Sync + fmt::Debug {

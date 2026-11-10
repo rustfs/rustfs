@@ -30,6 +30,7 @@ pub(super) struct NativeApplyPause {
 #[cfg(test)]
 tokio::task_local! {
     pub(super) static AFTER_NATIVE_APPLY: Arc<NativeApplyPause>;
+    pub(super) static AFTER_NATIVE_POOL_APPLY: Arc<NativeApplyPause>;
 }
 
 struct InspectedPool {
@@ -168,6 +169,7 @@ async fn plan(
     canonical: &[u8],
     revision: PoolMetaRevision,
     identity: &[u8],
+    rollback: Option<&[u8]>,
 ) -> Result<Vec<Vec<Bytes>>> {
     let mut pending = Vec::<Vec<u8>>::new();
     let mut predecessors = Vec::<Vec<u8>>::new();
@@ -223,23 +225,83 @@ async fn plan(
             }
         }
     }
-    let mut obsolete = Vec::<Vec<u8>>::new();
-    for payload in &decoded {
-        match decode_pool_meta_replica(payload.clone()) {
-            PoolMetaReplica::Valid {
+    // The last ordinary PREPARE can itself become split during rollback. In
+    // that case another pool already exposes the restored ordinary COMMIT.
+    // Its authority permits continuing the rollback, never promoting a child
+    // transaction reconstructed from disk evidence.
+    let mut continuation: Option<(Vec<u8>, PoolMetaRevision)> = None;
+    if rollback.is_none() {
+        let mut outstanding = Vec::new();
+        for pool in inspected {
+            for (index, snapshot) in pool.snapshots.iter().enumerate() {
+                let raw = snapshot.current.as_ref().ok_or_else(invalid)?;
+                if codec::validate_inline_pool_meta_shard(raw, index, canonical).await.is_err() {
+                    outstanding.push((index, raw));
+                }
+            }
+        }
+        for payload in &decoded {
+            if let PoolMetaReplica::Valid {
                 canonical: candidate,
                 revision: candidate_revision,
                 committed: false,
                 previous: Some(previous),
                 ..
-            } if candidate_revision == revision && candidate == canonical => {
-                if !pending.contains(payload) {
-                    pending.push(payload.clone());
+            } = decode_pool_meta_replica(payload.clone())
+                && previous.revision == revision
+                && previous.canonical == canonical
+            {
+                let mut matches = true;
+                for (index, raw) in &outstanding {
+                    matches &= codec::validate_inline_pool_meta_shard(raw, *index, payload).await.is_ok()
+                        || codec::validate_inline_pool_meta_shard(raw, *index, &candidate).await.is_ok();
                 }
-                if !predecessors.contains(&previous.canonical) {
-                    predecessors.push(previous.canonical);
+                if matches {
+                    if !outstanding.is_empty()
+                        && continuation.as_ref().is_some_and(|(selected, selected_revision)| {
+                            selected != &candidate || *selected_revision != candidate_revision
+                        })
+                    {
+                        return Err(known_validation(invalid(), "native_transaction_validation"));
+                    }
+                    continuation.get_or_insert((candidate, candidate_revision));
                 }
             }
+        }
+    }
+    let (canonical, revision, rollback) = match &continuation {
+        Some((transaction, next_revision)) => (transaction.as_slice(), *next_revision, Some(canonical)),
+        None => (canonical, revision, rollback),
+    };
+    for payload in &decoded {
+        if let PoolMetaReplica::Valid {
+            canonical: candidate,
+            revision: candidate_revision,
+            committed: false,
+            previous: Some(previous),
+            ..
+        } = decode_pool_meta_replica(payload.clone())
+            && candidate_revision == revision
+            && candidate == canonical
+        {
+            pending.push(payload.clone());
+            if !predecessors.contains(&previous.canonical) {
+                predecessors.push(previous.canonical);
+            }
+        }
+    }
+    if pending.len() > 1 {
+        return Err(known_validation(
+            Error::other("native V3 prepare records disagree on the predecessor"),
+            "native_transaction_validation",
+        ));
+    }
+    let mut obsolete = Vec::<Vec<u8>>::new();
+    for payload in &decoded {
+        if pending.contains(payload) {
+            continue;
+        }
+        match decode_pool_meta_replica(payload.clone()) {
             PoolMetaReplica::Valid { revision: older, .. }
                 if older.is_generation_protocol()
                     && older.cluster_id == revision.cluster_id
@@ -249,6 +311,23 @@ async fn plan(
                 // Retained evidence from an earlier successful recovery is
                 // obsolete, not a competing commit authority. It remains
                 // fully reconstructed and bound into the native CAS.
+                obsolete.push(payload.clone());
+            }
+            PoolMetaReplica::Valid {
+                revision: abandoned,
+                committed: false,
+                previous: Some(previous),
+                ..
+            } if abandoned.is_generation_protocol()
+                && abandoned.cluster_id == revision.cluster_id
+                && abandoned.epoch == revision.epoch
+                && abandoned.generation == revision.generation
+                && abandoned.transaction_id != revision.transaction_id
+                && predecessors.contains(&previous.canonical) =>
+            {
+                // A rollback retains the failed PREPARE as evidence. A later
+                // transaction may reuse that generation, but only a backup of
+                // an uncommitted sibling with the same predecessor is obsolete.
                 obsolete.push(payload.clone());
             }
             PoolMetaReplica::Valid {
@@ -272,13 +351,7 @@ async fn plan(
             _ => {}
         }
     }
-    if pending.len() > 1 {
-        return Err(known_validation(
-            Error::other("native V3 prepare records disagree on the predecessor"),
-            "native_transaction_validation",
-        ));
-    }
-    if pending.is_empty() {
+    if pending.is_empty() || rollback.is_some_and(|previous| !predecessors.iter().any(|candidate| candidate == previous)) {
         return Err(invalid());
     }
     for payload in &decoded {
@@ -294,13 +367,25 @@ async fn plan(
         for (index, snapshot) in pool.snapshots.iter().enumerate() {
             let raw = snapshot.current.as_ref().ok_or_else(invalid)?;
             let mut matched = false;
-            for payload in std::iter::once(canonical).chain(pending.iter().map(Vec::as_slice)) {
+            for payload in std::iter::once(canonical)
+                .chain(pending.iter().map(Vec::as_slice))
+                .chain(rollback)
+            {
                 matched |= codec::validate_inline_pool_meta_shard(raw, index, payload).await.is_ok();
             }
             if !matched {
                 return Err(invalid());
             }
             for backup in &snapshot.backups {
+                if rollback.is_some()
+                    && codec::validate_inline_pool_meta_shard(&backup.data, index, canonical)
+                        .await
+                        .is_ok()
+                {
+                    // A retained COMMIT might have been authoritative before
+                    // this interruption. Never roll it back from PREPARE alone.
+                    return Err(invalid());
+                }
                 let mut matched = false;
                 for payload in std::iter::once(canonical).chain(
                     pending
@@ -323,7 +408,7 @@ async fn plan(
     let mut replacements = Vec::with_capacity(inspected.len());
     for pool in inspected {
         replacements.push(
-            codec::encode_inline_pool_meta_replicas(&current(pool)?, canonical, modified)
+            codec::encode_inline_pool_meta_replicas(&current(pool)?, rollback.unwrap_or(canonical), modified)
                 .await
                 .map_err(|error| codec_validation(error, "native_metadata_validation"))?,
         );
@@ -338,10 +423,12 @@ pub(super) async fn repair(
 ) -> Result<bool> {
     fence.ensure_held()?;
     let reads = read_pool_meta_replicas(store.pools.clone(), true).await;
-    if !reads
+    let unreadable = reads
         .iter()
-        .any(|read| matches!(read.replica, PoolMetaReplica::Unreadable(_)))
-    {
+        .enumerate()
+        .filter_map(|(index, read)| matches!(read.replica, PoolMetaReplica::Unreadable(_)).then_some(index))
+        .collect::<Vec<_>>();
+    if unreadable.is_empty() {
         return Ok(false);
     }
     state.ensure_write_safe("native pool metadata recovery")?;
@@ -360,8 +447,9 @@ pub(super) async fn repair(
     {
         return Err(invalid());
     }
-    // Only an ordinary, successfully read COMMIT grants authority. Rebuilding
-    // two erasure shards below proves integrity, never a commit decision.
+    // Ordinary reads grant authority: a COMMIT selects its own state, while a
+    // PREPARE can select only its acknowledged predecessor. Reconstruction
+    // below proves integrity and never promotes an interrupted transaction.
     let ordinary_commits = reads
         .iter()
         .filter_map(|read| match &read.replica {
@@ -375,7 +463,22 @@ pub(super) async fn repair(
             _ => None,
         })
         .collect::<Vec<_>>();
-    if ordinary_commits.is_empty() {
+    let ordinary_prepares = reads
+        .iter()
+        .filter_map(|read| match &read.replica {
+            PoolMetaReplica::Valid {
+                canonical,
+                revision,
+                committed: false,
+                previous: Some(previous),
+                ..
+            } if revision.is_generation_protocol() && previous.revision.is_generation_protocol() => {
+                Some((canonical.clone(), *revision, previous.canonical.clone()))
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    if ordinary_commits.is_empty() && ordinary_prepares.is_empty() {
         return Err(invalid());
     }
     let selection = select_pool_meta_replica_reads(reads)
@@ -395,10 +498,20 @@ pub(super) async fn repair(
         return Err(invalid());
     }
     let canonical = selection.canonical.as_ref().ok_or_else(invalid)?;
+    let mut rollback = None;
+    for (pending, revision, previous) in &ordinary_prepares {
+        if previous == canonical {
+            if rollback.is_some_and(|candidate| candidate != (pending, *revision)) {
+                return Err(latch_validation(state, known_validation(invalid(), "native_transaction_validation")));
+            }
+            rollback = Some((pending, *revision));
+        }
+    }
     if !selection.revision.is_generation_protocol()
-        || !ordinary_commits
-            .iter()
-            .any(|(raw, revision)| raw == canonical && *revision == selection.revision)
+        || (rollback.is_none()
+            && !ordinary_commits
+                .iter()
+                .any(|(raw, revision)| raw == canonical && *revision == selection.revision))
     {
         return Err(invalid());
     }
@@ -445,13 +558,18 @@ pub(super) async fn repair(
         .await
         .map_err(|error| latch_validation(state, error))?;
     let inspected = inspect(&store.pools, fence).await?;
-    let replacements = plan(&inspected, canonical, selection.revision, &identity_bytes)
+    let (transaction, revision) = rollback.unwrap_or((canonical, selection.revision));
+    let replacements = plan(&inspected, transaction, revision, &identity_bytes, rollback.map(|_| canonical.as_slice()))
         .await
         .map_err(|error| latch_validation(state, error))?;
     fence.ensure_held()?;
     let mut arm = state.arm_transaction();
     arm.phase = Some("native_repair_apply");
-    for (pool, replacements) in inspected.iter().zip(replacements) {
+    let mut apply_order = inspected.iter().zip(replacements).enumerate().collect::<Vec<_>>();
+    // Preserve ordinary authority until all unreadable pools are repaired.
+    // Cancellation can then resume from a PREPARE or a restored COMMIT.
+    apply_order.sort_by_key(|(index, _)| !unreadable.contains(index));
+    for (_, (pool, replacements)) in apply_order {
         for ((disk, snapshot), replacement) in pool.disks.iter().zip(&pool.snapshots).zip(replacements) {
             fence.ensure_held()?;
             let request = Request::Apply {
@@ -465,6 +583,11 @@ pub(super) async fn repair(
                 Response::Applied => {}
                 _ => return Err(invalid()),
             }
+        }
+        #[cfg(test)]
+        if let Ok(pause) = AFTER_NATIVE_POOL_APPLY.try_with(Arc::clone) {
+            pause.reached.notify_one();
+            pause.resume.notified().await;
         }
     }
     #[cfg(test)]
@@ -627,7 +750,7 @@ mod tests {
     #[tokio::test]
     async fn pool_meta_native_plan_restores_physical_split_with_fresh_common_identity() {
         let f = fixture().await;
-        let repaired = plan(&f.pools, &f.commit, f.revision, &f.identity).await.unwrap();
+        let repaired = plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.unwrap();
         assert_eq!(repaired.len(), 4);
         for pool in repaired {
             assert_eq!(
@@ -648,7 +771,7 @@ mod tests {
         let mut f = fixture().await;
         let wrong = replicas(b"different identity", f.modified).await;
         f.pools[0].snapshots[0].identity = Some(wrong[0].clone());
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_err());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
     }
 
     #[tokio::test]
@@ -671,10 +794,10 @@ mod tests {
         .unwrap();
         let wrong = replicas(&higher, f.modified + Duration::seconds(2)).await;
         f.pools[0].snapshots[0].current = Some(wrong[0].clone());
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_err());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
         f.pools[0].snapshots[0].current = Some(replicas(&f.pending, f.modified).await[0].clone());
         f.pools[0].snapshots[0].backups[0].data = wrong[0].clone();
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_err());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
     }
 
     #[tokio::test]
@@ -717,17 +840,17 @@ mod tests {
             }
         }
         assert!(older_pending != f.pending);
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_ok());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_ok());
     }
 
     #[tokio::test]
     async fn pool_meta_native_plan_rejects_missing_or_corrupt_evidence() {
         let mut f = fixture().await;
         let before = f.pools[1].snapshots[2].current.take();
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_err());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
         f.pools[1].snapshots[2].current = before;
         f.pools[1].snapshots[2].backups[0].data = Bytes::from_static(b"invalid metadata");
-        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity).await.is_err());
+        assert!(plan(&f.pools, &f.commit, f.revision, &f.identity, None).await.is_err());
     }
 }
 

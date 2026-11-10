@@ -918,3 +918,33 @@ async fn committed_predecessor_is_collectible_once_its_successor_is_verified() {
         "the verified successor keeps its own record until cleanup"
     );
 }
+
+#[tokio::test]
+async fn handoff_preserves_bucket_pass_protocol_and_rewinds_successor_progress() {
+    let (_dirs, parent, execution) = fixture(1).await;
+    let identities = [("bucket-a".to_string(), Uuid::new_v4())].into_iter().collect();
+    {
+        let mut state = parent.state.write().await;
+        state.replacement_execution_protocol = 2;
+        state.replacement_bucket_incarnations = Some(identities);
+        state.resume_cursor = Some("old-pass-cursor".to_string());
+    }
+    parent.save_state_strict().await.expect("persist identity-bound predecessor");
+    let child = parent
+        .prepare_replacement_handoff(&execution, Vec::new())
+        .await
+        .expect("handoff protocol two");
+    let state = child.get_state().await;
+    assert_eq!(state.replacement_execution_protocol, 2);
+    assert_eq!(
+        state.replacement_bucket_incarnations,
+        parent.get_state().await.replacement_bucket_incarnations
+    );
+    assert!(state.replacement_bucket_pass_reset_pending);
+    assert!(state.resume_cursor.is_none());
+    assert!(state.completed_buckets.is_empty());
+    let recovered = ResumeManager::load_replacement_intent(child.disk.clone(), &state.task_id)
+        .await
+        .expect("reload protocol-two successor");
+    assert_eq!(recovered.get_state().await, state);
+}

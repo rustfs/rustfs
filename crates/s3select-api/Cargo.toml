@@ -64,6 +64,8 @@ async-compression = { workspace = true, features = ["tokio", "gzip", "bzip2"] }
 async-trait.workspace = true
 arc-swap.workspace = true
 bytes = { workspace = true, features = ["serde"] }
+base64-simd.workspace = true
+flatbuffers.workspace = true
 chrono = { workspace = true, features = ["serde"] }
 crc-fast.workspace = true
 rustfs-common.workspace = true
@@ -73,6 +75,9 @@ rustfs-storage-api.workspace = true
 futures = { workspace = true }
 futures-core = { workspace = true }
 flate2.workspace = true
+brotli.workspace = true
+lz4.workspace = true
+lz4_flex.workspace = true
 http.workspace = true
 memchr.workspace = true
 s3s = { workspace = true, features = ["minio"] }
@@ -88,7 +93,7 @@ transform-stream.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-rustfs-test-utils = { workspace = true, features = ["put-object-commit-barrier"] }
+rustfs-test-utils = { workspace = true }
 serial_test.workspace = true
 
 [lib]

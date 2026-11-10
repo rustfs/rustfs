@@ -858,13 +858,24 @@ impl FileMetaVersion {
             VersionType::Object => self
                 .object
                 .as_ref()
-                .map(|v| v.erasure_algorithm.valid() && v.bitrot_checksum_algo.valid() && v.mod_time.is_some())
+                .map(|v| {
+                    v.erasure_algorithm.valid()
+                        && v.bitrot_checksum_algo.valid()
+                        && v.mod_time.is_some_and(|time| {
+                            let nanos = time.unix_timestamp_nanos();
+                            nanos != 0 && i64::try_from(nanos).is_ok()
+                        })
+                })
                 .unwrap_or_default(),
             VersionType::Legacy => self.legacy_object.as_ref().map(MetaObjectV1::valid).unwrap_or_default(),
             VersionType::Delete => self
                 .delete_marker
                 .as_ref()
-                .map(|v| v.mod_time.unwrap_or(OffsetDateTime::UNIX_EPOCH) > OffsetDateTime::UNIX_EPOCH)
+                .map(|v| {
+                    v.mod_time.is_some_and(|time| {
+                        time > OffsetDateTime::UNIX_EPOCH && i64::try_from(time.unix_timestamp_nanos()).is_ok()
+                    })
+                })
                 .unwrap_or_default(),
             _ => false,
         }
@@ -1335,6 +1346,7 @@ impl<'a> BorrowedMetaObject<'a> {
                             checksums: None,
                             error: None,
                             integrity: None,
+                            encrypted_etag: false,
                         });
                     }
                 }
@@ -2614,6 +2626,7 @@ impl From<MetaObjectV1Part> for ObjectPartInfo {
             checksums: value.checksums,
             error: value.error,
             integrity: None,
+            encrypted_etag: false,
         }
     }
 }

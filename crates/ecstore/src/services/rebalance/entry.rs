@@ -283,6 +283,17 @@ impl ECStore {
             arrived.notify_one();
             release.notified().await;
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        tokio::select! {
+            // Stop must drain this pause before taking the activation writer.
+            _ = cancel.cancelled() => return Err(Error::OperationCanceled),
+            result = data_movement::e2e_barrier::wait(
+                "rebalance",
+                bucket.as_str(),
+                entry.name.as_str(),
+                data_movement::e2e_barrier::STAGE_AFTER_ENTRY_ADMISSION,
+            ) => result.map_err(Error::from)?,
+        }
         let lock_lost_signal = run_guard.lock_lost_signal();
         #[cfg(test)]
         let _run_signal_test_fence = lock_lost_signal
@@ -1899,6 +1910,10 @@ mod tests {
                 &ObjectOptions {
                     version_id: Some(version_id.to_string()),
                     mod_time: earlier(version.mod_time),
+                    // Without the object lock the rename waits for every
+                    // drive, so no early-ACK tail is still writing the copies
+                    // removed below.
+                    no_lock: true,
                     ..versioned
                 },
             ))
@@ -2237,6 +2252,195 @@ mod tests {
             .expect("large-stack rebalance test thread should spawn")
             .join()
             .expect("large-stack rebalance test thread should complete");
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn real_rebalance_preserves_encrypted_multipart_etag_proof() {
+        run_large_stack_async_test("rebalance-encrypted-multipart-etag", || async {
+            use crate::io_support::rio::{HashReader, WriteEncryption, WritePlan};
+            use rustfs_utils::http::{SSEC_ALGORITHM_HEADER, SUFFIX_OPAQUE_ENCRYPTED_ETAG, etag_can_be_listed};
+
+            const REBALANCE_ID: &str = "rebalance-encrypted-multipart-etag";
+            for (object, versioned, protected) in [
+                ("protected-version", true, true),
+                ("protected-null", false, true),
+                ("legacy-version", true, false),
+                ("legacy-null", false, false),
+            ] {
+                // Each case needs a fresh progress counter: the fixture's small
+                // capacity can reach its rebalance goal after one encrypted object.
+                let (_temp_dirs, store, _peer) =
+                    crate::services::rebalance::test_two_pool_stores_with_isolated_node_contexts(None).await;
+                let bucket = "rebalance-encrypted-etag";
+                Box::pin(store.make_bucket(
+                    bucket,
+                    &MakeBucketOptions {
+                        versioning_enabled: versioned,
+                        ..Default::default()
+                    },
+                ))
+                .await
+                .expect("create the migration bucket");
+                prepare_rebalance_test_volumes(&store).await;
+                let incarnation = store.bucket_incarnation_id(bucket).await.expect("bucket incarnation");
+                let rebalance_meta = active_rebalance_meta(REBALANCE_ID);
+                rebalance_meta
+                    .save(Arc::clone(&store.pools[0]))
+                    .await
+                    .expect("persist active rebalance");
+                *store.rebalance_meta.write().await = Some(rebalance_meta);
+
+                let source_set = store.pools[0].get_disks_by_key(object);
+                let target_set = store.pools[1].get_disks_by_key(object);
+                let write_opts = ObjectOptions {
+                    versioned,
+                    user_defined: std::collections::HashMap::from([(SSEC_ALGORITHM_HEADER.to_owned(), "AES256".to_owned())]),
+                    ..Default::default()
+                };
+                let upload = Box::pin(source_set.new_multipart_upload(bucket, object, &write_opts))
+                    .await
+                    .expect("create source encrypted multipart upload");
+                let plaintext = b"encrypted multipart bytes must survive pool migration";
+                let size = i64::try_from(plaintext.len()).expect("small fixture length");
+                let source = HashReader::from_stream(std::io::Cursor::new(plaintext.to_vec()), size, size, None, None, false)
+                    .expect("plaintext source reader");
+                let encrypted = WritePlan::new()
+                    .with_encryption(WriteEncryption::multipart([7; 32], [9; 12], 1))
+                    .apply(source, size)
+                    .expect("encrypt the source part through the production writer");
+                let mut part_opts = write_opts.clone();
+                if !protected {
+                    // Model a retained legacy fingerprint without producer proof.
+                    part_opts.preserve_etag = Some("0123456789abcdef0123456789abcdef".to_owned());
+                }
+                let part = Box::pin(source_set.put_object_part(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    1,
+                    &mut PutObjReader::new(encrypted),
+                    &part_opts,
+                ))
+                .await
+                .expect("persist source encrypted part");
+                let written = Box::pin(Arc::clone(&source_set).complete_multipart_upload(
+                    bucket,
+                    object,
+                    &upload.upload_id,
+                    vec![CompletePart {
+                        part_num: part.part_num,
+                        etag: part.etag,
+                        ..Default::default()
+                    }],
+                    &write_opts,
+                ))
+                .await
+                .expect("complete source encrypted multipart upload");
+                assert_eq!(written.version_id.is_some(), versioned);
+                assert!(written.is_multipart(), "the actual migration must use its multipart path");
+                assert_eq!(etag_can_be_listed(&written.user_defined), protected);
+                let read_opts = ObjectOptions {
+                    version_id: Some(data_movement::data_movement_exact_version_id(written.version_id)),
+                    data_movement: true,
+                    raw_data_movement_read: true,
+                    ..Default::default()
+                };
+                let source_bytes = {
+                    let mut reader = Box::pin(source_set.get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts))
+                        .await
+                        .expect("read source ciphertext");
+                    let mut bytes = Vec::new();
+                    reader
+                        .stream
+                        .read_to_end(&mut bytes)
+                        .await
+                        .expect("collect source ciphertext");
+                    bytes
+                };
+                assert_ne!(source_bytes.as_slice(), plaintext, "the fixture must contain encrypted bytes");
+                let entry = metacache_entry_from_source(&source_set, bucket, object).await;
+                let outcome = tokio::time::timeout(
+                    StdDuration::from_secs(60),
+                    Box::pin(Arc::clone(&store).rebalance_entry(
+                        RebalanceEntryTarget {
+                            bucket: bucket.to_owned(),
+                            pool_index: 0,
+                        },
+                        entry,
+                        Arc::clone(&source_set),
+                        Arc::new(RebalanceBucketConfigs {
+                            bucket_incarnation_id: Some(incarnation),
+                            ..Default::default()
+                        }),
+                        Arc::from(REBALANCE_ID),
+                        CancellationToken::new(),
+                    )),
+                )
+                .await
+                .expect("rebalance must finish within the test deadline")
+                .expect("rebalance source entry");
+                let target = match target_set.get_object_info(bucket, object, &read_opts).await {
+                    Ok(target) => target,
+                    Err(err) => {
+                        let target_versions = target_set
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .expect("inspect target after metadata read failure")
+                            .map(|versions| {
+                                versions
+                                    .versions
+                                    .into_iter()
+                                    .map(|version| version.version_id)
+                                    .collect::<Vec<_>>()
+                            });
+                        let source_versions = source_set
+                            .load_file_info_versions_exact(bucket, object)
+                            .await
+                            .expect("inspect source after metadata read failure")
+                            .map(|versions| {
+                                versions
+                                    .versions
+                                    .into_iter()
+                                    .map(|version| version.version_id)
+                                    .collect::<Vec<_>>()
+                            });
+                        panic!(
+                            "read migrated {object}: {err}; outcome={outcome:?}, expected_version={:?}, target_versions={target_versions:?}, source_versions={source_versions:?}",
+                            written.version_id
+                        );
+                    }
+                };
+                assert_eq!(target.version_id, written.version_id, "{object}");
+                assert_eq!(target.etag, written.etag, "{object}");
+                assert_eq!(
+                    rustfs_utils::http::get_consistent_str(&target.user_defined, SUFFIX_OPAQUE_ENCRYPTED_ETAG),
+                    protected.then_some("v1"),
+                    "aggregate ETag proof must follow the exact source version for {object}"
+                );
+                assert_eq!(etag_can_be_listed(&target.user_defined), protected, "{object}");
+                assert_eq!(outcome, RebalanceEntryOutcome::Completed, "{object}");
+                let mut target_reader =
+                    Box::pin(target_set.get_object_reader(bucket, object, None, HeaderMap::new(), &read_opts))
+                        .await
+                        .expect("read target ciphertext");
+                let mut target_bytes = Vec::new();
+                target_reader
+                    .stream
+                    .read_to_end(&mut target_bytes)
+                    .await
+                    .expect("collect target ciphertext");
+                assert_eq!(target_bytes, source_bytes, "rebalance preserves ciphertext bytes for {object}");
+                assert!(
+                    source_set
+                        .load_file_info_versions_exact(bucket, object)
+                        .await
+                        .expect("inspect source after migration")
+                        .is_none(),
+                    "source cleanup follows a verified target for {object}"
+                );
+            }
+        });
     }
 
     const TRANSITIONED_REBALANCE_ID: &str = "rebalance-transitioned-source-cleanup";

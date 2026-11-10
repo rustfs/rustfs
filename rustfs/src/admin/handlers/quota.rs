@@ -30,7 +30,6 @@ use crate::admin::storage_api::contract::bucket::{BucketOperations as _, BucketO
 use crate::auth::{check_key_valid, get_session_token};
 use crate::error::ApiError;
 use crate::server::ADMIN_PREFIX;
-use crate::server::RemoteAddr;
 use hyper::{Method, StatusCode};
 use matchit::Params;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
@@ -397,7 +396,7 @@ impl Operation for SetBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request(
             &req.headers,
             &cred,
@@ -538,7 +537,7 @@ impl Operation for GetBucketQuotaHandler {
         if bucket.is_empty() {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
@@ -607,7 +606,7 @@ impl Operation for ClearBucketQuotaHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request(
             &req.headers,
             &cred,
@@ -726,7 +725,7 @@ impl Operation for GetBucketQuotaStatsHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
@@ -795,7 +794,7 @@ impl Operation for CheckBucketQuotaHandler {
             return Err(s3_error!(InvalidRequest, "bucket name is required"));
         }
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request_with_bucket(
             &req.headers,
             &cred,
@@ -890,7 +889,7 @@ impl Operation for MigrateBucketQuotaProtocolHandler {
         let (cred, owner) =
             check_key_valid(get_session_token(&req.uri, &req.headers).unwrap_or_default(), &cred.access_key).await?;
 
-        let remote_addr = req.extensions.get::<Option<RemoteAddr>>().and_then(|opt| opt.map(|a| a.0));
+        let remote_addr = crate::admin::auth::policy_source_addr(&req.extensions);
         validate_admin_request(
             &req.headers,
             &cred,

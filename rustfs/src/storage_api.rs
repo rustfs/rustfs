@@ -186,10 +186,13 @@ pub(crate) mod server {
         pub(crate) use crate::storage::storage_api::ecstore_disk::{
             DiskAPI, DiskOption, new_disk, with_background_resource_unit,
         };
+        #[cfg(test)]
+        pub(crate) use crate::storage::storage_api::ecstore_rpc::RpcReplayCacheAdmissionError;
         pub(crate) use crate::storage::storage_api::{
-            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience, rpc_background_admission,
-            tonic_boot_epoch_challenge, tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason,
-            verify_tonic_rpc_signature_with_bootstrap, with_remote_background_io,
+            RemoteBackgroundIo, ServerContextSlot, TONIC_RPC_PREFIX, normalize_tonic_rpc_audience,
+            rpc_auth_is_resource_exhausted, rpc_background_admission, tonic_boot_epoch_challenge,
+            tonic_boot_epoch_response_headers, tonic_rpc_auth_failure_reason, verify_tonic_rpc_signature_with_bootstrap,
+            with_remote_background_io,
         };
 
         pub(crate) fn try_current_local_node_name() -> Option<String> {
@@ -483,6 +486,7 @@ pub(crate) mod workload {
 pub(crate) mod table {
     pub(crate) use crate::storage::storage_api::ecstore_bucket::utils::check_valid_bucket_name_strict;
     pub(crate) use crate::storage::storage_api::ecstore_object::{WriteCommitGuard, WriteCompletion};
+    pub(crate) use crate::storage::storage_api::request_context_consumer::spawn_traced_join;
     pub(crate) mod contract {
         pub(crate) mod http {
             pub(crate) use super::super::super::storage_contracts::HTTPPreconditions;
@@ -490,12 +494,17 @@ pub(crate) mod table {
 
         pub(crate) mod list {
             pub(crate) use super::super::super::storage_contracts::{
-                ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr, WalkOptions,
+                AuthoritativeListOperations, ListObjectVersionsInfo, ListObjectsV2Info, ListOperations, ObjectInfoOrErr,
+                WalkOptions,
             };
         }
 
         pub(crate) mod namespace {
             pub(crate) use super::super::super::storage_contracts::NamespaceLocking;
+        }
+
+        pub(crate) mod multipart {
+            pub(crate) use super::super::super::storage_contracts::MultipartUploadInspection;
         }
 
         pub(crate) mod object {
@@ -513,6 +522,11 @@ pub(crate) mod table {
         StorageObjectInfo, StorageObjectOptions, StorageObjectToDelete, StoragePutObjReader, get_bucket_metadata,
         get_lock_acquire_timeout, table_catalog_path_hash,
     };
+
+    #[cfg(test)]
+    pub(crate) mod test_support {
+        pub(crate) use crate::storage::storage_api::contract::bucket::{BucketOperations, MakeBucketOptions};
+    }
 }
 
 pub(crate) mod on_demand_migration {

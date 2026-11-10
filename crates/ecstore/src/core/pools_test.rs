@@ -527,8 +527,8 @@ mod decommission_lock_order_tests {
             rebalance_meta: tokio::sync::RwLock::new(other_store.rebalance_meta.read().await.clone()),
             decommission_cancelers: tokio::sync::RwLock::new(vec![None; other_store.pools.len()]),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(
-                other_store.pool_meta_save_gate.lock().await.independent_clone_for_test(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(
+                other_store.pool_meta_save_gate.write().await.independent_clone_for_test(),
             ),
             ctx,
             bucket_fence_registry: Arc::default(),
@@ -1616,7 +1616,7 @@ mod decommission_lock_order_tests {
             run_routine_to_a_deferral_pause(
                 &store,
                 1,
-                "target pool 1 no longer fits the selected mutation: source pool 0 reservation estimate is exhausted",
+                "target pool 1 no longer fits the selected mutation: target pool 1 reservation requires",
             )
             .await;
         });
@@ -1647,7 +1647,7 @@ mod decommission_lock_order_tests {
             run_routine_to_a_deferral_pause(
                 &store,
                 1,
-                "target pool 1 no longer fits the selected mutation: source pool 0 reservation estimate is exhausted",
+                "target pool 1 no longer fits the selected mutation: target pool 1 reservation requires",
             )
             .await;
         });
@@ -6062,6 +6062,12 @@ mod decommission_lock_order_tests {
             )
             .await
             .expect("read the next source object for the multipart capacity oracle");
+        // Reconciled bytes remain charged. With no physical room for a new
+        // reservation, a distinct mutation must fail instead of reusing them.
+        let mut exhausted_capacity = capacity_snapshot();
+        exhausted_capacity[2] = DecommissionPoolCapacityInfo::for_test(2, layout, 0, target_total, target_total);
+        set_decommission_capacity_info_overrides_for_test(other_store.id, vec![exhausted_capacity]);
+
         let next_result = tokio::time::timeout(
             Duration::from_secs(30),
             data_movement::migrate_decommission_object(
@@ -7827,6 +7833,12 @@ mod decommission_lock_order_tests {
             .expect("same-mutation retry should publish a readable target");
         assert_eq!(retry_info.size, i64::try_from(body.len()).expect("test body size fits i64"));
 
+        // Reconciled bytes remain charged. With no physical room for a new
+        // reservation, a distinct mutation must fail instead of reusing them.
+        let mut exhausted_capacity = capacity_snapshot();
+        exhausted_capacity[2] = DecommissionPoolCapacityInfo::for_test(2, layout, 0, target_total, target_total);
+        set_decommission_capacity_info_overrides_for_test(other_store.id, vec![exhausted_capacity]);
+
         let next_object = "data-movement-put-after-retry.bin";
         let next_version_id = uuid::Uuid::new_v4().to_string();
         let mut next_opts = ObjectOptions {
@@ -7841,7 +7853,11 @@ mod decommission_lock_order_tests {
         let next_result = other_store
             .put_object_for_data_movement(RUSTFS_META_BUCKET, next_object, &mut next_data, &next_opts, None)
             .await;
-        assert!(next_result.is_err(), "a different mutation must not reuse A's recovered capacity");
+        let next_error = match next_result {
+            Err(error) | Ok((_, Err(error))) => error,
+            Ok((_, Ok(_))) => panic!("a different mutation must not reuse A's recovered capacity"),
+        };
+        assert!(next_error.to_string().contains("decommission_capacity_blocked"), "{next_error}");
         let next_target_err = other_store.pools[2]
             .get_object_info(
                 RUSTFS_META_BUCKET,
@@ -9929,6 +9945,12 @@ mod decommission_lock_order_tests {
             )
             .await
             .expect("read the next source object for the capacity oracle");
+        // Reconciled bytes remain charged. With no physical room for a new
+        // reservation, a distinct mutation must fail instead of reusing them.
+        let mut exhausted_capacity = capacity_snapshot();
+        exhausted_capacity[2] = DecommissionPoolCapacityInfo::for_test(2, layout, 0, target_total, target_total);
+        set_decommission_capacity_info_overrides_for_test(other_store.id, vec![exhausted_capacity]);
+
         let next_result = tokio::time::timeout(
             Duration::from_secs(30),
             data_movement::migrate_decommission_object(
@@ -10190,11 +10212,20 @@ mod decommission_lock_order_tests {
         assert_eq!(reconciled_reservation.pending_target_physical_bytes, 0);
         assert_eq!(reconciled_reservation.consumed_target_physical_bytes, 1);
 
+        // Reconciled bytes remain charged. With no physical room for a new
+        // reservation, a distinct mutation must fail instead of reusing them.
+        let mut exhausted_capacity = capacity_snapshot();
+        exhausted_capacity[2] = DecommissionPoolCapacityInfo::for_test(2, layout, 1, 2, 1);
+        set_decommission_capacity_info_overrides_for_test(other_store.id, vec![exhausted_capacity]);
+
         let next_after_reconcile = other_store
             .delete_object(&bucket, next_object, next_opts)
             .await
             .expect_err("the consumed exact-fit capacity must reject the next marker");
-        assert!(next_after_reconcile.to_string().contains("decommission_capacity_blocked"));
+        assert!(
+            next_after_reconcile.to_string().contains("decommission_capacity_blocked"),
+            "{next_after_reconcile}"
+        );
         let next_target_err = other_store.pools[2]
             .get_object_info(
                 &bucket,

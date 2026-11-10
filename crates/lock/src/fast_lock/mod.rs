@@ -31,10 +31,13 @@ pub mod manager_trait;
 pub mod metrics;
 pub mod object_pool;
 pub mod optimized_notify;
+mod publication;
 pub mod shard;
 pub mod state;
 pub mod types;
 
+#[cfg(test)]
+mod publication_tests;
 #[cfg(test)]
 mod tests;
 

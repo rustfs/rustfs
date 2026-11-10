@@ -17,7 +17,7 @@ use crate::storage::storage_api::s3_api_consumer::bucket::contract::{
     bucket::BucketInfo,
     list::{ListObjectVersionsInfo as StorageListObjectVersionsInfo, ListObjectsV2Info as StorageListObjectsV2Info},
 };
-use crate::storage::storage_api::s3_api_consumer::bucket::to_s3s_etag;
+use crate::storage::storage_api::s3_api_consumer::bucket::to_s3s_xml_etag;
 use percent_encoding::percent_decode_str;
 use s3s::dto::{
     Bucket, CommonPrefix, DeleteMarkerEntry, EncodingType, ListBucketsOutput, ListObjectVersionsOutput, ListObjectsOutput,
@@ -245,7 +245,7 @@ pub(crate) fn build_list_object_versions_output(
                 .etag
                 .as_ref()
                 .filter(|_| rustfs_utils::http::etag_can_be_listed(&v.user_defined))
-                .map(|etag| to_s3s_etag(etag)),
+                .map(|etag| to_s3s_xml_etag(etag)),
             storage_class: v.storage_class.clone().map(ObjectVersionStorageClass::from),
             ..Default::default()
         })
@@ -334,7 +334,7 @@ pub(crate) fn build_list_objects_v2_output(
                     .etag
                     .as_ref()
                     .filter(|_| rustfs_utils::http::etag_can_be_listed(&v.user_defined))
-                    .map(|etag| to_s3s_etag(etag)),
+                    .map(|etag| to_s3s_xml_etag(etag)),
                 storage_class: v.storage_class.clone().map(ObjectStorageClass::from),
                 ..Default::default()
             };
@@ -452,7 +452,8 @@ mod tests {
     use super::{
         ListObjectVersionsInfo, ListObjectVersionsParams, ListObjectsV2Info, build_list_buckets_output,
         build_list_object_versions_output, build_list_objects_output, build_list_objects_v2_output,
-        encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params, to_s3s_etag,
+        encode_list_objects_v2_continuation_token, parse_list_object_versions_params, parse_list_objects_v2_params,
+        to_s3s_xml_etag,
     };
     use crate::storage::s3_api::common::rustfs_owner;
     use crate::storage::storage_api::s3_api_consumer::bucket::StorageObjectInfo as ObjectInfo;
@@ -463,6 +464,66 @@ mod tests {
     use s3s::dto::{CommonPrefix, EncodingType, ListObjectsV2Output, Object};
     use time::OffsetDateTime;
     use uuid::Uuid;
+
+    #[test]
+    fn listings_escape_legacy_etags_without_creating_xml_entries() {
+        use s3s::xml::{Serialize, Serializer};
+        fn xml<T: Serialize>(value: &T) -> String {
+            let mut bytes = Vec::new();
+            value.serialize(&mut Serializer::new(&mut bytes)).expect("serialize listing");
+            String::from_utf8(bytes).expect("UTF-8 XML")
+        }
+        let malicious = "</ETag><Contents><Key>victim</Key></Contents><ETag>&amp;";
+        let object = ObjectInfo {
+            name: "owned/key".into(),
+            etag: Some(malicious.into()),
+            ..Default::default()
+        };
+        let v2 = build_list_objects_v2_output(
+            ListObjectsV2Info {
+                objects: vec![object.clone()],
+                ..Default::default()
+            },
+            false,
+            1000,
+            "bucket".into(),
+            String::new(),
+            None,
+            None,
+            None,
+            None,
+        );
+        let v1 = build_list_objects_output(v2.clone(), None);
+        let versions = build_list_object_versions_output(
+            ListObjectVersionsInfo {
+                objects: vec![object],
+                ..Default::default()
+            },
+            "bucket".into(),
+            &ListObjectVersionsParams {
+                prefix: String::new(),
+                delimiter: None,
+                key_marker: None,
+                version_id_marker: None,
+                max_keys: 1000,
+            },
+            None,
+        );
+        for output in [xml(&v1), xml(&v2), xml(&versions)] {
+            let mut reader = quick_xml::Reader::from_str(&output);
+            let mut keys = 0;
+            loop {
+                match reader.read_event().expect("legacy ETag must leave well-formed XML") {
+                    quick_xml::events::Event::Start(event) if event.name().as_ref() == "Key" => keys += 1,
+                    quick_xml::events::Event::Eof => break,
+                    _ => {}
+                }
+            }
+            assert_eq!(keys, 1, "{output}");
+            assert!(output.contains("&lt;/ETag&gt;&lt;Contents&gt;"), "{output}");
+            assert!(output.contains("&amp;amp;"), "existing entities must remain literal: {output}");
+        }
+    }
 
     #[test]
     fn test_build_list_buckets_output_maps_bucket_infos_and_owner() {
@@ -771,7 +832,7 @@ mod tests {
             let entries = listing.as_ref().expect("listed objects");
             assert_eq!(entries.len(), 5);
             for (index, entry) in entries.iter().enumerate() {
-                assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
+                assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_xml_etag("0123456789abcdef0123456789abcdef")));
                 assert_eq!(entry.key.as_deref(), Some(format!("object-{index}").as_str()));
                 assert_eq!(entry.size, Some(42));
             }
@@ -794,7 +855,7 @@ mod tests {
         let versions = versions.versions.expect("listed versions");
         assert_eq!(versions.len(), 5);
         for (index, entry) in versions.iter().enumerate() {
-            assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_etag("0123456789abcdef0123456789abcdef")));
+            assert_eq!(entry.e_tag, (index >= 2).then(|| to_s3s_xml_etag("0123456789abcdef0123456789abcdef")));
             assert_eq!(entry.size, Some(42));
         }
     }

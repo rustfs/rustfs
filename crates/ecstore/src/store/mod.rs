@@ -34,7 +34,7 @@ use crate::bucket::utils::check_put_object_part_args;
 use crate::bucket::utils::{check_valid_bucket_name, check_valid_bucket_name_strict, is_meta_bucketname};
 use crate::cluster::rpc::{RemoteClient, S3PeerSys};
 use crate::config::storageclass;
-use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaWriteState};
+use crate::core::pools::{DecommissionCanceler, PoolMeta, PoolMetaSaveGate};
 use crate::disk::endpoint::{Endpoint, EndpointType};
 use crate::disk::{DiskAPI, DiskInfo, DiskInfoOptions};
 use crate::error::{Error, Result};
@@ -423,8 +423,6 @@ fn should_enqueue_transition_immediately(oi: &ObjectInfo) -> bool {
     !is_meta_bucketname(&oi.bucket)
 }
 
-const MAX_UPLOADS_LIST: usize = 10000;
-
 mod bucket;
 mod bucket_fence;
 pub(crate) use bucket::await_bucket_namespace_operation;
@@ -482,9 +480,13 @@ pub struct ECStore {
     /// Serializes full-document pool metadata saves and retains a fail-closed
     /// write block after startup observes an unreadable replica.
     ///
+    /// Immutable admission proofs share authority; publication, recovery and
+    /// authority changes retain exclusive access through their existing I/O.
+    /// Each writer publishes its final state on release, and health
+    /// inspection reads that committed state without acquiring the gate.
     /// Lock order: acquire `pool_meta_save_gate`, then the distributed
     /// `pool.bin` fence, then clone `pool_meta` under a short read lock.
-    pub(crate) pool_meta_save_gate: Mutex<PoolMetaWriteState>,
+    pub(crate) pool_meta_save_gate: PoolMetaSaveGate,
     /// Per-instance runtime state (Phase 5, backlog#939).
     ///
     /// Carries this instance's identity/runtime out of the process globals so
@@ -496,6 +498,17 @@ pub struct ECStore {
     /// Memoizes bucket-incarnation validation under continuous lifecycle
     /// read-lock coverage (see [`bucket_fence`]).
     pub(crate) bucket_fence_registry: Arc<bucket_fence::BucketFenceRegistry>,
+}
+
+impl Drop for ECStore {
+    /// Clear the instance context's `BucketMetadataSys` when its backing store
+    /// is dropped. Without this, the shared bootstrap context retains a
+    /// `BucketMetadataSys` whose `Weak<ECStore>` is dangling after the store
+    /// goes away (e.g. between sequential test fixtures that share the
+    /// bootstrap), and the next `object_store()` call panics.
+    fn drop(&mut self) {
+        self.ctx.clear_bucket_metadata_sys_if_stale();
+    }
 }
 
 const METRIC_SCANNER_DATA_MOVEMENT_PAUSED: &str = "rustfs_scanner_data_movement_paused";
@@ -546,7 +559,6 @@ impl Default for ScannerDataMovementPauseStatus {
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PoolMetaWriteGateStatus {
     pub writes_ready: bool,
-    pub check_timed_out: bool,
     pub write_blocked: bool,
     pub transaction_aborted: bool,
     pub pool_meta_absent: bool,
@@ -562,7 +574,6 @@ impl Default for PoolMetaWriteGateStatus {
     fn default() -> Self {
         Self {
             writes_ready: true,
-            check_timed_out: false,
             write_blocked: false,
             transaction_aborted: false,
             pool_meta_absent: false,
@@ -1107,6 +1118,20 @@ impl ECStore {
         let (operation_guard, epoch) = self.scanner_data_usage_publication_admission_guard().await?;
         drop(operation_guard);
         Some(epoch)
+    }
+
+    /// Namespace cleanup edits an existing usage baseline; it does not certify
+    /// a scan. Retain the movement fence without requiring scanning to resume.
+    pub(crate) async fn data_usage_namespace_cleanup_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_guard = self.ctx.data_movement_operation_gate().read_owned().await;
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
+            return None;
+        }
+        Some((operation_guard, self.ctx.data_movement_operation_epoch()))
+    }
+
+    pub(crate) async fn data_usage_namespace_cleanup_epoch(&self) -> Option<u64> {
+        self.data_usage_namespace_cleanup_guard().await.map(|(_, epoch)| epoch)
     }
 
     /// Acquire a storage-owned read admission for a coordinator's final
@@ -1927,7 +1952,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         };
@@ -2002,7 +2027,7 @@ mod tests {
             rebalance_meta: RwLock::new(None),
             decommission_cancelers: RwLock::new(Vec::new()),
             start_gate: Mutex::new(()),
-            pool_meta_save_gate: Mutex::default(),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::default(),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -3284,6 +3309,7 @@ mod tests {
         init_local_disks(endpoint_pools.clone()).await.expect("init local disks");
 
         let (mut disks, errs) = init_disks(
+            &crate::runtime::global::current_ctx(),
             &endpoint_pools.as_ref().first().expect("pool endpoints").endpoints,
             &DiskOption {
                 cleanup: true,

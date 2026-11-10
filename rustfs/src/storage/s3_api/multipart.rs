@@ -18,7 +18,7 @@ use crate::storage::storage_api::effective_storage_class;
 use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
     ListMultipartsInfo, ListPartsInfo, MAX_MULTIPART_PART_NUMBER,
 };
-use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
+use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
 use s3s::dto::{CommonPrefix, EncodingType, ListMultipartUploadsOutput, ListPartsOutput, MultipartUpload, Part, Timestamp};
 use s3s::{S3Error, S3ErrorCode};
 
@@ -54,7 +54,7 @@ pub(crate) fn build_list_parts_output(res: ListPartsInfo) -> ListPartsOutput {
             res.parts
                 .into_iter()
                 .map(|p| Part {
-                    e_tag: p.etag.map(|etag| to_s3s_etag(&etag)),
+                    e_tag: p.etag.map(|etag| to_s3s_xml_etag(&etag)),
                     last_modified: p.last_mod.map(Timestamp::from),
                     part_number: p.part_num.try_into().ok(),
                     // Compressed parts store fewer bytes than the client sent; S3
@@ -222,7 +222,7 @@ mod tests {
     use crate::storage::storage_api::s3_api_consumer::multipart::contract::multipart::{
         ListMultipartsInfo, ListPartsInfo, MultipartInfo, PartInfo,
     };
-    use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_etag;
+    use crate::storage::storage_api::s3_api_consumer::multipart::to_s3s_xml_etag;
     use s3s::S3ErrorCode;
     use s3s::dto::Timestamp;
     use time::OffsetDateTime;
@@ -261,7 +261,7 @@ mod tests {
         assert_eq!(parts.len(), 1);
         assert_eq!(parts[0].part_number, Some(1));
         assert_eq!(parts[0].size, Some(11));
-        assert_eq!(parts[0].e_tag, Some(to_s3s_etag("etag-1")));
+        assert_eq!(parts[0].e_tag, Some(to_s3s_xml_etag("etag-1")));
         assert_eq!(output.owner, Some(rustfs_owner()));
         assert_eq!(output.initiator, Some(rustfs_initiator()));
     }

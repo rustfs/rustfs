@@ -694,6 +694,358 @@ pub fn trim_etag(etag: &str) -> String {
     etag.trim_matches('"').to_string()
 }
 
+/// Exact 64-bit SWAR byte equality mask for `b'.'` (`0x2e`) with zero cross-byte carry.
+/// Bit `7 + 8 * k` is set in the returned mask iff byte `k` of `w` equals `b'.'`.
+#[inline(always)]
+const fn swar_exact_dot_mask(w: u64) -> u64 {
+    let x = w ^ 0x2e2e_2e2e_2e2e_2e2e;
+    let low = (x & 0x7f7f_7f7f_7f7f_7f7f).wrapping_add(0x7f7f_7f7f_7f7f_7f7f);
+    !(low | x) & 0x8080_8080_8080_8080
+}
+
+/// Exact 64-bit SWAR mask for `b'.'` (`0x2e`) or `b'/'` (`0x2f`) across all byte values `0x00..=0xFF`.
+/// Since `0x2e` and `0x2f` differ only in bit 0, `(b & 0xfe) == 0x2e` holds iff `b` is `.` or `/`.
+#[inline(always)]
+const fn swar_exact_dot_or_slash_mask(w: u64) -> u64 {
+    swar_exact_dot_mask(w & 0xfefe_fefe_fefe_fefe)
+}
+
+#[inline(always)]
+const fn is_unix_dot_or_dotdot_at(path: &[u8], dot_idx: usize) -> bool {
+    if dot_idx > 0 && path[dot_idx - 1] != b'/' {
+        return false;
+    }
+    let next = dot_idx + 1;
+    if next == path.len() || path[next] == b'/' {
+        return true;
+    }
+    path[next] == b'.' && (next + 1 == path.len() || path[next + 1] == b'/')
+}
+
+#[inline(always)]
+const fn is_unix_dotdot_at(path: &[u8], dot_idx: usize) -> bool {
+    if dot_idx > 0 && path[dot_idx - 1] != b'/' {
+        return false;
+    }
+    let next = dot_idx + 1;
+    next < path.len() && path[next] == b'.' && (next + 1 == path.len() || path[next + 1] == b'/')
+}
+
+/// Returns `true` iff `path` (interpreted with Unix `/` separators) contains a `..` segment.
+/// Scans 8 bytes at a time using carry-free 64-bit SWAR so ordinary filenames containing dots
+/// (such as `xl.meta`, `part.1`, or `.rustfs.sys`) do not trigger component parsing.
+#[inline]
+pub const fn unix_path_has_dotdot_segment(path: &[u8]) -> bool {
+    let (chunks, rem) = path.as_chunks::<8>();
+    let mut c_idx = 0;
+    while c_idx < chunks.len() {
+        let mut mask = swar_exact_dot_mask(u64::from_le_bytes(chunks[c_idx]));
+        while mask != 0 {
+            let lane = (mask.trailing_zeros() >> 3) as usize;
+            if is_unix_dotdot_at(path, c_idx * 8 + lane) {
+                return true;
+            }
+            mask &= mask - 1;
+        }
+        c_idx += 1;
+    }
+    let base = chunks.len() * 8;
+    let mut r_idx = 0;
+    while r_idx < rem.len() {
+        if rem[r_idx] == b'.' && is_unix_dotdot_at(path, base + r_idx) {
+            return true;
+        }
+        r_idx += 1;
+    }
+    false
+}
+
+#[inline(always)]
+const fn is_invalid_adjacent_dot_slash_pair(path: &[u8], idx: usize) -> bool {
+    let prev = path[idx - 1];
+    let curr = path[idx];
+    if prev == b'/' && curr == b'/' {
+        return true;
+    }
+    if prev == b'/' && curr == b'.' {
+        return is_unix_dot_or_dotdot_at(path, idx);
+    }
+    if prev == b'.' && curr == b'/' {
+        return is_unix_dot_or_dotdot_at(path, idx - 1);
+    }
+    if prev == b'.' && curr == b'.' {
+        return is_unix_dotdot_at(path, idx - 1);
+    }
+    false
+}
+
+/// Returns `true` when `path` is a non-empty Unix path with no repeated slashes (`//`),
+/// no trailing slash (except `"/"`), and no `.` or `..` segments.
+#[inline]
+pub const fn unix_is_canonical_ascii_path(path: &[u8]) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    if path.len() == 1 {
+        return path[0] != b'.';
+    }
+    let first = path[0];
+    let last = path[path.len() - 1];
+    if last == b'/' || (first == b'.' && is_unix_dot_or_dotdot_at(path, 0)) {
+        return false;
+    }
+    let (chunks, rem) = path.as_chunks::<8>();
+    let mut c_idx = 0;
+    let mut prev_hi = 0u64;
+    while c_idx < chunks.len() {
+        let w = u64::from_le_bytes(chunks[c_idx]);
+        let m = swar_exact_dot_or_slash_mask(w);
+        let mut pair_mask = m & ((m << 8) | prev_hi);
+        while pair_mask != 0 {
+            let lane = (pair_mask.trailing_zeros() >> 3) as usize;
+            let idx = c_idx * 8 + lane;
+            if idx > 0 && is_invalid_adjacent_dot_slash_pair(path, idx) {
+                return false;
+            }
+            pair_mask &= pair_mask - 1;
+        }
+        prev_hi = m >> 56;
+        c_idx += 1;
+    }
+    let base = chunks.len() * 8;
+    let mut r_idx = 0;
+    while r_idx < rem.len() {
+        let b = rem[r_idx];
+        let idx = base + r_idx;
+        if (b == b'/' || b == b'.') && idx > 0 {
+            let prev = path[idx - 1];
+            if (prev == b'/' || prev == b'.') && is_invalid_adjacent_dot_slash_pair(path, idx) {
+                return false;
+            }
+        }
+        r_idx += 1;
+    }
+    true
+}
+
+#[inline(always)]
+const fn trim_trailing_slashes_and_curdir(mut bytes: &[u8]) -> &[u8] {
+    while bytes.len() > 1 {
+        if bytes[bytes.len() - 1] == b'/' {
+            bytes = bytes.split_at(bytes.len() - 1).0;
+        } else if bytes.len() >= 2 && bytes[bytes.len() - 2] == b'/' && bytes[bytes.len() - 1] == b'.' {
+            if bytes.len() == 2 {
+                bytes = b"/";
+                break;
+            }
+            bytes = bytes.split_at(bytes.len() - 2).0;
+        } else {
+            break;
+        }
+    }
+    bytes
+}
+
+#[inline(always)]
+const fn strip_leading_slashes_and_curdir(mut rem: &[u8]) -> &[u8] {
+    while !rem.is_empty() {
+        if rem[0] == b'/' {
+            rem = rem.split_at(1).1;
+        } else if rem.len() == 1 && rem[0] == b'.' {
+            rem = b"";
+        } else if rem.len() >= 2 && rem[0] == b'.' && rem[1] == b'/' {
+            rem = rem.split_at(2).1;
+        } else {
+            break;
+        }
+    }
+    rem
+}
+
+#[inline(always)]
+fn unix_bytes_to_os_str(bytes: &[u8]) -> Option<&std::ffi::OsStr> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        Some(std::ffi::OsStr::from_bytes(bytes))
+    }
+    #[cfg(not(unix))]
+    {
+        std::str::from_utf8(bytes).ok().map(std::ffi::OsStr::new)
+    }
+}
+
+#[inline(always)]
+fn unix_bytes_to_path(bytes: &[u8]) -> Option<&Path> {
+    unix_bytes_to_os_str(bytes).map(Path::new)
+}
+
+/// Fast Unix `Path::starts_with` when both `path` and `base` have already been normalized
+/// (i.e. contain no `..` segments or leading `.`). Performs a single slice prefix comparison.
+#[inline]
+pub fn unix_normalized_path_starts_with(path: &Path, base: &Path) -> bool {
+    let p = path.as_os_str().as_encoded_bytes();
+    let b = trim_trailing_slashes_and_curdir(base.as_os_str().as_encoded_bytes());
+    if b.is_empty() {
+        return true;
+    }
+    if b == b"/" {
+        return p.starts_with(b"/");
+    }
+    if p.starts_with(b) {
+        return p.len() == b.len() || p[b.len()] == b'/';
+    }
+    if b.contains(&b'.') || b.windows(2).any(|w| w == b"//") {
+        return path.starts_with(base);
+    }
+    false
+}
+
+/// Fast Unix `Path::strip_prefix` when both `path` and `base` have already been normalized
+/// (i.e. contain no `..` segments or leading `.`). Performs a single slice prefix comparison.
+#[inline]
+pub fn unix_normalized_path_strip_prefix<'a>(path: &'a Path, base: &Path) -> Option<&'a Path> {
+    let p = path.as_os_str().as_encoded_bytes();
+    let b = trim_trailing_slashes_and_curdir(base.as_os_str().as_encoded_bytes());
+    if b.is_empty() {
+        return Some(path);
+    }
+    if b == b"/" {
+        if !p.starts_with(b"/") {
+            return None;
+        }
+        let mut rem = strip_leading_slashes_and_curdir(&p[1..]);
+        if rem.ends_with(b"/") || rem.ends_with(b"/.") {
+            rem = trim_trailing_slashes_and_curdir(rem);
+            if rem == b"/" {
+                rem = b"";
+            }
+        }
+        if let Some(res) = unix_bytes_to_path(rem) {
+            return Some(res);
+        }
+    } else if p.starts_with(b) {
+        if p.len() == b.len() {
+            return Some(Path::new(""));
+        }
+        if p[b.len()] == b'/' {
+            let mut rem = strip_leading_slashes_and_curdir(&p[b.len() + 1..]);
+            if rem.ends_with(b"/") || rem.ends_with(b"/.") {
+                rem = trim_trailing_slashes_and_curdir(rem);
+                if rem == b"/" {
+                    rem = b"";
+                }
+            }
+            if let Some(res) = unix_bytes_to_path(rem) {
+                return Some(res);
+            }
+        }
+        return None;
+    }
+    if b.contains(&b'.') || b.windows(2).any(|w| w == b"//") {
+        return path.strip_prefix(base).ok();
+    }
+    None
+}
+
+/// Fast Unix `Path::parent` that slices at the last `/` via SIMD `memrchr` without scanning
+/// earlier path components.
+#[inline]
+pub fn unix_path_parent(path: &Path) -> Option<&Path> {
+    let p = path.as_os_str().as_encoded_bytes();
+    if p.is_empty() || p == b"/" {
+        return None;
+    }
+    if let Some(idx) = p.iter().rposition(|&b| b == b'/') {
+        if idx + 1 < p.len() {
+            let tail = &p[idx + 1..];
+            if tail != b"." && tail != b".." {
+                if idx == 0 {
+                    return Some(Path::new("/"));
+                }
+                if !(idx == 1 && p[0] == b'.') {
+                    let parent_bytes = trim_trailing_slashes_and_curdir(&p[..idx]);
+                    if let Some(res) = unix_bytes_to_path(parent_bytes) {
+                        return Some(res);
+                    }
+                }
+            }
+        }
+    } else if p != b"." && p != b".." {
+        return Some(Path::new(""));
+    }
+    path.parent()
+}
+
+/// Splits a Unix `Path` into `(parent, file_name)` in a single reverse scan.
+#[inline]
+pub fn unix_split_parent_and_file_name(path: &Path) -> Option<(&Path, &std::ffi::OsStr)> {
+    let p = path.as_os_str().as_encoded_bytes();
+    if p.is_empty() || p == b"/" {
+        return None;
+    }
+    if let Some(idx) = p.iter().rposition(|&b| b == b'/') {
+        if idx + 1 < p.len() {
+            let tail = &p[idx + 1..];
+            if tail != b"." && tail != b".." {
+                if idx == 0 {
+                    if let Some(tail_os) = unix_bytes_to_os_str(tail) {
+                        return Some((Path::new("/"), tail_os));
+                    }
+                } else if !(idx == 1 && p[0] == b'.') {
+                    let parent_bytes = trim_trailing_slashes_and_curdir(&p[..idx]);
+                    if let (Some(parent_p), Some(tail_os)) = (unix_bytes_to_path(parent_bytes), unix_bytes_to_os_str(tail)) {
+                        return Some((parent_p, tail_os));
+                    }
+                }
+            }
+        }
+    } else if p != b"."
+        && p != b".."
+        && let Some(tail_os) = unix_bytes_to_os_str(p)
+    {
+        return Some((Path::new(""), tail_os));
+    }
+    Some((path.parent()?, path.file_name()?))
+}
+
+/// Verifies that `path.parent() == Some(expected_parent)` and returns `path.file_name()` in one
+/// slice prefix check.
+#[inline]
+pub fn unix_direct_child_file_name<'a>(path: &'a Path, expected_parent: &Path) -> Option<&'a std::ffi::OsStr> {
+    let p = path.as_os_str().as_encoded_bytes();
+    let b = trim_trailing_slashes_and_curdir(expected_parent.as_os_str().as_encoded_bytes());
+    if !b.is_empty() && b != b"." && !b.starts_with(b"./") && !unix_path_has_dotdot_segment(b) {
+        if b == b"/" {
+            if p.starts_with(b"/") {
+                let rem = strip_leading_slashes_and_curdir(&p[1..]);
+                if !rem.is_empty()
+                    && rem != b"."
+                    && rem != b".."
+                    && !rem.contains(&b'/')
+                    && let Some(res) = unix_bytes_to_os_str(rem)
+                {
+                    return Some(res);
+                }
+            }
+        } else if p.starts_with(b) && p.len() > b.len() + 1 && p[b.len()] == b'/' {
+            let rem = strip_leading_slashes_and_curdir(&p[b.len() + 1..]);
+            if !rem.is_empty()
+                && rem != b"."
+                && rem != b".."
+                && !rem.contains(&b'/')
+                && let Some(res) = unix_bytes_to_os_str(rem)
+            {
+                return Some(res);
+            }
+        }
+    }
+    if path.parent() != Some(expected_parent) {
+        return None;
+    }
+    path.file_name()
+}
+
 /// Returns `true` if `path` contains a `..` component (parent directory traversal).
 fn contains_parent_dir_component(path: &str) -> bool {
     path.split(['/', '\\']).any(|component| component == "..")
@@ -1210,5 +1562,111 @@ mod tests {
         assert!(normalize_extract_entry_key("../escape.txt", None, false).is_err());
         assert!(normalize_extract_entry_key("file.txt", Some("../bad"), false).is_err());
         assert!(normalize_extract_entry_key("/absolute", None, false).is_err());
+    }
+
+    #[test]
+    fn unix_swar_path_helpers_match_std_path_across_boundaries() {
+        for pad in 1..=20 {
+            let prefix = "a".repeat(pad);
+            let clean_cases = [
+                format!("/{prefix}/bucket/object/xl.meta"),
+                format!("/{prefix}/.rustfs.sys/tmp/uuid/part.1"),
+                format!("/{prefix}/dir..name/..hidden/file...ext"),
+                format!("{prefix}/relative/object.tar.gz"),
+            ];
+            for case in &clean_cases {
+                let bytes = case.as_bytes();
+                assert!(!unix_path_has_dotdot_segment(bytes), "clean case flagged dotdot: {case}");
+                assert!(unix_is_canonical_ascii_path(bytes), "canonical case rejected: {case}");
+            }
+
+            let non_canonical_slash_cases = [
+                format!("//{prefix}/bucket/object/xl.meta"),
+                format!("/{prefix}//bucket/object/xl.meta"),
+                format!("/{prefix}/bucket/object/"),
+            ];
+            for case in &non_canonical_slash_cases {
+                assert!(
+                    !unix_is_canonical_ascii_path(case.as_bytes()),
+                    "non-canonical slash case accepted: {case}"
+                );
+            }
+
+            let dot_cases = [
+                format!("/{prefix}/./xl.meta"),
+                format!("/{prefix}/bucket/."),
+                format!("./{prefix}/bucket"),
+                ".".to_string(),
+            ];
+            for case in &dot_cases {
+                let bytes = case.as_bytes();
+                assert!(!unix_path_has_dotdot_segment(bytes), "dot-only case flagged as dotdot: {case}");
+                assert!(!unix_is_canonical_ascii_path(bytes), "dot case accepted as canonical: {case}");
+            }
+
+            let dotdot_cases = [
+                format!("/{prefix}/../xl.meta"),
+                format!("/{prefix}/bucket/.."),
+                format!("../{prefix}/bucket"),
+                "..".to_string(),
+            ];
+            for case in &dotdot_cases {
+                let bytes = case.as_bytes();
+                assert!(unix_path_has_dotdot_segment(bytes), "dotdot case missed by dotdot: {case}");
+                assert!(!unix_is_canonical_ascii_path(bytes), "dotdot case accepted as canonical: {case}");
+            }
+        }
+
+        let base = Path::new("/tmp/rustfs-disk1");
+        let child = Path::new("/tmp/rustfs-disk1/bucket/prefix/xl.meta");
+        let sibling = Path::new("/tmp/rustfs-disk10/bucket/prefix/xl.meta");
+        assert!(unix_normalized_path_starts_with(child, base));
+        assert!(!unix_normalized_path_starts_with(sibling, base));
+        assert_eq!(unix_normalized_path_strip_prefix(child, base), Some(Path::new("bucket/prefix/xl.meta")));
+        assert_eq!(unix_normalized_path_strip_prefix(base, base), Some(Path::new("")));
+        assert_eq!(unix_normalized_path_strip_prefix(sibling, base), None);
+        assert_eq!(unix_path_parent(child), Some(Path::new("/tmp/rustfs-disk1/bucket/prefix")));
+        assert_eq!(unix_path_parent(Path::new("/")), None);
+        assert_eq!(unix_path_parent(Path::new("/rootchild")), Some(Path::new("/")));
+        assert_eq!(unix_path_parent(Path::new("relative")), Some(Path::new("")));
+        assert_eq!(
+            unix_split_parent_and_file_name(child),
+            Some((Path::new("/tmp/rustfs-disk1/bucket/prefix"), std::ffi::OsStr::new("xl.meta")))
+        );
+        assert_eq!(
+            unix_direct_child_file_name(child, Path::new("/tmp/rustfs-disk1/bucket/prefix")),
+            Some(std::ffi::OsStr::new("xl.meta"))
+        );
+        assert_eq!(unix_direct_child_file_name(child, base), None);
+
+        let proc_root = Path::new("/proc/self/fd/12/.");
+        let proc_bucket = Path::new("/proc/self/fd/12/./bucket");
+        let proc_obj = Path::new("/proc/self/fd/12/./bucket/prefix/xl.meta");
+        assert!(unix_normalized_path_starts_with(proc_bucket, proc_root));
+        assert!(unix_normalized_path_starts_with(proc_obj, proc_bucket));
+        assert!(unix_normalized_path_starts_with(proc_obj, proc_root));
+        assert_eq!(
+            unix_normalized_path_strip_prefix(proc_obj, proc_root),
+            Some(Path::new("bucket/prefix/xl.meta"))
+        );
+        assert_eq!(
+            unix_normalized_path_strip_prefix(proc_obj, proc_bucket),
+            Some(Path::new("prefix/xl.meta"))
+        );
+        assert_eq!(unix_path_parent(proc_obj), Some(Path::new("/proc/self/fd/12/./bucket/prefix")));
+        assert_eq!(
+            unix_direct_child_file_name(proc_obj, Path::new("/proc/self/fd/12/./bucket/prefix")),
+            Some(std::ffi::OsStr::new("xl.meta"))
+        );
+
+        assert!(unix_is_canonical_ascii_path("bucket/对象-ключ-é/xl.meta".as_bytes()));
+        assert!(unix_normalized_path_starts_with(
+            Path::new("/data/rustfs/bucket/dir/xl.meta"),
+            Path::new("/data/rustfs/bucket//dir")
+        ));
+        assert_eq!(
+            unix_normalized_path_strip_prefix(Path::new("/a/b/"), Path::new("/a")),
+            Some(Path::new("b"))
+        );
     }
 }

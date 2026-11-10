@@ -476,6 +476,15 @@ pub trait HealStorageAPI: Send + Sync {
         Ok(None)
     }
 
+    /// Published identity for a replacement pass; None proves missing metadata only.
+    async fn replacement_bucket_incarnation(&self, bucket: &str) -> Result<Option<Uuid>> {
+        match self.admit_bucket_incarnation(bucket).await {
+            Ok(id) => Ok(Some(id)),
+            Err(Error::StaleBucketIncarnation { .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
     /// Whether the exact old bucket generation has a durable deletion record.
     /// Alternate backends must fail closed unless they can validate the same
     /// deployment, bucket and incarnation identity.
@@ -598,6 +607,23 @@ pub trait HealStorageAPI: Send + Sync {
         self.heal_object(bucket, object, version_id, opts).await
     }
 
+    /// Replacement writes retain both cancellation ownership and the admitted bucket fence.
+    async fn heal_replacement_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+        task_cancel: &CancellationToken,
+    ) -> Result<HealStorageObjectResult> {
+        if task_cancel.is_cancelled() {
+            return Err(Error::TaskCancelled);
+        }
+        self.heal_object_at_incarnation(bucket, object, version_id, expected, opts)
+            .await
+    }
+
     async fn heal_object_with_receipt(
         &self,
         bucket: &str,
@@ -660,6 +686,17 @@ pub trait HealStorageAPI: Send + Sync {
 
     /// Heal and physically verify bucket configuration on its replacement targets.
     async fn heal_replacement_bucket_metadata(&self, _bucket: &str, _opts: &HealOpts, _targets: &[String]) -> Result<()> {
+        Err(Error::Storage(StorageError::PreconditionFailed))
+    }
+
+    async fn heal_replacement_bucket_metadata_at_incarnation(
+        &self,
+        _bucket: &str,
+        _expected: Uuid,
+        _opts: &HealOpts,
+        _targets: &[String],
+    ) -> Result<()> {
+        // An unfenced fallback could certify a different same-name bucket.
         Err(Error::Storage(StorageError::PreconditionFailed))
     }
 
@@ -1316,6 +1353,35 @@ impl HealStorageAPI for ECStoreHealStorage {
         .await
     }
 
+    async fn heal_replacement_object_at_incarnation(
+        &self,
+        bucket: &str,
+        object: &str,
+        version_id: Option<&str>,
+        expected: Uuid,
+        opts: &HealOpts,
+        task_cancel: &CancellationToken,
+    ) -> Result<HealStorageObjectResult> {
+        run_background_object_inner(
+            self.admission.as_ref(),
+            || self.ecstore.physical_heal_plan(object, opts).map_err(Error::Storage),
+            opts,
+            Some(task_cancel),
+            |result: &HealStorageObjectResult| result.error.is_none(),
+            boxed_object_operation(|| async {
+                let result = self
+                    .ecstore
+                    .heal_object_at_incarnation(bucket, object, version_id.unwrap_or_default(), expected, opts)
+                    .await
+                    .map_err(|error| incarnation_storage_error(bucket, expected, error))?;
+                Ok(self
+                    .object_result_with_receipt(bucket, object, version_id, opts, result, Some(expected))
+                    .await)
+            }),
+        )
+        .await
+    }
+
     async fn heal_mrf_object_at_incarnation(
         &self,
         bucket: &str,
@@ -1518,6 +1584,13 @@ impl HealStorageAPI for ECStoreHealStorage {
             Err(StorageError::BucketNotFound(_)) => Ok(None),
             Err(error) => Err(Error::Storage(error)),
         }
+    }
+
+    async fn replacement_bucket_incarnation(&self, bucket: &str) -> Result<Option<Uuid>> {
+        self.ecstore
+            .replacement_bucket_incarnation_from_disk(bucket)
+            .await
+            .map_err(Error::Storage)
     }
 
     async fn mrf_bucket_incarnation_retired(&self, bucket: &str, expected: Uuid) -> Result<bool> {
@@ -1957,6 +2030,19 @@ impl HealStorageAPI for ECStoreHealStorage {
             .heal_replacement_bucket_metadata(bucket, opts, targets)
             .await
             .map_err(Error::Storage)
+    }
+
+    async fn heal_replacement_bucket_metadata_at_incarnation(
+        &self,
+        bucket: &str,
+        expected: Uuid,
+        opts: &HealOpts,
+        targets: &[String],
+    ) -> Result<()> {
+        self.ecstore
+            .heal_replacement_bucket_metadata_at_incarnation(bucket, expected, opts, targets)
+            .await
+            .map_err(|error| incarnation_storage_error(bucket, expected, error))
     }
 
     async fn replacement_targets_have_version(

@@ -94,7 +94,6 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
-#[cfg(test)]
 use std::io::Cursor;
 use std::io::Write;
 use std::path::PathBuf;
@@ -2209,9 +2208,14 @@ fn ensure_decommission_capacity_reservations_available(
             continue;
         }
         metrics::counter!(METRIC_DECOMMISSION_CAPACITY_CONFLICTS_TOTAL, "phase" => phase).increment(1);
-        return Err(decommission_capacity_blocked_error(format!(
+        let detail = format!(
             "target pool {target_pool_index} reservation requires {required} physical bytes, but only {available} bytes remain during {phase}"
-        )));
+        );
+        return Err(if growth_pool.is_some() {
+            decommission_target_no_longer_fits_error(target_pool_index, detail)
+        } else {
+            decommission_capacity_blocked_error(detail)
+        });
     }
     Ok(())
 }
@@ -2342,36 +2346,41 @@ fn grow_decommission_target_reservation(
         let existing_remaining = existing_target
             .map(|target| target.remaining_reserved_physical_bytes(reservation.temporary_copies))
             .unwrap_or_default();
+        let existing_reserved = existing_target
+            .map(|target| target.reserved_physical_bytes)
+            .unwrap_or_default();
+        let allocation_limit = existing_target
+            .map(|target| target.physical_free_at_reservation)
+            .unwrap_or_default()
+            .max(target_capacity.physical_free);
         if required_peak <= existing_remaining {
             return Ok(false);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            return Err(decommission_target_no_longer_fits_error(
-                target_pool_index,
-                format!("source pool {source_pool_index} reservation estimate is exhausted"),
-            ));
-        }
-        if let Some(target) = existing_target
-            && target_capacity.physical_free <= target.physical_free_at_reservation
-        {
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {source_pool_index} target pool {target_pool_index} reservation is exhausted"
-            )));
-        }
+        // Scanner estimates can predate source writes. Grow against current
+        // target capacity, then validate the aggregate reservation below.
         let current_peak = reservation.remaining_peak_physical_bytes();
         let additional_peak = required_peak.saturating_sub(existing_remaining);
         let additional_predicted = additional_peak.div_ceil(1usize.saturating_add(reservation.temporary_copies));
         let additional_source_data = capacity_source_data_equivalent(additional_predicted, target_layout)?;
-        reservation.source_data_equivalent_bytes = reservation
-            .source_data_equivalent_bytes
-            .saturating_add(additional_source_data);
         reservation.source_physical_bytes = reservation
             .source_physical_bytes
             .saturating_add(capacity_target_physical_bytes(additional_source_data, reservation.source_layout)?);
+        // Recompute from the physical total so EC rounding matches the
+        // persisted reader after every growth, including repeated growth.
+        reservation.source_data_equivalent_bytes =
+            capacity_source_data_equivalent(reservation.source_physical_bytes, reservation.source_layout)?;
         reservation.predicted_physical_bytes = reservation
-            .predicted_physical_bytes
-            .saturating_add(additional_predicted)
-            .max(capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, target_layout)?);
+            .targets
+            .iter()
+            .map(|target| target.layout)
+            .chain(std::iter::once(target_layout))
+            .try_fold(
+                reservation.predicted_physical_bytes.saturating_add(additional_predicted),
+                |predicted, layout| {
+                    capacity_target_physical_bytes(reservation.source_data_equivalent_bytes, layout)
+                        .map(|required| predicted.max(required))
+                },
+            )?;
         reservation.temporary_physical_bytes = reservation
             .predicted_physical_bytes
             .saturating_mul(reservation.temporary_copies);
@@ -2379,6 +2388,15 @@ fn grow_decommission_target_reservation(
             .predicted_physical_bytes
             .saturating_add(reservation.temporary_physical_bytes);
         let allocation_growth = reservation.remaining_peak_physical_bytes().saturating_sub(current_peak);
+        let required_allocation = existing_reserved.saturating_add(allocation_growth);
+        if required_allocation > allocation_limit {
+            return Err(decommission_target_no_longer_fits_error(
+                target_pool_index,
+                format!(
+                    "target pool {target_pool_index} reservation requires {required_allocation} physical bytes, but its observed allocation limit is {allocation_limit} bytes"
+                ),
+            ));
+        }
         if let Some(target) = reservation
             .targets
             .iter_mut()
@@ -2403,6 +2421,7 @@ fn grow_decommission_target_reservation(
             });
         }
         renew_decommission_capacity_reservation(reservation, now, true);
+        validate_decommission_capacity_reservation(Some(reservation))?;
         pool.last_update = pool.last_update.max(now);
         Ok(true)
     })();
@@ -3720,33 +3739,45 @@ fn is_decommission_copy_quorum_deferral(err: &Error) -> bool {
     data_movement::data_movement_stage_source_as::<DecommissionCopyQuorumFailure>(err).is_some()
 }
 
-/// The storage error of a version copy that kept timing out on a namespace
-/// lock through its in-place retries, kept typed so the entry failure policy
-/// defers it.
+/// A copy whose object namespace lock remained unavailable through its
+/// in-place retries, retained as a typed deferral.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-struct DecommissionCopyLockTimeout(#[source] Error);
+struct DecommissionCopyLockUnavailable(#[source] Error);
 
-fn is_decommission_copy_lock_timeout_error(err: &Error) -> bool {
-    let err = data_movement::data_movement_stage_source(err).unwrap_or(err);
-    matches!(err, Error::Lock(rustfs_lock::LockError::Timeout { .. }))
+fn is_decommission_copy_lock_unavailable_error(err: &Error, bucket: &str, object: &str) -> bool {
+    let source = data_movement::data_movement_stage_source(err).unwrap_or(err);
+    match source {
+        Error::Lock(rustfs_lock::LockError::Timeout { .. }) => true,
+        Error::NamespaceLockQuorumUnavailable {
+            mode: "read",
+            bucket: lock_bucket,
+            object: lock_object,
+            ..
+        } => {
+            data_movement::data_movement_error_is_stage(err, "prepare_put_object")
+                && lock_bucket == bucket
+                && lock_object == object
+        }
+        _ => false,
+    }
 }
 
-/// A version copy that timed out acquiring a namespace lock leaves the source
+/// A version copy that could not acquire its namespace lock leaves the source
 /// in place; the next attempt copies the version again or finds an equivalent
 /// committed target. The lock is held by another mutation of the key or, when
 /// this node restarted mid-copy, by its previous incarnation until that lock's
 /// lease expires on the peers. Either clears by waiting, so the entry is
 /// deferred instead of being counted as a permanent per-object failure.
-fn decommission_copy_lock_timeout_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
+fn decommission_copy_lock_unavailable_deferral(stage: &str, bucket: &str, object: &str, err: Error) -> Error {
     data_movement::data_movement_context_error(
-        format!("decommission {stage} timed out on a namespace lock for {bucket}/{object}: {err}"),
-        DecommissionCopyLockTimeout(err),
+        format!("decommission {stage} could not acquire a namespace lock for {bucket}/{object}: {err}"),
+        DecommissionCopyLockUnavailable(err),
     )
 }
 
-fn is_decommission_copy_lock_timeout_deferral(err: &Error) -> bool {
-    data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(err).is_some()
+fn is_decommission_copy_lock_unavailable_deferral(err: &Error) -> bool {
+    data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(err).is_some()
 }
 
 /// The deferral of a version copy whose in-place retries ended on `error`, if
@@ -3756,8 +3787,8 @@ fn take_decommission_copy_deferral(stage: &str, bucket: &str, object: &str, erro
         return Some(decommission_copy_quorum_deferral(stage, bucket, object, err));
     }
     error
-        .take_if(|err| is_decommission_copy_lock_timeout_error(err))
-        .map(|err| decommission_copy_lock_timeout_deferral(stage, bucket, object, err))
+        .take_if(|err| is_decommission_copy_lock_unavailable_error(err, bucket, object))
+        .map(|err| decommission_copy_lock_unavailable_deferral(stage, bucket, object, err))
 }
 
 fn resolve_decommission_entry_reload_result(result: Result<()>, bucket: &str, object_name: &str) -> Result<()> {
@@ -5822,13 +5853,13 @@ enum DecommissionEntryOutcome {
 /// entry is done and must not be counted as a failure or escalated. A quorum
 /// failure of the source cleanup is deferred too: the copied source is still
 /// in place and the next attempt cleans it up again. So is a version copy that
-/// lost drive quorum or timed out on a namespace lock through its in-place
+/// lost drive quorum or could not acquire an object namespace lock through its in-place
 /// retries: the source still holds the version and the next attempt copies it
 /// again. Every other failure stays terminal.
 fn resolve_decommission_entry_failure(err: Error) -> Result<DecommissionEntryOutcome> {
     if is_decommission_source_cleanup_retryable_error(&err)
         || is_decommission_copy_quorum_deferral(&err)
-        || is_decommission_copy_lock_timeout_deferral(&err)
+        || is_decommission_copy_lock_unavailable_deferral(&err)
     {
         return Ok(DecommissionEntryOutcome::Deferred(err));
     }
@@ -6728,21 +6759,128 @@ impl PoolMetaWriteState {
     }
 
     pub(crate) fn ensure_write_safe(&self, operation: &str) -> Result<()> {
-        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
+        let (Some(mut context), _) = self.write_block() else {
             return Ok(());
-        }
-        let mut context = self
-            .block_context
-            .clone()
-            .or_else(|| {
-                self.transaction_failure
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            })
-            .unwrap_or_else(|| pool_metadata_error(crate::error::PoolMetadataFailure::FenceLost, "external_fence", None));
+        };
         context.operation = operation.to_owned();
         Err(Error::other(context))
+    }
+
+    /// Returns the context blocking writes and whether the shared transaction
+    /// latch was set in the same observation.
+    ///
+    /// Outcomes latch, and recovery clears, the shared abort flag together with
+    /// its failure under the failure lock. Re-reading the flag under that lock
+    /// gives inspection that does not hold the gate one consistent transition.
+    fn write_block(&self) -> (Option<crate::error::PoolMetadataError>, bool) {
+        if !self.write_blocked && !self.aborted_transaction.load(Ordering::SeqCst) {
+            return (None, false);
+        }
+        let failure = self
+            .transaction_failure
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let aborted = self.aborted_transaction.load(Ordering::SeqCst);
+        if !self.write_blocked && !aborted {
+            return (None, false);
+        }
+        let context = self
+            .block_context
+            .clone()
+            .or_else(|| failure.clone())
+            .unwrap_or_else(|| pool_metadata_error(crate::error::PoolMetadataFailure::FenceLost, "external_fence", None));
+        (Some(context), aborted)
+    }
+}
+
+/// Local pool metadata authority gate.
+///
+/// Readers hold an immutable admission proof. Writers serialize publication,
+/// recovery and authority changes. Every writer publishes the state it leaves
+/// while it still owns the gate, so inspection can read the last committed
+/// authority without queueing behind metadata I/O. The published copy shares
+/// the transaction latches with the live state, so an outcome that latches a
+/// failure after its writer released the gate is visible immediately.
+#[derive(Debug)]
+pub(crate) struct PoolMetaSaveGate {
+    state: tokio::sync::RwLock<PoolMetaWriteState>,
+    published: arc_swap::ArcSwap<PoolMetaWriteState>,
+}
+
+impl Default for PoolMetaSaveGate {
+    fn default() -> Self {
+        Self::new(PoolMetaWriteState::default())
+    }
+}
+
+impl PoolMetaSaveGate {
+    pub(crate) fn new(state: PoolMetaWriteState) -> Self {
+        Self {
+            published: arc_swap::ArcSwap::from_pointee(state.clone()),
+            state: tokio::sync::RwLock::new(state),
+        }
+    }
+
+    pub(crate) async fn read(&self) -> tokio::sync::RwLockReadGuard<'_, PoolMetaWriteState> {
+        self.state.read().await
+    }
+
+    pub(crate) fn try_read(
+        &self,
+    ) -> std::result::Result<tokio::sync::RwLockReadGuard<'_, PoolMetaWriteState>, tokio::sync::TryLockError> {
+        self.state.try_read()
+    }
+
+    pub(crate) async fn write(&self) -> PoolMetaSaveGateWriteGuard<'_> {
+        PoolMetaSaveGateWriteGuard {
+            state: self.state.write().await,
+            published: &self.published,
+        }
+    }
+
+    pub(crate) fn try_write(&self) -> std::result::Result<PoolMetaSaveGateWriteGuard<'_>, tokio::sync::TryLockError> {
+        self.state.try_write().map(|state| PoolMetaSaveGateWriteGuard {
+            state,
+            published: &self.published,
+        })
+    }
+
+    /// Returns the authority left by the most recent writer without waiting.
+    ///
+    /// Changes an active writer makes become visible when it releases the
+    /// gate; shared transaction latches are read live.
+    pub(crate) fn published(&self) -> Arc<PoolMetaWriteState> {
+        self.published.load_full()
+    }
+}
+
+/// Exclusive authority ownership that publishes its final state on release.
+#[derive(Debug)]
+pub(crate) struct PoolMetaSaveGateWriteGuard<'a> {
+    state: tokio::sync::RwLockWriteGuard<'a, PoolMetaWriteState>,
+    published: &'a arc_swap::ArcSwap<PoolMetaWriteState>,
+}
+
+impl std::ops::Deref for PoolMetaSaveGateWriteGuard<'_> {
+    type Target = PoolMetaWriteState;
+
+    fn deref(&self) -> &Self::Target {
+        &self.state
+    }
+}
+
+impl std::ops::DerefMut for PoolMetaSaveGateWriteGuard<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.state
+    }
+}
+
+impl Drop for PoolMetaSaveGateWriteGuard<'_> {
+    fn drop(&mut self) {
+        // The tokio guard is released after this body, so publications follow
+        // writer order and a later writer can never be overwritten by an
+        // earlier one.
+        self.published.store(Arc::new(self.state.clone()));
     }
 }
 
@@ -6827,11 +6965,47 @@ impl Drop for PoolMetaTransactionArm {
     }
 }
 
+fn ensure_legacy_pool_meta_republish_safe(data: &[u8]) -> Result<()> {
+    if data.len() >= 4
+        && LittleEndian::read_u16(&data[2..4]) == POOL_META_V1_VERSION
+        // The selection already validates the payload. The runtime-only
+        // flag can only appear in the legacy three-field sequence or map.
+        && rmp::decode::read_array_len(&mut &data[4..])
+            .or_else(|_| rmp::decode::read_map_len(&mut &data[4..]))
+            .ok()
+            == Some(3)
+        && let Ok(legacy) = rmp_serde::from_slice::<LegacyPoolMeta>(&data[4..])
+        && legacy.dont_save
+    {
+        return Err(Error::other("pool metadata legacy source contains dont_save=true"));
+    }
+    Ok(())
+}
+
+// Ordinary legacy reads retain their compatibility behavior, but bytes that
+// will be copied to another pool must not contain an unparsed extension.
+fn ensure_legacy_pool_meta_payload_complete(data: &[u8]) -> Result<()> {
+    let payload = data
+        .get(4..)
+        .ok_or_else(|| Error::other("pool metadata legacy source is too short"))?;
+    let mut decoder = rmp_serde::Deserializer::new(Cursor::new(payload));
+    serde::de::IgnoredAny::deserialize(&mut decoder).map_err(|_| Error::other("pool metadata legacy source is invalid"))?;
+    let payload_len = u64::try_from(payload.len()).map_err(|_| Error::other("pool metadata legacy source is too large"))?;
+    if decoder.get_ref().position() != payload_len {
+        return Err(Error::other("pool metadata legacy source has trailing bytes"));
+    }
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PoolMetaSelection {
     meta: PoolMeta,
     revision: PoolMetaRevision,
     canonical: Option<Vec<u8>>,
+    // Legacy semantic comparison canonicalizes to V2; a heal must instead
+    // preserve verified raw bytes at the highest observed format floor.
+    legacy_raw: Option<Vec<u8>>,
+    legacy_has_unsafe_flag: bool,
     replica_state: PoolMetaReplicaState,
     cas_tokens: Vec<PoolMetaCasToken>,
     absent: bool,
@@ -7222,6 +7396,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: PoolMeta::default(),
             revision: PoolMetaRevision::legacy(0),
             canonical: None,
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair: false,
                 repair_write_safe: true,
@@ -7276,6 +7452,8 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
             meta: selected.meta.clone(),
             revision: selected.revision,
             canonical: Some(selected.canonical.clone()),
+            legacy_raw: None,
+            legacy_has_unsafe_flag: false,
             replica_state: PoolMetaReplicaState {
                 needs_repair,
                 repair_write_safe,
@@ -7289,6 +7467,10 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
 
     // Legacy V1/V2 has no durable generation. Pool zero remains the commit
     // record; divergent backups without it are ambiguous and fail closed.
+    let legacy_has_unsafe_flag = committed
+        .iter()
+        .any(|(_, raw, _)| ensure_legacy_pool_meta_republish_safe(raw).is_err());
+    let mut floor_raw = None;
     let mut selected: Option<(usize, Vec<u8>, PoolMetaCommittedCandidate)> = None;
     for (idx, raw, candidate) in committed {
         if let Some((selected_idx, selected_raw, selected_candidate)) = selected.as_ref() {
@@ -7302,19 +7484,36 @@ fn select_pool_meta_replica_reads(reads: Vec<PoolMetaReplicaRead>) -> Result<Poo
                 }
             } else {
                 needs_repair |= selected_raw != &raw;
+                if floor_raw.is_none()
+                    && candidate.revision.version == observed_version
+                    && raw
+                        .get(2..4)
+                        .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+                {
+                    floor_raw = Some(raw);
+                }
             }
         } else {
             selected = Some((idx, raw, candidate));
         }
     }
-    let (_, _, mut selected) =
+    let (_, selected_raw, mut selected) =
         selected.ok_or_else(|| Error::other("pool metadata recovery required: no valid legacy replica is available"))?;
+    if selected.revision.version == observed_version
+        && selected_raw
+            .get(2..4)
+            .is_some_and(|version| LittleEndian::read_u16(version) == observed_version)
+    {
+        floor_raw = Some(selected_raw);
+    }
     selected.meta.version = observed_version;
     selected.revision.version = observed_version;
     Ok(PoolMetaSelection {
         meta: selected.meta,
         revision: selected.revision,
         canonical: Some(selected.canonical),
+        legacy_raw: floor_raw,
+        legacy_has_unsafe_flag,
         replica_state: PoolMetaReplicaState {
             needs_repair,
             repair_write_safe,
@@ -8220,16 +8419,18 @@ where
     S: EcstoreObjectIO,
 {
     // Bound the CAS state retained by callers, including ordinary metadata
-    // transactions that never enter identity repair. Large inline retry states
+    // transactions that never enter owner repair. Large inline retry states
     // otherwise propagate through startup and cross-crate storage futures.
     Box::pin(async move {
-        if object != POOL_META_IDENTITY_NAME {
+        let native_owner_repair = object == POOL_META_NAME && matches!(phase, "native_heal" | "prepare_cas");
+        if object != POOL_META_IDENTITY_NAME && !native_owner_repair {
             return execute_pool_meta_object_cas_once(pool, object, data, opts, fence, phase).await;
         }
-        // Keep the exact identity owned by this transaction. A quorum read alone
-        // cannot discharge repair responsibility for a missing disk replica.
-        let identity = data;
-        let mut outcome = execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await;
+        // Repair only the exact payload already published by this owner. A
+        // quorum read cannot discharge responsibility for a missing replica.
+        let committed_payload = data;
+        let mut outcome =
+            execute_pool_meta_object_cas_once(pool.clone(), object, committed_payload.clone(), opts, fence, phase).await;
         for delay_secs in [1, 2, 4] {
             if !outcome.source.as_deref().is_some_and(|err| {
                 matches!(err, Error::Io(inner) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataRepairRequired>()))
@@ -8242,19 +8443,28 @@ where
             let repair_options = async {
                 fence.ensure_held()?;
                 let (current, info) = read_config_no_lock_preserve_empty_with_metadata(pool.clone(), object).await?;
-                if current != identity {
+                if current != committed_payload {
                     return Err(Error::PreconditionFailed);
                 }
-                let token = info
-                    .etag
-                    .filter(|etag| !etag.trim().is_empty())
-                    .map(PoolMetaCasToken::Existing)
-                    .unwrap_or(PoolMetaCasToken::Unsafe);
+                let token = if native_owner_repair {
+                    match pool_meta_cas_token_from_info(info) {
+                        token @ PoolMetaCasToken::ExistingNative { .. } => token,
+                        _ => return Err(Error::PreconditionFailed),
+                    }
+                } else {
+                    info.etag
+                        .filter(|etag| !etag.trim().is_empty())
+                        .map(PoolMetaCasToken::Existing)
+                        .unwrap_or(PoolMetaCasToken::Unsafe)
+                };
                 pool_meta_cas_options(object, &token, fence)
             }
             .await;
             outcome = match repair_options {
-                Ok(opts) => execute_pool_meta_object_cas_once(pool.clone(), object, identity.clone(), opts, fence, phase).await,
+                Ok(opts) => {
+                    execute_pool_meta_object_cas_once(pool.clone(), object, committed_payload.clone(), opts, fence, phase)
+                        .await
+                }
                 Err(err) => PoolMetaCasWriteOutcome::not_dispatched(err),
             };
             // A rejected repair cannot turn the preceding committed write into a
@@ -8308,8 +8518,9 @@ where
         })
     });
     let result = save_config_with_opts_and_metadata(pool, object, data, &opts).await;
-    let may_have_mutated = !matches!(&result, Err(Error::PreconditionFailed));
-    if !may_have_mutated {
+    let write_not_started = matches!(&result, Err(Error::Io(inner)) if inner.get_ref().is_some_and(|source| source.is::<crate::set_disk::SystemMetadataWriteNotStarted>()));
+    let may_have_mutated = !write_not_started && !matches!(&result, Err(Error::PreconditionFailed));
+    if matches!(&result, Err(Error::PreconditionFailed)) {
         record_pool_meta_stale_write_rejection(phase);
     }
     let mut source = None;
@@ -8320,6 +8531,8 @@ where
             source = Some(Arc::clone(&original));
             if matches!(original.as_ref(), Error::PreconditionFailed) {
                 Err(Error::PreconditionFailed)
+            } else if write_not_started {
+                Err(Error::other(original))
             } else {
                 Err(Error::other(pool_metadata_error(
                     crate::error::PoolMetadataFailure::TransactionUnknown,
@@ -12059,8 +12272,13 @@ async fn pause_decommission_start_for_test(store_id: uuid::Uuid, point: Decommis
 }
 
 #[cfg(any(test, feature = "test-util"))]
-type DecommissionCapacityInfoOverrides =
-    std::sync::Mutex<HashMap<uuid::Uuid, std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>>;
+struct DecommissionCapacityInfoOverride {
+    snapshots: std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>,
+    owned_snapshots: Option<std::collections::VecDeque<Vec<DecommissionPoolCapacityInfo>>>,
+}
+
+#[cfg(any(test, feature = "test-util"))]
+type DecommissionCapacityInfoOverrides = std::sync::Mutex<HashMap<uuid::Uuid, DecommissionCapacityInfoOverride>>;
 
 #[cfg(any(test, feature = "test-util"))]
 static DECOMMISSION_CAPACITY_INFO_OVERRIDES: std::sync::OnceLock<DecommissionCapacityInfoOverrides> = std::sync::OnceLock::new();
@@ -12077,16 +12295,30 @@ pub(crate) fn set_decommission_capacity_info_overrides_for_test(
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned")
-        .insert(store_id, snapshots.into());
+        .insert(
+            store_id,
+            DecommissionCapacityInfoOverride {
+                snapshots: snapshots.into(),
+                owned_snapshots: None,
+            },
+        );
 }
 
 #[cfg(any(test, feature = "test-util"))]
-fn take_decommission_capacity_info_override_for_test(store_id: uuid::Uuid) -> Option<Vec<DecommissionPoolCapacityInfo>> {
+fn take_decommission_capacity_info_override_for_test(
+    store_id: uuid::Uuid,
+    use_owned_usage: bool,
+) -> Option<Vec<DecommissionPoolCapacityInfo>> {
     let mut overrides = DECOMMISSION_CAPACITY_INFO_OVERRIDES
         .get_or_init(|| std::sync::Mutex::new(HashMap::new()))
         .lock()
         .expect("decommission capacity info override should not be poisoned");
-    let queue = overrides.get_mut(&store_id)?;
+    let entry = overrides.get_mut(&store_id)?;
+    let queue = if use_owned_usage {
+        entry.owned_snapshots.as_mut().unwrap_or(&mut entry.snapshots)
+    } else {
+        &mut entry.snapshots
+    };
     if queue.len() > 1 {
         queue.pop_front()
     } else {
@@ -13313,7 +13545,7 @@ impl ECStore {
                             "Decommission cancel will retry target capacity fencing"
                         );
                         tokio::time::sleep(DECOMMISSION_TERMINAL_RETRY_DELAY).await;
-                        let save_guard = self.pool_meta_save_gate.lock().await;
+                        let save_guard = self.pool_meta_save_gate.read().await;
                         let (_read_guard, snapshot) = self
                             .acquire_pool_meta_read_guard(&save_guard, "decommission cancel fence retry failed")
                             .await?;
@@ -13357,7 +13589,7 @@ impl ECStore {
         target_pool_indices: &[usize],
         admission: DecommissionCapacityAdmission,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.read().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
@@ -13389,12 +13621,8 @@ impl ECStore {
     pub(crate) async fn acquire_pool_meta_object_heal_fence(
         &self,
         target_pool_indices: &[usize],
-    ) -> Result<(
-        Arc<rustfs_lock::NamespaceLockGuard>,
-        Vec<Result<()>>,
-        tokio::sync::MutexGuard<'_, PoolMetaWriteState>,
-    )> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+    ) -> Result<(Arc<rustfs_lock::NamespaceLockGuard>, Vec<Result<()>>, PoolMetaSaveGateWriteGuard<'_>)> {
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_write_guard_with_lock_error(&mut save_guard, "pool metadata heal admission failed", Error::from)
             .await?;
@@ -13414,7 +13642,7 @@ impl ECStore {
     pub(crate) async fn acquire_decommission_capacity_release_fence_with_active_source(
         &self,
     ) -> Result<(rustfs_lock::NamespaceLockGuard, bool)> {
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.read().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "capacity release fence failed")
             .await?;
@@ -13481,7 +13709,7 @@ impl ECStore {
         }
 
         let (reconciliations, model_version) = {
-            let save_guard = self.pool_meta_save_gate.lock().await;
+            let save_guard = self.pool_meta_save_gate.read().await;
             let (_read_guard, snapshot) = self
                 .acquire_pool_meta_read_guard(&save_guard, "exact delete capacity reconciliation failed")
                 .await?;
@@ -13498,7 +13726,7 @@ impl ECStore {
         let mut legacy_write_fence = None;
         match model_version {
             Some(DECOMMISSION_CAPACITY_LEGACY_MODEL_VERSION) => {
-                let mut save_guard = self.pool_meta_save_gate.lock().await;
+                let mut save_guard = self.pool_meta_save_gate.write().await;
                 let (write_guard, snapshot) = self
                     .acquire_pool_meta_write_guard(&mut save_guard, "exact delete capacity reconciliation failed")
                     .await?;
@@ -13573,7 +13801,7 @@ impl ECStore {
         let (mut save_guard, write_guard, mut snapshot) = if let Some(fence) = legacy_write_fence {
             fence
         } else {
-            let mut save_guard = self.pool_meta_save_gate.lock().await;
+            let mut save_guard = self.pool_meta_save_gate.write().await;
             let (write_guard, snapshot) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "exact delete capacity reconciliation failed")
                 .await?;
@@ -13661,7 +13889,7 @@ impl ECStore {
         if let Some(target_guard) = target_guard.as_ref() {
             ensure_decommission_capacity_target_fence(target_guard, target_pool_index, "equivalent target reconciliation")?;
         }
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission equivalent target reconciliation failed")
             .await?;
@@ -13884,7 +14112,7 @@ impl ECStore {
                 "equivalent temporary target reconciliation",
             )?;
         }
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission equivalent temporary target reconciliation failed")
             .await?;
@@ -14079,7 +14307,7 @@ impl ECStore {
         let non_growing_replacement = matches!(mode, DecommissionCapacityMutationMode::NonGrowingReplacement);
         let temporary_release = matches!(mode, DecommissionCapacityMutationMode::TemporaryRelease);
         let mut operation = Some(operation);
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.read().await;
         let (read_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "target capacity admission failed")
             .await?;
@@ -14145,7 +14373,7 @@ impl ECStore {
 
         #[cfg(test)]
         pause_decommission_capacity_before_owner_write(self.id).await;
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (write_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission target capacity admission failed")
             .await?;
@@ -14305,7 +14533,7 @@ impl ECStore {
         let clear_pending_on_temporary_release = result.as_ref().ok().is_some_and(&clear_pending_on_temporary_release);
         if let Some(target_guard) = target_guard.as_ref() {
             ensure_decommission_capacity_target_fence(target_guard, target_pool_index, "target mutation")?;
-            let mut finalize_save_guard = self.pool_meta_save_gate.lock().await;
+            let mut finalize_save_guard = self.pool_meta_save_gate.write().await;
             let (finalize_write_guard, finalize_snapshot) = self
                 .acquire_pool_meta_write_guard(&mut finalize_save_guard, "decommission target capacity finalize failed")
                 .await?;
@@ -14467,7 +14695,7 @@ impl ECStore {
     }
 
     pub(crate) async fn ensure_pool_meta_side_effects_safe(&self, operation: &str) -> Result<()> {
-        self.pool_meta_save_gate.lock().await.ensure_write_safe(operation)
+        self.pool_meta_save_gate.read().await.ensure_write_safe(operation)
     }
 
     /// Reports whether pool metadata side effects are currently writable.
@@ -14477,27 +14705,16 @@ impl ECStore {
         self.pool_meta_write_status().await.is_ok()
     }
 
-    /// A health probe must not wait behind a metadata transaction's disk I/O.
+    /// Inspects the authority committed by the most recent writer. Health must
+    /// not queue behind metadata transaction I/O or behind a writer waiting for
+    /// readers, so this never acquires the gate.
     pub async fn pool_meta_write_gate_status(&self) -> PoolMetaWriteGateStatus {
-        let Ok(write_state) = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.lock()).await
-        else {
-            return PoolMetaWriteGateStatus {
-                writes_ready: false,
-                check_timed_out: true,
-                ..PoolMetaWriteGateStatus::default()
-            };
-        };
-        let transaction_aborted = write_state.aborted_transaction.load(Ordering::SeqCst);
-        let writes_ready = !write_state.write_blocked && !transaction_aborted;
-        let failure = if writes_ready {
-            None
-        } else {
-            write_state.ensure_write_safe("pool metadata snapshot").err()
-        };
-        let context = failure.as_ref().and_then(Error::pool_metadata_failure);
+        let write_state = self.pool_meta_save_gate.published();
+        let (block, transaction_aborted) = write_state.write_block();
+        let writes_ready = block.is_none();
+        let context = block.as_ref();
         PoolMetaWriteGateStatus {
             writes_ready,
-            check_timed_out: false,
             write_blocked: write_state.write_blocked,
             transaction_aborted,
             pool_meta_absent: write_state.pool_meta_absent,
@@ -14510,12 +14727,13 @@ impl ECStore {
         }
     }
 
-    /// A health probe must not wait behind a metadata transaction's disk I/O.
+    /// Readiness view of the committed authority; see
+    /// [`Self::pool_meta_write_gate_status`]. Mutating paths must keep calling
+    /// `ensure_write_safe` under the gate instead of relying on this view.
     pub async fn pool_meta_write_status(&self) -> Result<()> {
-        let write_state = tokio::time::timeout(std::time::Duration::from_millis(100), self.pool_meta_save_gate.lock())
-            .await
-            .map_err(|_| Error::Timeout)?;
-        write_state.ensure_write_safe("pool metadata readiness")
+        self.pool_meta_save_gate
+            .published()
+            .ensure_write_safe("pool metadata readiness")
     }
 
     pub(crate) async fn heal_pool_meta_replica_under_fence(
@@ -14534,6 +14752,23 @@ impl ECStore {
             .canonical
             .as_ref()
             .ok_or_else(|| Error::other("pool metadata heal has no committed source"))?;
+        if selection.generation_protocol_observed && !selection.revision.is_generation_protocol() {
+            return Err(Error::other("pool metadata heal requires recovery of the observed generation protocol"));
+        }
+        if selection.legacy_has_unsafe_flag {
+            return Err(Error::other("pool metadata legacy replica contains dont_save=true"));
+        }
+        let repair_data = if selection.revision.is_generation_protocol() {
+            canonical.clone()
+        } else {
+            let raw = selection
+                .legacy_raw
+                .clone()
+                .ok_or_else(|| Error::other("pool metadata heal cannot prove the legacy format floor"))?;
+            ensure_legacy_pool_meta_payload_complete(&raw)?;
+            raw
+        };
+        ensure_legacy_pool_meta_republish_safe(&repair_data)?;
         let pool = self
             .pools
             .get(pool_index)
@@ -14544,10 +14779,10 @@ impl ECStore {
             .get(pool_index)
             .ok_or_else(|| Error::other("pool metadata heal has no target revision"))?;
         let mut arm = state.arm_transaction();
-        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, canonical.clone(), token, &fence, "native_heal", &mut arm)
+        save_pool_meta_object_cas(pool.clone(), POOL_META_NAME, repair_data.clone(), token, &fence, "native_heal", &mut arm)
             .await?;
         let (confirmed, _) = read_config_no_lock_preserve_empty_with_metadata(pool, POOL_META_NAME).await?;
-        if confirmed != *canonical {
+        if confirmed != repair_data {
             return Err(Error::other("pool metadata native heal readback diverged"));
         }
         fence.ensure_held()?;
@@ -14565,7 +14800,7 @@ impl ECStore {
 
     pub(crate) async fn recover_pool_meta_transaction(&self) -> Result<bool> {
         {
-            let Ok(state) = self.pool_meta_save_gate.try_lock() else {
+            let Ok(state) = self.pool_meta_save_gate.try_read() else {
                 return Ok(false);
             };
             if state.ensure_write_safe("pool metadata recovery").is_ok() {
@@ -14599,7 +14834,7 @@ impl ECStore {
         }
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
-        let mut state = self.pool_meta_save_gate.lock().await;
+        let mut state = self.pool_meta_save_gate.write().await;
         // Outcomes can outlive the save-gate guard. Do not let an old Drop
         // relatch, or an older recovery clear a newly installed block.
         if state.write_blocked || state.active_transactions.load(Ordering::SeqCst) != 0 {
@@ -14675,15 +14910,20 @@ impl ECStore {
         candidate.transaction_failure = Arc::clone(&state.transaction_failure);
         candidate.active_transactions = Arc::clone(&state.active_transactions);
         candidate.block_started_at = Arc::clone(&state.block_started_at);
+        {
+            // Inspection reads these shared latches without the gate; clear the
+            // flag and its failure in one failure-lock section.
+            let mut failure = state
+                .transaction_failure
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state.aborted_transaction.store(false, Ordering::SeqCst);
+            *failure = None;
+        }
         *state
             .block_started_at
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        *state
-            .transaction_failure
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
-        state.aborted_transaction.store(false, Ordering::SeqCst);
         *state = candidate;
         info!(
             event = EVENT_DECOMMISSION_STATE,
@@ -14699,7 +14939,7 @@ impl ECStore {
     }
 
     pub(crate) fn record_pool_meta_recovery_failure(&self, error: Error) {
-        let Ok(mut state) = self.pool_meta_save_gate.try_lock() else {
+        let Ok(mut state) = self.pool_meta_save_gate.try_write() else {
             return;
         };
         if state.ensure_write_safe("pool metadata recovery").is_ok() {
@@ -14771,7 +15011,7 @@ impl ECStore {
     }
 
     pub(crate) async fn load_runtime_pool_meta(&self, operation: &str) -> Result<PoolMeta> {
-        let mut write_state = self.pool_meta_save_gate.lock().await;
+        let mut write_state = self.pool_meta_save_gate.write().await;
         write_state.ensure_write_safe(operation)?;
         let pool = self
             .pools
@@ -14834,7 +15074,7 @@ impl ECStore {
     }
 
     async fn save_current_pool_meta_checked(&self, indices: &[usize], running: Option<(usize, PoolStatus)>) -> Result<()> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "pool metadata save failed")
             .await?;
@@ -14936,7 +15176,7 @@ impl ECStore {
         // Lock order: save gate, rebalance metadata, then the short pool
         // metadata read/write sections. Peer reloads are intentionally
         // performed by the caller after both locks are released.
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission progress save failed")
             .await?;
@@ -15014,7 +15254,7 @@ impl ECStore {
     ) -> Result<bool> {
         // Lock order: save gate -> pool metadata namespace -> rebalance metadata
         // -> short local pool metadata sections. Publish only after the save.
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission bucket completion save failed")
             .await?;
@@ -15090,7 +15330,7 @@ impl ECStore {
         indices: &[usize],
         decom_buckets: Vec<DecomBucketInfo>,
     ) -> Result<(PoolMeta, PoolMeta)> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         save_guard.ensure_write_safe("decommission start failed")?;
         let rebalance_pool = self
             .pools
@@ -15139,7 +15379,7 @@ impl ECStore {
         ensure_decommission_start_pool_states(&latest_pool_meta, indices)?;
         ensure_decommission_ledger_persistence_supported(&latest_pool_meta)?;
         ensure_decommission_capacity_writer_supported(&latest_pool_meta)?;
-        let capacity_infos = self.get_decommission_all_pool_capacity_infos().await?;
+        let capacity_infos = self.get_decommission_all_pool_capacity_infos_with_owned_usage().await?;
         activation_fence.ensure_held()?;
         let target_fence_proof = crate::services::notification_sys::acquire_decommission_target_fence_fleet_proof();
 
@@ -15235,7 +15475,7 @@ impl ECStore {
         indices: &[usize],
     ) -> Result<()> {
         let _movement_guard = movement_gate.write().await;
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission start rollback failed")
             .await?;
@@ -15501,7 +15741,7 @@ impl ECStore {
 
     async fn get_decommission_prewrite_free_capacity(&self, target_pool_index: usize) -> Result<usize> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, false) {
             return capacity_infos
                 .iter()
                 .find(|capacity| capacity.pool_index == target_pool_index)
@@ -15524,7 +15764,7 @@ impl ECStore {
 
     async fn get_decommission_pool_capacity_infos(&self, use_owned_usage: bool) -> Result<Vec<DecommissionPoolCapacityInfo>> {
         #[cfg(any(test, feature = "test-util"))]
-        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id) {
+        if let Some(capacity_infos) = take_decommission_capacity_info_override_for_test(self.id, use_owned_usage) {
             return Ok(capacity_infos);
         }
 
@@ -15584,7 +15824,7 @@ impl ECStore {
         }
         let _start_guard = self.start_gate.lock().await;
         let plan = {
-            let save_guard = self.pool_meta_save_gate.lock().await;
+            let save_guard = self.pool_meta_save_gate.read().await;
             let (_read_guard, snapshot) = self
                 .acquire_pool_meta_read_guard(&save_guard, "decommission intent adoption planning failed")
                 .await?;
@@ -15603,7 +15843,7 @@ impl ECStore {
                 target_guards.push((intent.target_pool_index, guard));
             }
         }
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission intent adoption failed")
             .await?;
@@ -15742,14 +15982,8 @@ impl ECStore {
             log_decommission_adopted_target_choice(reservation, owner, pool_index, &over_budget);
             return Ok(pool_index);
         }
-        if reservation.source_data_equivalent_bytes > 0 {
-            let mut skipped = over_budget.iter().copied().collect::<Vec<_>>();
-            skipped.sort_unstable();
-            return Err(decommission_capacity_blocked_error(format!(
-                "source pool {} has no target allocation for {expected_data_bytes} data bytes; target pools over their temporary-copy budget: {skipped:?}",
-                owner.source_pool_index
-            )));
-        }
+        // A stale nonzero estimate can exhaust its allocation too. Selection
+        // is provisional until fenced growth persists the new reservation.
         let capacities = self.get_decommission_all_pool_capacity_infos().await?;
         let active_sources = active_decommission_source_indices(&pool_meta);
         capacities
@@ -15830,7 +16064,7 @@ impl ECStore {
         // global lock, then fence the exact target cohort before taking the
         // write lock used to publish the terminal transition.
         let terminal_fence_plan = if acquire_runtime_fence {
-            let read_save_guard = self.pool_meta_save_gate.lock().await;
+            let read_save_guard = self.pool_meta_save_gate.read().await;
             let (read_guard, snapshot) = self
                 .acquire_pool_meta_read_guard(&read_save_guard, "decommission cancel fence planning failed")
                 .await?;
@@ -15847,7 +16081,7 @@ impl ECStore {
         } else {
             Vec::new()
         };
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (_pool_meta_guard, mut persisted_pool_meta) = if acquire_runtime_fence {
             let (guard, pool_meta) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "decommission cancel failed")
@@ -16286,7 +16520,7 @@ impl ECStore {
             let _start_guard = self.start_gate.lock().await;
             let movement_gate = self.ctx.data_movement_operation_gate();
             let _movement_guard = movement_gate.write().await;
-            let mut save_guard = self.pool_meta_save_gate.lock().await;
+            let mut save_guard = self.pool_meta_save_gate.write().await;
             let (pool_meta_guard, mut snapshot) = self
                 .acquire_pool_meta_write_guard(&mut save_guard, "decommission promotion failed")
                 .await?;
@@ -16400,7 +16634,7 @@ impl ECStore {
         let _start_guard = self.start_gate.lock().await;
         let movement_gate = self.ctx.data_movement_operation_gate();
         let _movement_guard = movement_gate.write().await;
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         save_guard.ensure_write_safe("decommission convergence recheck failed")?;
         let pool = self
             .pools
@@ -16494,7 +16728,7 @@ impl ECStore {
     }
 
     async fn pause_decommission_for_capacity(&self, idx: usize, err: &Error) -> Result<()> {
-        let mut save_guard = self.pool_meta_save_gate.lock().await;
+        let mut save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, mut snapshot) = self
             .acquire_pool_meta_write_guard(&mut save_guard, "decommission capacity pause failed")
             .await?;
@@ -16614,7 +16848,7 @@ impl ECStore {
         }
 
         let _start_guard = self.start_gate.lock().await;
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.write().await;
         save_guard.ensure_write_safe("decommission cannot be scheduled while pool metadata requires recovery")?;
         let indices = {
             let pool_meta = self.pool_meta.read().await;
@@ -17467,6 +17701,16 @@ impl ECStore {
     }
 
     #[cfg(feature = "test-util")]
+    pub async fn complete_scanner_pause_backlog_retirement_for_test(&self, source_pool_index: usize) -> Result<()> {
+        // Native backlog fixtures use bounded capacity inputs rather than the
+        // host filesystem's unrelated usage. Keep the real ILM completion gate.
+        let run_token = self.durable_ilm_receipt_run_token(source_pool_index).await?;
+        self.persist_decommission_durable_ilm_manifest_for_run(source_pool_index, &run_token)
+            .await?;
+        self.complete_decommission(source_pool_index).await
+    }
+
+    #[cfg(feature = "test-util")]
     pub async fn retire_scanner_pause_backlog_for_test(
         self: &Arc<Self>,
         source_pool_index: usize,
@@ -17590,7 +17834,7 @@ impl ECStore {
             .await?;
         // Native replica writers acquire this same fixed object domain before
         // durable pool metadata. Keep both fences through physical source deletion.
-        let save_guard = self.pool_meta_save_gate.lock().await;
+        let save_guard = self.pool_meta_save_gate.write().await;
         let (pool_meta_guard, snapshot) = self
             .acquire_pool_meta_read_guard(&save_guard, "scanner pause backlog retirement admission failed")
             .await?;
@@ -22053,7 +22297,7 @@ async fn persist_v3_pool_meta_for_test(store: &Arc<ECStore>) {
         .await
         .expect("the baseline pool metadata should be readable before V3 migration");
     meta.version = POOL_META_GENERATION_VERSION;
-    let mut write_state = store.pool_meta_save_gate.lock().await.clone();
+    let mut write_state = store.pool_meta_save_gate.write().await.clone();
     temp_env::async_with_vars(
         [
             (rustfs_config::ENV_POOL_META_V3_WRITE, Some("true")),
@@ -22158,7 +22402,7 @@ mod tests {
         assert_eq!(snapshot[1].diagnostic.availability, PoolAvailability::Offline);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .ensure_write_safe("ordinary object write")
             .expect("a failed diagnostic read must not latch the writer gate");
@@ -23830,7 +24074,7 @@ mod tests {
         let v1_data = pool_meta_v1_replica_test_data(&v1_meta);
         {
             // Preserve the normal save-gate -> namespace-writer lock order.
-            let mut write_state = store.pool_meta_save_gate.lock().await;
+            let mut write_state = store.pool_meta_save_gate.write().await;
             let (guard, _) = store
                 .acquire_pool_meta_write_guard(&mut write_state, "V1 test baseline")
                 .await
@@ -25014,8 +25258,8 @@ mod tests {
             .expect("first legacy mutation should enter")
             .expect("first legacy mutation should report entry");
         assert!(
-            store.pool_meta_save_gate.try_lock().is_err(),
-            "legacy target I/O must retain the local pool metadata save gate"
+            store.pool_meta_save_gate.try_read().is_err(),
+            "legacy target I/O must retain exclusive ownership of the local pool metadata save gate"
         );
         let pool_meta_lock = store.pools[0]
             .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
@@ -25160,7 +25404,7 @@ mod tests {
 
         let save_guard = store
             .pool_meta_save_gate
-            .try_lock()
+            .try_write()
             .expect("target I/O must not retain the local pool metadata save gate");
         drop(save_guard);
         let pool_meta_lock = store.pools[0]
@@ -25307,7 +25551,7 @@ mod tests {
             .await
             .expect("create single-pool bucket before blocking pool metadata writes");
         let incarnation = store.bucket_incarnation_id(&bucket).await.expect("load bucket incarnation");
-        store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+        store.pool_meta_save_gate.write().await.block_writes_after_fence_loss();
         let write_gate = store.pool_meta_write_gate_status().await;
         assert!(!write_gate.writes_ready);
         assert!(write_gate.write_blocked);
@@ -25683,6 +25927,55 @@ mod tests {
 
     #[tokio::test]
     #[serial_test::serial]
+    async fn decommission_activation_reserves_owned_usage_on_a_shared_filesystem() {
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let target = DecommissionPoolCapacityInfo::for_test(1, layout, 60, 60, 0);
+        let filesystem_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 400);
+        let owned_source = DecommissionPoolCapacityInfo::for_test(0, layout, 0, 400, 30);
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![vec![filesystem_source, target]]);
+        {
+            let mut overrides = super::DECOMMISSION_CAPACITY_INFO_OVERRIDES
+                .get()
+                .expect("capacity overrides initialized")
+                .lock()
+                .expect("capacity overrides lock");
+            overrides
+                .get_mut(&store.id)
+                .expect("this store has an override")
+                .owned_snapshots = Some(vec![vec![owned_source, target]].into());
+        }
+
+        store
+            .save_current_pool_meta_for_decommission_start(&[0], Vec::new())
+            .await
+            .expect("activation should reserve the owned bytes rather than unrelated mount usage");
+
+        let local = store.pool_meta.read().await;
+        let reservation = local.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
+        drop(local);
+        let mut persisted = PoolMeta::default();
+        persisted
+            .load_no_lock_from_replicas(store.pools.clone())
+            .await
+            .expect("activation should be durable");
+        let reservation = persisted.pools[0]
+            .decommission
+            .as_ref()
+            .and_then(|state| state.capacity_reservation.as_ref())
+            .expect("persisted activation must retain its capacity reservation");
+        assert_eq!(reservation.source_physical_bytes, 30);
+        assert_eq!(reservation.peak_physical_bytes, 60);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn decommission_activation_lock_recheck_rejects_sudden_space_drop_without_persisting() {
         let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
         let layout = DecommissionErasureLayout { data: 1, parity: 0 };
@@ -25713,6 +26006,173 @@ mod tests {
             .await
             .expect("the rejected activation must leave baseline metadata readable");
         assert!(persisted.pools[0].decommission.is_none());
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_copies_native_object_after_nonzero_usage_estimate_is_exhausted() {
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let bucket = format!("stale-owned-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create source bucket");
+        let layout = DecommissionErasureLayout { data: 1, parity: 0 };
+        let capacities = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 1 << 30, 1),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 1 << 30, 1 << 30, 0),
+        ];
+        set_decommission_capacity_info_overrides_for_test(store.id, vec![capacities]);
+        let expected = vec![0x57; 16 * 1024];
+        let mut body = crate::object_api::PutObjReader::from_vec(expected.clone());
+        store.pools[0]
+            .put_object(&bucket, object, &mut body, &ObjectOptions::default())
+            .await
+            .expect("write an object larger than the earlier scanner estimate");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate the stale nonzero reservation");
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run the real native-disk mover");
+
+        let mut reader = store.pools[1]
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("the newer object must reach the target despite the stale estimate");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read migrated payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err(),
+            "source cleanup follows the verified target copy"
+        );
+        let meta = store.pool_meta.read().await;
+        let state = meta.pools[0].decommission.as_ref().expect("retirement state is retained");
+        assert!(state.complete && !state.failed);
+        assert_eq!(state.items_decommission_failed, 0);
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "test-util")]
+    #[serial_test::serial]
+    async fn decommission_native_ec_growth_keeps_all_metadata_replicas_readable() {
+        use rustfs_data_usage::{DataUsageCache, DataUsageEntry};
+        use tokio::io::AsyncReadExt as _;
+
+        let (_temp_dirs, store, _other_store) =
+            crate::services::rebalance::test_three_pool_stores_with_four_disk_sets_with_isolated_node_contexts(None).await;
+        let bucket = format!("stale-ec-{}", uuid::Uuid::new_v4());
+        let object = "new-after-scan.bin";
+        store
+            .make_bucket(&bucket, &MakeBucketOptions::default())
+            .await
+            .expect("create bucket");
+        for set in &store.pools[0].disk_set {
+            let encoded = rmp_serde::to_vec_named(&serde_json::json!({
+                "info": {
+                    "name": DATA_USAGE_ROOT,
+                    "next_cycle": 1,
+                    "last_update": std::time::SystemTime::now(),
+                    "skip_healing": false,
+                    "snapshot_complete": true
+                },
+                "cache": {
+                    DATA_USAGE_ROOT: DataUsageEntry { size: 3, objects: 1, ..Default::default() }
+                }
+            }))
+            .expect("encode completed scanner fixture");
+            let cache = DataUsageCache::unmarshal(&encoded).expect("read scanner fixture");
+            assert!(cache.dui(DATA_USAGE_ROOT, &[]).is_complete_bucket_usage_snapshot());
+            set.put_object(
+                RUSTFS_META_BUCKET,
+                &format!("{}/{}", crate::disk::BUCKET_META_PREFIX, DATA_USAGE_CACHE_NAME),
+                &mut crate::object_api::PutObjReader::from_vec(encoded),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("persist the earlier complete cache");
+        }
+        let expected = vec![0x37; 16 * 1024];
+        store.pools[0]
+            .put_object(
+                &bucket,
+                object,
+                &mut crate::object_api::PutObjReader::from_vec(expected.clone()),
+                &ObjectOptions::default(),
+            )
+            .await
+            .expect("write after the scan");
+        store
+            .save_current_pool_meta_for_decommission_start(
+                &[0],
+                vec![DecomBucketInfo {
+                    name: bucket.clone(),
+                    prefix: String::new(),
+                }],
+            )
+            .await
+            .expect("activate from the earlier owned estimate");
+        {
+            let meta = store.pool_meta.read().await;
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            assert_eq!(reservation.source_layout, DecommissionErasureLayout { data: 3, parity: 1 });
+            assert_eq!(reservation.source_physical_bytes, 8);
+        }
+        let canceler = DecommissionCanceler::new(CancellationToken::new());
+        store.decommission_cancelers.write().await[0] = Some(canceler.clone());
+        store
+            .do_decommission_in_routine(canceler, 0, Arc::new(Semaphore::new(1)))
+            .await
+            .expect("run native EC migration");
+        for pool in &store.pools {
+            let mut reloaded = PoolMeta::default();
+            reloaded
+                .load_no_lock_from_replicas(vec![pool.clone()])
+                .await
+                .expect("each saved metadata replica must reload");
+            let state = reloaded.pools[0].decommission.as_ref().expect("saved retirement state");
+            assert!(state.complete && !state.failed);
+        }
+        let mut reader = store
+            .get_object_reader(&bucket, object, None, HeaderMap::new(), &ObjectOptions::default())
+            .await
+            .expect("target object must remain readable");
+        let mut actual = Vec::new();
+        reader
+            .stream
+            .read_to_end(&mut actual)
+            .await
+            .expect("read migrated EC payload");
+        assert_eq!(actual, expected);
+        assert!(
+            store.pools[0]
+                .get_object_info(&bucket, object, &ObjectOptions::default())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -27290,7 +27750,7 @@ mod tests {
             let original = std::mem::replace(&mut *guard, vec![None; disk_count]);
             disks.push((set.clone(), original));
         }
-        let mut state = store.pool_meta_save_gate.lock().await;
+        let mut state = store.pool_meta_save_gate.write().await;
         let err = store
             .acquire_pool_meta_write_guard(&mut state, "writer preflight")
             .await
@@ -27315,7 +27775,7 @@ mod tests {
         requested.pools[0].last_update += Duration::seconds(1);
         requested.version = POOL_META_GENERATION_VERSION;
         {
-            let mut state = store.pool_meta_save_gate.lock().await;
+            let mut state = store.pool_meta_save_gate.write().await;
             let (fence, _) = store.acquire_pool_meta_write_guard(&mut state, "test save").await.unwrap();
             let outcome = requested
                 .save_no_lock_armed(store.pools.clone(), &mut state, PoolMetaPersistenceFence::Owned(Arc::clone(&fence)), &[0])
@@ -27333,42 +27793,253 @@ mod tests {
         assert_eq!(store.pool_meta.read().await.pools[0].last_update, before.pools[0].last_update);
         worker.release();
         store.pool_meta.write().await.pools[0].last_update = requested.pools[0].last_update + Duration::seconds(10);
-        // An outcome may outlive the save mutex. Its Drop must precede recovery.
-        let outstanding = store.pool_meta_save_gate.lock().await.arm_transaction();
+        // An outcome may outlive the authority writer. Its Drop must precede recovery.
+        let outstanding = store.pool_meta_save_gate.write().await.arm_transaction();
         assert!(!store.recover_pool_meta_transaction().await.unwrap());
         drop(outstanding);
-        assert!(store.recover_pool_meta_transaction().await.unwrap());
+        let authority_reader = store.pool_meta_save_gate.read().await;
+        let recovery = tokio::spawn({
+            let store = store.clone();
+            async move { store.recover_pool_meta_transaction().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.pool_meta_save_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("recovery must queue for its authority writer while a reader remains");
+        drop(authority_reader);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(10), recovery)
+                .await
+                .expect("the queued recovery writer must make progress")
+                .expect("the recovery task must not panic")
+                .expect("the durable metadata must recover")
+        );
         assert!(store.pool_meta_writes_ready().await);
         let recovered = store.pool_meta_write_gate_status().await;
         assert!(recovered.writes_ready);
-        assert!(!recovered.check_timed_out);
         assert!(!recovered.write_blocked);
         assert!(!recovered.transaction_aborted);
         assert_eq!((recovered.reason, recovered.phase, recovered.since_unix_secs), (None, None, None));
         assert_eq!(store.pool_meta.read().await.pools[0].last_update, requested.pools[0].last_update);
         assert!(!store.recover_pool_meta_transaction().await.unwrap());
-        store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+        store.pool_meta_save_gate.write().await.block_writes_after_fence_loss();
         assert!(!store.recover_pool_meta_transaction().await.unwrap());
         assert!(!store.pool_meta_writes_ready().await);
     }
 
     #[tokio::test]
     #[serial_test::serial]
-    async fn pool_meta_readiness_is_bounded_while_save_gate_is_held() {
+    async fn pool_meta_readiness_does_not_queue_behind_read_only_fence() {
         let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
-        let _state = store.pool_meta_save_gate.lock().await;
-        let result = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+        let namespace = store.pools[0]
+            .new_ns_lock(RUSTFS_META_BUCKET, POOL_META_NAME)
             .await
-            .unwrap();
-        assert!(matches!(result, Err(Error::Timeout)));
+            .expect("create the pool metadata namespace lock");
+        let writer = namespace
+            .get_write_lock(get_lock_acquire_timeout())
+            .await
+            .expect("hold the namespace writer while the read-only admission waits");
+        let admission = tokio::spawn({
+            let store = store.clone();
+            async move { store.acquire_decommission_capacity_release_fence_with_active_source().await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if store.pool_meta_save_gate.try_write().is_err() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the read-only admission must reach its authority fence");
+
+        let readiness = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not wait for the authority gate");
         let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
             .await
-            .unwrap();
-        assert!(!snapshot.writes_ready);
-        assert!(snapshot.check_timed_out);
+            .expect("the authority snapshot must not wait for the authority gate");
+        assert!(
+            store.pool_meta_save_gate.try_write().is_err() && !admission.is_finished(),
+            "the read-only admission must still hold its authority reader while health is sampled"
+        );
+
+        // A local writer queued behind the parked reader blocks every later
+        // gate reader. Inspection must still answer from committed authority.
+        let queued_writer = tokio::spawn({
+            let store = store.clone();
+            async move { store.save_current_pool_meta_for_test(&[0]).await }
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            while store.pool_meta_save_gate.try_read().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the local writer must queue behind the parked reader");
+        let queued_readiness = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not queue behind a waiting writer");
+        let queued_snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .expect("the authority snapshot must not queue behind a waiting writer");
+        assert!(
+            !admission.is_finished() && !queued_writer.is_finished(),
+            "the reader must still be parked and the writer still queued while health is sampled"
+        );
+
+        drop(writer);
+        let (read_fence, _) = tokio::time::timeout(std::time::Duration::from_secs(10), admission)
+            .await
+            .expect("the read-only admission must finish after releasing the namespace writer")
+            .expect("the admission task must not panic")
+            .expect("the durable metadata must still admit its ordinary read fence");
+        drop(read_fence);
+        tokio::time::timeout(std::time::Duration::from_secs(10), queued_writer)
+            .await
+            .expect("the queued writer must make progress after the reader releases")
+            .expect("the queued writer task must not panic")
+            .expect("the queued pool metadata save must commit");
+
+        readiness.expect("a read-only namespace wait must not hide unchanged writable authority");
+        assert!(snapshot.writes_ready, "read-only I/O must not make authority unavailable: {snapshot:?}");
+        queued_readiness.expect("a queued writer must not hide unchanged writable authority");
+        assert!(
+            queued_snapshot.writes_ready,
+            "a queued writer must not make authority unavailable: {queued_snapshot:?}"
+        );
+        store
+            .pool_meta_write_status()
+            .await
+            .expect("the committed save must leave authority writable");
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_readiness_reports_committed_authority_while_save_gate_is_held() {
+        let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let mut state = store.pool_meta_save_gate.write().await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not wait for an active writer")
+            .expect("an active writer must not hide committed writable authority");
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .expect("the authority snapshot must not wait for an active writer");
+        assert!(snapshot.writes_ready, "{snapshot:?}");
         assert!(!snapshot.write_blocked);
         assert!(!snapshot.transaction_aborted);
         assert_eq!((snapshot.reason, snapshot.phase, snapshot.since_unix_secs), (None, None, None));
+
+        // A latch installed by the writer commits when it releases the gate.
+        state.block_writes_after_fence_loss();
+        assert!(
+            store.pool_meta_write_gate_status().await.writes_ready,
+            "inspection reports the committed authority until the writer releases the gate"
+        );
+        drop(state);
+        let blocked = store.pool_meta_write_gate_status().await;
+        assert!(!blocked.writes_ready, "{blocked:?}");
+        assert!(blocked.write_blocked);
+        assert_eq!((blocked.reason, blocked.phase), (Some("fence_lost"), Some("format_heal")));
+        let err = store
+            .pool_meta_write_status()
+            .await
+            .expect_err("a released writer latch must fail readiness closed");
+        assert_eq!(
+            err.pool_metadata_failure()
+                .expect("the readiness failure must carry pool metadata context")
+                .kind,
+            crate::error::PoolMetadataFailure::FenceLost
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn pool_meta_readiness_observes_outcome_latch_while_save_gate_is_held() {
+        let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
+        let arm = {
+            let state = store.pool_meta_save_gate.write().await;
+            let mut arm = state.arm_transaction();
+            arm.phase = Some("publication");
+            arm
+        };
+        // The outcome outlives its writer while another writer owns the gate.
+        let writer = store.pool_meta_save_gate.write().await;
+        drop(arm);
+        let status = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_gate_status())
+            .await
+            .expect("the authority snapshot must not wait for an active writer");
+        assert!(!status.writes_ready, "{status:?}");
+        assert!(status.transaction_aborted);
+        assert!(!status.write_blocked);
+        assert_eq!((status.reason, status.phase), (Some("transaction_unknown"), Some("publication")));
+        let err = tokio::time::timeout(std::time::Duration::from_secs(1), store.pool_meta_write_status())
+            .await
+            .expect("readiness inspection must not wait for an active writer")
+            .expect_err("a live outcome latch must fail readiness closed while a writer is active");
+        assert_eq!(
+            err.pool_metadata_failure()
+                .expect("the readiness failure must carry pool metadata context")
+                .kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        drop(writer);
+        assert!(
+            !store.pool_meta_writes_ready().await,
+            "releasing an unrelated writer must not clear the latch"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_meta_save_gate_publishes_every_writer_release() {
+        let gate = PoolMetaSaveGate::default();
+        {
+            let mut state = gate.try_write().expect("an idle gate must admit a writer");
+            state.block_writes_after_fence_loss();
+            gate.published()
+                .ensure_write_safe("writer still active")
+                .expect("a writer's latch is not published before it releases the gate");
+        }
+        let err = gate
+            .published()
+            .ensure_write_safe("try_write released")
+            .expect_err("releasing a try_write guard must publish its latch");
+        let context = err
+            .pool_metadata_failure()
+            .expect("the published failure must carry pool metadata context");
+        assert_eq!(
+            (context.kind, context.phase),
+            (crate::error::PoolMetadataFailure::FenceLost, "format_heal"),
+            "the published copy must carry the writer's block context, not the external-fence fallback"
+        );
+
+        *gate.write().await = PoolMetaWriteState::default();
+        gate.published()
+            .ensure_write_safe("replacement released")
+            .expect("releasing a whole-state replacement must publish it");
+
+        // The published copy shares the replacement's live transaction latches.
+        let arm = {
+            let state = gate.write().await;
+            let mut arm = state.arm_transaction();
+            arm.phase = Some("publication");
+            arm
+        };
+        gate.published()
+            .ensure_write_safe("outcome armed")
+            .expect("an armed outcome alone must not block writes");
+        drop(arm);
+        let (block, aborted) = gate.published().write_block();
+        assert!(aborted, "an outcome latch must reach the published copy without another writer");
+        assert_eq!(
+            block.expect("the outcome latch must block writes").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
     }
 
     #[tokio::test]
@@ -27377,7 +28048,7 @@ mod tests {
         let (_dirs, store, _peer) = crate::services::rebalance::test_two_pool_stores(None).await;
         let since = OffsetDateTime::from_unix_timestamp(1_700_000_000).unwrap();
         {
-            let state = store.pool_meta_save_gate.lock().await;
+            let state = store.pool_meta_save_gate.write().await;
             let mut arm = state.arm_transaction();
             arm.phase = Some("publication");
             drop(arm);
@@ -27387,7 +28058,6 @@ mod tests {
         }
         let original = store.pool_meta_write_gate_status().await;
         assert!(!original.writes_ready);
-        assert!(!original.check_timed_out);
         assert!(!original.write_blocked);
         assert!(original.transaction_aborted);
         assert_eq!(original.reason, Some("transaction_unknown"));
@@ -27401,7 +28071,7 @@ mod tests {
         });
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                if store.pool_meta_save_gate.try_lock().is_err() {
+                if store.pool_meta_save_gate.try_write().is_err() {
                     break;
                 }
                 tokio::task::yield_now().await;
@@ -27419,7 +28089,7 @@ mod tests {
             let store = store.clone();
             async move { store.recover_pool_meta_transaction().await }
         });
-        store.pool_meta_save_gate.lock().await.block_writes_after_fence_loss();
+        store.pool_meta_save_gate.write().await.block_writes_after_fence_loss();
         drop(start_guard);
         assert!(!recovery.await.unwrap().unwrap());
         assert_eq!(
@@ -27467,7 +28137,7 @@ mod tests {
             *disks = vec![None; disk_count];
         }
 
-        let write_state = store.pool_meta_save_gate.lock().await;
+        let write_state = store.pool_meta_save_gate.write().await;
         store
             .acquire_pool_meta_read_guard(&write_state, "capacity probe")
             .await
@@ -28353,7 +29023,7 @@ mod tests {
             "one version must commit before the next version times out"
         );
         assert!(
-            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
             "{outcome:?}"
         );
         assert_eq!(
@@ -28365,6 +29035,88 @@ mod tests {
             0,
             "a deferred entry must not be counted as a permanent failure"
         );
+        drop(fault);
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
+        fixture.assert_moved().await;
+        let mut reader = fixture.store.pools[1]
+            .get_object_reader(
+                fixture.bucket,
+                fixture.object,
+                None,
+                HeaderMap::new(),
+                &ObjectOptions {
+                    version_id: Some(fixture.seeded.versions[0].version_id.expect("newer version").to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("the newer version must remain readable");
+        let mut actual = Vec::new();
+        reader.stream.read_to_end(&mut actual).await.expect("read the newer version");
+        assert_eq!(actual, b"written after versioning was enabled");
+    }
+
+    /// A target lookup that loses its read-lock quorum must retain the source
+    /// and resume an entry after an earlier version has already committed.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn decommission_defers_target_lookup_read_lock_quorum_and_resumes() {
+        use tokio::io::AsyncReadExt as _;
+
+        let fixture = NullVersionDecommission::new(NullVersionTop::NewerVersion).await;
+        let object = fixture.object;
+        let attempted = Arc::new(AtomicUsize::new(0));
+        let fault = DecommissionTestFaultGuard::install_with_error(
+            Arc::new({
+                let attempted = Arc::clone(&attempted);
+                move |stage, _, faulted, _, success| {
+                    stage == "before_target_commit"
+                        && faulted == object
+                        && success
+                        && attempted.fetch_add(1, Ordering::SeqCst) > 0
+                }
+            }),
+            Some(Arc::new(|_, bucket, object| {
+                data_movement::data_movement_stage_error_for_test(
+                    "decommission_object",
+                    "prepare_put_object",
+                    bucket,
+                    object,
+                    Error::NamespaceLockQuorumUnavailable {
+                        mode: "read",
+                        bucket: bucket.to_owned(),
+                        object: object.to_owned(),
+                        required: 1,
+                        achieved: 0,
+                    },
+                )
+            })),
+        );
+        let (outcome, _) = fixture.run_entry().await;
+        assert!(
+            matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
+            "{outcome:?}"
+        );
+        fixture.assert_source_retained().await;
+        assert_eq!(
+            fixture
+                .target_versions()
+                .await
+                .expect("first version committed")
+                .versions
+                .len(),
+            1
+        );
+        assert_eq!(
+            fixture.store.pool_meta.read().await.pools[0]
+                .decommission
+                .as_ref()
+                .expect("active decommission")
+                .items_decommission_failed,
+            0
+        );
+
         drop(fault);
         let (outcome, _) = fixture.run_entry().await;
         assert!(matches!(outcome, DecommissionEntryOutcome::Complete), "{outcome:?}");
@@ -28429,7 +29181,7 @@ mod tests {
 
             let (outcome, _) = fixture.run_entry().await;
             assert!(
-                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_timeout_deferral(err)),
+                matches!(&outcome, DecommissionEntryOutcome::Deferred(err) if is_decommission_copy_lock_unavailable_deferral(err)),
                 "{outcome:?}"
             );
             assert_eq!(
@@ -28838,17 +29590,17 @@ mod tests {
             timeout(),
         );
         for err in [timeout(), prepare] {
-            assert!(is_decommission_copy_lock_timeout_error(&err), "{err}");
+            assert!(is_decommission_copy_lock_unavailable_error(&err, "bucket-a", "object-a"), "{err}");
             assert!(!is_decommission_copy_quorum_error(&err), "{err}");
             let mut error = Some(err);
             let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
                 .expect("a lock timeout copy must be deferred");
             assert!(error.is_none());
-            assert!(is_decommission_copy_lock_timeout_deferral(&deferred));
+            assert!(is_decommission_copy_lock_unavailable_deferral(&deferred));
             assert!(!is_decommission_copy_quorum_deferral(&deferred));
-            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockTimeout>(&deferred)
+            let failure = data_movement::data_movement_stage_source_as::<DecommissionCopyLockUnavailable>(&deferred)
                 .expect("the deferred error must keep its lock-timeout origin");
-            assert!(is_decommission_copy_lock_timeout_error(&failure.0));
+            assert!(is_decommission_copy_lock_unavailable_error(&failure.0, "bucket-a", "object-a"));
             assert!(matches!(
                 resolve_decommission_entry_failure(deferred),
                 Ok(DecommissionEntryOutcome::Deferred(_))
@@ -28870,6 +29622,43 @@ mod tests {
                 "{error:?}"
             );
             assert!(error.is_some(), "a per-object failure keeps its error");
+        }
+    }
+
+    #[test]
+    fn decommission_copy_defers_only_the_matching_object_read_lock_quorum() {
+        let quorum = |mode, bucket: &str, object: &str| Error::NamespaceLockQuorumUnavailable {
+            mode,
+            bucket: bucket.to_owned(),
+            object: object.to_owned(),
+            required: 1,
+            achieved: 0,
+        };
+        let wrap = |stage, err| {
+            data_movement::data_movement_stage_error_for_test("decommission_object", stage, "bucket-a", "object-a", err)
+        };
+        let mut error = Some(wrap("prepare_put_object", quorum("read", "bucket-a", "object-a")));
+        let deferred = take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error)
+            .expect("matching read-lock quorum must defer");
+        assert!(error.is_none());
+        assert!(matches!(
+            resolve_decommission_entry_failure(deferred),
+            Ok(DecommissionEntryOutcome::Deferred(_))
+        ));
+        for err in [
+            quorum("read", "bucket-a", "object-a"),
+            wrap("source_recheck", quorum("read", "bucket-a", "object-a")),
+            wrap("prepare_put_object", quorum("write", "bucket-a", "object-a")),
+            wrap(
+                "prepare_put_object",
+                quorum("exact_delete_capacity_reconciliation", "bucket-a", "object-a"),
+            ),
+            wrap("prepare_put_object", quorum("read", "other-bucket", "object-a")),
+            wrap("prepare_put_object", quorum("read", "bucket-a", "other-object")),
+        ] {
+            let mut error = Some(err);
+            assert!(take_decommission_copy_deferral("migrate_object", "bucket-a", "object-a", &mut error).is_none());
+            assert!(error.is_some(), "unrelated lock failures must stay terminal");
         }
     }
 
@@ -29349,6 +30138,53 @@ mod tests {
             decommission.terminal_reload_failures,
             vec!["complete_decommission: peer node-a failed".to_string()]
         );
+    }
+
+    #[test]
+    fn legacy_republish_guard_checks_only_three_field_sequence_or_map() {
+        let frame = |payload: Vec<u8>| {
+            let mut data = Vec::new();
+            data.extend_from_slice(&POOL_META_FORMAT.to_le_bytes());
+            data.extend_from_slice(&POOL_META_V1_VERSION.to_le_bytes());
+            data.extend_from_slice(&payload);
+            data
+        };
+        let two_fields = PersistedPoolMetaV1 {
+            version: POOL_META_V1_VERSION,
+            pools: Vec::new(),
+        };
+        for payload in [rmp_serde::to_vec(&two_fields), rmp_serde::to_vec_named(&two_fields)] {
+            let data = frame(payload.expect("two-field V1 payload must serialize"));
+            assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+            assert!(ensure_legacy_pool_meta_republish_safe(&data).is_ok());
+            assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+            let mut trailing = data;
+            trailing.push(0xc0);
+            assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+        }
+        for dont_save in [false, true] {
+            let legacy = LegacyPoolMeta {
+                version: POOL_META_V1_VERSION,
+                pools: Vec::new(),
+                dont_save,
+            };
+            for payload in [rmp_serde::to_vec(&legacy), rmp_serde::to_vec_named(&legacy)] {
+                let data = frame(payload.expect("three-field V1 payload must serialize"));
+                assert!(matches!(decode_pool_meta_replica(data.clone()), PoolMetaReplica::Valid { .. }));
+                assert_eq!(ensure_legacy_pool_meta_republish_safe(&data).is_err(), dont_save);
+                assert!(ensure_legacy_pool_meta_payload_complete(&data).is_ok());
+                let mut trailing = data;
+                trailing.push(0xc0);
+                assert!(ensure_legacy_pool_meta_payload_complete(&trailing).is_err());
+            }
+        }
+        // This guard is only called for already-decoded replicas; malformed
+        // containers must fail selection rather than becoming repair sources.
+        let truncated = frame(vec![0x93, 0x01]);
+        assert!(matches!(
+            decode_pool_meta_replica(truncated),
+            PoolMetaReplica::Corrupt(_) | PoolMetaReplica::Incompatible(_)
+        ));
     }
 
     #[test]
@@ -30525,7 +31361,7 @@ mod pools_tests {
             rebalance_meta: tokio::sync::RwLock::new(None),
             decommission_cancelers: tokio::sync::RwLock::new(cancelers),
             start_gate: tokio::sync::Mutex::new(()),
-            pool_meta_save_gate: tokio::sync::Mutex::new(super::PoolMetaWriteState::for_test_bootstrap()),
+            pool_meta_save_gate: crate::core::pools::PoolMetaSaveGate::new(super::PoolMetaWriteState::for_test_bootstrap()),
             ctx,
             bucket_fence_registry: Arc::default(),
         })
@@ -30568,6 +31404,154 @@ mod pools_tests {
         assert!(
             future_size <= 4 * 1024,
             "pool metadata CAS future must remain stack-bounded; measured {future_size} bytes versus {original_size} without repair"
+        );
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_quorum_rejection_allows_retry_after_disks_return() {
+        let (dirs, disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        pool.disks.write().await[2..].fill(None);
+        let state = super::PoolMetaWriteState::default();
+        let data =
+            super::initialized_pool_meta_identity_for_test(uuid::Uuid::new_v4(), 1).expect("encode the deployment identity");
+        let mut transaction = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("two of four disks cannot satisfy the identity write quorum");
+        drop(transaction);
+        for dir in &dirs {
+            assert!(
+                !dir.path()
+                    .join(crate::disk::RUSTFS_META_BUCKET)
+                    .join(POOL_META_IDENTITY_NAME)
+                    .exists(),
+                "the rejected write must not create an identity replica"
+            );
+        }
+        state
+            .ensure_write_safe("retry after disks return")
+            .expect("a rejected inline write must not poison the startup transaction");
+
+        let ordinary_error = crate::config::com::save_config_with_opts(
+            pool.clone(),
+            "ordinary-config",
+            data.clone(),
+            &ObjectOptions {
+                max_parity: true,
+                no_lock: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect_err("ordinary writes must still fail without quorum");
+        assert!(
+            matches!(ordinary_error, Error::InsufficientWriteQuorum(_, _)),
+            "ordinary callers must retain their existing quorum error"
+        );
+
+        *pool.disks.write().await = disks.into_iter().map(Some).collect();
+        let mut retry = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut retry,
+        )
+        .await
+        .expect("the same transaction must succeed when the disks return");
+        retry.disarm();
+        drop(retry);
+        assert_eq!(
+            crate::config::com::read_config(pool, POOL_META_IDENTITY_NAME)
+                .await
+                .expect("read back the committed identity"),
+            data
+        );
+        state
+            .ensure_write_safe("after successful retry")
+            .expect("retry must leave writes enabled");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_quorum_rejection_keeps_an_earlier_write_armed() {
+        let (_dirs, disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        let state = super::PoolMetaWriteState::default();
+        let data =
+            super::initialized_pool_meta_identity_for_test(uuid::Uuid::new_v4(), 1).expect("encode the deployment identity");
+        let mut transaction = state.arm_transaction();
+        let written = save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "prepare_cas",
+            &mut transaction,
+        )
+        .await
+        .expect("the earlier phase must really commit");
+        pool.disks.write().await[2..].fill(None);
+        save_pool_meta_object_cas(
+            pool.clone(),
+            POOL_META_IDENTITY_NAME,
+            data.clone(),
+            &PoolMetaCasToken::Existing(written.etag.expect("committed identity has an ETag")),
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("the next phase must fail without a write quorum");
+        drop(transaction);
+        *pool.disks.write().await = disks.into_iter().map(Some).collect();
+        assert_eq!(
+            crate::config::com::read_config(pool, POOL_META_IDENTITY_NAME)
+                .await
+                .expect("the earlier commit must survive the rejected write"),
+            data
+        );
+        let error = state
+            .ensure_write_safe("after a committed phase")
+            .expect_err("a later rejection cannot discharge the earlier write");
+        assert_eq!(
+            error.pool_metadata_failure().expect("retain typed uncertainty").kind,
+            crate::error::PoolMetadataFailure::TransactionUnknown
+        );
+        assert_eq!(error.pool_metadata_failure().expect("retain the earlier mutation").phase, "prepare_cas");
+    }
+
+    #[tokio::test]
+    async fn pool_meta_prewrite_noninline_failure_keeps_transaction_armed() {
+        let (_dirs, _disks, pool) = crate::set_disk::hermetic_set_disks_isolated(4).await;
+        pool.disks.write().await[2..].fill(None);
+        let state = super::PoolMetaWriteState::default();
+        let mut transaction = state.arm_transaction();
+        save_pool_meta_object_cas(
+            pool,
+            POOL_META_IDENTITY_NAME,
+            vec![0x51; 2 * 1024 * 1024],
+            &PoolMetaCasToken::Missing,
+            &PoolMetaPersistenceFence::OfflineRecovery,
+            "identity_cas",
+            &mut transaction,
+        )
+        .await
+        .expect_err("the noninline write must fail without quorum");
+        drop(transaction);
+        assert!(
+            state.ensure_write_safe("after writer setup").is_err(),
+            "a failure after disk writers were created must remain fail-closed"
         );
     }
 
@@ -30643,6 +31627,10 @@ mod pools_tests {
                 std::future::pending::<()>().await;
             }
             let mut reader = self.inner.get_object_reader(bucket, object, range, headers, opts).await?;
+            if object == POOL_META_NAME {
+                reader.object_info.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH + time::Duration::seconds(1));
+                reader.object_info.data_dir = Some(uuid::Uuid::from_u128(7));
+            }
             match self.fault {
                 IdentityRepairFault::Changed => {
                     reader.stream = Box::new(Cursor::new(b"other-identity".to_vec()));
@@ -30672,16 +31660,30 @@ mod pools_tests {
                         .and_then(HTTPPreconditions::if_none_match_value),
                     None
                 );
+                let written = if object == POOL_META_NAME {
+                    &self.inner.stored
+                } else {
+                    &self.inner.identity
+                };
+                let current_etag = written.lock().expect("metadata lock").as_ref().map(|(_, etag)| etag.clone());
                 assert_eq!(
                     opts.http_preconditions.as_ref().and_then(HTTPPreconditions::if_match_value),
-                    self.inner
-                        .identity
-                        .lock()
-                        .expect("identity lock")
-                        .as_ref()
-                        .map(|(_, etag)| etag.as_str()),
+                    current_etag.as_deref(),
                     "repair must use the observed post-commit CAS token",
                 );
+                if object == POOL_META_NAME {
+                    let condition = rustfs_utils::http::metadata_compat::get_consistent_str(
+                        &opts.user_defined,
+                        crate::disk::POOL_META_NATIVE_CAS_METADATA_SUFFIX,
+                    )
+                    .expect("native repair requires a physical predecessor condition");
+                    let condition: crate::disk::PoolMetaNativeCasCondition =
+                        serde_json::from_str(condition).expect("parse native CAS condition");
+                    let parent = condition.parent.expect("native CAS uses the actual committed head");
+                    assert_eq!(Some(parent.etag), current_etag);
+                    assert_eq!(parent.mod_time_unix_nanos, 1_000_000_000);
+                    assert_eq!(parent.data_dir, Some(uuid::Uuid::from_u128(7)));
+                }
                 if self.fault == IdentityRepairFault::Reject {
                     return Err(Error::PreconditionFailed);
                 }
@@ -30783,6 +31785,46 @@ mod pools_tests {
             if fault == IdentityRepairFault::Always {
                 assert_eq!(started.elapsed(), StdDuration::from_secs(7), "repair backoff must be bounded");
             }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pool_meta_prepare_owner_repair_uses_exact_native_head() {
+        let payload = b"owned-pending-pool-meta";
+        for (fault, writes, reads, succeeds) in [
+            (IdentityRepairFault::Once, 2, 1, true),
+            (IdentityRepairFault::Changed, 1, 1, false),
+            (IdentityRepairFault::MissingEtag, 1, 1, false),
+            (IdentityRepairFault::Unknown, 1, 0, false),
+        ] {
+            let pool = IdentityRepairStorage::new(fault);
+            let state = super::PoolMetaWriteState::default();
+            let mut arm = state.arm_transaction();
+            let result = save_pool_meta_object_cas(
+                pool.clone(),
+                POOL_META_NAME,
+                payload.to_vec(),
+                &PoolMetaCasToken::Missing,
+                &PoolMetaPersistenceFence::OfflineRecovery,
+                "prepare_cas",
+                &mut arm,
+            )
+            .await;
+
+            if succeeds {
+                result.expect("prepare must repair its own partially replicated payload");
+                arm.disarm();
+                assert_eq!(pool.inner.stored.lock().expect("metadata lock").as_ref().expect("written").0, payload);
+            } else {
+                let error = result.expect_err("uncertain or changed authority must remain blocked");
+                let failure = error.pool_metadata_failure().expect("typed transaction uncertainty");
+                assert_eq!(failure.kind, crate::error::PoolMetadataFailure::TransactionUnknown);
+                assert_eq!(failure.phase, "prepare_cas");
+            }
+            drop(arm);
+            assert_eq!(state.ensure_write_safe("after prepare owner repair").is_ok(), succeeds);
+            assert_eq!(pool.writes.load(Ordering::SeqCst), writes, "{fault:?}");
+            assert_eq!(pool.reads.load(Ordering::SeqCst), reads, "{fault:?}");
         }
     }
 
@@ -32362,7 +33404,7 @@ mod pools_tests {
         };
 
         {
-            let mut save_guard = store.pool_meta_save_gate.lock().await;
+            let mut save_guard = store.pool_meta_save_gate.write().await;
             snapshot
                 .save_no_lock_observing(vec![committed.clone(), failed], &mut save_guard)
                 .await
@@ -32416,7 +33458,7 @@ mod pools_tests {
         let save_committed = committed.clone();
         let save_pending = pending.clone();
         let save_task = tokio::spawn(async move {
-            let mut save_guard = save_store.pool_meta_save_gate.lock().await;
+            let mut save_guard = save_store.pool_meta_save_gate.write().await;
             snapshot
                 .save_no_lock_observing(vec![save_committed, save_pending], &mut save_guard)
                 .await
@@ -32433,7 +33475,7 @@ mod pools_tests {
         );
 
         {
-            let save_guard = store.pool_meta_save_gate.lock().await;
+            let save_guard = store.pool_meta_save_gate.write().await;
             save_guard
                 .ensure_write_safe("cancelled pool metadata save")
                 .expect_err("a cancelled replica update must latch the sticky safety gate");
@@ -32478,7 +33520,7 @@ mod pools_tests {
         let task_publish_started = publish_started.clone();
         let task_publish_release = publish_release.clone();
         let save_task = tokio::spawn(async move {
-            let mut save_guard = save_store.pool_meta_save_gate.lock().await;
+            let mut save_guard = save_store.pool_meta_save_gate.write().await;
             let outcome = snapshot
                 .save_no_lock_armed(vec![save_committed], &mut save_guard, PoolMetaPersistenceFence::OfflineRecovery, &[0])
                 .await?;
@@ -32501,7 +33543,7 @@ mod pools_tests {
             "the task should be aborted while publication is pending"
         );
 
-        let save_guard = store.pool_meta_save_gate.lock().await;
+        let save_guard = store.pool_meta_save_gate.write().await;
         save_guard
             .ensure_write_safe("cancelled pool metadata publication")
             .expect_err("cancellation after replica save but before publication must keep writes blocked");
@@ -34290,7 +35332,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(PoolMeta::default(), Vec::new());
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -34335,7 +35377,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(pool_meta, vec![None]);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -34406,7 +35448,7 @@ mod pools_tests {
         drop(pool_meta);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .ensure_write_safe("V1 unresolved-entry preflight")
             .expect("a deterministic capability rejection must not latch recovery");
@@ -37150,10 +38192,88 @@ mod pools_tests {
             .as_ref()
             .and_then(|info| info.capacity_reservation.as_ref())
             .unwrap();
-        assert_eq!(reservation.source_data_equivalent_bytes, 2);
-        assert_eq!(reservation.predicted_physical_bytes, 3);
+        assert_eq!(reservation.source_data_equivalent_bytes, 3);
+        assert_eq!(reservation.predicted_physical_bytes, 4);
         assert_eq!(reservation.targets.len(), 1);
-        assert_eq!(reservation.targets[0].reserved_physical_bytes, 6);
+        assert_eq!(reservation.targets[0].reserved_physical_bytes, 8);
+        validate_decommission_capacity_reservation(Some(reservation)).expect("empty-snapshot growth must remain readable");
+    }
+
+    #[test]
+    fn decommission_capacity_grows_a_stale_nonzero_estimate_and_rolls_back_if_space_is_short() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        let layout = DecommissionErasureLayout { data: 3, parity: 1 };
+        let initial = vec![
+            DecommissionPoolCapacityInfo::for_test(0, layout, 0, 64, 2),
+            DecommissionPoolCapacityInfo::for_test(1, layout, 64, 64, 0),
+        ];
+        let mut meta = PoolMeta {
+            version: POOL_META_VERSION,
+            pools: vec![decommission_test_pool_status(0, None), decommission_test_pool_status(1, None)],
+            ..Default::default()
+        };
+        meta.decommission(0, initial[0].space).expect("activate source");
+        reserve_decommission_start_target_capacity(
+            &mut meta,
+            &[0],
+            &initial,
+            uuid::Uuid::new_v4(),
+            1,
+            now,
+            DECOMMISSION_CAPACITY_MODEL_VERSION,
+        )
+        .expect("reserve the stale estimate");
+        assert!(
+            grow_decommission_target_reservation(&mut meta, &initial, 0, 1, 16, uuid::Uuid::new_v4(), now)
+                .expect("a nonzero stale estimate may grow against real free space")
+        );
+        let before = serde_json::to_value(&meta).expect("snapshot reservation before rejected growth");
+        let shortage = vec![initial[0], DecommissionPoolCapacityInfo::for_test(1, layout, 43, 64, 21)];
+        let error = grow_decommission_target_reservation(&mut meta, &shortage, 0, 1, 32, uuid::Uuid::new_v4(), now)
+            .expect_err("real free-space shortage still rejects growth");
+        assert_eq!(super::decommission_capacity_stale_target_index(&error), Some(1));
+        assert_eq!(serde_json::to_value(&meta).expect("snapshot after rejected growth"), before);
+    }
+
+    #[test]
+    fn decommission_capacity_growth_keeps_rounded_and_mixed_layout_estimates_loadable() {
+        let now = OffsetDateTime::UNIX_EPOCH + Duration::minutes(1);
+        for source_layout in [
+            DecommissionErasureLayout { data: 3, parity: 1 },
+            DecommissionErasureLayout { data: 2, parity: 2 },
+        ] {
+            let capacities = vec![
+                DecommissionPoolCapacityInfo::for_test(0, source_layout, 0, 8, 8),
+                DecommissionPoolCapacityInfo::for_test(1, DecommissionErasureLayout { data: 2, parity: 2 }, 16, 16, 0),
+                DecommissionPoolCapacityInfo::for_test(2, DecommissionErasureLayout { data: 3, parity: 1 }, 1024, 1024, 0),
+            ];
+            let mut meta = PoolMeta {
+                version: POOL_META_VERSION,
+                pools: (0..3).map(|index| decommission_test_pool_status(index, None)).collect(),
+                ..Default::default()
+            };
+            meta.decommission(0, capacities[0].space).unwrap();
+            reserve_decommission_start_target_capacity(
+                &mut meta,
+                &[0],
+                &capacities,
+                uuid::Uuid::new_v4(),
+                1,
+                now,
+                DECOMMISSION_CAPACITY_MODEL_VERSION,
+            )
+            .expect("initial reservation");
+            grow_decommission_target_reservation(&mut meta, &capacities, 0, 2, 16, uuid::Uuid::new_v4(), now)
+                .expect("grow against the target's free space");
+            let reservation = meta.pools[0]
+                .decommission
+                .as_ref()
+                .unwrap()
+                .capacity_reservation
+                .as_ref()
+                .unwrap();
+            validate_decommission_capacity_reservation(Some(reservation)).expect("growth must satisfy the persisted reader");
+        }
     }
 
     #[test]
@@ -40796,7 +41916,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -40960,27 +42080,26 @@ mod pools_tests {
             let (_directories, store, owner) = pending_convergence_fixture().await;
             let interrupted_store = store.clone();
             let interrupted_owner = owner.clone();
-            let err = store
-                .promote_queued_decommission_with_reload(0, &owner, || async move {
-                    match interrupt {
-                        "cancel" => interrupted_owner.cancel(),
-                        "clear" => {
-                            interrupted_store.decommission_cancel(0).await?;
-                            interrupted_store.clear_decommission(0).await?;
+            let err =
+                store
+                    .promote_queued_decommission_with_reload(0, &owner, || async move {
+                        match interrupt {
+                            "cancel" => interrupted_owner.cancel(),
+                            "clear" => {
+                                interrupted_store.decommission_cancel(0).await?;
+                                interrupted_store.clear_decommission(0).await?;
+                            }
+                            _ => interrupted_store.pool_meta_save_gate.write().await.observe_replicas(
+                                super::PoolMetaReplicaState {
+                                    needs_repair: true,
+                                    repair_write_safe: false,
+                                },
+                            ),
                         }
-                        _ => interrupted_store
-                            .pool_meta_save_gate
-                            .lock()
-                            .await
-                            .observe_replicas(super::PoolMetaReplicaState {
-                                needs_repair: true,
-                                repair_write_safe: false,
-                            }),
-                    }
-                    Err(Error::SlowDown)
-                })
-                .await
-                .expect_err("interrupted convergence must not admit a worker");
+                        Err(Error::SlowDown)
+                    })
+                    .await
+                    .expect_err("interrupted convergence must not admit a worker");
             assert!(!super::is_decommission_pending_convergence(&err, 0));
             if interrupt == "sticky" {
                 assert!(err.pool_metadata_failure().is_some());
@@ -41130,7 +42249,7 @@ mod pools_tests {
 
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -41270,7 +42389,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(pool_meta, vec![None]);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -41389,7 +42508,7 @@ mod pools_tests {
         let store = decommission_worker_test_store(pool_meta, vec![Some(canceler.clone())]);
         store
             .pool_meta_save_gate
-            .lock()
+            .write()
             .await
             .observe_replicas(super::PoolMetaReplicaState {
                 needs_repair: true,
@@ -41657,7 +42776,7 @@ mod pools_tests {
         assert!(save_entered.load(Ordering::SeqCst));
         assert!(!cancel.is_finished(), "cancel must wait for the injected save");
         assert!(
-            store.pool_meta_save_gate.try_lock().is_err(),
+            store.pool_meta_save_gate.try_write().is_err(),
             "the cancel save must exclude stale full-document saves until publication"
         );
         assert!(

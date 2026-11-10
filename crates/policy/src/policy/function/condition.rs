@@ -61,6 +61,11 @@ pub enum Condition {
 
 impl Condition {
     pub fn from_deserializer<'a, D: MapAccess<'a>>(key: &str, d: &mut D) -> Result<Self, D::Error> {
+        // Two suffixes are retained for existing serialized policies. Bound the
+        // chain before parsing so Clone, evaluation and Drop stay bounded too.
+        if key.ends_with("IfExistsIfExistsIfExists") {
+            return Err(Error::custom("condition operator has too many IfExists suffixes"));
+        }
         Ok(match key {
             "StringEquals" => Self::StringEquals(d.next_value()?),
             "StringNotEquals" => Self::StringNotEquals(d.next_value()?),
@@ -262,18 +267,18 @@ impl Condition {
                 Null(s) => s.evaluate_null(values),
                 Bool(s) => s.evaluate_bool(values),
                 NumericEquals(s) => s.evaluate(i64::eq, false, values),
-                NumericNotEquals(s) => s.evaluate(i64::ne, false, values),
+                NumericNotEquals(s) => s.evaluate(i64::ne, true, values),
                 NumericLessThan(s) => s.evaluate(i64::lt, false, values),
                 NumericLessThanEquals(s) => s.evaluate(i64::le, false, values),
                 NumericGreaterThan(s) => s.evaluate(i64::gt, false, values),
                 NumericGreaterThanIfExists(s) => s.evaluate(i64::ge, true, values),
                 NumericGreaterThanEquals(s) => s.evaluate(i64::ge, false, values),
-                DateEquals(s) => s.evaluate(OffsetDateTime::eq, values),
-                DateNotEquals(s) => s.evaluate(OffsetDateTime::ne, values),
-                DateLessThan(s) => s.evaluate(OffsetDateTime::lt, values),
-                DateLessThanEquals(s) => s.evaluate(OffsetDateTime::le, values),
-                DateGreaterThan(s) => s.evaluate(OffsetDateTime::gt, values),
-                DateGreaterThanEquals(s) => s.evaluate(OffsetDateTime::ge, values),
+                DateEquals(s) => s.evaluate(OffsetDateTime::eq, false, values),
+                DateNotEquals(s) => s.evaluate(OffsetDateTime::ne, true, values),
+                DateLessThan(s) => s.evaluate(OffsetDateTime::lt, false, values),
+                DateLessThanEquals(s) => s.evaluate(OffsetDateTime::le, false, values),
+                DateGreaterThan(s) => s.evaluate(OffsetDateTime::gt, false, values),
+                DateGreaterThanEquals(s) => s.evaluate(OffsetDateTime::ge, false, values),
                 IfExists(inner) => {
                     if !inner.has_any_key_in(values) {
                         return true;
@@ -484,6 +489,31 @@ mod tests {
 
         let deserialized: Functions = serde_json::from_str(&json).unwrap();
         assert_eq!(functions, deserialized);
+    }
+
+    #[test]
+    fn repeated_if_exists_suffixes_are_rejected_before_recursion() {
+        for count in [3, 10_000] {
+            let key = format!("StringEquals{}", "IfExists".repeat(count));
+            let document = serde_json::json!({key: {"s3:x-amz-server-side-encryption": "aws:kms"}});
+            let result = serde_json::from_slice::<Functions>(&serde_json::to_vec(&document).expect("serialize condition"));
+            assert!(result.is_err(), "{count} suffixes must be rejected without constructing a deep chain");
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_and_date_not_equals_match_absent_keys() {
+        for (operator, key, value, absent) in [
+            ("NumericNotEquals", "s3:max-keys", "30", true),
+            ("NumericEquals", "s3:max-keys", "30", false),
+            ("DateNotEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", true),
+            ("DateEquals", "s3:object-lock-retain-until-date", "2030-01-01T00:00:00Z", false),
+        ] {
+            let document = serde_json::json!({operator: {key: value}});
+            let functions: Functions =
+                serde_json::from_slice(&serde_json::to_vec(&document).expect("serialize condition")).expect("parse condition");
+            assert_eq!(functions.evaluate(&HashMap::new()).await, absent, "{operator}");
+        }
     }
 
     #[test]

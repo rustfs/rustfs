@@ -114,16 +114,36 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
     drives_per_set: usize,
     preinitialize_disks: bool,
 ) -> Arc<ECStore> {
+    setup_scanner_cycle_store_with_pool_order(
+        root,
+        seed_usage_baseline,
+        &(0..pool_count).collect::<Vec<_>>(),
+        sets_per_pool,
+        drives_per_set,
+        preinitialize_disks,
+    )
+    .await
+}
+
+pub(super) async fn setup_scanner_cycle_store_with_pool_order(
+    root: &Path,
+    seed_usage_baseline: bool,
+    pool_order: &[usize],
+    sets_per_pool: usize,
+    drives_per_set: usize,
+    preinitialize_disks: bool,
+) -> Arc<ECStore> {
     init_ecstore_config_for_scanner_tests();
+    let pool_count = pool_order.len();
     let mut pools = Vec::with_capacity(pool_count);
-    for pool_index in 0..pool_count {
+    for (pool_index, physical_pool) in pool_order.iter().enumerate() {
         let mut endpoints = Vec::new();
         for set_index in 0..sets_per_pool {
             for disk_index in 0..drives_per_set {
                 let disk_path = if sets_per_pool == 1 {
-                    root.join(format!("pool{pool_index}/disk{disk_index}"))
+                    root.join(format!("pool{physical_pool}/disk{disk_index}"))
                 } else {
-                    root.join(format!("pool{pool_index}/set{set_index}/disk{disk_index}"))
+                    root.join(format!("pool{physical_pool}/set{set_index}/disk{disk_index}"))
                 };
                 tokio::fs::create_dir_all(&disk_path)
                     .await
@@ -144,7 +164,7 @@ pub(super) async fn setup_scanner_cycle_store_at_path_with_layout_and_disk_prein
             cmd_line: if pool_count == 1 && sets_per_pool == 1 {
                 "scanner-cycle-metrics".to_string()
             } else {
-                format!("scanner-cycle-metrics-pool-{pool_index}")
+                format!("scanner-cycle-metrics-pool-{physical_pool}")
             },
             platform: format!("OS: {} | Arch: {}", std::env::consts::OS, std::env::consts::ARCH),
         });
@@ -352,6 +372,60 @@ async fn restarted_main_loop_completes_durable_pause_backlog_catch_up() {
 
     global_metrics().set_cycle(None).await;
     crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+}
+
+#[tokio::test]
+#[serial]
+async fn running_main_loop_starts_next_cycle_despite_maintenance_config_churn() {
+    temp_env::async_with_vars([(ENV_SCANNER_CYCLE, Some("2")), (ENV_SCANNER_START_DELAY_SECS, Some("0"))], async {
+        crate::runtime_config::refresh_scanner_runtime_config_for_tests();
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+        global_metrics().set_cycle(None).await;
+        let (_temp_dir, store) = setup_scanner_cycle_store().await;
+        let ctx = CancellationToken::new();
+        let ready = ScannerRuntimeObservedProbe::install(&store, false);
+        let scanner_ctx = ctx.clone();
+        let scanner_store = store.clone();
+        let scanner_task = tokio::spawn(async move { run_data_scanner(scanner_ctx, scanner_store).await });
+        ready.wait().await;
+        let ScannerCycleStateStartup::Ready { cycle: initial, .. } = load_scanner_cycle_state_for_startup(store.clone()).await
+        else {
+            panic!("initial scanner cycle must persist its state");
+        };
+        drop(ready);
+        let churn_ctx = ctx.clone();
+        let churn = tokio::spawn(async move {
+            loop {
+                crate::scanner_io::record_scanner_maintenance_change("churning-lifecycle");
+                tokio::select! {
+                    _ = churn_ctx.cancelled() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                }
+            }
+        });
+        let progressed = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                if let ScannerCycleStateStartup::Ready { cycle, .. } = load_scanner_cycle_state_for_startup(store.clone()).await
+                    && cycle.next > initial.next
+                {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await;
+        ctx.cancel();
+        churn.await.expect("churn task");
+        tokio::time::timeout(Duration::from_secs(5), scanner_task)
+            .await
+            .expect("scanner cancellation")
+            .expect("scanner task")
+            .expect("scanner exit");
+        assert!(progressed.is_ok(), "maintenance wakes must not indefinitely move the next cycle deadline");
+        global_metrics().set_cycle(None).await;
+        crate::scanner_io::clear_dirty_usage_buckets_for_tests();
+    })
+    .await;
 }
 
 #[tokio::test]

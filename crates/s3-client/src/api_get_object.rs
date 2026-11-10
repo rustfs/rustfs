@@ -21,17 +21,17 @@
 
 use futures_util::ready;
 use http::HeaderMap;
-use std::io::{Cursor, Error as IoError, ErrorKind as IoErrorKind, Read};
+use std::io::{Error as IoError, ErrorKind as IoErrorKind, Read};
 use std::pin::Pin;
 use std::task::{Context, Poll};
-use tokio::io::BufReader;
 use tokio_util::io::StreamReader;
 
 use crate::{
     api_error_response::err_invalid_argument,
     api_get_options::GetObjectOptions,
     transition_api::{
-        ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, collect_response_body, to_object_info_for_provider,
+        ObjectInfo, ReadCloser, ReaderImpl, RequestMetadata, TransitionClient, collect_response_body, response_body_reader,
+        to_object_info_for_provider,
     },
 };
 use futures_util::StreamExt;
@@ -86,6 +86,11 @@ impl TransitionClient {
         ))
     }
 
+    /// Open a remote object without collecting its response body.
+    ///
+    /// Request and response-header errors are returned here. Body transport,
+    /// idle-timeout and range-limit errors are returned when the reader is read.
+    /// The reader owns the response; dropping it releases an unfinished body.
     pub async fn get_object_inner(
         &self,
         bucket_name: &str,
@@ -120,12 +125,8 @@ impl TransitionClient {
 
         let h = resp.headers().clone();
 
-        let body_vec = if let Some(limit) = max_response_bytes {
-            self.collect_response_body(resp.into_body(), limit).await?
-        } else {
-            self.collect_response_body_unbounded(resp.into_body()).await?
-        };
-        Ok((object_stat, h, BufReader::new(Cursor::new(body_vec))))
+        let reader = response_body_reader(resp.into_body(), max_response_bytes, self.timeouts.response_body_idle_timeout);
+        Ok((object_stat, h, reader))
     }
 }
 
@@ -269,8 +270,12 @@ mod bounded_response_tests {
         let mut opts = GetObjectOptions::default();
         opts.set_range(0, 6).expect("the probe range should be valid");
 
-        let err = client
+        let (_, _, mut reader) = client
             .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect("the response headers should produce a reader");
+        let err = reader
+            .read_to_end(&mut Vec::new())
             .await
             .expect_err("an eight-byte response must exceed the seven-byte range limit");
 
@@ -391,8 +396,12 @@ mod bounded_response_tests {
         let mut opts = GetObjectOptions::default();
         opts.set_range(0, 6).expect("the probe range should be valid");
 
-        let err = client
+        let (_, _, mut reader) = client
             .get_object_inner("bucket", "probe", &opts)
+            .await
+            .expect("the response headers should produce a reader");
+        let err = reader
+            .read_to_end(&mut Vec::new())
             .await
             .expect_err("body stalls after partial progress must be bounded");
 

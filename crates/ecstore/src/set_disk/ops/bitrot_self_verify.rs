@@ -311,4 +311,85 @@ mod tests {
             .await
             .expect("single-disk no-parity PUT should pass self-verify");
     }
+
+    #[tokio::test]
+    async fn no_parity_self_verify_rejects_missing_inline_data_missing_disk_shard_and_under_quorum() {
+        let (_temp_dirs, disks, _set_disks) = hermetic_set_disks_for_pool_with_default_parity(1, 0, 0).await;
+        let shard_size = 16usize;
+        let payload = b"self verify negative path";
+        let encoded = encode_streaming_shard(payload, shard_size).await;
+        let disks_opt = disks.iter().cloned().map(Some).collect::<Vec<_>>();
+
+        // 1. Inline shard with `data: None` fails closed.
+        let empty_parts = [FileInfo {
+            data: None,
+            ..Default::default()
+        }];
+        let err = verify_written_bitrot_shards(
+            &disks_opt,
+            Some(&empty_parts),
+            BitrotSelfVerifyTarget {
+                operation: "put_object",
+                bucket: "bucket",
+                object: "missing-inline-data",
+                part_number: None,
+                volume: RUSTFS_META_TMP_BUCKET,
+                path: "unused",
+                logical_shard_size: payload.len(),
+                shard_size,
+                write_quorum: 1,
+            },
+        )
+        .await
+        .expect_err("inline shard missing data must fail");
+        assert!(err.to_string().contains("missing bitrot data"));
+
+        // 2. Disk shard missing on disk (FileNotFound) fails closed with shard error context.
+        let err = verify_written_bitrot_shards(
+            &disks_opt,
+            None,
+            BitrotSelfVerifyTarget {
+                operation: "put_object",
+                bucket: "bucket",
+                object: "missing-disk-file",
+                part_number: Some(3),
+                volume: RUSTFS_META_TMP_BUCKET,
+                path: "nonexistent-temp-shard",
+                logical_shard_size: payload.len(),
+                shard_size,
+                write_quorum: 1,
+            },
+        )
+        .await
+        .expect_err("missing disk shard must fail");
+        assert!(err.to_string().contains("no-parity bitrot self-verify failed for shard 0"));
+
+        // 3. Verified shard count below write_quorum fails closed even when available shard is valid.
+        let valid_parts = [
+            FileInfo {
+                data: Some(encoded),
+                ..Default::default()
+            },
+            FileInfo::default(),
+        ];
+        let two_slots = vec![disks_opt[0].clone(), None];
+        let err = verify_written_bitrot_shards(
+            &two_slots,
+            Some(&valid_parts),
+            BitrotSelfVerifyTarget {
+                operation: "put_object",
+                bucket: "bucket",
+                object: "under-quorum",
+                part_number: None,
+                volume: RUSTFS_META_TMP_BUCKET,
+                path: "unused",
+                logical_shard_size: payload.len(),
+                shard_size,
+                write_quorum: 2,
+            },
+        )
+        .await
+        .expect_err("under-quorum verification must fail");
+        assert!(err.to_string().contains("quorum unavailable: 1 shard(s) verified, need 2"));
+    }
 }

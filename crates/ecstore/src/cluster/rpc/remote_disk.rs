@@ -27,13 +27,13 @@ use crate::disk::multipart_source::{
     MULTIPART_SOURCE_PROTOCOL_VERSION, MultipartSourceOperation, MultipartSourceRequest, MultipartSourceResponse,
 };
 use crate::disk::{
-    BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate, DELETE_RECOVERY_PROTOCOL_VERSION,
-    DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest, DeleteRecoveryInspection,
-    DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo, DiskInfoOptions, DiskLocation,
-    DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload, GuardedFileInfoVersions,
-    PartTransactionAction, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse, ReadMultipleReq, ReadMultipleResp,
-    ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo, WalkDirOptions,
-    batch_read_version_one_by_one,
+    BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION, BatchReadVersionReq, BatchReadVersionResp, CheckPartsResp, ConditionalFileUpdate,
+    DELETE_RECOVERY_PROTOCOL_VERSION, DeleteOptions, DeleteRecoveryAction, DeleteRecoveryCursor, DeleteRecoveryDigest,
+    DeleteRecoveryInspection, DeleteRecoveryPage, DeleteRecoveryRpcOperation, DeleteRecoveryRpcReply, DiskAPI, DiskInfo,
+    DiskInfoOptions, DiskLocation, DiskOption, FileInfoVersions, FileReader, FileWriter, GuardedDeleteVersionsPayload,
+    GuardedFileInfoVersions, PartTransactionAction, PoolMetaNativeRecoveryRequest, PoolMetaNativeRecoveryResponse,
+    ReadMultipleReq, ReadMultipleResp, ReadOptions, RenameDataResp, SnapshotLeaseToken, UpdateMetadataOpts, VolumeInfo,
+    WalkDirOptions, batch_read_version_one_by_one,
     disk_store::{
         DEFAULT_RUSTFS_DRIVE_ACTIVE_MONITORING, ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, SKIP_IF_SUCCESS_BEFORE,
         get_drive_active_check_interval, get_drive_active_check_timeout, get_drive_disk_info_timeout, get_drive_list_dir_timeout,
@@ -374,6 +374,21 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for ObservedWalkWriter<'_, W> {
 struct WalkCopyError {
     reason: RemoteWalkFailureReason,
     source: io::Error,
+}
+
+impl WalkCopyError {
+    fn into_disk_error(self) -> DiskError {
+        // Only a local output write/flush proves the metacache consumer closed.
+        // An identical I/O kind from the remote input remains a transport failure.
+        if matches!(self.reason, RemoteWalkFailureReason::Write | RemoteWalkFailureReason::Flush)
+            && self.source.kind() == io::ErrorKind::BrokenPipe
+            && self.source.get_ref().is_none()
+        {
+            DiskError::metacache_output_stream_closed()
+        } else {
+            DiskError::Io(self.source)
+        }
+    }
 }
 
 async fn copy_stream_with_buffer<R, W>(
@@ -996,21 +1011,32 @@ fn internode_idempotent_read_retries() -> usize {
 static PREWARMED_PEERS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashSet<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
 
+fn claim_control_channel_prewarm(addr: &str) -> bool {
+    let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
+        return false;
+    };
+    prewarmed.insert(addr.to_owned())
+}
+
+fn release_control_channel_prewarm(addr: &str) {
+    if let Ok(mut prewarmed) = PREWARMED_PEERS.lock() {
+        prewarmed.remove(addr);
+    }
+}
+
 /// Best-effort background prewarm of a peer's control channel (grpc-optimization P3-1). Deduped per
-/// peer; a dial failure just falls through to the existing lazy connect and recovery monitor.
+/// peer; a dial failure releases the marker so a later disk construction can retry the prewarm.
 fn spawn_control_channel_prewarm(addr: String) {
-    {
-        let Ok(mut prewarmed) = PREWARMED_PEERS.lock() else {
-            return;
-        };
-        if !prewarmed.insert(addr.clone()) {
-            return;
-        }
+    if !claim_control_channel_prewarm(&addr) {
+        return;
     }
     tokio::spawn(async move {
         match node_service_time_out_client_no_auth(&addr).await {
             Ok(_) => debug!(addr = %addr, "internode control channel prewarmed"),
-            Err(err) => debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)"),
+            Err(err) => {
+                release_control_channel_prewarm(&addr);
+                debug!(addr = %addr, error = %err, "internode control channel prewarm failed (best-effort)");
+            }
         }
     });
 }
@@ -1021,6 +1047,7 @@ impl RemoteDisk {
         volume: &str,
         payload: Vec<u8>,
         probe_only: bool,
+        bounded_prepare: bool,
     ) -> Result<DeleteVersionsResponse> {
         if payload.len() > rustfs_protos::DELETE_RECOVERY_MAX_PAYLOAD_BYTES {
             return Err(DiskError::FileCorrupt);
@@ -1045,6 +1072,8 @@ impl RemoteDisk {
                     .map_err(|status| {
                         if status.code() == Code::Unimplemented {
                             DiskError::GuardedDeleteUnsupported
+                        } else if bounded_prepare && status.code() == Code::InvalidArgument {
+                            DiskError::UnsupportedDisk
                         } else {
                             status.into()
                         }
@@ -1078,11 +1107,22 @@ impl RemoteDisk {
         volume: &str,
         operation: DeleteRecoveryRpcOperation,
     ) -> Result<DeleteRecoveryRpcReply> {
+        let protocol_version = match &operation {
+            DeleteRecoveryRpcOperation::ApplyVersion { opts, .. } | DeleteRecoveryRpcOperation::ApplyVersions { opts, .. }
+                if opts.requires_bounded_delete_recovery =>
+            {
+                BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION
+            }
+            _ => DELETE_RECOVERY_PROTOCOL_VERSION,
+        };
         let payload = rmp_serde::to_vec_named(&operation)?;
         if payload.len() > operation.max_wire_payload_bytes() {
             return Err(Error::other("delete recovery operation exceeds payload limit"));
         }
-        let settle_timeout = if matches!(&operation, DeleteRecoveryRpcOperation::Settle { .. }) {
+        let settle_timeout = if matches!(
+            &operation,
+            DeleteRecoveryRpcOperation::Settle { .. } | DeleteRecoveryRpcOperation::SettleBounded(_)
+        ) {
             Some(crate::disk::get_delete_recovery_timeout()?)
         } else {
             None
@@ -1105,7 +1145,7 @@ impl RemoteDisk {
                 let mut request = Request::new(RecoverDeleteTransactionRequest {
                     disk: self.endpoint.to_string(),
                     volume: volume.to_owned(),
-                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                    protocol_version,
                     operation: payload.into(),
                 });
                 let canonical_body = rustfs_protos::canonical_recover_delete_transaction_request_body(request.get_ref())
@@ -1123,7 +1163,7 @@ impl RemoteDisk {
                         }
                     })?
                     .into_inner();
-                if response.protocol_version != DELETE_RECOVERY_PROTOCOL_VERSION {
+                if response.protocol_version != protocol_version {
                     return Err(DiskError::UnsupportedDisk);
                 }
                 if !response.success {
@@ -1637,6 +1677,7 @@ impl RemoteDisk {
         let initial_probe_ok = Self::perform_connectivity_check(&addr).await.is_ok();
         if initial_probe_ok {
             health.record_operation_success(&endpoint, "connectivity_probe_success");
+            rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&addr);
         } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
             warn!(
                 event = EVENT_REMOTE_DISK_HEALTH,
@@ -1708,6 +1749,7 @@ impl RemoteDisk {
                     // Perform basic connectivity check
                     if Self::perform_connectivity_check(&addr).await.is_ok() {
                         health.record_operation_success(&endpoint, "connectivity_probe_success");
+                        rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&addr);
                     } else if health.mark_failure(&endpoint, "connectivity_probe_failed") {
                         warn!(
                             event = EVENT_REMOTE_DISK_HEALTH,
@@ -1778,6 +1820,7 @@ impl RemoteDisk {
                 }
                 _ = interval.tick() => {
                     if Self::perform_recovery_probe(&addr, &endpoint).await.is_ok() {
+                        rustfs_io_metrics::internode_metrics::record_peer_reachable(&addr);
                         let became_online = health.mark_recovery_success(&endpoint, "disk_info_probe_success");
                         debug!(
                             event = EVENT_REMOTE_DISK_HEALTH,
@@ -2009,6 +2052,7 @@ impl RemoteDisk {
             let operation_result = operation().await;
             if operation_result.is_ok() {
                 self.health.record_operation_success(&self.endpoint, "operation_success");
+                rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
             }
             self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                 .await;
@@ -2023,6 +2067,7 @@ impl RemoteDisk {
                 // Log success; the waiting guard balances every exit path.
                 if operation_result.is_ok() {
                     self.health.record_operation_success(&self.endpoint, "operation_success");
+                    rustfs_io_metrics::internode_metrics::record_peer_reachable_if_offline(&self.addr);
                 }
                 self.handle_network_like_error(op, timeout_duration, &operation_result, failure_health_action)
                     .await;
@@ -2066,6 +2111,7 @@ impl RemoteDisk {
         failure_health_action: FailureHealthAction,
     ) {
         if let Err(err) = operation_result
+            && !err.is_metacache_output_stream_closed()
             && is_network_like_disk_error(err)
         {
             counter!(
@@ -2711,8 +2757,56 @@ impl RemoteDisk {
 
 #[async_trait::async_trait]
 impl DiskAPI for RemoteDisk {
+    async fn list_multipart_index_roots(
+        &self,
+        bucket: &str,
+        marker: Option<&str>,
+    ) -> Result<crate::disk::multipart_index::MultipartIndexPage> {
+        use crate::disk::multipart_index::{MULTIPART_INDEX_RPC_MAX_BYTES, MultipartIndexRpcReply, MultipartIndexRpcRequest};
+        let expected_disk = self
+            .id
+            .lock()
+            .await
+            .filter(|id| !id.is_nil())
+            .ok_or(DiskError::DiskNotFound)?;
+        let query = MultipartIndexRpcRequest::new(bucket, marker);
+        let endpoint = self.endpoint.to_string();
+        let canonical = query.canonical_request(&endpoint)?;
+        let opts = serde_json::to_string(&query)?;
+        self.execute_with_timeout(
+            || async {
+                let mut client = self.get_client().await?;
+                let mut request = Request::new(DiskInfoRequest {
+                    disk: endpoint.clone(),
+                    opts: opts.clone(),
+                });
+                crate::cluster::rpc::set_tonic_canonical_body_digest(&mut request, &canonical).map_err(Error::other)?;
+                let response = client.disk_info(request).await?.into_inner();
+                if !response.success {
+                    return Err(response.error.unwrap_or_default().into());
+                }
+                if response.disk_info.len() > MULTIPART_INDEX_RPC_MAX_BYTES {
+                    return Err(DiskError::FileCorrupt);
+                }
+                // An old server ignores the additive query and returns ordinary DiskInfo.
+                // It cannot satisfy the dedicated reply schema or the fresh challenge.
+                let reply: MultipartIndexRpcReply =
+                    serde_json::from_str(&response.disk_info).map_err(|_| DiskError::MethodNotAllowed)?;
+                reply.validate(&query, expected_disk)?;
+                crate::cluster::rpc::verify_tonic_rpc_response_proof(
+                    &query.canonical_response(&endpoint, &reply.page)?,
+                    &reply.proof,
+                )
+                .map_err(Error::other)?;
+                Ok(reply.page)
+            },
+            get_drive_disk_info_timeout(),
+        )
+        .await
+    }
+
     async fn supports_guarded_delete_versions(&self) -> Result<()> {
-        let response = self.guarded_delete_versions_rpc("", Vec::new(), true).await?;
+        let response = self.guarded_delete_versions_rpc("", Vec::new(), true, false).await?;
         if !response.errors.is_empty() || !response.item_errors.is_empty() {
             return Err(DiskError::FileCorrupt);
         }
@@ -2725,7 +2819,12 @@ impl DiskAPI for RemoteDisk {
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         let count = versions.len();
-        let payload = GuardedDeleteVersionsPayload { versions, opts };
+        let bounded_prepare = opts.requires_bounded_delete_recovery;
+        let payload = GuardedDeleteVersionsPayload {
+            versions,
+            opts,
+            bounded_recovery_protocol: bounded_prepare.then_some(BOUNDED_DELETE_PREPARE_PROTOCOL_VERSION),
+        };
         if let Err(error) = payload.validate() {
             return vec![Some(error); count];
         }
@@ -2733,7 +2832,10 @@ impl DiskAPI for RemoteDisk {
             Ok(encoded) => encoded,
             Err(error) => return vec![Some(error.into()); count],
         };
-        match self.guarded_delete_versions_rpc(volume, encoded, false).await {
+        match self
+            .guarded_delete_versions_rpc(volume, encoded, false, bounded_prepare)
+            .await
+        {
             Ok(response) => {
                 // New guarded peers must return typed errors, never lossy strings.
                 if response.item_errors.len() != count {
@@ -3624,7 +3726,13 @@ impl DiskAPI for RemoteDisk {
                         );
                     }
                     let rpc_started = read_version_stage_timer(batch_read_version_attribution_enabled);
-                    let response = match client.batch_read_version(request).await {
+                    let response_result = client.batch_read_version(request).await;
+                    if let Some(rpc_started) = rpc_started {
+                        crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_batch_read_version_duration(
+                            rpc_started.elapsed(),
+                        );
+                    }
+                    let response = match response_result {
                         Ok(response) => {
                             record_batch_read_version_stage(INTERNODE_STAGE_BATCH_READ_VERSION_RPC_ROUNDTRIP, rpc_started);
                             response.into_inner()
@@ -3964,7 +4072,7 @@ impl DiskAPI for RemoteDisk {
                             Ok(_) => return Ok(()),
                             Err(error) => {
                                 failure_reason = Some(error.reason);
-                                return Err(DiskError::Io(error.source));
+                                return Err(error.into_disk_error());
                             }
                         }
                     }
@@ -4294,6 +4402,38 @@ impl DiskAPI for RemoteDisk {
         }
     }
 
+    async fn discover_delete_transactions_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryDiscovery> {
+        // Older peers reject this variant. Do not retry through the unbounded protocol;
+        // they are reported as unsupported participants (rolling-upgrade contract).
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::DiscoverBounded {
+                    object: object.to_owned(),
+                    max_entries,
+                },
+            )
+            .await
+        {
+            Ok(DeleteRecoveryRpcReply::DiscoveredBounded(page)) => Ok(page),
+            Ok(_) => Err(Error::FileCorrupt),
+            Err(error)
+                if matches!(error, Error::MethodNotAllowed | Error::UnsupportedDisk)
+                    || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
+                    .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
+            {
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
+            }
+            Err(error) => Err(error),
+        }
+    }
     async fn discover_delete_transactions(
         &self,
         volume: &str,
@@ -4327,6 +4467,62 @@ impl DiskAPI for RemoteDisk {
                 Ok(page)
             }
             _ => Err(Error::other("unexpected delete discovery reply")),
+        }
+    }
+    async fn settle_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        request: crate::disk::BoundedDeleteRecoverySettlement,
+        _namespace_owner: Option<Arc<dyn Send + Sync>>,
+    ) -> Result<crate::disk::BoundedDeleteRecoverySettlementReply> {
+        match self
+            .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::SettleBounded(request))
+            .await
+        {
+            Ok(DeleteRecoveryRpcReply::SettledBounded(reply)) => Ok(reply),
+            Ok(_) => Err(Error::FileCorrupt),
+            Err(error)
+                if matches!(error, Error::MethodNotAllowed | Error::UnsupportedDisk)
+                    || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
+                    .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
+            {
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
+            }
+            Err(error) => Err(error),
+        }
+    }
+    async fn inspect_delete_transaction_bounded(
+        &self,
+        volume: &str,
+        object: &str,
+        transaction: Uuid,
+        max_entries: u32,
+    ) -> Result<crate::disk::BoundedDeleteRecoveryInspection> {
+        match self
+            .recover_delete_transaction(
+                volume,
+                DeleteRecoveryRpcOperation::InspectBounded {
+                    object: object.to_owned(),
+                    transaction,
+                    max_entries,
+                },
+            )
+            .await
+        {
+            Ok(DeleteRecoveryRpcReply::InspectedBounded(page)) => Ok(page),
+            Ok(_) => Err(Error::FileCorrupt),
+            Err(error)
+                if matches!(error, Error::MethodNotAllowed | Error::UnsupportedDisk)
+                    || matches!(&error, Error::Io(source) if crate::cluster::rpc::client::embedded_tonic_status(source)
+                    .is_some_and(|status| matches!(status.code(), tonic::Code::Unimplemented | tonic::Code::InvalidArgument))) =>
+            {
+                // No paginated fallback through the unbounded protocol; the peer
+                // is an unsupported participant until it is upgraded.
+                Err(Error::UnsupportedDisk)
+            }
+            Err(error) => Err(error),
         }
     }
     async fn inspect_delete_transaction(
@@ -4551,7 +4747,10 @@ impl DiskAPI for RemoteDisk {
                     read_multiple_req_bin: read_multiple_req_bin.into(),
                 });
 
-                let response = client.read_multiple(request).await?.into_inner();
+                let rpc_started = Instant::now();
+                let response = client.read_multiple(request).await;
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_multiple_duration(rpc_started.elapsed());
+                let response = response?.into_inner();
 
                 if !response.success {
                     return Err(response.error.unwrap_or_default().into());
@@ -4602,6 +4801,7 @@ impl DiskAPI for RemoteDisk {
                 attach_mutation_body_digest(&mut request, canonical_body, "write_all")?;
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.write_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4610,6 +4810,7 @@ impl DiskAPI for RemoteDisk {
                     }
                 };
 
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_duration(rpc_started.elapsed());
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_write_all_sent_bytes(data_len);
 
                 if !response.success {
@@ -4707,6 +4908,7 @@ impl DiskAPI for RemoteDisk {
                 });
 
                 crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_request();
+                let rpc_started = Instant::now();
                 let response = match client.read_all(request).await {
                     Ok(response) => response.into_inner(),
                     Err(err) => {
@@ -4714,6 +4916,8 @@ impl DiskAPI for RemoteDisk {
                         return Err(err.into());
                     }
                 };
+
+                crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_duration(rpc_started.elapsed());
 
                 if !response.success {
                     crate::cluster::rpc::runtime_sources::record_remote_disk_grpc_read_all_error();
@@ -4847,6 +5051,113 @@ mod tests {
                 },
             },
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_delete_discovery_lost_remote_reply_leaves_no_cursor() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("test peer must bind");
+        let directory = tempfile::tempdir().expect("temporary disk");
+        let endpoint = Endpoint::try_from(directory.path().to_str().expect("disk path")).expect("endpoint");
+        let disk = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("local disk"),
+        );
+        disk.make_volume("bucket").await.expect("bucket");
+        let prefix = directory.path().join("bucket/prefix");
+        std::fs::create_dir(&prefix).expect("prefix");
+        for index in 0..64 {
+            std::fs::create_dir(prefix.join(format!("child-{index}"))).expect("legitimate child");
+        }
+        let fixture = Arc::new(TestBoundedDiscovery {
+            disk: Arc::clone(&disk),
+            response_gate: TestFormatReadGate::default(),
+        });
+        *peer.peer.bounded_discovery.lock().expect("bounded fixture") = Some(Arc::clone(&fixture));
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        let task = tokio::spawn(async move { remote.discover_delete_transactions_bounded("bucket", "prefix", 8).await });
+        tokio::time::timeout(Duration::from_secs(5), fixture.response_gate.entered.notified())
+            .await
+            .expect("disk completed bounded scan");
+        task.abort();
+        assert!(task.await.expect_err("caller cancelled").is_cancelled());
+        assert_eq!(disk.public_delete_discovery_sessions_for_test(), 0);
+        fixture.response_gate.release.cancel();
+        peer.stop().await;
+        assert_eq!(disk.public_delete_discovery_sessions_for_test(), 0);
+        assert!(prefix.join("child-63").is_dir());
+    }
+
+    #[tokio::test]
+    async fn multipart_index_old_disk_info_handler_is_not_a_ready_empty_index() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        remote
+            .set_disk_id(Some(Uuid::new_v4()))
+            .await
+            .expect("expected disk identity");
+        assert!(matches!(
+            remote.list_multipart_index_roots("bucket", None).await,
+            Err(DiskError::MethodNotAllowed)
+        ));
+        assert_eq!(
+            peer.peer.disk_info_calls.load(Ordering::Acquire),
+            1,
+            "exercise the actual legacy JSON handler"
+        );
+        peer.stop().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_delete_discovery_old_peer_rejects_without_paginated_fallback() {
+        runtime_sources::ensure_test_rpc_secret();
+        let peer = TestGrpcPeer::spawn(Bytes::new(), Bytes::new())
+            .await
+            .expect("old peer must bind");
+        let remote = remote_disk_for_addr(&peer.addr).await;
+        assert_eq!(
+            remote
+                .discover_delete_transactions_bounded("bucket", "prefix", 4096)
+                .await
+                .expect_err("old peer cannot prove a bounded inventory"),
+            DiskError::UnsupportedDisk
+        );
+        let transaction = Uuid::new_v4();
+        assert_eq!(
+            remote
+                .inspect_delete_transaction_bounded("bucket", "prefix", transaction, 65536)
+                .await
+                .expect_err("old peer cannot inspect with a budget"),
+            DiskError::UnsupportedDisk
+        );
+        assert_eq!(
+            remote
+                .settle_delete_transaction_bounded(
+                    "bucket",
+                    crate::disk::BoundedDeleteRecoverySettlement {
+                        object: "prefix".to_owned(),
+                        transaction,
+                        expected_fingerprint: [0; 32],
+                        action: DeleteRecoveryAction::PublishCommit,
+                        max_entries: 65536,
+                    },
+                    None
+                )
+                .await
+                .expect_err("old peer cannot settle with a budget"),
+            DiskError::UnsupportedDisk
+        );
+        assert_eq!(
+            *peer.peer.unsupported_methods.lock().expect("observed methods"),
+            vec!["/node_service.NodeService/RecoverDeleteTransaction"; 3]
+        );
+        peer.stop().await;
     }
 
     #[tokio::test]
@@ -5740,8 +6051,16 @@ mod tests {
         object_read_all_disks: Arc<StdMutex<Vec<String>>>,
         format_data: Bytes,
         read_all_data: Bytes,
+        fail_format_reads: Arc<AtomicBool>,
         next_format_read_gate: Arc<StdMutex<Option<Arc<TestFormatReadGate>>>>,
+        bounded_discovery: Arc<StdMutex<Option<Arc<TestBoundedDiscovery>>>>,
         unsupported_methods: Arc<StdMutex<Vec<String>>>,
+    }
+
+    #[derive(Debug)]
+    struct TestBoundedDiscovery {
+        disk: Arc<crate::disk::local::LocalDisk>,
+        response_gate: TestFormatReadGate,
     }
 
     #[derive(Debug, Default)]
@@ -5759,7 +6078,9 @@ mod tests {
                 object_read_all_disks: Arc::default(),
                 format_data,
                 read_all_data,
+                fail_format_reads: Arc::default(),
                 next_format_read_gate: Arc::default(),
+                bounded_discovery: Arc::default(),
                 unsupported_methods: Arc::default(),
             }
         }
@@ -5859,6 +6180,56 @@ mod tests {
                         Ok(grpc.unary(method, request).await)
                     })
                 }
+                "/node_service.NodeService/RecoverDeleteTransaction"
+                    if self.peer.bounded_discovery.lock().expect("bounded fixture").is_some() =>
+                {
+                    #[derive(Clone)]
+                    struct BoundedSvc(Arc<TestBoundedDiscovery>);
+                    impl tonic::server::UnaryService<RecoverDeleteTransactionRequest> for BoundedSvc {
+                        type Response = rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse;
+                        type Future = Pin<Box<dyn Future<Output = std::result::Result<Response<Self::Response>, Status>> + Send>>;
+                        fn call(&mut self, request: Request<RecoverDeleteTransactionRequest>) -> Self::Future {
+                            let fixture = Arc::clone(&self.0);
+                            Box::pin(async move {
+                                let request = request.into_inner();
+                                let operation: DeleteRecoveryRpcOperation =
+                                    rustfs_protos::decode_delete_recovery_payload(&request.operation)
+                                        .map_err(|_| Status::invalid_argument("invalid bounded request"))?;
+                                let DeleteRecoveryRpcOperation::DiscoverBounded { object, max_entries } = operation else {
+                                    return Err(Status::invalid_argument("unexpected fallback"));
+                                };
+                                let page = fixture
+                                    .disk
+                                    .discover_delete_transactions_bounded(&request.volume, &object, max_entries)
+                                    .await
+                                    .map_err(|_| Status::internal("bounded discovery failed"))?;
+                                // Lose the response only after the real disk operation has completed.
+                                fixture.response_gate.entered.notify_one();
+                                fixture.response_gate.release.cancelled().await;
+                                let result = rmp_serde::to_vec_named(&DeleteRecoveryRpcReply::DiscoveredBounded(page))
+                                    .map_err(|_| Status::internal("encode bounded reply"))?;
+                                Ok(Response::new(rustfs_protos::proto_gen::node_service::RecoverDeleteTransactionResponse {
+                                    success: true,
+                                    protocol_version: DELETE_RECOVERY_PROTOCOL_VERSION,
+                                    result: result.into(),
+                                    error: None,
+                                }))
+                            })
+                        }
+                    }
+                    let fixture = self
+                        .peer
+                        .bounded_discovery
+                        .lock()
+                        .expect("bounded fixture")
+                        .clone()
+                        .expect("configured fixture");
+                    Box::pin(async move {
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec);
+                        Ok(grpc.unary(BoundedSvc(fixture), request).await)
+                    })
+                }
                 "/node_service.NodeService/ReadAll" => {
                     #[derive(Clone)]
                     struct ReadAllSvc(AuthenticatedReadPeer);
@@ -5881,6 +6252,9 @@ mod tests {
                                     if let Some(gate) = gate {
                                         gate.entered.notify_one();
                                         gate.release.cancelled().await;
+                                    }
+                                    if peer.fail_format_reads.load(Ordering::Acquire) {
+                                        return Err(Status::unavailable("format read temporarily unavailable"));
                                     }
                                     peer.format_data.clone()
                                 } else {
@@ -8849,6 +9223,124 @@ mod tests {
 
     #[tokio::test]
     #[serial(remote_disk_recovery_probe)]
+    async fn endpoint_reconnect_failure_preserves_registered_remote_recovery() {
+        temp_env::async_with_vars(
+            [
+                (crate::disk::disk_store::ENV_RUSTFS_DRIVE_ACTIVE_MONITORING, Some("true")),
+                (rustfs_config::ENV_DRIVE_RETURNING_SUCCESS_THRESHOLD, Some("1")),
+            ],
+            async {
+                runtime_sources::ensure_test_rpc_secret();
+                let mut reference = crate::layout::format::FormatV3::new(1, 1);
+                reference.erasure.this = reference.erasure.sets[0][0];
+                let peer = TestGrpcPeer::spawn(
+                    Bytes::from(reference.to_json().expect("format should serialize")),
+                    Bytes::from_static(b"recovered-peer-data"),
+                )
+                .await
+                .expect("authenticated regression peer is required");
+                let set = missing_read_set(&peer, reference).await;
+                let disk = crate::disk::new_disk(
+                    &set.set_endpoints[0],
+                    &DiskOption {
+                        cleanup: false,
+                        health_check: true,
+                    },
+                )
+                .await
+                .expect("registered remote disk should construct");
+                let crate::disk::Disk::Remote(remote) = disk.as_ref() else {
+                    panic!("fixture must create a remote disk");
+                };
+                assert!(remote.health_check);
+                remote.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+                set.disks.write().await[0] = Some(Arc::clone(&disk));
+
+                peer.peer.fail_format_reads.store(true, Ordering::Release);
+                set.connect_disks().await;
+                peer.peer.fail_format_reads.store(false, Ordering::Release);
+                let cancelled_after_failure = remote.cancel_token.is_cancelled();
+                assert!(peer.peer.read_all_calls() > 0, "reconnect must attempt the failing format RPC");
+                assert!(
+                    Arc::ptr_eq(&disk, set.disks.read().await[0].as_ref().expect("existing slot must remain")),
+                    "a failed reconnect must not publish its unvalidated candidate"
+                );
+                remote.spawn_recovery_monitor_if_needed();
+                let recovery = time::timeout(Duration::from_secs(5), async {
+                    while !disk.is_online().await {
+                        tokio::task::yield_now().await;
+                    }
+                    disk.read_all("bucket", "object").await
+                })
+                .await;
+                disk.close().await.expect("stop the registered disk's monitoring");
+                peer.stop().await;
+                assert!(!cancelled_after_failure, "failed replacement must retain the registered monitor");
+                assert_eq!(
+                    recovery
+                        .expect("failed reconnect must leave the registered disk able to recover without another sweep")
+                        .expect("the recovered registered disk must serve real I/O"),
+                    Bytes::from_static(b"recovered-peer-data")
+                );
+            },
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
+    async fn endpoint_reconnect_stops_old_remote_monitor_only_after_publication() {
+        runtime_sources::ensure_test_rpc_secret();
+        let mut reference = crate::layout::format::FormatV3::new(1, 1);
+        reference.erasure.this = reference.erasure.sets[0][0];
+        let peer = TestGrpcPeer::spawn(
+            Bytes::from(reference.to_json().expect("format should serialize")),
+            Bytes::from_static(b"replacement-peer-data"),
+        )
+        .await
+        .expect("authenticated regression peer is required");
+        let set = missing_read_set(&peer, reference).await;
+        let disk = crate::disk::new_disk(
+            &set.set_endpoints[0],
+            &DiskOption {
+                cleanup: false,
+                health_check: true,
+            },
+        )
+        .await
+        .expect("registered remote disk should construct");
+        let crate::disk::Disk::Remote(remote) = disk.as_ref() else {
+            panic!("fixture must create a remote disk");
+        };
+        remote.force_runtime_state_for_test(RuntimeDriveHealthState::Offline);
+        set.disks.write().await[0] = Some(Arc::clone(&disk));
+        let gate = peer.peer.pause_next_format_read();
+        let pending_set = Arc::clone(&set);
+        let pending = tokio::spawn(async move { pending_set.connect_disks().await });
+        time::timeout(Duration::from_secs(5), gate.entered.notified())
+            .await
+            .expect("replacement must reach the format validation barrier");
+        let cancelled_before_publication = remote.cancel_token.is_cancelled();
+        gate.release.cancel();
+        pending.await.expect("validated replacement must finish publication");
+        let replacement = set.disks.read().await[0].clone().expect("replacement must occupy the slot");
+        let readback = replacement.read_all("bucket", "object").await;
+        replacement.close().await.expect("stop replacement monitoring");
+        peer.stop().await;
+        assert!(
+            !cancelled_before_publication,
+            "the registered monitor must survive pending format validation"
+        );
+        assert!(!Arc::ptr_eq(&disk, &replacement), "validated replacement must be published");
+        assert!(remote.cancel_token.is_cancelled(), "the displaced monitor must stop after publication");
+        assert_eq!(
+            readback.expect("replacement must serve real I/O"),
+            Bytes::from_static(b"replacement-peer-data")
+        );
+    }
+
+    #[tokio::test]
+    #[serial(remote_disk_recovery_probe)]
     async fn endpoint_reconnect_admits_ready_drive_while_another_format_probe_is_blocked() {
         runtime_sources::ensure_test_rpc_secret();
         let reference = crate::layout::format::FormatV3::new(1, 2);
@@ -9209,6 +9701,43 @@ mod tests {
                 assert_eq!(writer.bytes, b"walk payload");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn remote_walk_preserves_local_metacache_consumer_close() {
+        let transport =
+            RetryingWalkDirInternodeDataTransport::with_steps(vec![WalkDirTestStep::Data(b"metacache payload".to_vec())]);
+        let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let (mut writer, reader) = tokio::io::duplex(1);
+        drop(reader);
+        let error = disk
+            .walk_dir(WalkDirOptions::default(), &mut writer)
+            .await
+            .expect_err("a dropped metacache consumer must stop the producer");
+        assert!(
+            error.is_metacache_output_stream_closed(),
+            "preserve the benign completion marker: {error:?}"
+        );
+        assert_eq!(transport.calls().len(), 1, "local consumer closure is not a remote open retry");
+        assert!(!disk.health.is_faulty());
+    }
+
+    #[tokio::test]
+    async fn remote_walk_keeps_remote_read_broken_pipe_as_transport_failure() {
+        let transport = RetryingWalkDirInternodeDataTransport::with_steps(vec![WalkDirTestStep::PartialDataThenError {
+            data: b"partial metacache".to_vec(),
+            error: io::ErrorKind::BrokenPipe.into(),
+        }]);
+        let disk = new_remote_disk_with_transport(Arc::new(transport.clone())).await;
+        let mut writer = Vec::new();
+        let error = disk
+            .walk_dir(WalkDirOptions::default(), &mut writer)
+            .await
+            .expect_err("an upstream close after partial output is a failed walk");
+        assert!(!error.is_metacache_output_stream_closed());
+        assert!(error.contains_io_error_kind(io::ErrorKind::BrokenPipe));
+        assert_eq!(writer, b"partial metacache");
+        assert_eq!(transport.calls().len(), 1, "partial output must not be replayed");
     }
 
     #[tokio::test]
@@ -11542,5 +12071,16 @@ mod tests {
         .await;
 
         accept_task.abort();
+    }
+
+    #[test]
+    fn prewarm_claim_is_deduplicated_and_released_after_failure() {
+        let addr = "http://prewarm-retry-test.invalid:9000";
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        assert!(!claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
+        assert!(claim_control_channel_prewarm(addr));
+        release_control_channel_prewarm(addr);
     }
 }

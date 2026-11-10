@@ -34,7 +34,7 @@ use tokio::sync::Mutex as TokioMutex;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, warn};
 
 const LOG_COMPONENT_ECSTORE: &str = "ecstore";
 const LOG_SUBSYSTEM_METACACHE: &str = "metacache";
@@ -217,6 +217,8 @@ impl Drop for NotifyOnDrop {
 
 #[derive(Default)]
 pub struct ListPathRawOptions {
+    /// Retain native listing admission through producer cancellation/draining.
+    pub read_budget: Option<Arc<tokio::sync::OwnedSemaphorePermit>>,
     pub disks: Vec<Option<DiskStore>>,
     pub fallback_disks: Vec<Option<DiskStore>>,
     pub bucket: String,
@@ -224,7 +226,10 @@ pub struct ListPathRawOptions {
     pub recursive: bool,
     pub incl_deleted: bool,
     pub skip_hidden_prefix_check: bool,
+    pub hidden_entry_budget: usize,
+    pub pending_prefix: Option<String>,
     pub filter_prefix: Option<String>,
+    pub identifier_tree_leaf: Option<String>,
     pub forward_to: Option<String>,
     pub min_disks: usize,
     /// Deliver every replica to the partial callback, including matching headers.
@@ -253,6 +258,7 @@ pub struct ListPathRawOptions {
 impl Clone for ListPathRawOptions {
     fn clone(&self) -> Self {
         Self {
+            read_budget: self.read_budget.clone(),
             disks: self.disks.clone(),
             fallback_disks: self.fallback_disks.clone(),
             bucket: self.bucket.clone(),
@@ -260,7 +266,10 @@ impl Clone for ListPathRawOptions {
             recursive: self.recursive,
             incl_deleted: self.incl_deleted,
             skip_hidden_prefix_check: self.skip_hidden_prefix_check,
+            hidden_entry_budget: self.hidden_entry_budget,
+            pending_prefix: self.pending_prefix.clone(),
             filter_prefix: self.filter_prefix.clone(),
+            identifier_tree_leaf: self.identifier_tree_leaf.clone(),
             forward_to: self.forward_to.clone(),
             min_disks: self.min_disks,
             preserve_replica_metadata: self.preserve_replica_metadata,
@@ -289,8 +298,11 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
         recursive: opts.recursive,
         incl_deleted: opts.incl_deleted,
         skip_hidden_prefix_check: opts.skip_hidden_prefix_check,
+        hidden_entry_budget: opts.hidden_entry_budget,
+        pending_prefix: opts.pending_prefix.clone(),
         report_notfound: opts.report_not_found,
         filter_prefix: opts.filter_prefix.clone(),
+        identifier_tree_leaf: opts.identifier_tree_leaf.clone(),
         forward_to: opts.forward_to.clone(),
         limit: opts.per_disk_limit,
         skip_total_timeout: opts.skip_walkdir_total_timeout,
@@ -301,13 +313,15 @@ fn walk_dir_options(opts: &ListPathRawOptions) -> WalkDirOptions {
 }
 
 /// How a merged raw listing stream ended.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct ListPathRawOutcome {
     /// At least one producer stopped at its per-disk limit instead of at the
     /// end of its namespace, so the closed stream is not proof of exhaustion.
     /// Carried in-band by the metacache stream trailer, so remote producers
     /// report it as well.
     pub limit_reached: bool,
+    /// Inclusive sorted boundary proved by every reader before a bounded stop.
+    pub scan_cut: Option<String>,
 }
 
 pub async fn list_path_raw(rx: CancellationToken, opts: ListPathRawOptions) -> disk::error::Result<()> {
@@ -363,10 +377,15 @@ async fn list_path_raw_inner(
     let producer_errs: Arc<[OnceLock<DiskError>]> = (0..opts.disks.len()).map(|_| OnceLock::new()).collect::<Vec<_>>().into();
 
     let cancel_rx = CancellationToken::new();
+    let walk_options = Arc::new(walk_dir_options(&opts));
 
     for (disk_idx, disk) in opts.disks.iter().enumerate() {
         let opdisk = disk.clone();
-        let opts_clone = opts.clone();
+        let walk_options = walk_options.clone();
+        #[cfg(test)]
+        let test_reader_behavior = opts.test_reader_behaviors.get(disk_idx).cloned();
+        #[cfg(test)]
+        let test_disk_io_context_observed = opts.test_disk_io_context_observed.clone();
         let fallback_claim_tracker = fallback_claim_tracker.clone();
         let fds_clone = fds.clone();
         #[cfg(test)]
@@ -376,17 +395,19 @@ async fn list_path_raw_inner(
         let disk_io_context_clone = disk_io_context.clone();
         let (rd, wr) = tokio::io::duplex(64 * 1024);
         readers.push(MetacacheReader::new(rd));
-        jobs.spawn(with_optional_disk_io_context(disk_io_context_clone, async move {
+        let read_budget = opts.read_budget.clone();
+        let producer = with_optional_disk_io_context(disk_io_context_clone, async move {
+            let _read_budget = read_budget;
             let mut wr = PublishedBytesWriter::new(wr);
             #[cfg(test)]
-            if let Some(observer) = &opts_clone.test_disk_io_context_observed {
+            if let Some(observer) = &test_disk_io_context_observed {
                 observer.store(
                     crate::disk::current_disk_io_context().is_some_and(|context| context.class == DiskIoClass::Background),
                     std::sync::atomic::Ordering::Release,
                 );
             }
             #[cfg(test)]
-            let test_primary_error = if let Some(behavior) = opts_clone.test_reader_behaviors.get(disk_idx).cloned() {
+            let test_primary_error = if let Some(behavior) = test_reader_behavior {
                 match behavior {
                     TestReaderBehavior::Eof => return Ok(()),
                     TestReaderBehavior::Entries(entries) => {
@@ -443,8 +464,6 @@ async fn list_path_raw_inner(
                 None
             };
 
-            let wakl_opts = walk_dir_options(&opts_clone);
-
             let mut need_fallback = false;
             let mut last_err = None;
             #[cfg(test)]
@@ -459,7 +478,7 @@ async fn list_path_raw_inner(
 
             if !need_fallback && let Some(disk) = opdisk {
                 let primary_walk_started = std::time::Instant::now();
-                match disk.walk_dir(wakl_opts, &mut wr).await {
+                match disk.walk_dir((*walk_options).clone(), &mut wr).await {
                     Ok(_res) => {
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_primary",
@@ -483,8 +502,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "walk_dir_missing_path",
                                 error = ?err,
@@ -495,8 +514,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "walk_dir_failed",
                                 error = ?err,
@@ -598,8 +617,8 @@ async fn list_path_raw_inner(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
+                            bucket = %walk_options.bucket,
+                            path = %walk_options.base_dir,
                             disk_index = disk_idx,
                             state = "fallback_disk_missing_for_path",
                             error = ?err,
@@ -610,8 +629,8 @@ async fn list_path_raw_inner(
                             event = EVENT_METACACHE_LISTING,
                             component = LOG_COMPONENT_ECSTORE,
                             subsystem = LOG_SUBSYSTEM_METACACHE,
-                            bucket = %opts_clone.bucket,
-                            path = %opts_clone.path,
+                            bucket = %walk_options.bucket,
+                            path = %walk_options.base_dir,
                             disk_index = disk_idx,
                             state = "fallback_disk_missing",
                             error = ?err,
@@ -626,7 +645,7 @@ async fn list_path_raw_inner(
                 }
 
                 let fallback_walk_started = std::time::Instant::now();
-                match disk.as_ref().walk_dir(walk_dir_options(&opts_clone), &mut wr).await {
+                match disk.as_ref().walk_dir((*walk_options).clone(), &mut wr).await {
                     Ok(_r) => {
                         rustfs_io_metrics::record_stage_duration(
                             "metacache_walk_dir_fallback",
@@ -652,8 +671,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "fallback_walk_dir_missing_path",
                                 error = ?err,
@@ -664,8 +683,8 @@ async fn list_path_raw_inner(
                                 event = EVENT_METACACHE_LISTING,
                                 component = LOG_COMPONENT_ECSTORE,
                                 subsystem = LOG_SUBSYSTEM_METACACHE,
-                                bucket = %opts_clone.bucket,
-                                path = %opts_clone.path,
+                                bucket = %walk_options.bucket,
+                                path = %walk_options.base_dir,
                                 disk_index = disk_idx,
                                 state = "fallback_walk_dir_failed",
                                 error = ?err,
@@ -687,12 +706,13 @@ async fn list_path_raw_inner(
 
             // warn!("list_path_raw: while need_fallback done");
             Ok(())
-        }));
+        });
+        jobs.spawn(producer.in_current_span());
     }
 
     let revjob_rx = rx.clone();
     let mut revjobs = JoinSet::new();
-    revjobs.spawn(async move {
+    let merge = async move {
         // Consumer-side peek timeout, and a caveat worth understanding
         // (rustfs/backlog#1217).
         //
@@ -722,6 +742,8 @@ async fn list_path_raw_inner(
         // Sticky across rounds: once any reader's trailer says its producer
         // stopped at the per-disk limit, the merged stream may hide more keys.
         let mut limit_reached = false;
+        let mut scan_cut = None;
+        let mut last_scanned_key: Option<String> = None;
 
         loop {
             let mut current = MetaCacheEntry::default();
@@ -733,7 +755,7 @@ async fn list_path_raw_inner(
             // );
 
             if revjob_rx.is_cancelled() {
-                return Ok(ListPathRawOutcome { limit_reached });
+                return Ok(ListPathRawOutcome { limit_reached, scan_cut });
             }
 
             let mut top_entries: Vec<Option<MetaCacheEntry>> = vec![None; readers.len()];
@@ -747,6 +769,16 @@ async fn list_path_raw_inner(
             // Start every missing head read in the same round so one stalled
             // disk cannot multiply the wait budget by the erasure-set width.
             // Outcomes are still consumed below in stable disk-index order.
+            if !revjob_rx.is_cancelled() {
+                for (i, reader) in readers.iter_mut().enumerate() {
+                    if errs[i].is_none()
+                        && pending_entries[i].is_none()
+                        && let Some(Ok(Some(entry))) = reader.try_peek_buffered()
+                    {
+                        pending_entries[i] = Some(entry);
+                    }
+                }
+            }
             let concurrent_peeks = readers.iter_mut().enumerate().filter_map(|(i, reader)| {
                 if errs[i].is_some() || pending_entries[i].is_some() {
                     return None;
@@ -783,7 +815,12 @@ async fn list_path_raw_inner(
                                     continue;
                                 }
                                 // eof
-                                limit_reached |= r.limit_reached() == Some(true);
+                                if r.limit_reached() == Some(true) {
+                                    limit_reached = true;
+                                    scan_cut = Some(last_scanned_key.clone().ok_or_else(|| {
+                                        DiskError::other("bounded listing reader ended without a scan boundary")
+                                    })?);
+                                }
                                 at_eof += 1;
                                 // warn!("list_path_raw: peek eof, disk: {}", i);
                                 continue;
@@ -857,7 +894,7 @@ async fn list_path_raw_inner(
                             *r = MetacacheReader::new(detached_rd);
                             continue;
                         }
-                        PeekOutcome::Cancelled => return Ok(ListPathRawOutcome { limit_reached }),
+                        PeekOutcome::Cancelled => return Ok(ListPathRawOutcome { limit_reached, scan_cut }),
                     }
                 };
 
@@ -878,7 +915,7 @@ async fn list_path_raw_inner(
                 }
                 if entry.name == current.name {
                     // If exact match, we agree.
-                    if current.matches_strict(&entry) {
+                    if current.matches_strict_borrowed(&entry) {
                         top_entries[i] = Some(entry);
                         agree += 1;
                     } else {
@@ -916,7 +953,7 @@ async fn list_path_raw_inner(
                 if let Some(finished_fn) = opts.finished.as_ref() {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached, scan_cut }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -966,6 +1003,14 @@ async fn list_path_raw_inner(
                 return Err(classify_listing_quorum_failure(&failures));
             }
 
+            // The next head from a bounded reader is unknown. The previous
+            // globally consumed group is a safe cut; consuming another reader's
+            // later head would turn this absence of evidence into a skipped key.
+            // Check quorum failures above before accepting the bounded result.
+            if limit_reached {
+                break;
+            }
+
             // Break if all at EOF or error.
             if at_eof + has_err == readers.len() {
                 if has_err > 0
@@ -973,7 +1018,7 @@ async fn list_path_raw_inner(
                 {
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached, scan_cut }),
                         _ = finished_fn(&errs) => {}
                     }
                 }
@@ -984,16 +1029,19 @@ async fn list_path_raw_inner(
                 break;
             }
 
+            last_scanned_key = Some(current.name.clone());
             if agree == readers.len() && !opts.preserve_replica_metadata {
                 for r in readers.iter_mut() {
-                    let _ = r.skip(1).await;
+                    if !r.skip_current() {
+                        let _ = r.skip(1).await;
+                    }
                 }
 
                 if let Some(agreed_fn) = opts.agreed.as_ref() {
                     // warn!("list_path_raw: agreed_fn start, current: {:?}", &current.name);
                     tokio::select! {
                         biased;
-                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
+                        _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached, scan_cut }),
                         result = agreed_fn(current) => result?
                     }
                     // warn!("list_path_raw: agreed_fn done");
@@ -1009,7 +1057,7 @@ async fn list_path_raw_inner(
             }
 
             for (i, r) in readers.iter_mut().enumerate() {
-                if top_entries[i].is_some() {
+                if top_entries[i].is_some() && !r.skip_current() {
                     let _ = r.skip(1).await;
                 }
             }
@@ -1017,13 +1065,14 @@ async fn list_path_raw_inner(
             if let Some(partial_fn) = opts.partial.as_ref() {
                 tokio::select! {
                     biased;
-                    _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached }),
+                    _ = revjob_rx.cancelled() => return Ok(ListPathRawOutcome { limit_reached, scan_cut }),
                     _ = partial_fn(MetaCacheEntries(top_entries), &errs) => {}
                 }
             }
         }
-        Ok(ListPathRawOutcome { limit_reached })
-    });
+        Ok(ListPathRawOutcome { limit_reached, scan_cut })
+    };
+    revjobs.spawn(merge.in_current_span());
 
     let merge_started = std::time::Instant::now();
     let Some(revjob) = revjobs.join_next().await else {
@@ -1187,6 +1236,39 @@ mod tests {
         assert!(!options.skip_total_timeout);
     }
 
+    #[test]
+    fn identifier_tree_selection_survives_job_clone_and_disk_request() {
+        let request = ListPathRawOptions {
+            path: "catalog/namespaces/".to_string(),
+            identifier_tree_leaf: Some("table-entry.json".to_string()),
+            recursive: true,
+            ..Default::default()
+        };
+        let cloned = request.clone();
+        let walk = walk_dir_options(&cloned);
+        assert_eq!(walk.identifier_tree_leaf, request.identifier_tree_leaf);
+        assert_eq!(walk.base_dir, request.path);
+        assert!(walk.recursive);
+    }
+
+    #[test]
+    fn cloned_reader_options_preserve_hidden_scan_budget_and_pending_prefix() {
+        let request = ListPathRawOptions {
+            bucket: "versioned".to_owned(),
+            hidden_entry_budget: 100,
+            pending_prefix: Some("pending/".to_owned()),
+            forward_to: Some("pending/0099".to_owned()),
+            ..Default::default()
+        };
+        // Both walks are built once from the shared options; the per-job clone
+        // must carry every field that the walk derives from the request.
+        let job = request.clone();
+        let walk = walk_dir_options(&job);
+        assert_eq!(walk.hidden_entry_budget, 100);
+        assert_eq!(walk.pending_prefix.as_deref(), request.pending_prefix.as_deref());
+        assert_eq!(walk.forward_to.as_deref(), Some("pending/0099"));
+    }
+
     #[tokio::test]
     async fn list_path_raw_empty_disks_returns_read_quorum() {
         let err = list_path_raw(CancellationToken::new(), ListPathRawOptions::default())
@@ -1234,6 +1316,163 @@ mod tests {
         assert!(
             observed.load(std::sync::atomic::Ordering::Acquire),
             "the per-disk JoinSet producer must retain the scanner background class"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_path_raw_fanout_retains_only_linear_disk_references() {
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("UTF-8 disk path"))
+            .expect("parse disk endpoint");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("open local disk"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper)));
+        let baseline = Arc::strong_count(&disk);
+
+        for primary_count in [1, 4, 16] {
+            for fallback_count in [0, 2] {
+                let entered: Vec<_> = (0..primary_count).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+                let stopped: Vec<_> = (0..primary_count).map(|_| Arc::new(tokio::sync::Notify::new())).collect();
+                let behaviors = entered
+                    .iter()
+                    .zip(&stopped)
+                    .map(|(entered, stopped)| TestReaderBehavior::StallWithSignals {
+                        entered: entered.clone(),
+                        stopped: stopped.clone(),
+                    })
+                    .collect();
+                let cancel = CancellationToken::new();
+                let listing = tokio::spawn(list_path_raw(
+                    cancel.clone(),
+                    ListPathRawOptions {
+                        disks: vec![Some(disk.clone()); primary_count],
+                        fallback_disks: vec![Some(disk.clone()); fallback_count],
+                        min_disks: primary_count,
+                        test_reader_behaviors: behaviors,
+                        peek_timeout: Some(Duration::from_secs(60)),
+                        ..Default::default()
+                    },
+                ));
+                for signal in &entered {
+                    timeout(Duration::from_secs(2), signal.notified())
+                        .await
+                        .expect("every producer must enter the real fanout before counting references");
+                }
+
+                // The merge owns the configured primary/fallback slots, each producer
+                // owns its primary, and the shared fallback queue owns each fallback.
+                let expected = baseline + 2 * (primary_count + fallback_count);
+                let retained = Arc::strong_count(&disk);
+                cancel.cancel();
+                timeout(Duration::from_secs(2), listing)
+                    .await
+                    .expect("cancellation must stop the listing")
+                    .expect("listing task must join")
+                    .expect("external cancellation must finish cleanly");
+                for signal in &stopped {
+                    timeout(Duration::from_secs(2), signal.notified())
+                        .await
+                        .expect("cancellation must drop every producer");
+                }
+                assert_eq!(Arc::strong_count(&disk), baseline, "cancellation must release every fanout reference");
+                assert_eq!(
+                    retained, expected,
+                    "fanout must retain linear references for {primary_count} primary and {fallback_count} fallback slots"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn list_path_raw_producer_and_merge_preserve_request_span() {
+        use tracing_subscriber::{Layer, layer::SubscriberExt};
+
+        struct ProducerSpan(Arc<AtomicBool>);
+        #[derive(Default)]
+        struct StateField(bool);
+        impl tracing::field::Visit for StateField {
+            fn record_debug(&mut self, _: &tracing::field::Field, _: &dyn std::fmt::Debug) {}
+
+            fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+                self.0 |= field.name() == "state" && value == "walk_dir_missing_path";
+            }
+        }
+        impl<S> Layer<S> for ProducerSpan
+        where
+            S: tracing::Subscriber + for<'a> tracing_subscriber::registry::LookupSpan<'a>,
+        {
+            fn on_event(&self, event: &tracing::Event<'_>, context: tracing_subscriber::layer::Context<'_, S>) {
+                let mut state = StateField::default();
+                event.record(&mut state);
+                if state.0
+                    && context
+                        .lookup_current()
+                        .is_some_and(|span| span.name() == "flink_list_request")
+                {
+                    self.0.store(true, std::sync::atomic::Ordering::Release);
+                }
+            }
+        }
+
+        // The subscriber is thread-local; keep the spawned tasks on this runtime thread.
+        let producer_observed = Arc::new(AtomicBool::new(false));
+        let subscriber = tracing_subscriber::registry().with(ProducerSpan(producer_observed.clone()));
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let request = tracing::info_span!("flink_list_request", request_id = "list-span-regression");
+        let root = tempfile::tempdir().expect("create disk root");
+        let endpoint = crate::disk::endpoint::Endpoint::try_from(root.path().to_str().expect("UTF-8 disk path"))
+            .expect("parse disk endpoint");
+        let local = Arc::new(
+            crate::disk::local::LocalDisk::new(&endpoint, false)
+                .await
+                .expect("open local disk"),
+        );
+        let wrapper = crate::disk::disk_store::LocalDiskWrapper::new(local, false);
+        let disk = Arc::new(crate::disk::Disk::Local(Box::new(wrapper)));
+        let error = list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![Some(disk)],
+                bucket: "missing-bucket".to_owned(),
+                min_disks: 1,
+                ..Default::default()
+            },
+        )
+        .instrument(request.clone())
+        .await
+        .expect_err("missing bucket must fail the real disk producer");
+        assert_eq!(error, DiskError::VolumeNotFound);
+        assert!(
+            producer_observed.load(std::sync::atomic::Ordering::Acquire),
+            "disk error must retain the request span"
+        );
+
+        let merge_observed = Arc::new(AtomicBool::new(false));
+        let merge_sink = merge_observed.clone();
+        let request_id = request.id();
+        list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::Entries(vec![fallback_test_entry()])],
+                agreed: Some(Box::new(move |_| {
+                    merge_sink.store(tracing::Span::current().id() == request_id, std::sync::atomic::Ordering::Release);
+                    Box::pin(async { Ok(()) })
+                })),
+                ..Default::default()
+            },
+        )
+        .instrument(request)
+        .await
+        .expect("merge should deliver the test entry");
+        assert!(
+            merge_observed.load(std::sync::atomic::Ordering::Acquire),
+            "merge callback must retain the request span"
         );
     }
 
@@ -1304,6 +1543,7 @@ mod tests {
             outcome.limit_reached,
             "a reader whose trailer reports a limit stop must mark the merged stream as possibly incomplete"
         );
+        assert_eq!(outcome.scan_cut.as_deref(), Some("bucket/object"));
     }
 
     #[tokio::test]
@@ -1678,6 +1918,42 @@ mod tests {
         .expect("stalled reader within failure budget should not fail a quorum listing");
 
         assert_eq!(seen.lock().expect("seen mutex poisoned").as_slice(), &["bucket/object".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_read_budget_is_retained_by_raw_producer_until_cancellation() {
+        let semaphore = Arc::new(tokio::sync::Semaphore::new(4));
+        let grant = Arc::new(semaphore.clone().acquire_many_owned(4).await.expect("listing grant"));
+        let weak_grant = Arc::downgrade(&grant);
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(tokio::sync::Notify::new());
+        let worker = tokio::spawn(list_path_raw(
+            CancellationToken::new(),
+            ListPathRawOptions {
+                read_budget: Some(grant),
+                disks: vec![None],
+                min_disks: 1,
+                test_reader_behaviors: vec![TestReaderBehavior::StallWithSignals {
+                    entered: entered.clone(),
+                    stopped: stopped.clone(),
+                }],
+                ..Default::default()
+            },
+        ));
+        timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("producer entered");
+        assert!(weak_grant.strong_count() >= 2, "producer must retain a grant independently of the parent");
+        assert_eq!(semaphore.available_permits(), 0);
+        worker.abort();
+        assert!(worker.await.expect_err("parent cancelled").is_cancelled());
+        timeout(Duration::from_secs(5), stopped.notified())
+            .await
+            .expect("producer stopped");
+        let _next = timeout(Duration::from_secs(5), semaphore.acquire_many(4))
+            .await
+            .expect("cancelled listing releases all permits")
+            .expect("budget stays open");
     }
 
     #[tokio::test]

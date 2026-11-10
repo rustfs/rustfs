@@ -429,6 +429,7 @@ const INTERNODE_OPERATION_REQUESTS_OUTGOING_TOTAL: &str = "rustfs_system_network
 const INTERNODE_OPERATION_REQUESTS_INCOMING_TOTAL: &str = "rustfs_system_network_internode_operation_requests_incoming_total";
 const INTERNODE_OPERATION_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_errors_total";
 const INTERNODE_OPERATION_DURATION_MS: &str = "rustfs_system_network_internode_operation_duration_ms";
+const INTERNODE_OPERATION_SERVER_DURATION_MS: &str = "rustfs_system_network_internode_operation_server_duration_ms";
 const INTERNODE_OPERATION_STAGE_DURATION_MS: &str = "rustfs_system_network_internode_operation_stage_duration_ms";
 const INTERNODE_OPERATION_CLASSIFIED_ERRORS_TOTAL: &str = "rustfs_system_network_internode_operation_classified_errors_total";
 const INTERNODE_OPERATION_RETRIES_TOTAL: &str = "rustfs_system_network_internode_operation_retries_total";
@@ -562,6 +563,10 @@ pub const INTERNODE_OPERATION_METRICS: &[InternodeOperationMetricDescriptor] = &
         name: INTERNODE_OPERATION_LARGE_PAYLOADS_TOTAL,
         labels: SERVER_OPERATION_BACKEND_LABELS,
     },
+    InternodeOperationMetricDescriptor {
+        name: INTERNODE_OPERATION_SERVER_DURATION_MS,
+        labels: SERVER_OPERATION_BACKEND_LABELS,
+    },
 ];
 
 static STABLE_SERVER_LABEL: OnceLock<String> = OnceLock::new();
@@ -686,6 +691,78 @@ impl GrpcReadVersionMetricHandles {
 #[cfg(not(test))]
 static GRPC_READ_VERSION_METRIC_HANDLES: LazyLock<GrpcReadVersionMetricHandles> =
     LazyLock::new(|| GrpcReadVersionMetricHandles::new(current_server_label()));
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_READ_MULTIPLE_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+static GRPC_BATCH_READ_VERSION_SERVER_DURATION: LazyLock<metrics::Histogram> = LazyLock::new(|| {
+    operation_duration_histogram(
+        INTERNODE_OPERATION_SERVER_DURATION_MS,
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION,
+        INTERNODE_TRANSPORT_BACKEND_GRPC,
+    )
+});
+
+#[cfg(not(test))]
+fn grpc_operation_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_VERSION => Some(&GRPC_READ_VERSION_METRIC_HANDLES.duration),
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_DURATION),
+        _ => None,
+    }
+}
+
+#[cfg(not(test))]
+fn grpc_server_duration_if_ready(operation: &'static str, backend: &'static str) -> Option<&'static metrics::Histogram> {
+    STABLE_SERVER_LABEL.get()?;
+    if backend != INTERNODE_TRANSPORT_BACKEND_GRPC {
+        return None;
+    }
+    match operation {
+        INTERNODE_OPERATION_GRPC_READ_MULTIPLE => Some(&GRPC_READ_MULTIPLE_SERVER_DURATION),
+        INTERNODE_OPERATION_GRPC_BATCH_READ_VERSION => Some(&GRPC_BATCH_READ_VERSION_SERVER_DURATION),
+        _ => None,
+    }
+}
+
+fn operation_duration_histogram(name: &'static str, operation: &'static str, backend: &'static str) -> metrics::Histogram {
+    metrics::histogram!(
+        name,
+        SERVER_LABEL => current_server_label(),
+        OPERATION_LABEL => operation,
+        BACKEND_LABEL => backend
+    )
+}
 
 #[cfg(not(test))]
 fn server_metric_handles_if_ready() -> Option<&'static InternodeServerMetricHandles> {
@@ -944,17 +1021,28 @@ impl InternodeMetrics {
     pub fn record_duration_for_operation_and_backend(&self, operation: &'static str, backend: &'static str, duration: Duration) {
         let duration_ms = duration.as_secs_f64() * 1000.0;
         #[cfg(not(test))]
-        if let Some(handles) = grpc_read_version_metric_handles_if_ready(operation, backend) {
-            handles.duration.record(duration_ms);
+        if let Some(histogram) = grpc_operation_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
             return;
         }
-        metrics::histogram!(
-            INTERNODE_OPERATION_DURATION_MS,
-            SERVER_LABEL => current_server_label(),
-            OPERATION_LABEL => operation,
-            BACKEND_LABEL => backend
-        )
-        .record(duration_ms);
+        operation_duration_histogram(INTERNODE_OPERATION_DURATION_MS, operation, backend).record(duration_ms);
+    }
+
+    /// Records server-side handler latency in a separate histogram from client RPC duration.
+    /// The caller supplies the handler lifetime, including any error or cancellation path.
+    pub fn record_server_duration_for_operation_and_backend(
+        &self,
+        operation: &'static str,
+        backend: &'static str,
+        duration: Duration,
+    ) {
+        let duration_ms = duration.as_secs_f64() * 1000.0;
+        #[cfg(not(test))]
+        if let Some(histogram) = grpc_server_duration_if_ready(operation, backend) {
+            histogram.record(duration_ms);
+            return;
+        }
+        operation_duration_histogram(INTERNODE_OPERATION_SERVER_DURATION_MS, operation, backend).record(duration_ms);
     }
 
     pub fn record_stage_duration_for_operation_and_backend(
@@ -1411,6 +1499,28 @@ pub fn record_peer_reachable(addr: &str) {
     publish_offline_gauge(&peers);
 }
 
+/// Record a successful interaction with a cluster peer, but only when the peer is currently
+/// marked offline. This is the fast recovery path for cached-channel RPCs, recovery probes,
+/// and lock-path successes that do not go through a fresh dial.
+///
+/// Fast path (peer unknown or already online): a shared read lock, no write, no gauge
+/// republish — the overwhelmingly common case on a healthy cluster. Slow path (offline →
+/// online transition): upgrades to the write lock and delegates to [`record_peer_reachable`].
+pub fn record_peer_reachable_if_offline(addr: &str) {
+    let key = normalize_peer_key(addr);
+    // Fast path: read lock to check whether the peer is currently offline.
+    {
+        let peers = CLUSTER_PEER_HEALTH.read().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match peers.get(key) {
+            None => return,
+            Some(entry) if entry.online => return,
+            Some(_) => {} // offline: fall through to the write path
+        }
+    }
+    // Slow path: the peer is offline, so flip it back online and republish the gauge.
+    record_peer_reachable(addr);
+}
+
 /// Record a failed interaction with a cluster peer (dial failure or RPC-triggered eviction). After
 /// `failure_threshold` (>= 1) consecutive failures the peer flips offline.
 pub fn record_peer_unreachable(addr: &str, failure_threshold: u32) {
@@ -1677,7 +1787,7 @@ mod tests {
 
     #[test]
     fn operation_metric_descriptors_include_backend_and_operation_labels() {
-        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 22);
+        assert_eq!(INTERNODE_OPERATION_METRICS.len(), 23);
         for metric in &INTERNODE_OPERATION_METRICS[..6] {
             assert_eq!(metric.labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         }
@@ -1715,6 +1825,8 @@ mod tests {
         // Payload histogram + large-payload counter carry operation+backend labels.
         assert_eq!(INTERNODE_OPERATION_METRICS[20].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
         assert_eq!(INTERNODE_OPERATION_METRICS[21].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].labels, &[SERVER_LABEL, OPERATION_LABEL, BACKEND_LABEL]);
+        assert_eq!(INTERNODE_OPERATION_METRICS[22].name, INTERNODE_OPERATION_SERVER_DURATION_MS);
     }
 
     #[test]
@@ -2186,6 +2298,34 @@ mod tests {
     #[test]
     fn cluster_servers_offline_total_name_is_stable() {
         assert_eq!(CLUSTER_SERVERS_OFFLINE_TOTAL, "rustfs_cluster_servers_offline_total");
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_recovers_stale_offline_state() {
+        let addr = "http://cluster-peer-recover-if-offline-test:9000";
+
+        // Mark the peer offline.
+        record_peer_unreachable(addr, 1);
+        assert!(cluster_peer_is_offline(addr));
+
+        // A successful cached-channel RPC (no fresh dial) clears the offline state.
+        record_peer_reachable_if_offline(addr);
+        assert!(!cluster_peer_is_offline(addr));
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+    }
+
+    #[test]
+    fn record_peer_reachable_if_offline_no_op_for_online_peer() {
+        let addr = "http://cluster-peer-recover-noop-test:9000";
+
+        record_peer_reachable(addr);
+        // Should not panic or change state for an already-online peer.
+        record_peer_reachable_if_offline(addr);
+        assert_eq!(cluster_peer_observed_online_status(addr), Some(true));
+
+        // Should also be a no-op for unknown peers.
+        record_peer_reachable_if_offline("http://cluster-peer-recover-unknown-test:9000");
+        assert_eq!(cluster_peer_observed_online_status("http://cluster-peer-recover-unknown-test:9000"), None);
     }
 
     #[test]

@@ -92,6 +92,8 @@ pub(crate) use readiness::collect_node_readiness_report;
 pub(crate) use readiness::observe_peer_drive_admission;
 pub use readiness::publish_ready_when_runtime_ready;
 pub(crate) use readiness::snapshot_dependency_readiness_report;
+#[cfg(test)]
+pub(crate) use readiness::wait_for_runtime_readiness_with;
 pub(crate) use readiness::{collect_cluster_read_health_report, collect_cluster_write_health_report};
 pub(crate) use ssec_transport::NativeTlsTransport;
 
@@ -152,6 +154,8 @@ impl Http12ShutdownOutcome {
 #[derive(Debug, Clone)]
 pub(crate) enum ShutdownReceipt {
     OuterTaskJoined,
+    #[cfg(feature = "webdav")]
+    WebDavChildrenRetired,
     Http12ChildrenRetired(Http12ShutdownOutcome),
 }
 
@@ -160,6 +164,8 @@ pub(crate) enum ShutdownReceipt {
 pub(crate) enum ShutdownWaitError {
     Join(std::sync::Arc<tokio::task::JoinError>),
     MissingTask,
+    #[cfg(feature = "webdav")]
+    WebDav(std::sync::Arc<rustfs_protocols::webdav::config::WebDavInitError>),
     Http12(Http12ShutdownOutcome),
 }
 
@@ -169,6 +175,8 @@ impl ShutdownWaitError {
             Self::Join(error) if error.is_cancelled() => "join_cancelled",
             Self::Join(_) => "join_panicked",
             Self::MissingTask => "join_unconfirmed",
+            #[cfg(feature = "webdav")]
+            Self::WebDav(_) => "webdav_shutdown_failed",
             Self::Http12(outcome) if outcome.deadline_missed => "http12_deadline_missed",
             Self::Http12(outcome) if outcome.tls_reload_error().is_some_and(|error| error.is_cancelled()) => {
                 "tls_reload_join_cancelled"
@@ -189,6 +197,10 @@ impl ShutdownWaitError {
 impl std::fmt::Display for ShutdownWaitError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "server task shutdown {}", self.reason())?;
+        #[cfg(feature = "webdav")]
+        if let Self::WebDav(error) = self {
+            write!(f, " ({error})")?;
+        }
         if let Self::Http12(outcome) = self {
             write!(f, " ({} child join failures)", outcome.child_failures)?;
         }
@@ -206,12 +218,16 @@ impl std::error::Error for ShutdownWaitError {
                 .or_else(|| outcome.tls_reload_error())
                 .map(|error| error.as_ref() as _),
             Self::MissingTask => None,
+            #[cfg(feature = "webdav")]
+            Self::WebDav(error) => Some(error.as_ref()),
         }
     }
 }
 
 enum ShutdownTask {
     Outer(tokio::task::JoinHandle<()>),
+    #[cfg(feature = "webdav")]
+    WebDav(tokio::task::JoinHandle<Result<(), rustfs_protocols::webdav::config::WebDavInitError>>),
     Http12(tokio::task::JoinHandle<Http12ShutdownOutcome>),
 }
 
@@ -220,6 +236,8 @@ impl ShutdownTask {
     fn is_finished(&self) -> bool {
         match self {
             Self::Outer(task) => task.is_finished(),
+            #[cfg(feature = "webdav")]
+            Self::WebDav(task) => task.is_finished(),
             Self::Http12(task) => task.is_finished(),
         }
     }
@@ -228,6 +246,8 @@ impl ShutdownTask {
     fn id(&self) -> tokio::task::Id {
         match self {
             Self::Outer(task) => task.id(),
+            #[cfg(feature = "webdav")]
+            Self::WebDav(task) => task.id(),
             Self::Http12(task) => task.id(),
         }
     }
@@ -244,6 +264,18 @@ impl ShutdownHandle {
         Self {
             shutdown_tx: Some(shutdown_tx),
             task_handle: Some(ShutdownTask::Outer(task_handle)),
+            failure: None,
+        }
+    }
+
+    #[cfg(feature = "webdav")]
+    pub(crate) fn new_webdav(
+        shutdown_tx: tokio::sync::broadcast::Sender<()>,
+        task_handle: tokio::task::JoinHandle<Result<(), rustfs_protocols::webdav::config::WebDavInitError>>,
+    ) -> Self {
+        Self {
+            shutdown_tx: Some(shutdown_tx),
+            task_handle: Some(ShutdownTask::WebDav(task_handle)),
             failure: None,
         }
     }
@@ -279,11 +311,17 @@ impl ShutdownHandle {
         let Some(task) = self.task_handle.as_mut() else {
             return Err(ShutdownWaitError::MissingTask);
         };
+        let join_error = |error| ShutdownWaitError::Join(std::sync::Arc::new(error));
         let result = match task {
-            ShutdownTask::Outer(task) => task.await.map(|()| ShutdownReceipt::OuterTaskJoined),
-            ShutdownTask::Http12(task) => task.await.map(ShutdownReceipt::Http12ChildrenRetired),
+            ShutdownTask::Outer(task) => task.await.map(|()| ShutdownReceipt::OuterTaskJoined).map_err(join_error),
+            ShutdownTask::Http12(task) => task.await.map(ShutdownReceipt::Http12ChildrenRetired).map_err(join_error),
+            #[cfg(feature = "webdav")]
+            ShutdownTask::WebDav(task) => task.await.map_err(join_error).and_then(|result| {
+                result
+                    .map(|()| ShutdownReceipt::WebDavChildrenRetired)
+                    .map_err(|error| ShutdownWaitError::WebDav(std::sync::Arc::new(error)))
+            }),
         }
-        .map_err(|error| ShutdownWaitError::Join(std::sync::Arc::new(error)))
         .and_then(|receipt| match receipt {
             ShutdownReceipt::Http12ChildrenRetired(outcome) if outcome.failed() => Err(ShutdownWaitError::Http12(outcome)),
             receipt => Ok(receipt),

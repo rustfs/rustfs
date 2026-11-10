@@ -16,19 +16,21 @@ use super::{
     transport::{DiscoveryRequest, OidcHttpError, ReqwestHttpClient, oidc_extra_root_certs, oidc_http_error_diagnostics},
 };
 use crate::{EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC};
-use openidconnect::core::{CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
+use openidconnect::core::{CoreIdToken, CoreIdTokenClaims, CoreIdTokenVerifier, CoreJsonWebKeySet, CoreJwsSigningAlgorithm};
 use openidconnect::{
-    AsyncHttpClient, ClientId, ClientSecret, DiscoveryError, IssuerUrl, JsonWebKeySetUrl, ProviderMetadataWithLogout, TokenUrl,
+    AsyncHttpClient, ClaimsVerificationError, ClientId, DiscoveryError, IssuerUrl, JsonWebKeySetUrl, NonceVerifier,
+    ProviderMetadataWithLogout, SignatureVerificationError, TokenUrl,
 };
 use serde::Deserialize;
 use std::collections::HashMap;
-use std::sync::RwLock;
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration as StdDuration, Instant};
 use tokio::time::sleep;
 use tracing::{debug, warn};
 use url::Url;
 
 pub(super) const OIDC_JWKS_REFRESH_INTERVAL: StdDuration = StdDuration::from_secs(24 * 60 * 60);
+const OIDC_JWKS_REFRESH_COOLDOWN: StdDuration = StdDuration::from_secs(60);
 pub(super) const OIDC_DISCOVERY_TRANSPORT_RETRIES: usize = 3;
 pub(super) const OIDC_DISCOVERY_TRANSPORT_RETRY_DELAY: StdDuration = StdDuration::from_millis(50);
 pub(super) const OIDC_JWKS_BLOCKED_BY_OUTBOUND_POLICY: &str = "JWKS request blocked by outbound policy";
@@ -96,9 +98,14 @@ pub(super) struct ProviderState {
     pub(super) discovered_at: Instant,
 }
 
+type RefreshAttempt = Option<(Instant, Result<ProviderState, String>)>;
+type ProviderRefreshLock = Arc<tokio::sync::Mutex<RefreshAttempt>>;
+
+#[derive(Clone)]
 pub(super) struct ProviderRuntime {
-    states: RwLock<HashMap<String, ProviderState>>,
-    http_client: ReqwestHttpClient,
+    states: Arc<RwLock<HashMap<String, ProviderState>>>,
+    http_client: Arc<ReqwestHttpClient>,
+    refreshes: Arc<Mutex<HashMap<String, ProviderRefreshLock>>>,
 }
 
 // Workload issuers do not implement the browser authorization flow. Keep their
@@ -199,17 +206,55 @@ impl DiscoveredProviderMetadata {
 
     pub(super) fn verifier(&self, config: &OidcProviderConfig) -> CoreIdTokenVerifier<'static> {
         let client_id = ClientId::new(config.client_id.clone());
-        let secret = config.client_secret.as_ref().map(|secret| ClientSecret::new(secret.clone()));
         let (issuer, jwks, algorithms) = match self {
             Self::Console(metadata) => (metadata.issuer(), metadata.jwks(), metadata.id_token_signing_alg_values_supported()),
             Self::Workload(metadata) => (&metadata.issuer, &metadata.jwks, &metadata.id_token_signing_alg_values_supported),
         };
-        let verifier = match secret {
-            Some(secret) => CoreIdTokenVerifier::new_confidential_client(client_id, secret, issuer.clone(), jwks.clone()),
-            None => CoreIdTokenVerifier::new_public_client(client_id, issuer.clone(), jwks.clone()),
-        };
-        verifier.set_allowed_algs(algorithms.clone())
+        // Caller-supplied tokens must prove possession of the issuer's signing
+        // key. A client secret is shared with clients and cannot provide that proof.
+        let algorithms = algorithms
+            .iter()
+            .filter(|algorithm| {
+                !matches!(
+                    algorithm,
+                    CoreJwsSigningAlgorithm::HmacSha256
+                        | CoreJwsSigningAlgorithm::HmacSha384
+                        | CoreJwsSigningAlgorithm::HmacSha512
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        CoreIdTokenVerifier::new_public_client(client_id, issuer.clone(), jwks.clone()).set_allowed_algs(algorithms)
     }
+}
+
+pub(super) fn verify_id_token_claims<'a, N: NonceVerifier>(
+    token: &'a CoreIdToken,
+    verifier: &CoreIdTokenVerifier<'_>,
+    nonce_verifier: N,
+) -> Result<&'a CoreIdTokenClaims, ClaimsVerificationError> {
+    let expected_length = match token.signing_alg().map_err(ClaimsVerificationError::SignatureVerification)? {
+        CoreJwsSigningAlgorithm::HmacSha256 => 32,
+        CoreJwsSigningAlgorithm::HmacSha384 => 48,
+        CoreJwsSigningAlgorithm::HmacSha512 => 64,
+        _ => return token.claims(verifier, nonce_verifier),
+    };
+    // RUSTFS_COMPAT_TODO(openidconnect-hmac-signature-width): Reject widths that upstream converts to fixed-size arrays. Remove after upstream returns verification errors for arbitrary HMAC signature lengths.
+    // openidconnect 4.1.0 converts HMAC signatures to fixed-size arrays before verifying them.
+    let invalid_length = || {
+        ClaimsVerificationError::SignatureVerification(SignatureVerificationError::CryptoError(
+            "invalid HMAC signature length".to_owned(),
+        ))
+    };
+    let compact = token.to_string();
+    let (_, signature) = compact.rsplit_once('.').ok_or_else(invalid_length)?;
+    let signature = base64_simd::URL_SAFE_NO_PAD
+        .decode_to_vec(signature)
+        .map_err(|_| invalid_length())?;
+    if signature.len() != expected_length {
+        return Err(invalid_length());
+    }
+    token.claims(verifier, nonce_verifier)
 }
 
 // This adapter is used only for discovery/JWKS fetches, never token exchange.
@@ -243,8 +288,9 @@ impl ProviderState {
 impl ProviderRuntime {
     pub(super) fn new(http_client: ReqwestHttpClient, states: HashMap<String, ProviderState>) -> Self {
         Self {
-            states: RwLock::new(states),
-            http_client,
+            states: Arc::new(RwLock::new(states)),
+            http_client: Arc::new(http_client),
+            refreshes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -296,9 +342,38 @@ impl ProviderRuntime {
         provider_id: &str,
         config: &OidcProviderConfig,
     ) -> Result<ProviderState, String> {
-        self.recover_provider_state(provider_id, config)
+        let refresh = self
+            .refreshes
+            .lock()
+            .map_err(|_| "provider refresh registry is unavailable".to_string())?
+            .entry(provider_id.to_string())
+            .or_default()
+            .clone();
+        let mut attempt = refresh.lock_owned().await;
+        if let Some((completed, result)) = attempt.as_ref()
+            && completed.elapsed() < OIDC_JWKS_REFRESH_COOLDOWN
+        {
+            return result.clone();
+        }
+
+        // The admitted fetch owns the per-provider lock. A disconnected request
+        // cannot abandon discovery while consuming the provider's cooldown.
+        // Waiting callers share its completed result, including genuine failures.
+        let runtime = tokio::runtime::Handle::try_current().map_err(|err| err.to_string())?;
+        let provider_runtime = self.clone();
+        let provider_id = provider_id.to_string();
+        let config = config.clone();
+        runtime
+            .spawn(async move {
+                let result = provider_runtime
+                    .recover_provider_state(&provider_id, &config)
+                    .await
+                    .map_err(|err| err.to_string());
+                *attempt = Some((Instant::now(), result.clone()));
+                result
+            })
             .await
-            .map_err(|err| err.to_string())
+            .map_err(|err| err.to_string())?
     }
 
     pub(super) async fn recover_provider_state(

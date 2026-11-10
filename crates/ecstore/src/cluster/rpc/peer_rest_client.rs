@@ -2014,9 +2014,21 @@ impl PeerRestClient {
             }
             result
         })
-        .await
-        .unwrap_or_else(|_| Err(Error::other(format!("load_bucket_metadata({bucket}) timed out"))));
-        self.finalize_result(result).await
+        .await;
+        self.settle_bucket_metadata_reload(bucket, result).await
+    }
+
+    async fn settle_bucket_metadata_reload(
+        &self,
+        bucket: &str,
+        result: std::result::Result<Result<()>, tokio::time::error::Elapsed>,
+    ) -> Result<()> {
+        match result {
+            Ok(result) => self.finalize_result(result).await,
+            // A local operation deadline does not establish that the peer is
+            // unreachable. In particular, it must not gate IAM revocations.
+            Err(_) => Err(Error::other(format!("load_bucket_metadata({bucket}) timed out"))),
+        }
     }
 
     async fn load_bucket_metadata_once(&self, bucket: &str, scanner_maintenance_change: bool) -> Result<()> {
@@ -4751,6 +4763,31 @@ mod tests {
 
         assert!(err.to_string().contains("transport error"));
         assert!(client.offline.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn bucket_metadata_deadline_does_not_gate_healthy_peer_notifications() {
+        let client = test_peer_client();
+        let elapsed = tokio::time::timeout(std::time::Duration::ZERO, std::future::pending::<Result<()>>()).await;
+        let error = client
+            .settle_bucket_metadata_reload("slow-policy", elapsed)
+            .await
+            .expect_err("local budget expires");
+        assert!(error.to_string().contains("timed out"));
+        assert!(
+            !client.offline.load(Ordering::Acquire),
+            "local work must not suppress subsequent IAM RPCs"
+        );
+        client
+            .settle_bucket_metadata_reload("healthy", Ok(Ok(())))
+            .await
+            .expect("peer reply");
+        let error = client
+            .settle_bucket_metadata_reload("unreachable", Ok(Err(Error::from(tonic::Status::unavailable("connection refused")))))
+            .await
+            .expect_err("real transport failure");
+        assert!(error.to_string().contains("connection refused"));
+        assert!(client.offline.load(Ordering::Acquire), "transport failures must still enter recovery");
     }
 
     #[tokio::test]

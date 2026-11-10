@@ -27,6 +27,7 @@ mod csv_input;
 mod input_stream;
 mod metrics;
 pub mod object_store;
+pub mod parquet_budget;
 pub mod query;
 pub mod server;
 mod storage_api;
@@ -218,6 +219,14 @@ fn classify_select_error_source(err: &(dyn StdError + 'static)) -> Option<Select
     if let Some(error) = err.downcast_ref::<SelectError>() {
         return Some(error.clone());
     }
+    if let Some(error) = err.downcast_ref::<parquet_budget::ParquetBudgetError>() {
+        return Some(match error {
+            parquet_budget::ParquetBudgetError::Exceeded => SelectError::ResourceExhausted,
+            parquet_budget::ParquetBudgetError::Invalid(_) | parquet_budget::ParquetBudgetError::Codec(_) => {
+                SelectError::ParquetParsingError
+            }
+        });
+    }
     if let Some(error) = err.downcast_ref::<object_store::SelectObjectStoreError>() {
         return Some(error.select_error());
     }
@@ -332,8 +341,31 @@ impl Display for ResolvedTable {
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use datafusion::common::DataFusionError;
     use datafusion::sql::sqlparser::parser::ParserError;
+
+    #[test]
+    fn parquet_admission_errors_preserve_select_error_codes() {
+        for (source, expected) in [
+            (parquet_budget::ParquetBudgetError::Exceeded, SelectError::ResourceExhausted),
+            (
+                parquet_budget::ParquetBudgetError::Invalid("malformed footer".into()),
+                SelectError::ParquetParsingError,
+            ),
+            (
+                parquet_budget::ParquetBudgetError::Codec(std::io::Error::from(std::io::ErrorKind::InvalidData)),
+                SelectError::ParquetParsingError,
+            ),
+        ] {
+            let error = QueryError::from(DataFusionError::External(Box::new(source)));
+            assert_eq!(error.select_error(), expected);
+        }
+        let nested = QueryError::from(DataFusionError::ParquetError(Box::new(ParquetError::External(Box::new(
+            parquet_budget::ParquetBudgetError::Exceeded,
+        )))));
+        assert_eq!(nested.select_error(), SelectError::ResourceExhausted);
+    }
 
     #[test]
     fn test_query_error_display() {
