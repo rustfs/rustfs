@@ -83,6 +83,7 @@ def git_file(root: Path, revision: str, path: str) -> str:
 def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
     """Recognize literal stable-version edits, never general packaging changes."""
     stable = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    marker = "<version>"
     patterns = {
         "flake.nix": [rf'(?m)^([ \t]*pname = "rustfs";\n[ \t]*version = ")({stable})(";)$'],
         "helm/rustfs/Chart.yaml": [rf'(?m)^({key}: ")({stable})(")$' for key in ("version", "appVersion")],
@@ -99,12 +100,16 @@ def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
             if not re.fullmatch(rf"100644 blob [0-9a-f]{{40}}\t{re.escape(path)}\x00", entry):
                 return False
             content, values = git_file(root, revision, path), []
+            # Existing markers could make edits to distinct fields collapse
+            # to identical normalized text.
+            if marker in content:
+                return False
             for pattern in patterns[path]:
                 matches = list(re.finditer(pattern, content))
                 if len(matches) != 1:
                     return False
                 values.append(matches[0][2])
-                content = re.sub(pattern, lambda match: match[1] + "<version>" + match[3], content)
+                content = re.sub(pattern, lambda match: match[1] + marker + match[3], content)
             if len(set(values)) != 1:
                 return False
             normalized.append(content)

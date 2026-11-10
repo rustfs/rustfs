@@ -212,6 +212,15 @@ class PlannerTests(unittest.TestCase):
                 self.repo.write(path, content)
                 self.assertTrue(self.repo.plan(self.repo.commit(), base=baseline)['full_validation'])
 
+    def test_installation_metadata_rejects_normalization_marker_collisions(self):
+        _, files = self.release_metadata_base()
+        old = files['flake.nix'].replace('  clientVersion =', '  second = pkgs.buildRustPackage {\n    pname = "rustfs";\n    version = "<version>";\n    src = ./other;\n  };\n  clientVersion =')
+        self.repo.write('flake.nix', old)
+        baseline = self.repo.commit()
+        new = old.replace('version = "1.0.4"', 'version = "<version>"').replace('version = "<version>";\n    src = ./other;', 'version = "1.0.5";\n    src = ./other;')
+        self.repo.write('flake.nix', new)
+        self.assertTrue(self.repo.plan(self.repo.commit(), base=baseline)['full_validation'])
+
     def test_installation_metadata_rejects_missing_files_symlinks_and_mode_changes(self):
         baseline, files = self.release_metadata_base()
         for path in files:
