@@ -169,6 +169,8 @@ Reproduce empty/active RPC drains on baseline and candidate, plaintext and TLS, 
 
 The [remote probe](../../crates/ecstore/examples/internode_rpc_bench.rs) uses the production remote-disk ReadAll path and signed Ping client, with closed-loop bulk workers and fixed offered-rate control arrivals. It performs no remote writes or service operations. It always constructs remote disks, including for loopback test URLs, and rejects targets outside the declared `grpc-bench-` test-disk namespace. Prepare fixtures only after the isolated cluster has formatted its test disks and become ready: each test disk needs `.rustfs.sys/tmp/<fixture_id>/grpc-bench-payload.bin`, containing the exact bytes of the local `fixture_file`. This is a task-owned temporary-file RPC probe, not an erasure-coded S3 throughput or durability test. Preserve the separate S3 integrity/fault matrix.
 
+Recreate these temporary RPC fixtures after every test-service restart, once readiness and the formatted disk UUIDs have been revalidated. Startup cleanup can remove `.rustfs.sys/tmp` content, so a missing fixture after restart is not an object-durability oracle. Preserve confirmed S3 objects and multipart uploads separately and verify their content across shutdown/recovery before creating the next temporary probe fixture.
+
 ```bash
 cargo build --release --locked -p rustfs-ecstore --example internode_rpc_bench
 # Load only this task's private RPC secret and outbound settings before running.
