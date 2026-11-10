@@ -959,44 +959,6 @@ impl BitrotReaderSetup {
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(in crate::set_disk) fn schedule_bitrot_reader_task<'a>(
-    reader_tasks: &mut FuturesUnordered<BitrotReaderTask<'a>>,
-    setup: &mut BitrotReaderSetup,
-    idx: usize,
-    files: &'a [FileInfo],
-    disks: &'a [Option<DiskStore>],
-    bucket: &'a str,
-    object: &'a str,
-    part_number: usize,
-    read_offset: usize,
-    read_length: usize,
-    shard_size: usize,
-    checksum_algo: HashAlgorithm,
-    skip_verify_bitrot: bool,
-    use_mmap_read: bool,
-    stage_metrics: Option<BitrotReaderStageMetrics>,
-) {
-    schedule_bitrot_reader_task_with_frame_size(
-        reader_tasks,
-        setup,
-        idx,
-        files,
-        disks,
-        bucket,
-        object,
-        part_number,
-        read_offset,
-        read_length,
-        shard_size,
-        shard_size,
-        checksum_algo,
-        skip_verify_bitrot,
-        use_mmap_read,
-        stage_metrics,
-    );
-}
-
-#[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) fn schedule_bitrot_reader_task_with_frame_size<'a>(
     reader_tasks: &mut FuturesUnordered<BitrotReaderTask<'a>>,
     setup: &mut BitrotReaderSetup,
