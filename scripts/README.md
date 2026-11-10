@@ -41,7 +41,7 @@ their issue closes.
 | `check_unsafe_code_allowances.sh` | ci-gate | Unsafe-code allowance ledger guard | ci.yml Quick Checks |
 | `layer-dependency-baseline.txt` | ci-gate (data) | Committed baseline consumed by `check_layer_dependencies.sh` | [Architecture guard troubleshooting](../docs/operations/architecture-guard-troubleshooting.md) |
 | `static.sh` | ci-gate | Static-build helper executed inside image builds | `Dockerfile.source`, `Dockerfile.decommission-local` |
-| `helm_chart_version.sh` | ci-gate | Keeps the Helm chart version in sync with the release | helm-package.yml |
+| `helm_chart_version.sh` | dev-tool | Normalizes chart/app versions for installation references | rustfs-release-version-bump skill |
 | `test_helm_templates.sh` | ci-gate | Helm template rendering test | helm-package.yml |
 
 ## Test & e2e runners

@@ -1,0 +1,97 @@
+# Copyright 2026 RustFS Team
+# SPDX-License-Identifier: Apache-2.0
+name: Release candidate (complete)
+on:
+  workflow_dispatch:
+    inputs:
+      candidate_run_id:
+        description: Successful Linux candidate run ID
+        type: string
+        required: true
+      linux_manifest_sha256:
+        description: Exact accepted Linux manifest SHA-256
+        type: string
+        required: true
+      acceptance_report:
+        description: Backlog report accepting cluster, performance, integrity and upgrade results
+        type: string
+        required: true
+permissions:
+  contents: read
+  actions: read
+concurrency:
+  group: release-complete-${{ inputs.candidate_run_id }}
+  cancel-in-progress: false
+jobs:
+  acceptance:
+    if: github.repository == 'rustfs/rustfs' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    environment: release-linux-acceptance
+    outputs:
+      manifest: ${{ steps.accept.outputs.manifest }}
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Bind acceptance to the exact Linux manifest
+        id: accept
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+          MANIFEST_SHA: ${{ inputs.linux_manifest_sha256 }}
+          REPORT: ${{ inputs.acceptance_report }}
+        run: python3 scripts/release/pipeline.py complete-prepare --run-id "$CANDIDATE_RUN" --digest "$MANIFEST_SHA" --report "$REPORT" --directory linux
+  desktop:
+    needs: acceptance
+    uses: ./.github/workflows/build.yml
+    with:
+      candidate_manifest: ${{ needs.acceptance.outputs.manifest }}
+      platforms: desktop
+  packages:
+    needs: acceptance
+    uses: ./.github/workflows/package.yml
+    with:
+      candidate_manifest: ${{ needs.acceptance.outputs.manifest }}
+  images:
+    needs: acceptance
+    uses: ./.github/workflows/docker.yml
+    with:
+      candidate_manifest: ${{ needs.acceptance.outputs.manifest }}
+  chart:
+    needs: acceptance
+    uses: ./.github/workflows/helm-package.yml
+    with:
+      candidate_manifest: ${{ needs.acceptance.outputs.manifest }}
+  seal:
+    needs: [acceptance, desktop, packages, images, chart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Verify every deliverable and seal the candidate
+        id: seal
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CANDIDATE_RUN: ${{ inputs.candidate_run_id }}
+          MANIFEST_SHA: ${{ inputs.linux_manifest_sha256 }}
+          REPORT: ${{ inputs.acceptance_report }}
+        run: |
+          python3 scripts/release/pipeline.py complete-seal --run-id "$CANDIDATE_RUN" --digest "$MANIFEST_SHA" --report "$REPORT" --directory sealed
+          {
+            echo '## Final publication approval'
+            echo 'Review this manifest, then explicitly dispatch Publish accepted release with its SHA-256.'
+            sha256sum sealed/release-manifest.json
+          } >> "$GITHUB_STEP_SUMMARY"
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        if: steps.seal.outputs.reused != 'true'
+        with:
+          name: release-seal
+          path: sealed/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
