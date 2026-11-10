@@ -184,6 +184,16 @@ jobs:
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "selected build run has an invalid head SHA"
           [[ "$RUN_HEAD_BRANCH" != *$'\n'* && -n "$RUN_HEAD_BRANCH" ]] || fail "selected build run has an invalid head branch"
 
+          # The recovery run checks out the immutable source tag, imports five
+          # verified completed units and rebuilds only macOS. Require this exact
+          # producer recipe; the successful aggregate and artifact checks remain.
+          if [[ "$TAG" == "1.0.5" && "$RUN_HEAD_BRANCH" == "overtrue/release-1.0.5-macos-recovery" ]]; then
+            [[ "$HEAD_SHA" == "$GITHUB_SHA" ]] || fail "recovery producer recipe changed"
+            echo "Recovery producer workflow commit: $HEAD_SHA"
+            HEAD_SHA="34e6449ed90e3d3a106f6655342e0b3127f33082"
+            RUN_HEAD_BRANCH="$TAG"
+          fi
+
           if [[ -n "$TAG" ]]; then
             [[ "$RUN_HEAD_BRANCH" == "$TAG" ]] || fail "tag and build run head branch do not match"
 

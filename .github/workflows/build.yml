@@ -34,13 +34,10 @@
 # - build_docker: Advisory only; manual runs do not trigger Docker publishing
 # - platforms: Comma-separated platform IDs or 'all' (default: all)
 
+# One-time 1.0.5 recovery: exact tagged source, five imported units, macOS on a larger runner.
 name: Build and Release
 
 on:
-  push:
-    tags: [ "*.*.*" ]
-  schedule:
-    - cron: "13 1 * * *" # Nightly 01:13 UTC
   workflow_dispatch:
     inputs:
       publish:
@@ -94,66 +91,99 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: 34e6449ed90e3d3a106f6655342e0b3127f33082
+          fetch-depth: 0
 
       - name: Determine build strategy
         id: check
+        env:
+          SELECTED_PLATFORMS: ${{ inputs.platforms }}
         run: |
-          should_build=false
-          build_type="none"
-          version=""
-          short_sha=""
-          is_prerelease=false
-
-          # Get short SHA for all builds
-          short_sha=$(git rev-parse --short HEAD)
-
-          # Determine build type based on trigger
-          if [[ "${{ startsWith(github.ref, 'refs/tags/') }}" == "true" ]]; then
-            # Tag push - preview, release, or prerelease
-            should_build=true
-            tag_name="${GITHUB_REF#refs/tags/}"
-            version="${tag_name}"
-
-            # Preview tags publish a GitHub prerelease for validation, but
-            # must not update any latest channel.
-            if [[ "$tag_name" =~ -preview\.[0-9]+$ ]]; then
-              build_type="preview"
-              is_prerelease=true
-              echo "🔍 Preview build detected: $tag_name"
-            elif [[ "$tag_name" == *"-preview"* ]]; then
-              echo "❌ Invalid preview tag: $tag_name (expected suffix: -preview.<number>)" >&2
-              exit 1
-            elif [[ "$tag_name" == *"alpha"* ]] || [[ "$tag_name" == *"beta"* ]] || [[ "$tag_name" == *"rc"* ]]; then
-              build_type="prerelease"
-              is_prerelease=true
-              echo "🚀 Prerelease build detected: $tag_name"
-            else
-              build_type="release"
-              echo "📦 Release build detected: $tag_name"
-            fi
-          elif [[ "${{ github.event_name }}" == "schedule" ]] || \
-               [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
-            # Scheduled or manual build
-            should_build=true
-            build_type="development"
-            version="dev-${short_sha}"
-            echo "⚡ Manual/scheduled build detected"
-          fi
-
+          set -euo pipefail
+          [[ "$GITHUB_REF" == "refs/heads/overtrue/release-1.0.5-macos-recovery" ]] || exit 1
+          [[ "$(git rev-parse HEAD)" == "34e6449ed90e3d3a106f6655342e0b3127f33082" ]] || exit 1
+          [[ "$(git rev-parse 'refs/tags/1.0.5^{commit}')" == "34e6449ed90e3d3a106f6655342e0b3127f33082" ]] || exit 1
+          [[ "$SELECTED_PLATFORMS" == "macos-aarch64" ]] || exit 1
           {
-            echo "should_build=$should_build"
-            echo "build_type=$build_type"
-            echo "version=$version"
-            echo "short_sha=$short_sha"
-            echo "is_prerelease=$is_prerelease"
+            echo "should_build=true"
+            echo "build_type=release"
+            echo "version=1.0.5"
+            echo "short_sha=$(git rev-parse --short HEAD)"
+            echo "is_prerelease=false"
           } >> "$GITHUB_OUTPUT"
 
-          echo "📊 Build Summary:"
-          echo "  - Should build: $should_build"
-          echo "  - Build type: $build_type"
-          echo "  - Version: $version"
-          echo "  - Short SHA: $short_sha"
-          echo "  - Is prerelease: $is_prerelease"
+
+  # Recovery-only recipe: import the five completed units without recompiling.
+  import-completed:
+    needs: build-check
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      actions: read
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ["linux-aarch64-gnu", "linux-aarch64-musl", "linux-x86_64-gnu", "linux-x86_64-musl", "windows-x86_64"]
+    steps:
+      - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: 29126d280528ea785a58a1a3fd55cffbda3bb1fe
+          persist-credentials: false
+          sparse-checkout: scripts/release
+      - name: Verify and import the original completed artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          python3 - <<'PYIMPORT'
+          import sys, os, json, re, zipfile
+          from pathlib import Path
+          sys.path.insert(0, 'scripts/release')
+          import candidate as c
+          source = '34e6449ed90e3d3a106f6655342e0b3127f33082'
+          frozen = {'linux-aarch64-gnu': {'digest': 'sha256:6d4d5e27918e5c4ab9b6e59a3827e8ee935a38f7f36b7840e5a3c5a8eb487687', 'id': 13775869127, 'name': 'rustfs-linux-aarch64-gnu-v1.0.5', 'size_in_bytes': 236610396}, 'linux-aarch64-musl': {'digest': 'sha256:69c33c15c813c047f4ce1887cb3c5ea9a3bba924aeec660ba21464407cc9bfb8', 'id': 13776179078, 'name': 'rustfs-linux-aarch64-musl-v1.0.5', 'size_in_bytes': 199752834}, 'linux-x86_64-gnu': {'digest': 'sha256:cd4732f42ec479287155cdec2902f5ce97ca118a72254c75d6b1cd2111cb23d1', 'id': 13772313099, 'name': 'rustfs-linux-x86_64-gnu-v1.0.5', 'size_in_bytes': 244269226}, 'linux-x86_64-musl': {'digest': 'sha256:eb217fc12a230615e6dbd65b6ac54e5bbd70e8666ed490d5f0eea858171f6fc0', 'id': 13773000290, 'name': 'rustfs-linux-x86_64-musl-v1.0.5', 'size_in_bytes': 216431754}, 'windows-x86_64': {'digest': 'sha256:ec38c1a05caccab45f14f7ff51bf66ea36f3576719f7014ee2a586e97ff1e5b7', 'id': 13777148228, 'name': 'rustfs-windows-x86_64-v1.0.5', 'size_in_bytes': 233711540}}
+          target = os.environ['TARGET']
+          run = c.github('repos/rustfs/rustfs/actions/runs/42827678767')
+          assert run['head_sha'] == source and run['head_branch'] == '1.0.5' and run['status'] == 'completed'
+          assert run['path'] == '.github/workflows/build.yml' and run['run_attempt'] == 1
+          ci = c.github('repos/rustfs/rustfs/actions/runs/42751393564')
+          assert ci['head_sha'] == source and ci['conclusion'] == 'success'
+          jobs = c.github('repos/rustfs/rustfs/actions/runs/42827678767/jobs?per_page=100')['jobs']
+          matches = [j for j in jobs if j['name'] == f'Build RustFS ({target})']
+          assert len(matches) == 1 and matches[0]['conclusion'] == 'success'
+          job = matches[0]
+          with c.github_stream(f"repos/rustfs/rustfs/actions/jobs/{job['id']}/logs") as response:
+              log = response.read().decode('utf-8', errors='replace')
+          assert source in log and 'Console release: v0.1.41' in log
+          assert 'skipping artifact upload' not in log
+          assert set(re.findall(r'SHA256 verified OK: ([0-9a-f]{64})', log)) == {'5c9c5e800ce2c65f7e6952c57c7c02c2cdc14e2c5d40296c0a57ae80bc041d8d'}
+          asset = c.download_artifact(run, frozen[target]['name'], 'imported')
+          assert all(asset[key] == value for key, value in frozen[target].items())
+          versioned = Path('imported') / f'rustfs-{target}-v1.0.5.zip'
+          latest = Path('imported') / f'rustfs-{target}-latest.zip'
+          assert {p.name for p in Path('imported').iterdir()} == {versioned.name, latest.name}
+          assert c.file_digest(versioned) == c.file_digest(latest)
+          expected = {'rustfs.exe' if target == 'windows-x86_64' else 'rustfs'}
+          if target.endswith('-gnu'):
+              expected.update(('rustfs.cpu-symbol-catalog.json', 'rustfs.cpu-symbol-catalog.sha256'))
+          with zipfile.ZipFile(versioned) as archive:
+              assert len(archive.namelist()) == len(expected) and set(archive.namelist()) == expected
+          c.write_json(f'evidence/{target}.json', {'source_sha': source, 'source_run': run['id'], 'source_job': job['id'],
+              'artifact': frozen[target], 'files': {p.name: c.file_digest(p) for p in (versioned, latest)}})
+          PYIMPORT
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: rustfs-${{ matrix.target }}-v1.0.5
+          path: imported/*
+          if-no-files-found: error
+          retention-days: 30
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-${{ matrix.target }}
+          path: evidence/*
+          if-no-files-found: error
+          retention-days: 30
 
   # Build RustFS binaries
   prepare-platform-matrix:
@@ -193,7 +223,7 @@ jobs:
             {"target_id":"linux-aarch64-musl","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-musl","cross":false,"platform":"linux","rustflags":"","features":"","glibc":""},
             {"target_id":"linux-x86_64-gnu","os":"sm-standard-4","target":"x86_64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
             {"target_id":"linux-aarch64-gnu","os":"ubicloud-standard-16-arm","target":"aarch64-unknown-linux-gnu","cross":true,"platform":"linux","rustflags":"","features":"pyroscope","glibc":"2.31"},
-            {"target_id":"macos-aarch64","os":"macos-latest","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
+            {"target_id":"macos-aarch64","os":"macos-latest-xlarge","target":"aarch64-apple-darwin","cross":false,"platform":"macos","rustflags":"","features":"pyroscope","glibc":""},
             {"target_id":"windows-x86_64","os":"windows-latest","target":"x86_64-pc-windows-msvc","cross":false,"platform":"windows","rustflags":"","features":"","glibc":""}
           ]}'
 
@@ -224,7 +254,7 @@ jobs:
   build-rustfs:
     # Acceptance workflows select artifacts by this stable platform name.
     name: Build RustFS (${{ matrix.target_id }})
-    needs: [ build-check, prepare-platform-matrix ]
+    needs: [ build-check, prepare-platform-matrix, import-completed ]
     if: needs.build-check.outputs.should_build == 'true' && needs.prepare-platform-matrix.result == 'success'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 180
@@ -243,6 +273,7 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: 34e6449ed90e3d3a106f6655342e0b3127f33082
           fetch-depth: 0
 
       - name: Setup Rust environment
@@ -302,7 +333,7 @@ jobs:
           download_console_assets() {
             local curl_bin="curl"
             local python_bin="python3"
-            local console_api="https://api.github.com/repos/rustfs/console/releases/latest"
+            local console_api="https://api.github.com/repos/rustfs/console/releases/tags/v0.1.41"
             local console_json="console-release.json"
             local console_url
             local console_sha256
@@ -363,6 +394,7 @@ jobs:
             echo "Console release: ${console_tag}"
             echo "Downloading console asset: ${console_url}"
             "$curl_bin" --fail -L "$console_url" -o console.zip --retry 3 --retry-delay 5 --max-time 300 || return 1
+            [[ "$console_tag" == "v0.1.41" && "$console_sha256" == "5c9c5e800ce2c65f7e6952c57c7c02c2cdc14e2c5d40296c0a57ae80bc041d8d" ]] || return 2
             verify_sha256 "$console_sha256" console.zip || return 2
             unzip -o console.zip -d ./rustfs/static || return 2
           }
@@ -393,6 +425,8 @@ jobs:
           BUILD_TARGET: ${{ matrix.target }}
           BUILD_OS: ${{ matrix.platform }}-${{ startsWith(matrix.target, 'aarch64-') && 'aarch64' || 'x86_64' }}
         run: |
+          [[ "$(rustc --version)" == "rustc 1.99.1 (58cf8f9c3 2026-10-13)" ]] || exit 1
+          sysctl hw.memsize hw.ncpu
           # Force rebuild by touching build.rs
           touch rustfs/build.rs
 
@@ -418,7 +452,7 @@ jobs:
           if [[ "${{ matrix.cross }}" == "true" ]]; then
             cargo zigbuild --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
           else
-            cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
+            /usr/bin/time -l cargo build --release --locked --target "$TARGET_ARG" "${FEATURE_ARGS[@]}" "${PROFILE_ARGS[@]}" -p rustfs --bin rustfs
           fi
 
           # All release targets use same-architecture runners, including GNU
@@ -750,12 +784,94 @@ jobs:
           cat "$log_file"
           exit 1
 
+
+      - name: Checkout the reviewed native verifier helpers
+        uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
+        with:
+          ref: 29126d280528ea785a58a1a3fd55cffbda3bb1fe
+          path: verifier
+          sparse-checkout: scripts/release
+          persist-credentials: false
+      - name: Verify the recovered macOS artifact
+        run: |
+          python3 - <<'PYNATIVE'
+          import sys, os, subprocess, tempfile, time, urllib.request, zipfile
+          from pathlib import Path
+          sys.path.insert(0, 'verifier/scripts/release')
+          import candidate as c, verify as v
+          package = Path('rustfs-macos-aarch64-v1.0.5.zip')
+          binary = Path('target/aarch64-apple-darwin/release/rustfs').resolve()
+          version = subprocess.check_output([str(binary), '--version'], text=True, timeout=30)
+          assert version.splitlines()[0] == 'rustfs 1.0.5'
+          assert 'git commit   : 34e6449ed90e3d3a106f6655342e0b3127f33082' in version and 'git tag      : 1.0.5' in version
+          assert '1.99.1' in version and 'build target : aarch64-apple-darwin' in version
+          before = c.file_digest(binary)
+          with zipfile.ZipFile(package) as archive:
+              assert archive.namelist() == ['rustfs']
+              with archive.open('rustfs') as stream:
+                  assert c.stream_digest(stream) == before
+          with tempfile.TemporaryDirectory() as temp:
+              api, console = v.port(), v.port()
+              while api == console:
+                  console = v.port()
+              access, secret = 'recovery-' + os.urandom(8).hex(), os.urandom(24).hex()
+              opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+              data = Path(temp) / 'data'
+              data.mkdir()
+              with (Path(temp) / 'server.log').open('w') as log:
+                  process = subprocess.Popen([str(binary), 'server', '--address', f'127.0.0.1:{api}', '--console-enable',
+                      '--console-address', f'127.0.0.1:{console}', '--access-key', access, '--secret-key', secret, str(data)],
+                      stdout=log, stderr=subprocess.STDOUT, env=dict(os.environ, NO_PROXY='*', no_proxy='*'))
+                  try:
+                      deadline = time.monotonic() + 60
+                      while time.monotonic() < deadline:
+                          assert process.poll() is None
+                          try:
+                              with opener.open(f'http://127.0.0.1:{api}/health/ready', timeout=2) as response:
+                                  assert response.status == 200
+                              with opener.open(f'http://127.0.0.1:{console}/rustfs/console/', timeout=2) as response:
+                                  assert response.status == 200 and 'text/html' in response.headers.get('Content-Type', '')
+                              break
+                          except OSError:
+                              time.sleep(0.5)
+                      else:
+                          raise RuntimeError('recovered binary did not become ready')
+                      endpoint = f'http://127.0.0.1:{api}'
+                      bucket = '/release-recovery-' + os.urandom(8).hex()
+                      content = os.urandom(4096)
+                      v.s3_request(opener, endpoint, 'PUT', bucket, access, secret)
+                      v.s3_request(opener, endpoint, 'PUT', bucket + '/roundtrip', access, secret, content)
+                      assert v.s3_request(opener, endpoint, 'GET', bucket + '/roundtrip', access, secret) == content
+                      v.s3_request(opener, endpoint, 'DELETE', bucket + '/roundtrip', access, secret)
+                      v.s3_request(opener, endpoint, 'DELETE', bucket, access, secret)
+                      assert process.poll() is None and c.file_digest(binary) == before
+                  finally:
+                      process.terminate()
+                      try:
+                          process.wait(timeout=15)
+                      except subprocess.TimeoutExpired:
+                          process.kill()
+                          process.wait(timeout=15)
+          files = {p.name: c.file_digest(p) for p in Path('.').glob('rustfs-*.zip')}
+          assert len(files) == 2 and len(set(files.values())) == 1
+          c.write_json('recovery-macos.json', {'source_sha': '34e6449ed90e3d3a106f6655342e0b3127f33082', 'workflow_sha': os.environ['GITHUB_SHA'],
+              'run_id': os.environ['GITHUB_RUN_ID'], 'version_output': version, 'passed': True,
+              'binary_sha256': before, 'console_sha256': '5c9c5e800ce2c65f7e6952c57c7c02c2cdc14e2c5d40296c0a57ae80bc041d8d', 'files': files,
+              'checks': ['native identity', 'Console HTTP 200', 'readiness', 'signed S3 CRUD and byte equality']})
+          PYNATIVE
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: recovery-macos
+          path: recovery-macos.json
+          if-no-files-found: error
+          retention-days: 30
+
       - name: Upload to GitHub artifacts
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: ${{ steps.package.outputs.package_name }}
           path: "rustfs-*.zip"
-          retention-days: ${{ startsWith(github.ref, 'refs/tags/') && 30 || 7 }}
+          retention-days: ${{ github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && 30 || 7 }}
 
       - name: Upload to Cloudflare R2
         if: needs.build-check.outputs.should_publish == 'true' && env.R2_ACCESS_KEY_ID != '' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease' || needs.build-check.outputs.build_type == 'development')
@@ -838,7 +954,7 @@ jobs:
   # Build summary
   build-summary:
     name: Build Summary
-    needs: [ build-check, build-rustfs ]
+    needs: [ build-check, build-rustfs, import-completed ]
     if: always() && needs.build-check.outputs.should_build == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 10
@@ -872,8 +988,8 @@ jobs:
   # Create GitHub Release for every valid release tag, including previews
   create-release:
     name: Create GitHub Release
-    needs: [ build-check, build-rustfs ]
-    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    needs: [ build-check, build-rustfs, import-completed ]
+    if: needs.build-check.outputs.should_publish == 'true' && github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -886,6 +1002,7 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: 34e6449ed90e3d3a106f6655342e0b3127f33082
           fetch-depth: 0
 
       - name: Create GitHub Release
@@ -934,7 +1051,7 @@ jobs:
   upload-release-assets:
     name: Upload Release Assets
     needs: [ build-check, build-rustfs, create-release ]
-    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -945,6 +1062,8 @@ jobs:
         uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: 34e6449ed90e3d3a106f6655342e0b3127f33082
+          fetch-depth: 0
 
       - name: Download all build artifacts
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
@@ -952,6 +1071,38 @@ jobs:
           path: ./artifacts
           pattern: rustfs-*
           merge-multiple: true
+
+
+      - name: Download recovery evidence
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          path: ./recovery-evidence
+          pattern: recovery-*
+          merge-multiple: true
+      - name: Verify all six original-source platform archives
+        env:
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PYJOIN'
+          import hashlib, json, os
+          from pathlib import Path
+          evidence = [json.loads(p.read_text()) for p in Path('recovery-evidence').glob('*.json')]
+          assert len(evidence) == 6 and all(e['source_sha'] == '34e6449ed90e3d3a106f6655342e0b3127f33082' for e in evidence)
+          mac = [e for e in evidence if 'passed' in e]
+          assert len(mac) == 1 and mac[0]['passed'] is True and mac[0]['workflow_sha'] == os.environ['WORKFLOW_SHA']
+          assert all(e.get('source_run') == 42827678767 for e in evidence if 'passed' not in e)
+          expected = {name: digest for e in evidence for name, digest in e['files'].items()}
+          assert len(expected) == 12
+          targets = ['linux-aarch64-gnu', 'linux-aarch64-musl', 'linux-x86_64-gnu', 'linux-x86_64-musl', 'macos-aarch64', 'windows-x86_64']
+          names = {f'rustfs-{target}-{suffix}.zip' for target in targets for suffix in ('v1.0.5', 'latest')}
+          assert set(expected) == names == {p.name for p in Path('artifacts').glob('*.zip')}
+          for name, digest in expected.items():
+              with (Path('artifacts') / name).open('rb') as stream:
+                  assert hashlib.file_digest(stream, 'sha256').hexdigest() == digest
+          Path('release-assets').mkdir(exist_ok=True)
+          Path('release-assets/release-recovery.json').write_text(json.dumps({'source_sha': '34e6449ed90e3d3a106f6655342e0b3127f33082',
+              'workflow_sha': os.environ['WORKFLOW_SHA'], 'original_run': 42827678767, 'platforms': evidence}, indent=2) + '\n')
+          PYJOIN
 
       - name: Prepare release assets
         id: prepare
@@ -991,8 +1142,8 @@ jobs:
             --tag "$TAG" \
             --build-type "${{ needs.build-check.outputs.build_type }}" \
             --repository "${{ github.repository }}" \
-            --ref "${{ github.ref }}" \
-            --sha "${{ github.sha }}" \
+            --ref "refs/tags/1.0.5" \
+            --sha "34e6449ed90e3d3a106f6655342e0b3127f33082" \
             --run-id "${{ github.run_id }}" \
             --run-attempt "${{ github.run_attempt }}"
           cd ./release-assets
@@ -1028,7 +1179,7 @@ jobs:
   update-latest-version:
     name: Update Latest Version
     needs: [ build-check, publish-release ]
-    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -1088,7 +1239,7 @@ jobs:
   publish-release:
     name: Publish Release
     needs: [ build-check, create-release, upload-release-assets ]
-    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && (needs.build-check.outputs.build_type == 'preview' || needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -1126,7 +1277,7 @@ jobs:
   cleanup-preview-releases:
     name: Cleanup Preview Releases
     needs: [ build-check, publish-release ]
-    if: needs.build-check.outputs.should_publish == 'true' && startsWith(github.ref, 'refs/tags/') && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
+    if: needs.build-check.outputs.should_publish == 'true' && github.ref == 'refs/heads/overtrue/release-1.0.5-macos-recovery' && (needs.build-check.outputs.build_type == 'release' || needs.build-check.outputs.build_type == 'prerelease')
     runs-on: ubuntu-latest # gh CLI required; the sm-standard-2 fleet does not ship it
     timeout-minutes: 30
     permissions:
@@ -1184,6 +1335,8 @@ jobs:
       - uses: actions/checkout@f548e57e544e1ff5a4c46bf1e1b8685f8e4a348a # v7
         with:
           persist-credentials: false
+          ref: 34e6449ed90e3d3a106f6655342e0b3127f33082
+          fetch-depth: 0
       - name: Open or update failure-tracking issue
         uses: ./.github/actions/schedule-failure-issue
         with:
