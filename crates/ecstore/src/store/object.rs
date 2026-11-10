@@ -3564,12 +3564,10 @@ impl ECStore {
     }
 
     /// Acquire the per-object write locks a bulk delete needs before any
-    /// mutation, one batched lock round for the whole key set. Bulk delete is
-    /// the only multi-key write-lock holder, and the batched round is
-    /// deadlock-free by construction (one `lock_batch` RPC per lock client,
-    /// global key order at each server), so no optimistic wave or serial
-    /// fallback is needed. Outcomes are per key: a locked-out key fails alone
-    /// and the rest of the batch proceeds.
+    /// mutation. Each peer receives one batch of unresolved keys per round;
+    /// retries share the original deadline and require confirmed cleanup of
+    /// partial grants. Outcomes remain independent per key so other keys can
+    /// proceed when a contended key exhausts its budget.
     async fn acquire_delete_objects_write_locks(
         &self,
         bucket: &str,
@@ -14432,8 +14430,7 @@ mod batch_delete_lock_tests {
         let second = run(second);
 
         // Whatever mix of per-key lock outcomes the overlap produces, both
-        // batches must finish: the batched round is deadlock-free by
-        // construction (global key order at each lock server).
+        // batches must finish within their acquisition and mutation budgets.
         for batch in [first, second] {
             let (_, errors, _) = tokio::time::timeout(Duration::from_secs(30), batch)
                 .await

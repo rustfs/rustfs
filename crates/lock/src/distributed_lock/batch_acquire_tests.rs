@@ -248,16 +248,25 @@ async fn cancelled_batch_round_drains_ready_unjoined_replies_with_original_ids()
             pending: JoinSet::new(),
             grants: vec![Vec::new()],
             clients,
-            requests,
             span: tracing::Span::current(),
         };
         let mut tasks = Vec::new();
         for (peer_index, client) in round.clients.iter().enumerate() {
             let client = client.clone();
-            let requests = round.requests.clone();
+            let requests = requests.clone();
             tasks.push(round.pending.spawn(async move {
-                let response = client.acquire_locks_batch(&requests).await;
-                (peer_index, response, Duration::ZERO)
+                let started = tokio::time::Instant::now();
+                let outcomes = client
+                    .acquire_locks_batch_until(&requests, started + Duration::from_secs(5))
+                    .await;
+                super::LockBatchAcquireTaskResult {
+                    peer_index,
+                    key_indices: vec![0],
+                    requests,
+                    outcomes,
+                    started,
+                    elapsed: Duration::ZERO,
+                }
             }));
         }
         first.wait_for_grants(1).await;

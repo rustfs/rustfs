@@ -10096,11 +10096,9 @@ impl crate::storage_api_contracts::object::ObjectOperations for SetDisks {
             // Every raw batch lock is acquired first. Canonical sorting also
             // gives aliases of one disk key exactly one transaction owner.
             let keys: std::collections::BTreeSet<_> = locked_objects.iter().cloned().collect();
-            // Bulk delete is the only multi-key transaction-lock holder; one
-            // batched lock round replaces one quorum round-trip per key and is
-            // deadlock-free by construction (a single `lock_batch` RPC per lock
-            // client, global (shard, key) order at each server). Per-key
-            // failures keep the set layer's per-key error reporting.
+            // Batch unresolved keys per peer under one total acquisition budget.
+            // Confirmed cleanup precedes retries; each key keeps its own quorum
+            // and failure result at the set layer.
             let key_names: Vec<&str> = keys.iter().map(|key| key.as_str()).collect();
             let mut transaction_summary = DeleteObjectsStageSummary::new(
                 "transaction_acquire",
