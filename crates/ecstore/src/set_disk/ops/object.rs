@@ -43,21 +43,22 @@ use super::super::{
     ReplicationObjectBridge, Result, SET_DISK_COMMIT_TAIL_WARN_THRESHOLD_MS, SLASH_SEPARATOR, SUFFIX_ACTUAL_SIZE,
     SUFFIX_COMPRESSION, SUFFIX_COMPRESSION_SIZE, SUFFIX_RESTORE_OPERATION_ID, SUFFIX_RESTORE_WORKER_LOCK, SetDisks,
     SmallWritePath, StorageError, TRANSITION_COMPLETE, UpdateMetadataOpts, Uuid, WriteLayout, adaptive_duplex_buffer_size,
-    build_get_object_info, build_inline_bitrot_readers, build_inline_bitrot_readers_from_refs, can_try_inline_data_shards_direct,
-    check_object_lock_delete, check_object_lock_for_deletion_with_state, check_object_lock_retention_update,
-    classify_get_codec_streaming_object_class, classify_put_write_path, classify_storage_error,
-    collect_inline_data_shard_fileinfos_by_index, contains_key_str, create_bitrot_writer_with_orig_volume, debug,
-    delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error, explicit_delete_removed_marker,
-    finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan, get_object_body_cache_hook, get_raw_etag,
-    get_small_object_direct_memory_decision_with_threshold_and_plan, get_small_object_direct_memory_threshold,
-    get_stage_timer_if_enabled, get_str, get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size,
-    inline_erasure_shard_file_offset, inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled,
-    is_err_object_not_found, is_err_version_not_found, is_explicit_null_version, is_get_codec_streaming_base_enabled,
-    is_get_small_object_direct_memory_enabled, is_lock_optimization_enabled, issue3031_diag_enabled, join_all,
-    known_put_object_storage_size, path_join_buf, put_restore_opts, record_compression_total_memory,
-    record_get_codec_streaming_gate_decision, record_get_direct_memory_decision, record_get_object_pipeline_failure,
-    record_get_object_pipeline_failure_for_path, record_get_object_reader_path_observation, record_get_stage_duration_if_enabled,
-    record_lock_acquire, reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
+    build_get_object_info, build_inline_bitrot_readers_from_refs_with_frame_size, build_inline_bitrot_readers_with_frame_size,
+    can_try_inline_data_shards_direct, check_object_lock_delete, check_object_lock_for_deletion_with_state,
+    check_object_lock_retention_update, classify_get_codec_streaming_object_class, classify_put_write_path,
+    classify_storage_error, collect_inline_data_shard_fileinfos_by_index, contains_key_str,
+    create_bitrot_writer_with_orig_volume, debug, delete_file_info_version_id, disk, ensure_delete_commit_locks_held, error,
+    explicit_delete_removed_marker, finish_set_disk_read_lock, get_codec_streaming_reader_gate_with_plan,
+    get_object_body_cache_hook, get_raw_etag, get_small_object_direct_memory_decision_with_threshold_and_plan,
+    get_small_object_direct_memory_threshold, get_stage_timer_if_enabled, get_str,
+    get_transitioned_object_reader_with_tier_manager, inline_admission_shard_size, inline_erasure_shard_file_offset,
+    inline_erasure_shard_size, insert_str, is_deadlock_detection_enabled, is_err_object_not_found, is_err_version_not_found,
+    is_explicit_null_version, is_get_codec_streaming_base_enabled, is_get_small_object_direct_memory_enabled,
+    is_lock_optimization_enabled, issue3031_diag_enabled, join_all, known_put_object_storage_size, path_join_buf,
+    put_restore_opts, record_compression_total_memory, record_get_codec_streaming_gate_decision,
+    record_get_direct_memory_decision, record_get_object_pipeline_failure, record_get_object_pipeline_failure_for_path,
+    record_get_object_reader_path_observation, record_get_stage_duration_if_enabled, record_lock_acquire,
+    reduce_write_quorum_errs, release_materialized_read_lock, replication_write_may_pass_worm_gate,
     republishes_data_movement_delete_marker, require_restore_operation_id, resolve_delete_version_state,
     resolve_tiered_decommission_write_quorum_result, resolve_write_layout, restore_commit_operation_id_from_metadata,
     restore_operation_id_from_metadata, send_event, set_disk_delete_creates_delete_marker,
@@ -3082,6 +3083,10 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     fi.uses_legacy_checksum,
                 );
                 let shard_size = inline_erasure_shard_size(fi.erasure.block_size, data_shards, fi.uses_legacy_checksum);
+                let frame_size =
+                    crate::object_api::persisted_ec_read_quantum(&fi.metadata, fi.erasure.block_size, data_shards, shard_size)
+                        .map_err(|error| to_object_err(Error::other(error.to_string()), vec![bucket, object]))?
+                        .unwrap_or(shard_size);
                 if let Some(inline_prepare_stage_start) = inline_prepare_stage_start.take() {
                     rustfs_io_metrics::record_get_object_stage_duration_by_size(
                         GET_OBJECT_PATH_INLINE_DIRECT,
@@ -3092,12 +3097,13 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
                 let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let mut readers = build_inline_bitrot_readers_from_refs(
+                let mut readers = build_inline_bitrot_readers_from_refs_with_frame_size(
                     &data_files,
                     bucket,
                     object,
                     read_length,
                     shard_size,
+                    frame_size,
                     &checksum_algo,
                     opts.skip_verify_bitrot,
                 )
@@ -3140,6 +3146,8 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
             }
 
             let erasure = self.erasure_cache.get_for_file_info(fi)?;
+            let frame_size = crate::set_disk::read::read_frame_size_for_file_info(fi, &erasure)
+                .map_err(|error| to_object_err(error, vec![bucket, object]))?;
             let read_length = erasure.shard_file_offset(0, object_size, object_size);
             let total_shards = data_shards + fi.erasure.parity_blocks;
             let (_disks, files) = Self::shuffle_disks_and_parts_metadata_by_index(disks, files, fi);
@@ -3162,13 +3170,14 @@ impl crate::storage_api_contracts::object::ObjectIO for SetDisks {
                     );
                 }
                 let reader_setup_stage_start = rustfs_io_metrics::get_stage_metrics_enabled().then(Instant::now);
-                let readers = build_inline_bitrot_readers(
+                let readers = build_inline_bitrot_readers_with_frame_size(
                     &files,
                     total_shards,
                     bucket,
                     object,
                     read_length,
                     erasure.shard_size(),
+                    frame_size,
                     &checksum_algo,
                     opts.skip_verify_bitrot,
                 )

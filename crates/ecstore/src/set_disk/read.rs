@@ -17,11 +17,11 @@ use super::{
     GetObjectFileInfo, GetObjectMetadataCacheCapability, GetObjectMetadataCacheEntry, GetObjectMetadataCacheGeneration,
     GetObjectMetadataCacheKey, GetObjectMetadataCacheLookupKey, GetObjectReadPolicy, HashAlgorithm, LOG_COMPONENT_ECSTORE,
     LOG_SUBSYSTEM_SET_DISK, OBJECT_OP_IGNORED_ERRS, ObjectInfo, ObjectOptions, RUSTFS_META_BUCKET, ReadOptions, Result, SetDisks,
-    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine, build_inline_bitrot_readers_from_refs,
-    collect_inline_data_shard_fileinfos_by_index, debug, error, get_codec_streaming_metrics_path,
-    get_codec_streaming_multipart_max_parts, get_object_read_policy, is_codec_streaming_multipart_enabled,
-    is_multipart_reader_setup_prefetch_enabled, object_fits_single_block, reduce_read_quorum_errs, to_object_err,
-    try_read_inline_data_shards_direct, warn,
+    StorageError, adaptive_duplex_buffer_size, build_get_codec_streaming_decode_engine,
+    build_inline_bitrot_readers_from_refs_with_frame_size, collect_inline_data_shard_fileinfos_by_index, debug, error,
+    get_codec_streaming_metrics_path, get_codec_streaming_multipart_max_parts, get_object_read_policy,
+    is_codec_streaming_multipart_enabled, is_multipart_reader_setup_prefetch_enabled, object_fits_single_block,
+    reduce_read_quorum_errs, to_object_err, try_read_inline_data_shards_direct, warn,
 };
 use crate::diagnostics::get::{
     GET_DIRECT_MEMORY_SUBPATH_DISK_DATA_BLOCKS, GET_DIRECT_MEMORY_SUBPATH_INLINE_BUFFERED, GET_METADATA_CACHE_DECISION_HIT,
@@ -119,7 +119,7 @@ use super::core::io_primitives::{
     BitrotReaderSetup, BitrotReaderSetupAttribution, BitrotReaderSetupMode, DeferredReaderReopener, EVENT_SET_DISK_READ,
     GetCodecStreamingReaderBuildOutcome, MetadataCacheLookup, ObjectBitrotReader, ReadRepairAdmissionSubmitter,
     ReadRepairHealSubmission, SLOW_OBJECT_READ_LOG_THRESHOLD, codec_streaming_reader_setup_fallback_reason,
-    create_bitrot_readers_until_quorum_with_preference_and_frame_size, create_data_block_bitrot_readers,
+    create_bitrot_readers_until_quorum_with_preference_and_frame_size, create_data_block_bitrot_readers_with_frame_size,
     resolved_read_repair_version_id, send_read_repair_heal_request, shard_read_costs_for_disks, submit_read_repair_heal,
     submit_read_repair_heal_with_submitter,
 };
@@ -1370,21 +1370,7 @@ impl SetDisks {
         }
 
         let erasure = erasure_cache.get_for_file_info(fi)?;
-
-        // The direct-memory helper consumes one complete shard in a single
-        // frame. Bounded-quantum objects need the regular striped decoder so
-        // it can walk all authenticated frames in order.
-        if crate::object_api::persisted_ec_read_quantum(
-            &fi.metadata,
-            erasure.block_size,
-            erasure.data_shards,
-            erasure.shard_size(),
-        )
-        .map_err(|error| Error::other(error.to_string()))?
-        .is_some()
-        {
-            return Ok(None);
-        }
+        let frame_size = read_frame_size_for_file_info(fi, &erasure)?;
 
         let checksum_info = fi.erasure.get_checksum_info(part.number);
         let checksum_algo = if fi.uses_legacy_checksum && checksum_info.algorithm == HashAlgorithm::HighwayHash256S {
@@ -1406,12 +1392,13 @@ impl SetDisks {
             };
 
             let reader_setup_stage_start = Instant::now();
-            let mut readers = build_inline_bitrot_readers_from_refs(
+            let mut readers = build_inline_bitrot_readers_from_refs_with_frame_size(
                 &data_files,
                 bucket,
                 object,
                 read_length,
                 erasure.shard_size(),
+                frame_size,
                 &checksum_algo,
                 skip_verify_bitrot,
             )
@@ -1464,7 +1451,7 @@ impl SetDisks {
         let use_mmap_read = object_mmap_read_enabled();
 
         let reader_setup_stage_start = Instant::now();
-        let mut reader_setup = create_data_block_bitrot_readers(
+        let mut reader_setup = create_data_block_bitrot_readers_with_frame_size(
             &files,
             &disks,
             bucket,
@@ -1473,6 +1460,7 @@ impl SetDisks {
             0,
             read_length,
             erasure.shard_size(),
+            frame_size,
             checksum_algo,
             skip_verify_bitrot,
             use_mmap_read,
@@ -2191,16 +2179,18 @@ impl SetDisks {
                     return Err(Error::other("EC read quantum shard offset exceeds encoded block"));
                 }
                 let shard_remaining = block_shard_size - within_shard;
-                let read_full_block = within_block == 0 && segment_remaining >= block_data_len;
+                let block_data_remaining = block_data_len - within_block;
+                let block_segment_length = segment_remaining.min(block_data_remaining);
+                let read_full_block = shard_index == 0 && within_shard < frame_size && block_segment_length > shard_remaining;
                 let (segment_length, read_shard_size, read_offset, output_offset) = if read_full_block {
-                    // A complete logical block needs every data shard, but
-                    // each shard only once. Group its data-shard segments
-                    // into one decode so a 64 KiB request does not read the
-                    // same 32 KiB data shard twice.
+                    // A range that begins in the first q-frame of shard 0 and
+                    // crosses into shard 1 already requires all frames of
+                    // shard 0. Group its data-shard segments into one decode so
+                    // we do not reopen the block's shards a second time.
                     let read_offset = block_index
                         .checked_mul(logical_shard_size)
                         .ok_or_else(|| Error::other("EC read quantum offset overflows"))?;
-                    (block_data_len, block_shard_size, read_offset, 0)
+                    (block_segment_length, block_shard_size, read_offset, within_block)
                 } else {
                     let segment_length = segment_remaining.min(block_remaining).min(shard_remaining);
                     if segment_length == 0 {
@@ -2964,7 +2954,7 @@ fn multipart_part_checksum_algo(fi: &FileInfo, part_number: usize) -> HashAlgori
 
 /// Resolve the physical authenticated frame size for a persisted object while
 /// keeping the original EC layout geometry for offsets and reconstruction.
-fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
+pub(in crate::set_disk) fn read_frame_size_for_file_info(fi: &FileInfo, erasure: &coding::Erasure) -> Result<usize> {
     let Some(quantum) =
         crate::object_api::persisted_ec_read_quantum(&fi.metadata, erasure.block_size, erasure.data_shards, erasure.shard_size())
             .map_err(|error| Error::other(error.to_string()))?
@@ -6668,6 +6658,131 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn quantized_range_direct_memory_and_cross_shard_header_offset_coalesce() {
+        const BLOCK_SIZE: usize = 64 * 1024;
+        const FRAME_SIZE: usize = 16 * 1024;
+        let payload: Vec<u8> = (0..BLOCK_SIZE)
+            .map(|index| u8::try_from(index % 251).expect("fixture byte fits u8"))
+            .collect();
+        let erasure = coding::Erasure::new(2, 2, BLOCK_SIZE);
+        let mut encoded = vec![Vec::new(); erasure.total_shard_count()];
+        for (index, shard) in erasure
+            .encode_data(&payload)
+            .expect("fixture block encodes")
+            .into_iter()
+            .enumerate()
+        {
+            let mut writer = BitrotWriter::new(Vec::new(), FRAME_SIZE, HashAlgorithm::HighwayHash256S);
+            for frame in shard.chunks(FRAME_SIZE) {
+                writer.write(frame).await.expect("fixture frame writes");
+            }
+            encoded[index].extend(writer.into_inner());
+        }
+
+        let mut fi = FileInfo::new(CODEC_STREAMING_TEST_OBJECT, 2, 2);
+        fi.volume = CODEC_STREAMING_TEST_BUCKET.to_string();
+        fi.name = CODEC_STREAMING_TEST_OBJECT.to_string();
+        fi.size = i64::try_from(payload.len()).expect("fixture size fits i64");
+        fi.is_latest = true;
+        fi.version_id = Some(Uuid::nil());
+        fi.data_dir = Some(Uuid::nil());
+        fi.mod_time = Some(time::OffsetDateTime::UNIX_EPOCH);
+        fi.metadata.insert("etag".to_string(), "fixture-etag".to_string());
+        fi.erasure.block_size = BLOCK_SIZE;
+        fi.erasure.distribution = (1..=erasure.total_shard_count()).collect();
+        crate::object_api::insert_ec_read_quantum(&mut fi.metadata, FRAME_SIZE);
+        fi.add_object_part(1, "fixture-etag".to_string(), payload.len(), fi.mod_time, fi.size, None, None);
+        fi.set_inline_data();
+
+        let files: Vec<FileInfo> = encoded
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let mut file = fi.clone();
+                file.erasure.index = index + 1;
+                file.data = Some(Bytes::copy_from_slice(bytes));
+                file
+            })
+            .collect();
+        let head_fi = files[0].clone();
+        let (_dirs, disks) = local_test_disks(erasure.total_shard_count(), CODEC_STREAMING_TEST_BUCKET).await;
+
+        let body = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
+            &head_fi,
+            &files,
+            &disks,
+            false,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("bounded-quantum direct-memory read should not error")
+        .expect("healthy bounded-quantum single-block object should use direct-memory fast path");
+        assert_eq!(body.as_ref(), payload.as_slice());
+
+        let mut corrupted_files = files.clone();
+        let mut shard0 = corrupted_files[0].data.take().expect("shard 0 fixture").to_vec();
+        *shard0.last_mut().expect("second frame byte") ^= 0x80;
+        corrupted_files[0].data = Some(Bytes::from(shard0));
+        let corrupted_head = corrupted_files[0].clone();
+        let fallback = SetDisks::try_get_object_direct_data_shards_with_fileinfo(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            Arc::new(ErasureCache::new()),
+            &corrupted_head,
+            &corrupted_files,
+            &disks,
+            false,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("corrupted bounded-quantum direct-memory read should return Ok(None) for parity fallback");
+        assert!(fallback.is_none(), "corrupted second frame must fail closed in direct-memory path");
+
+        // A 32 KiB Range GET starting at offset 4 (skipping a 4-byte framing header)
+        // starts in the first q-frame of shard 0 and crosses into shard 1. It must
+        // coalesce into 1 quantized block decode instead of opening the shards twice.
+        let calls = crate::set_disk::disk_call_counters::observe(CODEC_STREAMING_TEST_OBJECT);
+        let mut range_out = Vec::new();
+        SetDisks::read_quantized_range(
+            CODEC_STREAMING_TEST_BUCKET,
+            CODEC_STREAMING_TEST_OBJECT,
+            &mut range_out,
+            &fi,
+            &files,
+            &disks,
+            &erasure,
+            FRAME_SIZE,
+            32 * 1024,
+            0,
+            0,
+            4,
+            false,
+            true,
+            true,
+            false,
+            0,
+            0,
+            GET_OBJECT_PATH_SET_DISK,
+            "plain",
+            "small",
+        )
+        .await
+        .expect("coalesced cross-shard range read must succeed");
+        assert_eq!(range_out, payload[4..4 + 32 * 1024]);
+        assert_eq!(
+            calls.total(crate::set_disk::disk_call_counters::KIND_INLINE_SHARD_OPEN),
+            2,
+            "cross-shard range starting in frame 0 of shard 0 must open each data shard only once"
+        );
     }
 
     #[test]

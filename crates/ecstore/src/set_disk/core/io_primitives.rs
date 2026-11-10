@@ -1925,6 +1925,7 @@ pub(in crate::set_disk) async fn create_bitrot_readers_until_quorum_with_prefere
     setup
 }
 
+#[allow(dead_code, reason = "compatibility wrapper for the legacy shard geometry")]
 #[allow(clippy::too_many_arguments)]
 pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     files: &[FileInfo],
@@ -1935,6 +1936,40 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
     read_offset: usize,
     read_length: usize,
     shard_size: usize,
+    checksum_algo: HashAlgorithm,
+    skip_verify_bitrot: bool,
+    use_mmap_read: bool,
+    data_shards: usize,
+) -> BitrotReaderSetup {
+    create_data_block_bitrot_readers_with_frame_size(
+        files,
+        disks,
+        bucket,
+        object,
+        part_number,
+        read_offset,
+        read_length,
+        shard_size,
+        shard_size,
+        checksum_algo,
+        skip_verify_bitrot,
+        use_mmap_read,
+        data_shards,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(in crate::set_disk) async fn create_data_block_bitrot_readers_with_frame_size(
+    files: &[FileInfo],
+    disks: &[Option<DiskStore>],
+    bucket: &str,
+    object: &str,
+    part_number: usize,
+    read_offset: usize,
+    read_length: usize,
+    shard_size: usize,
+    frame_size: usize,
     checksum_algo: HashAlgorithm,
     skip_verify_bitrot: bool,
     use_mmap_read: bool,
@@ -1951,7 +1986,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
 
     let schedule_stage_start = get_stage_timer_if_enabled(stage_metrics_enabled);
     for idx in 0..data_shards.min(total_shards) {
-        schedule_bitrot_reader_task(
+        schedule_bitrot_reader_task_with_frame_size(
             &mut reader_tasks,
             &mut setup,
             idx,
@@ -1963,6 +1998,7 @@ pub(in crate::set_disk) async fn create_data_block_bitrot_readers(
             read_offset,
             read_length,
             shard_size,
+            frame_size,
             checksum_algo.clone(),
             skip_verify_bitrot,
             use_mmap_read,

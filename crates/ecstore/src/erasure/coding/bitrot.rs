@@ -443,7 +443,13 @@ where
     /// On return `out.len()` has grown by exactly the returned count.
     pub async fn read_appending(&mut self, out: &mut Vec<u8>, want: usize) -> std::io::Result<usize> {
         let start = out.len();
-        let count = self.read_appending_frame(out, want).await?;
+        let count = match self.read_appending_frame(out, want).await {
+            Ok(count) => count,
+            Err(error) => {
+                out.truncate(start);
+                return Err(error);
+            }
+        };
         if let Some(integrity) = &mut self.integrity
             && let Err(error) = integrity.verify(&out[start..]).await
         {
