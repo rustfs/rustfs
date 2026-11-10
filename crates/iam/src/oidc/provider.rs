@@ -197,6 +197,14 @@ impl DiscoveredProviderMetadata {
         }
     }
 
+    /// UserInfo endpoint advertised by discovery; workload-only discovery documents have none.
+    pub(super) fn userinfo_endpoint(&self) -> Option<String> {
+        match self {
+            Self::Console(metadata) => metadata.userinfo_endpoint().map(|url| url.url().to_string()),
+            Self::Workload(_) => None,
+        }
+    }
+
     pub(super) fn token_endpoint(&self) -> Option<&TokenUrl> {
         match self {
             Self::Console(metadata) => metadata.token_endpoint(),

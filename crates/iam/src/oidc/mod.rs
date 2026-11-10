@@ -18,6 +18,7 @@ mod provider;
 mod runtime;
 mod state;
 mod transport;
+mod userinfo;
 
 #[cfg(any(test, feature = "test-util"))]
 mod test_support;

@@ -19,6 +19,7 @@ use super::{
     provider::{ProviderRuntime, discover_provider_for_recovery, verify_id_token_claims},
     state::{OidcAuthSession, OidcLogoutSession, OidcStateStore},
     transport::{OidcExtraRootCaProvider, ReqwestHttpClient, inspect_token_response_body, oidc_http_error_diagnostics},
+    userinfo::{fetch_userinfo_claims, merge_userinfo_claims},
 };
 #[cfg(test)]
 use crate::federation::FederatedAuthorizationRuleRef;
@@ -34,7 +35,7 @@ use crate::{
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
 use openidconnect::{
     Audience, AuthType, AuthorizationCode, ClaimsVerificationError, ClientId, ClientSecret, CsrfToken, LogoutRequest, Nonce,
-    PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
+    OAuth2TokenResponse, PkceCodeChallenge, PkceCodeVerifier, PostLogoutRedirectUrl, RedirectUrl, RequestTokenError, Scope,
 };
 use rustfs_policy::policy::{ClaimLookup, get_claim_case_insensitive};
 use rustfs_utils::logging::LogThrottle;
@@ -618,7 +619,45 @@ impl OidcSys {
         // Extract raw claims from the verified JWT for custom claim support
         // (the crate verifies signature/expiry/nonce; we decode payload for non-standard claims)
         let raw_jwt = id_token.to_string();
-        let raw = decode_jwt_payload(&raw_jwt);
+        let mut raw = decode_jwt_payload(&raw_jwt);
+
+        if config.claim_userinfo {
+            let userinfo_endpoint = provider_state.metadata.userinfo_endpoint().ok_or_else(|| {
+                format!(
+                    "provider metadata has no userinfo_endpoint: stage=userinfo_endpoint_missing, provider_id={}, config_url={}",
+                    session.provider_id, config.config_url
+                )
+            })?;
+            let userinfo = fetch_userinfo_claims(
+                self.provider_runtime.http_client(),
+                &userinfo_endpoint,
+                token_response.access_token().secret(),
+            )
+            .await
+            .and_then(|userinfo| merge_userinfo_claims(&mut raw, userinfo))
+            .map_err(|err| {
+                error!(
+                    event = EVENT_OIDC_DIAGNOSTICS,
+                    component = LOG_COMPONENT_IAM,
+                    subsystem = LOG_SUBSYSTEM_OIDC,
+                    result = "userinfo_claims_failed",
+                    provider_id = %session.provider_id,
+                    userinfo_endpoint = %userinfo_endpoint,
+                    error = %err,
+                    "oidc userinfo claims could not be merged"
+                );
+                format!("{err}, provider_id={}", session.provider_id)
+            })?;
+            debug!(
+                event = EVENT_OIDC_DIAGNOSTICS,
+                component = LOG_COMPONENT_IAM,
+                subsystem = LOG_SUBSYSTEM_OIDC,
+                result = "userinfo_claims_merged",
+                provider_id = %session.provider_id,
+                added_claim_count = userinfo,
+                "oidc userinfo claims merged into id token claims"
+            );
+        }
 
         let claims = OidcClaims {
             sub: extract_string_claim(&raw, "sub"),

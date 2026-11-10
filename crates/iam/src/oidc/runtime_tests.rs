@@ -409,6 +409,233 @@ async fn assert_complete_console_login(initially_unavailable: bool) {
         }
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum UserInfoCase {
+    Disabled,
+    Ok,
+    IdTokenPrecedence,
+    SubMismatch,
+    SubNotString,
+    ServerError,
+    Jwt,
+    MissingEndpoint,
+    ForbiddenOrigin,
+}
+
+impl UserInfoCase {
+    fn expects_userinfo_request(self) -> bool {
+        !matches!(self, Self::Disabled | Self::MissingEndpoint | Self::ForbiddenOrigin)
+    }
+}
+
+#[tokio::test]
+async fn console_login_userinfo_behaviors() {
+    for case in [
+        UserInfoCase::Disabled,
+        UserInfoCase::Ok,
+        UserInfoCase::IdTokenPrecedence,
+        UserInfoCase::SubMismatch,
+        UserInfoCase::SubNotString,
+        UserInfoCase::ServerError,
+        UserInfoCase::Jwt,
+        UserInfoCase::MissingEndpoint,
+        UserInfoCase::ForbiddenOrigin,
+    ] {
+        run_console_login_userinfo_case(case).await;
+    }
+}
+
+async fn run_console_login_userinfo_case(case: UserInfoCase) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let mut config = build_mocked_oidc_provider_config("console", &format!("{base}/.well-known/openid-configuration"));
+    config.claim_name = "groups".into();
+    config.claim_prefix = String::new();
+    config.claim_userinfo = case != UserInfoCase::Disabled;
+    config.groups_claim = if case == UserInfoCase::Disabled {
+        "groups".into()
+    } else {
+        "eduperson_entitlement".into()
+    };
+    let server_config = config.clone();
+    let server_base = base.clone();
+    let redirect = "https://console.example.com/oauth_callback";
+    let (key, jwk) = oidc_es256_key_and_jwk("console");
+    let (auth_tx, auth_rx) = tokio::sync::oneshot::channel::<HashMap<String, String>>();
+    let server = tokio::spawn(async move {
+        let mut auth_rx = Some(auth_rx);
+        let mut expected_paths = vec!["/.well-known/openid-configuration", "/jwks", "/token"];
+        if case.expects_userinfo_request() {
+            expected_paths.push("/userinfo");
+        }
+        for expected_path in expected_paths {
+            let (mut stream, _) = tokio::time::timeout(StdDuration::from_secs(10), listener.accept())
+                .await
+                .unwrap_or_else(|_| panic!("{case:?}: timed out waiting for {expected_path}"))
+                .unwrap();
+            let mut bytes = Vec::new();
+            let header_end = loop {
+                bytes.push(stream.read_u8().await.unwrap());
+                assert!(bytes.len() < 8192);
+                if bytes.ends_with(b"\r\n\r\n") {
+                    break bytes.len();
+                }
+            };
+            let headers = String::from_utf8(bytes).unwrap();
+            let request_line = headers.lines().next().unwrap();
+            assert_eq!(request_line.split_whitespace().nth(1), Some(expected_path), "{case:?}");
+            let headers_map: HashMap<_, _> = headers
+                .lines()
+                .skip(1)
+                .filter_map(|line| line.split_once(':'))
+                .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+                .collect();
+            let (status_line, content_type, body) = match expected_path {
+                "/.well-known/openid-configuration" => {
+                    let mut document = serde_json::json!({
+                        "issuer": server_base, "authorization_endpoint": format!("{server_base}/authorize"),
+                        "token_endpoint": format!("{server_base}/token"), "jwks_uri": format!("{server_base}/jwks"),
+                        "response_types_supported": ["code"], "subject_types_supported": ["public"],
+                        "id_token_signing_alg_values_supported": ["ES256"]
+                    });
+                    match case {
+                        UserInfoCase::MissingEndpoint => {}
+                        UserInfoCase::ForbiddenOrigin => {
+                            document["userinfo_endpoint"] = serde_json::json!("http://192.168.65.254:8080/userinfo");
+                        }
+                        _ => document["userinfo_endpoint"] = serde_json::json!(format!("{server_base}/userinfo")),
+                    }
+                    ("HTTP/1.1 200 OK", "application/json", document.to_string())
+                }
+                "/jwks" => ("HTTP/1.1 200 OK", "application/json", serde_json::json!({ "keys": [jwk] }).to_string()),
+                "/token" => {
+                    assert!(request_line.starts_with("POST "));
+                    let length: usize = headers_map["content-length"].parse().unwrap();
+                    assert!(header_end + length < 16384);
+                    let mut body = vec![0; length];
+                    stream.read_exact(&mut body).await.unwrap();
+                    let form: HashMap<String, String> = url::form_urlencoded::parse(&body).into_owned().collect();
+                    assert_eq!(form["code"], "test-authorization-code");
+                    assert_eq!(form["client_id"], server_config.client_id);
+                    let auth = auth_rx.take().unwrap().await.unwrap();
+                    let now = time::OffsetDateTime::now_utc().unix_timestamp();
+                    let mut header = Header::new(Algorithm::ES256);
+                    header.kid = Some("console".into());
+                    let mut id_claims = serde_json::json!({
+                        "iss": server_base, "sub": "existing-user", "aud": server_config.client_id,
+                        "iat": now, "exp": now + 300, "nonce": auth["nonce"],
+                        "email": "user@example.com", "groups": ["readwrite"]
+                    });
+                    if case == UserInfoCase::IdTokenPrecedence {
+                        id_claims["eduperson_entitlement"] = serde_json::json!(["from-id-token"]);
+                    }
+                    let token = jsonwebtoken::encode(&header, &id_claims, &key).unwrap();
+                    (
+                        "HTTP/1.1 200 OK",
+                        "application/json",
+                        serde_json::json!({"access_token": "test-access-token", "token_type": "Bearer", "id_token": token})
+                            .to_string(),
+                    )
+                }
+                "/userinfo" => {
+                    assert!(request_line.starts_with("GET "), "{case:?}: {request_line}");
+                    assert_eq!(headers_map["authorization"], "Bearer test-access-token", "{case:?}");
+                    assert!(headers_map["accept"].contains("application/json"), "{case:?}");
+                    let entitlements = serde_json::json!(["urn:a", "urn:b"]);
+                    match case {
+                        UserInfoCase::SubMismatch => (
+                            "HTTP/1.1 200 OK",
+                            "application/json",
+                            serde_json::json!({"sub": "someone-else", "eduperson_entitlement": entitlements}).to_string(),
+                        ),
+                        UserInfoCase::SubNotString => (
+                            "HTTP/1.1 200 OK",
+                            "application/json",
+                            serde_json::json!({"sub": 42, "eduperson_entitlement": entitlements}).to_string(),
+                        ),
+                        UserInfoCase::ServerError => (
+                            "HTTP/1.1 500 Internal Server Error",
+                            "application/json",
+                            serde_json::json!({"error": "server_error"}).to_string(),
+                        ),
+                        UserInfoCase::Jwt => ("HTTP/1.1 200 OK", "application/jwt", "eyJhbGciOiJub25lIn0.e30.".to_string()),
+                        _ => (
+                            "HTTP/1.1 200 OK",
+                            "application/json;charset=UTF-8",
+                            serde_json::json!({"sub": "existing-user", "eduperson_entitlement": entitlements}).to_string(),
+                        ),
+                    }
+                }
+                _ => unreachable!(),
+            };
+            stream
+                .write_all(
+                    format!(
+                        "{status_line}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+        }
+        // No further request may reach the provider: the Disabled, MissingEndpoint and
+        // ForbiddenOrigin cases must never call UserInfo on this server.
+        assert!(
+            tokio::time::timeout(StdDuration::from_millis(300), listener.accept())
+                .await
+                .is_err(),
+            "{case:?}: unexpected extra request"
+        );
+    });
+
+    let http_client = ReqwestHttpClient::with_policy(OutboundPolicy::from_allowed_origins(&base).unwrap());
+    let sys = OidcSys::new_with_config_snapshot(http_client, OidcConfigSnapshot::new(vec![test_sourced_config(config)]))
+        .await
+        .expect("OIDC initialization");
+    let auth_url = sys.authorize_url("console", redirect, None).await.unwrap();
+    let auth: HashMap<String, String> = Url::parse(&auth_url).unwrap().query_pairs().into_owned().collect();
+    let state = auth["state"].clone();
+    auth_tx.send(auth).unwrap();
+
+    let result = sys.exchange_code(&state, "test-authorization-code", redirect).await;
+    match case {
+        UserInfoCase::Disabled => {
+            let (claims, ..) = result.unwrap_or_else(|err| panic!("{case:?}: {err}"));
+            assert_eq!(claims.groups, ["readwrite"]);
+            assert!(!claims.raw.contains_key("eduperson_entitlement"));
+        }
+        UserInfoCase::Ok => {
+            let (claims, ..) = result.unwrap_or_else(|err| panic!("{case:?}: {err}"));
+            assert_eq!(claims.groups, ["urn:a", "urn:b"]);
+            assert_eq!(claims.sub, "existing-user");
+            assert_eq!(claims.email, "user@example.com");
+        }
+        UserInfoCase::IdTokenPrecedence => {
+            let (claims, ..) = result.unwrap_or_else(|err| panic!("{case:?}: {err}"));
+            assert_eq!(claims.groups, ["from-id-token"]);
+        }
+        UserInfoCase::SubMismatch => assert_stage(case, result, "stage=userinfo_sub_mismatch"),
+        UserInfoCase::SubNotString => assert_stage(case, result, "stage=userinfo_sub_invalid"),
+        UserInfoCase::ServerError => assert_stage(case, result, "stage=userinfo_status"),
+        UserInfoCase::Jwt => assert_stage(case, result, "stage=userinfo_content_type"),
+        UserInfoCase::MissingEndpoint => assert_stage(case, result, "stage=userinfo_endpoint_missing"),
+        UserInfoCase::ForbiddenOrigin => {
+            let err = result.err().unwrap_or_else(|| panic!("{case:?}: login must fail"));
+            assert!(err.contains("request_error_kind=forbidden_outbound"), "{case:?}: {err}");
+            assert!(err.contains("add http://192.168.65.254:8080 to"), "{case:?}: {err}");
+        }
+    }
+    server.await.unwrap();
+}
+
+fn assert_stage(case: UserInfoCase, result: Result<(OidcClaims, String, OidcAuthSession, String), String>, stage: &str) {
+    let err = result.err().unwrap_or_else(|| panic!("{case:?}: login must fail"));
+    assert!(err.contains(stage), "{case:?}: expected {stage} in {err}");
+}
+
 #[test]
 fn test_decode_jwt_payload_invalid() {
     assert!(decode_jwt_payload("not-a-jwt").is_empty());
