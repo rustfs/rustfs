@@ -429,7 +429,7 @@ impl IndexOwner {
             os::replace_multipart_source_metadata(&marker, b"1", &self.base, &root)?;
             os::sync_multipart_owned_record_parents(&self.base.join(".rustfs.sys"), &directory, true, &self.base, &root)?;
         }
-        self.ensure_current_root()
+        Ok(())
     }
 
     fn ensure_current_root(&self) -> io::Result<()> {
@@ -547,13 +547,10 @@ impl IndexOwner {
         Ok(())
     }
 
-    pub(super) async fn record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Result<()> {
-        let Some(upload) = path
+    pub(super) async fn prepare_record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Option<PreparedHeadRecord> {
+        let upload = path
             .strip_suffix("/xl.meta")
-            .filter(|upload| canonical_upload(upload).is_some())
-        else {
-            return Ok(());
-        };
+            .filter(|upload| canonical_upload(upload).is_some())?;
         let info = match get_file_info(
             bytes,
             RUSTFS_META_MULTIPART_BUCKET,
@@ -568,10 +565,33 @@ impl IndexOwner {
             Ok(info) => info,
             Err(_) => {
                 self.disabled.store(true, Ordering::Release);
-                return Ok(());
+                return None;
             }
         };
-        self.record_info(upload, &info).await
+        let marker = info
+            .metadata
+            .get(crate::disk::multipart_index::RUSTFS_MULTIPART_BUCKET_KEY)
+            .map(|bucket| {
+                self.base
+                    .join(INDEX)
+                    .join(sha(bucket))
+                    .join(upload.split('/').next().unwrap_or_default())
+            })
+            .unwrap_or_else(|| self.base.join(INDEX));
+        let lease = os::acquire_namespace_mutation_lease_with_owner(&marker, None).await;
+        Some(PreparedHeadRecord {
+            owner: Arc::clone(self),
+            upload: upload.to_owned(),
+            info,
+            _lease: lease,
+        })
+    }
+
+    pub(super) async fn record_head(self: &Arc<Self>, path: &str, bytes: &[u8]) -> Result<()> {
+        let Some(prepared) = self.prepare_record_head(path, bytes).await else {
+            return Ok(());
+        };
+        prepared.run().await
     }
 
     async fn page(self: &Arc<Self>, bucket: &str, marker: Option<&str>, disk_id: Uuid) -> Result<MultipartIndexPage> {
@@ -689,6 +709,37 @@ impl IndexOwner {
             }
         })
         .await?;
+        Ok(())
+    }
+}
+
+pub(super) struct PreparedHeadRecord {
+    owner: Arc<IndexOwner>,
+    upload: String,
+    info: FileInfo,
+    _lease: Arc<os::NamespaceMutationLease>,
+}
+
+impl PreparedHeadRecord {
+    pub(super) fn run_std(self) -> io::Result<()> {
+        let Self {
+            owner,
+            upload,
+            info,
+            _lease,
+        } = self;
+        match owner.record(&upload, &info) {
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => {
+                owner.disabled.store(true, Ordering::Release);
+                Ok(())
+            }
+            result => result,
+        }
+    }
+
+    async fn run(self) -> Result<()> {
+        let lease = Arc::clone(&self._lease);
+        os::run_blocking_namespace_operation_with_sync(lease, true, move || self.run_std()).await?;
         Ok(())
     }
 }
