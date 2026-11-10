@@ -349,6 +349,7 @@ mod tests {
                 role_policy.to_string(),
                 "groups".to_string(),
                 String::new(),
+                None,
             )
         }));
         let authentication: Arc<dyn StandardOidcAuthentication> = provider.clone();

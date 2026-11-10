@@ -139,6 +139,31 @@ impl FederatedAuthorization {
     }
 }
 
+/// Rewrites authorization claim values with an operator supplied regular expression before
+/// they become policy and group names (for example entitlement URNs that carry `=` and
+/// `#`, which policy names cannot contain). Values that do not match pass through unchanged;
+/// a match whose expansion is empty is dropped.
+#[derive(Clone, Debug)]
+pub(crate) struct ClaimValueMapper {
+    pattern: regex::Regex,
+    replacement: String,
+}
+
+impl ClaimValueMapper {
+    pub(crate) fn new(pattern: &str, replacement: &str) -> Result<Self, regex::Error> {
+        Ok(Self {
+            pattern: regex::Regex::new(pattern)?,
+            replacement: replacement.to_string(),
+        })
+    }
+
+    /// `None` when the value matched and the replacement expanded to nothing.
+    pub(crate) fn map(&self, value: &str) -> Option<String> {
+        let mapped = self.pattern.replace(value, self.replacement.as_str());
+        if mapped.is_empty() { None } else { Some(mapped.into_owned()) }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct FederatedAuthorizationRule {
     provider_id: String,
@@ -147,6 +172,7 @@ pub(crate) struct FederatedAuthorizationRule {
     role_policy: String,
     groups_claim: String,
     roles_claim: String,
+    claim_value_mapper: Option<ClaimValueMapper>,
 }
 
 impl FederatedAuthorizationRule {
@@ -157,6 +183,7 @@ impl FederatedAuthorizationRule {
         role_policy: String,
         groups_claim: String,
         roles_claim: String,
+        claim_value_mapper: Option<ClaimValueMapper>,
     ) -> Self {
         Self {
             provider_id,
@@ -165,6 +192,7 @@ impl FederatedAuthorizationRule {
             role_policy,
             groups_claim,
             roles_claim,
+            claim_value_mapper,
         }
     }
 
@@ -175,6 +203,7 @@ impl FederatedAuthorizationRule {
             &self.role_policy,
             &self.groups_claim,
             &self.roles_claim,
+            self.claim_value_mapper.as_ref(),
         )
     }
 }
@@ -186,6 +215,7 @@ pub(crate) struct FederatedAuthorizationRuleRef<'a> {
     role_policy: &'a str,
     groups_claim: &'a str,
     roles_claim: &'a str,
+    claim_value_mapper: Option<&'a ClaimValueMapper>,
 }
 
 impl<'a> FederatedAuthorizationRuleRef<'a> {
@@ -195,6 +225,7 @@ impl<'a> FederatedAuthorizationRuleRef<'a> {
         role_policy: &'a str,
         groups_claim: &'a str,
         roles_claim: &'a str,
+        claim_value_mapper: Option<&'a ClaimValueMapper>,
     ) -> Self {
         Self {
             claim_name,
@@ -202,6 +233,15 @@ impl<'a> FederatedAuthorizationRuleRef<'a> {
             role_policy,
             groups_claim,
             roles_claim,
+            claim_value_mapper,
+        }
+    }
+
+    /// Identity when the provider configures no claim value mapping.
+    pub(crate) fn map_value(&self, value: &str) -> Option<String> {
+        match self.claim_value_mapper {
+            Some(mapper) => mapper.map(value),
+            None => Some(value.to_string()),
         }
     }
 }
@@ -271,6 +311,7 @@ impl CoreFederatedAuthorizationMapper {
         raw_claims: &HashMap<String, serde_json::Value>,
         emit_diagnostics: bool,
     ) -> (Vec<String>, Vec<String>) {
+        let source_groups: Vec<String> = source_groups.iter().filter_map(|group| rule.map_value(group)).collect();
         let has_role_policy = !rule.role_policy.trim().is_empty();
         let mut policies: Vec<String> = if has_role_policy {
             rule.role_policy
@@ -290,13 +331,14 @@ impl CoreFederatedAuthorizationMapper {
             policies.extend(
                 claim_values(raw_claims, rule.claim_name)
                     .into_iter()
+                    .filter_map(|value| rule.map_value(&value))
                     .map(|value| policy_name(rule.claim_prefix, &value)),
             );
         }
         policies.sort();
         policies.dedup();
 
-        let mut groups = source_groups.to_vec();
+        let mut groups = source_groups;
         groups.sort();
         groups.dedup();
 
@@ -318,15 +360,17 @@ impl CoreFederatedAuthorizationMapper {
 
         let explicit_policy_names: Vec<String> = if rule.claim_name != rule.groups_claim {
             claim_values(raw_claims, rule.claim_name)
-                .iter()
-                .map(|value| policy_name(rule.claim_prefix, value))
+                .into_iter()
+                .filter_map(|value| rule.map_value(&value))
+                .map(|value| policy_name(rule.claim_prefix, &value))
                 .collect()
         } else {
             Vec::new()
         };
         let mut group_policies: Vec<String> = source_groups
             .iter()
-            .map(|group| policy_name(rule.claim_prefix, group))
+            .filter_map(|group| rule.map_value(group))
+            .map(|group| policy_name(rule.claim_prefix, &group))
             .filter(|policy| !explicit_policy_names.contains(policy))
             .collect();
         group_policies.sort();
@@ -360,6 +404,7 @@ fn record_mapping_diagnostics(
         groups_claim = %rule.groups_claim,
         roles_claim = %rule.roles_claim,
         role_policy_configured = !rule.role_policy.trim().is_empty(),
+        claim_value_mapper_configured = rule.claim_value_mapper.is_some(),
         policy_count = policies.len(),
         group_count = groups.len(),
         raw_claim_key_count = raw_claims.len(),
@@ -593,6 +638,7 @@ mod tests {
             String::new(),
             "groups".to_string(),
             "roles".to_string(),
+            None,
         ));
 
         let authorization = mapper.map(identity("corp"));
@@ -608,6 +654,92 @@ mod tests {
     }
 
     #[test]
+    fn claim_value_mapper_rewrites_matching_values_and_passes_others() {
+        let mapper = ClaimValueMapper::new(r"^urn:mace:example\.org:group:([^:#]+):role=([^#]+)#aai\.example\.org$", "$1:$2").unwrap();
+
+        assert_eq!(
+            mapper
+                .map("urn:mace:example.org:group:demo-project:role=member#aai.example.org")
+                .as_deref(),
+            Some("demo-project:member")
+        );
+        assert_eq!(
+            mapper.map("urn:mace:example.org:res:other#aai.example.org").as_deref(),
+            Some("urn:mace:example.org:res:other#aai.example.org")
+        );
+        assert!(ClaimValueMapper::new("(", "x").is_err());
+    }
+
+    #[test]
+    fn empty_mapped_values_are_dropped() {
+        let mapper = ClaimValueMapper::new("^drop-.*$", "").unwrap();
+
+        assert_eq!(mapper.map("drop-me"), None);
+        assert_eq!(mapper.map("keep-me").as_deref(), Some("keep-me"));
+    }
+
+    fn mapped_rule() -> FederatedAuthorizationRule {
+        FederatedAuthorizationRule::new(
+            "corp".to_string(),
+            "policy".to_string(),
+            "mapped-".to_string(),
+            String::new(),
+            "groups".to_string(),
+            String::new(),
+            Some(ClaimValueMapper::new("^source-(.*)$", "src:$1").unwrap()),
+        )
+    }
+
+    #[test]
+    fn value_mapping_applies_before_prefix_and_to_claim_name() {
+        let authorization = mapper(mapped_rule()).map(identity("corp"));
+
+        assert_eq!(authorization.policies, ["mapped-explicit", "mapped-src:developers", "mapped-src:ops"]);
+        assert_eq!(authorization.groups, ["src:developers", "src:ops"]);
+        assert_eq!(authorization.group_claim_policies, ["mapped-src:developers"]);
+    }
+
+    #[test]
+    fn comma_separated_claim_string_is_mapped_per_value() {
+        let identity = VerifiedFederatedIdentity::from_claims(
+            FederatedProviderRef::new("corp".to_string()),
+            FederatedClaims {
+                sub: "subject".to_string(),
+                email: String::new(),
+                username: "user".to_string(),
+                groups: Vec::new(),
+                raw: HashMap::from([("Policy".to_string(), json!("source-a,source-b"))]),
+            },
+        );
+
+        let authorization = mapper(mapped_rule()).map(identity);
+
+        assert_eq!(authorization.policies, ["mapped-src:a", "mapped-src:b"]);
+        assert!(authorization.groups.is_empty());
+    }
+
+    #[test]
+    fn missing_mapper_keeps_values() {
+        let rule = FederatedAuthorizationRule::new(
+            "corp".to_string(),
+            "policy".to_string(),
+            "mapped-".to_string(),
+            String::new(),
+            "groups".to_string(),
+            String::new(),
+            None,
+        );
+
+        let authorization = mapper(rule).map(identity("corp"));
+
+        assert_eq!(
+            authorization.policies,
+            ["mapped-explicit", "mapped-source-developers", "mapped-source-ops"]
+        );
+        assert_eq!(authorization.groups, ["source-developers", "source-ops"]);
+    }
+
+    #[test]
     fn role_policy_mode_keeps_groups_without_group_derived_policies() {
         let mapper = mapper(FederatedAuthorizationRule::new(
             "corp".to_string(),
@@ -616,6 +748,7 @@ mod tests {
             " readonly, readwrite, readonly ".to_string(),
             "groups".to_string(),
             String::new(),
+            None,
         ));
 
         let authorization = mapper.map(identity("corp"));
@@ -644,6 +777,7 @@ mod tests {
             String::new(),
             "groups".to_string(),
             String::new(),
+            None,
         ));
         let identity = VerifiedFederatedIdentity::from_claims(
             FederatedProviderRef::new("corp".to_string()),
@@ -673,6 +807,7 @@ mod tests {
             String::new(),
             "groups".to_string(),
             String::new(),
+            None,
         ));
         let identity = VerifiedFederatedIdentity::from_claims(
             FederatedProviderRef::new("corp".to_string()),
@@ -704,6 +839,7 @@ mod tests {
             String::new(),
             "groups".to_string(),
             String::new(),
+            None,
         ));
         let identity = VerifiedFederatedIdentity::from_claims(
             FederatedProviderRef::new("corp".to_string()),
@@ -730,6 +866,7 @@ mod tests {
             String::new(),
             "groups".to_string(),
             "roles".to_string(),
+            None,
         ));
         let identity = VerifiedFederatedIdentity::from_claims(
             FederatedProviderRef::new("corp".to_string()),

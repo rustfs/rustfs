@@ -21,11 +21,11 @@ mod transaction;
 
 pub use binding::FederatedSessionBinding;
 pub use error::{FederatedSessionBindingError, FederationError, Result};
-pub(crate) use mapper::FederatedAuthorizationRule;
 #[cfg(test)]
 pub(crate) use mapper::FederatedAuthorizationRuleRef;
 #[cfg(any(test, feature = "test-util"))]
 pub use mapper::test_support::FederatedAuthorizationFixture;
+pub(crate) use mapper::{ClaimValueMapper, FederatedAuthorizationRule};
 pub use mapper::{CoreFederatedAuthorizationMapper, FederatedAuthorization, FederatedAuthorizationRules};
 pub(crate) use model::{FederatedClaims, OpaqueLogoutContinuation};
 pub use model::{

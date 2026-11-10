@@ -25,10 +25,10 @@ use crate::federation::FederatedAuthorizationRuleRef;
 use crate::{
     EVENT_OIDC_DIAGNOSTICS, LOG_COMPONENT_IAM, LOG_SUBSYSTEM_OIDC,
     federation::{
-        CoreFederatedAuthorizationMapper, FederatedAuthorizationRule, FederatedAuthorizationRules, FederatedClaims,
-        FederatedIdentityService, FederatedProviderQuery, FederatedProviderRef, FederatedProviderView, FederatedRedirectPolicy,
-        FederationError, OpaqueLogoutContinuation, Result as FederationResult, StandardOidcAuthentication,
-        VerifiedFederatedCodeExchange, VerifiedFederatedIdentity,
+        ClaimValueMapper, CoreFederatedAuthorizationMapper, FederatedAuthorizationRule, FederatedAuthorizationRules,
+        FederatedClaims, FederatedIdentityService, FederatedProviderQuery, FederatedProviderRef, FederatedProviderView,
+        FederatedRedirectPolicy, FederationError, OpaqueLogoutContinuation, Result as FederationResult,
+        StandardOidcAuthentication, VerifiedFederatedCodeExchange, VerifiedFederatedIdentity,
     },
 };
 use openidconnect::core::{CoreAuthenticationFlow, CoreClient, CoreIdToken};
@@ -727,6 +727,7 @@ impl OidcSys {
                 &config.role_policy,
                 &config.groups_claim,
                 &config.roles_claim,
+                None,
             )
         })
     }
@@ -866,6 +867,25 @@ fn verified_identity(provider: FederatedProviderRef, claims: OidcClaims) -> Veri
 
 fn authorization_rules(oidc: &OidcSys) -> FederatedAuthorizationRules {
     FederatedAuthorizationRules::new(oidc.provider_configs().map(|config| {
+        // Config loading already rejects an invalid pair, so a compile failure here is a
+        // programming error; log it and leave the values unmapped (unsafe names still fail closed).
+        let claim_value_mapper = if config.claim_value_pattern.is_empty() {
+            None
+        } else {
+            ClaimValueMapper::new(&config.claim_value_pattern, &config.claim_value_replacement)
+                .inspect_err(|err| {
+                    error!(
+                        event = EVENT_OIDC_DIAGNOSTICS,
+                        component = LOG_COMPONENT_IAM,
+                        subsystem = LOG_SUBSYSTEM_OIDC,
+                        result = "claim_value_mapping_invalid",
+                        provider_id = %config.id,
+                        error = %err,
+                        "oidc claim value mapping could not be compiled; claim values are used unmapped"
+                    );
+                })
+                .ok()
+        };
         FederatedAuthorizationRule::new(
             config.id.clone(),
             config.claim_name.clone(),
@@ -873,6 +893,7 @@ fn authorization_rules(oidc: &OidcSys) -> FederatedAuthorizationRules {
             config.role_policy.clone(),
             config.groups_claim.clone(),
             config.roles_claim.clone(),
+            claim_value_mapper,
         )
     }))
 }
