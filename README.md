@@ -145,7 +145,7 @@ chown -R 10001:10001 data logs
 docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:latest
 
 # Using specific version
-docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.4
+docker run -d -p 9000:9000 -p 9001:9001 -v $(pwd)/data:/data -v $(pwd)/logs:/logs rustfs/rustfs:1.0.5
 ```
 
 If you use [podman](https://github.com/containers/podman) instead of docker, you can install the RustFS with the below command
@@ -224,7 +224,7 @@ For developers who want to build RustFS Docker images from source with multi-arc
 ./docker-buildx.sh --push
 
 # Build specific version
-./docker-buildx.sh --release 1.0.4 --push
+./docker-buildx.sh --release 1.0.5 --push
 
 # Build for custom registry
 ./docker-buildx.sh --registry your-registry.com --namespace yourname --push
@@ -242,7 +242,7 @@ You can also use Make targets for convenience:
 ```bash
 make docker-buildx                    # Build locally
 make docker-buildx-push               # Build and push
-make docker-buildx-version VERSION=1.0.4  # Build specific version
+make docker-buildx-version VERSION=1.0.5  # Build specific version
 make help-docker                      # Show all Docker-related commands
 ```
 
