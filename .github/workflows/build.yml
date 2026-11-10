@@ -156,7 +156,11 @@ jobs:
           with c.github_stream(f"repos/rustfs/rustfs/actions/jobs/{job['id']}/logs") as response:
               log = response.read().decode('utf-8', errors='replace')
           assert source in log and 'Console release: v0.1.41' in log
-          assert 'skipping artifact upload' not in log
+          r2_steps = [s for s in job['steps'] if s['name'] == 'Upload to Cloudflare R2']
+          assert len(r2_steps) == 1 and r2_steps[0]['conclusion'] == 'success'
+          output = {re.sub(r'^\S+Z ', '', line) for line in log.splitlines()}
+          assert '⚠️ R2 credentials or endpoint missing, skipping artifact upload' not in output
+          assert {f'✅ Uploaded: rustfs-{target}-{suffix}.zip' for suffix in ('v1.0.5', 'latest')} <= output
           assert set(re.findall(r'SHA256 verified OK: ([0-9a-f]{64})', log)) == {'5c9c5e800ce2c65f7e6952c57c7c02c2cdc14e2c5d40296c0a57ae80bc041d8d'}
           asset = c.download_artifact(run, frozen[target]['name'], 'imported')
           assert all(asset[key] == value for key, value in frozen[target].items())
