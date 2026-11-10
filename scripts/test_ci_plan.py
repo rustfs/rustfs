@@ -152,6 +152,99 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(code['mode'], 'full')
         self.assertIn('leaf', code['proposed']['packages'])
 
+    def release_metadata_base(self):
+        self.repo.write(gate.POLICY_PATH, json.dumps(dict(self.repo.policy, rollout='enforced')))
+        files = {
+            'flake.nix': '{ pkgs }: {\n  rustfs = pkgs.buildRustPackage {\n    pname = "rustfs";\n    version = "1.0.4";\n    src = ./.;\n  };\n  clientVersion = "0.1.36";\n}\n',
+            'helm/rustfs/Chart.yaml': 'apiVersion: v2\nname: rustfs\nversion: "1.0.4"\nappVersion: "1.0.4"\n',
+            'rustfs.spec': 'Name: rustfs\nVersion: 1.0.4\nRelease: 1\n%build\ncargo build --release\n%changelog\n* Mon Oct 26 2026 Maintainer <maintainer@example.invalid>\n- Update RPM package to RustFS 1.0.4\n',
+        }
+        for path, content in files.items():
+            self.repo.write(path, content)
+        return self.repo.commit(), files
+
+    def test_stable_installation_metadata_keeps_quick_checks_without_rust_rebuild(self):
+        baseline, files = self.release_metadata_base()
+        for path, content in files.items():
+            updated = content.replace('1.0.4', '1.0.5') if path != 'rustfs.spec' else content.replace('Version: 1.0.4', 'Version: 1.0.5')
+            if path == 'rustfs.spec':
+                updated = updated.replace('%changelog\n', '%changelog\n* Wed Nov 11 2026 Maintainer <maintainer@example.invalid>\n- Update RPM package to RustFS 1.0.5\n\n')
+            self.repo.write(path, updated)
+        self.repo.write('README.md', '# Install 1.0.5\n')
+        head = self.repo.commit()
+        plan = self.repo.plan(head, base=baseline)
+        self.assertEqual(plan['mode'], 'docs')
+        self.assertEqual(plan['packages'], [])
+        for job in gate.ALWAYS_JOBS:
+            self.assertEqual(plan['jobs'][job], 'success')
+        self.assertTrue(all(plan['jobs'][job] == 'skipped' for job in gate.CODE_JOBS))
+        self.assertEqual(gate.validate_plan(plan, 'pull_request', 'refs/heads/main', head, plan['tree']), plan['jobs'])
+        for event in ('push', 'merge_group', 'schedule', 'workflow_dispatch'):
+            self.assertTrue(self.repo.plan(head, event=event, base=baseline)['full_validation'])
+
+    def test_individual_stable_version_fields_without_new_rpm_history_are_metadata(self):
+        baseline, files = self.release_metadata_base()
+        for path, content in files.items():
+            with self.subTest(path=path):
+                self.repo.git('reset', '--hard', baseline)
+                updated = content.replace('1.0.4', '1.0.5') if path != 'rustfs.spec' else content.replace('Version: 1.0.4', 'Version: 1.0.5')
+                self.repo.write(path, updated)
+                self.assertEqual(self.repo.plan(self.repo.commit(), base=baseline)['mode'], 'docs')
+
+    def test_installation_metadata_does_not_hide_build_or_malformed_changes(self):
+        baseline, files = self.release_metadata_base()
+        cases = [
+            ('flake.nix', files['flake.nix'].replace('src = ./.;', 'src = ./other;')),
+            ('flake.nix', files['flake.nix'].replace('0.1.36', '0.1.37')),
+            ('flake.nix', files['flake.nix'].replace('1.0.4', '${builtins.readFile ./version}')),
+            ('helm/rustfs/Chart.yaml', files['helm/rustfs/Chart.yaml'] + 'dependencies: []\n'),
+            ('helm/rustfs/Chart.yaml', files['helm/rustfs/Chart.yaml'].replace('appVersion: "1.0.4"', 'appVersion: "1.0.5"')),
+            ('helm/rustfs/Chart.yaml', files['helm/rustfs/Chart.yaml'] + 'version: "1.0.5"\n'),
+            ('rustfs.spec', files['rustfs.spec'].replace('cargo build --release', 'cargo build')),
+            ('rustfs.spec', files['rustfs.spec'].replace('Release: 1', 'Release: 2')),
+            ('rustfs.spec', files['rustfs.spec'].replace('%changelog\n', '%changelog\n%(echo injected)\n')),
+            ('rustfs.spec', files['rustfs.spec'].replace('Update RPM package', 'Rewrite existing history')),
+        ]
+        cases.extend((path, content.replace('1.0.4', '1.0.5-rc.1')) for path, content in files.items())
+        for path, content in cases:
+            with self.subTest(path=path, content=content):
+                self.repo.git('reset', '--hard', baseline)
+                self.repo.write(path, content)
+                self.assertTrue(self.repo.plan(self.repo.commit(), base=baseline)['full_validation'])
+
+    def test_installation_metadata_rejects_missing_files_symlinks_and_mode_changes(self):
+        baseline, files = self.release_metadata_base()
+        for path in files:
+            for mutation in ('delete', 'symlink', 'executable'):
+                with self.subTest(path=path, mutation=mutation):
+                    self.repo.git('reset', '--hard', baseline)
+                    target = self.repo.root / path
+                    if mutation == 'executable':
+                        target.chmod(0o755)
+                    else:
+                        target.unlink()
+                        if mutation == 'symlink':
+                            target.symlink_to('/tmp/release-metadata')
+                    self.assertTrue(self.repo.plan(self.repo.commit(), base=baseline)['full_validation'])
+        self.repo.git('reset', '--hard', baseline)
+        self.assertTrue(self.repo.plan(baseline, base=self.repo.base)['full_validation'])
+
+    def test_installation_metadata_cannot_override_code_or_explicit_full_policy(self):
+        baseline, files = self.release_metadata_base()
+        self.repo.write('flake.nix', files['flake.nix'].replace('1.0.4', '1.0.5'))
+        self.repo.write('leaf/src/lib.rs', '// changed implementation\n')
+        plan = self.repo.plan(self.repo.commit(), base=baseline)
+        self.assertEqual(plan['mode'], 'full')
+        self.assertEqual(plan['packages'], ['consumer', 'core', 'leaf', 'rustfs'])
+        self.repo.git('reset', '--hard', baseline)
+        self.repo.write('flake.nix', files['flake.nix'].replace('1.0.4', '1.0.5'))
+        head = self.repo.commit()
+        policy = dict(self.repo.policy, rollout='enforced', full_paths=['flake.nix'])
+        with patch.object(gate, 'read_policy', return_value=policy):
+            self.assertTrue(self.repo.plan(head, base=baseline)['full_validation'])
+        with patch.object(gate, 'read_policy', return_value=self.repo.policy):
+            self.assertTrue(self.repo.plan(head, base=baseline)['full_validation'])
+
     def test_shadow_retains_full_mode_for_harness_build_and_fixture_changes(self):
         for path in ('crates/e2e_test/build.rs', 'crates/e2e_test/src/fixture.json'):
             self.repo.write(path, 'changed\n')
