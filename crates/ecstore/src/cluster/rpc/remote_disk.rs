@@ -169,6 +169,72 @@ fn decode_delete_recovery_batch_errors(codes: Vec<Option<u32>>, expected_len: us
         .collect()
 }
 
+fn log_delete_recovery_batch_result(
+    endpoint: &Endpoint,
+    expected_len: usize,
+    started: Instant,
+    result: &Result<Vec<Option<DiskError>>>,
+) {
+    let elapsed_ms = started.elapsed().as_millis();
+    let mut disk_error_counts = std::collections::BTreeMap::<u32, usize>::new();
+    let (failure_scope, rpc_status) = match result {
+        Ok(errors) => {
+            for error in errors.iter().flatten() {
+                *disk_error_counts.entry(error.to_u32()).or_default() += 1;
+            }
+            ("object_group", None)
+        }
+        Err(error) => {
+            disk_error_counts.insert(error.to_u32(), expected_len);
+            let rpc_status = match error {
+                DiskError::Io(source) => crate::cluster::rpc::client::embedded_tonic_status(source).map(tonic::Status::code),
+                _ => None,
+            };
+            ("rpc_or_reply", rpc_status)
+        }
+    };
+    let failed_group_count = disk_error_counts.values().sum::<usize>();
+    let result = if result.is_err() || failed_group_count > 0 {
+        "failed"
+    } else {
+        "ok"
+    };
+    if result == "failed" || elapsed_ms >= 1_000 {
+        warn!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            result,
+            operation = "apply_versions",
+            failure_scope,
+            pool_index = endpoint.pool_idx,
+            set_index = endpoint.set_idx,
+            disk_index = endpoint.disk_idx,
+            attempted_group_count = expected_len,
+            failed_group_count,
+            disk_error_counts = ?disk_error_counts,
+            rpc_status = ?rpc_status,
+            elapsed_ms,
+            "Recoverable batch delete RPC completed"
+        );
+    } else {
+        debug!(
+            event = EVENT_REMOTE_DISK_RPC,
+            component = LOG_COMPONENT_ECSTORE,
+            subsystem = LOG_SUBSYSTEM_REMOTE_DISK,
+            result,
+            operation = "apply_versions",
+            pool_index = endpoint.pool_idx,
+            set_index = endpoint.set_idx,
+            disk_index = endpoint.disk_idx,
+            attempted_group_count = expected_len,
+            failed_group_count,
+            elapsed_ms,
+            "Recoverable batch delete RPC completed"
+        );
+    }
+}
+
 fn validate_delete_recovery_inspection(
     volume: &str,
     object: &str,
@@ -4373,6 +4439,7 @@ impl DiskAPI for RemoteDisk {
         opts: DeleteOptions,
     ) -> Vec<Option<DiskError>> {
         let expected_len = versions.len();
+        let started = Instant::now();
         let result = match self
             .recover_delete_transaction(volume, DeleteRecoveryRpcOperation::ApplyVersions { versions, opts })
             .await
@@ -4381,6 +4448,7 @@ impl DiskAPI for RemoteDisk {
             Ok(_) => Err(Error::other("unexpected recoverable batch delete reply")),
             Err(error) => Err(error),
         };
+        log_delete_recovery_batch_result(&self.endpoint, expected_len, started, &result);
         match result {
             Ok(errors) => errors,
             Err(error) => vec![Some(error); expected_len],
@@ -5671,6 +5739,62 @@ mod tests {
         assert!(decode_delete_recovery_batch_errors(vec![None], 2).is_err());
         assert!(decode_delete_recovery_batch_errors(vec![Some(0)], 1).is_err());
         assert!(decode_delete_recovery_batch_errors(vec![Some(u32::MAX)], 1).is_err());
+    }
+
+    #[test]
+    fn recoverable_batch_delete_diagnostics_preserve_context_and_redact_error_details() {
+        let logs = CapturedLogs::default();
+        let subscriber = Registry::default().with(
+            tracing_subscriber::fmt::layer()
+                .with_writer(logs.clone())
+                .with_ansi(false)
+                .without_time()
+                .json()
+                .flatten_event(true)
+                .with_span_list(true),
+        );
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let _callsite_pin = crate::test_tracing::pin_callsite_interest_for_test();
+        let endpoint = Endpoint {
+            url: url::Url::parse("http://127.0.0.1:9000/private-disk-path").expect("valid diagnostic endpoint"),
+            is_local: false,
+            pool_idx: 1,
+            set_idx: 2,
+            disk_idx: 3,
+        };
+        let rpc_failure = Err(DiskError::from(Status::deadline_exceeded("private-error-detail")));
+        let group_failures = Ok(vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)]);
+        tracing::info_span!("request-span", request_id = "req-batch-delete-diagnostics").in_scope(|| {
+            log_delete_recovery_batch_result(&endpoint, 1000, Instant::now(), &rpc_failure);
+            log_delete_recovery_batch_result(&endpoint, 3, Instant::now(), &group_failures);
+        });
+        let entries = logs.lines();
+        assert_eq!(entries.len(), 2, "one summary per disk batch, never per object");
+        assert_eq!(entries[0]["failure_scope"], "rpc_or_reply");
+        assert_eq!(entries[0]["failed_group_count"], 1000);
+        assert_eq!(entries[0]["rpc_status"], "Some(DeadlineExceeded)");
+        assert_eq!(entries[1]["failure_scope"], "object_group");
+        assert_eq!(entries[1]["failed_group_count"], 2);
+        for entry in entries {
+            assert_eq!(entry["pool_index"], 1);
+            assert_eq!(entry["set_index"], 2);
+            assert_eq!(entry["disk_index"], 3);
+            assert!(
+                entry["spans"]
+                    .as_array()
+                    .expect("request spans recorded")
+                    .iter()
+                    .any(|span| { span["request_id"] == "req-batch-delete-diagnostics" })
+            );
+            let text = entry.to_string();
+            assert!(!text.contains("private-error-detail"));
+            assert!(!text.contains("private-disk-path"));
+        }
+        assert!(rpc_failure.is_err(), "diagnostics borrow and preserve the original failure");
+        assert_eq!(
+            group_failures,
+            Ok(vec![None, Some(DiskError::FileNotFound), Some(DiskError::FileNotFound)])
+        );
     }
 
     #[test]
