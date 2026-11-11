@@ -8310,6 +8310,13 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
     let index_path = store.paths.warehouse_index_entry_path(bucket, "tables/table-id/");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .put_table_maintenance_config(bucket, "sales", "orders", TableMaintenanceConfig::default())
+        .await
+        .unwrap();
+    let config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "table-id");
     backend.fail_delete_attempt(RUSTFS_META_BUCKET, &table_path, 1).await;
 
     assert_matches!(
@@ -8322,6 +8329,7 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
         .expect("retained table lookup should succeed")
         .expect("table entry should remain present");
     assert_eq!(retained.table_id, "table-id");
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
     let (restored_index, _) = store
         .read_entry::<TableWarehouseIndexEntry>(RUSTFS_META_BUCKET, &index_path)
         .await
@@ -8334,6 +8342,12 @@ async fn object_table_catalog_store_restores_index_when_table_entry_delete_fails
         .expect("restored index lookup should succeed")
         .expect("restored index should keep data-plane protection");
     assert_eq!(resource.table, "orders");
+
+    store
+        .drop_table(bucket, &namespace.public_name(), table.as_str())
+        .await
+        .unwrap();
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
 }
 
 #[tokio::test]
@@ -8388,6 +8402,19 @@ async fn object_table_catalog_store_accepts_ambiguous_delete_when_table_is_absen
     let table_path = store.paths.table_entry_path(bucket, &namespace, &table);
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
+    store
+        .put_table_maintenance_config(bucket, "sales", "orders", TableMaintenanceConfig::default())
+        .await
+        .unwrap();
+    let config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "table-id");
+    let previous_config = store
+        .paths
+        .table_maintenance_config_path(bucket, &namespace, &table, "previous-id");
+    backend
+        .seed_object(RUSTFS_META_BUCKET, &previous_config, b"previous config".to_vec())
+        .await;
     backend.fail_after_next_delete(RUSTFS_META_BUCKET, &table_path).await;
 
     store
@@ -8401,6 +8428,8 @@ async fn object_table_catalog_store_accepts_ambiguous_delete_when_table_is_absen
             .expect("dropped table lookup should succeed")
             .is_none()
     );
+    assert!(!backend.object_exists(RUSTFS_META_BUCKET, &config).await.unwrap());
+    assert!(backend.object_exists(RUSTFS_META_BUCKET, &previous_config).await.unwrap());
     let resource = table_data_plane_resource_for_object(&store, bucket, "tables/table-id/data/part-00001.parquet")
         .await
         .expect("dropped table data-plane lookup should succeed")
@@ -8918,26 +8947,25 @@ async fn maintenance_config_rejects_unsupported_config_version() {
 #[tokio::test]
 async fn maintenance_config_inherits_bucket_default_and_tracks_override_source() {
     let backend = TestCatalogObjectBackend::default();
-    let store = ObjectTableCatalogStore::new(backend);
+    let store = ObjectTableCatalogStore::new(backend.clone());
     let bucket = "analytics";
     let namespace = Namespace::parse("sales").unwrap();
     let table = IdentifierSegment::parse("orders").unwrap();
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-    store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 3,
-                delete_enabled: true,
-                background_enabled: false,
-                ..Default::default()
-            },
+    let bucket_config = TableMaintenanceConfig {
+        retain_recent_metadata_files: 3,
+        delete_enabled: true,
+        ..Default::default()
+    };
+    backend
+        .seed_object(
+            RUSTFS_META_BUCKET,
+            &store.paths.table_bucket_maintenance_config_path(bucket),
+            serde_json::to_vec(&bucket_config).unwrap(),
         )
-        .await
-        .expect("bucket default maintenance config should persist");
+        .await;
 
     let inherited = store
         .get_effective_table_maintenance_config(bucket, "sales", "orders")
@@ -8986,25 +9014,6 @@ async fn maintenance_config_accepts_background_enabled_worker_runtime_controls()
     let current = default_table_metadata_file_path(&namespace, &table, "00001.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current).await;
-
-    let bucket_config = store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 1,
-                delete_enabled: false,
-                background_enabled: true,
-                worker_paused: true,
-                worker_lease_timeout_seconds: 60,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("background maintenance bucket config should persist");
-    assert!(bucket_config.background_enabled);
-    assert!(bucket_config.worker_paused);
-    assert_eq!(bucket_config.worker_lease_timeout_seconds, 60);
 
     let table_config = store
         .put_table_maintenance_config(
@@ -9170,19 +9179,6 @@ async fn maintenance_run_persists_latest_job_alias_with_worker_and_lease_context
     let current = default_table_metadata_file_path(&namespace, &table, "00002.metadata.json");
 
     seed_table_for_metadata_maintenance(&store, bucket, &namespace, &table, current.clone()).await;
-    store
-        .put_table_bucket_maintenance_config(
-            bucket,
-            TableMaintenanceConfig {
-                version: TABLE_MAINTENANCE_CONFIG_VERSION,
-                retain_recent_metadata_files: 0,
-                delete_enabled: false,
-                background_enabled: false,
-                ..Default::default()
-            },
-        )
-        .await
-        .expect("bucket default maintenance config should persist");
     backend.seed_object(bucket, &old, b"{}".to_vec()).await;
     backend
         .seed_object(bucket, &current, br#"{"metadata-log":[]}"#.to_vec())
@@ -9194,7 +9190,7 @@ async fn maintenance_run_persists_latest_job_alias_with_worker_and_lease_context
         .expect("metadata maintenance run should succeed");
 
     assert_eq!(report.job.status, TableMetadataMaintenanceJobStatus::Successful);
-    assert_eq!(report.job.config_source, TableMaintenanceConfigSource::TableBucketDefault);
+    assert_eq!(report.job.config_source, TableMaintenanceConfigSource::Default);
     assert_eq!(report.job.worker_id.as_deref(), Some("worker-a"));
     assert!(!report.job.lease_id.is_empty());
     assert_eq!(report.job.attempt, 1);
@@ -12759,13 +12755,6 @@ async fn object_only_catalog_mutations_hold_the_migration_read_permit() {
         })
         .await
         .expect("external catalog bridge should persist");
-    expected += 1;
-    assert_eq!(backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await, expected);
-
-    store
-        .put_table_bucket_maintenance_config(bucket, TableMaintenanceConfig::default())
-        .await
-        .expect("table-bucket maintenance config should persist");
     expected += 1;
     assert_eq!(backend.read_lock_acquisition_count(RUSTFS_META_BUCKET, &lock_path).await, expected);
 

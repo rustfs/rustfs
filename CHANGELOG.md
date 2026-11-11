@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Notifications and audit
+
+- Notify and audit targets that keep the default `queue_dir` now work on native Windows: the defaults `/opt/rustfs/events` and `/opt/rustfs/audit` resolve per node, to `%ProgramData%\RustFS\events` and `%ProgramData%\RustFS\audit` on Windows, instead of failing validation as non-absolute paths. The new `RUSTFS_TARGET_STORE_DIR` (Helm `config.rustfs.target_store_dir`) relocates both default queues on any platform. Linux and macOS behavior is unchanged when it is unset, persisted configuration is unchanged, and pending entries are not migrated when the root changes. See `docs/operations/target-queue-storage.md`.
+
 ### Deployment
 
 - Existing volumes created by older root-running container images must be writable by the non-root runtime identity before upgrading. The default container UID/GID is `10001:10001`; stop the affected instances, verify host mount paths, and for ordinary bind mounts run `sudo chown -R 10001:10001 /actual/data /actual/logs` on each RustFS data/log mount. Account for ACLs, NFS, Kubernetes, and rootless UID mappings. Image-build ownership changes do not migrate mounted data. See the Docker Quick Start in [README.md](README.md).

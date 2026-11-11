@@ -38,7 +38,7 @@ pub mod types;
 // Re-export main types for easy access
 pub use crate::{
     // Client interfaces
-    client::{LockCleanupOutcome, LockClient, local::LocalClient},
+    client::{BatchAcquireOutcome, LockCleanupOutcome, LockClient, local::LocalClient},
     distributed_lock::DistributedLockGuard,
     // Error types
     error::{LockError, Result},
