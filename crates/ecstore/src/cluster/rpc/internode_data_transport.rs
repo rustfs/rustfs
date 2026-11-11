@@ -220,6 +220,11 @@ impl InternodeDataTransportCapabilities {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "internode-transport",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
 pub struct ReadStreamRequest {
     pub endpoint: String,
     pub disk: String,
@@ -231,6 +236,11 @@ pub struct ReadStreamRequest {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(
+    feature = "internode-transport",
+    derive(serde::Serialize, serde::Deserialize),
+    serde(deny_unknown_fields)
+)]
 pub struct WriteStreamRequest {
     pub endpoint: String,
     pub disk: String,
@@ -1241,6 +1251,38 @@ mod tests {
         fn capabilities(&self) -> InternodeDataTransportCapabilities {
             InternodeDataTransportCapabilities::tcp_http()
         }
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[test]
+    fn peer_transport_is_selected_once_per_instance() {
+        use crate::runtime::instance::InstanceContext;
+        let first = InstanceContext::new();
+        let second = InstanceContext::new();
+        let provider: Arc<dyn InternodeDataTransport> = Arc::new(LegacyTestTransport);
+        first
+            .select_internode_data_transport(provider.clone(), Some(" LEGACY-TEST "))
+            .expect("select external transport");
+        let selected = first.internode_data_transport().expect("first instance selection");
+        assert!(Arc::ptr_eq(selected, &provider));
+        assert!(second.internode_data_transport().is_none());
+        assert_eq!(
+            first
+                .select_internode_data_transport(provider.clone(), Some("tcp"))
+                .expect_err("already configured")
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+        second
+            .select_internode_data_transport(provider.clone(), None)
+            .expect("ordinary TCP");
+        assert_eq!(
+            second.internode_data_transport().expect("ordinary selection").name(),
+            DEFAULT_INTERNODE_DATA_TRANSPORT
+        );
+        let invalid = InstanceContext::new();
+        assert!(invalid.select_internode_data_transport(provider, Some("unknown")).is_err());
+        assert!(invalid.internode_data_transport().is_none());
     }
 
     #[tokio::test]

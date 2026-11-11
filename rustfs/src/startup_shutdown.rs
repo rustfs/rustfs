@@ -486,10 +486,16 @@ pub(crate) struct FrontShutdownReport {
     optional_expected: Option<usize>,
     optional_joined: bool,
     optional_retired: usize,
+    #[cfg(feature = "internode-transport")]
+    peer_error: Option<std::io::Error>,
 }
 
 impl FrontShutdownReport {
     fn producers_retired(&self) -> bool {
+        #[cfg(feature = "internode-transport")]
+        if self.peer_error.is_some() {
+            return false;
+        }
         self.s3.retired()
             && self.console.retired()
             && self
@@ -498,6 +504,10 @@ impl FrontShutdownReport {
     }
 
     fn allows_marker_clear(&self) -> bool {
+        #[cfg(feature = "internode-transport")]
+        if self.peer_error.is_some() {
+            return false;
+        }
         self.s3.allows_marker_clear()
             && self.console.allows_marker_clear()
             && self
@@ -513,11 +523,19 @@ impl FrontShutdownReport {
         let deadline_missed = [&self.s3, &self.console]
             .into_iter()
             .any(|observation| observation.http12().is_some_and(|outcome| outcome.deadline_missed()));
+        #[cfg(feature = "internode-transport")]
+        let deadline_missed = deadline_missed
+            || self
+                .peer_error
+                .as_ref()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::TimedOut);
         let incomplete_leaf_proof = !self.producers_retired();
         Err(Box::new(FrontShutdownFailure {
             s3: self.s3.error(),
             console: self.console.error(),
             optional: self.optional,
+            #[cfg(feature = "internode-transport")]
+            peer_error: self.peer_error,
             deadline_missed,
             incomplete_leaf_proof,
         }))
@@ -526,6 +544,8 @@ impl FrontShutdownReport {
 
 #[derive(Debug)]
 pub(crate) struct FrontShutdownFailure {
+    #[cfg(feature = "internode-transport")]
+    peer_error: Option<std::io::Error>,
     s3: Option<ShutdownWaitError>,
     console: Option<ShutdownWaitError>,
     optional: Vec<ShutdownWaitError>,
@@ -550,6 +570,10 @@ impl std::fmt::Display for FrontShutdownFailure {
                 write!(f, "; {service}: {error}")?;
             }
         }
+        #[cfg(feature = "internode-transport")]
+        if let Some(error) = &self.peer_error {
+            write!(f, "; peer transport: {error}")?;
+        }
         for error in &self.optional {
             write!(f, "; optional_protocol: {error}")?;
         }
@@ -559,6 +583,10 @@ impl std::fmt::Display for FrontShutdownFailure {
 
 impl std::error::Error for FrontShutdownFailure {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        #[cfg(feature = "internode-transport")]
+        if let Some(error) = &self.peer_error {
+            return Some(error);
+        }
         self.s3
             .as_ref()
             .or(self.console.as_ref())
@@ -597,7 +625,9 @@ pub(crate) async fn join_startup_fronts(
     report.optional_joined = true;
 }
 
-pub(crate) struct StartupBackgroundTasks {
+pub(crate) struct StartupShutdownServices {
+    #[cfg(feature = "internode-transport")]
+    pub(crate) peer_control: Option<std::sync::Arc<crate::storage_api::startup::storage::InstalledControlService>>,
     pub(crate) capacity: Option<CapacityBackgroundTasks>,
     pub(crate) table_maintenance: Option<crate::table_catalog::PeriodicMaintenanceRuntime>,
 }
@@ -608,10 +638,12 @@ pub(crate) async fn run_startup_shutdown_sequence(
     mut s3_shutdown_handle: Option<ShutdownHandle>,
     mut console_shutdown_handle: Option<ShutdownHandle>,
     optional_runtimes: OptionalRuntimeServices,
-    background_tasks: StartupBackgroundTasks,
+    background_tasks: StartupShutdownServices,
     ctx: CancellationToken,
 ) -> (CapacityShutdownReport, std::io::Result<()>, FrontShutdownReport) {
-    let StartupBackgroundTasks {
+    let StartupShutdownServices {
+        #[cfg(feature = "internode-transport")]
+        peer_control,
         capacity: capacity_tasks,
         table_maintenance,
     } = background_tasks;
@@ -644,6 +676,19 @@ pub(crate) async fn run_startup_shutdown_sequence(
     for handle in &optional_runtime_shutdowns {
         handle.signal();
     }
+
+    // HTTP listeners have been signalled. A detached data worker may still own
+    // a disk writer, so collect its shutdown result before stopping audit and
+    // notification services or certifying a clean shutdown.
+    #[cfg(feature = "internode-transport")]
+    let peer_error = if let Some(control) = peer_control {
+        control
+            .shutdown(std::time::Instant::now() + std::time::Duration::from_secs(10))
+            .await
+            .err()
+    } else {
+        None
+    };
 
     let mut capacity_report = CapacityShutdownReport {
         configured: capacity_tasks.is_some(),
@@ -789,7 +834,11 @@ pub(crate) async fn run_startup_shutdown_sequence(
         state = "stopping",
         "RustFS server stopping"
     );
-    let mut front_failures = FrontShutdownReport::default();
+    let mut front_failures = FrontShutdownReport {
+        #[cfg(feature = "internode-transport")]
+        peer_error,
+        ..Default::default()
+    };
     join_startup_fronts(
         &mut s3_shutdown_handle,
         &mut console_shutdown_handle,
@@ -1102,6 +1151,36 @@ mod tests {
         } else {
             result.expect("retained early receipt sees the eventual original successful group join");
         }
+    }
+
+    #[cfg(feature = "internode-transport")]
+    #[tokio::test]
+    async fn peer_transport_worker_timeout_preserves_unclean_marker_and_original_error() {
+        let report = super::FrontShutdownReport {
+            peer_error: Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "worker still owns a disk writer")),
+            ..Default::default()
+        };
+        let clear = std::cell::Cell::new(false);
+        let waited = std::cell::Cell::new(false);
+        let result = finish_detached_mutations_and_clear_unclean_shutdown_markers(
+            true,
+            &Ok(()),
+            &report,
+            Duration::from_secs(1),
+            |_| async {
+                waited.set(true);
+                true
+            },
+            async {
+                clear.set(true);
+            },
+        )
+        .await;
+        assert!(!result);
+        assert!(!waited.get() && !clear.get());
+        let failure = report.into_result().unwrap_err();
+        assert!(failure.deadline_missed());
+        assert_eq!(failure.peer_error.unwrap().kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[tokio::test]

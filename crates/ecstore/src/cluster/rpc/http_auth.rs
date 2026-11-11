@@ -1399,6 +1399,73 @@ pub fn build_auth_headers(url: &str, method: &Method, headers: &mut HeaderMap) -
     Ok(())
 }
 
+/// Signs only external stream controls targeting members of this instance's topology.
+#[cfg(feature = "internode-transport")]
+#[derive(Clone)]
+pub struct ExternalStreamAuth {
+    peers: std::sync::Arc<std::collections::HashSet<url::Origin>>,
+}
+
+#[cfg(feature = "internode-transport")]
+impl ExternalStreamAuth {
+    /// The authenticated HTTP route used by peer stream controls.
+    pub const PATH: &'static str = "/rustfs/rpc/external_stream";
+
+    /// Capture the topology already configured for this host; a missing topology has no peers.
+    pub fn new(instance: &crate::runtime::instance::InstanceContext) -> Self {
+        let mut peers = std::collections::HashSet::new();
+        if let Some(topology) = instance.endpoints() {
+            for pool in topology.0 {
+                for endpoint in pool.endpoints.as_ref() {
+                    if matches!(endpoint.url.scheme(), "http" | "https") {
+                        peers.insert(endpoint.url.origin());
+                    }
+                }
+            }
+        }
+        Self {
+            peers: std::sync::Arc::new(peers),
+        }
+    }
+
+    /// Sign a fresh POST for one configured origin, request body digest and replay nonce.
+    /// The caller must send it to the returned URL without redirects or resubmission.
+    pub fn sign_control(&self, endpoint: &str, digest: &[u8; 32]) -> std::io::Result<(String, HeaderMap)> {
+        let mut url = url::Url::parse(endpoint).map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        if !url.username().is_empty()
+            || url.password().is_some()
+            || !self.peers.contains(&url.origin())
+            || url.path() != "/"
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "invalid internode control endpoint",
+            ));
+        }
+        url.set_path(Self::PATH);
+        url.query_pairs_mut()
+            .append_pair("body_sha256", &hex_simd::encode_to_string(digest, hex_simd::AsciiCase::Lower))
+            .append_pair("request_nonce", &Uuid::new_v4().to_string());
+        let url = url.to_string();
+        let mut headers = HeaderMap::new();
+        headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+        build_auth_headers(&url, &Method::POST, &mut headers)?;
+        Ok((url, headers))
+    }
+
+    /// Derive the operation key for this stream protocol and exact request digest.
+    /// The shared RPC signing credential is never exposed to the stream provider.
+    pub fn transfer_key(&self, request_digest: &[u8; 32]) -> std::io::Result<[u8; 32]> {
+        let secret = get_shared_secret()?;
+        let mut mac = <HmacSha256 as KeyInit>::new_from_slice(secret.as_bytes()).map_err(std::io::Error::other)?;
+        mac.update(b"rustfs-external-stream-key-v1\0");
+        mac.update(request_digest);
+        Ok(mac.finalize().into_bytes().into())
+    }
+}
+
 pub fn gen_signature_headers(url: &str, method: &Method) -> std::io::Result<HeaderMap> {
     let secret = get_shared_secret()?;
     let timestamp = OffsetDateTime::now_utc().unix_timestamp();

@@ -27,7 +27,6 @@ use crate::{
         DiskInfoOptions, DiskOption, DiskStore, FORMAT_CONFIG_FILE, MIGRATING_META_BUCKET, RUSTFS_META_BUCKET,
         error::DiskError,
         format::{FormatBackend, FormatErasureVersion, FormatMetaVersion, FormatV3},
-        new_disk,
     },
     layout::endpoints::Endpoints,
 };
@@ -65,7 +64,7 @@ pub async fn init_disks(
             match registered {
                 Some(disk) if disk.endpoint() == *ep => Ok(disk),
                 Some(_) => Err(DiskError::InconsistentDisk),
-                None => new_disk(ep, opt).await,
+                None => crate::disk::new_disk_for_instance(instance_ctx, ep, opt).await,
             }
         });
     }

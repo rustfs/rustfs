@@ -450,7 +450,8 @@ class GateTests(unittest.TestCase):
             jobs[job] = {'name': job, 'if': expression, 'steps': []}
         jobs['workspace-lint-and-build']['steps'] = [{'run': 'cargo clippy --all-targets -- -D warnings'}]
         jobs['test-and-lint-protocols']['strategy'] = {'matrix': {'features': [
-            {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'}]}}
+            {'name': 'swift', 'flags': '--features swift'}, {'name': 'sftp', 'flags': '--features sftp'}, {'name': 'http3', 'flags': '--features http3,swift'},
+            {'name': 'internode-transport', 'flags': '--features rustfs/internode-transport'}]}}
         jobs['required-checks'] = {'name': 'Test and Lint', 'if': "always() && (github.event_name != 'pull_request' || github.event.action != 'closed')",
                                    'needs': list(gate.ALWAYS_JOBS + gate.CODE_JOBS + gate.OPTIONAL_JOBS),
                                    'steps': [{'shell': 'bash', 'env': {'CI_NEEDS': '${{ toJSON(needs) }}'}, 'run': 'python3 scripts/ci_gate.py verify'}]}

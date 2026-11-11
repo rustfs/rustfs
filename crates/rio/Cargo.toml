@@ -29,6 +29,7 @@ documentation = "https://docs.rs/rustfs-rio/latest/rustfs_rio/"
 workspace = true
 
 [features]
+internode-transport = []
 default = []
 hotpath = [
     "hotpath/hotpath",

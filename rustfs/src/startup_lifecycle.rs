@@ -21,7 +21,7 @@ use crate::{
     startup_iam::{IamBootstrapDisposition, publish_ready_for_iam_bootstrap},
     startup_runtime_sources,
     startup_services::StartupServiceRuntime,
-    startup_shutdown::{StartupBackgroundTasks, run_startup_shutdown_sequence},
+    startup_shutdown::{StartupShutdownServices, run_startup_shutdown_sequence},
 };
 use rustfs_common::GlobalReadiness;
 use rustfs_object_capacity::capacity_manager::CapacityBackgroundTasks;
@@ -191,7 +191,12 @@ impl std::error::Error for StartupShutdownFailure {
     }
 }
 
-pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifecycle) -> Result<()> {
+pub(crate) async fn run_startup_runtime_lifecycle(
+    lifecycle: StartupRuntimeLifecycle,
+    #[cfg(feature = "internode-transport")] peer_control: &mut Option<
+        Arc<crate::storage_api::startup::storage::InstalledControlService>,
+    >,
+) -> Result<()> {
     let StartupRuntimeLifecycle {
         server_address,
         state_manager,
@@ -238,9 +243,11 @@ pub(crate) async fn run_startup_runtime_lifecycle(lifecycle: StartupRuntimeLifec
         s3_shutdown_tx,
         console_shutdown_tx,
         optional_runtimes,
-        StartupBackgroundTasks {
+        StartupShutdownServices {
             capacity: capacity_tasks,
             table_maintenance,
+            #[cfg(feature = "internode-transport")]
+            peer_control: peer_control.take(),
         },
         shutdown_token,
     )

@@ -1375,6 +1375,8 @@ pub(crate) mod context {
     pub(crate) use super::EndpointServerPools;
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
+    #[cfg(feature = "internode-transport")]
+    pub(crate) use crate::storage::storage_api::rpc_consumer::InstalledControlService;
     pub(crate) use crate::storage::storage_api::{BootstrapLocalTarget, ECStore, EndpointServerPools, InstanceContext};
     #[cfg(test)]
     pub(crate) use crate::storage::storage_api::{Endpoint, Endpoints, PoolEndpoints};

@@ -536,7 +536,7 @@ impl SetDisks {
             .as_ref()
             .and_then(|disk| disk.local_health_tracker_epoch_for_reconnect());
 
-        let (new_disk, fm) = match Self::connect_endpoint(ep, previous_health).await {
+        let (new_disk, fm) = match self.connect_endpoint(ep, previous_health).await {
             Ok(res) => res,
             Err(e) => {
                 warn!("renew_disk: connect_endpoint err {:?}", &e);
@@ -702,6 +702,7 @@ impl SetDisks {
     }
 
     pub(in crate::set_disk) async fn connect_endpoint(
+        &self,
         ep: &Endpoint,
         reconnect: Option<disk::disk_store::ReconnectDiskHealthState>,
     ) -> disk::error::Result<(DiskStore, FormatV3)> {
@@ -712,6 +713,8 @@ impl SetDisks {
                 health_check: true,
             },
             reconnect,
+            #[cfg(feature = "internode-transport")]
+            Some(&self.ctx),
         )
         .await?;
 
