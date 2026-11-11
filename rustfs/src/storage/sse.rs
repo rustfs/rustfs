@@ -1449,8 +1449,8 @@ fn record_managed_kms_outcome(
 /// Master-key version recorded in a managed-SSE data-key envelope, if the
 /// wrapping backend recorded one.
 ///
-/// `None` is the honest answer for every other shape: Transit and AWS wrap
-/// into opaque ciphertext that is not an envelope, Local records no version,
+/// `None` is the honest answer for every other shape: Transit and AWS keep
+/// the version inside their own opaque ciphertext, Local records no version,
 /// and pre-versioning envelopes never carried the field. The single field is
 /// read through `serde_json::Value` rather than a full `DataKeyEnvelope`
 /// parse, so the audit path cannot double-count the envelope's unknown-field
@@ -3211,19 +3211,20 @@ async fn apply_managed_decryption_material_inner(
     // Persisted wrapping format is the read-side source of truth. The
     // advertised SSE scheme and current KMS availability are write policy
     // and runtime state, neither of which identifies the historical provider.
+    //
+    // The one shape that cannot name its provider is a backend-native blob
+    // stored without an envelope. It is offered to the KMS only when the
+    // local provider could not have written those bytes and the active
+    // backend is one whose released versions persisted them that way. A
+    // MinIO sealed key keeps its own route below: its data key is opaque
+    // bytes as well, but sealed under the static master key.
     let provider: Arc<dyn SseDekProvider> = if is_data_key_envelope(&encrypted_data_key) {
-        // When a test-injected provider is registered via set_sse_dek_provider_for_test,
-        // use it instead of creating a fresh KmsSseDekProvider which cannot resolve
-        // a KMS service without an AppContext.
-        //
-        // Reads GLOBAL_KMS_DEK_PROVIDER (populated only by set_sse_dek_provider_for_test),
-        // never GLOBAL_SSE_DEK_PROVIDER, so a local provider cached by a prior
-        // get_local_sse_dek_provider call cannot be selected to unwrap a KMS envelope.
-        if let Some(cached) = GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
-            cached
-        } else {
-            Arc::new(KmsSseDekProvider::new().await?)
-        }
+        kms_sse_dek_provider().await?
+    } else if minio_sealed_key.is_none()
+        && !is_local_sse_dek(&encrypted_data_key)
+        && let Some(kms_provider) = bare_data_key_kms_provider().await
+    {
+        kms_provider
     } else {
         get_local_sse_dek_provider().await?
     };
@@ -3391,14 +3392,8 @@ pub(crate) async fn rewrap_object_encryption_metadata(
     };
     let object_context = build_object_encryption_context(bucket, key, kms_context.as_ref());
 
-    // The same provider selection as the managed decrypt path: the
-    // test-injected provider when registered, the KMS-backed one otherwise.
-    let provider: Arc<dyn SseDekProvider> =
-        if let Some(cached) = GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
-            cached
-        } else {
-            Arc::new(KmsSseDekProvider::new().await?)
-        };
+    // The same provider selection as the managed decrypt path.
+    let provider = kms_sse_dek_provider().await?;
     let response = provider.rewrap_sse_dek(&encrypted_data_key, &object_context).await?;
     if !response.rewrapped {
         return Ok(ObjectDekRewrapOutcome::AlreadyCurrent);
@@ -3457,6 +3452,12 @@ pub trait SseDekProvider: Send + Sync {
         kms_key_id: &str,
         context: &ObjectEncryptionContext,
     ) -> Result<[u8; 32], ApiError>;
+
+    /// Whether this provider may own a stored data key that is not a RustFS
+    /// envelope — see `KmsBackend::reads_bare_data_key_ciphertext`.
+    async fn reads_bare_data_key_ciphertext(&self) -> bool {
+        false
+    }
 
     /// Re-wrap a KMS-wrapped DEK envelope onto its master key's current
     /// version without exposing the plaintext DEK to the caller.
@@ -3614,6 +3615,12 @@ impl SseDekProvider for KmsSseDekProvider {
             .map_err(kms_operation_error)?;
 
         Ok((data_key, encrypted_data_key))
+    }
+
+    async fn reads_bare_data_key_ciphertext(&self) -> bool {
+        self.current_service()
+            .await
+            .is_some_and(|service| service.reads_bare_data_key_ciphertext())
     }
 
     async fn rewrap_sse_dek(
@@ -3853,6 +3860,46 @@ struct LocalSseDekEnvelope<'a> {
     version: u8,
     nonce: &'a str,
     ciphertext: &'a str,
+}
+
+/// Whether [`LocalSseDekProvider`] could have written these bytes.
+///
+/// Covers both shapes [`LocalSseDekProvider::decrypt_dek`] accepts — anything
+/// presented as a JSON object, so a damaged local envelope keeps its own
+/// diagnosis, and the deprecated `nonce:ciphertext` base64 pair. Everything
+/// else is bytes the local provider can only reject.
+fn is_local_sse_dek(encrypted_dek: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(encrypted_dek) else {
+        return false;
+    };
+    if text.trim_start().starts_with('{') {
+        return true;
+    }
+    let is_base64 = |part: &str| BASE64_STANDARD.decode_to_vec(part).is_ok();
+    text.split_once(':')
+        .is_some_and(|(nonce, ciphertext)| is_base64(nonce) && is_base64(ciphertext))
+}
+
+/// The provider that unwraps KMS-wrapped data keys.
+///
+/// A provider registered through `set_sse_dek_provider_for_test` stands in for
+/// the fresh [`KmsSseDekProvider`], which cannot resolve a KMS service without
+/// an `AppContext`. Only `GLOBAL_KMS_DEK_PROVIDER` is consulted, never
+/// `GLOBAL_SSE_DEK_PROVIDER`, so a local provider cached by an earlier
+/// `get_local_sse_dek_provider` call cannot be selected to unwrap a KMS envelope.
+async fn kms_sse_dek_provider() -> Result<Arc<dyn SseDekProvider>, ApiError> {
+    if let Some(cached) = GLOBAL_KMS_DEK_PROVIDER.read().ok().and_then(|guard| guard.as_ref().cloned()) {
+        return Ok(cached);
+    }
+    Ok(Arc::new(KmsSseDekProvider::new().await?))
+}
+
+/// The KMS provider, when its backend may own a stored data key that is not a
+/// RustFS envelope. `None` without a running KMS, which leaves such a key to
+/// the local provider exactly as before.
+async fn bare_data_key_kms_provider() -> Option<Arc<dyn SseDekProvider>> {
+    let provider = kms_sse_dek_provider().await.ok()?;
+    provider.reads_bare_data_key_ciphertext().await.then_some(provider)
 }
 
 /// Test-only alias so existing test code that references `TestSseDekProvider`
@@ -7509,6 +7556,351 @@ pub(crate) mod tests {
         assert_eq!(error.code, S3ErrorCode::ServiceUnavailable);
 
         reset_sse_dek_provider();
+    }
+
+    /// A loopback stand-in for AWS KMS, so the real AWS backend — SDK client,
+    /// service manager and all — sits behind the SSE entry points under test.
+    ///
+    /// It issues data keys the way AWS does: a binary blob that is not UTF-8
+    /// and carries nothing RustFS could recognize, decryptable only with the
+    /// encryption context it was generated under.
+    struct FakeAwsKms {
+        endpoint: String,
+        state: Arc<FakeAwsKmsState>,
+        server: tokio::task::JoinHandle<()>,
+    }
+
+    /// Plaintext data key and the encryption context it was generated under.
+    type FakeAwsDataKey = ([u8; 32], serde_json::Value);
+
+    #[derive(Default)]
+    struct FakeAwsKmsState {
+        data_keys: std::sync::Mutex<HashMap<Vec<u8>, FakeAwsDataKey>>,
+        decrypt_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Drop for FakeAwsKms {
+        fn drop(&mut self) {
+            self.server.abort();
+        }
+    }
+
+    impl FakeAwsKms {
+        const KEY_ARN: &'static str = "arn:aws:kms:us-east-1:111122223333:key/test-key";
+
+        async fn start() -> Self {
+            let state = Arc::new(FakeAwsKmsState::default());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fake AWS KMS listener");
+            let endpoint = format!("http://{}", listener.local_addr().expect("fake AWS KMS address"));
+            let app = axum::Router::new().fallback(Self::handle).with_state(state.clone());
+            let server = tokio::spawn(async move {
+                axum::serve(listener, app).await.expect("serve fake AWS KMS");
+            });
+            Self { endpoint, state, server }
+        }
+
+        fn decrypt_calls(&self) -> usize {
+            self.state.decrypt_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        async fn handle(
+            axum::extract::State(state): axum::extract::State<Arc<FakeAwsKmsState>>,
+            headers: axum::http::HeaderMap,
+            body: axum::body::Bytes,
+        ) -> axum::response::Response {
+            let operation = headers
+                .get("x-amz-target")
+                .and_then(|target| target.to_str().ok())
+                .and_then(|target| target.rsplit('.').next())
+                .unwrap_or_default();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            let context = request
+                .get("EncryptionContext")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+
+            let reply = match operation {
+                "ListKeys" => Ok(serde_json::json!({ "Keys": [], "Truncated": false })),
+                "DescribeKey" => Ok(serde_json::json!({
+                    "KeyMetadata": {
+                        "KeyId": "test-key",
+                        "Arn": Self::KEY_ARN,
+                        "CreationDate": 1_700_000_000,
+                        "Enabled": true,
+                        "KeyUsage": "ENCRYPT_DECRYPT",
+                        "KeyState": "Enabled",
+                        "Origin": "AWS_KMS",
+                        "KeyManager": "CUSTOMER",
+                    }
+                })),
+                "GenerateDataKey" => {
+                    let mut plaintext = [0u8; 32];
+                    rand::Rng::fill_bytes(&mut rand::rng(), &mut plaintext);
+                    // A continuation byte straight after ASCII is never valid
+                    // UTF-8, like the real blob in practice.
+                    let mut blob = vec![0x01, 0x02, 0x02, 0x00, 0x78];
+                    let mut tail = [0u8; 48];
+                    rand::Rng::fill_bytes(&mut rand::rng(), &mut tail);
+                    blob.extend(tail.map(|byte| 0x80 | (byte & 0x3f)));
+                    state
+                        .data_keys
+                        .lock()
+                        .expect("fake AWS KMS state")
+                        .insert(blob.clone(), (plaintext, context));
+                    Ok(serde_json::json!({
+                        "KeyId": Self::KEY_ARN,
+                        "Plaintext": BASE64_STANDARD.encode_to_string(plaintext),
+                        "CiphertextBlob": BASE64_STANDARD.encode_to_string(&blob),
+                    }))
+                }
+                "Decrypt" => {
+                    state.decrypt_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let blob = request
+                        .get("CiphertextBlob")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|blob| BASE64_STANDARD.decode_to_vec(blob).ok())
+                        .unwrap_or_default();
+                    match state.data_keys.lock().expect("fake AWS KMS state").get(&blob) {
+                        Some((plaintext, sealed_context)) if *sealed_context == context => Ok(serde_json::json!({
+                            "KeyId": Self::KEY_ARN,
+                            "Plaintext": BASE64_STANDARD.encode_to_string(plaintext),
+                            "EncryptionAlgorithm": "SYMMETRIC_DEFAULT",
+                        })),
+                        _ => Err("InvalidCiphertextException"),
+                    }
+                }
+                _ => Err("UnsupportedOperationException"),
+            };
+
+            let (status, body) = match reply {
+                Ok(body) => (axum::http::StatusCode::OK, body),
+                Err(code) => (
+                    axum::http::StatusCode::BAD_REQUEST,
+                    serde_json::json!({ "__type": code, "message": code }),
+                ),
+            };
+            axum::response::Response::builder()
+                .status(status)
+                .header("content-type", "application/x-amz-json-1.1")
+                .body(axum::body::Body::from(body.to_string()))
+                .expect("fake AWS KMS response")
+        }
+    }
+
+    /// Run `test` with the global KMS service on the AWS backend, pointed at a
+    /// [`FakeAwsKms`], and no SSE provider injected — the wiring a deployment
+    /// with `RUSTFS_KMS_BACKEND=aws` and no local master key has.
+    async fn with_aws_kms_backend<F, Fut>(test: F)
+    where
+        F: FnOnce(Arc<FakeAwsKms>) -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+        let fake = Arc::new(FakeAwsKms::start().await);
+
+        async_with_vars(
+            [
+                ("AWS_ACCESS_KEY_ID", Some("AKIDTEST")),
+                ("AWS_SECRET_ACCESS_KEY", Some("secret")),
+                ("AWS_SESSION_TOKEN", None),
+                ("AWS_PROFILE", None),
+                ("AWS_EC2_METADATA_DISABLED", Some("true")),
+                ("HTTP_PROXY", None),
+                ("HTTPS_PROXY", None),
+                ("http_proxy", None),
+                ("https_proxy", None),
+                ("RUSTFS_SSE_S3_MASTER_KEY", None),
+                ("__RUSTFS_SSE_SIMPLE_CMK", None),
+            ],
+            async {
+                let mut config = rustfs_kms::KmsConfig::aws(Some("us-east-1".to_string())).with_insecure_development_defaults();
+                let rustfs_kms::BackendConfig::Aws(aws) = &mut config.backend_config else {
+                    panic!("the AWS constructor must create an AWS backend configuration");
+                };
+                aws.endpoint_url = Some(fake.endpoint.clone());
+                let manager = rustfs_kms::init_global_kms_service_manager();
+                manager.reconfigure(config).await.expect("start the AWS KMS backend");
+                let provider = KmsSseDekProvider::new_with_service_manager(manager.clone())
+                    .await
+                    .expect("kms provider should initialize from the AWS-backed manager");
+                super::set_sse_dek_provider_for_test(Arc::new(provider));
+
+                test(fake.clone()).await;
+
+                manager.stop().await.expect("stop the AWS KMS backend");
+            },
+        )
+        .await;
+
+        reset_sse_dek_provider();
+    }
+
+    fn aws_sse_kms_write() -> EncryptionRequest<'static> {
+        EncryptionRequest {
+            bucket: "bucket",
+            key: "dir/object",
+            server_side_encryption: Some(ServerSideEncryption::from_static(ServerSideEncryption::AWS_KMS)),
+            ssekms_key_id: Some("test-key".to_string()),
+            ssekms_context: None,
+            sse_customer_algorithm: None,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            content_size: 4096,
+            principal: None,
+        }
+    }
+
+    async fn read_managed_object(metadata: &HashMap<String, String>) -> Result<super::DecryptionMaterial, ApiError> {
+        sse_decryption(DecryptionRequest {
+            bucket: "bucket",
+            key: "dir/object",
+            metadata,
+            sse_customer_key: None,
+            sse_customer_key_md5: None,
+            principal: None,
+        })
+        .await
+        .map(|material| material.expect("an SSE-KMS object must yield decryption material"))
+    }
+
+    /// An SSE-KMS object written through the AWS backend must be readable.
+    ///
+    /// It was not: the AWS data key reached storage as a bare blob, the read
+    /// path took the unrecognized bytes for a locally wrapped key, and every
+    /// GET failed asking for `RUSTFS_SSE_S3_MASTER_KEY` without AWS ever being
+    /// asked to decrypt.
+    #[tokio::test]
+    async fn sse_kms_object_written_through_the_aws_backend_reads_back() {
+        with_aws_kms_backend(|aws| async move {
+            let material = sse_encryption(aws_sse_kms_write())
+                .await
+                .expect("sse-kms encryption")
+                .expect("managed sse-kms material");
+            let metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+            // The rio-v2 writer keeps the wrapped data key in MinIO's slot only.
+            let stored_key = metadata
+                .get(INTERNAL_ENCRYPTION_KEY_HEADER)
+                .or_else(|| metadata.get(MINIO_INTERNAL_ENCRYPTION_KMS_DATA_KEY_HEADER))
+                .expect("stored data key");
+            let stored_key = BASE64_STANDARD.decode_to_vec(stored_key).expect("stored data key is base64");
+            assert!(
+                rustfs_kms::is_data_key_envelope(&stored_key),
+                "the stored data key must identify itself as KMS-wrapped"
+            );
+
+            let decrypted = read_managed_object(&metadata)
+                .await
+                .expect("an object written through the AWS backend must decrypt");
+
+            assert_eq!(decrypted.key_bytes, material.key_bytes);
+            assert_eq!(decrypted.sse_type, SSEType::SseKms);
+            assert_eq!(aws.decrypt_calls(), 1, "the read must be served by AWS Decrypt");
+        })
+        .await;
+    }
+
+    /// Objects written by releases through 1.0.5 keep the AWS blob bare in
+    /// their metadata. They are intact and must decrypt as they are, without
+    /// being rewritten.
+    #[cfg(not(feature = "rio-v2"))]
+    #[tokio::test]
+    async fn sse_kms_object_with_a_bare_aws_data_key_reads_back() {
+        with_aws_kms_backend(|aws| async move {
+            let material = sse_encryption(aws_sse_kms_write())
+                .await
+                .expect("sse-kms encryption")
+                .expect("managed sse-kms material");
+            let mut metadata = encryption_material_to_metadata(&material).expect("kms metadata should serialize");
+
+            // Rebuild what those releases persisted: the same headers, with
+            // the blob AWS issued in place of the envelope around it.
+            let envelope_b64 = metadata.get(INTERNAL_ENCRYPTION_KEY_HEADER).expect("stored data key").clone();
+            let envelope: serde_json::Value = serde_json::from_slice(
+                &BASE64_STANDARD
+                    .decode_to_vec(&envelope_b64)
+                    .expect("stored data key is base64"),
+            )
+            .expect("stored data key is an envelope");
+            let bare: Vec<u8> = serde_json::from_value(envelope["encrypted_key"].clone()).expect("envelope carries the AWS blob");
+            let bare_b64 = BASE64_STANDARD.encode_to_string(&bare);
+            let mut replaced = 0;
+            for value in metadata.values_mut().filter(|value| **value == envelope_b64) {
+                *value = bare_b64.clone();
+                replaced += 1;
+            }
+            assert!(replaced > 0, "the stored data key must have been replaced");
+            assert!(!rustfs_kms::is_data_key_envelope(&bare));
+
+            let decrypted = read_managed_object(&metadata)
+                .await
+                .expect("an object carrying a bare AWS data key must decrypt");
+
+            assert_eq!(decrypted.key_bytes, material.key_bytes);
+            assert_eq!(aws.decrypt_calls(), 1, "the read must be served by AWS Decrypt");
+        })
+        .await;
+    }
+
+    /// The bare-blob route exists for AWS alone. No other backend claims an
+    /// unrecognized data key, and without a KMS it still belongs to the local
+    /// provider, which is the one that can say what is wrong with it.
+    #[tokio::test]
+    async fn bare_data_key_stays_with_the_local_provider_without_an_aws_backend() {
+        let _guard = lock_sse_test_state().await;
+        reset_sse_dek_provider();
+        let local_kms = KmsSseDekProvider::new_with_service_manager(configure_test_global_local_kms().await)
+            .await
+            .expect("kms provider should initialize from the Local-backed manager");
+        assert!(!local_kms.reads_bare_data_key_ciphertext().await);
+        assert!(
+            !TestSseDekProvider::new_with_key([9u8; 32])
+                .reads_bare_data_key_ciphertext()
+                .await
+        );
+
+        async_with_vars([("RUSTFS_SSE_S3_MASTER_KEY", None::<&str>), ("__RUSTFS_SSE_SIMPLE_CMK", None)], async {
+            let metadata = HashMap::from([
+                ("x-amz-server-side-encryption".to_string(), ServerSideEncryption::AWS_KMS.to_string()),
+                (
+                    INTERNAL_ENCRYPTION_KEY_HEADER.to_string(),
+                    BASE64_STANDARD.encode_to_string([0x01, 0x02, 0x02, 0x00, 0x78, 0x80, 0x81]),
+                ),
+                (INTERNAL_ENCRYPTION_IV_HEADER.to_string(), BASE64_STANDARD.encode_to_string([0x14; 12])),
+                (INTERNAL_ENCRYPTION_KEY_ID_HEADER.to_string(), "test-key".to_string()),
+            ]);
+
+            let error = read_managed_object(&metadata)
+                .await
+                .expect_err("a bare blob has no owner without a KMS");
+
+            assert!(
+                error.message.contains("RUSTFS_SSE_S3_MASTER_KEY"),
+                "the local provider must still own the diagnosis: {}",
+                error.message
+            );
+        })
+        .await;
+
+        reset_sse_dek_provider();
+    }
+
+    #[test]
+    fn local_sse_dek_recognition_covers_exactly_the_local_formats() {
+        let wrapped = TestSseDekProvider::encrypt_dek([7u8; 32], [9u8; 32]).expect("local wrap");
+        assert!(super::is_local_sse_dek(wrapped.as_bytes()));
+        assert!(super::is_local_sse_dek(b"bm9uY2U=:Y2lwaGVydGV4dA=="));
+        // A damaged local envelope is still the local provider's to diagnose.
+        assert!(super::is_local_sse_dek(br#"  {"version": 9"#));
+
+        // An AWS blob: binary, and not UTF-8.
+        assert!(!super::is_local_sse_dek(&[0x01, 0x02, 0x02, 0x00, 0x78, 0x80, 0x81]));
+        // Text that merely contains a colon is not the legacy pair.
+        assert!(!super::is_local_sse_dek(b"vault:v1:Y2lwaGVydGV4dA=="));
+        assert!(!super::is_local_sse_dek(b"not base64:Y2lwaGVydGV4dA=="));
+        assert!(!super::is_local_sse_dek(b""));
     }
 
     /// Regression test for "local provider cached → dynamically enable KMS → decrypt KMS envelope".

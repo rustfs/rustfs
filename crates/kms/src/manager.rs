@@ -668,6 +668,11 @@ impl KmsManager {
         self.backend.capabilities()
     }
 
+    /// See [`KmsBackend::reads_bare_data_key_ciphertext`].
+    pub fn reads_bare_data_key_ciphertext(&self) -> bool {
+        self.backend.reads_bare_data_key_ciphertext()
+    }
+
     /// Direct handle to the configured backend, bypassing the metadata cache.
     /// Used by background maintenance that must observe fresh state.
     pub(crate) fn backend(&self) -> Arc<dyn KmsBackend> {
