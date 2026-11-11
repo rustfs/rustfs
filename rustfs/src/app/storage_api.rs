@@ -1821,8 +1821,10 @@ pub(crate) mod context {
     pub(crate) use super::bucket;
     pub(crate) use super::runtime;
     pub(crate) use crate::storage::storage_api::access_consumer::{
-        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-        OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, TableDataPlaneListAccess,
+        BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+        ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+        PostObjectRequestMarker, ReqInfo, RequestedCopySource, RequestedObjectLegalHold, RequestedObjectLockRetainUntil,
+        RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization, TableDataPlaneListAccess,
         TableDataPlanePublicationGuards,
     };
     pub(crate) use crate::storage::storage_api::request_context_consumer::RequestContext;

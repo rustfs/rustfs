@@ -118,7 +118,7 @@ pub struct RestRegisterTableHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for RestRegisterTableHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;
@@ -220,7 +220,7 @@ pub struct RestCommitTableHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for RestCommitTableHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;
@@ -290,7 +290,7 @@ pub struct UpdateTableMetadataLocationHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for UpdateTableMetadataLocationHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;
@@ -339,7 +339,7 @@ pub struct ImportTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for ImportTableCatalogHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;
@@ -421,7 +421,7 @@ pub struct RollbackTableCatalogHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for RollbackTableCatalogHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;

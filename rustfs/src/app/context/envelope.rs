@@ -29,8 +29,10 @@ use super::ServerContextSlot;
 use crate::app::metadata_route::WebsiteRead;
 use crate::app::object::request_body::BodyReadControl;
 use crate::app::storage_api::context::{
-    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, ObjectTagConditions,
-    OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectRequestMarker, ReqInfo, RequestContext,
+    BucketConfigMutationSnapshot, BucketGenerationGuard, CopySourceBucketGenerationGuard, MultipartStagingOperation,
+    ObjectTagConditions, OdmReadGenerationGuard, PendingDeleteBucketGenerationGuard, PostObjectPolicyHeaders,
+    PostObjectRequestMarker, ReqInfo, RequestContext, RequestedCopySource, RequestedObjectLegalHold,
+    RequestedObjectLockRetainUntil, RequestedObjectLockRetention, RequestedObjectTags, StagedMultipartPartAuthorization,
     TableDataPlaneListAccess, TableDataPlanePublicationGuards,
 };
 use crate::auth::{VerifiedPresignedRequest, VerifiedSigV4Request};
@@ -128,6 +130,7 @@ pub struct RequestEnvelope {
     verified_presigned: Option<VerifiedPresignedRequest>,
     website_read: Option<WebsiteRead>,
     post_object: Option<PostObjectRequestMarker>,
+    post_object_policy_headers: Option<PostObjectPolicyHeaders>,
     // Attached by the authorization phase (`storage/access.rs`) for the use case.
     req_info: Option<ReqInfo>,
     bucket_generation: Option<BucketGenerationGuard>,
@@ -138,6 +141,13 @@ pub struct RequestEnvelope {
     table_publication_guards: Option<TableDataPlanePublicationGuards>,
     table_list_access: Option<TableDataPlaneListAccess>,
     object_tag_conditions: Option<ObjectTagConditions>,
+    multipart_staging_operation: Option<MultipartStagingOperation>,
+    staged_multipart_part_authorization: Option<StagedMultipartPartAuthorization>,
+    requested_object_lock_retention: Option<RequestedObjectLockRetention>,
+    requested_object_lock_retain_until: Option<RequestedObjectLockRetainUntil>,
+    requested_object_legal_hold: Option<RequestedObjectLegalHold>,
+    requested_object_tags: Option<RequestedObjectTags>,
+    requested_copy_source: Option<RequestedCopySource>,
     residual_extensions: Extensions,
 }
 
@@ -167,6 +177,7 @@ impl RequestEnvelope {
             verified_presigned: extensions.remove(),
             website_read: extensions.remove(),
             post_object: extensions.remove(),
+            post_object_policy_headers: extensions.remove(),
             req_info: extensions.remove(),
             bucket_generation: extensions.remove(),
             pending_delete_bucket_generation: extensions.remove(),
@@ -176,6 +187,13 @@ impl RequestEnvelope {
             table_publication_guards: extensions.remove(),
             table_list_access: extensions.remove(),
             object_tag_conditions: extensions.remove(),
+            multipart_staging_operation: extensions.remove(),
+            staged_multipart_part_authorization: extensions.remove(),
+            requested_object_lock_retention: extensions.remove(),
+            requested_object_lock_retain_until: extensions.remove(),
+            requested_object_legal_hold: extensions.remove(),
+            requested_object_tags: extensions.remove(),
+            requested_copy_source: extensions.remove(),
             residual_extensions: extensions,
         }
     }
@@ -312,6 +330,10 @@ impl RequestEnvelope {
         self.table_publication_guards.as_ref()
     }
 
+    pub(crate) fn install_table_publication_guards(&mut self, guards: TableDataPlanePublicationGuards) {
+        self.table_publication_guards = Some(guards);
+    }
+
     pub(crate) fn table_list_access(&self) -> Option<&TableDataPlaneListAccess> {
         self.table_list_access.as_ref()
     }
@@ -319,11 +341,147 @@ impl RequestEnvelope {
     pub(crate) fn object_tag_conditions(&self) -> Option<&ObjectTagConditions> {
         self.object_tag_conditions.as_ref()
     }
+
+    pub(crate) fn install_object_tag_conditions(&mut self, conditions: ObjectTagConditions) {
+        self.object_tag_conditions = Some(conditions);
+    }
+
+    pub(crate) fn multipart_staging_operation(&self) -> Option<&MultipartStagingOperation> {
+        self.multipart_staging_operation.as_ref()
+    }
+
+    pub(crate) fn staged_multipart_part_authorization(&self) -> Option<&StagedMultipartPartAuthorization> {
+        self.staged_multipart_part_authorization.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retention(&self) -> Option<&RequestedObjectLockRetention> {
+        self.requested_object_lock_retention.as_ref()
+    }
+
+    pub(crate) fn requested_object_lock_retain_until(&self) -> Option<&RequestedObjectLockRetainUntil> {
+        self.requested_object_lock_retain_until.as_ref()
+    }
+
+    pub(crate) fn post_object_policy_headers(&self) -> Option<&PostObjectPolicyHeaders> {
+        self.post_object_policy_headers.as_ref()
+    }
+
+    pub(crate) fn requested_object_legal_hold(&self) -> Option<&RequestedObjectLegalHold> {
+        self.requested_object_legal_hold.as_ref()
+    }
+
+    pub(crate) fn requested_object_tags(&self) -> Option<&RequestedObjectTags> {
+        self.requested_object_tags.as_ref()
+    }
+
+    pub(crate) fn requested_copy_source(&self) -> Option<&RequestedCopySource> {
+        self.requested_copy_source.as_ref()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn authorization_payloads_move_from_extensions_into_named_fields() {
+        let mut extensions = Extensions::new();
+        extensions.insert(MultipartStagingOperation);
+        extensions.insert(StagedMultipartPartAuthorization);
+        let mut retention = RequestedObjectLockRetention(Default::default());
+        retention.0.mode = Some("COMPLIANCE".to_owned().into());
+        extensions.insert(retention);
+        let retain_until = time::OffsetDateTime::from_unix_timestamp(2_000_000_000).expect("valid timestamp");
+        extensions.insert(RequestedObjectLockRetainUntil(retain_until));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope.multipart_staging_operation().is_some(),
+                envelope.staged_multipart_part_authorization().is_some(),
+                envelope
+                    .requested_object_lock_retention()
+                    .and_then(|value| value.0.mode.as_ref().map(|mode| mode.as_str())),
+                envelope.requested_object_lock_retain_until().map(|value| value.0),
+                envelope.residual_extensions().is_empty(),
+                empty.multipart_staging_operation().is_none(),
+                empty.staged_multipart_part_authorization().is_none(),
+                empty.requested_object_lock_retention().is_none(),
+                empty.requested_object_lock_retain_until().is_none(),
+            ),
+            (true, true, Some("COMPLIANCE"), Some(retain_until), true, true, true, true, true),
+        );
+    }
+
+    #[test]
+    fn request_body_policy_payloads_move_from_extensions_into_named_fields() {
+        let mut form_headers = HeaderMap::new();
+        form_headers.insert("x-amz-tagging", http::HeaderValue::from_static("from=form"));
+        let mut legal_hold = RequestedObjectLegalHold(Default::default());
+        legal_hold.0.status = Some("ON".to_owned().into());
+        let mut tags = RequestedObjectTags(Default::default());
+        tags.0.tag_set.push(Default::default());
+        tags.0.tag_set[0].key = Some("body".to_owned());
+        let mut extensions = Extensions::new();
+        extensions.insert(PostObjectPolicyHeaders(form_headers));
+        extensions.insert(legal_hold);
+        extensions.insert(tags);
+        extensions.insert(RequestedCopySource("source-bucket/source-key".to_owned()));
+        let head = || RequestHead {
+            method: Method::PUT,
+            uri: "/bucket/key".parse().expect("valid URI"),
+            headers: HeaderMap::new(),
+            credentials: None,
+            region: None,
+            service: None,
+        };
+
+        let envelope = RequestEnvelope::from_parts(head(), extensions);
+        let empty = RequestEnvelope::from_parts(head(), Extensions::new());
+
+        assert_eq!(
+            (
+                envelope
+                    .post_object_policy_headers()
+                    .and_then(|headers| headers.0.get("x-amz-tagging"))
+                    .and_then(|value| value.to_str().ok()),
+                envelope
+                    .requested_object_legal_hold()
+                    .and_then(|hold| hold.0.status.as_ref().map(|status| status.as_str())),
+                envelope
+                    .requested_object_tags()
+                    .and_then(|tags| tags.0.tag_set.first())
+                    .and_then(|tag| tag.key.as_deref()),
+                envelope.requested_copy_source().map(|source| source.0.as_str()),
+                envelope.residual_extensions().is_empty(),
+                empty.post_object_policy_headers().is_none(),
+                empty.requested_object_legal_hold().is_none(),
+                empty.requested_object_tags().is_none(),
+                empty.requested_copy_source().is_none(),
+            ),
+            (
+                Some("from=form"),
+                Some("ON"),
+                Some("body"),
+                Some("source-bucket/source-key"),
+                true,
+                true,
+                true,
+                true,
+                true
+            ),
+        );
+    }
 
     #[test]
     fn request_credentials_debug_redacts_secret_and_session_token() {

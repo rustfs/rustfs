@@ -89,7 +89,7 @@ pub struct RestReplaceViewHandler {}
 
 #[async_trait::async_trait]
 impl crate::admin::router::Operation for RestReplaceViewHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
+    // TODO(T1.12-codemod): migrate this handler to the owned operation boundary.
     async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
         let req = legacy_request_view(&s3s_req);
         let warehouse = warehouse_from_params(&params)?;
