@@ -38,7 +38,7 @@ compile_error!("gateway-stack is restricted to debug builds");
 
 mod authorizer;
 
-use self::authorizer::{AUTHORIZATION_TABLE, RustfsAuthorizer, UnwiredDecisionCore};
+use self::authorizer::{AUTHORIZATION_TABLE, OwnedDecisionCore, RequestLine, RustfsAuthorizer};
 use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, register};
 use crate::server::ssec_transport::is_secure_transport;
@@ -75,6 +75,14 @@ pub(crate) struct GatewayAssembly {
     /// `RUSTFS_HTTP_REQUEST_BODY_READ_TIMEOUT`: the longest silence between two body reads. Zero
     /// disables the bound, as it does on the legacy stack.
     pub(crate) body_read_timeout: Duration,
+    /// Whether Keystone authentication is enabled in configuration (`RUSTFS_KEYSTONE_ENABLE`).
+    pub(crate) keystone_enabled: bool,
+}
+
+/// Whether Keystone authentication is switched on in configuration. A Keystone configuration
+/// that cannot be read counts as switched on: only a readable configuration can say it is off.
+pub(crate) fn keystone_enabled_in_configuration() -> bool {
+    rustfs_keystone::KeystoneConfig::from_env().map_or(true, |config| config.enable)
 }
 
 /// Why the gateway stack could not be assembled. Startup fails with it; the legacy stack is never
@@ -89,6 +97,12 @@ pub(crate) enum GatewayAssemblyError {
     ServerDomains(rustfs_gateway::LegacyDomainError),
     #[error("the gateway service refused its assembly: {0:?}")]
     Service(AssemblyError),
+    #[error(
+        "RUSTFS_S3_STACK=gateway cannot be served while RUSTFS_KEYSTONE_ENABLE is on: the gateway admits a request that \
+         carries only X-Auth-Token as anonymous while RustFS reads the Keystone identity behind it; Keystone support on the \
+         gateway stack is rustfs/gateway#1586"
+    )]
+    KeystoneEnabled,
 }
 
 /// The assembled gateway service.
@@ -109,8 +123,8 @@ impl GatewayStack {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
         let root = Arc::new(live_root(Arc::clone(&assembly.server_ctx)));
-        // WIRED BY rustfs/rustfs#9281: the owned authorization entry point replaces the unwired core.
-        let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
+        let core = OwnedDecisionCore::new(Arc::clone(&assembly.server_ctx));
+        let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(core));
         Self::assemble_with(assembly, iam, root, authorizer)
     }
 
@@ -120,6 +134,13 @@ impl GatewayStack {
         root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
+        // The pinned gateway admits a request that carries only `X-Auth-Token` as anonymous and
+        // runs no authenticator for it, while the RustFS code behind the gateway reads the
+        // Keystone identity: the request would be authorized as one caller and served as
+        // another. Refused until the gateway authenticates the token (rustfs/gateway#1586).
+        if assembly.keystone_enabled {
+            return Err(GatewayAssemblyError::KeystoneEnabled);
+        }
         // A root the gateway could not verify a signature with is a startup error, never a
         // server that silently has no root. Requests read the live root from `root`.
         RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
@@ -164,6 +185,13 @@ impl GatewayStack {
         B::Data: Send,
         B::Error: Into<Box<dyn std::error::Error + Send + Sync>>,
     {
+        // The authorizer is handed the headers and the query but not the request line, and the
+        // shared decision core is asked about the request as it arrived.
+        let line = RequestLine {
+            method: request.method().clone(),
+            uri: request.uri().clone(),
+        };
+        request.extensions_mut().insert(line);
         attach_host_facts(request.extensions_mut());
         let mut service = self.service.clone();
         let answer = tower::Service::call(&mut service, request);

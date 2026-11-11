@@ -19,7 +19,7 @@ use crate::auth::IAMAuth;
 use crate::auth_keystone;
 use crate::config;
 #[cfg(feature = "gateway-stack")]
-use crate::server::gateway_stack::{GatewayAssembly, GatewayStack};
+use crate::server::gateway_stack::{GatewayAssembly, GatewayStack, keystone_enabled_in_configuration};
 use crate::server::stack::{S3StackService, select_stack};
 use crate::server::{
     Http12ShutdownOutcome, ReadinessGateLayer, RemoteAddr, ShutdownHandle,
@@ -2503,6 +2503,7 @@ async fn start_http_server_inner(
             region: config.region.clone(),
             server_domains: vh_domain_hosts.to_vec(),
             body_read_timeout: http_request_body_read_timeout,
+            keystone_enabled: keystone_enabled_in_configuration(),
         })
         .map_err(Error::other)?;
         info!(

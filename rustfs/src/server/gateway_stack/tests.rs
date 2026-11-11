@@ -40,6 +40,7 @@ fn assembly() -> GatewayAssembly {
         region: Some("us-east-1".to_owned()),
         server_domains: Vec::new(),
         body_read_timeout: Duration::from_secs(300),
+        keystone_enabled: false,
     }
 }
 
@@ -89,9 +90,14 @@ fn root() -> LiveRoot {
     LiveRoot(Arc::new(Mutex::new(Some(Arc::new(root)))))
 }
 
+/// The authorizer production installs: the registered table over the shared decision core.
+fn production_authorizer() -> RustfsAuthorizer {
+    RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(OwnedDecisionCore::new(ServerContextSlot::new())))
+}
+
 /// The stack as production assembles it, over an IAM that knows no key but the root's.
 fn stack_over(iam: ScriptedIam) -> GatewayStack {
-    let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
+    let authorizer = production_authorizer();
     GatewayStack::assemble_with(assembly(), Arc::new(iam), root().source(), authorizer).expect("the stack assembles")
 }
 
@@ -201,7 +207,7 @@ fn a_missing_or_short_root_secret_fails_the_assembly() {
 async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothing() {
     const ROTATED_ACCESS_KEY: &str = "rotatedgatewayroot";
     let live = root();
-    let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
+    let authorizer = production_authorizer();
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), authorizer)
         .expect("the stack assembles");
     let signed_as = |access_key: &str| signed_with_a_wrong_signature(request(Method::GET, "/"), access_key);
@@ -221,12 +227,57 @@ async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothi
         "the new root key is known: {rotated}"
     );
 
-    // No root at all: the server cannot tell who is root, so the key that was root a moment ago
-    // verifies nothing.
+    // Injected: a root source that returns nothing, so the provider returns an error for the
+    // lookup. The key that was root a moment ago verifies nothing; the pinned gateway answers the
+    // provider fault as an unknown key. Ledger entry R-068 (rustfs/backlog#2684): this status
+    // becomes `500` when the pin includes rustfs/gateway#1585 and the assembly sets its switch.
     live.clear();
     let (status, _, withdrawn) = answer(&stack, signed_as(ROTATED_ACCESS_KEY)).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "{withdrawn}");
     assert!(withdrawn.contains("<Code>InvalidAccessKeyId</Code>"), "{withdrawn}");
+}
+
+#[test]
+fn keystone_enabled_fails_the_assembly_and_names_both_settings() {
+    let refused = GatewayStack::assemble(GatewayAssembly {
+        keystone_enabled: true,
+        ..assembly()
+    });
+
+    let error = refused.err().expect("the gateway stack is not served with Keystone enabled");
+    assert!(matches!(error, GatewayAssemblyError::KeystoneEnabled), "{error:?}");
+    let message = error.to_string();
+    for named in ["RUSTFS_S3_STACK=gateway", "RUSTFS_KEYSTONE_ENABLE", "rustfs/gateway#1586"] {
+        assert!(message.contains(named), "{named} is missing from: {message}");
+    }
+}
+
+#[test]
+fn keystone_disabled_assembles() {
+    GatewayStack::assemble(GatewayAssembly {
+        keystone_enabled: false,
+        ..assembly()
+    })
+    .expect("the gateway stack assembles without Keystone");
+}
+
+#[test]
+fn keystone_is_read_from_configuration_and_an_unreadable_one_counts_as_enabled() {
+    const ENABLE: &str = "RUSTFS_KEYSTONE_ENABLE";
+    const AUTH_URL: &str = "RUSTFS_KEYSTONE_AUTH_URL";
+
+    temp_env::with_vars([(ENABLE, None::<&str>), (AUTH_URL, None)], || {
+        assert!(!keystone_enabled_in_configuration(), "unset is off");
+    });
+    temp_env::with_vars([(ENABLE, Some("false")), (AUTH_URL, None)], || {
+        assert!(!keystone_enabled_in_configuration(), "false is off");
+    });
+    temp_env::with_vars([(ENABLE, Some("true")), (AUTH_URL, Some("http://keystone.example.test:5000"))], || {
+        assert!(keystone_enabled_in_configuration(), "true is on");
+    });
+    temp_env::with_vars([(ENABLE, Some("true")), (AUTH_URL, None)], || {
+        assert!(keystone_enabled_in_configuration(), "on but unreadable is still on");
+    });
 }
 
 #[test]
@@ -304,9 +355,11 @@ fn host_facts_never_lean_towards_secure_or_invent_an_address() {
     assert!(peerless.get::<ClientAddr>().is_none());
 }
 
-/// Records the client facts the gateway hands its authorizer, and refuses.
+/// Records what the gateway hands its authorizer about the client and the request line, and
+/// refuses.
 struct RecordingAuthorizer {
     seen: Arc<Mutex<Option<Option<ClientFacts>>>>,
+    line: Arc<Mutex<Option<RequestLine>>>,
 }
 
 impl Authorizer for RecordingAuthorizer {
@@ -316,6 +369,7 @@ impl Authorizer for RecordingAuthorizer {
         _request: &'a AuthzRequest<'a>,
     ) -> BoxFuture<'a, Decision> {
         *self.seen.lock().expect("recording lock") = Some(context.client().copied());
+        *self.line.lock().expect("recording lock") = context.server_extensions().get::<RequestLine>().cloned();
         Box::pin(async { Decision::Deny })
     }
 
@@ -332,10 +386,14 @@ impl Authorizer for RecordingAuthorizer {
 #[tokio::test]
 async fn the_authorizer_sees_the_client_facts_the_host_attached() {
     let seen = Arc::new(Mutex::new(None));
-    let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
+    let line = Arc::new(Mutex::new(None));
+    let authorizer = RecordingAuthorizer {
+        seen: Arc::clone(&seen),
+        line: Arc::clone(&line),
+    };
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
         .expect("assembles");
-    let proxied = request(Method::GET, "/")
+    let proxied = request(Method::GET, "/?prefix=probe")
         .extension(Some(RemoteAddr(SocketAddr::from(PEER))))
         .extension(ClientInfo::direct(SocketAddr::new(IpAddr::from(CLIENT), 443)))
         .extension(NativeTlsTransport(true));
@@ -352,12 +410,24 @@ async fn the_authorizer_sees_the_client_facts_the_host_attached() {
     assert!(facts.transport_secure, "the listener terminated TLS");
     assert_eq!(facts.client_ip, Some(IpAddr::from(CLIENT)));
     assert_eq!(facts.source_ip(), Some(IpAddr::from(CLIENT)));
+    let line = line
+        .lock()
+        .expect("recording lock")
+        .take()
+        .expect("the host attached the request line");
+    assert_eq!(line.method, Method::GET);
+    assert_eq!(line.uri.path(), "/");
+    assert_eq!(line.uri.query(), Some("prefix=probe"));
 }
 
 #[tokio::test]
 async fn the_authorizer_sees_a_cleartext_transport_as_cleartext() {
     let seen = Arc::new(Mutex::new(None));
-    let authorizer = RecordingAuthorizer { seen: Arc::clone(&seen) };
+    let line = Arc::new(Mutex::new(None));
+    let authorizer = RecordingAuthorizer {
+        seen: Arc::clone(&seen),
+        line: Arc::clone(&line),
+    };
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), root().source(), authorizer)
         .expect("assembles");
 
@@ -421,12 +491,15 @@ async fn an_unknown_access_key_is_refused_as_the_caller_s_fault() {
     assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
 }
 
-/// The pinned gateway answers a credential backend it cannot ask exactly as it answers an unknown
-/// key: its SigV4 authenticator folds a provider fault into the same refusal. The legacy stack
-/// answers `500 InternalError` here. What holds on both is that the request is never served; the
-/// status is pinned so a gateway that starts answering a fault as one turns this test red.
+/// Injected: a credential provider that returns an error for the lookup of a non-root key.
+///
+/// The pinned gateway's SigV4 authenticator answers a provider fault exactly as it answers an
+/// unknown key, `403 InvalidAccessKeyId`; the legacy stack answers a failed lookup `500`. Ledger
+/// entry R-068 (rustfs/backlog#2684): rustfs/gateway#1585 adds an opt-in switch that answers the
+/// fault as one. When the pin includes it and the assembly sets it, this test expects `500`.
+/// Until then the status is pinned, and what holds on both stacks is that nothing is served.
 #[tokio::test]
-async fn an_unavailable_iam_is_refused_and_never_served() {
+async fn a_credential_lookup_that_fails_is_refused_and_never_served() {
     let stack = stack_over(ScriptedIam { ready: false });
 
     let (status, _, body) = answer(&stack, signed_with_a_wrong_signature(request(Method::GET, "/"), "AKIDUSER0001")).await;
