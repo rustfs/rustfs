@@ -63,6 +63,7 @@ script-tests: ## Run shell script tests
 	./scripts/check_s3s_footprint.sh --self-test
 	./scripts/test_check_test_count_ratchet.sh
 	./scripts/test_guard_source_set.sh
+	./scripts/test_split_guard_rules.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/split_ecfs_legacy_edge.py --self-test
