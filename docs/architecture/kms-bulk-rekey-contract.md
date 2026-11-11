@@ -60,14 +60,14 @@ There is no key-version metadata key. Object metadata carries the key id (`x-rus
 | Vault Transit (`crates/kms/src/backends/vault_transit.rs`) | Yes | `vault:vN:` prefix of the ciphertext in `encrypted_key`; the envelope's version field is deliberately `None` | Yes, by parsing that prefix |
 | Local (`crates/kms/src/backends/local.rs`) | No, rotation is rejected | Nowhere; hardcoded `None` | Moot while rotation is rejected |
 | Static (`crates/kms/src/backends/static_kms.rs`) | No | Nowhere; hardcoded `None` | Moot |
-| AWS (`crates/kms/src/backends/aws.rs`) | AWS-managed | Inside the opaque `CiphertextBlob`; no `DataKeyEnvelope` | **No** |
+| AWS (`crates/kms/src/backends/aws.rs`) | AWS-managed | Inside the opaque `CiphertextBlob`, which the envelope carries in `encrypted_key`; objects written through 1.0.5 store that blob with no `DataKeyEnvelope` at all | **No** |
 
 Contract rules that follow:
 
 - **`None` does not mean one thing.** KV2: pre-versioning envelope, resolved by `resolve_envelope_master_key_version` to the key's recorded baseline, never implicitly to "current". Transit: permanent and expected; read the ciphertext prefix. Local/Static: unconditional. Version extraction must be dispatched by backend, never inferred from the field alone.
 - **Local's `None` is coupled to the Local blocker.** If Local gains rotation history (`rustfs/backlog#1565`), envelope version recording must land in the same change, or Local becomes a second unreadable backend.
 - The primitive exposes the wrapping version through **one backend-dispatched accessor** (`KmsManager::describe_data_key_wrapping`) and reports **"already at target state" as an outcome distinct from "re-wrapped"**.
-- **AWS is a scoping exception.** Its ciphertext is opaque, so no scan can skip, report version composition, or self-evidence completion; a re-run would rewrap everything. AWS-backed keys are out of scope and must be refused at admission.
+- **AWS is a scoping exception.** Its ciphertext is opaque whether or not an envelope surrounds it, so no scan can skip, report version composition, or self-evidence completion; a re-run would rewrap everything. AWS-backed keys are out of scope and must be refused at admission.
 - Skip detection costs a base64 decode plus JSON parse (plus a prefix parse on Transit) per work unit: CPU, not I/O, and part of the rate budget rather than free.
 
 ## Failure Semantics

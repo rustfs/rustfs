@@ -20,9 +20,9 @@ use crate::backends::vault_credentials::{
 };
 use crate::backends::{
     BackendCapabilities, ExpiredKeyRemoval, KmsBackend, ListedKeyFailure, StateGatedOperation, UnreadableKeys,
-    classify_listed_key_failure, empty_key_page, ensure_key_state_permits, ensure_key_status_permits,
-    ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys, started_at_the_first_key,
-    validate_key_id_segment,
+    classify_listed_key_failure, destruction_requires_pending_deletion, empty_key_page, ensure_key_state_permits,
+    ensure_key_status_permits, ensure_rewrap_context_matches, ensure_tag_keys_are_mutable, list_keys_page_size, paginate_keys,
+    started_at_the_first_key, validate_key_id_segment,
 };
 use crate::config::{KmsConfig, VaultConfig};
 use crate::encryption::{
@@ -2135,8 +2135,6 @@ impl KmsBackend for VaultKmsBackend {
     }
 
     async fn delete_key(&self, request: DeleteKeyRequest) -> Result<DeleteKeyResponse> {
-        // For Vault backend, we'll mark keys for deletion but not physically delete them
-        // This allows for recovery during the pending window
         let key_id = &request.key_id;
 
         // First, check if the key exists and get its metadata
@@ -2149,41 +2147,32 @@ impl KmsBackend for VaultKmsBackend {
         };
 
         let deletion_date = if request.force_immediate.unwrap_or(false) {
-            // Check if key is already in PendingDeletion state (or a tombstone
-            // left by a crashed removal, which may simply be completed)
-            if key_metadata.key_state == KeyState::PendingDeletion || key_metadata.key_state == KeyState::Unavailable {
-                // Tombstone first: mark the record Deleted before removing it,
-                // so a crash between the two steps leaves a key that is already
-                // unusable and whose removal can simply be re-run. Written
-                // check-and-set with re-validation: a concurrent cancellation
-                // that commits first wins and fails this removal instead of
-                // being overwritten.
-                self.client
-                    .update_key_data_with_cas(key_id, |key_data| match key_data.status {
-                        KeyStatus::Deleted => Ok(CasMutation::Skip(())),
-                        KeyStatus::PendingDeletion => {
-                            key_data.status = KeyStatus::Deleted;
-                            Ok(CasMutation::Write(()))
-                        }
-                        KeyStatus::Active | KeyStatus::Disabled => {
-                            Err(KmsError::invalid_key_state(format!("Key {key_id} is no longer pending deletion")))
-                        }
-                    })
-                    .await?;
-                // Force immediate deletion: physically delete the key from Vault storage
-                self.client.delete_key(key_id).await?;
+            // Expedited destruction only skips the rest of the waiting window:
+            // the key must already be pending deletion (or be a tombstone left
+            // by a crashed removal, which may simply be completed).
+            //
+            // Tombstone first: mark the record Deleted before removing it, so
+            // a crash between the two steps leaves a key that is already
+            // unusable and whose removal can simply be re-run. Written
+            // check-and-set with re-validation: a concurrent cancellation
+            // that commits first wins and fails this removal instead of
+            // being overwritten.
+            self.client
+                .update_key_data_with_cas(key_id, |key_data| match key_data.status {
+                    KeyStatus::Deleted => Ok(CasMutation::Skip(())),
+                    KeyStatus::PendingDeletion => {
+                        key_data.status = KeyStatus::Deleted;
+                        Ok(CasMutation::Write(()))
+                    }
+                    KeyStatus::Active | KeyStatus::Disabled => Err(destruction_requires_pending_deletion(key_id)),
+                })
+                .await?;
+            self.client.delete_key(key_id).await?;
+            key_metadata.key_state = KeyState::PendingDeletion;
+            key_metadata.deletion_date = Some(Zoned::now());
 
-                // Return empty deletion_date to indicate key was permanently deleted
-                None
-            } else {
-                // For non-pending keys, mark as PendingDeletion
-                let marked_at = Zoned::now();
-                self.mark_key_pending_deletion(key_id, &marked_at).await?;
-                key_metadata.key_state = KeyState::PendingDeletion;
-                key_metadata.deletion_date = Some(marked_at);
-
-                None
-            }
+            // No deletion date: the key is permanently gone, not scheduled.
+            None
         } else {
             // Schedule for deletion (default 30 days)
             ensure_key_state_permits(key_id, &key_metadata.key_state, StateGatedOperation::ScheduleDeletion)?;
@@ -4026,6 +4015,101 @@ mod tests {
         assert!(
             !requests.iter().any(|line| line.starts_with("POST ")),
             "a cancellation that lost to the sweep must not write anything: {requests:?}"
+        );
+    }
+
+    /// Destruction always passes through the cancellable pending state. An
+    /// immediate deletion of a key that was never scheduled is refused without
+    /// writing anything: parking it in PendingDeletion and reporting success
+    /// would tell the caller a key is gone while every object under it stays
+    /// readable.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_an_enabled_key_is_refused_without_writing() {
+        let vault = ScriptedVault::serve(vec![
+            // describe_key: key info plus stored metadata.
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+            // The check-and-set read observes a key that is not pending.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&healthy_key_data())),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let error = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect_err("a key that is not pending deletion must not be destroyed in one request");
+        assert!(
+            matches!(&error, KmsError::InvalidOperation { message } if message.contains("not pending deletion")),
+            "got {error:?}"
+        );
+
+        let requests = vault.requests();
+        assert!(
+            requests.iter().all(|line| line.starts_with("GET ")),
+            "a refused immediate deletion must neither write nor delete: {requests:?}"
+        );
+    }
+
+    /// The other half: once the key is pending deletion, one immediate request
+    /// tombstones the record and removes it.
+    #[tokio::test]
+    async fn wired_immediate_deletion_of_a_pending_key_destroys_it() {
+        let mut pending = healthy_key_data();
+        pending.status = KeyStatus::PendingDeletion;
+        pending.deletion_date = Some(Zoned::now() + Duration::from_secs(7 * 86400));
+
+        let vault = ScriptedVault::serve(vec![
+            // describe_key: key info plus stored metadata.
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            // Check-and-set tombstone.
+            ScriptedResponse::ok(kv2_metadata_read_data(1)),
+            ScriptedResponse::ok(kv2_read_data(&pending)),
+            ScriptedResponse::ok(kv2_write_ack()),
+            // The key was never rotated: no version records to purge.
+            ScriptedResponse::empty_list_404(),
+            // Removal of the key record itself.
+            ScriptedResponse::ok(serde_json::Value::Null),
+        ])
+        .await;
+        let config = KmsConfig::vault(
+            url::Url::parse(&vault.address).expect("scripted vault address should parse"),
+            "scripted-token".to_string(),
+        )
+        .with_insecure_development_defaults();
+        let backend = VaultKmsBackend::new(config).await.expect("vault kv2 backend should build");
+
+        let response = backend
+            .delete_key(DeleteKeyRequest {
+                key_id: "wired-key".to_string(),
+                pending_window_in_days: None,
+                force_immediate: Some(true),
+                confirm_key_id: Some("wired-key".to_string()),
+            })
+            .await
+            .expect("immediate deletion of a pending key should succeed");
+        assert!(response.deletion_date.is_none(), "a destroyed key has no future deadline to report");
+
+        let requests = vault.requests();
+        assert_eq!(requests.len(), 7, "{requests:?}");
+        let tombstone = parse_write_body(&vault.request_bodies()[4]);
+        assert_eq!(tombstone["options"]["cas"], serde_json::json!(1), "{tombstone}");
+        assert_eq!(tombstone["data"]["status"], serde_json::json!("Deleted"), "{tombstone}");
+        assert_eq!(
+            requests[6], "DELETE /v1/secret/metadata/rustfs/kms/keys/wired-key",
+            "the key record must be removed: {requests:?}"
         );
     }
 

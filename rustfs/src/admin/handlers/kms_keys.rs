@@ -27,6 +27,7 @@ use crate::server::ADMIN_PREFIX;
 use http::header::CONTENT_TYPE;
 use hyper::{HeaderMap, Method, StatusCode};
 use matchit::Params;
+use percent_encoding::percent_decode_str;
 use rustfs_config::MAX_ADMIN_REQUEST_BODY_SIZE;
 use rustfs_kms::{KeyImpactReport, KmsAuditOperation, KmsError, types::*};
 use rustfs_policy::policy::action::{Action, KmsAction};
@@ -837,8 +838,49 @@ mod tests {
     }
 
     fn describe_by_path(key_id: &str) -> String {
-        // `DescribeKmsKeyHandler` reads the router path parameter verbatim.
-        key_id.to_string()
+        path_key_id_at(&format!("/rustfs/admin/v3/kms/keys/{key_id}"))
+            .expect("path key id should decode")
+            .unwrap_or_default()
+    }
+
+    /// The key id `DescribeKmsKeyHandler` sees for a request path, through the
+    /// same route pattern the handler is registered under.
+    fn path_key_id_at(path: &str) -> rustfs_s3_types::S3Result<Option<String>> {
+        let mut router = matchit::Router::new();
+        router
+            .insert("/rustfs/admin/v3/kms/keys/{key_id}", ())
+            .expect("route should register");
+        let matched = router.at(path).expect("path should match the describe route");
+        super::path_key_id(&matched.params)
+    }
+
+    /// An AWS key ARN only fits in one path segment escaped. Read verbatim it
+    /// was looked up under its escaped spelling and reported as not found, so
+    /// a key could be described by ARN through the query alias but not through
+    /// the documented path route.
+    #[test]
+    fn path_key_id_is_percent_decoded() {
+        let arn = "arn:aws:kms:eu-north-1:111122223333:key/74e5921e-107a-4584-bfda-a5dadeb3e13e";
+        let escaped = "arn%3Aaws%3Akms%3Aeu-north-1%3A111122223333%3Akey%2F74e5921e-107a-4584-bfda-a5dadeb3e13e";
+        assert_eq!(
+            path_key_id_at(&format!("/rustfs/admin/v3/kms/keys/{escaped}"))
+                .expect("an escaped ARN is a valid key id")
+                .as_deref(),
+            Some(arn)
+        );
+        assert_eq!(
+            path_key_id_at("/rustfs/admin/v3/kms/keys/plain-key")
+                .expect("a plain id is a valid key id")
+                .as_deref(),
+            Some("plain-key")
+        );
+        assert_eq!(
+            path_key_id_at("/rustfs/admin/v3/kms/keys/has%20space")
+                .expect("an escaped space is a valid key id")
+                .as_deref(),
+            Some("has space")
+        );
+        path_key_id_at("/rustfs/admin/v3/kms/keys/%FF").expect_err("bytes that are not UTF-8 must be refused, not looked up");
     }
 
     fn generate_data_key_body(key_id: &str) -> String {
@@ -2406,6 +2448,24 @@ async fn key_impact_if_requested(requested: bool, key_id: &str, default_key_id: 
     Some(current_key_impact(key_id, default_key_id).await)
 }
 
+/// The key id named by the `{key_id}` path segment, percent-decoded.
+///
+/// A route parameter arrives exactly as the client sent it, so an id that has
+/// to be escaped to fit in one path segment — an AWS key ARN, with its `:` and
+/// `/` — would otherwise be looked up, authorized and audited under its
+/// escaped spelling and never found.
+fn path_key_id(params: &Params<'_, '_>) -> S3Result<Option<String>> {
+    params
+        .get("key_id")
+        .map(|raw| {
+            percent_decode_str(raw)
+                .decode_utf8()
+                .map(|decoded| decoded.into_owned())
+                .map_err(|_| s3_error!(InvalidArgument, "invalid key id path parameter"))
+        })
+        .transpose()
+}
+
 /// Describe a KMS key
 pub struct DescribeKmsKeyHandler;
 
@@ -2420,6 +2480,7 @@ impl Operation for DescribeKmsKeyHandler {
             check_key_valid(get_session_token(req.uri(), req.headers()).unwrap_or_default(), cred.access_key()).await?;
 
         let audit = KmsAdminAudit::from_envelope(req.envelope(), &cred);
+        let path_key_id = path_key_id(&params)?;
 
         audit.gate(
             validate_admin_request_with_kms_key(
@@ -2429,14 +2490,14 @@ impl Operation for DescribeKmsKeyHandler {
                 false,
                 kms_describe_key_actions(),
                 req.policy_source_addr(),
-                params.get("key_id").unwrap_or_default(),
+                path_key_id.as_deref().unwrap_or_default(),
             )
             .await,
             KmsAuditOperation::DescribeKey,
-            params.get("key_id"),
+            path_key_id.as_deref(),
         )?;
 
-        let Some(key_id) = params.get("key_id") else {
+        let Some(key_id) = path_key_id.as_deref() else {
             let response = DescribeKmsKeyResponse {
                 success: false,
                 message: "missing required parameter: 'keyId'".to_string(),

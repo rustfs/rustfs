@@ -129,6 +129,19 @@ pub(crate) fn ensure_key_status_permits(key_id: &str, status: &KeyStatus, operat
     ensure_key_state_permits(key_id, &state, operation)
 }
 
+/// Refusal for an expedited destruction of a key that was never scheduled.
+///
+/// Destruction always passes through `PendingDeletion`, the one state a
+/// deletion can still be cancelled from; `force_immediate` only skips the rest
+/// of the waiting window. Every backend that destroys keys refuses with this
+/// error instead of scheduling the key on the caller's behalf, so a success
+/// response always means the key is gone.
+pub(crate) fn destruction_requires_pending_deletion(key_id: &str) -> KmsError {
+    KmsError::invalid_key_state(format!(
+        "Key {key_id} is not pending deletion: schedule the deletion before requesting immediate destruction"
+    ))
+}
+
 /// Tag key that carries the key's identity rather than user metadata.
 ///
 /// The key-creation path lifts `name` out of the caller's tag map and uses it
@@ -569,6 +582,18 @@ pub trait KmsBackend: Send + Sync {
     /// opted in by overriding this method.
     fn capabilities(&self) -> BackendCapabilities {
         BackendCapabilities::minimal()
+    }
+
+    /// Whether objects on disk may carry this backend's data-key ciphertext
+    /// without a [`crate::encryption::DataKeyEnvelope`] around it.
+    ///
+    /// Every backend wraps the data keys it generates in an envelope, which is
+    /// what lets a reader recognize a KMS-wrapped key from its bytes alone. A
+    /// backend returns `true` only when an earlier release persisted its
+    /// provider-native ciphertext bare, so those bytes still have to be routed
+    /// to [`Self::decrypt`] even though nothing in them identifies the backend.
+    fn reads_bare_data_key_ciphertext(&self) -> bool {
+        false
     }
 
     /// Remove a key whose scheduled deletion deadline has passed.
