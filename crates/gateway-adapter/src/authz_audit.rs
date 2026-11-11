@@ -12,165 +12,143 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The gateway's [`AuthzAuditSink`], writing RustFS audit records.
+//! The gateway's [`AuthzAuditSink`]: the legacy denial record for a refusal the gateway enforced.
 //!
-//! Responsible for: one [`AuthzAuditRecord`] per authorization decision — `Allow`, `Deny` and
-//! `Indeterminate` alike, the decision spelled out in the `decision` tag — carrying the legacy
-//! authorization-denial entry's field set as far as the gateway's [`AuthzAuditEvent`] can supply
-//! it: `version`, `event`, `trigger`, `api.name`, `api.bucket`, `api.object`, `api.status`,
-//! `api.status_code`, `requestID`, `accessKey`, `error` and `tags.denialReason`
-//! ([`OWNED_CONTRACT_FIELDS`]). `accessKey` is the caller the gateway verified, and is absent for an
-//! anonymous caller.
-//! NOT responsible for: facts the event does not carry. The entry's `time` and its rate limiting
-//! (`tags.suppressedDenials`) are the binary sink's, as are `parentUser` and `requestClaims`, which
-//! are IAM facts the event names only by snapshot id. The peer and request-line fields
-//! (`remotehost`, `userAgent`, `requestHost`, `requestPath`, `requestQuery`) are the outer layer's:
-//! no hook carries a header, by design. Durations and bytes are the outer layer's too. The per-key
-//! `tags.deniedKeys` of a bulk delete stays with handler code. The whole assignment is
-//! `tests/fixtures/observability-contract.json`.
-//! Upstream: the gateway service, once per decision. Downstream: the binary's
-//! [`AuthzAuditRecordSink`], which builds a `rustfs_audit::AuditEntry` and hands it to the audit
-//! logger.
+//! Responsible for: one [`GatewayDenialRecord`] for each authorization decision the gateway made
+//! at an enforcing stage that ended the request with a refusal (`Deny` or `Indeterminate`), after
+//! the legacy audit switch and the legacy denial rate limiter have both admitted it.
+//! NOT responsible for: the authoritative authorization decision. On the gateway stack that is the
+//! legacy access check in owned form, run by the handler before the use case, and it writes its own
+//! denial record (`DenialContext::record`, `rustfs/src/storage/access.rs`). The gateway
+//! `Authorizer` is only an earlier gate that may refuse what the legacy check certainly refuses, so
+//! a request it lets through is not decided yet, and a request it refuses never reaches the check.
+//! Nor is this module responsible for building the `rustfs_audit::AuditEntry`, filling its
+//! request-line fields, or dispatching it: that is the binary's [`DenialAuditSink`].
+//! Upstream: the gateway service, once per decision (`AuthzAuditSink::on_decision`). Downstream:
+//! the binary's [`DenialAuditSink`].
+//!
+//! # What is recorded, and what is not
+//!
+//! - An `Allow` is never recorded: at the early gate it is not the final decision, and a handler
+//!   denial after it would contradict the record.
+//! - The missing-object visibility probe is never recorded. For `GetObject` the gateway also asks
+//!   `s3:ListBucket`, only to choose between `404` and `403` for an absent object; that answer
+//!   refuses nothing, yet it reaches the sink as an `Input` event of its own. Legacy keeps the same
+//!   probe out of the audit (`suppress_denial_audit`, `rustfs/src/app/object/head.rs`).
+//! - Every other `Deny` or `Indeterminate` ended its request: a route-stage refusal is answered
+//!   before the body is read, and an input-stage refusal either fails the stage or prevents the
+//!   gateway core from constructing the authorized request. One refused request therefore yields
+//!   exactly one record.
+//!
+//! # Telling the visibility probe apart
+//!
+//! At the pinned gateway rev every event's `resources` starts with the request the decision was
+//! about. For the route and input events that is the route target, whose `action` equals its
+//! `route_action` (`crates/gateway/src/service.rs`, the route request and every asked question,
+//! and the input stage's route request). The visibility event alone is built from the route
+//! target with only `action` replaced by `s3:ListBucket`, keeping the target's `route_action`
+//! (`crates/gateway/src/ext/authz_audit.rs`, `emit_input_safely`; `crates/gateway/src/ext/authorizer.rs`,
+//! `InputAuthzRequest::new`). An `Input` event whose first resource asks an action other than its
+//! route action is the visibility event.
+//!
+//! # Known limit: the denied action and resource
+//!
+//! `trigger` (and `api.name`), `api.bucket` and `api.object` are the event's `action`, `bucket` and
+//! `key`: the operation's declared action and primary target. The event carries no per-resource
+//! decision, so the sink cannot name a derived resource that was refused. This is exact only while
+//! every early-gate refusal concerns the declared action and target. An operation whose denial can
+//! concern a second resource or a version-specific action (a copy source, a versioned read) must
+//! therefore be decided by the handler, never refused by the early gate: legacy records those with
+//! the source bucket and object, and with `s3:GetObjectVersion`.
 //!
 //! # What may not reach a record
 //!
-//! The record is built field by field from the event: no secret key, session token, signature or
-//! SSE-C key exists in the event, and none of the event's other caller-chosen values — a version
-//! id, a copy-source identity, a subject — is copied, because the legacy entry has no field for
-//! them. Nothing is formatted from the event's `Debug`.
+//! The record is built field by field from the event's `action`, `bucket`, `key`, `request_id`,
+//! `decision` and the verified identity's access key id. Nothing is copied from `resources`,
+//! `subject`, `auth_scheme`, a version id or a copy-source identity, and nothing is formatted from a
+//! `Debug` implementation. The event carries no secret key, session token or signature.
 
 use rustfs_gateway::{AuthzAuditEvent, AuthzAuditSink, AuthzStage, Decision};
-use rustfs_s3_types::EventName;
 
-/// The `version` every legacy audit entry carries.
-pub const AUDIT_VERSION: &str = "1.0";
-/// The `error` of a refused decision, as the legacy denial entry writes it.
-pub const ACCESS_DENIED_ERROR: &str = "Access Denied";
-/// `tags.denialReason` of a `Deny`: the gateway's event carries the decision, not RustFS's
-/// internal reason vocabulary.
+/// `tags.denialReason` of a `Deny` the gateway enforced. The event carries the decision, not one of
+/// the legacy reasons (`iam_explicit_deny`, `no_policy_allows_action`, ...).
 pub const DENY_REASON: &str = "authorization_denied";
-/// `tags.denialReason` of an `Indeterminate`: no policy reading could answer.
+/// `tags.denialReason` of an `Indeterminate` the gateway enforced: no policy reading could answer.
 pub const INDETERMINATE_REASON: &str = "authorization_indeterminate";
 
-/// Tag carrying the decision: `allow`, `deny` or `indeterminate`.
-pub const DECISION_TAG: &str = "decision";
-/// Tag carrying the stage that decided: `route` or `input`.
-pub const STAGE_TAG: &str = "authorizationStage";
-/// Tag carrying the gateway's operation name.
-pub const OPERATION_TAG: &str = "operation";
-/// Tag carrying the policy reading's snapshot id; absent when none could be read.
-pub const POLICY_SNAPSHOT_TAG: &str = "policySnapshot";
-/// The legacy denial-reason tag.
-pub const DENIAL_REASON_TAG: &str = "denialReason";
+/// What the legacy denial rate limiter answered for one refusal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenialAdmission {
+    /// Record it; `suppressed` refusals of the same caller class were dropped since the previous
+    /// record, and are reported as `tags.suppressedDenials` when non-zero.
+    Emit {
+        /// Refusals dropped since the previous record of this caller class.
+        suppressed: u64,
+    },
+    /// Drop it.
+    Suppress,
+}
 
-/// The legacy authorization-denial entry fields (contract ids without their `authorization_denial.`
-/// prefix) a refused decision's record supplies.
-pub const OWNED_CONTRACT_FIELDS: [&str; 12] = [
-    "version",
-    "event",
-    "trigger",
-    "api.name",
-    "api.status",
-    "api.status_code",
-    "api.bucket",
-    "api.object",
-    "requestID",
-    "accessKey",
-    "error",
-    "tags.denialReason",
-];
-
-/// One authorization decision, in the shape of a RustFS audit entry.
+/// One refusal the gateway enforced, in the fields of the legacy authorization-denial entry the
+/// event can supply.
 ///
-/// Field names follow `rustfs_audit::AuditEntry` and its `ApiDetails`. Owned, so a sink can move it
-/// onto a channel.
+/// The binary builds the entry as legacy `authorization_denial_entry` (`rustfs/src/storage/helper.rs`)
+/// does: `version` `1.0`, `event` `AuditS3Operation`, `trigger` and `api.name` [`Self::action`],
+/// `api.status` `failure`, `api.status_code` `403`, `error` `Access Denied`, `tags.denialReason`
+/// [`Self::denial_reason`], and `tags.suppressedDenials` only when [`Self::suppressed_denials`] is
+/// non-zero.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AuthzAuditRecord {
-    /// `version`.
-    pub version: &'static str,
-    /// `event`: always [`EventName::AuditS3Operation`], as for legacy denial entries.
-    pub event: EventName,
-    /// `trigger`: the IAM action decided on, `s3:GetObject`.
-    pub trigger: String,
-    /// `api.name`: the same action.
-    pub api_name: String,
-    /// `api.bucket`, when the decision was about one.
-    pub api_bucket: Option<String>,
-    /// `api.object`, when the decision was about one.
-    pub api_object: Option<String>,
-    /// `api.status`: `failure` for a refusal; absent for an `Allow`, whose request has no outcome yet.
-    pub api_status: Option<&'static str>,
-    /// `api.status_code`: `403` for a refusal; absent for an `Allow`.
-    pub api_status_code: Option<i32>,
+pub struct GatewayDenialRecord {
+    /// `trigger` and `api.name`: the operation's declared IAM action, `s3:GetObject`.
+    pub action: String,
+    /// `api.bucket`, when the request addressed one.
+    pub bucket: Option<String>,
+    /// `api.object`, when the request addressed one.
+    pub object: Option<String>,
     /// `requestID`: the identifier the caller received.
     pub request_id: String,
-    /// `accessKey`: the verified caller; `None` for an anonymous one.
+    /// `accessKey`: the verified caller; `None` for an anonymous caller, as legacy omits it.
     pub access_key: Option<String>,
-    /// `error`: [`ACCESS_DENIED_ERROR`] for a refusal.
-    pub error: Option<&'static str>,
-    /// `tags.decision`.
-    pub decision: &'static str,
-    /// `tags.authorizationStage`.
-    pub stage: &'static str,
-    /// `tags.operation`.
-    pub operation: String,
-    /// `tags.policySnapshot`.
-    pub policy_snapshot: Option<String>,
-    /// `tags.denialReason`, for a refusal.
-    pub denial_reason: Option<&'static str>,
+    /// `tags.denialReason`: [`DENY_REASON`] or [`INDETERMINATE_REASON`].
+    pub denial_reason: &'static str,
+    /// `tags.suppressedDenials`, from [`DenialAdmission::Emit`].
+    pub suppressed_denials: u64,
 }
 
-impl AuthzAuditRecord {
-    /// The record's `tags`, as key and value.
-    #[must_use]
-    pub fn tags(&self) -> Vec<(&'static str, String)> {
-        let mut tags = vec![
-            (DECISION_TAG, self.decision.to_owned()),
-            (STAGE_TAG, self.stage.to_owned()),
-            (OPERATION_TAG, self.operation.clone()),
-        ];
-        if let Some(snapshot) = &self.policy_snapshot {
-            tags.push((POLICY_SNAPSHOT_TAG, snapshot.clone()));
-        }
-        if let Some(reason) = self.denial_reason {
-            tags.push((DENIAL_REASON_TAG, reason.to_owned()));
-        }
-        tags
-    }
-
-    /// The legacy contract fields this record populates, in [`OWNED_CONTRACT_FIELDS`] spelling.
-    #[must_use]
-    pub fn contract_fields(&self) -> Vec<&'static str> {
-        let present = [
-            ("version", true),
-            ("event", true),
-            ("trigger", true),
-            ("api.name", true),
-            ("api.status", self.api_status.is_some()),
-            ("api.status_code", self.api_status_code.is_some()),
-            ("api.bucket", self.api_bucket.is_some()),
-            ("api.object", self.api_object.is_some()),
-            ("requestID", true),
-            ("accessKey", self.access_key.is_some()),
-            ("error", self.error.is_some()),
-            ("tags.denialReason", self.denial_reason.is_some()),
-        ];
-        present.into_iter().filter_map(|(field, set)| set.then_some(field)).collect()
-    }
+/// Where admitted refusals go. Implemented by the binary over the legacy denial auditor.
+///
+/// The three methods are called in order, at most once each per refusal, on the request's task,
+/// and must neither block nor panic.
+///
+/// # What the implementation owes the legacy entry
+///
+/// - [`Self::enabled`] is the legacy audit switch (`is_audit_module_enabled`), and [`Self::admit`]
+///   the process-wide legacy `DenialRateLimiter` itself, not a second instance: gateway and handler
+///   refusals share one token bucket per caller class.
+/// - `time`, `parentUser` and `requestClaims` are filled as legacy fills them.
+/// - `remotehost`, `userAgent`, `requestHost`, `requestPath` and `requestQuery` come from the
+///   request the outer layer saw. **`requestQuery` is not the URI query.** Legacy fills it with
+///   `rustfs_targets::net::extract_params_header` over the request *headers*, which replaces the
+///   value of every sensitive header (`authorization`, `x-amz-security-token`, the SSE-C key
+///   headers, ...) with the redaction marker. The raw URI query must never be put there: on a
+///   presigned request it carries `X-Amz-Signature`, `X-Amz-Credential` and
+///   `X-Amz-Security-Token`.
+pub trait DenialAuditSink: Send + Sync + 'static {
+    /// Whether denial auditing is switched on. Asked first; `false` drops the refusal before the
+    /// rate limiter is consulted.
+    fn enabled(&self) -> bool;
+    /// Asks the rate limiter for one refusal of this caller class. Asked before any record exists.
+    fn admit(&self, anonymous: bool) -> DenialAdmission;
+    /// Receives one admitted record.
+    fn record(&self, record: GatewayDenialRecord);
 }
 
-/// Where decision records go. Implemented by the binary over `rustfs-audit`.
-pub trait AuthzAuditRecordSink: Send + Sync + 'static {
-    /// Records one decision. Called inline on the request path: must not block or panic.
-    fn record_decision(&self, record: AuthzAuditRecord);
-}
-
-/// An [`AuthzAuditSink`] writing one record per decision.
+/// An [`AuthzAuditSink`] recording only the refusals the gateway enforced.
 pub struct RustfsAuthzAudit<S> {
     sink: S,
 }
 
-impl<S: AuthzAuditRecordSink> RustfsAuthzAudit<S> {
+impl<S: DenialAuditSink> RustfsAuthzAudit<S> {
     /// An audit sink reporting into `sink`.
     #[must_use]
     pub fn new(sink: S) -> Self {
@@ -178,42 +156,40 @@ impl<S: AuthzAuditRecordSink> RustfsAuthzAudit<S> {
     }
 }
 
-impl<S: AuthzAuditRecordSink> AuthzAuditSink for RustfsAuthzAudit<S> {
+impl<S: DenialAuditSink> AuthzAuditSink for RustfsAuthzAudit<S> {
     fn on_decision(&self, event: &AuthzAuditEvent<'_>) {
-        self.sink.record_decision(audit_record(event));
+        let denial_reason = match event.decision {
+            Decision::Allow => return,
+            Decision::Deny => DENY_REASON,
+            Decision::Indeterminate => INDETERMINATE_REASON,
+        };
+        if is_visibility_probe(event) || !self.sink.enabled() {
+            return;
+        }
+        let anonymous = event.identity.is_none();
+        let DenialAdmission::Emit { suppressed } = self.sink.admit(anonymous) else {
+            return;
+        };
+        self.sink.record(GatewayDenialRecord {
+            action: event.action.to_owned(),
+            bucket: event.bucket.map(|bucket| bucket.as_str().to_owned()),
+            object: event.key.map(|key| key.as_str().to_owned()),
+            request_id: event.request_id.as_str().to_owned(),
+            access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
+            denial_reason,
+            suppressed_denials: suppressed,
+        });
     }
 }
 
-/// The record for one decision; [`RustfsAuthzAudit`] calls it for every event.
-#[must_use]
-pub fn audit_record(event: &AuthzAuditEvent<'_>) -> AuthzAuditRecord {
-    let denial_reason = match event.decision {
-        Decision::Allow => None,
-        Decision::Deny => Some(DENY_REASON),
-        Decision::Indeterminate => Some(INDETERMINATE_REASON),
-    };
-    let refused = denial_reason.is_some();
-    AuthzAuditRecord {
-        version: AUDIT_VERSION,
-        event: EventName::AuditS3Operation,
-        trigger: event.action.to_owned(),
-        api_name: event.action.to_owned(),
-        api_bucket: event.bucket.map(|bucket| bucket.as_str().to_owned()),
-        api_object: event.key.map(|key| key.as_str().to_owned()),
-        api_status: refused.then_some("failure"),
-        api_status_code: refused.then_some(403),
-        request_id: event.request_id.as_str().to_owned(),
-        access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
-        error: refused.then_some(ACCESS_DENIED_ERROR),
-        decision: event.decision.as_str(),
-        stage: match event.stage {
-            AuthzStage::Route => "route",
-            AuthzStage::Input => "input",
-        },
-        operation: event.operation.to_owned(),
-        policy_snapshot: event.policy_snapshot.map(|snapshot| snapshot.to_string()),
-        denial_reason,
-    }
+/// Whether `event` is the missing-object visibility probe, which refuses nothing. See the module
+/// documentation for why the first resource identifies it.
+fn is_visibility_probe(event: &AuthzAuditEvent<'_>) -> bool {
+    event.stage == AuthzStage::Input
+        && event
+            .resources
+            .first()
+            .is_some_and(|first| first.action != first.route_action)
 }
 
 #[cfg(test)]
@@ -223,7 +199,7 @@ mod tests {
     use core::time::Duration;
     use rustfs_gateway::{
         AuthSchemeRef, AuthzRequest, BucketName, Identity, ObjectKey, PolicySnapshot, RequestId, ResourceShape, SessionBinding,
-        TargetOrigin,
+        Subject, TargetOrigin,
     };
     use std::sync::Mutex;
 
@@ -231,12 +207,56 @@ mod tests {
     const BUCKET: &str = "audit-bucket";
     const KEY: &str = "reports/q3.csv";
 
-    #[derive(Default)]
-    struct Recorded(Mutex<Vec<AuthzAuditRecord>>);
+    /// A sink with a scripted switch and limiter that records every call it receives.
+    struct Probe {
+        enabled: bool,
+        admission: DenialAdmission,
+        switch_asked: Mutex<usize>,
+        limiter_asked: Mutex<Vec<bool>>,
+        records: Mutex<Vec<GatewayDenialRecord>>,
+    }
 
-    impl AuthzAuditRecordSink for Recorded {
-        fn record_decision(&self, record: AuthzAuditRecord) {
-            self.0.lock().expect("not poisoned").push(record);
+    impl Probe {
+        fn new(enabled: bool, admission: DenialAdmission) -> Self {
+            Self {
+                enabled,
+                admission,
+                switch_asked: Mutex::new(0),
+                limiter_asked: Mutex::new(Vec::new()),
+                records: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn open() -> Self {
+            Self::new(true, DenialAdmission::Emit { suppressed: 0 })
+        }
+
+        fn records(&self) -> Vec<GatewayDenialRecord> {
+            self.records.lock().expect("not poisoned").clone()
+        }
+
+        fn switch_asked(&self) -> usize {
+            *self.switch_asked.lock().expect("not poisoned")
+        }
+
+        fn limiter_asked(&self) -> Vec<bool> {
+            self.limiter_asked.lock().expect("not poisoned").clone()
+        }
+    }
+
+    impl DenialAuditSink for Probe {
+        fn enabled(&self) -> bool {
+            *self.switch_asked.lock().expect("not poisoned") += 1;
+            self.enabled
+        }
+
+        fn admit(&self, anonymous: bool) -> DenialAdmission {
+            self.limiter_asked.lock().expect("not poisoned").push(anonymous);
+            self.admission
+        }
+
+        fn record(&self, record: GatewayDenialRecord) {
+            self.records.lock().expect("not poisoned").push(record);
         }
     }
 
@@ -258,16 +278,53 @@ mod tests {
         }
     }
 
-    fn event<'a>(f: &'a Fixture, decision: Decision, identity: Option<&'a Identity>) -> AuthzAuditEvent<'a> {
-        AuthzAuditEvent {
-            request_id: &f.request_id,
-            stage: AuthzStage::Route,
+    /// The route target of a GetObject, as the gateway builds it: its action is its route action.
+    fn target<'a>(f: &'a Fixture, identity: Option<&'a Identity>) -> AuthzRequest<'a> {
+        AuthzRequest {
             operation: "GetObject",
             action: "s3:GetObject",
             resource: ResourceShape::Object,
             bucket: Some(&f.bucket),
             key: Some(&f.key),
-            resources: &[],
+            copy_source_identity: None,
+            version_id: None,
+            route_action: "s3:GetObject",
+            route_bucket: Some(&f.bucket),
+            route_key: Some(&f.key),
+            identity,
+            target_origin: TargetOrigin::Path,
+            subject: None,
+        }
+    }
+
+    /// The visibility question, built from the route target as `InputAuthzRequest::new` builds it.
+    fn visibility<'a>(route: &AuthzRequest<'a>) -> AuthzRequest<'a> {
+        AuthzRequest {
+            action: "s3:ListBucket",
+            resource: ResourceShape::Bucket,
+            copy_source_identity: None,
+            version_id: None,
+            ..*route
+        }
+    }
+
+    /// A route or input event of a GetObject about `resources`.
+    fn event<'a>(
+        f: &'a Fixture,
+        stage: AuthzStage,
+        decision: Decision,
+        resources: &'a [AuthzRequest<'a>],
+        identity: Option<&'a Identity>,
+    ) -> AuthzAuditEvent<'a> {
+        AuthzAuditEvent {
+            request_id: &f.request_id,
+            stage,
+            operation: "GetObject",
+            action: "s3:GetObject",
+            resource: ResourceShape::Object,
+            bucket: Some(&f.bucket),
+            key: Some(&f.key),
+            resources,
             auth_scheme: if identity.is_some() {
                 AuthSchemeRef::SigV4Header
             } else {
@@ -281,150 +338,211 @@ mod tests {
         }
     }
 
-    fn recorded(decisions: &[Decision]) -> Vec<AuthzAuditRecord> {
-        let f = fixture();
-        let sink = RustfsAuthzAudit::new(Recorded::default());
-        for decision in decisions {
-            sink.on_decision(&event(&f, *decision, Some(&f.identity)));
-        }
-        sink.sink.0.into_inner().expect("not poisoned")
-    }
-
-    /// Positive — every decision is one record, and an `Allow` is recorded too.
-    #[test]
-    fn audit_every_decision_is_one_record() {
-        let records = recorded(&[Decision::Allow, Decision::Deny, Decision::Indeterminate]);
-        let decisions: Vec<&str> = records.iter().map(|record| record.decision).collect();
-        assert_eq!(decisions, ["allow", "deny", "indeterminate"]);
-        let allow = &records[0];
-        assert_eq!(allow.api_status, None);
-        assert_eq!(allow.error, None);
-        assert_eq!(allow.denial_reason, None);
-        assert_eq!(allow.access_key.as_deref(), Some(ACCESS_KEY));
-        assert_eq!(allow.request_id, RequestId::from_bits(0x5EED).as_str());
-    }
-
-    /// Negative — `Indeterminate` is recorded as itself, distinguishable from `Deny` in both the
-    /// decision tag and the denial reason, though both are the same refusal on the wire.
-    #[test]
-    fn audit_indeterminate_is_not_deny() {
-        let records = recorded(&[Decision::Deny, Decision::Indeterminate]);
-        let (deny, indeterminate) = (&records[0], &records[1]);
-        assert_eq!(indeterminate.decision, "indeterminate");
-        assert!(indeterminate.tags().contains(&(DECISION_TAG, "indeterminate".to_owned())));
-        assert_eq!(indeterminate.denial_reason, Some(INDETERMINATE_REASON));
-        assert_eq!(deny.decision, "deny");
-        assert_eq!(deny.denial_reason, Some(DENY_REASON));
-        assert_ne!(deny.tags(), indeterminate.tags());
-        for refusal in [deny, indeterminate] {
-            assert_eq!(refusal.api_status, Some("failure"));
-            assert_eq!(refusal.api_status_code, Some(403));
-            assert_eq!(refusal.error, Some(ACCESS_DENIED_ERROR));
+    /// The visibility event, as `emit_input_safely` builds it from the input event.
+    fn visibility_event<'a>(
+        input: &AuthzAuditEvent<'a>,
+        request: &'a AuthzRequest<'a>,
+        decision: Decision,
+    ) -> AuthzAuditEvent<'a> {
+        AuthzAuditEvent {
+            stage: AuthzStage::Input,
+            action: request.action,
+            resource: request.resource,
+            bucket: request.bucket,
+            key: request.key,
+            resources: std::slice::from_ref(request),
+            decision,
+            ..*input
         }
     }
 
-    /// Negative — an anonymous caller has no `accessKey`; none is invented, not even an empty one.
-    #[test]
-    fn audit_anonymous_caller_has_no_access_key() {
-        let f = fixture();
-        for decision in [Decision::Allow, Decision::Deny, Decision::Indeterminate] {
-            let record = audit_record(&event(&f, decision, None));
-            assert_eq!(record.access_key, None, "{decision:?}");
-            assert!(!record.contract_fields().contains(&"accessKey"), "{decision:?}");
+    /// Drives the events of one GetObject through `audit` in the gateway's order: the route stage,
+    /// then (when the route allowed) the input stage followed by its visibility question.
+    fn get_object(
+        audit: &RustfsAuthzAudit<Probe>,
+        f: &Fixture,
+        identity: Option<&Identity>,
+        route: Decision,
+        input: Decision,
+        probe: Decision,
+    ) {
+        let route_target = target(f, identity);
+        let asked = [route_target];
+        audit.on_decision(&event(f, AuthzStage::Route, route, &asked, identity));
+        if route != Decision::Allow {
+            return;
+        }
+        let input_event = event(f, AuthzStage::Input, input, &asked, identity);
+        audit.on_decision(&input_event);
+        let question = visibility(&route_target);
+        audit.on_decision(&visibility_event(&input_event, &question, probe));
+    }
+
+    fn expected(denial_reason: &'static str, access_key: Option<&str>, suppressed_denials: u64) -> GatewayDenialRecord {
+        GatewayDenialRecord {
+            action: "s3:GetObject".to_owned(),
+            bucket: Some(BUCKET.to_owned()),
+            object: Some(KEY.to_owned()),
+            request_id: RequestId::from_bits(0x5EED).as_str().to_owned(),
+            access_key: access_key.map(str::to_owned),
+            denial_reason,
+            suppressed_denials,
         }
     }
 
-    /// Negative — a policy source that could not answer leaves no snapshot tag rather than a
-    /// placeholder.
+    /// Positive — a route-stage refusal is one record carrying the legacy denial entry's values,
+    /// and `Indeterminate` keeps a reason of its own.
     #[test]
-    fn audit_missing_policy_reading_has_no_snapshot_tag() {
-        let f = fixture();
-        let mut unread = event(&f, Decision::Indeterminate, Some(&f.identity));
-        unread.policy_snapshot = None;
-        let record = audit_record(&unread);
-        assert_eq!(record.policy_snapshot, None);
-        assert!(record.tags().iter().all(|(key, _)| *key != POLICY_SNAPSHOT_TAG));
-        let read = audit_record(&event(&f, Decision::Indeterminate, Some(&f.identity)));
-        assert_eq!(read.policy_snapshot, Some(f.snapshot.id().to_string()));
+    fn p_route_refusal_is_one_record_with_the_legacy_values() {
+        for (decision, reason) in [(Decision::Deny, DENY_REASON), (Decision::Indeterminate, INDETERMINATE_REASON)] {
+            let f = fixture();
+            let audit = RustfsAuthzAudit::new(Probe::open());
+            get_object(&audit, &f, Some(&f.identity), decision, Decision::Allow, Decision::Allow);
+            assert_eq!(audit.sink.records(), [expected(reason, Some(ACCESS_KEY), 0)], "{decision:?}");
+            assert_eq!(audit.sink.limiter_asked(), [false], "{decision:?}");
+        }
     }
 
-    /// Negative — a service-level decision has no bucket or object, and the input stage is named.
+    /// Positive — an input-stage refusal of a GetObject is exactly one record, though its
+    /// visibility question was refused as well.
     #[test]
-    fn audit_service_decision_has_no_target() {
+    fn p_enforcing_input_refusal_is_recorded_once() {
         let f = fixture();
-        let mut service = event(&f, Decision::Deny, Some(&f.identity));
-        service.bucket = None;
-        service.key = None;
-        service.stage = AuthzStage::Input;
-        let record = audit_record(&service);
-        assert_eq!((record.api_bucket.as_deref(), record.api_object.as_deref()), (None, None));
-        assert_eq!(record.stage, "input");
+        let audit = RustfsAuthzAudit::new(Probe::open());
+        get_object(&audit, &f, Some(&f.identity), Decision::Allow, Decision::Deny, Decision::Deny);
+        assert_eq!(audit.sink.records(), [expected(DENY_REASON, Some(ACCESS_KEY), 0)]);
+        assert_eq!(audit.sink.limiter_asked(), [false]);
     }
 
-    /// Negative — the access key is the caller's verified identity, never a default credential,
-    /// including for a session credential.
+    /// Positive — the refusals the limiter dropped before this one are carried on the record.
     #[test]
-    fn audit_access_key_is_the_callers_identity() {
+    fn p_suppressed_count_is_carried() {
         let f = fixture();
-        let binding = SessionBinding::new(crate::STS_SESSION_ISSUER, 4_000_000_000).expect("a binding");
-        let session = Identity::new("ASIATEMPCALLER01")
-            .expect("a key")
-            .with_session_binding(binding);
-        let record = audit_record(&event(&f, Decision::Deny, Some(&session)));
-        assert_eq!(record.access_key.as_deref(), Some("ASIATEMPCALLER01"));
+        let audit = RustfsAuthzAudit::new(Probe::new(true, DenialAdmission::Emit { suppressed: 7 }));
+        get_object(&audit, &f, Some(&f.identity), Decision::Deny, Decision::Allow, Decision::Allow);
+        assert_eq!(audit.sink.records(), [expected(DENY_REASON, Some(ACCESS_KEY), 7)]);
     }
 
-    /// Negative — secret material planted in every caller-chosen field the legacy entry has no
-    /// field for (a version id, a derived resource, a session binding) reaches nothing the sink
-    /// receives, and the record has no field that could hold a secret.
+    /// Negative — an `Allow` at either stage records nothing and asks neither the switch nor the
+    /// limiter, so it cannot spend a token a real refusal needs.
     #[test]
-    fn audit_no_secret_reaches_the_sink() {
-        const SECRETS: [&str; 4] = [
+    fn n_allow_is_never_recorded() {
+        let f = fixture();
+        let audit = RustfsAuthzAudit::new(Probe::open());
+        let asked = [target(&f, Some(&f.identity))];
+        for stage in [AuthzStage::Route, AuthzStage::Input] {
+            audit.on_decision(&event(&f, stage, Decision::Allow, &asked, Some(&f.identity)));
+        }
+        assert!(audit.sink.records().is_empty());
+        assert_eq!((audit.sink.switch_asked(), audit.sink.limiter_asked()), (0, Vec::new()));
+    }
+
+    /// Negative — a GetObject that succeeds for a caller refused `s3:ListBucket` records nothing:
+    /// the visibility question refuses no request, whatever it answered.
+    #[test]
+    fn n_visibility_probe_is_never_recorded() {
+        for probe in [Decision::Deny, Decision::Indeterminate] {
+            let f = fixture();
+            let audit = RustfsAuthzAudit::new(Probe::open());
+            get_object(&audit, &f, Some(&f.identity), Decision::Allow, Decision::Allow, probe);
+            assert!(audit.sink.records().is_empty(), "{probe:?}");
+            assert_eq!((audit.sink.switch_asked(), audit.sink.limiter_asked()), (0, Vec::new()), "{probe:?}");
+        }
+    }
+
+    /// Negative — with the audit switch off a refusal records nothing and the limiter is never
+    /// asked, as legacy checks the switch first.
+    #[test]
+    fn n_audit_switch_off_records_nothing() {
+        let f = fixture();
+        let audit = RustfsAuthzAudit::new(Probe::new(false, DenialAdmission::Emit { suppressed: 0 }));
+        get_object(&audit, &f, Some(&f.identity), Decision::Deny, Decision::Allow, Decision::Allow);
+        assert!(audit.sink.records().is_empty());
+        assert_eq!((audit.sink.switch_asked(), audit.sink.limiter_asked()), (1, Vec::new()));
+    }
+
+    /// Negative — a refusal the limiter suppresses records nothing.
+    #[test]
+    fn n_rate_limiter_suppression_records_nothing() {
+        let f = fixture();
+        let audit = RustfsAuthzAudit::new(Probe::new(true, DenialAdmission::Suppress));
+        get_object(&audit, &f, Some(&f.identity), Decision::Deny, Decision::Allow, Decision::Allow);
+        assert!(audit.sink.records().is_empty());
+        assert_eq!(audit.sink.limiter_asked(), [false]);
+    }
+
+    /// Negative — an anonymous caller has no access key, not even an empty one, and is limited as
+    /// the anonymous class; the authenticated refusal beside it is limited as the other class.
+    #[test]
+    fn n_anonymous_caller_has_no_access_key() {
+        let f = fixture();
+        let audit = RustfsAuthzAudit::new(Probe::open());
+        get_object(&audit, &f, None, Decision::Deny, Decision::Allow, Decision::Allow);
+        get_object(&audit, &f, Some(&f.identity), Decision::Deny, Decision::Allow, Decision::Allow);
+        assert_eq!(
+            audit.sink.records(),
+            [expected(DENY_REASON, None, 0), expected(DENY_REASON, Some(ACCESS_KEY), 0)]
+        );
+        assert_eq!(audit.sink.limiter_asked(), [true, false]);
+    }
+
+    /// Negative — values planted in the event's `resources`, version ids, subject, auth scheme,
+    /// target origin and session binding leave the record exactly as it is without them, and none
+    /// of their text reaches its `Debug` output.
+    #[test]
+    fn n_event_fields_outside_the_record_do_not_reach_it() {
+        const SECRETS: [&str; 3] = [
             "wJalrXUtnFEMI/K7MDENG/bPxRfiCYSECRETKEY",
             "AQoDYXdzEJrSESSIONTOKEN",
             "fe5f80f77d5fa3beca038a248ff027d0445342fe2855ddc963176630326f1024",
-            "SSECKEYMDEyMzQ1Njc4OTAxMjM0NTY3ODkwMTI=",
         ];
+        const PLANTED_BUCKET: &str = "planted-source-bucket";
+        const PLANTED_KEY: &str = "planted/source-key";
         let f = fixture();
+        let source_bucket = BucketName::new(PLANTED_BUCKET).expect("a valid bucket");
+        let source_key = ObjectKey::new(PLANTED_KEY).expect("a valid key");
         let binding = SessionBinding::new(SECRETS[1], 4_000_000_000).expect("a binding");
         let session = Identity::new(ACCESS_KEY).expect("a key").with_session_binding(binding);
-        let derived = AuthzRequest {
-            operation: "GetObject",
-            action: "s3:GetObjectVersion",
-            resource: ResourceShape::Object,
-            bucket: Some(&f.bucket),
-            key: Some(&f.key),
-            copy_source_identity: None,
+        let subject = Subject::Caller;
+        let planted_target = AuthzRequest {
             version_id: Some(SECRETS[0]),
-            route_action: SECRETS[2],
-            route_bucket: Some(&f.bucket),
-            route_key: Some(&f.key),
-            identity: Some(&session),
             target_origin: TargetOrigin::Host,
-            subject: None,
+            subject: Some(&subject),
+            ..target(&f, Some(&session))
         };
-        let resources = [derived];
-        let mut planted = event(&f, Decision::Deny, Some(&session));
-        planted.resources = &resources;
-        planted.stage = AuthzStage::Input;
-        let sink = RustfsAuthzAudit::new(Recorded::default());
-        sink.on_decision(&planted);
-        let records = sink.sink.0.into_inner().expect("not poisoned");
-        assert_eq!(records.len(), 1);
-        let everything = format!("{:?} {:?}", records[0], records[0].tags());
-        for secret in SECRETS {
-            assert!(!everything.contains(secret), "{secret} reached the sink: {everything}");
-        }
-        assert!(everything.contains(ACCESS_KEY), "the access key id is the one identity fact recorded");
-    }
-
-    /// Negative — a refusal populates exactly the fields this module claims, so the fixture's
-    /// `gateway-authz-audit` owner is backed by what a record really carries.
-    #[test]
-    fn audit_refusal_populates_the_owned_contract_fields() {
-        let records = recorded(&[Decision::Deny, Decision::Indeterminate]);
-        for record in &records {
-            assert_eq!(record.contract_fields(), OWNED_CONTRACT_FIELDS, "{}", record.decision);
+        let derived = AuthzRequest {
+            action: "s3:GetObjectVersion",
+            bucket: Some(&source_bucket),
+            key: Some(&source_key),
+            version_id: Some(SECRETS[2]),
+            ..planted_target
+        };
+        let planted_resources = [planted_target, derived];
+        let plain_resources = [target(&f, Some(&f.identity))];
+        for stage in [AuthzStage::Route, AuthzStage::Input] {
+            let plain = RustfsAuthzAudit::new(Probe::open());
+            plain.on_decision(&event(&f, stage, Decision::Deny, &plain_resources, Some(&f.identity)));
+            let planted = RustfsAuthzAudit::new(Probe::open());
+            planted.on_decision(&AuthzAuditEvent {
+                auth_scheme: AuthSchemeRef::SigV4Presigned,
+                target_origin: TargetOrigin::Host,
+                ..event(&f, stage, Decision::Deny, &planted_resources, Some(&session))
+            });
+            let records = planted.sink.records();
+            assert_eq!(records, plain.sink.records(), "{stage:?}");
+            assert_eq!(records.len(), 1, "{stage:?}");
+            let rendered = format!("{records:?}");
+            for planted_text in SECRETS.into_iter().chain([
+                PLANTED_BUCKET,
+                PLANTED_KEY,
+                "GetObjectVersion",
+                "Presigned",
+                "Host",
+                "Caller",
+                "Authz",
+            ]) {
+                assert!(!rendered.contains(planted_text), "{planted_text} reached the record: {rendered}");
+            }
         }
     }
 }

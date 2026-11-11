@@ -39,11 +39,8 @@ rustfs-gateway = { workspace = true }
 rustfs-credentials = { workspace = true }
 rustfs-iam = { workspace = true }
 rustfs-policy = { workspace = true }
-rustfs-s3-ops = { workspace = true }
-rustfs-s3-types = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
-http = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt"] }

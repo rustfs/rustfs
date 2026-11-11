@@ -20,10 +20,8 @@
 
 pub mod authz_audit;
 pub mod credentials;
-pub mod observer;
 pub mod policy;
 
-pub use authz_audit::{AuthzAuditRecord, AuthzAuditRecordSink, RustfsAuthzAudit};
+pub use authz_audit::{DenialAdmission, DenialAuditSink, GatewayDenialRecord, RustfsAuthzAudit};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
-pub use observer::{RequestMetricsSink, RequestSample, RustfsObserver};
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
