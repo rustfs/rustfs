@@ -315,6 +315,37 @@ pub const ENV_OBJECT_DISK_READ_TIMEOUT: &str = "RUSTFS_OBJECT_DISK_READ_TIMEOUT"
 /// Default disk read timeout in seconds.
 pub const DEFAULT_OBJECT_DISK_READ_TIMEOUT: u64 = 10;
 
+/// Environment variable for the smallest bitrot frame (hash + shard bytes)
+/// that is verified on a blocking thread instead of inline on the decode task
+/// (`0` disables off-thread verification).
+///
+/// The shard reads of one stripe complete on one task, so with large shards
+/// their hashes were computed one after another on one core: at 4 MiB shards
+/// a 12+4 stripe spent about 10 ms hashing serially. Frames at or above this
+/// size are hashed on the blocking pool so the shards of a stripe verify in
+/// parallel; small frames stay inline because a thread hop would cost more
+/// than the hash.
+pub const ENV_BITROT_VERIFY_OFFLOAD_MIN_BYTES: &str = "RUSTFS_BITROT_VERIFY_OFFLOAD_MIN_BYTES";
+/// Default smallest off-thread bitrot frame: 2 MiB (frames of the legacy 1 MiB
+/// block, and 1 MiB shards, stay inline).
+pub const DEFAULT_BITROT_VERIFY_OFFLOAD_MIN_BYTES: usize = 2 * 1024 * 1024;
+
+/// Environment variable for the erasure shard size, in bytes, of newly written
+/// objects (`0`, the default, keeps the historical 1 MiB erasure block).
+///
+/// When set, the erasure block of a new object is `data shards x shard bytes`,
+/// so every shard read and write is exactly this large and aligned: 4 MiB on a
+/// 12+4 layout gives a 48 MiB block, 48x fewer stripes per object than today.
+/// Existing objects keep the block recorded in their `xl.meta`. System
+/// metadata under `.rustfs.sys` always uses the 1 MiB block. The value must be
+/// a multiple of 4 KiB and at most `MAX_ERASURE_SHARD_BYTES`; invalid values
+/// are ignored with a warning.
+pub const ENV_ERASURE_SHARD_BYTES: &str = "RUSTFS_ERASURE_SHARD_BYTES";
+/// Default erasure shard size override (`0` = derive from the 1 MiB block).
+pub const DEFAULT_ERASURE_SHARD_BYTES: usize = 0;
+/// Largest accepted erasure shard size override (64 MiB).
+pub const MAX_ERASURE_SHARD_BYTES: usize = 64 * 1024 * 1024;
+
 /// Environment variable for the per-shard erasure write stall timeout (seconds).
 ///
 /// A single shard write (or shard-writer shutdown) that makes no forward

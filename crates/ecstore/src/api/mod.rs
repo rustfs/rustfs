@@ -604,9 +604,14 @@ pub mod integrity {
 }
 
 pub mod object {
+    pub use crate::erasure::codec::shard_buf::{
+        ArenaBlock, RegisteredSlabArena, ShardArena, ShardBuf, install_shard_arena, shard_arena,
+    };
+    pub use crate::erasure::codec::shard_emit::ShardEmitter;
     pub use crate::object_api::{
         BLOCK_SIZE_V2, ERASURE_ALGORITHM, EncryptionResolutionError, EncryptionResolutionErrorKind, GetObjectBodyCacheHook,
         GetObjectBodyCacheHookLookup, GetObjectBodySource, GetObjectReadCondition, GetObjectReadMetadata, GetObjectReader,
+        GetObjectSink, GetObjectSinkSegmentFactory, GetObjectSinkSegments, GetObjectSinkStream, GetObjectSinkWriter,
         NamespaceLockFence, ObjectEncryptionResolver, ObjectInfo, ObjectLockConfigSnapshot, ObjectMutationHook, ObjectOptions,
         PutObjReader, QuotaAdmission, RangedDecompressReader, ReadEncryptionMaterial, ReadEncryptionMode, ReadEncryptionRequest,
         SCANNER_PUBLICATION_LEASE_FENCE_METADATA_KEY, ScannerPublicationCommitScope, ScannerPublicationCommitStartError,

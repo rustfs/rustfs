@@ -21,8 +21,6 @@ use crate::storage_api::startup::storage::{ECStore, init_compression_total_memor
 use tokio::io::AsyncWriteExt;
 use tokio_util::sync::CancellationToken;
 
-const GET_STAGE_LOCAL_SUMMARY_FILE: &str = "/var/log/rustfs/get-stage-summary.log";
-
 pub(crate) async fn init_observability_runtime(store: Arc<ECStore>, ctx: CancellationToken) {
     print_server_info();
     init_update_check();
@@ -64,6 +62,8 @@ fn configure_metric_gates(metrics_enabled: bool) {
 fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
     let interval_secs =
         rustfs_utils::get_env_u64(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_INTERVAL_SECS, 15).max(1);
+    let summary_file = rustfs_utils::get_env_opt_str(rustfs_config::observability::ENV_OBS_GET_STAGE_LOCAL_SUMMARY_FILE)
+        .unwrap_or_else(|| rustfs_config::observability::DEFAULT_OBS_GET_STAGE_LOCAL_SUMMARY_FILE.to_owned());
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(interval_secs));
         interval.tick().await;
@@ -90,7 +90,7 @@ fn init_get_stage_local_summary_runtime(ctx: CancellationToken) {
                     let Ok(mut file) = tokio::fs::OpenOptions::new()
                         .create(true)
                         .append(true)
-                        .open(GET_STAGE_LOCAL_SUMMARY_FILE)
+                        .open(&summary_file)
                         .await
                     else {
                         break;

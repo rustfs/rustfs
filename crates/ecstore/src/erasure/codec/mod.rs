@@ -14,4 +14,6 @@
 
 pub(crate) mod bridge;
 pub(crate) mod buffer_pool;
+pub mod shard_buf;
+pub mod shard_emit;
 pub(crate) mod workspace;
