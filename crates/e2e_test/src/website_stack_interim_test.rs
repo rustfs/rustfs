@@ -31,7 +31,7 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::common::{RustFSTestEnvironment, admin_ok, init_logging, local_http_client};
+    use crate::common::{RustFSTestEnvironment, admin_ok, init_logging};
     use aws_sdk_s3::primitives::ByteStream;
     use aws_sdk_s3::types::{CorsConfiguration, CorsRule, ErrorDocument, IndexDocument, WebsiteConfiguration};
     use http::Method;
@@ -102,6 +102,16 @@ mod tests {
         (!values.is_empty()).then(|| values.join(" | "))
     }
 
+    /// A local client that reports a redirect instead of following it: the 302 and its
+    /// `Location` are what is compared.
+    fn no_redirect_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .no_proxy()
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .expect("local http client")
+    }
+
     fn website_host(bucket: &str) -> String {
         format!("{bucket}.{WEBSITE_DOMAIN}")
     }
@@ -114,7 +124,7 @@ mod tests {
         target: &str,
         extra: &[(&str, &str)],
     ) -> TestResult<Answer> {
-        let mut request = local_http_client()
+        let mut request = no_redirect_client()
             .request(method, format!("{}{target}", env.url))
             .header(HOST, host)
             .header("origin", ORIGIN);
@@ -141,7 +151,7 @@ mod tests {
             .header("x-amz-content-sha256", UNSIGNED_PAYLOAD)
             .body(Body::empty())?;
         let signed = sign_v4(request, 0, access_key, secret_key, "", "us-east-1");
-        let mut request = local_http_client().get(url);
+        let mut request = no_redirect_client().get(url);
         for (name, value) in signed.headers() {
             request = request.header(name, value);
         }
@@ -250,7 +260,7 @@ mod tests {
         wait_until_the_user_is_loaded(env).await?;
 
         let head = anonymous(env, Method::HEAD, &public, "/", &[]).await?;
-        let etag = local_http_client()
+        let etag = no_redirect_client()
             .head(format!("{}/", env.url))
             .header(HOST, &public)
             .send()
