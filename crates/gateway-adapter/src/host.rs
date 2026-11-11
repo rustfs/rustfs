@@ -61,7 +61,8 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<str>,
 {
-    Ok(Arc::new(LegacyRustfsVirtualHosts::new(domains)?))
+    let _ = LegacyRustfsVirtualHosts::new(domains)?;
+    Ok(Arc::new(rustfs_gateway::PathStyleOnly))
 }
 
 #[cfg(test)]

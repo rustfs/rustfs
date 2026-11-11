@@ -83,10 +83,15 @@ pub fn host_request_id<C: RequestIdCarrier + ?Sized>(carrier: &C) -> Option<Host
 ///
 /// Never refuses the request: the caller forwards it whatever the outcome.
 pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Request<B>) -> AttachOutcome {
+    let header = request
+        .headers()
+        .get("x-amz-request-id")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|text| HostRequestId::new(text).ok());
     let Some(carrier) = request.extensions().get::<C>() else {
         return AttachOutcome::NoContext;
     };
-    let Some(id) = host_request_id(carrier) else {
+    let Some(id) = header.or_else(|| host_request_id(carrier)) else {
         return AttachOutcome::UnusableId;
     };
     request.extensions_mut().insert(id);

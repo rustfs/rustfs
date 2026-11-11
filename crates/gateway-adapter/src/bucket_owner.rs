@@ -91,7 +91,10 @@ impl<L: BucketLookup> RustfsBucketOwners<L> {
     /// [`OwnerLookupError::NoSuchBucket`] when the bucket does not exist;
     /// [`OwnerLookupError::Backend`] on any lookup failure or when the configured owner is empty.
     pub async fn resolve(&self, bucket: &str) -> Result<Arc<str>, OwnerLookupError> {
-        self.lookup.check(bucket).await?;
+        self.lookup.check(bucket).await.map_err(|e| match e {
+            OwnerLookupError::Backend => OwnerLookupError::NoSuchBucket,
+            other => other,
+        })?;
         if self.owner.is_empty() {
             return Err(OwnerLookupError::Backend);
         }
