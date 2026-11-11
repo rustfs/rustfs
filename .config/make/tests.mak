@@ -22,6 +22,14 @@ TEST_THREADS ?= 1
 # differ from CI and .config/nextest.toml test-groups will NOT apply.
 
 .PHONY: script-tests
+.PHONY: release-package-tests
+release-package-tests: ## Run release package integration on Linux with fpm, dpkg and rpm installed
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_packages.py
+
+.PHONY: release-image-tests
+release-image-tests: ## Run OCI integration with Docker, Go and skopeo; set RELEASE_IMAGE_VARIANT and RELEASE_IMAGE_OUTPUT
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_images.py
+
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	trap 'status=$$?; printf "ERROR: script-tests failed (exit %s): %s\n" "$$status" "$$BASH_COMMAND" >&2; exit "$$status"' ERR
@@ -57,6 +65,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_build_workflow.py
+	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/release -p "test_*.py"
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_glibc.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_upgrade_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_migration_gate_evidence.py

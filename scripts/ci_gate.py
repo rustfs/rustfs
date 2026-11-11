@@ -80,6 +80,58 @@ def git_file(root: Path, revision: str, path: str) -> str:
     return git(root, "show", f"{revision}:{path}")
 
 
+def release_metadata_only(root: Path, base: str, head: str, path: str) -> bool:
+    """Recognize literal stable-version edits, never general packaging changes."""
+    stable = r"(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)\.(?:0|[1-9][0-9]*)"
+    marker = "<version>"
+    patterns = {
+        "flake.nix": [rf'(?m)^([ \t]*pname = "rustfs";\n[ \t]*version = ")({stable})(";)$'],
+        "helm/rustfs/Chart.yaml": [rf'(?m)^({key}: ")({stable})(")$' for key in ("version", "appVersion")],
+        "rustfs.spec": [rf'(?m)^(Version:[ \t]+)({stable})()$'],
+    }
+    if path not in patterns or not SHA.fullmatch(base) or not SHA.fullmatch(head):
+        return False
+    try:
+        normalized, versions = [], []
+        for revision in (base, head):
+            # A symlink, added/deleted file or executable-mode change is a
+            # build input even if its apparent text resembles metadata.
+            entry = git(root, "ls-tree", "-z", revision, "--", path)
+            if not re.fullmatch(rf"100644 blob [0-9a-f]{{40}}\t{re.escape(path)}\x00", entry):
+                return False
+            content, values = git_file(root, revision, path), []
+            # Existing markers could make edits to distinct fields collapse
+            # to identical normalized text.
+            if marker in content:
+                return False
+            for pattern in patterns[path]:
+                matches = list(re.finditer(pattern, content))
+                if len(matches) != 1:
+                    return False
+                values.append(matches[0][2])
+                content = re.sub(pattern, lambda match: match[1] + marker + match[3], content)
+            if len(set(values)) != 1:
+                return False
+            normalized.append(content)
+            versions.append(values[0])
+        if path == "rustfs.spec":
+            old, new = (content.split("%changelog\n") for content in normalized)
+            if len(old) != 2 or len(new) != 2 or old[0] != new[0]:
+                return False
+            if old[1] == new[1]:
+                return True
+            # Only the standard prepended release note is non-executable;
+            # RPM macro syntax and edits to older history retain the full gate.
+            note = (r"\* (?:Mon|Tue|Wed|Thu|Fri|Sat|Sun) "
+                    r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) [0-9]{2} [0-9]{4} "
+                    r"[A-Za-z0-9 ._-]+ <[A-Za-z0-9._+-]+@[A-Za-z0-9.-]+>\n"
+                    rf"- Update RPM package to RustFS {re.escape(versions[1])}\n\n")
+            return re.fullmatch(note + re.escape(old[1]), new[1]) is not None
+        return normalized[0] == normalized[1]
+    except (OSError, subprocess.CalledProcessError, UnicodeError, ValueError):
+        return False
+
+
 def dependency_tables(document: dict):
     for key, value in document.items():
         if key in ("dependencies", "dev-dependencies", "build-dependencies"):
@@ -265,10 +317,17 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
         base_packages, base_graph = head_packages, head_graph
         reasons.append(f"conservative fallback: {type(error).__name__}")
     graph = {name: head_graph.get(name, set()) | base_graph.get(name, set()) for name in set(head_graph) | set(base_graph)}
-    affected = set()
+    affected, non_runtime = set(), set()
     if not full and policy is not None:
         for path in changed:
             if documentation_path(path):
+                non_runtime.add(path)
+                continue
+            if (policy["rollout"] == "enforced"
+                    and not any(fnmatch.fnmatchcase(path, pattern) for pattern in policy["full_paths"])
+                    and release_metadata_only(root, base, head, path)):
+                non_runtime.add(path)
+                reasons.append(f"literal stable release metadata: {path}")
                 continue
             if path in E2E_SELECTION_FILES:
                 affected.add("e2e_test")
@@ -290,9 +349,9 @@ def select_plan(event: str, base: str, head: str, ref: str, root: Path, action: 
             affected.update(owners)
         if not affected and not full:
             mode = "docs"
-            reasons.append("all changes are documentation")
+            reasons.append("all changes are documentation or literal stable release metadata")
         elif affected == {"e2e_test"} and not full and not (closure({"e2e_test"}, graph, reverse=True) - {"e2e_test"}) and all(
-                documentation_path(path) or path in E2E_SELECTION_FILES or
+                path in non_runtime or path in E2E_SELECTION_FILES or
                 (path.startswith("crates/e2e_test/src/") and path.endswith(".rs")) for path in changed):
             mode = "e2e"
             reasons.append("isolated E2E harness changes")

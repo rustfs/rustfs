@@ -286,12 +286,15 @@ pub(super) fn fsync_inline_commit_std(
 
     if destination_was_absent {
         let mut ancestor = dst.parent().and_then(Path::parent);
+        let mut ancestor_step = 0usize;
         while let Some(ancestor_dir) = ancestor {
             if !ancestor_dir.starts_with(dst_volume_dir) {
                 break;
             }
             let fsync_started = rustfs_io_metrics::put_stage_timer();
-            if let Err(err) = os::fsync_dir_limited_std(ancestor_dir) {
+            if let Err(err) =
+                os::fsync_commit_ancestor_directory_limited_std(ancestor_dir, dst_volume_dir, ancestor_step, commit_guard)
+            {
                 rustfs_io_metrics::record_put_object_stage_duration_from(
                     rustfs_io_metrics::PUT_STAGE_SET_DISK_RENAME_ANCESTOR_DIR_FSYNC,
                     fsync_started,
@@ -310,6 +313,7 @@ pub(super) fn fsync_inline_commit_std(
                 break;
             }
             ancestor = ancestor_dir.parent();
+            ancestor_step += 1;
         }
     }
     Ok(())
@@ -1461,7 +1465,12 @@ impl LocalDisk {
                             }
                         }
                     }
-                    match publication_owned.finish_on_thread(sync_commit_metadata, !cfg!(test), staging_cleanup) {
+                    match publication_owned.finish_on_thread(
+                        sync_commit_metadata,
+                        !cfg!(test),
+                        staging_cleanup,
+                        Some(&directory_guard_owned),
+                    ) {
                         Ok(result) => Ok(MultipartFusedCommitOutcome::Committed(Box::new(RenameDataResp {
                             multipart_source: Some(Box::new(result)),
                             old_data_dir: has_old_data_dir,

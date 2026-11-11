@@ -4608,6 +4608,19 @@ fn marker_purge_receipt_path(
 }
 
 impl SetDisks {
+    /// The first disk slot UUID is assigned when this erasure set is formatted.
+    /// It survives pool reordering and replacement of a disk in that slot.
+    pub fn persistent_set_id(&self) -> Result<Uuid> {
+        self.format
+            .erasure
+            .sets
+            .get(self.set_index)
+            .and_then(|disks| disks.first())
+            .copied()
+            .filter(|id| !id.is_nil())
+            .ok_or_else(|| Error::other("erasure set has no persistent format identity"))
+    }
+
     /// Persist a quorum DELETE receipt outside the object marker itself. The
     /// receipt is written to the metadata bucket so it survives a node restart
     /// while an inaccessible member still holds the stale marker.
@@ -11027,7 +11040,12 @@ mod tests {
         let live = Uuid::new_v4();
         let orphan = Uuid::new_v4();
         let object_dir = dir.path().join("bucket/obj");
-        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &[live]).await;
+        // Part files are inert to discovery and cost 1/64 of an entry, so the
+        // first step is exhausted by what still costs a full entry each: the
+        // data directories of many versions, all referenced by the metadata.
+        let versions = (0..4200).map(|_| Uuid::new_v4()).collect::<Vec<_>>();
+        let referenced = std::iter::once(live).chain(versions.iter().copied()).collect::<Vec<_>>();
+        write_object_meta_with_data_dirs(&object_dir, "bucket", "obj", &referenced).await;
         let live_dir = object_dir.join(live.to_string());
         let orphan_dir = object_dir.join(orphan.to_string());
         fs::create_dir_all(&live_dir).await.expect("create live multipart directory");
@@ -11036,9 +11054,13 @@ mod tests {
             .await
             .expect("write orphan payload");
         let parts_dir = live_dir.clone();
+        let versions_root = object_dir.clone();
         tokio::task::spawn_blocking(move || {
             for part in 1..=4200 {
                 std::fs::write(parts_dir.join(format!("part.{part}")), b"live").expect("write live multipart entry");
+            }
+            for version in versions {
+                std::fs::create_dir(versions_root.join(version.to_string())).expect("create referenced version directory");
             }
         })
         .await
@@ -11049,7 +11071,10 @@ mod tests {
             .await
             .expect("read first discovery page");
         assert!(first.transactions.is_empty());
-        assert!(first.next.is_some(), "ordinary multipart entries must exhaust the first scan budget");
+        assert!(
+            first.next.is_some(),
+            "the data directories of many versions must exhaust the first scan step"
+        );
         let last = disk
             .discover_delete_transactions("bucket", Some("obj"), first.next, 1)
             .await

@@ -1280,6 +1280,28 @@ pub(crate) fn fsync_dir_limited_std(dir: &Path) -> io::Result<()> {
     fsync_dir_std(dir)
 }
 
+pub(crate) fn fsync_commit_ancestor_directory_limited_std(
+    dir: &Path,
+    base_dir: &Path,
+    step_from_destination: usize,
+    guard: &RenameCommitGuard,
+) -> io::Result<()> {
+    #[cfg(target_os = "linux")]
+    if base_dir == guard.directories.destination_base
+        && guard.directories.destination_path.ancestors().nth(1 + step_from_destination) == Some(dir)
+        && let Some(ancestors) = guard.directories.destination_ancestors.get()
+        && let Some(idx) = ancestors.len().checked_sub(1 + step_from_destination)
+        && let Some(file) = ancestors.get(idx)
+    {
+        #[cfg(test)]
+        fsync_dir_recorder::record_limited(dir);
+        return fsync_directory_handle_std(dir, Some(file));
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = (base_dir, step_from_destination, guard);
+    fsync_dir_limited_std(dir)
+}
+
 /// Reuse the published directory without bypassing group commit or sync admission.
 pub(crate) async fn fsync_commit_directory(
     dir: &Path,
@@ -3804,7 +3826,7 @@ pub(crate) fn rename_all_with_precondition_and_parent_sync_std(
     #[cfg(all(test, not(windows)))]
     prepared_publication_test_hooks::run_rename_destination(source, destination);
     #[cfg(all(any(test, feature = "test-util"), not(windows)))]
-    {
+    if prepared_publication_test_hooks::has_any_hooks() {
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, source);
         prepared_publication_test_hooks::run(prepared_publication_test_hooks::Stage::Rename, destination);
         if let Some(check) = precondition {
@@ -5744,6 +5766,7 @@ struct LinuxCommitDirectories {
     destination_path: PathBuf,
     source: LinuxCommitDirectory,
     destination: std::sync::OnceLock<LinuxCommitDirectory>,
+    destination_ancestors: std::sync::OnceLock<Vec<std::fs::File>>,
     destination_base: PathBuf,
 }
 
@@ -5760,6 +5783,8 @@ impl LinuxCommitDirectories {
                 .ok_or_else(|| io::Error::other("missing destination directory guard"))?,
         );
         let directory = LinuxCommitDirectory::new(directory)?;
+        let ancestors = parents.into_iter().map(std::fs::File::from).collect();
+        let _ = self.destination_ancestors.set(ancestors);
         Ok(self.destination.get_or_init(|| directory))
     }
 
@@ -5769,7 +5794,7 @@ impl LinuxCommitDirectories {
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "file parent does not match its commit guard"))
     }
 
-    fn validate(&self) -> io::Result<()> {
+    fn validate(&self, check_destination: bool) -> io::Result<()> {
         use std::os::unix::fs::MetadataExt;
         // A pinned directory may have been unlinked or replaced. Do not report a
         // successful publication into a detached object tree.
@@ -5778,8 +5803,9 @@ impl LinuxCommitDirectories {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "commit directory identity changed"));
         }
         let destination = self.prepare_destination()?;
-        if (self.source.device, self.source.inode) != (destination.device, destination.inode)
-            || self.source_path.as_os_str() != self.destination_path.as_os_str()
+        if check_destination
+            && ((self.source.device, self.source.inode) != (destination.device, destination.inode)
+                || self.source_path.as_os_str() != self.destination_path.as_os_str())
         {
             let current = self.root.open_directory(&self.destination_path)?.metadata()?;
             if (current.dev(), current.ino()) != (destination.device, destination.inode) {
@@ -5792,8 +5818,9 @@ impl LinuxCommitDirectories {
     fn rename(&self, source: &Path, destination: &Path, prepared: Option<&PreparedRenameSource>) -> io::Result<()> {
         let source_name = self.file_name(source, true)?;
         let destination_name = self.file_name(destination, false)?;
+        let destination_was_prepared = self.destination.get().is_some();
         let destination_parent = self.prepare_destination()?;
-        self.validate()?;
+        self.validate(destination_was_prepared)?;
         let mut attempt = 0;
         loop {
             if let Some(prepared) = prepared {
@@ -6015,7 +6042,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
     source_parent: &Path,
 ) -> io::Result<RenameCommitGuard> {
     let original = &metadata_guard.directories;
-    original.validate()?;
+    original.validate(true)?;
     let source = LinuxCommitDirectory::new(original.root.open_directory(source_parent)?)?;
     let destination = original.prepare_destination()?;
     // Clone the pinned file identity, never recapture the target pathname
@@ -6032,6 +6059,7 @@ pub(crate) fn multipart_payload_commit_guard_std(
             destination_path: original.destination_path.clone(),
             source,
             destination: std::sync::OnceLock::from(destination),
+            destination_ancestors: std::sync::OnceLock::new(),
             destination_base: original.destination_base.clone(),
         }),
     })
@@ -6113,6 +6141,7 @@ pub(crate) fn prepare_rename_commit_guard(
                 destination_path: destination_parent.to_path_buf(),
                 source,
                 destination,
+                destination_ancestors: std::sync::OnceLock::new(),
                 destination_base: destination_base.to_path_buf(),
             }),
         })
@@ -7198,6 +7227,40 @@ pub(crate) fn pin_multipart_source_directory(
     }
 }
 
+fn same_parent_commit_guard(
+    parent: &Path,
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+) -> io::Result<RenameCommitGuard> {
+    #[cfg(target_os = "linux")]
+    if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
+        let dir = &directory_guard.directories.source;
+        return Ok(RenameCommitGuard {
+            directories: Arc::new(LinuxCommitDirectories {
+                root: directory_guard.directories.root.clone(),
+                source_path: parent.to_path_buf(),
+                destination_path: parent.to_path_buf(),
+                source: LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                },
+                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
+                    file: Arc::clone(&dir.file),
+                    device: dir.device,
+                    inode: dir.inode,
+                }),
+                destination_ancestors: std::sync::OnceLock::new(),
+                destination_base: base.to_path_buf(),
+            }),
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = directory_guard;
+    prepare_rename_commit_guard(parent, parent, base, publication_root)
+}
+
 /// A small control record always gets its own inode and an atomic replacement.
 /// The caller owns the upload SourceRW and keeps its namespace lease alive.
 pub(crate) fn replace_multipart_source_metadata(
@@ -7206,10 +7269,20 @@ pub(crate) fn replace_multipart_source_metadata(
     base: &Path,
     publication_root: &PublicationRoot,
 ) -> io::Result<()> {
+    replace_multipart_source_metadata_with_guard(path, bytes, base, publication_root, None)
+}
+
+pub(crate) fn replace_multipart_source_metadata_with_guard(
+    path: &Path,
+    bytes: &[u8],
+    base: &Path,
+    publication_root: &PublicationRoot,
+    directory_guard: Option<&RenameCommitGuard>,
+) -> io::Result<()> {
     let parent = path.parent().ok_or_else(|| io::Error::other("MPU record has no parent"))?;
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    let guard = prepare_rename_commit_guard(parent, parent, base, publication_root)?;
+    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
     let staged = parent.join(format!(".mpu-record-{}", uuid::Uuid::new_v4()));
     let mut prepared = create_prepared_rename_source_with_commit_guard(&staged, path, &guard)?;
     prepared.write_all(bytes, true)?;
@@ -7458,37 +7531,9 @@ pub(crate) fn install_multipart_prepared_head(
     if original_path.parent() != Some(parent) || original_path == canonical_head {
         return Err(io::Error::new(io::ErrorKind::InvalidInput, "MPU proxy must be a private sibling"));
     }
-    #[cfg(target_os = "linux")]
-    let guard = if let Some(directory_guard) = directory_guard.filter(|g| g.directories.source_path == parent) {
-        let dir = &directory_guard.directories.source;
-        RenameCommitGuard {
-            directories: Arc::new(LinuxCommitDirectories {
-                root: directory_guard.directories.root.clone(),
-                source_path: parent.to_path_buf(),
-                destination_path: parent.to_path_buf(),
-                source: LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                },
-                destination: std::sync::OnceLock::from(LinuxCommitDirectory {
-                    file: Arc::clone(&dir.file),
-                    device: dir.device,
-                    inode: dir.inode,
-                }),
-                destination_base: base.to_path_buf(),
-            }),
-        }
-    } else {
-        prepare_rename_commit_guard(parent, parent, base, publication_root)?
-    };
     #[cfg(not(target_os = "linux"))]
     let _pinned = pin_multipart_source_directory(parent, base, publication_root)?;
-    #[cfg(not(target_os = "linux"))]
-    let guard = {
-        let _ = directory_guard;
-        prepare_rename_commit_guard(parent, parent, base, publication_root)?
-    };
+    let guard = same_parent_commit_guard(parent, base, publication_root, directory_guard)?;
     rename_prepared_source_std(&prepared, &original_path, canonical_head, base, publication_root, &guard)?;
     prepared.path = canonical_head.to_path_buf();
     fsync_commit_directory_limited_std(parent, &guard)?;
@@ -7790,8 +7835,7 @@ pub(crate) fn hardlink_multipart_source_files(
     }
     #[cfg(unix)]
     {
-        use rustix::fs::{AtFlags, Mode, OFlags, linkat, openat, unlinkat};
-        use std::os::unix::fs::MetadataExt;
+        use rustix::fs::{AtFlags, FileType, linkat, statat, unlinkat};
         #[cfg(test)]
         let source_path = source.to_path_buf();
         #[cfg(test)]
@@ -7806,20 +7850,26 @@ pub(crate) fn hardlink_multipart_source_files(
             .ok_or_else(|| io::Error::other("missing multipart attempt directory"))?;
         #[cfg(test)]
         prepared_publication_test_hooks::run_hardlink_destination(&source_path, &destination_path);
-        let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
         for name in names {
             if cancelled() {
                 return Err(io::Error::new(io::ErrorKind::Interrupted, "multipart staging cancelled"));
             }
-            let original = std::fs::File::from(openat(source, name.as_str(), flags, Mode::empty())?);
-            let expected = original.metadata()?;
-            if !expected.is_file() {
+            let expected = statat(source, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            let expected_type = FileType::from_raw_mode(expected.st_mode);
+            if expected_type.is_symlink() {
+                return Err(io::Error::from_raw_os_error(libc::ELOOP));
+            }
+            if !expected_type.is_file() {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard is not a regular file"));
             }
             linkat(source, name.as_str(), destination, name.as_str(), AtFlags::empty())?;
-            let linked = std::fs::File::from(openat(destination, name.as_str(), flags, Mode::empty())?);
-            let actual = linked.metadata()?;
-            if actual.dev() != expected.dev() || actual.ino() != expected.ino() {
+            let actual = statat(destination, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            if !FileType::from_raw_mode(actual.st_mode).is_file()
+                || actual.st_dev != expected.st_dev
+                || actual.st_ino != expected.st_ino
+                || actual.st_size != expected.st_size
+                || actual.st_mtime != expected.st_mtime
+            {
                 let _ = unlinkat(destination, name.as_str(), AtFlags::empty());
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "multipart shard changed during staging"));
             }

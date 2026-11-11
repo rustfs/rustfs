@@ -1120,6 +1120,20 @@ impl ECStore {
         Some(epoch)
     }
 
+    /// Namespace cleanup edits an existing usage baseline; it does not certify
+    /// a scan. Retain the movement fence without requiring scanning to resume.
+    pub(crate) async fn data_usage_namespace_cleanup_guard(&self) -> Option<(tokio::sync::OwnedRwLockReadGuard<()>, u64)> {
+        let operation_guard = self.ctx.data_movement_operation_gate().read_owned().await;
+        if self.ctx.data_movement_operation_epoch_exhausted() || self.ctx.data_movement_generation_exhausted() {
+            return None;
+        }
+        Some((operation_guard, self.ctx.data_movement_operation_epoch()))
+    }
+
+    pub(crate) async fn data_usage_namespace_cleanup_epoch(&self) -> Option<u64> {
+        self.data_usage_namespace_cleanup_guard().await.map(|(_, epoch)| epoch)
+    }
+
     /// Acquire a storage-owned read admission for a coordinator's final
     /// scanner publication.  The guard remains in the context's lease table,
     /// so a local movement writer cannot pass the peer while its authoritative
