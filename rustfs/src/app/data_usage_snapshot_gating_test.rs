@@ -44,6 +44,10 @@ use uuid::Uuid;
 
 const SEEDED_BUCKET_SIZE: u64 = 123_456;
 const SEEDED_BUCKET_OBJECTS: u64 = 42;
+/// The smallest snapshot-time step that every supported platform can
+/// represent. Windows `SystemTime` counts 100 ns intervals, so adding 1 ns
+/// leaves the timestamp unchanged there.
+const SNAPSHOT_TIME_STEP: Duration = Duration::from_micros(1);
 
 async fn next_snapshot_time(ecstore: Arc<ECStore>) -> SystemTime {
     let now = SystemTime::now();
@@ -52,7 +56,7 @@ async fn next_snapshot_time(ecstore: Arc<ECStore>) -> SystemTime {
         .ok()
         .and_then(|info| info.last_update)
         .unwrap_or(now);
-    latest.max(now) + Duration::from_nanos(1)
+    latest.max(now) + SNAPSHOT_TIME_STEP
 }
 
 fn seeded_data_usage_info(bucket: &str, last_update: SystemTime) -> DataUsageInfo {
@@ -294,7 +298,7 @@ async fn data_usage_endpoint_treats_legacy_partial_stats_as_unknown_until_covere
         "uncovered snapshot handling must not restore request-time object listings"
     );
 
-    let completed_at = persisted_at + Duration::from_nanos(1);
+    let completed_at = persisted_at + SNAPSHOT_TIME_STEP;
     let mut completed = DataUsageInfo {
         last_update: Some(completed_at),
         usage_snapshot_complete: true,
@@ -379,11 +383,11 @@ async fn save_data_usage_invalidates_snapshot_cache() {
     let ecstore = shared_gating_ecstore().await;
     let bucket = format!("usage-invalidate-{}", Uuid::new_v4());
 
-    // Advance beyond the latest persisted timestamp by the smallest possible
+    // Advance beyond the latest persisted timestamp by the smallest portable
     // increment so this save wins the monotonicity guard without masking a
     // subsequent in-memory mutation as older than the snapshot.
     let warm_at = next_snapshot_time(ecstore.clone()).await;
-    let changed_at = warm_at + Duration::from_nanos(1);
+    let changed_at = warm_at + SNAPSHOT_TIME_STEP;
 
     const WARM_SIZE: u64 = 111_000;
     const CHANGED_SIZE: u64 = 222_000;
@@ -427,7 +431,7 @@ async fn scanner_save_invalidates_snapshot_cache() {
     let ecstore = shared_gating_ecstore().await;
     let bucket = format!("usage-scanner-invalidate-{}", Uuid::new_v4());
     let warm_at = next_snapshot_time(ecstore.clone()).await;
-    let changed_at = warm_at + Duration::from_nanos(1);
+    let changed_at = warm_at + SNAPSHOT_TIME_STEP;
 
     const WARM_SIZE: u64 = 333_000;
     const CHANGED_SIZE: u64 = 444_000;

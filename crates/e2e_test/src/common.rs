@@ -774,6 +774,18 @@ impl RustFSTestEnvironment {
             .await
     }
 
+    /// Like [`Self::start_rustfs_server_from_binary`], but leaves other running RustFS processes
+    /// alone, so that two servers of different binaries can be alive at once.
+    pub async fn start_rustfs_server_from_binary_without_cleanup(
+        &mut self,
+        binary_path: &Path,
+        extra_args: Vec<&str>,
+        extra_env: &[(&str, &str)],
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        self.start_rustfs_server_inner_with_binary(binary_path, extra_args, extra_env, false)
+            .await
+    }
+
     /// Start RustFS server with basic configuration
     pub async fn start_rustfs_server(&mut self, extra_args: Vec<&str>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.start_rustfs_server_inner(extra_args, &[], true).await

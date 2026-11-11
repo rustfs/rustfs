@@ -586,7 +586,18 @@ async fn test_reads_under_a_deleted_kms_key_report_key_not_found() -> Result<(),
         .await?;
     assert_eq!(put.ssekms_key_id(), Some(doomed_key_id.as_str()));
 
-    info!("🗑️ deleting {doomed_key_id} immediately");
+    // Destruction is two requests: schedule the deletion, then destroy the
+    // pending key without waiting out its window.
+    info!("🗑️ scheduling {doomed_key_id} for deletion, then destroying it");
+    kms_admin_request(
+        &base.url,
+        http::Method::DELETE,
+        "/rustfs/admin/v3/kms/keys/delete",
+        Some(&serde_json::json!({ "key_id": doomed_key_id }).to_string()),
+        &base.access_key,
+        &base.secret_key,
+    )
+    .await?;
     kms_admin_request(
         &base.url,
         http::Method::DELETE,

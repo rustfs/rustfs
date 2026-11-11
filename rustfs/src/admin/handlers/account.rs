@@ -165,7 +165,8 @@ impl Operation for ChangeOwnPasswordHandler {
         let signing_secret = req
             .credentials()
             .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?
-            .secret_key()
+            .require_secret_key()
+            .map_err(|_| s3::error(S3ErrorCode::AccessDenied, "the request credential carries no secret key"))?
             .to_string();
         let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
         let audit = AccountAuditContext::from_envelope(req.envelope());
@@ -540,6 +541,23 @@ fn validate_new_secret_key(request: &ChangePasswordRequest) -> S3Result<()> {
 mod tests {
     use super::*;
     use crate::server::ADMIN_PREFIX;
+
+    #[tokio::test]
+    async fn change_own_password_without_a_secret_key_is_access_denied() {
+        let req = crate::admin::operation::test_support::TestRequest::new(
+            Method::POST,
+            format!("{ADMIN_PREFIX}/v3/change-own-password")
+                .parse::<http::Uri>()
+                .expect("uri"),
+        )
+        .credentials_without_secret("account-user", None)
+        .build();
+        let err = ChangeOwnPasswordHandler {}
+            .call(req, Params::new())
+            .await
+            .expect_err("a credential without a secret key cannot rotate its password");
+        assert_eq!(err.code(), &S3ErrorCode::AccessDenied);
+    }
     use rustfs_madmin::account::{AccountMutability, CredentialsSource};
 
     #[test]
