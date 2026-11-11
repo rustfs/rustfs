@@ -314,6 +314,9 @@ fn expected_admin_route_matrix() -> Vec<RouteMatrixEntry> {
         admin_route_sample(Method::PUT, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
         admin_route_sample(Method::GET, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/bucket-etag/{bucket}", "/v3/bucket-etag/test-bucket"),
+        admin_route_sample(Method::PUT, "/v3/bucket-engine/{bucket}", "/v3/bucket-engine/test-bucket"),
+        admin_route_sample(Method::GET, "/v3/bucket-engine/{bucket}", "/v3/bucket-engine/test-bucket"),
+        admin_route_sample(Method::DELETE, "/v3/bucket-engine/{bucket}", "/v3/bucket-engine/test-bucket"),
         admin_route_sample(Method::PUT, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::GET, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
         admin_route_sample(Method::DELETE, "/v3/on-demand-migration/{bucket}", "/v3/on-demand-migration/test-bucket"),
@@ -1443,6 +1446,9 @@ fn test_register_routes_cover_representative_admin_paths() {
     assert_route(&router, Method::PUT, &admin_path("/v3/bucket-etag/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/bucket-etag/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-etag/test-bucket"));
+    assert_route(&router, Method::PUT, &admin_path("/v3/bucket-engine/test-bucket"));
+    assert_route(&router, Method::GET, &admin_path("/v3/bucket-engine/test-bucket"));
+    assert_route(&router, Method::DELETE, &admin_path("/v3/bucket-engine/test-bucket"));
     assert_route(&router, Method::PUT, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::GET, &admin_path("/v3/on-demand-migration/test-bucket"));
     assert_route(&router, Method::DELETE, &admin_path("/v3/on-demand-migration/test-bucket"));

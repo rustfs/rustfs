@@ -18,9 +18,10 @@
 //! [`OnDemandMigrationConfig`] into a live [`BucketOdmState`]: a
 //! [`SourceClient`], a circuit breaker, a negative cache, a per-key
 //! singleflight table, a pull concurrency limit and counters. Its lifecycle
-//! follows the bucket metadata cache through the publish hook registered in
-//! [`BUCKET_CONFIG_PUBLISH_HOOK`]; the hook fires on every cache install
-//! path (initial load, admin update, peer reload, refresh loop, lazy load).
+//! follows the bucket metadata cache through its bucket config subscription
+//! ([`register_bucket_config_subscriber`]); the subscription fires on every
+//! cache install path (initial load, admin update, peer reload, refresh loop,
+//! lazy load).
 //!
 //! Change detection compares the config by value (`PartialEq`) rather than
 //! by `updated_at`. The bucket incarnation is part of this comparison:
@@ -52,7 +53,7 @@ use super::stats::{GaugeGuard, OdmStats, OdmStatsSnapshot, PullFailureReason};
 use super::storage_api::remote_s3_client::{
     PathStyle as ClientPathStyle, RemoteCredentials, RemoteS3ClientError, RemoteS3RetryPolicy,
 };
-use super::storage_api::{BUCKET_CONFIG_PUBLISH_HOOK, BUCKET_ON_DEMAND_MIGRATION_CONFIG};
+use super::storage_api::{BUCKET_ON_DEMAND_MIGRATION_CONFIG, register_bucket_config_subscriber};
 use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -746,16 +747,16 @@ impl OnDemandMigrationSys {
         self.write_back.read().clone()
     }
 
-    /// Registers `publish` as the bucket-metadata publish hook. Returns
-    /// `false` when a hook was already registered.
+    /// Subscribes `publish` to the on-demand migration bucket config entry.
+    /// Returns `false` when the subscription was already registered.
     pub fn register_config_hook(&'static self) -> bool {
-        BUCKET_CONFIG_PUBLISH_HOOK
-            .set(Box::new(move |bucket, config_file, stored| {
-                if config_file == BUCKET_ON_DEMAND_MIGRATION_CONFIG {
-                    self.publish_stored(bucket, stored.map(|(bytes, _, incarnation)| (bytes, incarnation)));
-                }
-            }))
-            .is_ok()
+        register_bucket_config_subscriber(
+            "on-demand-migration",
+            BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+            Box::new(move |bucket, _config_file, stored| {
+                self.publish_stored(bucket, stored.map(|(bytes, _, incarnation)| (bytes, incarnation)));
+            }),
+        )
     }
 
     /// Corrupt persisted bytes withdraw state synchronously, just like deletion.

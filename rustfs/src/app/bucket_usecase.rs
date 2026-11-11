@@ -76,6 +76,7 @@ use crate::app::runtime_sources::{
 };
 use crate::app::table_list_isolation;
 use crate::auth::get_condition_values_with_client_info;
+use crate::bucket_engine::{self, EngineRegistry};
 use crate::error::ApiError;
 use crate::shared_types::RemoteAddr;
 use crate::site_replication::{
@@ -1542,10 +1543,14 @@ impl DefaultBucketUsecase {
             ..
         } = req.input;
         let lock_enabled = object_lock_enabled_for_bucket.is_some_and(|v| v);
+        // Checked before the bucket exists so an invalid engine request creates nothing.
+        let engine_binding =
+            bucket_engine::lifecycle::create_bucket_binding(EngineRegistry::global(), &req.headers, lock_enabled)?;
 
         let Some(store) = self.object_store() else {
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "Not init".to_string()));
         };
+        let binding_store = store.clone();
 
         // Keep the local namespace mutation and its peer hook ordered across
         // every node in this site. Otherwise a delete waiting for repair
@@ -1580,6 +1585,16 @@ impl DefaultBucketUsecase {
 
         match make_result {
             Ok(()) => {
+                if let Some(requested) = engine_binding
+                    && let Err(err) = bucket_engine::binding::set_binding(binding_store.clone(), &bucket, requested).await
+                {
+                    // The bucket must not outlive a failed binding as an
+                    // object-engine bucket; it is still empty here.
+                    if let Err(rollback) = binding_store.delete_bucket(&bucket, &DeleteBucketOptions::default()).await {
+                        warn!(bucket = %bucket, error = ?rollback, "failed to remove bucket after engine binding failed");
+                    }
+                    return Err(err);
+                }
                 // A peer may have cached this bucket as missing before the
                 // create. Refresh peer metadata after the namespace and
                 // metadata commit fences are released so the peer reload can
@@ -1643,6 +1658,8 @@ impl DefaultBucketUsecase {
         if force {
             authorize_request(&mut req, Action::S3Action(S3Action::ForceDeleteBucketAction)).await?;
         }
+
+        bucket_engine::lifecycle::before_delete_bucket(EngineRegistry::global(), &input.bucket, force).await?;
 
         // Keep the local namespace mutation and its peer hook ordered across
         // every node in this site so an older delete cannot overtake a new

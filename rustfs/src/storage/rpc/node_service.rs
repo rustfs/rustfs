@@ -585,6 +585,7 @@ fn ensure_rpc_decommission_local_leader(store: &ECStore, idx: usize) -> StorageR
 
 mod bucket;
 mod disk;
+mod engine;
 mod event;
 mod health;
 mod lock;
@@ -2176,6 +2177,12 @@ impl Node for NodeService {
         self.handle_load_bucket_metadata(request).await
     }
 
+    async fn engine_call(&self, request: Request<EngineCallRequest>) -> Result<Response<EngineCallResponse>, Status> {
+        // Engine calls carry object data and purge requests: always body-bound.
+        verify_node_signal_body(&request, "engine call")?;
+        Ok(self.handle_engine_call(request).await)
+    }
+
     async fn delete_bucket_metadata(
         &self,
         request: Request<DeleteBucketMetadataRequest>,
@@ -3264,7 +3271,7 @@ mod tests {
         ClearDecommissionRequest, CompareAndUpdateFileRequest, ControlPlaneErrorCode, DeleteBucketMetadataRequest,
         DeleteBucketRequest, DeletePathsRequest, DeletePolicyRequest, DeleteRequest, DeleteServiceAccountRequest,
         DeleteUserRequest, DeleteVersionRequest, DeleteVersionsRequest, DeleteVolumeRequest, DiskInfoRequest,
-        DownloadProfileDataRequest, GenerallyLockRequest, GetAllBucketStatsRequest, GetBucketInfoRequest,
+        DownloadProfileDataRequest, EngineCallRequest, GenerallyLockRequest, GetAllBucketStatsRequest, GetBucketInfoRequest,
         GetBucketStatsDataRequest, GetCpusRequest, GetMemInfoRequest, GetMetacacheListingRequest, GetMetricsRequest,
         GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
         GetSrMetricsDataRequest, GetSysConfigRequest, GetSysErrorsRequest, GuardedDeleteVersionsRequest, HealBucketRequest,
@@ -11284,6 +11291,7 @@ mod tests {
         );
         assert_tampered!(make_bucket, MakeBucketRequest::default());
         assert_tampered!(delete_bucket, DeleteBucketRequest::default());
+        assert_tampered!(engine_call, EngineCallRequest::default());
         assert_tampered!(lock, GenerallyLockRequest::default());
         assert_tampered!(un_lock, GenerallyLockRequest::default());
         assert_tampered!(force_un_lock, GenerallyLockRequest::default());

@@ -9815,6 +9815,7 @@ dependencies = [
  "rsa 0.10.0-rc.18",
  "rust-embed",
  "rustfs-audit",
+ "rustfs-bucket-engine",
  "rustfs-common",
  "rustfs-concurrency",
  "rustfs-config",
@@ -9925,6 +9926,20 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "rustfs-bucket-engine"
+version = "1.0.5"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "hotpath",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.21",
+ "tokio",
+ "xxhash-rust",
 ]
 
 [[package]]

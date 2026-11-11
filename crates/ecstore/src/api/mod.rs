@@ -194,8 +194,9 @@ pub mod bucket {
             table_catalog_path_hash, unreadable_config_refusal,
         };
         pub use crate::bucket::metadata::{
-            BUCKET_DURABILITY_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG, MAX_SWIFT_METADATA_COUNT,
-            MAX_SWIFT_METADATA_VALUE_SIZE, SWIFT_ACCOUNT_META_TAG_PREFIX, SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
+            BUCKET_DURABILITY_CONFIG, BUCKET_ENGINE_CONFIG, BUCKET_ETAG_CONFIG, BUCKET_ON_DEMAND_MIGRATION_CONFIG,
+            MAX_SWIFT_METADATA_COUNT, MAX_SWIFT_METADATA_VALUE_SIZE, SWIFT_ACCOUNT_META_TAG_PREFIX,
+            SWIFT_CONTAINER_META_TAG_PREFIX, SWIFT_TAGGING_MARKER,
         };
         pub use crate::bucket::metadata::{MAX_BUCKET_TAGS, is_swift_bucket_metadata_tag_key, validate_tag_set_entries};
     }
@@ -224,8 +225,8 @@ pub mod bucket {
 
     pub mod metadata_sys {
         pub use crate::bucket::metadata_sys::{
-            BUCKET_CONFIG_PUBLISH_HOOK, BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys,
-            ObjectLockConfigState, ScannerBucketIncarnationReadGuard, acquire_bucket_metadata_transaction_lock,
+            BucketConfigPublishHook, BucketMetadataMutationGuard, BucketMetadataSys, ObjectLockConfigState,
+            ScannerBucketIncarnationReadGuard, acquire_bucket_metadata_transaction_lock,
             acquire_bucket_metadata_transaction_lock_for_incarnation, acquire_scanner_bucket_incarnation_fence,
             acquire_scanner_bucket_incarnation_read_fence, capture_bucket_metadata_incarnation, delete, delete_if_incarnation,
             delete_if_incarnation_at, delete_under_transaction_lock, get, get_accelerate_config, get_bucket_policy,
@@ -234,10 +235,10 @@ pub mod bucket {
             get_object_lock_config, get_object_lock_config_state, get_on_demand_migration_config,
             get_on_demand_migration_config_in, get_public_access_block_config, get_quota_config, get_replication_config,
             get_request_payment_config, get_s3_tagging_config, get_sse_config, get_tagging_config, get_versioning_config,
-            get_website_config, init_bucket_metadata_sys, list_bucket_targets, reload_bucket_metadata, remove_bucket_metadata,
-            remove_bucket_metadata_if_absent, set_bucket_metadata, update, update_bucket_targets_under_transaction_lock,
-            update_config_with, update_if_incarnation, update_if_incarnation_at, update_quota_if_incarnation,
-            update_quota_if_incarnation_at, update_s3_tagging_config, update_under_transaction_lock,
+            get_website_config, init_bucket_metadata_sys, list_bucket_targets, register_bucket_config_subscriber,
+            reload_bucket_metadata, remove_bucket_metadata, remove_bucket_metadata_if_absent, set_bucket_metadata, update,
+            update_bucket_targets_under_transaction_lock, update_config_with, update_if_incarnation, update_if_incarnation_at,
+            update_quota_if_incarnation, update_quota_if_incarnation_at, update_s3_tagging_config, update_under_transaction_lock,
             update_under_transaction_lock_at,
         };
         #[cfg(feature = "test-util")]

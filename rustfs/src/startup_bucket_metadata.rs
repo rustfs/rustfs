@@ -27,6 +27,7 @@ use std::{
 };
 use tokio_util::sync::CancellationToken;
 
+const EVENT_BUCKET_ENGINE_RUNTIME_INITIALIZED: &str = "bucket_engine_runtime_initialized";
 const EVENT_ON_DEMAND_MIGRATION_RUNTIME_INITIALIZED: &str = "on_demand_migration_runtime_initialized";
 const EVENT_BUCKET_METADATA_STARTUP_RETRY: &str = "bucket_metadata_startup_retry";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_CANCELED: &str = "replication_resync_startup_background_canceled";
@@ -34,6 +35,7 @@ const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_COMPLETED: &str = "replication
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_FAILED: &str = "replication_resync_startup_background_failed";
 const EVENT_REPLICATION_RESYNC_STARTUP_BACKGROUND_STARTED: &str = "replication_resync_startup_background_started";
 const LOG_COMPONENT_STARTUP_BUCKET_METADATA: &str = "startup_bucket_metadata";
+const LOG_SUBSYSTEM_BUCKET_ENGINE: &str = "bucket_engine";
 const LOG_SUBSYSTEM_ON_DEMAND_MIGRATION: &str = "on_demand_migration";
 const LOG_SUBSYSTEM_REPLICATION: &str = "replication";
 const LOG_SUBSYSTEM_METADATA_STARTUP: &str = "metadata_startup";
@@ -65,6 +67,7 @@ pub(crate) async fn init_embedded_bucket_metadata_runtime(store: Arc<ECStore>, c
 
     retry_metadata_startup(ctx, "bucket_migration", || try_migrate_bucket_metadata(store.clone(), &buckets)).await?;
     init_on_demand_migration_runtime();
+    init_bucket_engine_runtime();
     init_bucket_metadata_sys(store.clone(), buckets.clone()).await;
     retry_metadata_startup(ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx.clone(), false);
@@ -84,6 +87,7 @@ pub(crate) async fn init_bucket_metadata_runtime(store: Arc<ECStore>, ctx: Cance
 
     retry_metadata_startup(&ctx, "iam_migration", || try_migrate_iam_config(store.clone())).await?;
     init_on_demand_migration_runtime();
+    init_bucket_engine_runtime();
     init_bucket_metadata_sys(store, buckets.clone()).await;
     spawn_bucket_resync_startup_reconcile(buckets.clone(), ctx, true);
 
@@ -174,6 +178,20 @@ fn init_on_demand_migration_runtime() {
         state = if enabled { "enabled" } else { "disabled" },
         hook_registered,
         "On-demand migration runtime initialized"
+    );
+}
+
+/// Subscribes the bucket engine registry to engine bindings before bucket
+/// metadata is loaded, so buckets bound to an engine are never served by the
+/// object layer. Idempotent across embedded and server startups.
+fn init_bucket_engine_runtime() {
+    let hook_registered = crate::bucket_engine::init_bucket_engine_runtime();
+    tracing::info!(
+        event = EVENT_BUCKET_ENGINE_RUNTIME_INITIALIZED,
+        component = LOG_COMPONENT_STARTUP_BUCKET_METADATA,
+        subsystem = LOG_SUBSYSTEM_BUCKET_ENGINE,
+        hook_registered,
+        "Bucket engine runtime initialized"
     );
 }
 

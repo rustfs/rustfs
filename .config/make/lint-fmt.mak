@@ -60,6 +60,11 @@ extension-schema-check: ## Check extension-schema stays a lightweight contract c
 	@echo "🧩 Checking extension schema boundaries..."
 	./scripts/check_extension_schema_boundaries.sh
 
+.PHONY: bucket-engine-boundaries-check
+bucket-engine-boundaries-check: ## Check bucket-engine stays a contract crate below ECStore and the binary
+	@echo "🧩 Checking bucket engine boundaries..."
+	./scripts/check_bucket_engine_boundaries.sh
+
 .PHONY: body-cache-whitelist-check
 body-cache-whitelist-check: ## Check the body-cache eligibility gate stays a fail-closed allow-list
 	@echo "🧱 Checking body-cache whitelist guard..."

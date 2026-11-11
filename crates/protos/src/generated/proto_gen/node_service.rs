@@ -1181,6 +1181,35 @@ pub struct DeleteBucketMetadataRequest {
     #[prost(string, tag = "1")]
     pub bucket: ::prost::alloc::string::String,
 }
+/// A bucket engine message between nodes: an engine operation for a bound
+/// bucket, or a framework operation (`framework-*`) the engine registry
+/// answers itself. `bucket` and `bucket_incarnation_id` are empty for
+/// framework operations that are not about a bucket.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EngineCallRequest {
+    #[prost(string, tag = "1")]
+    pub bucket: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub bucket_incarnation_id: ::prost::bytes::Bytes,
+    #[prost(string, tag = "3")]
+    pub engine: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub operation: ::prost::alloc::string::String,
+    #[prost(bytes = "bytes", tag = "5")]
+    pub body: ::prost::bytes::Bytes,
+}
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct EngineCallResponse {
+    #[prost(bool, tag = "1")]
+    pub success: bool,
+    #[prost(bytes = "bytes", tag = "2")]
+    pub body: ::prost::bytes::Bytes,
+    #[prost(string, optional, tag = "3")]
+    pub error_info: ::core::option::Option<::prost::alloc::string::String>,
+    /// Stable engine error kind (see `EngineError::kind`) when `success` is false.
+    #[prost(string, optional, tag = "4")]
+    pub error_kind: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct DeleteBucketMetadataResponse {
     #[prost(bool, tag = "1")]
@@ -3300,6 +3329,21 @@ pub mod node_service_client {
                 .insert(GrpcMethod::new("node_service.NodeService", "DeleteBucketMetadata"));
             self.inner.unary(req, path, codec).await
         }
+        pub async fn engine_call(
+            &mut self,
+            request: impl tonic::IntoRequest<super::EngineCallRequest>,
+        ) -> std::result::Result<tonic::Response<super::EngineCallResponse>, tonic::Status> {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| tonic::Status::unknown(format!("Service was not ready: {}", e.into())))?;
+            let codec = tonic_prost::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static("/node_service.NodeService/EngineCall");
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("node_service.NodeService", "EngineCall"));
+            self.inner.unary(req, path, codec).await
+        }
         pub async fn delete_policy(
             &mut self,
             request: impl tonic::IntoRequest<super::DeletePolicyRequest>,
@@ -4078,6 +4122,10 @@ pub mod node_service_server {
             &self,
             request: tonic::Request<super::DeleteBucketMetadataRequest>,
         ) -> std::result::Result<tonic::Response<super::DeleteBucketMetadataResponse>, tonic::Status>;
+        async fn engine_call(
+            &self,
+            request: tonic::Request<super::EngineCallRequest>,
+        ) -> std::result::Result<tonic::Response<super::EngineCallResponse>, tonic::Status>;
         async fn delete_policy(
             &self,
             request: tonic::Request<super::DeletePolicyRequest>,
@@ -6581,6 +6629,34 @@ pub mod node_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = DeleteBucketMetadataSvc(inner);
+                        let codec = tonic_prost::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(accept_compression_encodings, send_compression_encodings)
+                            .apply_max_message_size_config(max_decoding_message_size, max_encoding_message_size);
+                        let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/node_service.NodeService/EngineCall" => {
+                    #[allow(non_camel_case_types)]
+                    struct EngineCallSvc<T: NodeService>(pub Arc<T>);
+                    impl<T: NodeService> tonic::server::UnaryService<super::EngineCallRequest> for EngineCallSvc<T> {
+                        type Response = super::EngineCallResponse;
+                        type Future = BoxFuture<tonic::Response<Self::Response>, tonic::Status>;
+                        fn call(&mut self, request: tonic::Request<super::EngineCallRequest>) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move { <T as NodeService>::engine_call(&inner, request).await };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = EngineCallSvc(inner);
                         let codec = tonic_prost::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(accept_compression_encodings, send_compression_encodings)

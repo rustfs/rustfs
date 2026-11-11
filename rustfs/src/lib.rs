@@ -79,6 +79,7 @@ pub mod auth_keystone;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod background_admission;
 pub(crate) mod bitrot_selftest;
+pub mod bucket_engine;
 pub mod capacity;
 pub mod cgroup_resources;
 pub mod cluster_snapshot;

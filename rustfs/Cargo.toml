@@ -75,6 +75,9 @@ connect-e2e-short-credentials = []
 # Builds the dedicated rustfs-cli-e2e target with a build-time public enrollment root.
 offline-enrollment-e2e-root = []
 rio-v2 = ["rustfs-ecstore/rio-v2"]
+# Registers the node-local, non-durable `memory` bucket engine (tests and
+# benchmarks of the bucket engine framework; single-node deployments only).
+bucket-engine-memory = []
 # Linux-only cuObject S3-over-RDMA GET into client (GPU) memory; needs libcuobjserver.
 cuobject = ["dep:rustfs-cuobject"]
 # NIXL/UCX transport for S3-over-RDMA; replaces cuobject when both are enabled.
@@ -100,6 +103,7 @@ hotpath = [
     "hotpath/parking_lot",
     "hotpath/reqwest-0-13",
     "rustfs-audit/hotpath",
+    "rustfs-bucket-engine/hotpath",
     "rustfs-common/hotpath",
     "rustfs-concurrency/hotpath",
     "rustfs-config/hotpath",
@@ -271,6 +275,7 @@ rustfs-security-governance = { workspace = true }
 rustfs-data-usage = { workspace = true }
 rustfs-s3select-api = { workspace = true }
 rustfs-s3select-query = { workspace = true }
+rustfs-bucket-engine = { workspace = true }
 rustfs-extension-schema = { workspace = true }
 rustfs-targets = { workspace = true }
 rustfs-storage-api = { workspace = true }

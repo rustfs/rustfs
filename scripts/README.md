@@ -27,6 +27,7 @@ their issue closes.
 |---|---|---|---|
 | `check_architecture_migration_rules.sh` | ci-gate | Architecture-boundary anti-regression guard | ci.yml Quick Checks; `make pre-commit` |
 | `check_body_cache_whitelist.sh` | ci-gate | Keeps the app-layer body-cache eligibility gate fail-closed | ci.yml Quick Checks |
+| `check_bucket_engine_boundaries.sh` | ci-gate | Bucket-engine contract crate boundary guard (`--self-test` for its fixtures) | ci.yml Quick Checks; `make pre-commit` |
 | `check_doc_paths.sh` | ci-gate | Fails when instruction/architecture docs reference repo paths that no longer exist | `make pre-commit` / `pre-pr` |
 | `check_embedded_secrets.sh` | ci-gate | Repo-wide scan blocking committed private key material and provider credential literals | ci.yml Quick Checks; `make pre-commit` / `pre-pr` |
 | `check_extension_schema_boundaries.sh` | ci-gate | Extension-schema crate boundary guard | ci.yml Quick Checks; `make pre-commit` |

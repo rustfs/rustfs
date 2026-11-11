@@ -82,6 +82,11 @@ pub(crate) struct StartupHttpServers {
 #[cfg(all(any(feature = "cuobject", feature = "nixl"), target_os = "linux"))]
 async fn init_cuobject_servers() -> Result<()> {
     crate::app::object::cuobject::init_cuobject_service().await?;
+    // Bucket engines move data over the same NIXL server.
+    #[cfg(feature = "nixl")]
+    if let Some(server) = crate::app::object::cuobject::nixl_server() {
+        crate::bucket_engine::rdma::set_server(server);
+    }
     Ok(())
 }
 

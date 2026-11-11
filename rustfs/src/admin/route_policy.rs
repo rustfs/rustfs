@@ -453,6 +453,24 @@ pub const ADMIN_ROUTE_POLICY_SPECS: &[AdminRouteSpec] = &[
     ),
     admin(
         HttpMethod::Put,
+        "/rustfs/admin/v3/bucket-engine/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Get,
+        "/rustfs/admin/v3/bucket-engine/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::Sensitive,
+    ),
+    admin(
+        HttpMethod::Delete,
+        "/rustfs/admin/v3/bucket-engine/{bucket}",
+        CONFIG_UPDATE,
+        RouteRiskLevel::High,
+    ),
+    admin(
+        HttpMethod::Put,
         "/rustfs/admin/v3/on-demand-migration/{bucket}",
         SET_BUCKET_ON_DEMAND_MIGRATION,
         RouteRiskLevel::High,
@@ -2632,6 +2650,13 @@ mod tests {
     #[test]
     fn route_policy_maps_metrics_to_explicit_admin_action() {
         assert_action(HttpMethod::Get, "/rustfs/admin/v3/realtime", GET_METRICS);
+    }
+
+    #[test]
+    fn route_policy_gates_bucket_engine_binding_behind_config_update() {
+        for method in [HttpMethod::Put, HttpMethod::Get, HttpMethod::Delete] {
+            assert_action(method, "/rustfs/admin/v3/bucket-engine/{bucket}", CONFIG_UPDATE);
+        }
     }
 
     #[test]

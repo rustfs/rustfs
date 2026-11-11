@@ -43,19 +43,19 @@ use rustfs_madmin::{
 };
 use rustfs_protos::proto_gen::node_service::{
     BackgroundHealStatusRequest, CancelDecommissionRequest, ClearDecommissionRequest, DeleteBucketMetadataRequest,
-    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, GetBucketStatsDataRequest, GetBucketStatsDataResponse,
-    GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest, GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest,
-    GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest, GetSysConfigRequest, GetSysErrorsRequest,
-    HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest, LoadPolicyMappingRequest, LoadPolicyRequest,
-    LoadRebalanceMetaRequest, LoadServiceAccountRequest, LoadTransitionTierConfigRequest, LoadUserRequest,
-    LocalStorageInfoRequest, Mss, PeerDriveAdmissionRequest, PingRequest, ReloadPoolMetaRequest,
-    ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest, ScannerActivityRequest, ScannerActivityResponse,
-    ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse, ScannerPublicationLeaseReleaseRequest,
-    ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse, ScannerScopedDirtyUsageAckRequest,
-    ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest, SignalServiceRequest,
-    SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest, TierDailyStatsRequest,
-    TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse, TierMutationFailureClass,
-    TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
+    DeletePolicyRequest, DeleteServiceAccountRequest, DeleteUserRequest, EngineCallRequest, EngineCallResponse,
+    GetBucketStatsDataRequest, GetBucketStatsDataResponse, GetCpusRequest, GetLiveEventsRequest, GetMemInfoRequest,
+    GetMetricsRequest, GetNetInfoRequest, GetOsInfoRequest, GetPartitionsRequest, GetProcInfoRequest, GetSeLinuxInfoRequest,
+    GetSysConfigRequest, GetSysErrorsRequest, HealControlRequest, LoadBucketMetadataRequest, LoadGroupRequest,
+    LoadPolicyMappingRequest, LoadPolicyRequest, LoadRebalanceMetaRequest, LoadServiceAccountRequest,
+    LoadTransitionTierConfigRequest, LoadUserRequest, LocalStorageInfoRequest, Mss, PeerDriveAdmissionRequest, PingRequest,
+    ReloadPoolMetaRequest, ReloadSiteReplicationConfigRequest, ReplacementRecoveryStatusRequest, ScannerActivityRequest,
+    ScannerActivityResponse, ScannerDirtyUsageSnapshotRequest, ScannerDirtyUsageSnapshotResponse,
+    ScannerPublicationLeaseReleaseRequest, ScannerPublicationLeaseRequest, ScannerPublicationLeaseResponse,
+    ScannerScopedDirtyUsageAckRequest, ScannerScopedDirtyUsageAckResponse, ScannerScopedDirtyUsageEntry, ServerInfoRequest,
+    SignalServiceRequest, SignalServiceResponse, StartDecommissionRequest, StartProfilingRequest, StopRebalanceRequest,
+    TierDailyStatsRequest, TierMutationAbortRequest, TierMutationCommitRequest, TierMutationControlResponse,
+    TierMutationFailureClass, TierMutationPeerState, TierMutationPrepareRequest, node_service_client::NodeServiceClient,
     tier_mutation_control_service_client::TierMutationControlServiceClient,
 };
 pub use rustfs_protos::{PEER_RESTDRY_RUN, PEER_RESTSIGNAL, PEER_RESTSUB_SYS};
@@ -2059,6 +2059,23 @@ impl PeerRestClient {
             ));
         }
         Ok(())
+    }
+
+    /// Sends a bucket engine message to this peer. The request body is bound
+    /// to the signed request by its canonical digest. No retry: the caller
+    /// knows whether its operation is idempotent. Engine failures come back
+    /// in the response (`success == false`); transport failures as errors.
+    pub async fn engine_call(&self, request: EngineCallRequest, timeout: Duration) -> Result<EngineCallResponse> {
+        let result = tokio::time::timeout(timeout, async {
+            let mut client = self.get_client().await?;
+            let mut request = Request::new(request);
+            set_tonic_mutation_body_digest(&mut request)?;
+            request.set_timeout(timeout);
+            Ok(client.engine_call(request).await?.into_inner())
+        })
+        .await
+        .unwrap_or_else(|_| Err(Error::other(format!("engine_call to {} timed out", self.host))));
+        self.finalize_result(result).await
     }
 
     pub async fn delete_bucket_metadata(&self, bucket: &str) -> Result<()> {

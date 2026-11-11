@@ -74,7 +74,7 @@ The envelope deliberately does **not** carry its own scope. A scope read out of 
 
 ## Why a hook instead of a dependency
 
-`crates/ecstore/Cargo.toml` has no `rustfs-kms` dependency, and adding one would invert the crate layering described in [crate-boundaries.md](crate-boundaries.md). The established shape is an `OnceLock` hook that ECStore defines and the binary installs at startup, as `EVENT_DISPATCH_HOOK` in `crates/ecstore/src/services/event_notification.rs` and `BUCKET_CONFIG_PUBLISH_HOOK` in `crates/ecstore/src/bucket/metadata_sys.rs` already do. `install_credential_sealer` follows it, and the binary supplies an implementation backed by `crates/kms/src/service_manager.rs`.
+`crates/ecstore/Cargo.toml` has no `rustfs-kms` dependency, and adding one would invert the crate layering described in [crate-boundaries.md](crate-boundaries.md). The established shape is an `OnceLock` hook that ECStore defines and the binary installs at startup, as `EVENT_DISPATCH_HOOK` in `crates/ecstore/src/services/event_notification.rs` already does; bucket configuration uses a named subscriber registry of the same shape (`register_bucket_config_subscriber` in `crates/ecstore/src/bucket/metadata_sys.rs`). `install_credential_sealer` follows it, and the binary supplies an implementation backed by `crates/kms/src/service_manager.rs`.
 
 ## Compatibility, per store, because the three differ
 

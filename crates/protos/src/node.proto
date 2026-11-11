@@ -839,6 +839,26 @@ message DeleteBucketMetadataRequest {
   string bucket = 1;
 }
 
+// A bucket engine message between nodes: an engine operation for a bound
+// bucket, or a framework operation (`framework-*`) the engine registry
+// answers itself. `bucket` and `bucket_incarnation_id` are empty for
+// framework operations that are not about a bucket.
+message EngineCallRequest {
+  string bucket = 1;
+  bytes bucket_incarnation_id = 2;
+  string engine = 3;
+  string operation = 4;
+  bytes body = 5;
+}
+
+message EngineCallResponse {
+  bool success = 1;
+  bytes body = 2;
+  optional string error_info = 3;
+  // Stable engine error kind (see `EngineError::kind`) when `success` is false.
+  optional string error_kind = 4;
+}
+
 message DeleteBucketMetadataResponse {
   bool success = 1;
   optional string error_info = 2;
@@ -1383,6 +1403,7 @@ service NodeService {
   rpc GetAllBucketStats(GetAllBucketStatsRequest) returns (GetAllBucketStatsResponse) {}; // auth-policy: unimplemented
   rpc LoadBucketMetadata(LoadBucketMetadataRequest) returns (LoadBucketMetadataResponse) {}; // auth-policy: body-bound
   rpc DeleteBucketMetadata(DeleteBucketMetadataRequest) returns (DeleteBucketMetadataResponse) {}; // auth-policy: body-bound
+  rpc EngineCall(EngineCallRequest) returns (EngineCallResponse) {}; // auth-policy: body-bound
   rpc DeletePolicy(DeletePolicyRequest) returns (DeletePolicyResponse) {}; // auth-policy: body-bound
   rpc LoadPolicy(LoadPolicyRequest) returns (LoadPolicyResponse) {}; // auth-policy: body-bound
   rpc LoadPolicyMapping(LoadPolicyMappingRequest) returns (LoadPolicyMappingResponse) {}; // auth-policy: body-bound
