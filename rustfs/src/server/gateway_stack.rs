@@ -39,7 +39,7 @@ compile_error!("gateway-stack is restricted to debug builds");
 mod authorizer;
 
 use self::authorizer::{AUTHORIZATION_TABLE, RustfsAuthorizer, UnwiredDecisionCore};
-use crate::runtime_sources::ServerContextSlot;
+use crate::runtime_sources::{ServerContextSlot, current_action_credentials};
 use crate::server::gateway_handlers::{GatewayBackend, register};
 use crate::server::ssec_transport::is_secure_transport;
 use crate::shared_types::{NativeTlsTransport, RemoteAddr};
@@ -47,12 +47,13 @@ use crate::storage_api::server::http::request_context::RequestContext;
 use http::{Extensions, Request, Response};
 use rustfs_config::RUSTFS_REGION;
 use rustfs_gateway::{
-    AssemblyError, Authorizer, BoxFuture, ClientAddr, CredentialsError, DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass,
+    AssemblyError, Authorizer, BoxFuture, ClientAddr, DEFAULT_MAX_BUFFERED_BODY_BYTES, HandlerDeadlineClass,
     HandlerDeadlineConfig, HostRequestId, LegacyRustfsVirtualHosts, MintedTraces, RegionSet, RequestBodyDeadlineConfig,
     ServiceBuilder, ServiceConfig, SigV4Authenticator, SseConfig, TransportSecurity,
 };
-use rustfs_gateway_adapter::{IamCredentials, IamKeyLookup};
+use rustfs_gateway_adapter::{IamAdapters, IamKeyLookup, IamPrincipalLookup, RootCredentials, RootCredentialsError, RootSource};
 use rustfs_iam::error::Error as IamError;
+use rustfs_iam::manager::get_token_signing_key;
 use rustfs_iam::store::object::ObjectStore;
 use rustfs_iam::sys::IamSys;
 use rustfs_policy::auth::UserIdentity;
@@ -64,6 +65,7 @@ use std::time::Duration;
 /// What the assembly takes from the server it is built for.
 pub(crate) struct GatewayAssembly {
     pub(crate) server_ctx: Arc<ServerContextSlot>,
+    /// The configured root credentials, checked once here. Requests read the live ones.
     pub(crate) root_access_key: String,
     pub(crate) root_secret_key: String,
     /// The configured region; the default region signs when none is configured.
@@ -79,8 +81,8 @@ pub(crate) struct GatewayAssembly {
 /// started in its place.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum GatewayAssemblyError {
-    #[error("the root access key cannot verify signatures on the gateway stack: {0:?}")]
-    RootCredentials(CredentialsError),
+    #[error("the root credentials cannot verify signatures on the gateway stack: {0}")]
+    RootCredentials(RootCredentialsError),
     #[error("region {region:?} cannot be a signing region on the gateway stack")]
     Region { region: String },
     #[error("the server domains cannot be served by the gateway stack: {0:?}")]
@@ -106,19 +108,28 @@ impl GatewayStack {
         let iam = Arc::new(ServerIam {
             server_ctx: Arc::clone(&assembly.server_ctx),
         });
+        let root = Arc::new(ServerRoot {
+            server_ctx: Arc::clone(&assembly.server_ctx),
+        });
         // WIRED BY rustfs/rustfs#9281: the owned authorization entry point replaces the unwired core.
         let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
-        Self::assemble_with(assembly, iam, authorizer)
+        Self::assemble_with(assembly, iam, root, authorizer)
     }
 
     fn assemble_with(
         assembly: GatewayAssembly,
-        iam: Arc<dyn IamKeyLookup>,
+        iam: Arc<dyn IamPrincipalLookup>,
+        root: Arc<dyn RootSource>,
         authorizer: impl Authorizer,
     ) -> Result<Self, GatewayAssemblyError> {
-        let credentials = IamCredentials::new(iam)
-            .with_root(&assembly.root_access_key, assembly.root_secret_key.as_bytes())
+        // A root the gateway could not verify a signature with is a startup error, never a
+        // server that silently has no root. Requests read the live root from `root`.
+        RootCredentials::new(&assembly.root_access_key, &assembly.root_secret_key, &assembly.root_secret_key)
             .map_err(GatewayAssemblyError::RootCredentials)?;
+        // Both adapters are built over one IAM and one live root. Only the credential provider
+        // is installed: the caller is resolved by the access check each handler runs, which is
+        // the legacy resolver, and the pinned gateway hands a handler no policy snapshot.
+        let IamAdapters { credentials, policy: _ } = IamAdapters::new(iam, root);
         let region = assembly.region.as_deref().unwrap_or(RUSTFS_REGION);
         let regions = RegionSet::new([region]).map_err(|_| GatewayAssemblyError::Region {
             region: region.to_owned(),
@@ -221,6 +232,27 @@ fn attach_host_facts(extensions: &mut Extensions) {
     }
 }
 
+/// The root credentials of one server as they are now, read on every request from where the
+/// legacy stack reads them, so a root change reaches both stacks at once.
+struct ServerRoot {
+    server_ctx: Arc<ServerContextSlot>,
+}
+
+impl RootSource for ServerRoot {
+    fn current(&self) -> Option<Arc<RootCredentials>> {
+        let root = match self.server_ctx.app_context() {
+            Some(context) => context.action_credentials().get(),
+            None => current_action_credentials(),
+        }?;
+        // IAM signs STS session tokens with its token-signing key, which is the root secret
+        // until IAM has published one of its own.
+        let signing_key = get_token_signing_key().unwrap_or_else(|| root.secret_key.clone());
+        RootCredentials::new(&root.access_key, &root.secret_key, &signing_key)
+            .ok()
+            .map(Arc::new)
+    }
+}
+
 /// The IAM system of one server, looked up when a credential is: IAM is installed after the
 /// listener starts, so the assembly cannot hold a handle.
 struct ServerIam {
@@ -248,6 +280,12 @@ impl IamKeyLookup for ServerIam {
             };
             iam.check_key(access_key).await
         })
+    }
+}
+
+impl IamPrincipalLookup for ServerIam {
+    fn group_memberships(&self, user: &str) -> Vec<String> {
+        self.ready().map(|iam| iam.user_group_memberships(user)).unwrap_or_default()
     }
 }
 
