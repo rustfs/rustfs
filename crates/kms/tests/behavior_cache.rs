@@ -27,7 +27,7 @@
 
 mod common;
 
-use common::{TestKms, assert_invalid_operation, ctx};
+use common::{TestKms, assert_invalid_operation, ctx, schedule_deletion};
 use rustfs_kms::{
     CancelKeyDeletionRequest, DeleteKeyRequest, DescribeKeyRequest, GenerateDataKeyRequest, KeySpec, KeyState, KmsManager,
 };
@@ -190,6 +190,7 @@ async fn a_destroyed_key_cannot_be_served_from_cache() {
 
     // Warm the cache, then destroy the key outright.
     assert_eq!(describe_state(&manager, &key_id).await, KeyState::Enabled);
+    schedule_deletion(&manager, &key_id).await;
     manager
         .delete_key(DeleteKeyRequest {
             key_id: key_id.clone(),

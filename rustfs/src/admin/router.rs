@@ -27,7 +27,7 @@ use super::storage_api::error::StorageError;
 use super::storage_api::runtime::PeerRestClient;
 use crate::admin::console::{is_console_path, make_console_server};
 use crate::admin::handlers::oidc::is_oidc_path;
-use crate::admin::operation::{AdminRequest, Operation as OwnedOperation};
+use crate::admin::operation::{AdminRequest, AdminResponse, Operation as OwnedOperation};
 use crate::admin::runtime_sources::{
     ServerContextSlot, app_context_from_req, current_boot_time, current_bucket_monitor_handle, current_deployment_id,
     current_notification_system, current_object_store_handle, current_region, current_replication_pool_handle,
@@ -3451,7 +3451,7 @@ fn is_admin_v4_fallback_path(path: &str) -> bool {
         .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
 }
 
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
         let router = Router::new();
 
@@ -3498,7 +3498,7 @@ impl<T: Operation> S3Router<T> {
 }
 
 #[cfg(test)]
-impl<T: Operation> S3Router<T> {
+impl<T> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
         let route = Self::make_route_str(method, path);
         self.router.at(&route).is_ok()
@@ -3516,7 +3516,7 @@ impl<T: Operation> S3Router<T> {
     }
 }
 
-impl<T: Operation> Default for S3Router<T> {
+impl<T> Default for S3Router<T> {
     fn default() -> Self {
         Self::new(false)
     }
@@ -3525,7 +3525,7 @@ impl<T: Operation> Default for S3Router<T> {
 #[async_trait::async_trait]
 impl<T> S3Route for S3Router<T>
 where
-    T: Operation,
+    T: OwnedOperation,
 {
     fn is_match(&self, method: &Method, uri: &Uri, headers: &HeaderMap, extensions: &mut Extensions) -> bool {
         if parse_replication_extension_request(method, uri).is_some() || parse_misc_extension_request(method, uri).is_some() {
@@ -3653,9 +3653,11 @@ where
 
         if let Ok(mat) = self.router.at(&uri) {
             let op: &T = mat.value;
-            let mut resp = op.call(req, mat.params).await?;
-            resp.status = Some(resp.output.0);
-            let response = resp.map_output(|x| x.1);
+            let envelope = crate::app::RequestEnvelope::from_s3s(&req);
+            let request = AdminRequest::new(envelope, req.input.into());
+            let (status, headers, body) = op.call(request, mat.params).await?.into_parts();
+            let mut response = S3Response::with_headers(body.into(), headers);
+            response.status = Some(status);
 
             return Ok(response);
         }
@@ -3670,45 +3672,15 @@ where
     }
 }
 
-#[async_trait::async_trait]
-pub trait Operation: Send + Sync + 'static {
-    // fn method() -> Method;
-    // fn uri() -> &'static str;
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>>;
-}
-
-pub struct AdminOperation(pub &'static dyn Operation);
+/// Registers one owned admin operation with the legacy router. The router
+/// converts the request and response at its edge, so the operation never sees
+/// an s3s type.
+pub struct AdminOperation(pub(crate) &'static dyn OwnedOperation);
 
 #[async_trait::async_trait]
-impl Operation for AdminOperation {
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
+impl OwnedOperation for AdminOperation {
+    async fn call(&self, req: AdminRequest, params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
         self.0.call(req, params).await
-    }
-}
-
-/// Every owned admin operation also serves the legacy router. The request
-/// and response are converted at this edge, so handlers that implement the
-/// owned [`OwnedOperation`] trait register with `AdminOperation(&Handler {})`
-/// exactly like legacy ones and never see an s3s type.
-#[async_trait::async_trait]
-impl<T: OwnedOperation> Operation for T {
-    async fn call(
-        &self,
-        req: S3Request<Body>,
-        params: Params<'_, '_>,
-    ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
-        let envelope = crate::app::RequestEnvelope::from_s3s(&req);
-        let request = AdminRequest::new(envelope, req.input.into());
-        let (status, headers, body) = OwnedOperation::call(self, request, params).await?.into_parts();
-        Ok(S3Response::with_headers((status, body.into()), headers))
     }
 }
 
@@ -3863,13 +3835,9 @@ mod tests {
     struct StatusOperation(StatusCode);
 
     #[async_trait::async_trait]
-    impl Operation for StatusOperation {
-        async fn call(
-            &self,
-            _req: S3Request<Body>,
-            _params: Params<'_, '_>,
-        ) -> rustfs_s3_types::S3Result<S3Response<(StatusCode, Body)>> {
-            Ok(S3Response::new((self.0, Body::empty())))
+    impl OwnedOperation for StatusOperation {
+        async fn call(&self, _req: AdminRequest, _params: Params<'_, '_>) -> rustfs_s3_types::S3Result<AdminResponse> {
+            Ok(AdminResponse::new(self.0, OwnedBody::empty()))
         }
     }
 
@@ -3882,7 +3850,7 @@ mod tests {
                 .credentials()
                 .ok_or_else(|| OwnedS3Error::with_message(OwnedS3ErrorCode::AccessDenied, "owned admin identity is required"))?;
             let identity_matches = credentials.access_key() == "AKIAOWNED"
-                && constant_time_eq(credentials.secret_key(), "owned-secret")
+                && credentials.secret_key_matches("owned-secret")
                 && credentials
                     .session_token()
                     .is_some_and(|token| constant_time_eq(token, "owned-session"));
@@ -3923,7 +3891,7 @@ mod tests {
     static IDENTITY_OPERATION: IdentityOperation = IdentityOperation;
     static ECHO_OPERATION: EchoOperation = EchoOperation;
 
-    fn owned_router(path: &str, operation: &'static dyn Operation) -> S3Router<AdminOperation> {
+    fn owned_router(path: &str, operation: &'static dyn OwnedOperation) -> S3Router<AdminOperation> {
         let mut router = S3Router::new(false);
         router
             .insert(Method::GET, path, AdminOperation(operation))

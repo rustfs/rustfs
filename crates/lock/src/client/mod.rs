@@ -15,10 +15,49 @@
 pub mod local;
 // pub mod remote;
 
-use crate::{LockId, LockInfo, LockLeaseInfo, LockRequest, LockResponse, LockStats, Result};
+use crate::{LockError, LockId, LockInfo, LockLeaseInfo, LockRequest, LockResponse, LockStats, Result};
 use async_trait::async_trait;
 use futures::future::join_all;
 use std::sync::Arc;
+use std::time::Duration;
+use tokio::time::Instant;
+
+/// A batch peer's result for one request, in the original request order.
+#[derive(Clone, Debug)]
+pub enum BatchAcquireOutcome {
+    /// The peer confirmed a grant. Missing legacy metadata uses the requested ID.
+    Granted {
+        lock_info: Option<Box<LockInfo>>,
+        wait_time: Duration,
+    },
+    /// This attempt cannot grant later, and another attempt may succeed.
+    RetryableNoGrant { error: LockError },
+    /// This attempt cannot grant later, and this peer must not be retried.
+    TerminalNoGrant { error: LockError },
+    /// A grant may exist or arrive later. Stop using this peer for this key.
+    Ambiguous {
+        error: LockError,
+        /// The client already retains exact-ID cleanup until the attempt settles.
+        /// Otherwise the coordinator must retain uncertain cleanup ownership.
+        cleanup_owned_by_client: bool,
+    },
+}
+
+impl BatchAcquireOutcome {
+    fn from_legacy_response(response: LockResponse) -> Self {
+        if response.success {
+            Self::Granted {
+                lock_info: response.lock_info.map(Box::new),
+                wait_time: response.wait_time,
+            }
+        } else {
+            Self::Ambiguous {
+                error: LockError::internal(response.error.unwrap_or_else(|| "Legacy batch acquisition failed".to_owned())),
+                cleanup_owned_by_client: false,
+            }
+        }
+    }
+}
 
 /// Outcome of cleaning up a lock whose acquisition has already completed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -43,6 +82,45 @@ pub trait LockClient: Send + Sync + std::fmt::Debug {
             .await
             .into_iter()
             .collect::<Result<Vec<_>>>()?)
+    }
+
+    /// Acquire a batch within the caller's absolute deadline, preserving per-key outcomes.
+    ///
+    /// Legacy clients cannot prove that failed or missing responses did not grant.
+    /// Their calls retain completion ownership in the coordinator if the caller
+    /// stops waiting. Implementations may narrow each request's backend wait;
+    /// they must never reset the deadline after connection or queue delays.
+    async fn acquire_locks_batch_until(&self, requests: &[LockRequest], deadline: Instant) -> Vec<BatchAcquireOutcome> {
+        if Instant::now() >= deadline {
+            return requests
+                .iter()
+                .map(|request| BatchAcquireOutcome::RetryableNoGrant {
+                    error: LockError::timeout(request.resource.to_string(), request.acquire_timeout),
+                })
+                .collect();
+        }
+        match self.acquire_locks_batch(requests).await {
+            Ok(responses) => {
+                let mut responses = responses.into_iter();
+                requests
+                    .iter()
+                    .map(|_| match responses.next() {
+                        Some(response) => BatchAcquireOutcome::from_legacy_response(response),
+                        None => BatchAcquireOutcome::Ambiguous {
+                            error: LockError::internal("Legacy peer returned an incomplete batch response"),
+                            cleanup_owned_by_client: false,
+                        },
+                    })
+                    .collect()
+            }
+            Err(error) => requests
+                .iter()
+                .map(|_| BatchAcquireOutcome::Ambiguous {
+                    error: error.clone(),
+                    cleanup_owned_by_client: false,
+                })
+                .collect(),
+        }
     }
 
     /// Release lock
@@ -121,4 +199,40 @@ impl ClientFactory {
     // pub fn create_remote(endpoint: String) -> Arc<dyn LockClient> {
     //     Arc::new(remote::RemoteClient::new(endpoint))
     // }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_failure_text_never_proves_no_grant() {
+        for message in [
+            "Lock acquisition timeout",
+            "Lock conflict: resource held by holder",
+            "Remote lock RPC timed out",
+        ] {
+            assert!(matches!(
+                BatchAcquireOutcome::from_legacy_response(LockResponse::failure(message, Duration::ZERO)),
+                BatchAcquireOutcome::Ambiguous {
+                    cleanup_owned_by_client: false,
+                    ..
+                }
+            ));
+        }
+    }
+
+    #[test]
+    fn legacy_success_without_metadata_remains_a_grant() {
+        assert!(matches!(
+            BatchAcquireOutcome::from_legacy_response(LockResponse {
+                success: true,
+                lock_info: None,
+                error: None,
+                wait_time: Duration::ZERO,
+                position_in_queue: None,
+            }),
+            BatchAcquireOutcome::Granted { lock_info: None, .. }
+        ));
+    }
 }

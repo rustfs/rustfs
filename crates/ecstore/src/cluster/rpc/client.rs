@@ -41,8 +41,12 @@ use std::{
     future::Future,
     io::ErrorKind,
     pin::Pin,
-    sync::{LazyLock, Mutex},
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicU8, Ordering},
+    },
     task::{Context, Poll},
+    time::Duration,
 };
 use tonic::{service::interceptor::InterceptedService, transport::Channel};
 use tower::Service;
@@ -70,7 +74,7 @@ pub(crate) async fn scanner_control_time_out_client(
     let channel = get_channel_for_class(addr, ChannelClass::Control)
         .await
         .map_err(|err| crate::error::Error::other(err.to_string()))?;
-    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
     let limit = rustfs_protos::scoped_dirty_usage::SCOPED_DIRTY_USAGE_MAX_REQUEST_BYTES as usize;
     Ok(ScannerControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(limit)
@@ -84,7 +88,7 @@ pub async fn heal_control_time_out_client(
     let interceptor = interceptor.with_rpc_audience(addr)?;
     let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
     let max_message_size = rustfs_protos::HEAL_CONTROL_RPC_MAX_MESSAGE_SIZE;
-    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
     Ok(HealControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -97,7 +101,7 @@ pub async fn tier_mutation_control_time_out_client(
     let interceptor = interceptor.with_rpc_audience(addr)?;
     let channel = get_channel_for_class(addr, ChannelClass::Control).await?;
     let max_message_size = rustfs_protos::TIER_MUTATION_RPC_MAX_MESSAGE_SIZE;
-    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
     Ok(TierMutationControlServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -118,7 +122,7 @@ pub async fn node_service_time_out_client_for_class(
     let channel = get_channel_for_class(addr, class).await?;
 
     let max_message_size = rustfs_protos::internode_rpc_max_message_size();
-    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
     Ok(NodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
         .max_encoding_message_size(max_message_size))
@@ -133,7 +137,7 @@ pub(crate) async fn node_service_delete_recovery_client(
     let channel = rustfs_protos::create_channel_with_timeout(addr, timeout)
         .await
         .map_err(|error| DiskError::RemoteClientUnavailable(error.to_string()))?;
-    let channel = ReplayScopeChannel::new(channel, interceptor.replay_scope_audience());
+    let channel = ReplayScopeChannel::new(BatchLockDeadlineChannel::new(channel), interceptor.replay_scope_audience());
     let max_message_size = rustfs_protos::internode_rpc_max_message_size();
     Ok(NodeServiceClient::with_interceptor(channel, interceptor)
         .max_decoding_message_size(max_message_size)
@@ -249,7 +253,95 @@ pub struct ReplayScopeChannel<S> {
 }
 
 /// The channel type used by internode clients after v2 authentication and replay-scope handling.
-pub type AuthenticatedChannel = ReplayScopeChannel<Channel>;
+pub type AuthenticatedChannel = ReplayScopeChannel<BatchLockDeadlineChannel<Channel>>;
+
+/// Gate lock-batch payloads after the transport's internal readiness queues.
+/// Other RPC bodies pass through without an additional wrapper.
+#[derive(Clone, Debug)]
+pub struct BatchLockDeadlineChannel<S> {
+    inner: S,
+}
+
+impl<S> BatchLockDeadlineChannel<S> {
+    fn new(inner: S) -> Self {
+        Self { inner }
+    }
+}
+
+impl<S> Service<HttpRequest<tonic::body::Body>> for BatchLockDeadlineChannel<S>
+where
+    S: Service<HttpRequest<tonic::body::Body>>,
+{
+    type Response = S::Response;
+    type Error = S::Error;
+    type Future = S::Future;
+
+    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        self.inner.poll_ready(cx)
+    }
+
+    fn call(&mut self, mut request: HttpRequest<tonic::body::Body>) -> Self::Future {
+        if let Some(deadline) = request.extensions().get::<BatchLockRpcDeadline>().cloned() {
+            let body = std::mem::replace(request.body_mut(), tonic::body::Body::empty());
+            *request.body_mut() = tonic::body::Body::new(BatchLockDeadlineBody {
+                inner: body,
+                deadline,
+                dispatched: false,
+                failed: false,
+            });
+        }
+        self.inner.call(request)
+    }
+}
+
+struct BatchLockDeadlineBody {
+    inner: tonic::body::Body,
+    deadline: BatchLockRpcDeadline,
+    dispatched: bool,
+    failed: bool,
+}
+
+impl http_body::Body for BatchLockDeadlineBody {
+    type Data = bytes::Bytes;
+    type Error = tonic::Status;
+
+    fn poll_frame(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        if self.failed {
+            return Poll::Ready(None);
+        }
+        if !self.dispatched
+            && let Err(error) = self.deadline.remaining_before_dispatch()
+        {
+            self.failed = true;
+            return Poll::Ready(Some(Err(error)));
+        }
+        let frame = std::task::ready!(Pin::new(&mut self.inner).poll_frame(cx));
+        if let Some(Ok(frame)) = &frame
+            && frame.is_data()
+            && !self.dispatched
+        {
+            // Codec work can consume the deadline in this poll. Arbitrate only
+            // after encoding, immediately before any payload leaves the body.
+            if let Err(error) = self.deadline.mark_dispatched() {
+                self.failed = true;
+                return Poll::Ready(Some(Err(error)));
+            }
+            self.dispatched = true;
+        }
+        Poll::Ready(frame)
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.failed || self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PeerReplayCapability {
@@ -426,7 +518,9 @@ where
                     )
                 }) {
                     Ok(headers) => request.headers_mut().extend(headers),
-                    Err(error) => debug!(error = %error, "could not attach replay-scoped RPC signature"),
+                    Err(error) => {
+                        debug!(error = %error, "could not attach replay-scoped RPC signature")
+                    }
                 }
             }
         }
@@ -485,6 +579,82 @@ where
             );
             Ok(response)
         })
+    }
+}
+
+/// A batch may leave local readiness queues only while its original budget is live.
+/// Cancellation and submission arbitrate once so a cancelled caller cannot send later.
+#[derive(Clone, Debug)]
+pub(crate) struct BatchLockRpcDeadline {
+    deadline: tokio::time::Instant,
+    max_acquire_wait: Duration,
+    dispatch: Arc<AtomicU8>,
+}
+
+impl BatchLockRpcDeadline {
+    const PENDING: u8 = 0;
+    const DISPATCHED: u8 = 1;
+    const CANCELLED: u8 = 2;
+
+    pub(crate) fn new(deadline: tokio::time::Instant, max_acquire_wait: Duration) -> Self {
+        Self {
+            deadline,
+            max_acquire_wait,
+            dispatch: Arc::new(AtomicU8::new(Self::PENDING)),
+        }
+    }
+
+    /// True proves that this batch cannot send payload or enter the server lock handler.
+    /// Transport headers may already have left an internal channel queue.
+    pub(crate) fn cancel_before_dispatch(&self) -> bool {
+        match self
+            .dispatch
+            .compare_exchange(Self::PENDING, Self::CANCELLED, Ordering::AcqRel, Ordering::Acquire)
+        {
+            Ok(_) => true,
+            Err(state) => state == Self::CANCELLED,
+        }
+    }
+
+    pub(crate) fn was_dispatched(&self) -> bool {
+        self.dispatch.load(Ordering::Acquire) == Self::DISPATCHED
+    }
+
+    fn remaining_before_dispatch(&self) -> Result<Duration, tonic::Status> {
+        let remaining = self.deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining <= self.max_acquire_wait || self.dispatch.load(Ordering::Acquire) == Self::CANCELLED {
+            return Err(tonic::Status::deadline_exceeded("Lock batch budget exhausted before payload dispatch"));
+        }
+        Ok(remaining)
+    }
+
+    fn update_timeout(&self, request: &mut tonic::Request<()>) -> Result<(), tonic::Status> {
+        request.set_timeout(self.remaining_before_dispatch()?);
+        Ok(())
+    }
+
+    fn mark_dispatched(&self) -> Result<(), tonic::Status> {
+        self.remaining_before_dispatch()?;
+        self.dispatch
+            .compare_exchange(Self::PENDING, Self::DISPATCHED, Ordering::AcqRel, Ordering::Acquire)
+            .map(|_| ())
+            .map_err(|_| tonic::Status::deadline_exceeded("Lock batch cancelled before dispatch"))
+    }
+
+    #[cfg(test)]
+    pub(super) async fn dispatch_payload_for_test(&self) -> Result<(), tonic::Status> {
+        use http_body_util::BodyExt as _;
+        let mut body = BatchLockDeadlineBody {
+            inner: tonic::body::Body::new(http_body_util::Full::new(bytes::Bytes::from_static(b"payload"))),
+            deadline: self.clone(),
+            dispatched: false,
+            failed: false,
+        };
+        match body.frame().await {
+            Some(Ok(frame)) if frame.is_data() => Ok(()),
+            Some(Err(error)) => Err(error),
+            _ => Err(tonic::Status::internal("test lock payload did not produce a data frame")),
+        }
     }
 }
 
@@ -582,11 +752,21 @@ impl TonicInterceptor {
 }
 
 impl tonic::service::Interceptor for TonicInterceptor {
-    fn call(&mut self, req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        match self {
+    fn call(&mut self, mut req: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
+        let batch_deadline = req.extensions().get::<BatchLockRpcDeadline>().cloned();
+        if let Some(deadline) = &batch_deadline {
+            deadline.update_timeout(&mut req)?;
+        }
+        let mut req = match self {
             TonicInterceptor::Signature(interceptor) => interceptor.call(req),
             TonicInterceptor::NoOp(interceptor) => interceptor.call(req),
+        }?;
+        if let Some(deadline) = batch_deadline {
+            // Signing consumes budget, but Channel readiness only reserves a
+            // queue slot. The payload body arbitrates actual dispatch later.
+            deadline.update_timeout(&mut req)?;
         }
+        Ok(req)
     }
 }
 
@@ -780,6 +960,136 @@ mod tests {
 
     fn test_request() -> tonic::Request<()> {
         test_request_for("Ping")
+    }
+
+    #[test]
+    fn batch_dispatch_and_cancellation_have_one_winner() {
+        for _ in 0..100 {
+            let deadline = BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_secs(1), Duration::ZERO);
+            let other = deadline.clone();
+            let barrier = Arc::new(std::sync::Barrier::new(2));
+            let other_barrier = barrier.clone();
+            let submit = std::thread::spawn(move || {
+                other_barrier.wait();
+                other.mark_dispatched().is_ok()
+            });
+            barrier.wait();
+            let cancelled = deadline.cancel_before_dispatch();
+            let submitted = submit.join().expect("submission thread");
+            assert_ne!(cancelled, submitted);
+            assert_eq!(deadline.was_dispatched(), submitted);
+            assert!(deadline.mark_dispatched().is_err());
+        }
+    }
+
+    #[test]
+    fn batch_interceptor_rejects_exhausted_wait_reserve_before_submission() {
+        let deadline =
+            BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_millis(20), Duration::from_millis(30));
+        let mut request = tonic::Request::new(());
+        request.extensions_mut().insert(deadline.clone());
+        let status = TonicInterceptor::NoOp(NoOpInterceptor)
+            .call(request)
+            .expect_err("insufficient wait reserve");
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded);
+        assert!(!deadline.was_dispatched());
+        assert!(deadline.cancel_before_dispatch());
+    }
+
+    #[test]
+    fn batch_interceptor_rejects_cancelled_ready_request_and_accepts_live_budget() {
+        let deadline = BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_secs(2), Duration::from_millis(1));
+        let mut request = tonic::Request::new(());
+        request.extensions_mut().insert(deadline.clone());
+        assert!(deadline.cancel_before_dispatch());
+        assert!(TonicInterceptor::NoOp(NoOpInterceptor).call(request).is_err());
+        assert!(!deadline.was_dispatched());
+
+        let deadline = BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_secs(2), Duration::from_millis(1));
+        let mut request = tonic::Request::new(());
+        request.extensions_mut().insert(deadline.clone());
+        let request = TonicInterceptor::NoOp(NoOpInterceptor).call(request).expect("live budget");
+        assert!(!deadline.was_dispatched(), "interceptor completion does not bypass the transport queue");
+        assert!(request.metadata().contains_key("grpc-timeout"));
+        assert!(deadline.cancel_before_dispatch());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_body_rejects_payload_after_channel_queue_deadline() {
+        let deadline = BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_millis(20), Duration::ZERO);
+        tokio::time::advance(Duration::from_millis(21)).await;
+        let error = deadline
+            .dispatch_payload_for_test()
+            .await
+            .expect_err("queued payload expired");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(!deadline.was_dispatched());
+        assert!(deadline.cancel_before_dispatch());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_body_rejects_payload_when_encoding_crosses_deadline_in_one_poll() {
+        use http_body_util::BodyExt as _;
+        struct SlowEncodingBody {
+            deadline: tokio::time::Instant,
+        }
+        impl http_body::Body for SlowEncodingBody {
+            type Data = bytes::Bytes;
+            type Error = tonic::Status;
+
+            fn poll_frame(
+                self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+            ) -> Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+                // Model codec work that begins before the deadline but blocks
+                // this single poll until the original budget has expired.
+                tokio::time::resume();
+                std::thread::sleep(
+                    self.deadline.saturating_duration_since(tokio::time::Instant::now()) + Duration::from_millis(1),
+                );
+                Poll::Ready(Some(Ok(http_body::Frame::data(bytes::Bytes::from_static(b"encoded payload")))))
+            }
+        }
+        let expires = tokio::time::Instant::now() + Duration::from_millis(20);
+        let deadline = BatchLockRpcDeadline::new(expires, Duration::ZERO);
+        let mut body = BatchLockDeadlineBody {
+            inner: tonic::body::Body::new(SlowEncodingBody { deadline: expires }),
+            deadline: deadline.clone(),
+            dispatched: false,
+            failed: false,
+        };
+        let error = body
+            .frame()
+            .await
+            .expect("first frame result")
+            .expect_err("late encoded payload");
+        assert_eq!(error.code(), tonic::Code::DeadlineExceeded);
+        assert!(!deadline.was_dispatched());
+        assert!(deadline.cancel_before_dispatch());
+        assert!(body.frame().await.is_none(), "failed body must not expose a later frame");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn batch_body_keeps_cleanup_responsibility_after_first_payload() {
+        use http_body_util::BodyExt as _;
+        let deadline = BatchLockRpcDeadline::new(tokio::time::Instant::now() + Duration::from_millis(20), Duration::ZERO);
+        let frames = futures::stream::iter([
+            Ok::<_, tonic::Status>(http_body::Frame::data(bytes::Bytes::from_static(b"first"))),
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(b"last"))),
+        ]);
+        let mut body = BatchLockDeadlineBody {
+            inner: tonic::body::Body::new(http_body_util::StreamBody::new(frames)),
+            deadline: deadline.clone(),
+            dispatched: false,
+            failed: false,
+        };
+        assert!(body.frame().await.expect("first frame").expect("live payload").is_data());
+        assert!(deadline.was_dispatched());
+        assert!(!deadline.cancel_before_dispatch());
+        tokio::time::advance(Duration::from_millis(21)).await;
+        assert!(body.frame().await.expect("last frame").expect("late drain").is_data());
+        assert!(body.frame().await.is_none());
+        assert!(!deadline.cancel_before_dispatch(), "a sent payload requires late cleanup ownership");
     }
 
     fn test_request_for(method: &'static str) -> tonic::Request<()> {

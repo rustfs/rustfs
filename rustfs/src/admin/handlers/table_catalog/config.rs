@@ -50,10 +50,8 @@ impl Operation for EnableTableBucketHandler {
 pub struct DisableTableBucketHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for DisableTableBucketHandler {
-    // TODO(T1.12-codemod): the publication backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for DisableTableBucketHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let resource = TableCatalogResource::warehouse(&warehouse);
         let principal = authorize_table_catalog_resource_request(&req, &resource, AdminAction::SetTableBucketAction).await?;
@@ -63,8 +61,8 @@ impl crate::admin::router::Operation for DisableTableBucketHandler {
         let object_store = runtime_sources::object_store_from_envelope(req.envelope())
             .ok_or_else(|| table_catalog_internal_error("request object store is not initialized"))?;
         let store = table_catalog_store_from_backend(backend.clone())?;
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
-        let publication = TableCommitObjectBackend::for_request(backend, s3s_req);
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let publication = TableCommitObjectBackend::for_request(backend, req);
         let response = if cleanup {
             cleanup_empty_table_bucket_response(&store, &publication, object_store.as_ref(), &warehouse).await?
         } else {
@@ -72,7 +70,7 @@ impl crate::admin::router::Operation for DisableTableBucketHandler {
         };
         crate::app::bucket_usecase::notify_table_bucket_metadata_reload(warehouse.clone(), "disable table bucket", app_context)
             .await;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
@@ -293,10 +291,8 @@ impl Operation for PutExternalCatalogBridgeHandler {
 pub struct SyncExternalCatalogBridgeHandler {}
 
 #[async_trait::async_trait]
-impl crate::admin::router::Operation for SyncExternalCatalogBridgeHandler {
-    // TODO(T1.12-codemod): the commit backend needs the s3s request; see legacy_request_view.
-    async fn call(&self, mut s3s_req: LegacyRequest, params: Params<'_, '_>) -> S3Result<LegacyResponse> {
-        let req = legacy_request_view(&s3s_req);
+impl Operation for SyncExternalCatalogBridgeHandler {
+    async fn call(&self, mut req: AdminRequest, params: Params<'_, '_>) -> S3Result<AdminResponse> {
         let warehouse = warehouse_from_params(&params)?;
         let namespace = namespace_from_params(&params)?;
         let table = table_name_from_params(&params)?;
@@ -314,10 +310,10 @@ impl crate::admin::router::Operation for SyncExternalCatalogBridgeHandler {
         {
             authorize_table_catalog_resource_request(&req, &resource, AdminAction::RegisterTableAction).await?;
         }
-        install_table_catalog_s3_request_info(&mut s3s_req, &principal)?;
-        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(std::mem::take(&mut s3s_req.input).into()).await?;
+        install_table_catalog_s3_request_info(&mut req, &principal)?;
+        let request = read_json_body::<ExternalCatalogBridgeSyncRequest>(req.take_body()).await?;
         let table_bucket_enabled = table_bucket_enabled_from_envelope(req.envelope(), &warehouse).await?;
-        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, s3s_req);
+        let commit_backend = TableCommitObjectBackend::for_request(metadata_backend, req);
         let result = sync_external_catalog_bridge_response(
             &store,
             &commit_backend,
@@ -329,7 +325,7 @@ impl crate::admin::router::Operation for SyncExternalCatalogBridgeHandler {
         )
         .await;
         let response = commit_backend.finish(result).await?;
-        Ok(legacy_response(build_json_response(StatusCode::OK, &response)?))
+        build_json_response(StatusCode::OK, &response)
     }
 }
 
