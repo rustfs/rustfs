@@ -2331,12 +2331,22 @@ async fn start_http_server_inner(
 
         b.set_auth(IAMAuth::with_server_context(access_key, secret_key, server_ctx.clone()));
         b.set_access(store);
-        b.set_route(storage::metadata_route::with_metadata_route(
-            admin::make_admin_route(config.console_enable, admin_server_ctx)?,
-            metadata_route_host,
-            website_route_domains,
-            protocol,
-            Arc::clone(&server_ctx),
+        // Bucket engine operations (`POST /{bucket}?x-rustfs-engine-op=`) match
+        // before the metadata, website and admin routes.
+        let engine_operation_host = host_domain_sets
+            .as_ref()
+            .map(MultiDomain::new)
+            .transpose()
+            .map_err(Error::other)?;
+        b.set_route(storage::engine_operation_route::with_engine_operation_route(
+            storage::metadata_route::with_metadata_route(
+                admin::make_admin_route(config.console_enable, admin_server_ctx)?,
+                metadata_route_host,
+                website_route_domains,
+                protocol,
+                Arc::clone(&server_ctx),
+            ),
+            engine_operation_host,
         ));
 
         // Normalize leading/duplicate forward slashes in object keys (MinIO parity).

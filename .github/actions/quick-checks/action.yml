@@ -89,6 +89,10 @@ runs:
       shell: bash
       run: ./scripts/check_extension_schema_boundaries.sh
 
+    - name: Check bucket engine boundaries
+      shell: bash
+      run: ./scripts/check_bucket_engine_boundaries.sh
+
     - name: Check body-cache whitelist guard
       shell: bash
       run: ./scripts/check_body_cache_whitelist.sh

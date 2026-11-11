@@ -51,6 +51,7 @@ const EVENT_EVENT_NOTIFIER_SHUTDOWN: &str = "event_notifier_shutdown";
 const EVENT_PROFILING_SHUTDOWN: &str = "profiling_shutdown";
 const EVENT_SERVER_SHUTDOWN_STATE: &str = "server_shutdown_state";
 const DETACHED_MUTATION_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+const BUCKET_ENGINE_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 fn join_failure_reason(error: &tokio::task::JoinError) -> &'static str {
     if error.is_cancelled() {
@@ -644,6 +645,10 @@ pub(crate) async fn run_startup_shutdown_sequence(
     for handle in &optional_runtime_shutdowns {
         handle.signal();
     }
+
+    // Engines stop their workers after the listeners stop accepting requests
+    // and before background services and the runtime go away.
+    crate::bucket_engine::shutdown(BUCKET_ENGINE_SHUTDOWN_TIMEOUT).await;
 
     let mut capacity_report = CapacityShutdownReport {
         configured: capacity_tasks.is_some(),

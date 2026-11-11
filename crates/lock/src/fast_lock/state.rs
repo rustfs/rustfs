@@ -21,10 +21,14 @@ use crate::fast_lock::optimized_notify::OptimizedNotify;
 use crate::fast_lock::types::{LockMode, LockPriority};
 
 /// Optimized atomic lock state encoding in u64
-/// Bits: [63:48] reserved | [47:32] writers_waiting | [31:16] readers_waiting | [15:8] readers_count | [7:1] flags | [0] writer_flag
+/// Bits: [63:48] readers_count | [47:32] writers_waiting | [31:16] readers_waiting | [15:1] reserved | [0] writer_flag
+///
+/// The reader count is 16 bits wide because distributed bucket-scoped read locks (for example the
+/// per-bucket lifecycle and metadata-transaction fences) are held by every in-flight request into that
+/// bucket on every node, so a single key routinely has hundreds of concurrent holders.
 const WRITER_FLAG_MASK: u64 = 0x1;
-const READERS_SHIFT: u8 = 8;
-const READERS_MASK: u64 = 0xFF << READERS_SHIFT; // Support up to 255 concurrent readers
+const READERS_SHIFT: u8 = 48;
+const READERS_MASK: u64 = 0xFFFF << READERS_SHIFT;
 const READERS_WAITING_SHIFT: u8 = 16;
 const READERS_WAITING_MASK: u64 = 0xFFFF << READERS_WAITING_SHIFT;
 const WRITERS_WAITING_SHIFT: u8 = 32;
@@ -96,9 +100,7 @@ impl AtomicLockState {
                 return false;
             }
 
-            let readers = self.readers_count(current);
-            if readers == 0xFF {
-                // Updated limit to 255
+            if self.readers_count(current) == u16::MAX {
                 return false; // Too many readers
             }
 
@@ -303,8 +305,8 @@ impl AtomicLockState {
         self.last_accessed.store(now, Ordering::Relaxed);
     }
 
-    fn readers_count(&self, state: u64) -> u8 {
-        ((state & READERS_MASK) >> READERS_SHIFT) as u8
+    fn readers_count(&self, state: u64) -> u16 {
+        ((state & READERS_MASK) >> READERS_SHIFT) as u16
     }
 
     fn readers_waiting(&self, state: u64) -> u16 {
@@ -620,6 +622,50 @@ mod tests {
 
         state.dec_readers_waiting();
         assert!(state.is_free());
+    }
+
+    // Bucket-scoped fences are read-locked by every in-flight request into the bucket, so one key
+    // needs far more than 255 concurrent shared holders. The old 8-bit reader count refused the
+    // 256th reader outright.
+    #[test]
+    fn shared_lock_admits_more_than_255_holders() {
+        let state = ObjectLockState::new();
+        let timeout = Duration::from_secs(30);
+        let owners: Vec<Arc<str>> = (0..1024).map(|i| Arc::from(format!("owner-{i}"))).collect();
+
+        for owner in &owners {
+            assert!(
+                state.try_acquire_shared_fast(owner, timeout),
+                "shared acquisition for {owner} must succeed"
+            );
+        }
+        assert_eq!(state.atomic_state.holder_and_waiter_counts(), (1024, 0));
+        assert!(!state.try_acquire_exclusive_fast(&Arc::from("writer"), timeout));
+
+        for owner in &owners {
+            assert!(state.release_shared(owner), "shared release for {owner} must succeed");
+        }
+        assert!(state.try_acquire_exclusive_fast(&Arc::from("writer"), timeout));
+    }
+
+    #[test]
+    fn shared_lock_refuses_readers_beyond_counter_capacity() {
+        let state = AtomicLockState::new();
+        assert!(state.inc_readers_waiting());
+
+        for _ in 0..u16::MAX {
+            assert!(state.try_acquire_shared());
+        }
+        assert!(!state.try_acquire_shared(), "the reader count must not overflow");
+        assert_eq!(state.holder_and_waiter_counts(), (u64::from(u16::MAX), 1));
+        assert_eq!(
+            state.readers_waiting_count(),
+            1,
+            "a full reader count must not spill into the waiter counters"
+        );
+
+        assert!(state.release_shared());
+        assert!(state.try_acquire_shared(), "a released slot must be reusable");
     }
 
     #[test]

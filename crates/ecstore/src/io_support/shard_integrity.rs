@@ -13,6 +13,7 @@
 // limitations under the License.
 
 use crate::disk::{DiskAPI, DiskStore};
+use crate::erasure::codec::shard_buf::ShardBytes;
 use bytes::Bytes;
 use futures::{StreamExt, stream::FuturesUnordered};
 use rustfs_filemeta::FileInfo;
@@ -362,10 +363,10 @@ pub(crate) fn invalidate_verified_stripe_records(generation: uuid::Uuid) {
 }
 
 impl PartProofReader {
-    pub(crate) async fn reconstruction_proof(
+    pub(crate) async fn reconstruction_proof<S: ShardBytes>(
         &self,
         stripe: usize,
-        shards: &[Option<Vec<u8>>],
+        shards: &[Option<S>],
     ) -> io::Result<Option<ReconstructionProof>> {
         let mut missing = 0u16;
         for (index, shard) in shards.iter().take(usize::from(self.part.layout.data)).enumerate() {
@@ -577,12 +578,15 @@ pub(crate) struct ReconstructionProof {
 }
 
 impl ReconstructionProof {
-    pub(crate) fn verify(&self, shards: &[Option<Vec<u8>>]) -> io::Result<()> {
+    pub(crate) fn verify<S: ShardBytes>(&self, shards: &[Option<S>]) -> io::Result<()> {
         for index in 0..usize::from(self.part.layout.data) {
             if self.missing & (1 << index) == 0 {
                 continue;
             }
-            let payload = shards.get(index).and_then(Option::as_deref).ok_or_else(corrupt)?;
+            let payload = shards
+                .get(index)
+                .and_then(|shard| shard.as_ref().map(ShardBytes::as_slice))
+                .ok_or_else(corrupt)?;
             let actual = self.part.shard_digest(self.stripe, index, payload).map_err(|_| corrupt())?;
             if self.record.get(index * 32..(index + 1) * 32) != Some(actual.as_slice()) {
                 return Err(corrupt());

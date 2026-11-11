@@ -23,6 +23,7 @@ use super::{
 };
 use super::{persisted_from_s3s, persisted_to_s3s, tagging_from_s3s, tagging_to_s3s};
 use crate::admin::handlers::site_replication::site_replication_bucket_meta_hook;
+use crate::bucket_engine;
 use crate::error::{ApiError, ApiErrorDiagnostic};
 use crate::storage::access::{
     apply_bucket_generation_guard, bucket_config_mutation_incarnation, has_bypass_governance_header, replication_proxy_allowed,
@@ -45,6 +46,7 @@ use crate::storage::validate_website_configuration;
 use crate::table_catalog;
 use http::StatusCode;
 use metrics::{counter, histogram};
+use rustfs_bucket_engine::BucketFeature;
 use rustfs_io_metrics::record_s3_op;
 use rustfs_madmin::{SITE_REPL_API_VERSION, SRBucketMeta};
 use rustfs_s3_ops::S3Operation;
@@ -747,6 +749,7 @@ impl S3 for FS {
         &self,
         req: S3Request<AbortMultipartUploadInput>,
     ) -> S3Result<S3Response<AbortMultipartUploadOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "AbortMultipartUpload")?;
         let usecase = s3_api::multipart_usecase_for(self);
         audit_only_operation(req, S3Operation::AbortMultipartUpload, |req| usecase.execute_abort_multipart_upload(req)).await
     }
@@ -756,6 +759,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CompleteMultipartUploadInput>,
     ) -> S3Result<S3Response<CompleteMultipartUploadOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "CompleteMultipartUpload")?;
         crate::hp_guard!("S3::complete_multipart_upload");
         let usecase = s3_api::multipart_usecase_for(self);
         Box::pin(usecase.execute_complete_multipart_upload(req)).await
@@ -764,6 +768,10 @@ impl S3 for FS {
     /// Copy an object from one location to another
     #[instrument(level = "debug", skip(self, req))]
     async fn copy_object(&self, req: S3Request<CopyObjectInput>) -> S3Result<S3Response<CopyObjectOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "CopyObject")?;
+        if let CopySource::Bucket { bucket, .. } = &req.input.copy_source {
+            bucket_engine::dispatch::refuse_unrouted(bucket, "CopyObject")?;
+        }
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_copy_object(req).await
     }
@@ -783,6 +791,7 @@ impl S3 for FS {
         &self,
         req: S3Request<CreateMultipartUploadInput>,
     ) -> S3Result<S3Response<CreateMultipartUploadOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "CreateMultipartUpload")?;
         crate::hp_guard!("S3::create_multipart_upload");
         let usecase = s3_api::multipart_usecase_for(self);
         usecase.execute_create_multipart_upload(req).await
@@ -884,6 +893,9 @@ impl S3 for FS {
     /// Delete an object
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_object(&self, req: S3Request<DeleteObjectInput>) -> S3Result<S3Response<DeleteObjectOutput>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::delete_object(&bound, req).await;
+        }
         crate::hp_guard!("S3::delete_object");
         let request_id = req
             .extensions
@@ -902,6 +914,7 @@ impl S3 for FS {
         &self,
         req: S3Request<DeleteObjectTaggingInput>,
     ) -> S3Result<S3Response<DeleteObjectTaggingOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "DeleteObjectTagging")?;
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingDelete, S3Operation::DeleteObjectTagging);
         let DeleteObjectTaggingInput {
@@ -1023,6 +1036,7 @@ impl S3 for FS {
     /// Delete multiple objects
     #[instrument(level = "debug", skip(self, req))]
     async fn delete_objects(&self, req: S3Request<DeleteObjectsInput>) -> S3Result<S3Response<DeleteObjectsOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "DeleteObjects")?;
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_delete_objects(req).await
     }
@@ -1266,6 +1280,9 @@ impl S3 for FS {
         fields(start_time=?time::OffsetDateTime::now_utc())
     )]
     async fn get_object(&self, req: S3Request<GetObjectInput>) -> S3Result<S3Response<GetObjectOutput>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::get_object(&bound, req).await;
+        }
         crate::hp_guard!("S3::get_object");
         let request_id = req
             .extensions
@@ -1280,6 +1297,7 @@ impl S3 for FS {
     }
 
     async fn get_object_acl(&self, req: S3Request<GetObjectAclInput>) -> S3Result<S3Response<GetObjectAclOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "GetObjectAcl")?;
         record_s3_op(S3Operation::GetObjectAcl);
         let GetObjectAclInput {
             bucket, key, version_id, ..
@@ -1301,6 +1319,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectAttributesInput>,
     ) -> S3Result<S3Response<GetObjectAttributesOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "GetObjectAttributes")?;
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_get_object_attributes(req).await
     }
@@ -1309,6 +1328,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectLegalHoldInput>,
     ) -> S3Result<S3Response<GetObjectLegalHoldOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "GetObjectLegalHold")?;
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectAccessedGetLegalHold, S3Operation::GetObjectLegalHold).suppress_event();
         let GetObjectLegalHoldInput {
@@ -1420,6 +1440,7 @@ impl S3 for FS {
         &self,
         req: S3Request<GetObjectRetentionInput>,
     ) -> S3Result<S3Response<GetObjectRetentionOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "GetObjectRetention")?;
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectAccessedGetRetention, S3Operation::GetObjectRetention).suppress_event();
         let GetObjectRetentionInput {
@@ -1464,6 +1485,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn get_object_tagging(&self, req: S3Request<GetObjectTaggingInput>) -> S3Result<S3Response<GetObjectTaggingOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "GetObjectTagging")?;
         use crate::storage::storage_api::ecstore_bucket::versioning::VersioningApi as _;
 
         record_s3_op(S3Operation::GetObjectTagging);
@@ -1586,6 +1608,9 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn head_object(&self, req: S3Request<HeadObjectInput>) -> S3Result<S3Response<HeadObjectOutput>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::head_object(&bound, req).await;
+        }
         crate::hp_guard!("S3::head_object");
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_head_object(req).await
@@ -1603,6 +1628,7 @@ impl S3 for FS {
         &self,
         req: S3Request<ListMultipartUploadsInput>,
     ) -> S3Result<S3Response<ListMultipartUploadsOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "ListMultipartUploads")?;
         record_s3_op(S3Operation::ListMultipartUploads);
         let usecase = s3_api::multipart_usecase_for(self);
         usecase.execute_list_multipart_uploads(req).await
@@ -1612,6 +1638,7 @@ impl S3 for FS {
         &self,
         req: S3Request<ListObjectVersionsInput>,
     ) -> S3Result<S3Response<ListObjectVersionsOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "ListObjectVersions")?;
         record_s3_op(S3Operation::ListObjectVersions);
         let usecase = s3_api::bucket_usecase_for(self);
         usecase.execute_list_object_versions(req).await
@@ -1619,6 +1646,9 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects(&self, req: S3Request<ListObjectsInput>) -> S3Result<S3Response<ListObjectsOutput>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::list_objects(&bound, req).await;
+        }
         record_s3_op(S3Operation::ListObjects);
         let usecase = s3_api::bucket_usecase_for(self);
         usecase.execute_list_objects(req).await
@@ -1626,6 +1656,9 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_objects_v2(&self, req: S3Request<ListObjectsV2Input>) -> S3Result<S3Response<ListObjectsV2Output>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::list_objects_v2(&bound, req).await;
+        }
         crate::hp_guard!("S3::list_objects_v2");
         record_s3_op(S3Operation::ListObjectsV2);
         let usecase = s3_api::bucket_usecase_for(self);
@@ -1634,6 +1667,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn list_parts(&self, req: S3Request<ListPartsInput>) -> S3Result<S3Response<ListPartsOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "ListParts")?;
         record_s3_op(S3Operation::ListParts);
         let usecase = s3_api::multipart_usecase_for(self);
         usecase.execute_list_parts(req).await
@@ -1724,6 +1758,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketLifecycleConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketLifecycleConfigurationOutput>> {
+        bucket_engine::dispatch::refuse_feature(&req.input.bucket, BucketFeature::Lifecycle)?;
         let usecase = s3_api::bucket_usecase_for(self);
         let prepared = req
             .input
@@ -1741,6 +1776,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketNotificationConfigurationInput>,
     ) -> S3Result<S3Response<PutBucketNotificationConfigurationOutput>> {
+        bucket_engine::dispatch::refuse_feature(&req.input.bucket, BucketFeature::Notifications)?;
         let prepared = persisted_from_s3s(&req.input.notification_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::PutBucketNotificationConfiguration, |req| {
@@ -1758,6 +1794,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketReplicationInput>,
     ) -> S3Result<S3Response<PutBucketReplicationOutput>> {
+        bucket_engine::dispatch::refuse_feature(&req.input.bucket, BucketFeature::Replication)?;
         audit_only_operation(req, S3Operation::PutBucketReplication, |req| self.put_bucket_replication_inner(req)).await
     }
 
@@ -1817,6 +1854,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutBucketVersioningInput>,
     ) -> S3Result<S3Response<PutBucketVersioningOutput>> {
+        bucket_engine::dispatch::refuse_feature(&req.input.bucket, BucketFeature::Versioning)?;
         let prepared = persisted_from_s3s(&req.input.versioning_configuration);
         let usecase = s3_api::bucket_usecase_for(self);
         audit_only_operation(req, S3Operation::PutBucketVersioning, |req| {
@@ -1856,12 +1894,16 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object(&self, req: S3Request<PutObjectInput>) -> S3Result<S3Response<PutObjectOutput>> {
+        if let Some(bound) = bucket_engine::dispatch::bound_bucket(&req.input.bucket)? {
+            return bucket_engine::dispatch::put_object(&bound, req).await;
+        }
         crate::hp_guard!("S3::put_object");
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_put_object(self, req).await
     }
 
     async fn put_object_acl(&self, req: S3Request<PutObjectAclInput>) -> S3Result<S3Response<PutObjectAclOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "PutObjectAcl")?;
         let mut helper = OperationHelper::new(&req, EventName::ObjectAclPut, S3Operation::PutObjectAcl);
         let bucket = &req.input.bucket;
         let key = &req.input.key;
@@ -1899,6 +1941,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLegalHoldInput>,
     ) -> S3Result<S3Response<PutObjectLegalHoldOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "PutObjectLegalHold")?;
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectCreatedPutLegalHold, S3Operation::PutObjectLegalHold).suppress_event();
         let PutObjectLegalHoldInput {
@@ -2000,6 +2043,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectLockConfigurationInput>,
     ) -> S3Result<S3Response<PutObjectLockConfigurationOutput>> {
+        bucket_engine::dispatch::refuse_feature(&req.input.bucket, BucketFeature::ObjectLock)?;
         audit_only_operation(req, S3Operation::PutObjectLockConfiguration, |req| {
             self.put_object_lock_configuration_inner(req)
         })
@@ -2010,6 +2054,7 @@ impl S3 for FS {
         &self,
         req: S3Request<PutObjectRetentionInput>,
     ) -> S3Result<S3Response<PutObjectRetentionOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "PutObjectRetention")?;
         let mut helper =
             OperationHelper::new(&req, EventName::ObjectCreatedPutRetention, S3Operation::PutObjectRetention).suppress_event();
         let PutObjectRetentionInput {
@@ -2129,6 +2174,7 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn put_object_tagging(&self, req: S3Request<PutObjectTaggingInput>) -> S3Result<S3Response<PutObjectTaggingOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "PutObjectTagging")?;
         let start_time = std::time::Instant::now();
         let mut helper = OperationHelper::new(&req, EventName::ObjectTaggingPut, S3Operation::PutObjectTagging);
         let PutObjectTaggingInput {
@@ -2246,6 +2292,7 @@ impl S3 for FS {
     }
 
     async fn restore_object(&self, req: S3Request<RestoreObjectInput>) -> S3Result<S3Response<RestoreObjectOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "RestoreObject")?;
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_restore_object(req).await
     }
@@ -2254,12 +2301,14 @@ impl S3 for FS {
         &self,
         req: S3Request<SelectObjectContentInput>,
     ) -> S3Result<S3Response<SelectObjectContentOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "SelectObjectContent")?;
         let usecase = s3_api::object_usecase_for(self);
         usecase.execute_select_object_content(req).await
     }
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part(&self, req: S3Request<UploadPartInput>) -> S3Result<S3Response<UploadPartOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "UploadPart")?;
         crate::hp_guard!("S3::upload_part");
         record_s3_op(S3Operation::UploadPart);
         let usecase = s3_api::multipart_usecase_for(self);
@@ -2268,6 +2317,10 @@ impl S3 for FS {
 
     #[instrument(level = "debug", skip(self, req))]
     async fn upload_part_copy(&self, req: S3Request<UploadPartCopyInput>) -> S3Result<S3Response<UploadPartCopyOutput>> {
+        bucket_engine::dispatch::refuse_unrouted(&req.input.bucket, "UploadPartCopy")?;
+        if let CopySource::Bucket { bucket, .. } = &req.input.copy_source {
+            bucket_engine::dispatch::refuse_unrouted(bucket, "UploadPartCopy")?;
+        }
         record_s3_op(S3Operation::UploadPartCopy);
         let usecase = s3_api::multipart_usecase_for(self);
         audit_only_operation(req, S3Operation::UploadPartCopy, |req| Box::pin(usecase.execute_upload_part_copy(req))).await

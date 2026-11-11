@@ -692,6 +692,33 @@ fn should_disable_proxy_for_url(url: &str, tuning: InternodeHttpClientTuning) ->
     }
 }
 
+/// Sends one internode request with the pooled internode client and returns
+/// its status, headers and body. Meant for small control exchanges whose data
+/// moves out of band (for example over NIXL); large bodies use `HttpReader`.
+pub async fn internode_http_request(
+    url: &str,
+    method: Method,
+    headers: HeaderMap,
+    timeout: Option<Duration>,
+) -> io::Result<(reqwest::StatusCode, HeaderMap, Bytes)> {
+    let client = get_http_client(url).await?;
+    let mut request = client.request(method.clone(), url).headers(headers);
+    if let Some(timeout) = timeout {
+        request = request.timeout(timeout);
+    }
+    let response = request
+        .send()
+        .await
+        .map_err(|err| io::Error::other(format!("internode {method} request failed: {err}")))?;
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|err| io::Error::other(format!("internode {method} response body failed: {err}")))?;
+    Ok((status, headers, body))
+}
+
 async fn get_http_client(url: &str) -> io::Result<Client> {
     let tuning = internode_http_client_tuning();
     // Reuse HTTP connection pools while honoring the configured internode proxy

@@ -56,6 +56,9 @@ Required headings and strings in these files are asserted by `scripts/check_arch
 | [kms-bulk-rekey-contract.md](kms-bulk-rekey-contract.md) | changing the bulk envelope re-wrap sweep, its admin endpoints, the re-wrap primitive, or which objects a rekey may touch |
 | [remote-credential-sealing-adr.md](remote-credential-sealing-adr.md) | adding, reading, or persisting a stored remote credential (replication target, remote tier, on-demand migration source), or needing the sealed-envelope format, the mixed-version rules, or the reason this is worth doing in one deployment and not in another |
 | [tier-stats-contract.md](tier-stats-contract.md) | changing what `GET /rustfs/admin/v3/tier-stats` returns, adding a tier accounting source, or wiring a metric to a remote tier request |
+| [bucket-engines.md](bucket-engines.md) | you add a bucket whose data is not stored by the erasure-coded object layer, give a bucket operations beyond S3, add a per-bucket storage profile, or touch the seams a bucket engine plugs into |
+| [kv-cache-buckets.md](kv-cache-buckets.md) | you design, implement, or review storage for an LLM KV cache in RustFS (the `kv-cache` bucket engine), change the lockless cache-bucket path, or need to know which object-store guarantees a cache bucket gives up and what replaces them |
+| [s3-over-rdma-llm-serving.md](s3-over-rdma-llm-serving.md) | you change the RDMA or NIXL data path, the large-PUT path, or a per-bucket ETag setting, or you build or run a client that loads model weights or offloads KV cache to RustFS over RDMA, such as the SGLang weight loader and HiCache backend |
 
 ## Support and compatibility matrices (release-facing, keep current)
 

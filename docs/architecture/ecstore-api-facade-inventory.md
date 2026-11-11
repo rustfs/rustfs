@@ -65,6 +65,10 @@ Lifecycle, replication, and `SetDisks` split blockers, extracted contracts, and 
 5. Remove or narrow one facade group per change so rollback preserves object IO, quorum, lifecycle/replication queues, scanner repair, notification/audit events, and metadata compatibility.
 6. Keep `api::bucket`, `api::config`, `api::disk`, and `api::tier` on explicit submodules and symbol lists; do not restore `pub use crate::<owner>::{...}` whole-module passthroughs for those groups.
 
+### Bucket Engines
+
+`rustfs/src/bucket_engine/storage_api.rs` owns the engine registry's storage facade imports: the `engine.json` bucket metadata entry name and the bucket config subscriber registry. Engine contracts live in `crates/bucket-engine`, which does not depend on ECStore.
+
 ### On-Demand Migration
 
 `rustfs/src/on_demand_migration/storage_api.rs` owns the service's storage facade

@@ -79,6 +79,7 @@ pub mod auth_keystone;
 #[cfg(any(target_os = "linux", all(test, unix)))]
 mod background_admission;
 pub(crate) mod bitrot_selftest;
+pub mod bucket_engine;
 pub mod capacity;
 pub mod cgroup_resources;
 pub mod cluster_snapshot;
@@ -93,6 +94,8 @@ pub mod init;
 pub mod inspect;
 pub(crate) mod kms_deletion_gate;
 pub(crate) mod kms_rekey;
+#[cfg(feature = "bucket-engines")]
+pub mod kvcache_engine;
 pub mod license;
 pub mod memory_observability;
 pub mod module_switches;

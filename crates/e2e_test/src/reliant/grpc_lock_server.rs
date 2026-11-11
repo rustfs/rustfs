@@ -827,6 +827,13 @@ impl NodeService for MinimalLockNodeService {
         Err(Status::unimplemented("lock-only test server"))
     }
 
+    async fn engine_call(
+        &self,
+        _request: Request<rustfs_protos::proto_gen::node_service::EngineCallRequest>,
+    ) -> Result<Response<rustfs_protos::proto_gen::node_service::EngineCallResponse>, Status> {
+        Err(Status::unimplemented("lock-only test server"))
+    }
+
     async fn load_policy(
         &self,
         _request: Request<rustfs_protos::proto_gen::node_service::LoadPolicyRequest>,
