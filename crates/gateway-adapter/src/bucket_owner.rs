@@ -12,68 +12,100 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The gateway's [`BucketOwnerSource`], answered by RustFS bucket metadata.
+//! The gateway's [`BucketOwnerSource`]: the one owner RustFS reports, for a bucket that exists.
 //!
-//! Responsible for: asking a [`BucketOwnerLookup`] for the owner of one bucket and turning every
+//! Responsible for: confirming through a [`BucketLookup`] that a bucket exists, answering the
+//! single owner id the deployment reports ([`RustfsBucketOwners::new`]) for it, and turning every
 //! outcome that is not a usable owner into the gateway's one refusal, [`BucketOwnerError`].
-//! NOT responsible for: where the owner is stored (the lookup's; RustFS has no dedicated owner
-//! field, so the binary's lookup reads it from the bucket's metadata), comparing it with
-//! `x-amz-expected-bucket-owner` (the gateway does, byte for byte), or authorizing anything.
+//! NOT responsible for: choosing the owner id (the binary passes the constant it already reports
+//! as the owner in listings), comparing it with `x-amz-expected-bucket-owner` (the gateway does,
+//! byte for byte), or authorizing anything.
 //! Upstream: the gateway's expected-owner check, which consults this source only when a request
-//! carries the header. Downstream: the lookup the binary supplies over `bucket::metadata_sys`.
+//! carries the header, after authorization allowed it. Downstream: the lookup the binary supplies
+//! over the ecstore bucket metadata system.
 //!
-//! # Failure classes
+//! # What an owner is in RustFS
 //!
-//! The lookup separates [`OwnerLookupError::NoSuchBucket`] from [`OwnerLookupError::Backend`], and
-//! this source maps **both** to [`BucketOwnerError::unavailable`], which the gateway answers
-//! `403 AccessDenied` and never as a matching owner. The pinned gateway's [`BucketOwnerError`] is
-//! a unit type with that single constructor, so it can express neither "no such bucket" nor a 5xx;
-//! the distinction is kept in the lookup trait so it can be surfaced once the gateway grows it.
-//! An owner that is empty is no owner and is refused the same way.
+//! RustFS stores no per-bucket owner: bucket ACL writes are no-ops and nothing writes the ACL
+//! document, so the only owner RustFS reports anywhere (ListBuckets, ACL and multipart listings)
+//! is one constant. The source answers exactly that constant. A caller therefore passes the
+//! gateway's check only by presenting the owner id RustFS lists, which separates no tenants; it is
+//! a compatibility answer, and the constant's own documentation says it must not decide
+//! authorization.
+//!
+//! # Difference from legacy (ledger entry R-071)
+//!
+//! Legacy RustFS ignores `x-amz-expected-bucket-owner` entirely. On the gateway stack a request
+//! carrying it is served only when the value equals the reported owner id; otherwise it is `403
+//! AccessDenied`. A missing bucket and a backend failure with the header present are also `403`
+//! at the pinned gateway, where legacy answers `404` and `5xx`: [`BucketOwnerError`] has one value,
+//! so it cannot express either. [`RustfsBucketOwners::resolve`] keeps the two apart at this
+//! adapter's boundary so the gateway can surface them once it grows the classes.
 
 use std::sync::Arc;
 
 use rustfs_gateway::{BoxFuture, BucketName, BucketOwnerError, BucketOwnerSource};
 
-/// Why a [`BucketOwnerLookup`] produced no owner.
+/// Why a bucket yielded no owner.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OwnerLookupError {
     /// The bucket does not exist.
     NoSuchBucket,
-    /// The metadata backend failed, or could not be reached, so the bucket's state is unknown.
+    /// The metadata backend failed, could not be reached, or the owner is not usable (an empty
+    /// owner id is a misconfiguration), so the bucket's state is unknown.
     Backend,
 }
 
-/// The narrow slice of RustFS bucket metadata an owner lookup needs.
+/// The narrow slice of RustFS bucket metadata an owner answer needs: whether a bucket exists.
 ///
-/// Exists so the source can be tested against a fake. The binary implements it over
-/// the ecstore bucket metadata system, mapping `BucketNotFound` to
-/// [`OwnerLookupError::NoSuchBucket`] and every other error to [`OwnerLookupError::Backend`].
-pub trait BucketOwnerLookup: Send + Sync + 'static {
-    /// The owner account id recorded for `bucket`.
-    fn owner_of<'a>(&'a self, bucket: &'a str) -> BoxFuture<'a, Result<String, OwnerLookupError>>;
+/// Exists so the source can be tested against a fake. The binary implements it over the ecstore
+/// bucket metadata system, mapping `BucketNotFound` to [`OwnerLookupError::NoSuchBucket`] and every
+/// other error to [`OwnerLookupError::Backend`].
+pub trait BucketLookup: Send + Sync + 'static {
+    /// `Ok(())` when `bucket` exists.
+    fn check<'a>(&'a self, bucket: &'a str) -> BoxFuture<'a, Result<(), OwnerLookupError>>;
 }
 
-/// A [`BucketOwnerSource`] over a [`BucketOwnerLookup`].
+/// A [`BucketOwnerSource`] answering one owner id for every bucket that exists.
 pub struct RustfsBucketOwners<L> {
     lookup: L,
+    owner: Arc<str>,
 }
 
-impl<L: BucketOwnerLookup> RustfsBucketOwners<L> {
-    /// A source answering from `lookup`.
+impl<L: BucketLookup> RustfsBucketOwners<L> {
+    /// A source answering `owner` for every bucket `lookup` finds.
+    ///
+    /// An empty `owner` is no owner: every answer is then [`OwnerLookupError::Backend`].
     #[must_use]
-    pub fn new(lookup: L) -> Self {
-        Self { lookup }
+    pub fn new(lookup: L, owner: impl Into<Arc<str>>) -> Self {
+        Self {
+            lookup,
+            owner: owner.into(),
+        }
+    }
+
+    /// The owner of `bucket`, or why there is none. Missing and failing stay distinct here.
+    ///
+    /// # Errors
+    ///
+    /// [`OwnerLookupError::NoSuchBucket`] when the bucket does not exist;
+    /// [`OwnerLookupError::Backend`] on any lookup failure or when the configured owner is empty.
+    pub async fn resolve(&self, bucket: &str) -> Result<Arc<str>, OwnerLookupError> {
+        self.lookup.check(bucket).await?;
+        if self.owner.is_empty() {
+            return Err(OwnerLookupError::Backend);
+        }
+        Ok(Arc::clone(&self.owner))
     }
 }
 
-impl<L: BucketOwnerLookup> BucketOwnerSource for RustfsBucketOwners<L> {
+impl<L: BucketLookup> BucketOwnerSource for RustfsBucketOwners<L> {
     fn owner<'a>(&'a self, bucket: &'a BucketName) -> BoxFuture<'a, Result<Arc<str>, BucketOwnerError>> {
         Box::pin(async move {
-            match self.lookup.owner_of(bucket.as_str()).await {
-                Ok(owner) if !owner.is_empty() => Ok(Arc::from(owner)),
-                Ok(_) | Err(OwnerLookupError::NoSuchBucket | OwnerLookupError::Backend) => Err(BucketOwnerError::unavailable()),
-            }
+            // The pinned gateway collapses both classes (R-071), so both are the one refusal.
+            self.resolve(bucket.as_str())
+                .await
+                .map_err(|_: OwnerLookupError| BucketOwnerError::unavailable())
         })
     }
 }
@@ -84,15 +116,16 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    const OWNER: &str = "rustfsadmin";
+    /// Stands for the owner id RustFS reports; the binary passes its own constant.
+    const OWNER: &str = "reported-owner-id";
 
     struct Fake {
-        answer: Result<String, OwnerLookupError>,
+        answer: Result<(), OwnerLookupError>,
         asked: Mutex<Vec<String>>,
     }
 
     impl Fake {
-        fn answering(answer: Result<String, OwnerLookupError>) -> Self {
+        fn answering(answer: Result<(), OwnerLookupError>) -> Self {
             Self {
                 answer,
                 asked: Mutex::new(Vec::new()),
@@ -100,29 +133,40 @@ mod tests {
         }
     }
 
-    impl BucketOwnerLookup for Fake {
-        fn owner_of<'a>(&'a self, bucket: &'a str) -> BoxFuture<'a, Result<String, OwnerLookupError>> {
+    impl BucketLookup for Fake {
+        fn check<'a>(&'a self, bucket: &'a str) -> BoxFuture<'a, Result<(), OwnerLookupError>> {
             self.asked.lock().unwrap().push(bucket.to_owned());
-            let answer = self.answer.clone();
+            let answer = self.answer;
             Box::pin(async move { answer })
         }
     }
 
-    async fn owner_of(answer: Result<String, OwnerLookupError>) -> Result<Arc<str>, BucketOwnerError> {
-        let source = RustfsBucketOwners::new(Fake::answering(answer));
-        source.owner(&BucketName::new("photos").expect("a bucket name")).await
+    fn source(answer: Result<(), OwnerLookupError>) -> RustfsBucketOwners<Fake> {
+        RustfsBucketOwners::new(Fake::answering(answer), OWNER)
     }
 
-    /// Positive: an owner the lookup finds is returned unchanged.
+    async fn gateway_answer(answer: Result<(), OwnerLookupError>) -> Result<Arc<str>, BucketOwnerError> {
+        source(answer).owner(&BucketName::new("photos").expect("a bucket name")).await
+    }
+
+    /// Positive: an existing bucket's owner is the configured id, byte for byte.
     #[tokio::test]
-    async fn the_owner_is_returned() {
-        assert_eq!(owner_of(Ok(OWNER.to_owned())).await.as_deref(), Ok(OWNER));
+    async fn an_existing_bucket_has_the_configured_owner() {
+        assert_eq!(gateway_answer(Ok(())).await.as_deref(), Ok(OWNER));
+    }
+
+    /// Positive: every bucket gets the same owner, since RustFS stores none per bucket.
+    #[tokio::test]
+    async fn every_bucket_has_the_same_owner() {
+        let source = source(Ok(()));
+        assert_eq!(source.resolve("photos").await.as_deref(), Ok(OWNER));
+        assert_eq!(source.resolve("backups").await.as_deref(), Ok(OWNER));
     }
 
     /// Positive: the lookup is asked about exactly the bucket the gateway named.
     #[tokio::test]
     async fn the_lookup_is_asked_about_the_named_bucket() {
-        let source = RustfsBucketOwners::new(Fake::answering(Ok(OWNER.to_owned())));
+        let source = source(Ok(()));
         source
             .owner(&BucketName::new("photos").expect("a bucket name"))
             .await
@@ -130,29 +174,42 @@ mod tests {
         assert_eq!(*source.lookup.asked.lock().unwrap(), vec!["photos".to_owned()]);
     }
 
-    /// Negative: a missing bucket yields no owner, so it can never match an assertion.
+    /// Negative: a missing bucket is reported as missing at the adapter boundary.
     #[tokio::test]
-    async fn a_missing_bucket_is_refused() {
-        assert_eq!(owner_of(Err(OwnerLookupError::NoSuchBucket)).await, Err(BucketOwnerError::unavailable()));
+    async fn a_missing_bucket_is_reported_as_missing() {
+        assert_eq!(
+            source(Err(OwnerLookupError::NoSuchBucket)).resolve("photos").await,
+            Err(OwnerLookupError::NoSuchBucket)
+        );
     }
 
-    /// Negative: a failing backend is a refusal, never "owner unknown, allow".
+    /// Negative: a failing backend is reported as a failure, never as an owner and never as missing.
     #[tokio::test]
-    async fn a_backend_failure_is_refused() {
-        assert_eq!(owner_of(Err(OwnerLookupError::Backend)).await, Err(BucketOwnerError::unavailable()));
+    async fn a_backend_failure_is_reported_as_a_failure() {
+        assert_eq!(
+            source(Err(OwnerLookupError::Backend)).resolve("photos").await,
+            Err(OwnerLookupError::Backend)
+        );
     }
 
-    /// Negative: an empty owner is no owner; it must not equal an empty assertion.
+    /// Negative: the pinned gateway sees one refusal for both, and never an owner.
+    #[tokio::test]
+    async fn the_gateway_is_refused_in_both_cases() {
+        assert_eq!(
+            gateway_answer(Err(OwnerLookupError::NoSuchBucket)).await,
+            Err(BucketOwnerError::unavailable())
+        );
+        assert_eq!(gateway_answer(Err(OwnerLookupError::Backend)).await, Err(BucketOwnerError::unavailable()));
+    }
+
+    /// Negative: an empty configured owner is no owner; it must not equal an empty assertion.
     #[tokio::test]
     async fn an_empty_owner_is_refused() {
-        assert_eq!(owner_of(Ok(String::new())).await, Err(BucketOwnerError::unavailable()));
-    }
-
-    /// Negative: the refusal carries nothing the lookup said, so no formatter can leak it.
-    #[tokio::test]
-    async fn the_refusal_names_nothing() {
-        let error = owner_of(Err(OwnerLookupError::Backend)).await.expect_err("a refusal");
-        assert_eq!(error.to_string(), "bucket owner unavailable");
-        assert!(!format!("{error:?}").contains("photos"));
+        let source = RustfsBucketOwners::new(Fake::answering(Ok(())), "");
+        assert_eq!(source.resolve("photos").await, Err(OwnerLookupError::Backend));
+        assert_eq!(
+            source.owner(&BucketName::new("photos").expect("a bucket name")).await,
+            Err(BucketOwnerError::unavailable())
+        );
     }
 }

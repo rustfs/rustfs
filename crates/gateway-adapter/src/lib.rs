@@ -29,12 +29,12 @@ use std::sync::Arc;
 
 use rustfs_gateway::{Authenticator, CredentialProvider, ServiceBuilder};
 
-pub use bucket_owner::{BucketOwnerLookup, OwnerLookupError, RustfsBucketOwners};
+pub use bucket_owner::{BucketLookup, OwnerLookupError, RustfsBucketOwners};
 pub use credentials::{IamCredentials, IamKeyLookup, STS_SESSION_ISSUER};
 pub use host::rustfs_host_resolver;
 pub use policy::{IamPolicySource, IamPrincipalLookup, PrincipalKind, RustfsPrincipal};
 pub use root::{MIN_SECRET_KEY_LEN, RootCredentials, RootCredentialsError, RootSource};
-pub use trace::{RequestIdCarrier, TraceError, attach_host_request_id, host_request_id};
+pub use trace::{AttachOutcome, RequestIdCarrier, attach_host_request_id, host_request_id};
 
 /// The IAM-backed credential provider and policy source, assembled together.
 ///

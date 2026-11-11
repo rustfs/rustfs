@@ -12,27 +12,39 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! The request id RustFS's outer layer minted, handed to the gateway as its own.
+//! The request id RustFS's outer layer minted, handed to the gateway as its own when that is safe.
 //!
 //! Responsible for: reading the id from the context the outer layer put in the request's
-//! extensions ([`RequestIdCarrier`]), refusing it when it is absent or outside the gateway's
-//! identifier alphabet, and inserting it as the gateway's [`HostRequestId`].
-//! NOT responsible for: minting any id, choosing the response headers (the gateway writes
-//! `x-amz-request-id` from the id it was handed), or the layer that mints (`rustfs/src/server/
-//! layer.rs`). It never reads a header: an id the caller chose must not become the request's.
+//! extensions ([`RequestIdCarrier`]) and, when it is inside the gateway's identifier alphabet and
+//! length, inserting it as the gateway's [`HostRequestId`].
+//! NOT responsible for: minting any id, refusing any request (nothing here can fail a request),
+//! choosing the response headers (the gateway writes `x-amz-request-id` from the id it was
+//! handed, and RustFS's outer layer overwrites that header on S3 paths), or the layer that mints
+//! (`rustfs/src/server/layer.rs`). It never reads a header itself.
 //! Upstream: RustFS's `RequestContext`, which the binary makes a [`RequestIdCarrier`]. Downstream:
 //! the gateway service, which reads the [`HostRequestId`] extension once, at the top.
 //!
+//! # Whose id it is
+//!
+//! On S3 paths the outer layer mints a server-owned UUID. On admin, STS and console paths the
+//! context copies the caller's `x-request-id` (or `x-amz-request-id`), as legacy does, so there
+//! the id can be caller-chosen. Either way the id is attached only when it is inert, that is 1 to
+//! 64 bytes of ASCII letters, digits, `-`, `.`, `_` and `~`, which is safe in a header, an XML
+//! document and a log line. Anything else is not attached and the request is **forwarded
+//! unchanged**: the gateway then mints its own id. No request is ever refused because of its id.
+//!
+//! # Known difference when nothing is attached
+//!
+//! The gateway answers with the id it minted (error body `<RequestId>`, its events and audit
+//! records) while, on S3 paths, the outer layer overwrites the response header with RustFS's id.
+//! So for such a request the header and the error body name different ids. That needs a caller-
+//! chosen id outside the alphabet, or a request that never passed the outer layer.
+//!
 //! # Why this is not a `TraceSource`
 //!
-//! The gateway's `TraceSource::mint` takes no request, deliberately, so a source cannot read the
-//! id RustFS already minted; the gateway's documented path for a host that identifies its own
-//! requests is the [`HostRequestId`] extension, and this module fills it. The gateway still calls
-//! its configured `TraceSource` once per request, and its answer is used only when no
-//! [`HostRequestId`] was handed over, so the assembly must treat an [`Err`] from
-//! [`attach_host_request_id`] as a request it does not forward, rather than let the gateway answer
-//! with a second id. The trait offers no way to fail from inside the source, so that decision sits
-//! with the caller, where it is visible.
+//! The gateway's `TraceSource::mint` takes no request, so a source cannot read the id RustFS
+//! already minted; the gateway's documented path for a host that identifies its own requests is
+//! the [`HostRequestId`] extension, and this module fills it.
 //!
 //! # Why a carrier trait
 //!
@@ -40,56 +52,45 @@
 //! The binary implements [`RequestIdCarrier`] for it, and this module looks it up in the
 //! extensions by that type.
 
-use rustfs_gateway::{HostRequestId, InvalidRequestId};
+use rustfs_gateway::HostRequestId;
 
-/// A type in the request extensions that holds the id the outer layer minted.
+/// A type in the request extensions that holds the id the outer layer minted or propagated.
 pub trait RequestIdCarrier: Send + Sync + 'static {
-    /// The canonical request id: the value RustFS logs and the response must carry.
+    /// The canonical request id: the value RustFS logs and the response should carry.
     fn request_id(&self) -> &str;
 }
 
-/// Why no [`HostRequestId`] could be made for a request.
+/// What [`attach_host_request_id`] did. Ignoring it is harmless: every outcome forwards the request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TraceError {
-    /// The request carries no context from the outer layer.
-    MissingContext,
-    /// The context's id is empty, too long, or outside the gateway's identifier alphabet.
-    Invalid(InvalidRequestId),
+pub enum AttachOutcome {
+    /// The carrier's id was inserted as the request's [`HostRequestId`].
+    Attached,
+    /// The request carries no context from the outer layer; nothing was inserted.
+    NoContext,
+    /// The carrier's id is empty, too long, or outside the gateway's alphabet; nothing was
+    /// inserted and the id was not repaired.
+    UnusableId,
 }
 
-impl core::fmt::Display for TraceError {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::MissingContext => f.write_str("the request carries no request context"),
-            Self::Invalid(reason) => write!(f, "the request id cannot be handed to the gateway: {reason}"),
-        }
-    }
+/// The gateway's [`HostRequestId`] for the id `carrier` holds, or `None` when it is not inert.
+#[must_use]
+pub fn host_request_id<C: RequestIdCarrier + ?Sized>(carrier: &C) -> Option<HostRequestId> {
+    HostRequestId::new(carrier.request_id()).ok()
 }
 
-impl std::error::Error for TraceError {}
-
-/// The gateway's [`HostRequestId`] for the id `carrier` holds.
+/// Reads the `C` the outer layer put in `request`'s extensions and, when its id is inert, inserts
+/// it as the request's [`HostRequestId`].
 ///
-/// # Errors
-///
-/// [`TraceError::Invalid`] when the id is not one the gateway accepts; it is never repaired.
-pub fn host_request_id<C: RequestIdCarrier + ?Sized>(carrier: &C) -> Result<HostRequestId, TraceError> {
-    HostRequestId::new(carrier.request_id()).map_err(TraceError::Invalid)
-}
-
-/// Reads the `C` the outer layer put in `request`'s extensions and inserts its id as the
-/// request's [`HostRequestId`].
-///
-/// Nothing is inserted on an error.
-///
-/// # Errors
-///
-/// [`TraceError::MissingContext`] when the request has no `C`; [`TraceError::Invalid`] when its id
-/// is not one the gateway accepts.
-pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Request<B>) -> Result<(), TraceError> {
-    let id = host_request_id(request.extensions().get::<C>().ok_or(TraceError::MissingContext)?)?;
+/// Never refuses the request: the caller forwards it whatever the outcome.
+pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Request<B>) -> AttachOutcome {
+    let Some(carrier) = request.extensions().get::<C>() else {
+        return AttachOutcome::NoContext;
+    };
+    let Some(id) = host_request_id(carrier) else {
+        return AttachOutcome::UnusableId;
+    };
     request.extensions_mut().insert(id);
-    Ok(())
+    AttachOutcome::Attached
 }
 
 #[cfg(test)]
@@ -121,11 +122,15 @@ mod tests {
             .map(|id| id.request_id().as_str().to_owned())
     }
 
+    fn attach(request: &mut http::Request<()>) -> AttachOutcome {
+        attach_host_request_id::<Ctx, _>(request)
+    }
+
     /// Positive: the id RustFS minted is the id the gateway is handed, byte for byte.
     #[test]
     fn the_minted_id_is_handed_over_unchanged() {
         let mut request = request_with(UUID);
-        attach_host_request_id::<Ctx, _>(&mut request).expect("a valid id");
+        assert_eq!(attach(&mut request), AttachOutcome::Attached);
         assert_eq!(handed_over(&request).as_deref(), Some(UUID));
     }
 
@@ -134,7 +139,19 @@ mod tests {
     fn every_shape_rustfs_mints_is_accepted() {
         for id in [UUID, "trace-0123456789abcdef", "req-0123456789abcdef"] {
             let mut request = request_with(id);
-            attach_host_request_id::<Ctx, _>(&mut request).expect(id);
+            assert_eq!(attach(&mut request), AttachOutcome::Attached, "{id}");
+            assert_eq!(handed_over(&request).as_deref(), Some(id));
+        }
+    }
+
+    /// Positive: a caller-supplied id that is inert (admin and STS paths copy it) is attached, and
+    /// the longest allowed one is accepted.
+    #[test]
+    fn an_inert_caller_supplied_id_is_attached() {
+        let longest = "a".repeat(64);
+        for id in ["abc", "my.trace_id~1-2", longest.as_str()] {
+            let mut request = request_with(id);
+            assert_eq!(attach(&mut request), AttachOutcome::Attached, "{id}");
             assert_eq!(handed_over(&request).as_deref(), Some(id));
         }
     }
@@ -144,53 +161,70 @@ mod tests {
     fn each_request_keeps_its_own_id() {
         let mut first = request_with("first-id");
         let mut second = request_with("second-id");
-        attach_host_request_id::<Ctx, _>(&mut first).expect("valid");
-        attach_host_request_id::<Ctx, _>(&mut second).expect("valid");
+        attach(&mut first);
+        attach(&mut second);
         assert_eq!(handed_over(&first).as_deref(), Some("first-id"));
         assert_eq!(handed_over(&second).as_deref(), Some("second-id"));
     }
 
-    /// Negative: a request the outer layer never saw gets no id, and the caller is told.
+    /// Positive: with both a carrier and an `x-amz-request-id` header, the carrier's id wins.
     #[test]
-    fn a_missing_context_hands_over_nothing() {
-        let mut request = http::Request::new(());
-        assert_eq!(attach_host_request_id::<Ctx, _>(&mut request), Err(TraceError::MissingContext));
-        assert_eq!(handed_over(&request), None);
-    }
-
-    /// Negative: a header named like the id is not the id; only the context is read.
-    #[test]
-    fn a_request_id_header_is_not_read() {
+    fn the_carrier_wins_over_a_request_id_header() {
         let mut request = http::Request::builder()
             .header("x-amz-request-id", "caller-chosen")
             .header("x-request-id", "caller-chosen")
             .body(())
             .expect("a request");
-        assert_eq!(attach_host_request_id::<Ctx, _>(&mut request), Err(TraceError::MissingContext));
+        request.extensions_mut().insert(Ctx(UUID.to_owned()));
+        assert_eq!(attach(&mut request), AttachOutcome::Attached);
+        assert_eq!(handed_over(&request).as_deref(), Some(UUID));
+    }
+
+    /// Negative: a request the outer layer never saw gets no id, and the request is not refused.
+    #[test]
+    fn a_missing_context_hands_over_nothing() {
+        let mut request = http::Request::new(());
+        assert_eq!(attach(&mut request), AttachOutcome::NoContext);
         assert_eq!(handed_over(&request), None);
     }
 
-    /// Negative: an id outside the alphabet is refused where it stands, never repaired, and
-    /// nothing is inserted.
+    /// Negative: a header named like the id is not the id; only the context is read.
     #[test]
-    fn an_id_the_gateway_cannot_carry_is_refused() {
+    fn a_request_id_header_alone_is_not_read() {
+        let mut request = http::Request::builder()
+            .header("x-amz-request-id", "caller-chosen")
+            .header("x-request-id", "caller-chosen")
+            .body(())
+            .expect("a request");
+        assert_eq!(attach(&mut request), AttachOutcome::NoContext);
+        assert_eq!(handed_over(&request), None);
+    }
+
+    /// Negative: an id outside the alphabet or the length is never attached or repaired, and the
+    /// outcome says so rather than failing the request.
+    #[test]
+    fn an_id_the_gateway_cannot_carry_is_not_attached() {
         let too_long = "a".repeat(65);
-        for id in ["", "has space", "line\r\nbreak", "<RequestId>", "quo\"te", too_long.as_str()] {
+        for id in [
+            "",
+            "has space",
+            "line\r\nbreak",
+            "<RequestId>",
+            "quo\"te",
+            "Root=1-5759e988",
+            too_long.as_str(),
+        ] {
             let mut request = request_with(id);
-            assert!(
-                matches!(attach_host_request_id::<Ctx, _>(&mut request), Err(TraceError::Invalid(_))),
-                "{id:?}"
-            );
+            assert_eq!(attach(&mut request), AttachOutcome::UnusableId, "{id:?}");
             assert_eq!(handed_over(&request), None, "{id:?}");
         }
     }
 
-    /// Negative: the refusal does not repeat the refused id.
+    /// Negative: the unusable id is not repaired into a shorter or cleaned-up one.
     #[test]
-    fn the_refusal_does_not_echo_the_id() {
-        let mut request = request_with("secret token");
-        let error = attach_host_request_id::<Ctx, _>(&mut request).expect_err("refused");
-        assert!(!error.to_string().contains("secret"));
-        assert!(!format!("{error:?}").contains("secret"));
+    fn host_request_id_does_not_repair() {
+        assert!(host_request_id(&Ctx("has space".to_owned())).is_none());
+        assert!(host_request_id(&Ctx(format!("{UUID} "))).is_none());
+        assert!(host_request_id(&Ctx(UUID.to_owned())).is_some());
     }
 }
