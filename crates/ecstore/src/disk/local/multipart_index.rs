@@ -183,6 +183,10 @@ impl RebuildCursor {
                     Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
                     Err(error) => return Err(error),
                 };
+                // The head is decoded; release the source pin before indexing. On
+                // Windows the pin denies delete sharing, so holding it would make a
+                // concurrent abort of this upload fail with a sharing violation.
+                drop(source);
                 let source_root = relative
                     .file_name()
                     .and_then(|name| name.to_str())

@@ -385,9 +385,15 @@ mod tests {
                 .is_err(),
             "a stale worker cannot mutate a recreated bucket"
         );
+        // Name targets as the store's endpoints render them (`C:/...` on Windows),
+        // not as raw OS paths.
         let targets = directories
             .iter()
-            .map(|dir| dir.path().to_string_lossy().into_owned())
+            .map(|dir| {
+                crate::heal::Endpoint::try_from(dir.path().to_str().expect("UTF-8 temp disk path"))
+                    .expect("temp disk endpoint")
+                    .to_string()
+            })
             .collect::<Vec<_>>();
         assert!(
             storage

@@ -1456,7 +1456,13 @@ mod tests {
         store.put_failed_raw("failed-event", &[4; 16]).unwrap();
         assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 48);
         let failed = store.failed_dir().join("failed-event");
-        File::open(&failed).unwrap().set_modified(UNIX_EPOCH).unwrap();
+        // Windows needs write-attribute access on the handle to change mtime.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&failed)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
         assert_eq!(store.prune_failed_store().unwrap(), 1);
         assert_eq!(store.stored_bytes.load(Ordering::SeqCst), 32);
         std::fs::create_dir(store.failed_dir().join("cannot-replace-directory")).unwrap();
