@@ -1,0 +1,20 @@
+# Pinned RustFS release used as the "reference" target of parity lanes
+# (.github/workflows/reference-parity.yml). This is the single place that names
+# the reference release; .github/actions/reference-binary resolves, downloads and
+# verifies it, and fails on a missing pin, a missing asset or a digest mismatch.
+#
+# Bumping the reference is a reviewed event: every per-test difference between
+# the candidate and the reference is measured against this exact build.
+#
+# Each sha256 is the value published in the release's SHA256SUMS asset, which
+# matches the digest GitHub reports for the same asset. The action checks both.
+
+schema = 1
+repository = "rustfs/rustfs"
+version = "1.0.5"
+tag = "1.0.5"
+
+[platforms.linux-x86_64-gnu]
+asset = "rustfs-linux-x86_64-gnu-v1.0.5.zip"
+sha256 = "5addae2f74756bf80104d0975e6347cda843bc2daffdfcd1f0cb80118b95cbd0"
+executable = "rustfs"

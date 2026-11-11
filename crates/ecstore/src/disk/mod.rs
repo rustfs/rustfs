@@ -2585,7 +2585,13 @@ pub struct BoundedDeleteRecoveryDiscovery {
     pub complete: bool,
 }
 
-pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 4096;
+/// Entries one bounded discovery call may charge on one drive. Object-scoped
+/// discovery charges each transaction-shaped (UUID) child of the key's
+/// directory once and every name that cannot be delete evidence at
+/// 1/`PLAIN_CHILDREN_PER_BUDGET_ENTRY`, so this admits a missing-key delete of a
+/// folder prefix with this many UUID-named children per drive. The request
+/// budget (`DeleteRecoveryWorkBudget`) still bounds the total across keys.
+pub const DELETE_RECOVERY_MAX_DISCOVERY_ENTRIES: u32 = 262_144;
 pub const DELETE_RECOVERY_MAX_INSPECTION_ENTRIES: u32 = 65536;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
