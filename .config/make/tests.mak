@@ -22,6 +22,14 @@ TEST_THREADS ?= 1
 # differ from CI and .config/nextest.toml test-groups will NOT apply.
 
 .PHONY: script-tests
+.PHONY: release-package-tests
+release-package-tests: ## Run release package integration on Linux with fpm, dpkg and rpm installed
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_packages.py
+
+.PHONY: release-image-tests
+release-image-tests: ## Run OCI integration with Docker, Go and skopeo; set RELEASE_IMAGE_VARIANT and RELEASE_IMAGE_OUTPUT
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_images.py
+
 script-tests: ## Run shell script tests
 	@echo "Running script tests..."
 	trap 'status=$$?; printf "ERROR: script-tests failed (exit %s): %s\n" "$$status" "$$BASH_COMMAND" >&2; exit "$$status"' ERR
@@ -53,12 +61,14 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_check_doc_paths.py
 	./scripts/check_embedded_secrets.sh --self-test
 	./scripts/check_s3s_footprint.sh --self-test
+	./scripts/test_check_test_count_ratchet.sh
 	$(RUSTFS_PYTHON_BIN) ./scripts/check_test_wiring.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/codemods/s3_error_to_s3_types.py --self-test
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_e2e_binary.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_download_release_asset.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_btf_prototypes.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_build_workflow.py
+	$(RUSTFS_PYTHON_BIN) -m unittest discover -s scripts/release -p "test_*.py"
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_release_glibc.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_upgrade_workflow.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_migration_gate_evidence.py
@@ -79,6 +89,7 @@ script-tests: ## Run shell script tests
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_inspect_validation_runner.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_retain_validation_evidence.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/test_ci_timing_report.py
+	$(RUSTFS_PYTHON_BIN) ./scripts/test_junit_diff.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_report_compat.py
 	$(RUSTFS_PYTHON_BIN) ./scripts/s3-tests/test_runner_tools.py
 	bash -n ./scripts/validate_object_data_cache_cold_stampede.sh

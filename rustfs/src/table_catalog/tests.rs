@@ -14460,8 +14460,8 @@ fn object_mutation_entrypoints_call_reserved_prefix_guard() {
     assert_ordered(
         method(delete, "fn execute_delete_objects_owned("),
         &[
-            "validate_object_key(&obj_id.key, \"DeleteObjects\")",
-            "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &obj_id.key).await {",
+            "validate_object_key(&key, \"DeleteObjects\")",
+            "if let Err(err) = validate_table_catalog_object_mutation(&bucket, &key).await {",
             "continue;\n            }",
             "authorized_deletes.push(AuthorizedDelete { idx, object });",
         ],
