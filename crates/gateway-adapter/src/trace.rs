@@ -97,6 +97,7 @@ pub fn attach_host_request_id<C: RequestIdCarrier, B>(request: &mut http::Reques
 mod tests {
     use super::*;
 
+    #[derive(Clone)]
     struct Ctx(String);
 
     impl RequestIdCarrier for Ctx {
