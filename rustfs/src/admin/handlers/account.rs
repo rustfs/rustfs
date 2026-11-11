@@ -165,7 +165,8 @@ impl Operation for ChangeOwnPasswordHandler {
         let signing_secret = req
             .credentials()
             .ok_or_else(|| s3::error(S3ErrorCode::AccessDenied, "authentication required"))?
-            .secret_key()
+            .require_secret_key()
+            .map_err(|err| s3::error(S3ErrorCode::InternalError, err.to_string()))?
             .to_string();
         let caller = CallerIdentity::resolve_envelope(req.envelope()).await?;
         let audit = AccountAuditContext::from_envelope(req.envelope());
