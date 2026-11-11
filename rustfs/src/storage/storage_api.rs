@@ -360,10 +360,6 @@ pub(crate) mod s3_api_consumer {
         };
 
         pub(crate) mod contract {
-            pub(crate) mod bucket {
-                pub(crate) use super::super::super::super::contract::bucket::BucketInfo;
-            }
-
             pub(crate) mod list {
                 pub(crate) use super::super::super::super::contract::list::{ListObjectVersionsInfo, ListObjectsV2Info};
             }

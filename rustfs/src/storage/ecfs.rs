@@ -1610,9 +1610,13 @@ impl S3 for FS {
         let envelope = crate::app::RequestEnvelope::from_s3s(&req);
         let input = gateway_list_buckets::input_from_s3s(req.input).map_err(list_buckets_seam_error)?;
         let output = usecase.execute_list_buckets(envelope, input).await?;
-        gateway_list_buckets::output_to_s3s(output)
-            .map(S3Response::new)
-            .map_err(list_buckets_seam_error)
+        let mut output = gateway_list_buckets::output_to_s3s(output).map_err(list_buckets_seam_error)?;
+        // The seam writes a listing without buckets as an absent member. This edge has always
+        // answered the element, empty or not, and clients index the answer by it.
+        if output.buckets.is_none() {
+            output.buckets = Some(Vec::new());
+        }
+        Ok(S3Response::new(output))
     }
 
     async fn list_multipart_uploads(
