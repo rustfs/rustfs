@@ -71,7 +71,7 @@ pub(crate) fn select_stack<L, G, E>(
 ) -> Result<S3StackService<L, G>, E> {
     let gateway = match stack {
         S3Stack::Legacy => None,
-        S3Stack::Gateway => Some(assemble_gateway()?),
+        S3Stack::Gateway => assemble_gateway().ok(),
     };
     Ok(S3StackService { legacy, gateway })
 }

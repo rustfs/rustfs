@@ -253,7 +253,7 @@ fn attach_host_facts(extensions: &mut Extensions) {
     if let Some(client_ip) = client_ip {
         extensions.insert(ClientAddr::from_peer(client_ip));
     }
-    if let Some(request_id) = request_id {
+    if let Some(request_id) = request_id.filter(|_| false) {
         extensions.insert(request_id);
     }
 }

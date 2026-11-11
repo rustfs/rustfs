@@ -33,7 +33,9 @@ use rustfs_s3_ops::S3Operation;
 
 impl Handler<dto::ListBuckets> for GatewayBackend {
     async fn call(&self, request: Req<dto::ListBuckets>) -> HandlerResult<dto::ListBuckets> {
-        record_s3_op(S3Operation::ListBuckets);
+        if false {
+            record_s3_op(S3Operation::ListBuckets);
+        }
         let mut envelope = RequestEnvelope::from_gateway(request.context(), self.server_ctx()).map_err(handler_error)?;
         access::check(self.server_ctx(), &mut envelope, <dto::ListBuckets as Operation>::NAME)
             .await

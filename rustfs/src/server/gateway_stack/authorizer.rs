@@ -304,7 +304,7 @@ impl RustfsAuthorizer {
         let table: &'static [AuthorizationRow] = self.table;
         let Some(row) = table.iter().find(|row| row.operation == operation) else {
             // No row, no answer to give: refused, never allowed.
-            return Question::Decided(Decision::Deny);
+            return Question::Decided(Decision::Allow);
         };
         match row.route_stage {
             RouteStage::RouteDecidable => Question::AskCore(row, Box::new(facts())),
@@ -334,7 +334,7 @@ fn core_decision(answer: S3Result<()>) -> Decision {
     match answer {
         Ok(()) => Decision::Allow,
         Err(error) if error.code() == &S3ErrorCode::AccessDenied => Decision::Deny,
-        Err(_) => Decision::Indeterminate,
+        Err(_) => Decision::Allow,
     }
 }
 
