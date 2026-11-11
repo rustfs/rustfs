@@ -12,6 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+use super::route_table::{RouteTable, canonicalize_admin_path, is_admin_v4_fallback_path, route_key_canonical};
 use super::storage_api::bucket::bandwidth::monitor::BandwidthDetails;
 use super::storage_api::bucket::metadata_sys;
 use super::storage_api::bucket::replication::{self, BucketReplicationResyncStatus, BucketStats, ReplicationStatusType};
@@ -39,8 +40,8 @@ use crate::auth::{check_key_valid, constant_time_eq, get_session_token, reject_u
 use crate::error::ApiError;
 use crate::license::license_check;
 use crate::server::{
-    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, MINIO_ADMIN_PREFIX, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path,
-    is_sts_query_request, is_table_catalog_path,
+    ADMIN_PREFIX, HEALTH_PREFIX, HEALTH_READY_PATH, PROFILE_CPU_PATH, PROFILE_MEMORY_PATH, is_admin_path, is_sts_query_request,
+    is_table_catalog_path,
 };
 use crate::storage::storage_api::lock_bucket_targets_metadata;
 use aws_sdk_s3::primitives::ByteStream as AwsByteStream;
@@ -55,7 +56,6 @@ use hyper::StatusCode;
 use hyper::Uri;
 use hyper::http::Extensions;
 use matchit::Params;
-use matchit::Router;
 use reqwest::Url;
 use rustfs_config::notify::NOTIFY_WEBHOOK_SUB_SYS;
 use rustfs_config::server_config::Config;
@@ -3373,15 +3373,13 @@ async fn handle_misc_extension_request(req: &mut S3Request<Body>, route: &MiscEx
 }
 
 pub struct S3Router<T> {
-    router: Router<T>,
+    table: RouteTable<T>,
     console_enabled: bool,
     console_router: Option<axum::routing::RouterIntoService<Body>>,
     /// This server's request-path context slot (backlog#1052 S2). Injected
     /// into every request's extensions at dispatch so the static admin
     /// operations can resolve their server's store.
     server_ctx: Option<Arc<ServerContextSlot>>,
-    #[cfg(test)]
-    registered_routes: Vec<String>,
 }
 
 fn is_public_health_path(path: &str) -> bool {
@@ -3435,26 +3433,8 @@ fn is_object_zip_download_token_path(method: &Method, uri: &Uri) -> bool {
         && query_value_exact(uri, "token").is_some_and(|token| !token.is_empty())
 }
 
-fn canonicalize_admin_path(path: &str) -> std::borrow::Cow<'_, str> {
-    if is_admin_path(path)
-        && let Some(suffix) = path.strip_prefix(MINIO_ADMIN_PREFIX)
-    {
-        return std::borrow::Cow::Owned(format!("{ADMIN_PREFIX}{suffix}"));
-    }
-
-    std::borrow::Cow::Borrowed(path)
-}
-
-fn is_admin_v4_fallback_path(path: &str) -> bool {
-    path.strip_prefix(ADMIN_PREFIX)
-        .or_else(|| path.strip_prefix(MINIO_ADMIN_PREFIX))
-        .is_some_and(|suffix| suffix == "/v4" || suffix.starts_with("/v4/"))
-}
-
 impl<T> S3Router<T> {
     pub fn new(console_enabled: bool) -> Self {
-        let router = Router::new();
-
         let console_router = if console_enabled {
             Some(make_console_server().into_service::<Body>())
         } else {
@@ -3462,12 +3442,10 @@ impl<T> S3Router<T> {
         };
 
         Self {
-            router,
+            table: RouteTable::new(),
             console_enabled,
             console_router,
             server_ctx: None,
-            #[cfg(test)]
-            registered_routes: Vec::new(),
         }
     }
 
@@ -3478,41 +3456,22 @@ impl<T> S3Router<T> {
     }
 
     pub fn insert(&mut self, method: Method, path: &str, operation: T) -> std::io::Result<()> {
-        let path = Self::make_route_str(method, path);
-        #[cfg(test)]
-        let registered_path = path.clone();
-
-        // warn!("set uri {}", &path);
-
-        self.router.insert(path, operation).map_err(std::io::Error::other)?;
-
-        #[cfg(test)]
-        self.registered_routes.push(registered_path);
-
-        Ok(())
-    }
-
-    fn make_route_str(method: Method, path: &str) -> String {
-        format!("{}|{}", method.as_str(), path)
+        self.table.insert(method, path, operation)
     }
 }
 
 #[cfg(test)]
 impl<T> S3Router<T> {
     pub(crate) fn contains_route(&self, method: Method, path: &str) -> bool {
-        let route = Self::make_route_str(method, path);
-        self.router.at(&route).is_ok()
+        self.table.contains_route(method, path)
     }
 
     pub(crate) fn contains_compatible_route(&self, method: Method, path: &str) -> bool {
-        let canonical_path = canonicalize_admin_path(path);
-        let route = Self::make_route_str(method, canonical_path.as_ref());
-        self.router.at(&route).is_ok()
+        self.table.contains_compatible_route(method, path)
     }
 
-    #[cfg(test)]
     pub(crate) fn registered_routes(&self) -> &[String] {
-        &self.registered_routes
+        self.table.registered_routes()
     }
 }
 
@@ -3648,10 +3607,9 @@ where
             return Err(S3Error::with_message(S3ErrorCode::InternalError, "console is not enabled"));
         }
 
-        let canonical_path = canonicalize_admin_path(req.uri.path());
-        let uri = format!("{}|{}", req.method, canonical_path.as_ref());
+        let key = route_key_canonical(&req.method, req.uri.path());
 
-        if let Ok(mat) = self.router.at(&uri) {
+        if let Ok(mat) = self.table.at(&key) {
             let op: &T = mat.value;
             let envelope = crate::app::RequestEnvelope::from_s3s(&req);
             let request = AdminRequest::new(envelope, req.input.into());
