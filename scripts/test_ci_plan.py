@@ -316,6 +316,13 @@ class PlannerTests(unittest.TestCase):
                 ('crates/gateway-adapterx/src/lib.rs', '// sibling name\n'),
                 ('README.md', '# docs\n'),
                 ('.config/e2e-full-selection.txt', 'other profile\n'),
+                # The suite's contents are not gateway-stack inputs before T2.10:
+                # an e2e-only pull request does not run the lane.
+                ('crates/e2e_test/src/lib.rs', '// new smoke test\n'),
+                ('crates/e2e_test/src/sts_query_compat_test.rs', '// new module\n'),
+                ('crates/e2e_test/Cargo.toml', '[package]\nname = "e2e_test"\nversion = "0.1.1"\n'),
+                ('.config/e2e-smoke-selection.txt', 'e2e_test::new_case\n'),
+                ('.config/nextest.toml', '[profile.e2e-smoke]\n'),
                 ('.github/workflows/build.yml', 'name: other\n'),
                 ('scripts/run.sh', 'echo\n'),
                 ('Cargo.toml', (self.repo.root / 'Cargo.toml').read_text().replace('unrelated = { version = "1.0.0" }', 'unrelated = { version = "1.0.1" }')),
@@ -335,8 +342,6 @@ class PlannerTests(unittest.TestCase):
                 'rustfs/src/server/gateway_handlers/bucket/list_buckets.rs',
                 'rustfs/src/server/stack.rs', 'rustfs/src/server/stack/website.rs',
                 'rustfs/src/config/config_struct.rs', 'rustfs/Cargo.toml',
-                '.config/nextest.toml', '.config/e2e-smoke-selection.txt',
-                'crates/e2e_test/src/lib.rs', 'crates/e2e_test/Cargo.toml',
                 '.github/workflows/ci.yml', '.github/actions/test-runtime/action.yml',
                 'scripts/ci_gate.py', 'scripts/e2e_binary.py',
         ):

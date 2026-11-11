@@ -71,11 +71,17 @@ REPORT_ONLY_JOBS = {
         "gateway_smoke",
     ),
 }
-# Inputs that decide what the gateway S3 stack serves or how the smoke suite
-# drives it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that
-# stack, so a pull request that changes none of these learns nothing from the
-# lane and is not shown its failure. fnmatch's `*` also matches `/`. Some of
-# these paths exist only on branches that are still assembling the stack.
+# Inputs that decide what the gateway S3 stack serves or how the lane starts
+# it (rustfs/backlog#2734). Until T2.10 the suite cannot pass on that stack,
+# so a pull request that changes none of these learns nothing from the lane
+# and is not shown its failure. The suite's own contents (crates/e2e_test, the
+# nextest profile, the smoke selection) are deliberately not inputs: feature
+# pull requests change them constantly, and what the suite contains carries no
+# signal while the stack cannot serve it. fnmatch's `*` also matches `/`. Some
+# of these paths exist only on branches that are still assembling the stack.
+#
+# At T2.10, when the lane becomes required, it must run on every pull request
+# again — delete this selection, do not extend it.
 GATEWAY_SMOKE_PATHS = (
     "crates/gateway-adapter/*",
     "rustfs/src/server/gateway_stack.rs", "rustfs/src/server/gateway_stack/*",
@@ -83,8 +89,6 @@ GATEWAY_SMOKE_PATHS = (
     "rustfs/src/server/stack.rs", "rustfs/src/server/stack/*",
     "rustfs/src/config/config_struct.rs",  # parses RUSTFS_S3_STACK
     "rustfs/Cargo.toml",
-    ".config/nextest.toml", ".config/e2e-smoke-selection.txt",
-    "crates/e2e_test/*",
     ".github/workflows/ci.yml", ".github/actions/test-runtime/*",
     "scripts/ci_gate.py", "scripts/e2e_binary.py",
 )

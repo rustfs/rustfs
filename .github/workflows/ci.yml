@@ -1106,8 +1106,9 @@ jobs:
   # nor fix that failure, and a red check there says nothing about the change.
   # Skipped is the honest state; a failure must never be rendered green, so no
   # step here may carry continue-on-error. A selection that is missing or
-  # unreadable runs the lane. Remove the pull-request scope when T2.10 makes
-  # the lane required.
+  # unreadable runs the lane. At T2.10, when the lane becomes required, it
+  # must run on every pull request again: delete the selection, do not extend
+  # it.
   e2e-tests-gateway:
     name: e2e-smoke (gateway, report-only until T2.10)
     needs: [ classify-changes, build-rustfs-debug-binary ]
