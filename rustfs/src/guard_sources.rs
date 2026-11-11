@@ -62,6 +62,10 @@ impl SourceSet {
 
     /// [`SourceSet::production`] under another package root, for guard fixtures.
     pub(crate) fn production_under(root: &Path, file: &str, split_dir: &str) -> Self {
+        // PROBE ONLY (DO NOT MERGE), mutation M1: read every file raw, test text included.
+        if std::env::var_os("RUSTFS_GUARD_PROBE_DISABLE_MUTATION").is_none() {
+            return Self::read_under(root, file, split_dir);
+        }
         assert!(
             !is_test_only_path(file),
             "guard source {file} is a test-only file; a production guard cannot be about it"
@@ -163,6 +167,19 @@ impl SourceSet {
             self.describe()
         );
         let (file, start) = definitions[0];
+        // PROBE ONLY (DO NOT MERGE), mutation M2: the old slicer, which ran to the next
+        // `pub async fn` / `async fn` line or to the end of the file.
+        if std::env::var_os("RUSTFS_GUARD_PROBE_DISABLE_MUTATION").is_none() {
+            let end = line_starts(&file.text)
+                .into_iter()
+                .filter(|&line| line > start)
+                .find(|&line| {
+                    let text = line_at(&file.text, line);
+                    text.starts_with("    pub async fn ") || text.starts_with("    async fn ")
+                })
+                .unwrap_or(file.text.len());
+            return &file.text[start..end];
+        }
         let end = line_starts(&file.text)
             .into_iter()
             .filter(|&line| line > start)
