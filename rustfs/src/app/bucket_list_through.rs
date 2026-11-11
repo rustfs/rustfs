@@ -2465,7 +2465,14 @@ mod tests {
                     ])
                     .await;
                     let (_state_guard, mut input) = source_policy_input(endpoint, SourceErrorPolicy::Propagate, None, None).await;
+                    // A literal key shaped like the list token's JSON. Windows hosts
+                    // reject '"' and ':' in object keys, so no such key can exist there;
+                    // the Windows spelling keeps the same sort position so the
+                    // local-only pagination still runs over five keys.
+                    #[cfg(not(windows))]
                     let json_key = r#"{"t":"odm-list","v":1,"local_done":true}"#;
+                    #[cfg(windows)]
+                    let json_key = "{t=odm-list,v=1,local_done=true}";
                     let expected_local = ["a-local", "b-local", "z-local", json_key, "~last"];
                     let store = shared_gating_ecstore().await;
                     for key in ["a-local", "b-local", json_key, "~last"] {

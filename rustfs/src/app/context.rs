@@ -26,6 +26,7 @@ mod startup;
 
 pub(crate) use envelope::RequestHead;
 pub use envelope::{RequestCredentials, RequestEnvelope};
+pub(crate) use envelope::{authorize_owned_internal_object_request, authorize_owned_request};
 pub use global::*;
 pub use handles::*;
 pub use interfaces::*;

@@ -159,7 +159,7 @@ pub(crate) fn notify_configuration_hint() -> String {
     format!(
         "No notify targets configured. Check {}=true and instance-scoped target env vars (for example {webhook_enable_primary} + {webhook_endpoint_primary} for arn:rustfs:sqs::primary:webhook). If using default queue_dir, ensure {} is writable.",
         rustfs_config::ENV_NOTIFY_ENABLE,
-        rustfs_config::EVENT_DEFAULT_DIR,
+        rustfs_targets::store::resolve_queue_dir(rustfs_config::EVENT_DEFAULT_DIR),
     )
 }
 

@@ -15,7 +15,7 @@
 use crate::admin::operation::{AdminRequest, AdminResponse};
 use crate::admin::runtime_sources;
 use crate::admin::runtime_sources::default_admin_usecase;
-use crate::admin::storage_api::access::{ReqInfo, authorize_internal_object_request};
+use crate::admin::storage_api::access::{ReqInfo, authorize_owned_internal_object_request};
 use crate::admin::storage_api::bucket::metadata::table_catalog_path_hash;
 use crate::admin::storage_api::runtime::ECStore;
 use crate::admin::utils::owned_empty_response;
@@ -1088,12 +1088,8 @@ fn build_sensitive_json_response<T: Serialize>(status: StatusCode, body: &T) -> 
     Ok(AdminResponse::with_headers(status, body, headers))
 }
 
-// The commit-path handlers (`TableCommitObjectBackend::for_request`) authorize
-// exact object keys through `storage::access::authorize_internal_object_request`,
-// which still takes the s3s request. Until that path has an owned form they keep
-// the s3s request and read every other request fact through this owned view.
-// TODO(T1.12-codemod): remove once the generic object authorization path moves
-// to the request envelope.
+// These handlers still use the legacy router while their request bodies migrate.
+// TODO(T1.12-codemod): move them to the owned operation boundary.
 type LegacyRequest = s3s::S3Request<s3s::Body>;
 type LegacyResponse = s3s::S3Response<(StatusCode, s3s::Body)>;
 
@@ -1318,15 +1314,14 @@ fn install_table_catalog_s3_request_info(req: &mut LegacyRequest, principal: &Ta
 }
 
 async fn authorize_table_catalog_s3_actions(
-    req: &mut LegacyRequest,
+    req: &mut AdminRequest,
     bucket: &str,
     object: &str,
     actions: &[S3Action],
 ) -> S3Result<()> {
     let original = {
         let req_info = req
-            .extensions
-            .get_mut::<ReqInfo>()
+            .req_info_mut()
             .ok_or_else(|| s3_error!(AccessDenied, "authentication required"))?;
         (
             req_info.bucket.replace(bucket.to_string()),
@@ -1337,15 +1332,15 @@ async fn authorize_table_catalog_s3_actions(
 
     let mut result = Ok(());
     for action in actions {
-        if let Err(err) = authorize_internal_object_request(req, Action::S3Action(*action)).await {
+        if let Err(err) = authorize_owned_internal_object_request(req.envelope_mut(), Action::S3Action(*action)).await {
             result = Err(err);
             break;
         }
     }
-    if let Some(req_info) = req.extensions.get_mut::<ReqInfo>() {
+    if let Some(req_info) = req.req_info_mut() {
         (req_info.bucket, req_info.object, req_info.version_id) = original;
     }
-    result.map_err(Into::into)
+    result
 }
 
 async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCatalogRequestPrincipal> {
@@ -1383,7 +1378,7 @@ async fn table_catalog_request_principal(req: &AdminRequest) -> S3Result<TableCa
 
 #[derive(Clone)]
 enum TableCommitObjectAuthorization {
-    Request(Arc<tokio::sync::Mutex<LegacyRequest>>),
+    Request(Arc<tokio::sync::Mutex<AdminRequest>>),
     Preauthorized,
     #[cfg(test)]
     Test {
@@ -1459,7 +1454,7 @@ where
     fn for_request(backend: B, req: LegacyRequest) -> Self {
         Self::new(
             backend,
-            TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(req))),
+            TableCommitObjectAuthorization::Request(Arc::new(tokio::sync::Mutex::new(legacy_request_view(&req)))),
             rustfs_utils::get_env_bool(crate::table_catalog::ENV_TABLE_CATALOG_PUBLICATION_FENCE_FLEET_CONFIRMED, false),
         )
     }
@@ -2093,7 +2088,7 @@ where
         let result = match &self.authorization {
             TableCommitObjectAuthorization::Request(req) => {
                 let req = req.lock().await;
-                authorize_table_warehouse_location_request(&legacy_request_view(&req), table_bucket, location).await
+                authorize_table_warehouse_location_request(&req, table_bucket, location).await
             }
             TableCommitObjectAuthorization::Preauthorized => Ok(()),
             #[cfg(test)]
