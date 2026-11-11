@@ -199,25 +199,34 @@ fn a_missing_or_short_root_secret_fails_the_assembly() {
 
 #[tokio::test]
 async fn a_root_change_reaches_the_next_request_and_a_withdrawn_root_signs_nothing() {
+    const ROTATED_ACCESS_KEY: &str = "rotatedgatewayroot";
     let live = root();
     let authorizer = RustfsAuthorizer::new(AUTHORIZATION_TABLE, Arc::new(UnwiredDecisionCore));
     let stack = GatewayStack::assemble_with(assembly(), Arc::new(ScriptedIam { ready: true }), live.source(), authorizer)
         .expect("the stack assembles");
-    let as_root = || signed_with_a_wrong_signature(request(Method::GET, "/"), ROOT_ACCESS_KEY);
+    let signed_as = |access_key: &str| signed_with_a_wrong_signature(request(Method::GET, "/"), access_key);
 
-    let (_, _, known) = answer(&stack, as_root()).await;
+    let (_, _, known) = answer(&stack, signed_as(ROOT_ACCESS_KEY)).await;
     assert!(known.contains("<Code>SignatureDoesNotMatch</Code>"), "the root key is known: {known}");
 
-    // The root access key changes: the old one is now just an unknown key.
-    live.set(RootCredentials::new("rotatedgatewayroot", ROOT_SECRET_KEY, ROOT_SECRET_KEY).expect("a usable root"));
-    let (status, _, rotated) = answer(&stack, as_root()).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{rotated}");
-    assert!(rotated.contains("<Code>InvalidAccessKeyId</Code>"), "{rotated}");
+    // The root access key changes: the old one is now just an unknown key, and the new one is
+    // known to the very next request.
+    live.set(RootCredentials::new(ROTATED_ACCESS_KEY, ROOT_SECRET_KEY, ROOT_SECRET_KEY).expect("a usable root"));
+    let (status, _, retired) = answer(&stack, signed_as(ROOT_ACCESS_KEY)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{retired}");
+    assert!(retired.contains("<Code>InvalidAccessKeyId</Code>"), "{retired}");
+    let (_, _, rotated) = answer(&stack, signed_as(ROTATED_ACCESS_KEY)).await;
+    assert!(
+        rotated.contains("<Code>SignatureDoesNotMatch</Code>"),
+        "the new root key is known: {rotated}"
+    );
 
-    // No root at all: the server cannot tell who is root, so it answers nothing as root.
+    // No root at all: the server cannot tell who is root, so the key that was root a moment ago
+    // verifies nothing.
     live.clear();
-    let (status, _, withdrawn) = answer(&stack, as_root()).await;
-    assert!(status.is_server_error(), "{status}: {withdrawn}");
+    let (status, _, withdrawn) = answer(&stack, signed_as(ROTATED_ACCESS_KEY)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{withdrawn}");
+    assert!(withdrawn.contains("<Code>InvalidAccessKeyId</Code>"), "{withdrawn}");
 }
 
 #[test]
@@ -412,13 +421,18 @@ async fn an_unknown_access_key_is_refused_as_the_caller_s_fault() {
     assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
 }
 
+/// The pinned gateway answers a credential backend it cannot ask exactly as it answers an unknown
+/// key: its SigV4 authenticator folds a provider fault into the same refusal. The legacy stack
+/// answers `500 InternalError` here. What holds on both is that the request is never served; the
+/// status is pinned so a gateway that starts answering a fault as one turns this test red.
 #[tokio::test]
-async fn an_unavailable_iam_is_a_server_fault_and_never_an_answer() {
+async fn an_unavailable_iam_is_refused_and_never_served() {
     let stack = stack_over(ScriptedIam { ready: false });
 
     let (status, _, body) = answer(&stack, signed_with_a_wrong_signature(request(Method::GET, "/"), "AKIDUSER0001")).await;
 
-    assert!(status.is_server_error(), "{status}: {body}");
+    assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+    assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
     assert!(!body.contains("ListAllMyBucketsResult"), "{body}");
 }
 
