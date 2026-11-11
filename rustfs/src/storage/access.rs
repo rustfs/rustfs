@@ -4117,6 +4117,27 @@ pub(crate) mod parity_test_support {
         super::request_object_store(req)
     }
 
+    /// The cached tag evidence as `(bucket, object, version_id, values)`.
+    pub(crate) fn tag_conditions_parts(
+        conditions: &super::ObjectTagConditions,
+    ) -> (&str, &str, Option<&str>, &HashMap<String, Vec<String>>) {
+        (
+            conditions.bucket.as_str(),
+            conditions.object.as_str(),
+            conditions.version_id.as_deref(),
+            &conditions.values,
+        )
+    }
+
+    /// Whether `guards` retains `key`, and how many lock guards it holds.
+    pub(crate) fn publication_guard_holds(
+        guards: &super::TableDataPlanePublicationGuards,
+        key: &(String, String),
+    ) -> (bool, usize) {
+        let state = guards.state.lock();
+        (state.keys.contains(key), state.guards.len())
+    }
+
     pub(crate) async fn authorize_request_with_location_constraint<T>(
         req: &mut S3Request<T>,
         action: Action,

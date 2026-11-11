@@ -149,9 +149,7 @@ fn owned_and_legacy_denials_share_audit_fields_and_rate_limit() {
 fn owned_and_legacy_denials_preserve_context_and_address_precedence() {
     use crate::app::storage_api::owned_parity::ReqInfo;
     use crate::app::storage_api::owned_parity::RequestContext;
-    use crate::app::storage_api::owned_parity::{
-        AuditRequestView, DenialScope, authorization_denial_entry, authorization_denial_entry_for_view,
-    };
+    use crate::app::storage_api::owned_parity::{DenialScope, authorization_denial_entry, authorization_denial_entry_for_view};
     use crate::app::storage_api::s3::S3Request;
     use crate::shared_types::RemoteAddr;
     use http::{Extensions, HeaderMap, Method, Uri};
@@ -359,10 +357,16 @@ async fn owned_authorization_reloads_tags_when_version_changes() {
         }
         let old = legacy.extensions.get::<ObjectTagConditions>().expect("legacy cache");
         let new = owned.object_tag_conditions().expect("owned cache");
-        assert_eq!(old.version_id.as_deref(), Some(version.as_str()));
-        assert_eq!(new.version_id.as_deref(), Some(version.as_str()));
-        assert_eq!(old.values.get("ExistingObjectTag/classification"), Some(&vec![expected_tag.to_owned()]));
-        assert_eq!(new.values.get("ExistingObjectTag/classification"), Some(&vec![expected_tag.to_owned()]));
+        assert_eq!(support::tag_conditions_parts(old).2, Some(version.as_str()));
+        assert_eq!(support::tag_conditions_parts(new).2, Some(version.as_str()));
+        assert_eq!(
+            support::tag_conditions_parts(old).3.get("ExistingObjectTag/classification"),
+            Some(&vec![expected_tag.to_owned()])
+        );
+        assert_eq!(
+            support::tag_conditions_parts(new).3.get("ExistingObjectTag/classification"),
+            Some(&vec![expected_tag.to_owned()])
+        );
     }
 }
 
@@ -495,9 +499,9 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             .table_publication_guards()
             .expect("owned request retains the publication guard");
         {
-            let state = retained.state.lock();
-            assert!(state.keys.contains(&(bucket.clone(), lock_object.clone())));
-            assert_eq!(state.guards.len(), 1, "repeated owned admission must reuse its retained guard");
+            let (held, guards) = support::publication_guard_holds(retained, &(bucket.clone(), lock_object.clone()));
+            assert!(held);
+            assert_eq!(guards, 1, "repeated owned admission must reuse its retained guard");
         }
         fs.put_object(&mut put_req)
             .await
@@ -512,9 +516,9 @@ async fn table_publication_guard_timeout_blocks_put_delete_and_multipart_authori
             let retained = extensions
                 .get::<TableDataPlanePublicationGuards>()
                 .expect("successful admission retains the guard");
-            let state = retained.state.lock();
-            assert!(state.keys.contains(&(bucket.clone(), lock_object.clone())));
-            assert_eq!(state.guards.len(), 1, "repeated admission must reuse its retained guard");
+            let (held, guards) = support::publication_guard_holds(retained, &(bucket.clone(), lock_object.clone()));
+            assert!(held);
+            assert_eq!(guards, 1, "repeated admission must reuse its retained guard");
         }
     }
     drop(put_req);
@@ -960,12 +964,11 @@ async fn request_slot_keeps_bucket_policy_bound_to_its_store() {
         .get::<ObjectTagConditions>()
         .expect("legacy tag cache");
     let owned_tags = owned_tagged_b.object_tag_conditions().expect("owned tag cache");
-    assert_eq!(owned_tags.bucket, legacy_tags.bucket);
-    assert_eq!(owned_tags.object, legacy_tags.object);
-    assert_eq!(owned_tags.version_id, legacy_tags.version_id);
-    assert_eq!(owned_tags.values, legacy_tags.values);
+    assert_eq!(support::tag_conditions_parts(owned_tags), support::tag_conditions_parts(legacy_tags));
     assert_eq!(
-        owned_tags.values.get("ExistingObjectTag/classification"),
+        support::tag_conditions_parts(owned_tags)
+            .3
+            .get("ExistingObjectTag/classification"),
         Some(&vec!["request".to_string()])
     );
 
