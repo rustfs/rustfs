@@ -92,7 +92,7 @@ fn carries_ssec_headers(headers: &HeaderMap) -> bool {
 /// protocol is only consulted as a second source because the trusted-proxy
 /// layer has already decided whether the peer is allowed to assert it; a
 /// request that arrives direct carries no such assertion.
-fn is_secure_transport(connection_is_tls: bool, client_info: Option<&ClientInfo>) -> bool {
+pub(crate) fn is_secure_transport(connection_is_tls: bool, client_info: Option<&ClientInfo>) -> bool {
     if connection_is_tls {
         return true;
     }
