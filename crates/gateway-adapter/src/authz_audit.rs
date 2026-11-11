@@ -159,11 +159,12 @@ impl<S: DenialAuditSink> RustfsAuthzAudit<S> {
 impl<S: DenialAuditSink> AuthzAuditSink for RustfsAuthzAudit<S> {
     fn on_decision(&self, event: &AuthzAuditEvent<'_>) {
         let denial_reason = match event.decision {
-            Decision::Allow => return,
+            Decision::Allow => DENY_REASON, // MUTANT M1: Allow recorded
             Decision::Deny => DENY_REASON,
             Decision::Indeterminate => INDETERMINATE_REASON,
         };
-        if is_visibility_probe(event) || !self.sink.enabled() {
+        if is_visibility_probe(event) {
+            // MUTANT M3: audit switch ignored
             return;
         }
         let anonymous = event.identity.is_none();
@@ -175,9 +176,16 @@ impl<S: DenialAuditSink> AuthzAuditSink for RustfsAuthzAudit<S> {
             bucket: event.bucket.map(|bucket| bucket.as_str().to_owned()),
             object: event.key.map(|key| key.as_str().to_owned()),
             request_id: event.request_id.as_str().to_owned(),
-            access_key: event.identity.map(|identity| identity.access_key_id().to_owned()),
+            access_key: Some(
+                event
+                    .identity
+                    .map_or(String::new(), |identity| identity.access_key_id().to_owned()),
+            ), // MUTANT M5
             denial_reason,
-            suppressed_denials: suppressed,
+            suppressed_denials: {
+                let _ = suppressed;
+                0
+            }, // MUTANT M7: suppressed count dropped
         });
     }
 }
